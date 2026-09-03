@@ -307,6 +307,133 @@ describe("scripted-agent-runtime-shared", () => {
     });
   });
 
+  describe("launch-time harness probe (IFLB)", () => {
+    it("isHarnessProbePrompt recognizes the marker as the first line", async () => {
+      const mod = await import(sharedModulePath);
+      assert.equal(
+        mod.isHarnessProbePrompt(
+          'TAMANDUA_HARNESS_PROBE: skill-path\nRun the exact command "/abs/tamandua skill-path" and reply with the PATH and nothing else.',
+        ),
+        true,
+        "a probe prompt whose first line is the marker must be recognized",
+      );
+    });
+
+    it("isHarnessProbePrompt rejects work prompts and marker-not-first prompts", async () => {
+      const mod = await import(sharedModulePath);
+      const workPrompt = [
+        'workflow "test-wf", agent "test-wf_doer", run "run-abc"',
+        "Task: do a thing",
+        '"/abs/tamandua" step claim "test-wf_doer" --run-id "run-abc"',
+      ].join("\n");
+      assert.equal(mod.isHarnessProbePrompt(workPrompt), false, "work prompts are not probes");
+      assert.equal(
+        mod.isHarnessProbePrompt("lead-in line\nTAMANDUA_HARNESS_PROBE: skill-path"),
+        false,
+        "the marker must be the FIRST line to count as a probe",
+      );
+      assert.equal(mod.isHarnessProbePrompt(""), false, "empty prompt is not a probe");
+    });
+
+    it("parseHarnessProbeCommand extracts the exact quoted command", async () => {
+      const mod = await import(sharedModulePath);
+      const cmd = mod.parseHarnessProbeCommand(
+        'TAMANDUA_HARNESS_PROBE: skill-path\nRun the exact command "/abs/launcher skill-path" and reply with the PATH and nothing else.',
+      );
+      assert.equal(cmd, "/abs/launcher skill-path");
+      assert.equal(
+        mod.parseHarnessProbeCommand('workflow "x", agent "y", run "z"'),
+        null,
+        "non-probe prompts quote no probe command",
+      );
+    });
+
+    it("splitProbeCommand splits quote-aware into argv", async () => {
+      const mod = await import(sharedModulePath);
+      assert.deepEqual(mod.splitProbeCommand("/abs/launcher skill-path"), [
+        "/abs/launcher",
+        "skill-path",
+      ]);
+      assert.deepEqual(mod.splitProbeCommand('"/my dir/launcher" skill-path'), [
+        "/my dir/launcher",
+        "skill-path",
+      ]);
+    });
+
+    it("execHarnessProbe runs the quoted command for real and returns its stdout path", async () => {
+      const tmp = makeTempStateDir();
+      try {
+        const mod = await import(sharedModulePath);
+        const mockBin = path.join(tmp, "mock-skill-path");
+        fs.writeFileSync(mockBin, "#!/bin/sh\necho /skills/fake/skill/path\n", { mode: 0o755 });
+        const probePrompt = [
+          "TAMANDUA_HARNESS_PROBE: skill-path",
+          `Run the exact command "${mockBin} skill-path" and reply with the PATH and nothing else.`,
+        ].join("\n");
+        const result = mod.execHarnessProbe(probePrompt);
+        assert.equal(result.ok, true, `probe should pass, got ${JSON.stringify(result)}`);
+        assert.equal(result.path, "/skills/fake/skill/path");
+        assert.equal(result.exitCode, 0);
+      } finally {
+        cleanup(tmp);
+      }
+    });
+
+    it("execHarnessProbe returns ok:false for a non-probe prompt and for a failing command", async () => {
+      const tmp = makeTempStateDir();
+      try {
+        const mod = await import(sharedModulePath);
+        const bad = mod.execHarnessProbe('workflow "x", agent "y", run "z"');
+        assert.equal(bad.ok, false, "a prompt without a quoted command must not pass");
+        assert.equal(bad.exitCode, 2);
+
+        const deadBin = path.join(tmp, "dead-skill-path");
+        fs.writeFileSync(deadBin, "#!/bin/sh\nexit 3\n", { mode: 0o755 });
+        const dead = mod.execHarnessProbe(
+          [
+            "TAMANDUA_HARNESS_PROBE: skill-path",
+            `Run the exact command "${deadBin} skill-path" and reply with the PATH and nothing else.`,
+          ].join("\n"),
+        );
+        assert.equal(dead.ok, false, "a non-zero probe command exit must not pass");
+        assert.equal(dead.exitCode, 3);
+      } finally {
+        cleanup(tmp);
+      }
+    });
+
+    it("execHarnessProbe has no side effects: no invocation journal, no workcount, no index consumption", async () => {
+      const tmp = makeTempStateDir();
+      try {
+        const mod = await import(sharedModulePath);
+        const mockBin = path.join(tmp, "mock-skill-path");
+        fs.writeFileSync(mockBin, "#!/bin/sh\necho /skills/fake/skill/path\n", { mode: 0o755 });
+        const probePrompt = [
+          "TAMANDUA_HARNESS_PROBE: skill-path",
+          `Run the exact command "${mockBin} skill-path" and reply with the PATH and nothing else.`,
+        ].join("\n");
+        const stateDir = path.join(tmp, "probe-state");
+        fs.mkdirSync(stateDir, { recursive: true });
+
+        const result = mod.execHarnessProbe(probePrompt);
+        assert.equal(result.ok, true);
+
+        // The probe must NOT journal an invocation nor create/advance a
+        // per-agent work counter: a subsequent work round still gets index 0.
+        const entries = fs.readdirSync(stateDir);
+        assert.equal(
+          entries.filter((e) => e.endsWith(".workcount") || e === "invocations.jsonl").length,
+          0,
+          `probe must not journal or consume an index, stateDir has: ${JSON.stringify(entries)}`,
+        );
+        const idx = mod.nextWorkIndex(stateDir, "doer");
+        assert.equal(idx, 0, "the first work invocation after a probe must still be index 0");
+      } finally {
+        cleanup(tmp);
+      }
+    });
+  });
+
   describe("other shared exports unmodified", () => {
     it("parseInputVars still works correctly", async () => {
       const mod = await import(sharedModulePath);

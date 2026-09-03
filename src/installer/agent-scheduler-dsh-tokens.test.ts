@@ -156,6 +156,11 @@ describe("executeDispatchRound dsh token accounting", () => {
     "TAMANDUA_DSH_BINARY",
     "DSH_HOME",
     "PATH",
+    // The mock harnesses reply NO_WORK_AVAILABLE to any prompt — they would
+    // never pass a launch-time harness probe — so the probe is disabled for
+    // these dispatch rounds (session token accounting is the behavior under
+    // test).
+    "TAMANDUA_HARNESS_PROBE",
   ] as const;
 
   beforeEach(() => {
@@ -171,6 +176,7 @@ describe("executeDispatchRound dsh token accounting", () => {
     fs.mkdirSync(dshHome, { recursive: true });
     process.env.HOME = homeDir;
     process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
     process.env.DSH_HOME = dshHome;
 
     // Guard mock pi: if a dsh run ever misroutes to pi, this fake logs it

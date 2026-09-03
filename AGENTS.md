@@ -217,6 +217,25 @@ followed by a top-level command listing.
 - Logs: `~/.tamandua/tamandua.log`
 - Medic: `~/.tamandua/medic.json`
 
+### DB schema changes (migrations)
+
+- New columns are added ONLY via guarded idempotent ALTERs inside `migrate()`
+  in `src/db.ts`, using the `SELECT name FROM pragma_table_info('<table>')
+  WHERE name = '<col>'` guard (the pattern `instant_fail_count` uses). The
+  table's `CREATE TABLE` statement keeps its original explicit column list,
+  and nullable additions never touch explicit-column INSERTs or the status.ts
+  SELECT column lists.
+- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 9). This is
+  the WLST5.1 failure mode: adding a guarded ALTER without bumping leaves
+  existing DBs (user_version === the old version) early-returning in
+  `migrate()` and skipping the ALTER, so any SQL touching the new column
+  crashes with "no such column".
+- Migration coverage belongs in `src/db.test.ts` MIGV tests: build a legacy DB
+  with raw pre-bump DDL + `PRAGMA user_version = SCHEMA_VERSION - 1` in a temp
+  HOME, open it through `getDb()` in a subprocess (import from `dist/db.js`,
+  `TAMANDUA_TEST_GUARD=1`), and assert the new column(s), the re-stamped
+  user_version, and a status SELECT over runs.
+
 ## Update and Catalog Staleness
 
 Installed workflows live in `~/.tamandua/workflows/` and may become older than the
@@ -293,10 +312,16 @@ two lanes; contributors don't need to know about lanes — just run `npm test`:
    `src/db.test.ts`; `find` covers everything except `e2e-tests/`).
 
 **Classification rule**: a test file belongs in the serial lane if it
-(a) imports from `node:child_process`, or (b) calls a daemonctl spawner
+(a) imports from `node:child_process`, (b) calls a daemonctl spawner
 (`startDaemon`/`startMcp`/`startControlPlane` and their stop/restart
-counterparts). In-process servers (`createDashboardServer`,
-`createTamanduaMcpServer`) are NOT serial candidates.
+counterparts), or (c) imports any export of a source module that itself
+imports `node:child_process` (e.g. a module that spawnSyncs a child —
+`harness-probe.test.ts` is serial because `harness-probe.ts` owns the
+`<launcher> skill-path` spawn). The guard resolves dist-style test imports
+back to their source module and flags the process-spawning dependency even
+when the test only calls pure functions. In-process servers
+(`createDashboardServer`, `createTamanduaMcpServer`) are NOT serial
+candidates.
 
 If you add a spawn-capable test file without listing it in
 `tests/serial-files.txt`, `tests/serial-classification-guard.test.ts` fails
@@ -305,6 +330,50 @@ direction (everything listed must be spawn-capable and existing).
 
 Never convert absolute-deadline assertions into polls or retries to fix a
 flake — raise the timeout or move the file to the serial lane.
+
+#### Launch-time harness probe in dispatch tests (IFLB)
+
+The dispatch motor probes a run's harness at its first real dispatch
+(`<launcher> skill-path`) and force-fails the run immediately when the
+harness cannot answer. In-process dispatch tests that drive
+`executeDispatchRound`/daemons with **canned fake harnesses** (fake pi /
+hermes / dsh shims that reply `NO_WORK_AVAILABLE`, claim+die, or print
+canned output regardless of the prompt) must set `TAMANDUA_HARNESS_PROBE=0`
+for the round — saved/restored exactly like `TAMANDUA_PI_BINARY` is today —
+otherwise the probe runs the fake through the probe prompt and force-fails
+the run before the intended work round. Suites that exercise the probe
+itself use a probe-aware fake pi whose output contains the expected path
+(the daemon computes it by running the same command), journaling probe
+invocations so the once-per-run rule is assertable. The PRODUCT scripted
+harness runtimes (`e2e-tests/helpers/scripted-agent-runtime-shared.mjs` —
+recognize the `TAMANDUA_HARNESS_PROBE: skill-path` marker line, run the
+quoted `<launcher> skill-path` command for real, and reply with the PATH;
+shared by the pi/dsh/hermes runtimes in `e2e-tests/helpers`) ANSWER probe
+prompts, so daemon e2e suites (workflows-scripted/-hermes/-dsh,
+workflows-harness-probe, autoresearch-scripted, stress-concurrent) run with
+the probe ENABLED by default — the probe round is never journaled and never
+consumes a canned-behaviors invocation index, so per-agent invocation/round
+assertions are unaffected. A probe answer must be emitted in the runtime's
+own output contract (pi: a message_end JSON line; dsh/hermes: plain-text
+final message) and exits 0. Npm daemon suites whose scenario is NOT the
+probe (dashboard-crash-isolation, pause-kill-resume-regression) still launch
+with `TAMANDUA_HARNESS_PROBE=0` to keep the behavior under test focused.
+
+The torture-test scripted tiers have their own FORK of these runtimes
+(`torture-test/scripted-runtimes/` — runtime-pi.mjs / runtime-hermes.mjs /
+runtime-shared.mjs, forked from `e2e-tests/helpers/` at the commit recorded in
+`torture-test/scripted-runtimes/FROZEN_SHA`). When the e2e helper contract
+grows (as the IFLB probe support did in US-006/US-007), port the change into
+the torture fork too — fork-only code goes inside documented
+`KNOB-REGION-BEGIN`/`KNOB-REGION-END` markers plus keyword exemptions in
+`fork-parity-check` / `scripted-runtime-fork.test.ts`, and code that must track
+the live e2e helpers (e.g. the probe answer blocks) should stay byte-identical
+to the e2e copy. The torture probe self-test is
+`torture-test/self-tests/tier0-scripted-runtime-harness-probe.test.ts`.
+Never run multiple torture self-test files concurrently in one `node --test
+f1 f2 ...` process: `scripted-runtime-install-parity.test.ts` temporarily
+mutates the real runtime files in place (restoring in `finally`), which can
+crash a concurrently spawned runtime child.
 
 ### End-to-End Tests
 

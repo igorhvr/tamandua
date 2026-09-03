@@ -301,7 +301,13 @@ describe("TATR US-011: cancel-race and post-terminal token ordering under load",
     for (let i = 0; i < LOAD_ITERATIONS; i++) {
       const temp = createTempHome("tamandua-cancel-race-");
       try {
-        const result = runNodeScript(CANCEL_RACE_SCRIPT, { HOME: temp.homeDir }) as unknown as CancelRaceResult;
+        const result = runNodeScript(CANCEL_RACE_SCRIPT, {
+          HOME: temp.homeDir,
+          // The fake pi never answers a launch-time harness probe prompt —
+          // disable the probe so the cancel-race settle is the behavior
+          // under test.
+          TAMANDUA_HARNESS_PROBE: "0",
+        }) as unknown as CancelRaceResult;
 
         // Sanity: stopWorkflow succeeded and the run reached canceled.
         assert.equal(result.ok, true, `iteration ${i}: stopWorkflow must succeed`);
@@ -336,7 +342,13 @@ describe("TATR US-011: cancel-race and post-terminal token ordering under load",
     for (let i = 0; i < LOAD_ITERATIONS; i++) {
       const temp = createTempHome("tamandua-postterminal-");
       try {
-        const result = runNodeScript(POST_TERMINAL_SCRIPT, { HOME: temp.homeDir }) as unknown as PostTerminalResult;
+        const result = runNodeScript(POST_TERMINAL_SCRIPT, {
+          HOME: temp.homeDir,
+          // The fake pi never answers a launch-time harness probe prompt —
+          // disable the probe so the post-terminal flush is the behavior
+          // under test.
+          TAMANDUA_HARNESS_PROBE: "0",
+        }) as unknown as PostTerminalResult;
 
         // Sanity: the run reached failed with the flush's delta.
         assert.equal(result.status, "failed", `iteration ${i}: run must be failed in the DB`);

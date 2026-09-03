@@ -7,7 +7,7 @@
 
 import { installWorkflow } from "../../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../../installer/uninstall.js";
-import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, forceFailRun } from "../../installer/status.js";
+import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, forceFailRun, readHarnessProbeFailureBlock } from "../../installer/status.js";
 import { runWorkflow, resumeWorkflow, type ResumeResult } from "../../installer/run.js";
 import { listBundledWorkflows } from "../../installer/workflow-fetch.js";
 import { loadWorkflowSpec } from "../../installer/workflow-spec.js";
@@ -933,6 +933,19 @@ export async function handleWorkflow(
         for (const story of result.stories) {
           const label = displayStoryStatus({ status: story.status, resumeResetCount: story.resumeResetCount });
           console.log(`  ${story.storyId} [${label}] ${story.title}`);
+        }
+      }
+      // IFLB US-004: a run that failed because the launch-time harness probe
+      // failed prints its mechanical keyline block verbatim as the LAST
+      // output — FAILURE_CLASS: harness_unavailable first, STDERR_TAIL last,
+      // no prose after it. The block is read from the run's durable per-run
+      // events (the probe round wrote it before force-failing), so it
+      // renders even after a daemon/CLI restart. Runs without a probe
+      // failure print nothing extra (output stays unchanged).
+      if (result.status === "failed") {
+        const probeBlock = readHarnessProbeFailureBlock(result.id);
+        if (probeBlock) {
+          console.log(probeBlock);
         }
       }
     } catch (err) {

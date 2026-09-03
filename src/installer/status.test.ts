@@ -103,7 +103,7 @@ function seedDb(dbPath: string, runId: string, context: Record<string, string>, 
   originalBranch?: string;
   status?: string;
   cleanupPolicy?: string;
-}): void {
+}, status = "running"): void {
   const db = new DatabaseSync(dbPath);
 
   db.exec(`
@@ -171,7 +171,7 @@ function seedDb(dbPath: string, runId: string, context: Record<string, string>, 
 
   db.prepare(
     "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, datetime('now'), datetime('now'))"
-  ).run(runId, "feature-dev", "Build something", "running", JSON.stringify(context));
+  ).run(runId, "feature-dev", "Build something", status, JSON.stringify(context));
 
   if (wtData) {
     db.prepare(
@@ -919,6 +919,12 @@ process.exit(0);
     );
     process.env.TAMANDUA_PI_BINARY = fakePi;
     process.env.TAMANDUA_ROUND_MARKER = marker;
+    // The canned fake-pi shim never answers a launch-time harness probe
+    // prompt (it claims + completes regardless of the prompt), so the probe
+    // is disabled for this dispatch round — keeping the cancel/attribution
+    // settle semantics unchanged.
+    const savedHarnessProbe = process.env.TAMANDUA_HARNESS_PROBE;
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
 
     const jobId = `tamandua-feature-dev-merge-worktree-${runId}-developer`;
     const round = executeDispatchRound(
@@ -963,6 +969,8 @@ process.exit(0);
     } finally {
       delete process.env.TAMANDUA_PI_BINARY;
       delete process.env.TAMANDUA_ROUND_MARKER;
+      if (savedHarnessProbe === undefined) delete process.env.TAMANDUA_HARNESS_PROBE;
+      else process.env.TAMANDUA_HARNESS_PROBE = savedHarnessProbe;
     }
   });
 
@@ -1506,5 +1514,188 @@ describe("late teardown/webhook continuations land in sticky temp state", () => 
     } finally {
       await new Promise<void>((resolve) => webhookServer.close(() => resolve()));
     }
+  });
+});
+
+// ── IFLB US-004: harness-probe failure surfacing ─────────────────────
+//
+// The launch-time harness probe's mechanical keyline block (written to the
+// run's durable per-run events before force-failing) must be readable back
+// through readHarnessProbeFailureBlock and rendered verbatim by
+// `tamandua workflow status <run>` for a probe-failed run — even across a
+// CLI restart — while runs without a probe failure print nothing extra.
+
+/** Append one JSONL event to a run's per-run events file. */
+function appendRunEventFile(tamanduaDir: string, runId: string, evt: Record<string, unknown>): void {
+  const eventsDir = path.join(tamanduaDir, "events");
+  fs.mkdirSync(eventsDir, { recursive: true });
+  fs.appendFileSync(
+    path.join(eventsDir, `${runId}.jsonl`),
+    JSON.stringify({ ts: new Date().toISOString(), runId, ...evt }) + "\n",
+    "utf-8",
+  );
+}
+
+/** Run the CLI to completion and return its stdout. */
+async function runCliStdout(args: string[], env: Record<string, string>): Promise<string> {
+  const { child, getStdout } = spawnCli(args, env);
+  await new Promise<void>((resolve) => {
+    child.on("close", () => resolve());
+  });
+  return getStdout();
+}
+
+describe("harness-probe failure block durable read + status surfacing (IFLB US-004)", () => {
+  it("readHarnessProbeFailureBlock returns the block from the LAST run.harness_probe_failed event", async () => {
+    const env = createTempEnv();
+    const origHome = process.env.HOME;
+    const origState = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    try {
+      const runId = "probe-dup-0001";
+      const olderBlock = "FAILURE_CLASS: harness_unavailable\nHARNESS: pi\nOLDER";
+      const latestBlock = "FAILURE_CLASS: harness_unavailable\nHARNESS: dsh\nPROBE_CMD: /x skill-path\nSTDERR_TAIL: boot error";
+      appendRunEventFile(env.tamanduaDir, runId, { event: "run.harness_probe_failed", reason: olderBlock, detail: olderBlock });
+      appendRunEventFile(env.tamanduaDir, runId, { event: "run.harness_probe_failed", reason: latestBlock, detail: latestBlock });
+
+      const { readHarnessProbeFailureBlock } = await import("../../dist/installer/status.js");
+      assert.equal(readHarnessProbeFailureBlock(runId), latestBlock, "the newest probe-failed block must win");
+    } finally {
+      restoreOrDelete("HOME", origHome);
+      restoreOrDelete("TAMANDUA_STATE_DIR", origState);
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("readHarnessProbeFailureBlock falls back to a run.force_failed carrying the mechanical signature", async () => {
+    const env = createTempEnv();
+    const origHome = process.env.HOME;
+    const origState = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    try {
+      const runId = "probe-ffbk-0001";
+      // No run.harness_probe_failed at all — only the force-fail that the
+      // defensive re-force-fail path emits with the block as its reason.
+      const block = "FAILURE_CLASS: harness_unavailable\nHARNESS: pi\nPROBE_CMD: /x skill-path\nSTDERR_TAIL: dead";
+      appendRunEventFile(env.tamanduaDir, runId, { event: "run.force_failed", reason: block, detail: block });
+
+      const { readHarnessProbeFailureBlock } = await import("../../dist/installer/status.js");
+      assert.equal(readHarnessProbeFailureBlock(runId), block, "a force_failed carrying the probe block must be readable");
+    } finally {
+      restoreOrDelete("HOME", origHome);
+      restoreOrDelete("TAMANDUA_STATE_DIR", origState);
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("readHarnessProbeFailureBlock returns undefined without a probe failure", async () => {
+    const env = createTempEnv();
+    const origHome = process.env.HOME;
+    const origState = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    try {
+      const runId = "probe-none-0001";
+      // A force-failed run with a PROSE reason (operator force-fail, RSPN)
+      // must not be mistaken for a probe failure.
+      appendRunEventFile(env.tamanduaDir, runId, { event: "run.force_failed", reason: "operator force-fail", detail: "operator force-fail" });
+      appendRunEventFile(env.tamanduaDir, runId, { event: "run.failed", detail: "pipeline failure" });
+
+      const { readHarnessProbeFailureBlock } = await import("../../dist/installer/status.js");
+      assert.equal(readHarnessProbeFailureBlock(runId), undefined, "non-probe force-fails must not surface a probe block");
+      // And a run with no events file at all reads as undefined, never throws.
+      assert.equal(readHarnessProbeFailureBlock("probe-missing-0001"), undefined);
+    } finally {
+      restoreOrDelete("HOME", origHome);
+      restoreOrDelete("TAMANDUA_STATE_DIR", origState);
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("workflow status prints the keyline block verbatim for a probe-failed run, durably across a CLI restart", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = crypto.randomUUID();
+    seedDb(dbPath, runId, { workspace_mode: "direct" }, undefined, "failed");
+
+    const { buildHarnessProbeFailureBlock } = await import("../../dist/installer/harness-probe.js");
+    const block = buildHarnessProbeFailureBlock({
+      harness: "pi",
+      probeCmd: "/abs/launcher/tamandua skill-path",
+      expected: "/abs/skill/path/result.txt",
+      observed: "No API key found for the selected model",
+      exitCode: 1,
+      signal: null,
+      durationMs: 312,
+      stderrTail: "No API key found for the selected model\n(context: credentials invalidated)",
+    });
+    // The probe round writes the block BEFORE force-failing; the force-fail
+    // then carries the same block. Both are durable per-run events.
+    appendRunEventFile(env.tamanduaDir, runId, {
+      event: "run.harness_probe_failed",
+      reason: block,
+      detail: block,
+      harness: "pi",
+      probeCmd: "/abs/launcher/tamandua skill-path",
+      expected: "/abs/skill/path/result.txt",
+      observed: "No API key found for the selected model",
+      exitCode: 1,
+      durationMs: 312,
+      stderrTail: "No API key found for the selected model\n(context: credentials invalidated)",
+    });
+    appendRunEventFile(env.tamanduaDir, runId, { event: "run.force_failed", reason: block, detail: block });
+
+    const cliEnv = { HOME: env.homeDir };
+    const stdout = await runCliStdout(["workflow", "status", runId], cliEnv);
+    assert.match(stdout, /Status: failed/, "the run must display as failed");
+    // The whole mechanical block is present verbatim, keys in order,
+    // FAILURE_CLASS first and STDERR_TAIL the last key of the block.
+    assert.ok(stdout.includes(block), `expected the verbatim keyline block in status output:\n${stdout}`);
+    const blockKeys = [
+      "FAILURE_CLASS: harness_unavailable",
+      "\nHARNESS: ",
+      "\nPROBE_CMD: ",
+      "\nEXPECTED: ",
+      "\nOBSERVED: ",
+      "\nEXIT_CODE: ",
+      "\nSIGNAL: ",
+      "\nDURATION_MS: ",
+      "\nSTDERR_TAIL: ",
+    ];
+    let lastIdx = -1;
+    for (const key of blockKeys) {
+      const idx = stdout.indexOf(key);
+      assert.notEqual(idx, -1, `expected key ${key.trim()} in status output:\n${stdout}`);
+      assert.ok(idx > lastIdx, `keys must appear in block order; ${key.trim()} out of order:\n${stdout}`);
+      lastIdx = idx;
+    }
+    const blockLines = block.split("\n");
+    assert.equal(blockLines[0], "FAILURE_CLASS: harness_unavailable");
+    assert.ok(stdout.trimEnd().endsWith(blockLines[blockLines.length - 1]), "the block (STDERR_TAIL value) must be the last output of status");
+
+    // A SECOND CLI invocation (fresh process = simulated CLI restart) reads
+    // the same durable events and still renders the block verbatim.
+    const stdout2 = await runCliStdout(["workflow", "status", runId], cliEnv);
+    assert.ok(stdout2.includes(block), "the durable block must render again after a CLI restart");
+    assert.ok(stdout2.trimEnd().endsWith(blockLines[blockLines.length - 1]));
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+
+  it("workflow status output is unchanged for a failed run without a probe failure", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = crypto.randomUUID();
+    seedDb(dbPath, runId, { workspace_mode: "direct" }, undefined, "failed");
+
+    const stdout = await runCliStdout(["workflow", "status", runId], { HOME: env.homeDir });
+    assert.match(stdout, /Status: failed/);
+    assert.doesNotMatch(stdout, /FAILURE_CLASS: harness_unavailable/, "no probe block without a probe failure");
+    assert.doesNotMatch(stdout, /\nHARNESS: /, "no probe HARNESS key without a probe failure");
+    assert.doesNotMatch(stdout, /STDERR_TAIL:/, "no probe STDERR_TAIL key without a probe failure");
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
   });
 });

@@ -95,6 +95,11 @@ filter_diff() {
       if (line ~ /e2e-database\.mjs/) return 1
       if (line ~ /\.\/database\.mjs/) return 1
 
+      # IFLB US-007: launch-time harness probe import specifiers (the probe
+      # support bodies themselves live inside documented KNOB-REGION blocks)
+      if (line ~ /isHarnessProbePrompt/) return 1
+      if (line ~ /execHarnessProbe/) return 1
+
       # US-003: shortAgent/agentId key changes
       if (line ~ /shortAgent/) return 1
       if (line ~ /agentId/) return 1

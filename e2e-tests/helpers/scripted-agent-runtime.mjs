@@ -50,6 +50,8 @@ import {
   logInvocation as sharedLogInvocation,
   fatal as sharedFatal,
   applyBehaviorActions,
+  isHarnessProbePrompt,
+  execHarnessProbe,
 } from "./scripted-agent-runtime-shared.mjs";
 
 const prompt = process.argv[process.argv.length - 1] ?? "";
@@ -110,6 +112,24 @@ function emitMessageEnd(text, totalTokens) {
       responseId: crypto.randomUUID(),
     },
   });
+}
+
+// ── Launch-time harness probe (IFLB) ────────────────────────────────
+// The probe prompt is NOT a work prompt (no workflow/agent/run header), so it
+// must be answered BEFORE parsePrompt — otherwise this runtime would fatal on
+// it and the daemon would force-fail every run whose harness is this scripted
+// agent. Run the exact quoted `<launcher> skill-path` command for real and
+// reply with the PATH via a pi-shaped message_end (the daemon reads the final
+// assistant message). Exit 0 on success. Never journaled and never consumes a
+// work index: the probe is not a work round.
+
+if (isHarnessProbePrompt(prompt)) {
+  const probe = execHarnessProbe(prompt);
+  const reply = probe.ok
+    ? probe.path
+    : `probe command failed (exit ${probe.exitCode ?? "signal"}): ${probe.stderr}`;
+  emitMessageEnd(reply, 0);
+  process.exit(probe.ok ? 0 : 1);
 }
 
 // ── Parse the work prompt (this pins the prompt protocol) ───────────

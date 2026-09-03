@@ -9,8 +9,10 @@ import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import {
   RUN_LIFECYCLE_EVENTS,
   RUN_ALERT_EVENTS,
+  RUN_DIAGNOSTIC_EVENTS,
   getRunEvents,
   getEventsPath,
+  emitEvent,
   type TamanduaEvent,
 } from "../../dist/installer/events.js";
 import { emitRunTerminalEvent } from "../../dist/installer/step-ops.js";
@@ -97,6 +99,31 @@ const PINNED_TERMINAL_EVENT_VOCABULARY = [
 ];
 
 /**
+ * Compile-time pin of the IFLB launch-time harness probe payload fields on
+ * TamanduaEvent (US-004): run.harness_probe_ok carries harness/durationMs/
+ * tokens and run.harness_probe_failed carries the mechanical keyline-block
+ * fields harness/probeCmd/expected/observed/exitCode/signal/durationMs/
+ * stderrTail. If any of these fields is dropped from TamanduaEvent, this
+ * assignment fails typecheck.
+ */
+const TAMANDUA_EVENT_PROBE_PAYLOAD_FIELDS: TamanduaEvent = {
+  ts: "static-pin",
+  event: "run.harness_probe_failed",
+  runId: "static-pin",
+  workflowId: "static-pin",
+  harness: "pi",
+  probeCmd: "static-pin",
+  expected: "static-pin",
+  observed: "static-pin",
+  exitCode: 1,
+  signal: "SIGTERM",
+  durationMs: 42,
+  stderrTail: "static-pin",
+  tokens: 7,
+};
+void TAMANDUA_EVENT_PROBE_PAYLOAD_FIELDS;
+
+/**
  * The run-level alert vocabulary (RSPN). These are NON-terminal diagnostic
  * events emitted while a run is still active — they surface a pathology
  * (e.g. a worker instant-fail loop heading toward force-fail escalation)
@@ -104,6 +131,20 @@ const PINNED_TERMINAL_EVENT_VOCABULARY = [
  */
 const PINNED_RUN_ALERT_VOCABULARY = [
   "run.instant_fail_loop",
+];
+
+/**
+ * The launch-time harness probe diagnostic vocabulary (IFLB). These are
+ * NON-terminal run-diagnostics emitted around the once-per-run probe that
+ * precedes a run's first real dispatch: run.harness_probe_ok records a
+ * passing probe (harness answered `<launcher> skill-path` with the expected
+ * PATH) and run.harness_probe_failed records a failing one (the run is
+ * force-failed immediately afterwards). Pinned alongside the lifecycle and
+ * alert vocabularies.
+ */
+const PINNED_RUN_DIAGNOSTIC_VOCABULARY = [
+  "run.harness_probe_ok",
+  "run.harness_probe_failed",
 ];
 
 // ── Test suite ─────────────────────────────────────────────────────────
@@ -242,6 +283,28 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     }
   });
 
+  it("pins the harness-probe diagnostic vocabulary: {run.harness_probe_ok, run.harness_probe_failed} (IFLB)", () => {
+    assert.ok(Array.isArray(RUN_DIAGNOSTIC_EVENTS), "RUN_DIAGNOSTIC_EVENTS must be exported");
+    assert.deepEqual(
+      [...RUN_DIAGNOSTIC_EVENTS].sort(),
+      [...PINNED_RUN_DIAGNOSTIC_VOCABULARY].sort(),
+      "the run-diagnostic vocabulary changed — update this pin deliberately (IFLB)",
+    );
+    assert.equal(RUN_DIAGNOSTIC_EVENTS.length, PINNED_RUN_DIAGNOSTIC_VOCABULARY.length, "diagnostic vocabulary must not contain duplicates");
+    assert.ok(Object.isFrozen(RUN_DIAGNOSTIC_EVENTS), "diagnostic vocabulary must be frozen");
+    for (const evt of RUN_DIAGNOSTIC_EVENTS) {
+      assert.match(evt, /^run\.[a-z_.]+$/, `malformed diagnostic event name: ${evt}`);
+      assert.ok(
+        !RUN_LIFECYCLE_EVENTS.includes(evt),
+        `diagnostic event ${evt} must not also be a lifecycle event`,
+      );
+      assert.ok(
+        !RUN_ALERT_EVENTS.includes(evt),
+        `diagnostic event ${evt} must not also be an alert event`,
+      );
+    }
+  });
+
   it("terminal events land in the isolated test state dir (guard-aware)", () => {
     // The test-isolation guard refuses writes into the real ~/.tamandua;
     // this pins that every event produced by this suite resolves into the
@@ -366,6 +429,73 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
       "run.force_failed",
       `a force-failed run's event stream must end on run.force_failed, got: ${eventNames.join(", ")}`,
     );
+  });
+
+  it("run.harness_probe_ok/run.harness_probe_failed event payloads persist the IFLB fields (US-004)", () => {
+    const runId = "run-vocab-probe-001";
+    seedRun(runId);
+    const block = [
+      "FAILURE_CLASS: harness_unavailable",
+      "HARNESS: pi",
+      "PROBE_CMD: /abs/launcher/tamandua skill-path",
+      "EXPECTED: /abs/skill/path/result.txt",
+      "OBSERVED: No API key found for the selected model",
+      "EXIT_CODE: 1",
+      "SIGNAL: ",
+      "DURATION_MS: 42",
+      "STDERR_TAIL: No API key found for the selected model",
+    ].join("\n");
+
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.harness_probe_ok",
+      runId,
+      workflowId: "wf-vocab",
+      harness: "pi",
+      durationMs: 42,
+      tokens: 7,
+    });
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.harness_probe_failed",
+      runId,
+      workflowId: "wf-vocab",
+      detail: block,
+      reason: block,
+      harness: "pi",
+      probeCmd: "/abs/launcher/tamandua skill-path",
+      expected: "/abs/skill/path/result.txt",
+      observed: "No API key found for the selected model",
+      exitCode: 1,
+      signal: null,
+      durationMs: 42,
+      stderrTail: "No API key found for the selected model",
+    });
+
+    const events = getRunEvents(runId);
+    assert.equal(events.length, 2, "one ok + one failed probe event expected");
+    const [ok, failed] = events;
+
+    // ok: harness + durationMs + tokens (the attributed one-tiny-turn cost)
+    assert.equal(ok.event, "run.harness_probe_ok");
+    assert.equal(ok.harness, "pi");
+    assert.equal(ok.durationMs, 42);
+    assert.equal(ok.tokens, 7);
+    assert.ok(!("probeCmd" in ok), "the ok event must not carry failure-only fields");
+    assert.ok(!("exitCode" in ok), "the ok event must not carry failure-only fields");
+
+    // failed: the mechanical keyline-block fields, reason/detail = block
+    assert.equal(failed.event, "run.harness_probe_failed");
+    assert.equal(failed.reason, block, "reason must carry the keyline block verbatim");
+    assert.equal(failed.detail, block, "detail must carry the keyline block verbatim");
+    assert.equal(failed.harness, "pi");
+    assert.equal(failed.probeCmd, "/abs/launcher/tamandua skill-path");
+    assert.equal(failed.expected, "/abs/skill/path/result.txt");
+    assert.equal(failed.observed, "No API key found for the selected model");
+    assert.equal(failed.exitCode, 1);
+    assert.equal(failed.signal, null);
+    assert.equal(failed.durationMs, 42);
+    assert.equal(failed.stderrTail, "No API key found for the selected model");
   });
 
   it("run.started emitter (src/installer/run.ts) carries ts and runId (source pin)", () => {

@@ -183,6 +183,40 @@ function spawnDsh(
   );
 }
 
+/**
+ * Spawn the dsh runtime with a launch-time harness probe prompt (IFLB): the
+ * same `dsh --profile headless "<prompt>"` invocation shape, but the prompt
+ * is the probe prompt whose quoted `<launcher> skill-path` command is
+ * `mockProbeBin skill-path`.
+ */
+function spawnDshProbe(
+  dirs: TestDirs,
+  mockProbeBin: string,
+  env: Record<string, string>,
+  opts?: { timeoutMs?: number },
+): SpawnSyncReturns<string> {
+  const prompt = [
+    "TAMANDUA_HARNESS_PROBE: skill-path",
+    `Run the exact command "${mockProbeBin} skill-path" and reply with the PATH and nothing else.`,
+  ].join("\n");
+
+  return spawnSync(
+    process.execPath,
+    [runtimePath, "--profile", "headless", prompt],
+    {
+      encoding: "utf-8",
+      cwd: dirs.workdir,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? os.tmpdir(),
+        ...env,
+      },
+      timeout: opts?.timeoutMs ?? 10_000,
+      maxBuffer: 16 * 1024 * 1024,
+    },
+  );
+}
+
 function listSessionDirs(dirs: TestDirs): string[] {
   const projectDir = dshSessionProjectDir(dirs.dshHome, dirs.workdir);
   if (!fs.existsSync(projectDir)) return [];
@@ -685,6 +719,89 @@ describe("scripted-dsh-runtime", () => {
         assert.equal(result.stdout, "NO_WORK_AVAILABLE\n");
         assert.equal(result.stderr, "", "stderr should stay empty");
         assert.equal(listSessionDirs(dirs).length, 0, "heartbeat should not write a session log");
+      } finally {
+        cleanup(dirs.tmp);
+      }
+    });
+  });
+
+  // ── Launch-time harness probe (IFLB) ──────────────────────────────
+
+  describe("launch-time harness probe (IFLB)", () => {
+    function writeProbeBin(dirs: TestDirs, pathOut: string): string {
+      const probeBin = path.join(dirs.tmp, "mock-skill-path");
+      fs.writeFileSync(
+        probeBin,
+        `#!/bin/sh\necho "${pathOut}"\n`,
+        { mode: 0o755 },
+      );
+      return probeBin;
+    }
+
+    it("answers a probe prompt with the real command's path, exit 0, no journal/session", () => {
+      const dirs = makeTempDirs();
+      try {
+        const probeBin = writeProbeBin(dirs, "/skills/dsh/skill/path");
+
+        const result = spawnDshProbe(dirs, probeBin, {
+          DSH_HOME: dirs.dshHome,
+          TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
+          TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
+        });
+
+        assert.equal(
+          result.status,
+          0,
+          `probe answer should exit 0, got status=${result.status} signal=${result.signal}, stderr: ${result.stderr}`,
+        );
+        assert.equal(
+          result.stdout,
+          "/skills/dsh/skill/path\n",
+          `probe answer should be exactly the PATH plus a newline, got: "${result.stdout}"`,
+        );
+        assert.equal(result.stderr, "", "stderr should stay empty on a probe answer");
+        // The probe is not a work round: no session file, no invocation journal.
+        assert.equal(listSessionDirs(dirs).length, 0, "probe must not write a session log");
+        const invocationsPath = path.join(dirs.stateDir, "invocations.jsonl");
+        assert.ok(!fs.existsSync(invocationsPath), "probe must not journal an invocation");
+      } finally {
+        cleanup(dirs.tmp);
+      }
+    });
+
+    it("does not consume the canned-invocation index (next work round still starts at index 0)", () => {
+      const dirs = makeTempDirs();
+      try {
+        createMockCli(dirs.tmp);
+        writeBehaviors(dirs.behaviorsPath, {
+          agents: {
+            doer: [
+              { output: "STATUS: done\nROUND: first" },
+              { output: "STATUS: done\nROUND: second" },
+            ],
+          },
+        });
+        const probeBin = writeProbeBin(dirs, "/skills/dsh/skill/path");
+
+        // Probe first — it must NOT consume a behavior slot.
+        const probe = spawnDshProbe(dirs, probeBin, {
+          DSH_HOME: dirs.dshHome,
+          TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
+          TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
+        });
+        assert.equal(probe.status, 0, `probe failed: ${probe.stderr}`);
+        assert.equal(probe.stdout, "/skills/dsh/skill/path\n");
+
+        // The first WORK invocation after the probe must still be index 0.
+        const work = spawnDsh(dirs, {
+          DSH_HOME: dirs.dshHome,
+          TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
+          TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
+        });
+        assert.ok(
+          work.stdout.includes("ROUND: first"),
+          `first work round after a probe should use behavior index 0, got: "${work.stdout}", stderr: ${work.stderr}`,
+        );
       } finally {
         cleanup(dirs.tmp);
       }

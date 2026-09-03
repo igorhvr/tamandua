@@ -103,17 +103,23 @@ describe("executeDispatchRound harness dispatch", () => {
   let tempHome: string;
   let savedPiBinary: string | undefined;
   let savedHermesBinary: string | undefined;
+  let savedHarnessProbe: string | undefined;
 
   beforeEach(() => {
     tempHome = tamanduaTempDir("tamandua-test-routing-");
     savedPiBinary = process.env.TAMANDUA_PI_BINARY;
     savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    savedHarnessProbe = process.env.TAMANDUA_HARNESS_PROBE;
 
     const homeDir = path.join(tempHome, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
     process.env.HOME = homeDir;
     process.env.TAMANDUA_STATE_DIR = stateDir;
+    // The mock harnesses reply NO_WORK_AVAILABLE to any prompt — they would
+    // never pass a launch-time harness probe — so the probe is disabled for
+    // these dispatch rounds (routing is the behavior under test).
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
 
     // Create mock pi binary. The dispatch motor only spawns a harness when
     // a pending step exists, so each test seeds one; the mock replies
@@ -129,6 +135,8 @@ describe("executeDispatchRound harness dispatch", () => {
     else process.env.TAMANDUA_PI_BINARY = savedPiBinary;
     if (savedHermesBinary === undefined) delete process.env.TAMANDUA_HERMES_BINARY;
     else process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+    if (savedHarnessProbe === undefined) delete process.env.TAMANDUA_HARNESS_PROBE;
+    else process.env.TAMANDUA_HARNESS_PROBE = savedHarnessProbe;
     shutdownAllCrons();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });

@@ -28,7 +28,13 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // REQUIRED (see the WLST5.1 note below): adding the guarded ALTER without
 // bumping leaves existing DBs (user_version === 7) early-returning and
 // skipping the migration, so status SELECTs crash with "no such column".
-export const SCHEMA_VERSION = 8;
+// v9: IFLB US-001 added the guarded runs.harness_probe_status + harness_probe_at
+// columns (launch-time harness probe result persistence). The bump is REQUIRED
+// (see the WLST5.1 note below): adding the guarded ALTERs without bumping
+// leaves existing DBs (user_version === 8) early-returning and skipping the
+// migration, so the dispatch motor's probe status reads crash with
+// "no such column: harness_probe_status".
+export const SCHEMA_VERSION = 9;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -354,6 +360,27 @@ function migrate(db: DatabaseSync): void {
   const addTestCmdSource = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'test_cmd_source'").all();
   if (addTestCmdSource.length === 0) {
     db.exec("ALTER TABLE runs ADD COLUMN test_cmd_source TEXT");
+  }
+
+  // ── IFLB harness_probe_status / harness_probe_at for runs ──
+  // Persists the launch-time harness probe outcome so the dispatch motor
+  // probes a run exactly ONCE and a daemon restart does not re-probe a run
+  // that already passed. harness_probe_status is NULL (never probed) until a
+  // probe is reserved ('probing') and then recorded ('ok' | 'failed');
+  // harness_probe_at is the ISO timestamp when the outcome was recorded.
+  // Both are nullable with no backfill: existing runs keep NULL (never
+  // probed). NOTE (WLST5.1): the SCHEMA_VERSION bump to v9 (above) is
+  // REQUIRED — adding these guarded ALTERs without bumping leaves existing
+  // DBs (user_version === 8) early-returning and skipping the migration, so
+  // the scheduler's probe-status reads crash with "no such column". The
+  // PRAGMA table_info guard keeps them idempotent on re-run.
+  const addHarnessProbeStatus = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'harness_probe_status'").all();
+  if (addHarnessProbeStatus.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN harness_probe_status TEXT");
+  }
+  const addHarnessProbeAt = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'harness_probe_at'").all();
+  if (addHarnessProbeAt.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN harness_probe_at TEXT");
   }
 
   // Indexes for run-scoped scheduling and step claim queries.

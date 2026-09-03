@@ -6,7 +6,7 @@ import type { WorkflowSpec, WorkflowAgent, HarnessType } from "./types.js";
 import { logger } from "../lib/logger.js";
 import { getRoleTimeoutSeconds, inferRole } from "./install.js";
 import { formatPiCommandPreview } from "./pi-command-preview.js";
-import { emitEvent, type TamanduaEvent } from "./events.js";
+import { emitEvent, getRunEvents, type TamanduaEvent } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
@@ -18,6 +18,21 @@ import {
   getInstantFailEscalationThreshold,
   type InstantFailRoundSignals,
 } from "./instant-fail.js";
+import {
+  buildHarnessProbeCommand,
+  buildHarnessProbeFailureBlock,
+  buildHarnessProbePrompt,
+  computeExpectedHarnessProbePath,
+  evaluateHarnessProbe,
+  getHarnessProbeWallMs,
+  harnessProbeObservedDisplay,
+  harnessProbeStderrTailDisplay,
+  isHarnessProbeEnabled,
+  readHarnessProbeStatus,
+  recordHarnessProbeResult,
+  reserveHarnessProbe,
+  type HarnessProbeFailureFields,
+} from "./harness-probe.js";
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
 import { lookupDshSessionTokens } from "./dsh-usage.js";
 
@@ -1571,6 +1586,151 @@ export async function executeDispatchRound(
       });
     }
 
+    // ── Launch-time harness probe gate (IFLB US-003) ───────────────
+    // At a run's FIRST real dispatch (after the peek confirmed HAS_WORK and
+    // any zero-token auto-completes, BEFORE any step is claimed), the run's
+    // harness is asked to run the exact command `<launcher> skill-path` and
+    // reply with the PATH — a real tool call that fails fast when the
+    // harness cannot work at all (pi with invalidated credentials, dsh boot
+    // failure under a contained daemon). Without it, a launch-broken
+    // harness used to strand the run in three instant-fail backoff rounds
+    // (RSPN) that never escalated. Exactly ONE probe runs per run: the DB
+    // reserve below is atomic across the run's dispatch jobs and a recorded
+    // 'ok'/'failed' row survives a daemon restart, so a passed run is never
+    // re-probed. The probe round is NOT a work round: it never claims a
+    // step and is never classified by the instant-fail (RSPN) tracker nor
+    // ticks worker_lost/ceiling_expiry counters (trackInstantFailRound is
+    // not called for it).
+    if (isHarnessProbeEnabled()) {
+      const probeWallMs = getHarnessProbeWallMs();
+      const probeStatus = readHarnessProbeStatus(job.runId);
+      if (probeStatus === "ok") {
+        // Already probed (daemon-restart safe) — proceed to the work spawn.
+        logger.debug("Dispatch round proceeds — run already harness-probed", {
+          ...context,
+          reason: "harness_probe_ok",
+        });
+      } else if (probeStatus === "failed") {
+        // A probe round recorded a definitive failure; the winning round
+        // force-failed the run right after. If a crash or force-fail hiccup
+        // left the run alive, re-surface the durable keyline block and
+        // force-fail now (otherwise the run-status check tears the job down
+        // on the next tick).
+        logger.warn("Dispatch round skipped — run harness probe previously failed", {
+          ...context,
+          reason: "harness_probe_failed",
+        });
+        const durableReason = readLastHarnessProbeFailureBlock(job.runId)
+          ?? "Launch-time harness probe failed (see run.harness_probe_failed event)";
+        try {
+          const { forceFailRun } = await import("./status.js");
+          const forceResult = await forceFailRun(job.runId, durableReason, true);
+          if (!forceResult.ok) {
+            logger.warn("Harness-probe re-force-fail refused", {
+              ...context,
+              reason: forceResult.reason,
+            });
+          }
+        } catch (err) {
+          // Run already terminal — the normal run_not_running path handles
+          // the teardown; nothing else to do here.
+          logger.debug("Harness-probe re-force-fail skipped (run terminal)", {
+            ...context,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        return;
+      } else {
+        // NULL (never probed) or 'probing' (an in-flight reservation that
+        // may be stale after a daemon crash mid-probe). Attempt the atomic
+        // once-per-run reservation — exactly one caller wins; losers and
+        // rounds that see a fresh in-flight probe defer to the next tick.
+        if (!reserveHarnessProbe(job.runId, { wallMs: probeWallMs })) {
+          logger.debug("Dispatch round deferred — harness probe in flight for the run", {
+            ...context,
+            reason: "harness_probe_in_flight",
+          });
+          return;
+        }
+
+        const probeOutcome = await runLaunchTimeHarnessProbe({
+          job,
+          context,
+          workdir: workingDirectoryForHarness,
+          preferTokenSaver,
+          wallMs: probeWallMs,
+          onSpawn: ({ pid, pgid }: { pid: number; pgid: number }) => {
+            inFlightChildren.set(job.id, { pid, pgid, killed: false });
+          },
+        });
+
+        if (!probeOutcome.passed) {
+          // ── Probe failure: fail the run fast and legibly ────────
+          recordHarnessProbeResult(job.runId, "failed");
+          emitEvent({
+            ts: new Date().toISOString(),
+            event: "run.harness_probe_failed",
+            runId: job.runId,
+            workflowId: job.workflowId,
+            detail: probeOutcome.failureBlock,
+            reason: probeOutcome.failureBlock,
+            harness: probeOutcome.harness,
+            probeCmd: probeOutcome.probeCmd,
+            expected: probeOutcome.expected,
+            observed: probeOutcome.observed,
+            exitCode: probeOutcome.exitCode ?? undefined,
+            signal: probeOutcome.signal ?? undefined,
+            durationMs: probeOutcome.durationMs,
+            stderrTail: probeOutcome.stderrTail,
+          });
+          logger.error("Launch-time harness probe failed — force-failing run", {
+            ...context,
+            reason: probeOutcome.failureBlock,
+            durationMs: probeOutcome.durationMs,
+          });
+          try {
+            const { forceFailRun } = await import("./status.js");
+            const forceResult = await forceFailRun(job.runId, probeOutcome.failureBlock, true);
+            if (!forceResult.ok) {
+              logger.warn("Harness-probe force-fail refused", {
+                ...context,
+                reason: forceResult.reason,
+              });
+            }
+          } catch (err) {
+            logger.error("Harness-probe force-fail failed", {
+              ...context,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // Return WITHOUT spawning the work round: no step is claimed or
+          // started. Other dispatch jobs tear down on their next round via
+          // the existing run_not_running path.
+          return;
+        }
+
+        // ── Probe success: record once, then dispatch normally ────
+        recordHarnessProbeResult(job.runId, "ok");
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "run.harness_probe_ok",
+          runId: job.runId,
+          workflowId: job.workflowId,
+          harness: probeOutcome.harness,
+          durationMs: probeOutcome.durationMs,
+          tokens: probeOutcome.tokens,
+        });
+        logger.info("Launch-time harness probe passed", {
+          ...context,
+          harness: probeOutcome.harness,
+          durationMs: probeOutcome.durationMs,
+          probeTokens: probeOutcome.tokens,
+        });
+        // Fall through — this round continues as the run's first real work
+        // round, dispatching normally below.
+      }
+    }
+
     // ── Work spawn ─────────────────────────────────────────────────
     let agentPersonaInstructions = "";
     try {
@@ -1617,31 +1777,7 @@ export async function executeDispatchRound(
     // options.binaryPath so runRound skips its own redundant findBinary()
     // call.
     const binaryPath = await adapter.findBinary({ preferTokenSaver });
-    const harnessEnv: Record<string, string> = {
-      TAMANDUA_WORKER_JOB_ID: job.id,
-      TAMANDUA_WORKER_PID: String(process.pid),
-      // Run identity for the worker subprocess: nested CLI invocations
-      // (tamandua merge-branch, tamandua workflow run) read this to
-      // attribute themselves to the run that spawned them (TATR facets 1
-      // and 5). Mirrors the env-inheritance mechanism step claim/complete
-      // already rely on.
-      TAMANDUA_RUN_ID: job.runId,
-    };
-    if (harnessType === "hermes") {
-      harnessEnv.TAMANDUA_HERMES_BINARY = binaryPath;
-    } else if (harnessType === "dsh") {
-      harnessEnv.TAMANDUA_DSH_BINARY = binaryPath;
-    }
-    // Prepend the binary's directory to the child PATH so nested
-    // hermes/pi/dsh invocations within the agent session can find the
-    // same binary, even when the daemon's own PATH lacked it (e.g.
-    // login-shell-discovered hermes/dsh). The original PATH is preserved
-    // as a suffix so standard system tools remain reachable.
-    const binaryDir = path.dirname(binaryPath);
-    const currentPathDirs = (process.env.PATH ?? "").split(path.delimiter);
-    if (!currentPathDirs.includes(binaryDir)) {
-      harnessEnv.PATH = `${binaryDir}${path.delimiter}${process.env.PATH ?? ""}`;
-    }
+    const harnessEnv = buildHarnessChildEnv(job, binaryPath);
     result = await adapter.runRound(workPrompt, {
       timeout,
       workdir: workingDirectoryForHarness,
@@ -1978,6 +2114,311 @@ export async function executeDispatchRound(
       signal.resolve();
     }
   }
+}
+
+// ── Launch-time harness probe helpers (IFLB US-003) ─────────────────
+
+/**
+ * Build the child environment for one harness invocation of a dispatch job:
+ * the standard worker identity vars (job id / worker pid / run id), the
+ * per-harness binary env override, and a PATH that prepends the resolved
+ * binary's directory so nested pi/hermes/dsh invocations inside the agent
+ * session resolve to the same binary even when the daemon's own PATH lacks
+ * it. Shared by the work round and the launch-time harness probe round so
+ * the probe exercises the exact environment a real work round receives.
+ */
+function buildHarnessChildEnv(job: CronJobInfo, binaryPath: string): Record<string, string> {
+  const harnessType = job.harnessType ?? "pi";
+  const harnessEnv: Record<string, string> = {
+    TAMANDUA_WORKER_JOB_ID: job.id,
+    TAMANDUA_WORKER_PID: String(process.pid),
+    // Run identity for the worker subprocess: nested CLI invocations
+    // (tamandua merge-branch, tamandua workflow run) read this to
+    // attribute themselves to the run that spawned them (TATR facets 1
+    // and 5). Mirrors the env-inheritance mechanism step claim/complete
+    // already rely on.
+    TAMANDUA_RUN_ID: job.runId,
+  };
+  if (harnessType === "hermes") {
+    harnessEnv.TAMANDUA_HERMES_BINARY = binaryPath;
+  } else if (harnessType === "dsh") {
+    harnessEnv.TAMANDUA_DSH_BINARY = binaryPath;
+  }
+  // Prepend the binary's directory to the child PATH so nested
+  // hermes/pi/dsh invocations within the agent session can find the
+  // same binary, even when the daemon's own PATH lacked it (e.g.
+  // login-shell-discovered hermes/dsh). The original PATH is preserved
+  // as a suffix so standard system tools remain reachable.
+  const binaryDir = path.dirname(binaryPath);
+  const currentPathDirs = (process.env.PATH ?? "").split(path.delimiter);
+  if (!currentPathDirs.includes(binaryDir)) {
+    harnessEnv.PATH = `${binaryDir}${path.delimiter}${process.env.PATH ?? ""}`;
+  }
+  return harnessEnv;
+}
+
+/** Outcome of one launch-time harness probe round (IFLB US-003). */
+interface LaunchTimeProbeOutcome {
+  passed: boolean;
+  /** The run's harness: pi | hermes | dsh. */
+  harness: string;
+  /** The exact probe command the harness was asked to run. */
+  probeCmd: string;
+  /** The expected path ('<launcher> skill-path' stdout); '' when it could not be computed. */
+  expected: string;
+  /** Wall-clock duration of the probe round in ms. */
+  durationMs: number;
+  /** Probe tokens attributed to the run through the per-round path (0 when none/not parseable). */
+  tokens: number;
+  /** Present when passed === false: the mechanical failure keyline block. */
+  failureBlock: string;
+  /** Present when passed === false: capped single-line observed message (≤400 chars). */
+  observed: string;
+  /** Present when passed === false: harness process exit code (null when killed by signal). */
+  exitCode: number | null;
+  /** Present when passed === false: signal that killed the harness process, if any. */
+  signal: string | null;
+  /** Present when passed === false: capped stderr tail (≤2000 chars). */
+  stderrTail: string;
+}
+
+/**
+ * Run one launch-time harness probe round through the run's OWN harness
+ * (pi / hermes / dsh — whichever the run was launched with), using the
+ * same adapter, working directory, child environment, in-flight child
+ * tracking, token-saver preference, pre-resolved binary path, and
+ * round-start/duration capture as a normal work round — the only
+ * differences are the probe prompt and the probe wall budget.
+ *
+ * The probe NEVER throws to the caller: every failure shape (expected path
+ * uncomputable, binary resolution failure, spawn failure, adapter result
+ * with wrong output / non-zero exit / signal death / wall exceeded) is
+ * converted into a `passed: false` outcome carrying the mechanical keyline
+ * failure block, so the caller can record + force-fail without the round
+ * ever being classified by the instant-fail (RSPN) tracker.
+ */
+async function runLaunchTimeHarnessProbe(params: {
+  job: CronJobInfo;
+  context: Record<string, unknown>;
+  workdir: string;
+  preferTokenSaver: boolean;
+  wallMs: number;
+  onSpawn: (handle: { pid: number; pgid: number }) => void;
+}): Promise<LaunchTimeProbeOutcome> {
+  const { job, context, workdir, preferTokenSaver, wallMs, onSpawn } = params;
+  const harnessType = job.harnessType ?? "pi";
+  const probeCmd = buildHarnessProbeCommand();
+  const prompt = buildHarnessProbePrompt();
+  const probeStartedAtMs = Date.now();
+  // dsh probe rounds need a round-start timestamp for the session-file
+  // token scan (dsh prints no session id; usage lives in $DSH_HOME files).
+  let dshProbeStartedAtMs: number | undefined;
+
+  const fail = (fields: HarnessProbeFailureFields): LaunchTimeProbeOutcome => ({
+    passed: false,
+    harness: fields.harness,
+    probeCmd: fields.probeCmd,
+    expected: fields.expected,
+    durationMs: fields.durationMs ?? Math.max(0, Date.now() - probeStartedAtMs),
+    tokens: 0,
+    failureBlock: buildHarnessProbeFailureBlock(fields),
+    observed: harnessProbeObservedDisplay(fields.observed),
+    exitCode: fields.exitCode ?? null,
+    signal: fields.signal ?? null,
+    stderrTail: harnessProbeStderrTailDisplay(fields.stderrTail),
+  });
+
+  const adapter = getHarnessAdapter(harnessType);
+
+  // Resolve the binary exactly like a work round (token-saver preference
+  // honored); a resolution failure is itself a probe failure.
+  let binaryPath: string;
+  try {
+    binaryPath = await adapter.findBinary({ preferTokenSaver });
+  } catch (err) {
+    return fail({
+      harness: harnessType,
+      probeCmd,
+      expected: "",
+      observed: "",
+      exitCode: null,
+      signal: null,
+      durationMs: undefined,
+      stderrTail: `harness binary resolution failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+
+  if (harnessType === "dsh") {
+    dshProbeStartedAtMs = Date.now();
+  }
+  const harnessEnv = buildHarnessChildEnv(job, binaryPath);
+  // The adapter merges options.env over process.env for real rounds; give
+  // the daemon-side expected-value computation the SAME full child env so
+  // both sides resolve the command identically.
+  const fullChildEnv: Record<string, string | undefined> = {
+    ...process.env,
+    ...harnessEnv,
+  };
+
+  // Daemon-side expected value: run the very command the harness must run.
+  // When the daemon itself cannot run it, the probe cannot pass — surface
+  // the daemon-side forensics as the probe failure.
+  const expectedResult = computeExpectedHarnessProbePath(fullChildEnv, workdir);
+  if (!expectedResult.ok) {
+    return fail({
+      harness: harnessType,
+      probeCmd,
+      expected: "",
+      observed: "",
+      exitCode: expectedResult.exitCode ?? null,
+      signal: expectedResult.signal ?? null,
+      durationMs: undefined,
+      stderrTail:
+        expectedResult.stderrTail ??
+        `expected path could not be computed: '<launcher> skill-path' exited ${expectedResult.exitCode ?? "with a signal"}`,
+    });
+  }
+  const expectedPath = expectedResult.path ?? "";
+
+  // Run the probe round through the run's own harness.
+  let result: HarnessRoundResult;
+  try {
+    result = await adapter.runRound(prompt, {
+      timeout: Math.max(1, Math.ceil(wallMs / 1000)),
+      workdir,
+      env: harnessEnv,
+      onSpawn,
+      preferTokenSaver,
+      binaryPath,
+    });
+  } catch (err) {
+    return fail({
+      harness: harnessType,
+      probeCmd,
+      expected: expectedPath,
+      observed: "",
+      exitCode: null,
+      signal: null,
+      durationMs: undefined,
+      stderrTail: `harness probe spawn failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+
+  const durationMs = result.durationMs ?? Math.max(0, Date.now() - probeStartedAtMs);
+
+  // The observed message is the harness's final assistant message — for pi
+  // (--mode json) that is the message_end assistant text, for text-only
+  // harnesses the normalized whole output.
+  const metadata = parseWorkRoundMetadata(result.output);
+  const observedMessage =
+    metadata.assistantOutput.length > 0 ? metadata.assistantOutput : result.output;
+
+  // Attribute probe tokens through the existing per-round path so they land
+  // on runs.tokens_spent exactly once (pi usage from --mode json; hermes and
+  // dsh best-effort like normal rounds). Best-effort: an attribution hiccup
+  // must never flip a passing probe into a failed run.
+  let tokens = 0;
+  try {
+    const outputSummary = summarizeWorkRoundOutput(result.output);
+    if (harnessType === "pi") {
+      if (metadata.tokenUsage !== null && metadata.tokenUsage > 0) {
+        await attributeWorkRoundTokenUsage(context, job, outputSummary, metadata);
+        tokens = metadata.tokenUsage;
+      }
+    } else if (harnessType === "hermes" && result.sessionRef) {
+      const hermesTokens = await lookupHermesSessionTokens(result.sessionRef);
+      if (hermesTokens !== null && hermesTokens > 0) {
+        const hermesMetadata: WorkRoundMetadata = {
+          assistantOutput: result.output,
+          tokenUsage: hermesTokens,
+          runId: null,
+          stepId: null,
+          jsonMetadataDetected: false,
+        };
+        await attributeWorkRoundTokenUsage(context, job, outputSummary, hermesMetadata);
+        tokens = hermesTokens;
+      }
+    } else if (harnessType === "dsh" && dshProbeStartedAtMs !== undefined) {
+      const dshUsage = await lookupDshSessionTokens({
+        spawnedAtMs: dshProbeStartedAtMs,
+        workdir,
+      });
+      if (dshUsage !== null && dshUsage.totalTokens > 0) {
+        const dshMetadata: WorkRoundMetadata = {
+          assistantOutput: result.output,
+          tokenUsage: dshUsage.totalTokens,
+          runId: null,
+          stepId: null,
+          jsonMetadataDetected: false,
+        };
+        await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
+        tokens = dshUsage.totalTokens;
+      }
+    }
+  } catch (err) {
+    logger.warn("Launch-time harness probe token attribution failed", {
+      ...context,
+      harness: harnessType,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const outcome = evaluateHarnessProbe({
+    harness: harnessType,
+    probeCmd,
+    expectedPath,
+    wallMs,
+    adapter: {
+      output: observedMessage,
+      stderrTail: result.stderrTail,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      durationMs: result.durationMs,
+    },
+  });
+
+  if (outcome.passed) {
+    return {
+      passed: true,
+      harness: harnessType,
+      probeCmd,
+      expected: expectedPath,
+      durationMs,
+      tokens,
+      failureBlock: "",
+      observed: "",
+      exitCode: null,
+      signal: null,
+      stderrTail: "",
+    };
+  }
+  return fail({ ...(outcome.failure as HarnessProbeFailureFields), durationMs });
+}
+
+/**
+ * Read the last durable run.harness_probe_failed keyline block from the
+ * run's per-run events file (the emitting round wrote the full block to
+ * reason/detail BEFORE force-failing). Used by the defensive re-force-fail
+ * path when a probe-failed run is somehow still alive (daemon crash between
+ * the record and the force-fail).
+ */
+function readLastHarnessProbeFailureBlock(runId: string): string | undefined {
+  try {
+    const events = getRunEvents(runId);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const evt = events[i];
+      if (evt.event === "run.harness_probe_failed") {
+        return evt.reason ?? evt.detail;
+      }
+    }
+  } catch (err) {
+    logger.warn("Failed to read durable harness-probe failure reason", {
+      runId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return undefined;
 }
 
 // ── Public API: run-scoped scheduling ──────────────────────────────

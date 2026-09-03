@@ -342,6 +342,81 @@ describe("wait command", () => {
     );
 
     assert.equal(result.status, 1);
+    assert.doesNotMatch(result.stdout, /FAILURE_CLASS: harness_unavailable/, "no probe block without a probe failure");
+  });
+
+  // ── Integration: probe-failed run prints the durable keyline block ──
+  //
+  // IFLB US-004: a run that failed because the launch-time harness probe
+  // failed must exit 1 AND print the mechanical keyline block verbatim
+  // (read from the run's durable per-run events) as the final output.
+
+  it("exits 1 and prints the keyline block verbatim for a probe-failed run", () => {
+    const runId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    insertRun(db, runId, 1, "test-wf", "failed");
+
+    const block = [
+      "FAILURE_CLASS: harness_unavailable",
+      "HARNESS: pi",
+      "PROBE_CMD: /abs/launcher/tamandua skill-path",
+      "EXPECTED: /abs/skill/path/result.txt",
+      "OBSERVED: No API key found for the selected model",
+      "EXIT_CODE: 1",
+      "SIGNAL: ",
+      "DURATION_MS: 312",
+      "STDERR_TAIL: No API key found for the selected model",
+    ].join("\n");
+    const eventsDir = path.join(tempRoot, ".tamandua", "events");
+    fs.mkdirSync(eventsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(eventsDir, `${runId}.jsonl`),
+      JSON.stringify({ ts: new Date().toISOString(), runId, event: "run.harness_probe_failed", reason: block, detail: block }) + "\n",
+      "utf-8",
+    );
+
+    const env = { HOME: tempRoot, TAMANDUA_DB_PATH: dbPath, TAMANDUA_TEST_GUARD: "0" };
+
+    // First wait invocation: exit 1, block verbatim, STDERR_TAIL last.
+    const result = runWait([runId], env);
+    assert.equal(result.status, 1, `probe-failed wait must exit 1; stderr: ${result.stderr}`);
+    assert.ok(result.stdout.includes(block), `expected the verbatim keyline block in wait output:\n${result.stdout}`);
+    assert.ok(
+      result.stdout.trimEnd().endsWith("STDERR_TAIL: No API key found for the selected model"),
+      "STDERR_TAIL must be the final line of wait output",
+    );
+
+    // Second wait invocation (fresh CLI process = simulated restart): the
+    // block is read from the same durable events and still renders.
+    const result2 = runWait([runId], env);
+    assert.equal(result2.status, 1);
+    assert.ok(result2.stdout.includes(block), "the durable block must render again after a CLI restart");
+  });
+
+  it("--quiet probe-failed run suppresses stdout but still exits 1", () => {
+    const runId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    insertRun(db, runId, 2, "test-wf", "failed");
+
+    const eventsDir = path.join(tempRoot, ".tamandua", "events");
+    fs.mkdirSync(eventsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(eventsDir, `${runId}.jsonl`),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        runId,
+        event: "run.harness_probe_failed",
+        reason: "FAILURE_CLASS: harness_unavailable\nHARNESS: pi\nSTDERR_TAIL: dead",
+        detail: "FAILURE_CLASS: harness_unavailable\nHARNESS: pi\nSTDERR_TAIL: dead",
+      }) + "\n",
+      "utf-8",
+    );
+
+    const result = runWait(
+      [runId, "--quiet"],
+      { HOME: tempRoot, TAMANDUA_DB_PATH: dbPath, TAMANDUA_TEST_GUARD: "0" },
+    );
+
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout.trim(), "", "--quiet must suppress stdout including the block");
   });
 
   // ── Integration: --json output ─────────────────────────────────────

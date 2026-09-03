@@ -278,6 +278,12 @@ describe("pause-kill-resume regression (PAUS)", { concurrency: 1 }, () => {
         HOME: th.homeDir,
         TAMANDUA_CONTROL_PORT: String(controlPort),
         ...scriptedAgent.env,
+        // Launch with the launch-time harness probe disabled (deliberate,
+        // not a workaround: the product scripted runtime answers probe
+        // prompts, but pause/kill/resume regression is the behavior under
+        // test — probe pass/fail behavior is covered by the probe e2e suite
+        // and scheduler tests).
+        TAMANDUA_HARNESS_PROBE: "0",
       }),
       stdio: ["ignore", "pipe", "pipe"],
     });

@@ -136,6 +136,51 @@ failure). No automatic replacement is triggered for these failures.
 Use `tamandua workflow resume <run-id>` to reattempt a permanently
 failed run; fix the underlying issue before resuming.
 
+#### Launch-time harness probe
+
+Before a run's first real work round — and before any step is claimed —
+the scheduler checks that the run's harness (pi, Hermes, or dsh,
+whichever the run was launched with) can actually work. The probe asks
+the harness to run the exact command `<launcher> skill-path` — the same
+absolute CLI launcher path step prompts use, never a bare `tamandua`
+that depends on the agent shell's `PATH` — and reply with the PATH. The
+daemon computes the expected value itself by running the same command
+in the same environment the harness receives, and the probe passes only
+when the harness's final message contains that path as a whole line or
+token (whitespace trimmed, markdown code fences/backticks stripped).
+Anything else — wrong output, non-zero exit, signal death, or a wall
+clock exceeded — fails the probe. The probe costs **one tiny model turn
+per run** and runs exactly once per run: the outcome is persisted on the
+run, so a daemon restart never re-probes a run that already passed.
+
+On probe failure the run is force-failed immediately and legibly — no
+workflow step is claimed or started — with a mechanical keyline block
+(shown verbatim by `tamandua workflow status` and
+`tamandua workflow run --wait`):
+
+```
+FAILURE_CLASS: harness_unavailable
+HARNESS: pi
+PROBE_CMD: /absolute/path/to/tamandua skill-path
+EXPECTED: /absolute/path/to/skill
+OBSERVED: <final harness message, at most 400 chars>
+EXIT_CODE: 1
+SIGNAL:
+DURATION_MS: 320
+STDERR_TAIL: <last 2000 chars of stderr>
+```
+
+The probe's wall clock defaults to **180 seconds**
+(`TAMANDUA_HARNESS_PROBE_WALL_MS` overrides it). Set
+`TAMANDUA_HARNESS_PROBE=0` to disable the probe entirely (escape hatch;
+the probe is on by default).
+
+> **Known-open (IFLB-mid):** a harness that passes the launch-time probe
+> but breaks MID-run is still handled by the existing instant-fail
+> backoff (after consecutive instant-fail rounds the scheduler backs off
+> and stops relaunching); that backoff's relaunch behavior is known-open
+> and deliberately unchanged by the launch-time probe.
+
 ### Feature Development
 
 Story-based feature development. The planner decomposes your task into ordered user

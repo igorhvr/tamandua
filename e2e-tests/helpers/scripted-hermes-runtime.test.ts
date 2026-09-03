@@ -151,6 +151,47 @@ function spawnHermes(
   );
 }
 
+/**
+ * Spawn the hermes runtime with a launch-time harness probe prompt (IFLB):
+ * the same `chat --max-turns 8192 --yolo -Q -q "<prompt>"` invocation shape,
+ * but the prompt is the probe prompt whose quoted `<launcher> skill-path`
+ * command is `mockProbeBin skill-path`.
+ */
+function spawnHermesProbe(
+  mockProbeBin: string,
+  env: Record<string, string>,
+  opts?: { timeoutMs?: number },
+): ReturnType<typeof spawnSync> {
+  const prompt = [
+    "TAMANDUA_HARNESS_PROBE: skill-path",
+    `Run the exact command "${mockProbeBin} skill-path" and reply with the PATH and nothing else.`,
+  ].join("\n");
+
+  return spawnSync(
+    process.execPath,
+    [
+      runtimePath,
+      "chat",
+      "--max-turns",
+      "8192",
+      "--yolo",
+      "-Q",
+      "-q",
+      prompt,
+    ],
+    {
+      encoding: "utf-8",
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? os.tmpdir(),
+        ...env,
+      },
+      timeout: opts?.timeoutMs ?? 10_000,
+      maxBuffer: 16 * 1024 * 1024,
+    },
+  );
+}
+
 function readStateDb(dbPath: string): Array<Record<string, unknown>> {
   const db = openE2eDatabase(dbPath, { readOnly: true });
   try {
@@ -909,6 +950,88 @@ describe("scripted-hermes-runtime", () => {
         assert.ok(
           resultLog.note?.includes("reporting step complete before emitting output"),
           `result note should mention reportBeforeEmit, got: ${resultLog.note}`,
+        );
+      } finally {
+        cleanup(dirs.tmp);
+      }
+    });
+  });
+
+  // ── Launch-time harness probe (IFLB) ──────────────────────────────
+
+  describe("launch-time harness probe (IFLB)", () => {
+    function writeProbeBin(tmp: string, pathOut: string): string {
+      const probeBin = path.join(tmp, "mock-skill-path");
+      fs.writeFileSync(probeBin, `#!/bin/sh\necho "${pathOut}"\n`, { mode: 0o755 });
+      return probeBin;
+    }
+
+    it("answers a probe prompt with the real command's path, exit 0, no journal/db row", () => {
+      const dirs = makeTempDirs();
+      try {
+        const probeBin = writeProbeBin(dirs.tmp, "/skills/hermes/skill/path");
+
+        const result = spawnHermesProbe(probeBin, {
+          HERMES_HOME: dirs.hermesHome,
+          TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
+          TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
+        });
+
+        assert.equal(
+          result.status,
+          0,
+          `probe answer should exit 0, got status=${result.status} signal=${result.signal}, stderr: ${result.stderr}`,
+        );
+        assert.equal(
+          result.stdout.trim(),
+          "/skills/hermes/skill/path",
+          `probe answer stdout should be the PATH, got: "${result.stdout}"`,
+        );
+        // The probe is not a work round: no session row, no invocation journal.
+        const dbPath = path.join(dirs.hermesHome, "state.db");
+        assert.ok(!fs.existsSync(dbPath), "probe must not create a state.db session row");
+        assert.equal(
+          readInvocations(path.join(dirs.stateDir, "invocations.jsonl")).length,
+          0,
+          "probe must not journal an invocation",
+        );
+      } finally {
+        cleanup(dirs.tmp);
+      }
+    });
+
+    it("does not consume the canned-invocation index (next work round still starts at index 0)", () => {
+      const dirs = makeTempDirs();
+      try {
+        createMockCli(dirs.tmp);
+        writeBehaviors(dirs.behaviorsPath, {
+          agents: {
+            doer: [
+              { output: "STATUS: done\nROUND: first" },
+              { output: "STATUS: done\nROUND: second" },
+            ],
+          },
+        });
+        const probeBin = writeProbeBin(dirs.tmp, "/skills/hermes/skill/path");
+
+        // Probe first — it must NOT consume a behavior slot.
+        const probe = spawnHermesProbe(probeBin, {
+          HERMES_HOME: dirs.hermesHome,
+          TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
+          TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
+        });
+        assert.equal(probe.status, 0, `probe failed: ${probe.stderr}`);
+        assert.equal(probe.stdout.trim(), "/skills/hermes/skill/path");
+
+        // The first WORK invocation after the probe must still be index 0.
+        const work = spawnHermes(dirs.mockCliPath, {
+          HERMES_HOME: dirs.hermesHome,
+          TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
+          TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
+        });
+        assert.ok(
+          work.stdout.includes("ROUND: first"),
+          `first work round after a probe should use behavior index 0, got: "${work.stdout}", stderr: ${work.stderr}`,
         );
       } finally {
         cleanup(dirs.tmp);

@@ -271,25 +271,38 @@ describe("scripted-runtimes fork (US-001)", () => {
     }
 
     // runtime-shared.mjs has behavioral modifications (US-003 behaviors lookup
-    // priority change), so it's no longer byte-identical. Verify only that
-    // the diff consists of the expected behavior-for-invocation change.
+    // priority change) and IFLB US-007 probe-support additions (a documented
+    // KNOB-REGION block), so it's no longer byte-identical. Verify only that
+    // the diff consists of the expected behavior-for-invocation change plus
+    // the documented KNOB-REGION additions.
     const sharedDiff = runDiff(
       "e2e-tests/helpers/scripted-agent-runtime-shared.mjs",
       "torture-test/scripted-runtimes/runtime-shared.mjs",
     );
     if (sharedDiff) {
-      const nonBehaviorDiffs = sharedDiff
-        .split("\n")
-        .filter((line: string) => line.startsWith("<") || line.startsWith(">"))
-        .filter(
-          (line: string) =>
-            !line.includes("behaviorForInvocation") &&
-            !line.includes("Full workflowId_agentId") &&
-            !line.includes("Tries shortAgent") &&
-            !line.includes("backward") &&
-            !line.includes("shortAgent") &&
-            !line.includes("agentId"),
-        );
+      const nonBehaviorDiffs = [];
+      let inKnobRegion = false;
+      for (const line of sharedDiff.split("\n")) {
+        if (!line.startsWith("<") && !line.startsWith(">")) continue;
+        const trimmed = line.slice(2);
+        if (trimmed === "") continue;
+        // IFLB US-007: KNOB-REGION tracking (mirrors the pi/hermes filters)
+        if (trimmed.includes("KNOB-REGION-BEGIN")) { inKnobRegion = true; continue; }
+        if (trimmed.includes("KNOB-REGION-END")) { inKnobRegion = false; continue; }
+        if (inKnobRegion) continue;
+        if (trimmed.includes("KNOB-REGION") || trimmed.includes("═══")) continue;
+        if (
+          trimmed.includes("behaviorForInvocation") ||
+          trimmed.includes("Full workflowId_agentId") ||
+          trimmed.includes("Tries shortAgent") ||
+          trimmed.includes("backward") ||
+          trimmed.includes("shortAgent") ||
+          trimmed.includes("agentId")
+        ) {
+          continue;
+        }
+        nonBehaviorDiffs.push(line);
+      }
       assert.equal(
         nonBehaviorDiffs.length,
         0,

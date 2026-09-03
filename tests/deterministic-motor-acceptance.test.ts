@@ -211,6 +211,10 @@ function runDispatchRounds(opts: {
     {
       HOME: opts.homeDir,
       TAMANDUA_PI_BINARY: opts.fakePiPath,
+      // The journaling fake pi never answers a launch-time harness probe
+      // prompt — disable the probe so harness invocations equal executed
+      // work rounds (the N1–N3 invocation-count contract under test).
+      TAMANDUA_HARNESS_PROBE: "0",
       // The N1 assertion counts "Dispatch round idle" lines as its probe
       // that each idle round ran; those lines are debug-level and dropped
       // unless TAMANDUA_DEBUG is set.

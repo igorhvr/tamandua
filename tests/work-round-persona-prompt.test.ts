@@ -69,7 +69,15 @@ function runRoundAndCapturePrompt(opts: { personaFiles?: Record<string, string> 
   `;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     cwd: repoRoot,
-    env: cleanChildEnv({ HOME: homeDir, TAMANDUA_PI_BINARY: fakePi, TAMANDUA_STATE_DIR: stateDir }),
+    env: cleanChildEnv({
+      HOME: homeDir,
+      TAMANDUA_PI_BINARY: fakePi,
+      TAMANDUA_STATE_DIR: stateDir,
+      // The fake pi captures the work prompt but never answers a
+      // launch-time harness probe prompt — disable the probe so persona
+      // injection is the behavior under test.
+      TAMANDUA_HARNESS_PROBE: "0",
+    }),
     encoding: "utf-8",
     maxBuffer: 16 * 1024 * 1024,
   });

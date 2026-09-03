@@ -20,6 +20,7 @@ let savedPiBinary: string | undefined;
 let savedHome: string | undefined;
 let savedStateDir: string | undefined;
 let savedDbPath: string | undefined;
+let savedHarnessProbe: string | undefined;
 
 function makeExecutable(dir: string, name: string, body = "#!/bin/sh\nexit 0\n"): string {
   const p = path.join(dir, name);
@@ -34,7 +35,13 @@ beforeEach(() => {
   savedHome = process.env.HOME;
   savedStateDir = process.env.TAMANDUA_STATE_DIR;
   savedDbPath = process.env.TAMANDUA_DB_PATH;
+  savedHarnessProbe = process.env.TAMANDUA_HARNESS_PROBE;
   delete process.env.TAMANDUA_PI_BINARY;
+  // The mock harnesses reply NO_WORK_AVAILABLE to any prompt — they would
+  // never pass a launch-time harness probe — so the probe is disabled for
+  // the dispatch rounds in this file (token-saver preference is the
+  // behavior under test).
+  process.env.TAMANDUA_HARNESS_PROBE = "0";
 });
 
 afterEach(() => {
@@ -47,6 +54,8 @@ afterEach(() => {
   else process.env.TAMANDUA_STATE_DIR = savedStateDir;
   if (savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
   else process.env.TAMANDUA_DB_PATH = savedDbPath;
+  if (savedHarnessProbe === undefined) delete process.env.TAMANDUA_HARNESS_PROBE;
+  else process.env.TAMANDUA_HARNESS_PROBE = savedHarnessProbe;
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 

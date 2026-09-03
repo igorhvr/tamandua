@@ -114,6 +114,10 @@ function runHermesDispatchRound(
       HOME: homeDir,
       TAMANDUA_HERMES_BINARY: fakeHermes,
       HERMES_HOME: hermesHome,
+      // The fake hermes prints STATUS/session_id but never answers a
+      // launch-time harness probe prompt — disable the probe so token
+      // attribution is the behavior under test.
+      TAMANDUA_HARNESS_PROBE: "0",
     }),
     encoding: "utf-8",
     maxBuffer: 16 * 1024 * 1024,
@@ -266,6 +270,10 @@ describe("hermes token attribution", () => {
           HOME: temp.homeDir,
           TAMANDUA_PI_BINARY: fakePi,
           HERMES_HOME: hermesHome,
+          // The canned fake pi never answers a launch-time harness probe
+          // prompt — disable the probe so pi-vs-hermes token attribution is
+          // the behavior under test.
+          TAMANDUA_HARNESS_PROBE: "0",
         }),
         encoding: "utf-8",
         maxBuffer: 16 * 1024 * 1024,

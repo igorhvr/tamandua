@@ -41,6 +41,8 @@ const OS_TMPDIR_ALLOWLIST: Record<string, string> = {
   // HOME fallback for subprocess environments.  os.tmpdir() is the correct
   // fallback here — it's a per-user writeable directory suitable as a HOME
   // substitute, NOT a temp asset managed by Tamandua.
+  "e2e-tests/helpers/scripted-agent-runtime.test.ts":
+    "HOME fallback for subprocess env — not a temp asset",
   "e2e-tests/helpers/scripted-hermes-runtime.test.ts":
     "HOME fallback for subprocess env — not a temp asset",
   "e2e-tests/helpers/scripted-hermes.test.ts":

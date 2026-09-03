@@ -78,6 +78,12 @@ export interface TamanduaEvent {
   tokenDelta?: number;
   tokensSpent?: number;
   /**
+   * IFLB: the launch-time harness probe round's token spend, attributed to
+   * the run through the per-round path. Present on run.harness_probe_ok so
+   * operators see the probe's one-tiny-turn cost per run.
+   */
+  tokens?: number;
+  /**
    * TATR US-007: explicit post-terminal flush identity. True when the
    * run's DB status was already terminal ('completed'/'failed'/'canceled')
    * at the moment this token flush was attributed — i.e. the flush landed
@@ -120,6 +126,20 @@ export interface TamanduaEvent {
   ceilingExpiryCount?: number;
   /** Consecutive instant-fail worker rounds at the time a run.instant_fail_loop alert fires. */
   consecutiveInstantFails?: number;
+  /**
+   * IFLB launch-time harness probe fields. `harness` names the run's
+   * harness (pi | hermes | dsh); `probeCmd` the exact command the probe
+   * asked the harness to run (`<launcher> skill-path`); `expected` the
+   * daemon-computed expected path; `observed` the normalized final message
+   * actually observed (capped at HARNESS_PROBE_OBSERVED_MAX_CHARS).
+   * Present on run.harness_probe_ok (harness/durationMs/tokens) and
+   * run.harness_probe_failed (all of the above plus exitCode/signal/
+   * durationMs/stderrTail — the mechanical keyline-block fields).
+   */
+  harness?: string;
+  probeCmd?: string;
+  expected?: string;
+  observed?: string;
   passCount?: number;
   failCount?: number;
   window?: string;
@@ -238,6 +258,26 @@ export const RUN_LIFECYCLE_EVENTS: readonly string[] = Object.freeze([
  */
 export const RUN_ALERT_EVENTS: readonly string[] = Object.freeze([
   "run.instant_fail_loop",
+]);
+
+/**
+ * Run-level launch-time harness probe diagnostic vocabulary (IFLB).
+ *
+ * `run.harness_probe_ok` fires when the probe round passes (the run's
+ * harness answered the exact `<launcher> skill-path` command with the
+ * expected PATH) and carries `harness`, `durationMs`, and `tokens` (the
+ * probe round's attributed token spend). `run.harness_probe_failed` fires
+ * when the probe fails (wrong output, non-zero exit, signal death, wall
+ * exceeded, or an uncomputable expectation) and carries the mechanical
+ * keyline-block fields HARNESS / PROBE_CMD / EXPECTED / OBSERVED (≤400
+ * chars) / EXIT_CODE / SIGNAL / DURATION_MS / STDERR_TAIL (≤2000 chars)
+ * plus the full block in `reason`/`detail`; the run is force-failed
+ * immediately afterwards (run.force_failed). Pinned by
+ * src/installer/events-vocabulary.test.ts.
+ */
+export const RUN_DIAGNOSTIC_EVENTS: readonly string[] = Object.freeze([
+  "run.harness_probe_ok",
+  "run.harness_probe_failed",
 ]);
 
 export type EventCursorSource =

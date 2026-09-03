@@ -98,6 +98,120 @@ export function failStep(cli, stepId, reason) {
   return cli(["step", "fail", stepId, reason]);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// KNOB-REGION-BEGIN — IFLB US-007 launch-time harness probe support
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Launch-time harness probe support (IFLB) ────────────────────────
+//
+// The dispatch motor runs a launch-time harness probe at a run's FIRST real
+// dispatch (see src/installer/harness-probe.ts): the harness is asked to run
+// the exact command `<launcher> skill-path` (an absolute CLI launcher path,
+// never a bare `tamandua`) and reply with the PATH and nothing else. The
+// probe prompt is NOT a work prompt — it has no workflow/agent/run header,
+// so parsePrompt() cannot parse it and every scripted runtime would otherwise
+// fatal() on it. Each runtime therefore recognizes the stable marker line
+// below BEFORE parsing, executes the quoted command for real in the child
+// environment, and replies with the command's stdout path.
+//
+// A probe answer must NOT be journaled as an invocation and must NOT consume
+// the canned-behaviors invocation index: the probe is not a work round, so it
+// must not disturb behaviors.json work sequencing or the invocation journal
+// that scripted e2e suites assert on.
+
+export const HARNESS_PROBE_MARKER = "TAMANDUA_HARNESS_PROBE: skill-path";
+
+/**
+ * True when the prompt is a launch-time harness probe prompt: its first line
+ * is exactly the stable marker `TAMANDUA_HARNESS_PROBE: skill-path`.
+ */
+export function isHarnessProbePrompt(prompt) {
+  const firstLine = String(prompt ?? "").split(/\r?\n/, 1)[0] ?? "";
+  return firstLine.trim() === HARNESS_PROBE_MARKER;
+}
+
+/**
+ * Extract the exact quoted command from a probe prompt. The daemon builds the
+ * prompt as `<marker>\nRun the exact command "<launcher> skill-path" and reply
+ * with the PATH and nothing else.` Returns null when the prompt is not a probe
+ * prompt / does not quote a command.
+ */
+export function parseHarnessProbeCommand(prompt) {
+  const m = String(prompt ?? "").match(
+    /Run the exact command "([^"]+)" and reply with the PATH and nothing else\./,
+  );
+  return m ? m[1] : null;
+}
+
+/**
+ * Split a probe command string into an argv array. The daemon quotes the whole
+ * `<launcher> skill-path` command; the launcher is an absolute path that may
+ * (in principle) contain spaces, so split quote-aware instead of on whitespace.
+ */
+export function splitProbeCommand(cmd) {
+  const argv = [];
+  let current = "";
+  let inQuotes = false;
+  for (const ch of String(cmd)) {
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === " " && !inQuotes) {
+      if (current.length > 0) {
+        argv.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (current.length > 0) argv.push(current);
+  return argv;
+}
+
+/**
+ * Execute the quoted probe command for real in the child environment (the
+ * same env the runtime process itself received — the daemon hands the harness
+ * the identical env it uses for the daemon-side expected-value computation).
+ *
+ * Returns { ok, path, exitCode, signal, stderr }:
+ *  - ok: the command exited 0 and produced a non-empty trimmed stdout path
+ *  - path: the trimmed stdout (the PATH the harness must reply with)
+ *  - exitCode / signal / stderr: child forensics for the failure reply
+ *
+ * Never journaled, never consumes a work index, never throws.
+ */
+export function execHarnessProbe(prompt) {
+  const cmd = parseHarnessProbeCommand(prompt);
+  if (cmd === null || cmd.length === 0) {
+    return {
+      ok: false,
+      path: "",
+      exitCode: 2,
+      signal: null,
+      stderr: `probe prompt did not quote a command: ${String(prompt).slice(0, 200)}`,
+    };
+  }
+  const argv = splitProbeCommand(cmd);
+  const r = spawnSync(argv[0], argv.slice(1), {
+    encoding: "utf-8",
+    cwd: process.cwd(),
+    env: process.env,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const stdout = (r.stdout ?? "").trim();
+  return {
+    ok: r.status === 0 && stdout.length > 0,
+    path: stdout,
+    exitCode: r.status,
+    signal: r.signal,
+    stderr: (r.stderr ?? "").slice(0, 2000),
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// KNOB-REGION-END
+// ═══════════════════════════════════════════════════════════════════
+
 // ── Behaviors config ────────────────────────────────────────────────
 
 const DEFAULT_CONFIG = { agents: {}, heartbeatTokens: 17, defaultTokens: 111 };

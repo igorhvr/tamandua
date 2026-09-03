@@ -34,7 +34,7 @@ import {
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
-import type { SetupAgentCronsOptions, NudgeResult } from "../../dist/installer/agent-scheduler.js";
+import type { SetupAgentCronsOptions, NudgeResult, CronJobInfo } from "../../dist/installer/agent-scheduler.js";
 import type { WorkflowSpec } from "../../dist/installer/types.js";
 
 function makeWorkflow(overrides: {
@@ -764,10 +764,16 @@ describe("executeDispatchRound round-termination classification (WLST5)", () => 
       TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
       TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
       TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      // The canned fake-pi shims below never answer a launch-time harness
+      // probe prompt (they claim/die per FAKE_PI_DIE), so the probe is
+      // disabled for these rounds — exactly as TAMANDUA_PI_BINARY is
+      // managed — keeping the WLST5 classification assertions unchanged.
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
     };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
     // Guard awareness (test-isolation-guard): this suite emits events and
     // reads the run DB through the same isolated temp state dir it creates.
     assert.doesNotThrow(() =>
@@ -908,10 +914,17 @@ describe("executeDispatchRound instant-fail classification and escalation (RSPN)
       TAMANDUA_INSTANT_FAIL_BACKOFF_K: process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K,
       TAMANDUA_INSTANT_FAIL_ESCALATION_N: process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N,
       TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS: process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS,
+      // The canned fake-pi shims never answer a launch-time harness probe
+      // prompt (they exit 1 / print lone '\n' / SIGKILL themselves per
+      // FAKE_PI_MODE), so the probe is disabled for these rounds — exactly
+      // as TAMANDUA_PI_BINARY is managed — keeping every RSPN assertion
+      // unchanged (the run's instant-fail loop is the behavior under test).
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
     };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
     // Generous wall threshold: the fake harness's process startup (~tens
     // of ms) must reliably fall below it even on loaded CI machines.
     process.env.TAMANDUA_INSTANT_FAIL_WALL_MS = "10000";
@@ -1241,10 +1254,17 @@ describe("executeDispatchRound harness env run identity (TATR)", () => {
       TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
       TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
       TAMANDUA_RUN_ID: process.env.TAMANDUA_RUN_ID,
+      // The canned fake-pi shim never answers a launch-time harness probe
+      // prompt (it claims the step and prints STATUS: done regardless of
+      // the prompt), so the probe is disabled for these rounds — exactly as
+      // TAMANDUA_PI_BINARY is managed — keeping the run-identity
+      // assertions unchanged.
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
     };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
     // Drop any ambient TAMANDUA_RUN_ID so the child-env observation can
     // only come from the scheduler's harnessEnv (not process-env bleed).
     delete process.env.TAMANDUA_RUN_ID;
@@ -1365,10 +1385,16 @@ describe("settleRunInFlightRounds (TATR US-005)", () => {
       TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
       TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
       TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+      // The canned fake-pi shims never answer a launch-time harness probe
+      // prompt, so the probe is disabled for these rounds — exactly as
+      // TAMANDUA_PI_BINARY is managed — keeping the settle semantics
+      // unchanged.
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
     };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
     // Guard awareness (test-isolation-guard): this suite emits events and
     // reads the run DB through the same isolated temp state dir it creates.
     assert.doesNotThrow(() =>
@@ -1577,10 +1603,16 @@ describe("attributeWorkRoundTokenUsage post-terminal flush identity (TATR US-007
       TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
       TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
       TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+      // The canned fake-pi shims never answer a launch-time harness probe
+      // prompt, so the probe is disabled for these rounds — exactly as
+      // TAMANDUA_PI_BINARY is managed — keeping the post-terminal flush
+      // semantics unchanged.
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
     };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
     // Guard awareness (test-isolation-guard): this suite emits events and
     // reads the run DB through the same isolated temp state dir it creates.
     assert.doesNotThrow(() =>
@@ -1722,10 +1754,16 @@ describe("attributeWorkRoundTokenUsage dispatch-run attribution identity (TATR U
       TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
       TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
       TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+      // The canned fake-pi shims never answer a launch-time harness probe
+      // prompt, so the probe is disabled for these rounds — exactly as
+      // TAMANDUA_PI_BINARY is managed — keeping the dispatch-run
+      // attribution identity assertions unchanged.
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
     };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
     // Guard awareness (test-isolation-guard): this suite emits events and
     // reads the run DB / log through the same isolated temp state dir it
     // creates.
@@ -1900,6 +1938,367 @@ process.exit(0);
     assert.ok(
       !logContent.includes("cross_run_metadata_hijack"),
       "no warning when the stream carries no run id",
+    );
+  });
+});
+
+// ── IFLB US-003: launch-time harness probe gate ─────────────────────
+// At a run's FIRST real dispatch (after the deterministic peek confirms
+// HAS_WORK and before any step is claimed), the dispatch motor runs the
+// run's harness through the probe prompt and force-fails the run
+// immediately and legibly when the harness cannot work (a launch-broken
+// harness — pi with invalidated credentials, dsh boot failure — used to
+// strand the run in three instant-fail backoff rounds that never
+// escalated). These tests drive the gate at the scheduler level: (a) a
+// failing harness force-fails with the keyline block and zero steps
+// started; (b/c) a probe-aware harness is probed exactly once (probe ok
+// precedes the first step.running), records 'ok' so the second dispatch
+// never re-probes, and attributes probe tokens exactly once.
+
+describe("executeDispatchRound launch-time harness probe (IFLB US-003)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-harness-probe-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_RUN_ID: process.env.TAMANDUA_RUN_ID,
+      // The probe is ENABLED (default) in this suite: the fixtures below
+      // are probe-aware. Restore whatever the previous suite left behind.
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    delete process.env.TAMANDUA_HARNESS_PROBE;
+    // Drop any ambient TAMANDUA_RUN_ID so run identity only comes from the
+    // scheduler's harnessEnv.
+    delete process.env.TAMANDUA_RUN_ID;
+    // Guard awareness (test-isolation-guard): this suite emits events and
+    // reads the run DB through the same isolated temp state dir it creates.
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-iflb-probe"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    _resetInstantFailStreaks();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /** Seed a running run with `count` pending steps so the peek says HAS_WORK. */
+  function seedProbeRun(count: number): { runId: string; jobId: string; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'probe task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    for (let i = 0; i < count; i++) {
+      db.prepare(
+        "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, ?, 'test-wf_test-agent', ?, 'do work', 'STATUS', 'pending', ?, ?)",
+      ).run(`${runId}-step-${i}`, runId, `step-${i}`, i, now, now);
+    }
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    return { runId, jobId, workdir };
+  }
+
+  const jobFor = (runId: string, jobId: string, workdir: string): CronJobInfo => ({
+    id: jobId,
+    workflowId: "test-wf",
+    runId,
+    agentId: "test-wf_test-agent",
+    harnessType: "pi",
+    workingDirectoryForHarness: workdir,
+    createdAt: "",
+  });
+
+  const agentFor = (timeoutSeconds = 30) => ({
+    id: "test-agent",
+    model: "fake",
+    workspace: { baseDir: "." },
+    timeoutSeconds,
+  });
+
+  /**
+   * Probe-aware fake pi: when the last argv starts with the probe marker it
+   * executes the quoted `<launcher> skill-path` command for real, journals
+   * the probe invocation, and replies with the PATH (plus a message_end
+   * usage line so probe tokens attribute exactly once). Otherwise it runs
+   * the REAL work protocol — step claim / step complete through the
+   * tamandua CLI — so step.running fires and the pipeline advances.
+   */
+  function writeProbeAwareFakePi(probeJournal: string, reportDir: string): string {
+    const launcher = path.resolve(import.meta.dirname, "..", "..", "bin", "tamandua");
+    const fakePi = path.join(tempHome, "pi-probe-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
+const prompt = process.argv[process.argv.length - 1] ?? "";
+const isProbe = typeof prompt === "string" && prompt.startsWith("TAMANDUA_HARNESS_PROBE: skill-path");
+
+if (isProbe) {
+  fs.appendFileSync(process.env.TAMANDUA_PROBE_JOURNAL, "probe\\n");
+  const m = prompt.match(/"([^"\\n]+)"/);
+  const raw = m ? m[1] : "";
+  const space = raw.indexOf(" ");
+  const cmd = space === -1 ? raw : raw.slice(0, space);
+  const rest = space === -1 ? [] : [raw.slice(space + 1)];
+  if (!cmd) process.exit(1);
+  const res = spawnSync(cmd, rest, { encoding: "utf-8" });
+  const stdout = (res.stdout ?? "").trim();
+  if (res.status !== 0 || stdout.length === 0) process.exit(res.status ?? 1);
+  console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: stdout, usage: { totalTokens: 42 } } }));
+  process.exit(0);
+}
+
+const agent = ${JSON.stringify("test-wf_test-agent")};
+const launcher = ${JSON.stringify(launcher)};
+const reportDir = process.env.TAMANDUA_PROBE_REPORT_DIR;
+const claim = spawnSync(launcher, ["step", "claim", agent, "--run-id", process.env.TAMANDUA_RUN_ID], { encoding: "utf-8" });
+if (claim.status !== 0) process.exit(claim.status ?? 1);
+let stepId = null;
+try { stepId = JSON.parse(claim.stdout).stepId; } catch { stepId = null; }
+if (!stepId) process.exit(1);
+const report = path.join(reportDir, "report-" + stepId + ".txt");
+fs.writeFileSync(report, "STATUS: done\\nCHANGES: probe passed\\nTESTS: n/a");
+const done = spawnSync(launcher, ["step", "complete", stepId, "--file", report], { encoding: "utf-8" });
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "STATUS: done", usage: { totalTokens: 137 } } }));
+console.log("STATUS: done");
+process.exit(done.status ?? 0);
+`,
+      { mode: 0o755 },
+    );
+    return fakePi;
+  }
+
+  it("(a) a pi shim that exits 1 with empty output force-fails the run with the keyline block; zero steps start", async () => {
+    const { runId, jobId, workdir } = seedProbeRun(1);
+    const deadPi = path.join(tempHome, "pi-dead-mock");
+    fs.writeFileSync(deadPi, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    process.env.TAMANDUA_PI_BINARY = deadPi;
+
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agentFor());
+
+    const db = getDb();
+    const row = db.prepare(
+      "SELECT status, harness_probe_status, instant_fail_count, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?",
+    ).get(runId) as {
+      status: string;
+      harness_probe_status: string | null;
+      instant_fail_count: number;
+      worker_lost_count: number;
+      ceiling_expiry_count: number;
+    };
+    assert.equal(row.status, "failed", "a failed harness probe must force-fail the run within the round");
+    assert.equal(row.harness_probe_status, "failed", "the probe outcome must be persisted as 'failed'");
+    // The probe round is NOT an instant-fail (RSPN) round and never ticks
+    // worker_lost / ceiling_expiry counters.
+    assert.equal(row.instant_fail_count, 0, "a failed probe must not tick instant_fail_count");
+    assert.equal(row.worker_lost_count, 0, "a failed probe must not tick worker_lost_count");
+    assert.equal(row.ceiling_expiry_count, 0, "a failed probe must not tick ceiling_expiry_count");
+
+    const events = getRunEvents(runId);
+    const failed = events.filter((e) => e.event === "run.harness_probe_failed");
+    assert.equal(failed.length, 1, "exactly one run.harness_probe_failed must be emitted");
+    const reason = failed[0].reason ?? "";
+    assert.match(reason, /^FAILURE_CLASS: harness_unavailable\n/, "reason must open with the mechanical keyline block");
+    assert.match(reason, /\nHARNESS: pi\n/, "reason must name the harness");
+    assert.match(reason, /\nPROBE_CMD: .* skill-path\n/, "reason must quote the probe command");
+    assert.match(reason, /\nEXIT_CODE: 1\n/, "reason must carry the harness exit code");
+    assert.ok(
+      reason.trimEnd().endsWith("STDERR_TAIL:"),
+      "STDERR_TAIL must be the LAST key of the block, got: " + reason,
+    );
+    assert.equal(failed[0].harness, "pi");
+    assert.equal(failed[0].exitCode, 1);
+    assert.ok(typeof failed[0].durationMs === "number", "the failed event must carry DURATION_MS");
+    // IFLB US-004: pin the full mechanical keyline-block payload on the
+    // failed event — every block field must round-trip on the event.
+    assert.equal(
+      failed[0].reason,
+      failed[0].detail,
+      "reason and detail must both carry the keyline block verbatim",
+    );
+    assert.match(failed[0].probeCmd ?? "", / skill-path$/, "probeCmd must quote the <launcher> skill-path command");
+    assert.ok(
+      typeof failed[0].expected === "string" && (failed[0].expected as string).length > 0,
+      "the failed event must carry the daemon-computed EXPECTED path",
+    );
+    assert.ok(typeof failed[0].observed === "string", "the failed event must carry the normalized OBSERVED message");
+    assert.ok(typeof failed[0].stderrTail === "string", "the failed event must carry the STDERR_TAIL string");
+    // A plain exit-1 shim dies with no signal: SIGNAL stays absent/null.
+    if ("signal" in failed[0]) {
+      assert.equal(failed[0].signal, null);
+    }
+
+    const forceFailures = events.filter((e) => e.event === "run.force_failed");
+    assert.equal(forceFailures.length, 1, "the run must be force-failed through the sanctioned path");
+    assert.equal(
+      events[events.length - 1].event,
+      "run.force_failed",
+      "run.force_failed must be the run's final event",
+    );
+
+    // Zero steps started: the step was never claimed (no step.running, no
+    // claim events) — force-fail merely canceled the pending step.
+    const stepRunning = events.filter((e) => e.event === "step.running");
+    assert.equal(stepRunning.length, 0, "a failed probe must never start a step");
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step-0`) as { status: string };
+    assert.equal(step.status, "canceled", "the unclaimed pending step must be canceled by the force-fail");
+  });
+
+  it("(b+c) a probe-aware harness passes the probe once, proceeds, and is never re-probed on the next dispatch", async () => {
+    // Two pending steps: round 1 probes + works step 0; round 2 must NOT
+    // re-probe ('ok' persisted) and works step 1 to completion.
+    const { runId, jobId, workdir } = seedProbeRun(2);
+    const probeJournal = path.join(tempHome, "probe-invocations.log");
+    const reportDir = path.join(tempHome, "reports");
+    fs.mkdirSync(reportDir, { recursive: true });
+    process.env.TAMANDUA_PI_BINARY = writeProbeAwareFakePi(probeJournal, reportDir);
+    process.env.TAMANDUA_PROBE_JOURNAL = probeJournal;
+    process.env.TAMANDUA_PROBE_REPORT_DIR = reportDir;
+
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agentFor());
+
+    // Round 1: the probe ran, passed, and recorded 'ok' BEFORE the work
+    // round claimed step 0.
+    let db = getDb();
+    let row = db.prepare("SELECT harness_probe_status, tokens_spent, instant_fail_count, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as {
+      harness_probe_status: string | null;
+      tokens_spent: number;
+      instant_fail_count: number;
+      worker_lost_count: number;
+      ceiling_expiry_count: number;
+    };
+    assert.equal(row.harness_probe_status, "ok", "a passing probe must persist 'ok'");
+    assert.equal(
+      fs.readFileSync(probeJournal, "utf-8").split("\n").filter(Boolean).length,
+      1,
+      "exactly one probe invocation may run",
+    );
+
+    let events = getRunEvents(runId);
+    const okEvents = events.filter((e) => e.event === "run.harness_probe_ok");
+    assert.equal(okEvents.length, 1, "exactly one run.harness_probe_ok must be emitted");
+    assert.equal(okEvents[0].harness, "pi", "the ok event must name the harness");
+    assert.equal(okEvents[0].tokens, 42, "the ok event must carry the probe round's attributed tokens");
+    assert.ok(typeof okEvents[0].durationMs === "number", "the ok event must carry DURATION_MS");
+    assert.ok(!("probeCmd" in okEvents[0]), "the ok event must not carry failure-only payload fields");
+    assert.ok(!("exitCode" in okEvents[0]), "the ok event must not carry failure-only payload fields");
+    assert.ok(!("stderrTail" in okEvents[0]), "the ok event must not carry failure-only payload fields");
+
+    const firstRunningIdx = events.findIndex((e) => e.event === "step.running");
+    const okIdx = events.findIndex((e) => e.event === "run.harness_probe_ok");
+    assert.notEqual(firstRunningIdx, -1, "the work round must claim a step (step.running)");
+    assert.ok(
+      okIdx !== -1 && okIdx < firstRunningIdx,
+      "run.harness_probe_ok must precede the first step.running",
+    );
+
+    // Probe tokens (42) + step-0 work tokens (137) land exactly once.
+    const probeTokenEvents = events.filter(
+      (e) => e.event === "run.tokens.updated" && e.tokenDelta === 42,
+    );
+    assert.equal(probeTokenEvents.length, 1, "probe tokens must be attributed exactly once");
+    assert.equal(row.tokens_spent, 42 + 137, "probe + first work tokens must land on runs.tokens_spent");
+    assert.equal(row.instant_fail_count, 0, "the probe round must not tick instant_fail_count");
+    assert.equal(row.worker_lost_count, 0, "the probe round must not tick worker_lost_count");
+    assert.equal(row.ceiling_expiry_count, 0, "the probe round must not tick ceiling_expiry_count");
+
+    // Round 2: 'ok' is persisted → the gate skips the probe entirely and the
+    // round dispatches work for step 1.
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agentFor());
+
+    db = getDb();
+    row = db.prepare("SELECT status, harness_probe_status, tokens_spent FROM runs WHERE id = ?").get(runId) as {
+      status: string;
+      harness_probe_status: string | null;
+      tokens_spent: number;
+    };
+    assert.equal(row.status, "completed", "the run must reach its normal terminal state after step 1");
+    assert.equal(row.harness_probe_status, "ok", "the 'ok' probe status must persist through the run");
+    assert.equal(
+      fs.readFileSync(probeJournal, "utf-8").split("\n").filter(Boolean).length,
+      1,
+      "the second dispatch must NOT re-probe (no second probe spawn)",
+    );
+
+    events = getRunEvents(runId);
+    assert.equal(
+      events.filter((e) => e.event === "run.harness_probe_ok").length,
+      1,
+      "the second dispatch must NOT emit a second run.harness_probe_ok",
+    );
+    assert.equal(
+      events.filter((e) => e.event === "run.harness_probe_failed").length,
+      0,
+      "no probe failure event may ever fire on the passing path",
+    );
+    // No double counting: 42 (probe) + 137 (step 0) + 137 (step 1).
+    assert.equal(row.tokens_spent, 42 + 137 + 137, "tokens must be attributed exactly once per round");
+  });
+
+  it("TAMANDUA_HARNESS_PROBE=0 skips the probe entirely and rounds dispatch exactly as before", async () => {
+    const { runId, jobId, workdir } = seedProbeRun(1);
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+
+    // A canned fake pi that ignores the prompt entirely (claims the step via
+    // the DB and prints STATUS: done) — with the probe disabled it must never
+    // be probed, and the work round must complete the step exactly as before.
+    const fakePi = path.join(tempHome, "pi-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "STATUS: done", usage: { totalTokens: 7 } } }));
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agentFor());
+
+    const db = getDb();
+    const row = db.prepare("SELECT status, harness_probe_status, tokens_spent FROM runs WHERE id = ?").get(runId) as {
+      status: string;
+      harness_probe_status: string | null;
+      tokens_spent: number;
+    };
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step-0`) as { status: string };
+    assert.equal(row.status, "completed", "with the probe disabled the round must dispatch work exactly as before");
+    assert.equal(row.harness_probe_status, null, "with the probe disabled the run is never probed (status stays NULL)");
+    assert.equal(row.tokens_spent, 7, "the work round's tokens must attribute normally");
+    assert.equal(step.status, "done", "the claimed step must auto-complete as before");
+
+    const events = getRunEvents(runId);
+    assert.equal(
+      events.filter((e) => e.event === "run.harness_probe_ok" || e.event === "run.harness_probe_failed").length,
+      0,
+      "no probe events may fire when the probe is disabled",
     );
   });
 });

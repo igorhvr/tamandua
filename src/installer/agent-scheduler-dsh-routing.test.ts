@@ -75,6 +75,10 @@ describe("executeDispatchRound dsh routing", () => {
     "DSH_HOME",
     "DEEPSEEK_API_KEY",
     "PATH",
+    // The mock harnesses reply NO_WORK_AVAILABLE to any prompt — they would
+    // never pass a launch-time harness probe — so the probe is disabled for
+    // these dispatch rounds (routing is the behavior under test).
+    "TAMANDUA_HARNESS_PROBE",
   ] as const;
 
   beforeEach(() => {
@@ -88,6 +92,7 @@ describe("executeDispatchRound dsh routing", () => {
     fs.mkdirSync(stateDir, { recursive: true });
     process.env.HOME = homeDir;
     process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
 
     // Guard mock pi: if a dsh run ever misroutes to pi, this fake logs it
     // and the test assertions on the pi log fail loudly.
@@ -395,6 +400,11 @@ describe("dsh-token-saver preference in no-hurry mode", () => {
     "TAMANDUA_PI_BINARY",
     "TAMANDUA_DSH_BINARY",
     "PATH",
+    // The mock harnesses reply NO_WORK_AVAILABLE to any prompt — they would
+    // never pass a launch-time harness probe — so the probe is disabled for
+    // these dispatch rounds (token-saver preference is the behavior under
+    // test).
+    "TAMANDUA_HARNESS_PROBE",
   ] as const;
 
   beforeEach(() => {
@@ -408,6 +418,7 @@ describe("dsh-token-saver preference in no-hurry mode", () => {
     fs.mkdirSync(stateDir, { recursive: true });
     process.env.HOME = homeDir;
     process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
     delete process.env.TAMANDUA_DSH_BINARY;
 
     const piPath = path.join(tempHome, "pi-mock");

@@ -108,7 +108,14 @@ function runDispatchRound(homeDir: string, fakePi: string, runId: string, stepId
 
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     cwd: repoRoot,
-    env: cleanChildEnv({ HOME: homeDir, TAMANDUA_PI_BINARY: fakePi }),
+    env: cleanChildEnv({
+      HOME: homeDir,
+      TAMANDUA_PI_BINARY: fakePi,
+      // The canned fake pi never answers a launch-time harness probe
+      // prompt — disable the probe so work-token attribution is the
+      // behavior under test.
+      TAMANDUA_HARNESS_PROBE: "0",
+    }),
     encoding: "utf-8",
     maxBuffer: 16 * 1024 * 1024,
   });

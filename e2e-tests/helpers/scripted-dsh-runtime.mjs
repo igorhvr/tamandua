@@ -55,6 +55,8 @@ import {
   logInvocation as sharedLogInvocation,
   fatal as sharedFatal,
   applyBehaviorActions,
+  isHarnessProbePrompt,
+  execHarnessProbe,
 } from "./scripted-agent-runtime-shared.mjs";
 
 // ── dsh argv parsing ────────────────────────────────────────────────
@@ -237,6 +239,25 @@ function writeSessionLog(sessionId, tokens) {
       note: `session log write failed: ${err instanceof Error ? err.message : String(err)}`,
     });
   }
+}
+
+// ── Launch-time harness probe (IFLB) ────────────────────────────────
+// The probe prompt is NOT a work prompt (no workflow/agent/run header), so it
+// must be answered BEFORE parsePrompt — otherwise this runtime would fatal on
+// it and the daemon would force-fail every run whose harness is this scripted
+// dsh. Run the exact quoted `<launcher> skill-path` command for real and reply
+// with the PATH on stdout (the dsh headless contract: exactly the final text
+// plus a newline, nothing on stderr). Exit 0 on success. Never journaled,
+// never writes a session file, and never consumes a work index: the probe is
+// not a work round (zero-token round — the daemon attributes no dsh session).
+
+if (isHarnessProbePrompt(prompt)) {
+  const probe = execHarnessProbe(prompt);
+  const reply = probe.ok
+    ? probe.path
+    : `probe command failed (exit ${probe.exitCode ?? "signal"}): ${probe.stderr}`;
+  emitOutput(reply);
+  process.exit(probe.ok ? 0 : 1);
 }
 
 // ── Parse the work prompt ───────────────────────────────────────────

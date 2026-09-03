@@ -41,6 +41,7 @@ src/installer/dsh-resolver.test.ts
 src/installer/dsh-usage.test.ts
 src/installer/events-vocabulary.test.ts
 src/installer/harness-adapter.test.ts
+src/installer/harness-probe.test.ts
 src/installer/harness-type.test.ts
 src/installer/hermes-resolver.test.ts
 src/installer/ledger-gate-enforcement.test.ts

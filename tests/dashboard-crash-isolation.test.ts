@@ -398,7 +398,14 @@ describe("Dashboard crash isolation", () => {
 
   it("daemon and scheduling survive dashboard crash", async () => {
     // ── 1. Start the daemon (control plane + motor) ──────────────────
-    daemonChild = await startDaemonProcess(homeDir, controlPort, scripted.env);
+    // Launch with the launch-time harness probe disabled (deliberate, not a
+    // workaround: the product scripted runtime answers probe prompts, but
+    // dashboard-crash isolation is the behavior under test — probe pass/fail
+    // behavior is covered by the probe e2e suite and scheduler tests).
+    daemonChild = await startDaemonProcess(homeDir, controlPort, {
+      ...scripted.env,
+      TAMANDUA_HARNESS_PROBE: "0",
+    });
     assert.ok(daemonChild.pid, "daemon should have a PID");
     assert.ok(isProcessAlive(daemonChild.pid), "daemon should be alive after start");
 

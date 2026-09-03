@@ -3008,6 +3008,7 @@ describe("control-plane terminate settles in-flight rounds (TATR US-005)", { con
   let origControlPort: string | undefined;
   let origPiBinary: string | undefined;
   let origRoundMarker: string | undefined;
+  let origHarnessProbe: string | undefined;
 
   before(async () => {
     origHome = process.env.HOME;
@@ -3016,6 +3017,7 @@ describe("control-plane terminate settles in-flight rounds (TATR US-005)", { con
     origControlPort = process.env.TAMANDUA_CONTROL_PORT;
     origPiBinary = process.env.TAMANDUA_PI_BINARY;
     origRoundMarker = process.env.TAMANDUA_ROUND_MARKER;
+    origHarnessProbe = process.env.TAMANDUA_HARNESS_PROBE;
 
     tempHome = tamanduaTempDir("tamandua-settle-ep-");
     stateDir = path.join(tempHome, ".tamandua");
@@ -3025,6 +3027,10 @@ describe("control-plane terminate settles in-flight rounds (TATR US-005)", { con
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
+    // The canned fake-pi shim never answers a launch-time harness probe
+    // prompt, so the probe is disabled for the dispatch round this suite
+    // exercises (the settle semantics are the behavior under test).
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
 
     secret = crypto.randomBytes(16).toString("hex");
     fs.mkdirSync(path.dirname(path.join(stateDir, "daemon-secret")), { recursive: true });
@@ -3059,6 +3065,8 @@ describe("control-plane terminate settles in-flight rounds (TATR US-005)", { con
     else delete process.env.TAMANDUA_PI_BINARY;
     if (origRoundMarker) process.env.TAMANDUA_ROUND_MARKER = origRoundMarker;
     else delete process.env.TAMANDUA_ROUND_MARKER;
+    if (origHarnessProbe) process.env.TAMANDUA_HARNESS_PROBE = origHarnessProbe;
+    else delete process.env.TAMANDUA_HARNESS_PROBE;
     if (tempHome) fs.rmSync(tempHome, { recursive: true, force: true });
   });
 

@@ -700,6 +700,283 @@ describe("YSE stories resume_reset_count migration", () => {
   });
 });
 
+describe("IFLB harness probe persistence columns migration", () => {
+  // IFLB US-001: runs.harness_probe_status (TEXT, NULL = never probed; later
+  // 'probing' | 'ok' | 'failed') + runs.harness_probe_at (TEXT, NULL = never
+  // probed; ISO timestamp when the probe outcome was recorded) durably record
+  // the launch-time harness probe outcome so the dispatch motor probes a run
+  // exactly ONCE and a daemon restart does not re-probe a passed run. Both are
+  // nullable with no backfill, added to the runs table via guarded idempotent
+  // ALTERs (the runs CREATE TABLE keeps its explicit column list unchanged),
+  // with SCHEMA_VERSION bumped (v8 → v9) so existing v8 installs actually run
+  // the migration (the WLST5.1 failure mode). Existing rows read back NULL.
+
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  // Pre-IFLB (v8) runs schema: identical to the current shape except runs
+  // lacks harness_probe_status and harness_probe_at.
+  const LEGACY_V8_DDL = `
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      run_number INTEGER,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      notify_url TEXT,
+      scheduling_status TEXT,
+      scheduling_requested_at TEXT,
+      scheduling_error TEXT,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      parent_run_id TEXT,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      test_cmd_established TEXT,
+      test_cmd_source TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      input_template TEXT NOT NULL,
+      expects TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      claim_job_id TEXT,
+      claim_pid INTEGER,
+      claim_pgid INTEGER,
+      claim_updated_at TEXT,
+      reroute_count INTEGER DEFAULT 0,
+      terminal_reroute_count INTEGER DEFAULT 0,
+      ledger_concession_count INTEGER DEFAULT 0,
+      claim_invalidated_by TEXT,
+      conditional_condition TEXT,
+      auto_completed INTEGER NOT NULL DEFAULT 0,
+      auto_complete_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE stories (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      story_index INTEGER NOT NULL,
+      story_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      abandoned_count INTEGER DEFAULT 0,
+      resume_reset_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO runs (
+      id, run_number, workflow_id, task, status, context, tokens_spent,
+      worker_lost_count, ceiling_expiry_count, instant_fail_count,
+      created_at, updated_at
+    ) VALUES (
+      'legacy-run', 1, 'workflow', 'task', 'running', '{}', 42, 3, 0, 2,
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+  `;
+
+  function runInSubprocess(
+    th: { homeDir: string },
+    dbPath: string,
+    script: string,
+  ): string {
+    return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    }).trim();
+  }
+
+  before(() => {
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  it("fresh DB: runs has both harness probe columns at SCHEMA_VERSION", () => {
+    const th = createTempHome("tamandua-iflb-fresh-");
+    const dbPath = path.join(th.root, "fresh.db");
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const statusCol = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "harness_probe_status");',
+      'const atCol = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "harness_probe_at");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      "console.log(JSON.stringify({ statusCol, atCol, user_version: ver.user_version }));",
+    ].join("\n");
+
+    const result = runInSubprocess(th, dbPath, script);
+    const parsed = JSON.parse(result) as {
+      statusCol?: { type: string; notnull: number; dflt_value: string | null };
+      atCol?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+    };
+
+    assert.equal(parsed.user_version, SCHEMA_VERSION,
+      `fresh DB should be stamped at ${SCHEMA_VERSION}`);
+    assert.ok(parsed.statusCol, "harness_probe_status column should exist on a fresh DB");
+    assert.equal(parsed.statusCol.type, "TEXT", "harness_probe_status should be TEXT");
+    assert.equal(parsed.statusCol.notnull, 0, "harness_probe_status should be nullable");
+    assert.equal(parsed.statusCol.dflt_value, null, "harness_probe_status should have no default");
+    assert.ok(parsed.atCol, "harness_probe_at column should exist on a fresh DB");
+    assert.equal(parsed.atCol.type, "TEXT", "harness_probe_at should be TEXT");
+    assert.equal(parsed.atCol.notnull, 0, "harness_probe_at should be nullable");
+    assert.equal(parsed.atCol.dflt_value, null, "harness_probe_at should have no default");
+  });
+
+  it("migrates a pre-IFLB (v8) DB: adds both columns, re-stamps version, status SELECT works", () => {
+    // Regression for the WLST5.1 failure mode: adding the guarded harness
+    // probe ALTERs without bumping SCHEMA_VERSION would leave every existing
+    // DB (user_version === SCHEMA_VERSION) early-returned and skipping the
+    // migration — the dispatch motor's probe status reads then crash with
+    // "no such column: harness_probe_status". This fixture is the exact
+    // broken state a real pre-v9 install carries: user_version at the
+    // pre-bump version with a runs table lacking the columns.
+    const PRE_IFLB_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-iflb-migrate-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V8_DDL}
+      PRAGMA user_version = ${PRE_IFLB_SCHEMA_VERSION};
+    `);
+    // Sanity: the legacy DB really is in the pre-IFLB broken state.
+    const preCols = legacyDb.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    assert.ok(preCols.some((c) => c.name === "instant_fail_count"), "precondition: legacy runs has instant_fail_count");
+    assert.ok(preCols.some((c) => c.name === "test_cmd_established"), "precondition: legacy runs has test_cmd_established");
+    assert.ok(!preCols.some((c) => c.name === "harness_probe_status"), "precondition: legacy runs lacks harness_probe_status");
+    assert.ok(!preCols.some((c) => c.name === "harness_probe_at"), "precondition: legacy runs lacks harness_probe_at");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, PRE_IFLB_SCHEMA_VERSION, "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    // Spawn a fresh subprocess so getDb() runs migrate() from scratch on the legacy file.
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const statusCol = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "harness_probe_status");',
+      'const atCol = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "harness_probe_at");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      // The exact status SELECT shape from src/installer/status.ts — extended
+      // with the new columns; must no longer throw and must read NULL.
+      'const row = db.prepare("SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, harness_probe_status, harness_probe_at FROM runs WHERE id = ?").get("legacy-run");',
+      "console.log(JSON.stringify({ statusCol, atCol, user_version: ver.user_version, row }));",
+    ].join("\n");
+
+    const result = runInSubprocess(th, dbPath, script);
+    const migrated = JSON.parse(result) as {
+      statusCol?: { type: string; notnull: number; dflt_value: string | null };
+      atCol?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+      row: {
+        id: string;
+        instant_fail_count: number;
+        worker_lost_count: number;
+        ceiling_expiry_count: number;
+        harness_probe_status: string | null;
+        harness_probe_at: string | null;
+      };
+    };
+
+    assert.ok(migrated.statusCol, "harness_probe_status column should be added by migration");
+    assert.equal(migrated.statusCol.type, "TEXT", "harness_probe_status should be TEXT");
+    assert.equal(migrated.statusCol.notnull, 0, "harness_probe_status should be nullable");
+    assert.equal(migrated.statusCol.dflt_value, null, "harness_probe_status should have no default");
+    assert.ok(migrated.atCol, "harness_probe_at column should be added by migration");
+    assert.equal(migrated.atCol.type, "TEXT", "harness_probe_at should be TEXT");
+    assert.equal(migrated.atCol.notnull, 0, "harness_probe_at should be nullable");
+    assert.equal(migrated.atCol.dflt_value, null, "harness_probe_at should have no default");
+    assert.equal(migrated.user_version, SCHEMA_VERSION,
+      `user_version should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
+    assert.equal(migrated.row.harness_probe_status, null, "legacy row reads back harness_probe_status = NULL (never probed)");
+    assert.equal(migrated.row.harness_probe_at, null, "legacy row reads back harness_probe_at = NULL (never probed)");
+    assert.equal(migrated.row.instant_fail_count, 2, "existing RSPN counter untouched");
+    assert.equal(migrated.row.worker_lost_count, 3, "existing WLST5 counters untouched");
+    assert.equal(migrated.row.ceiling_expiry_count, 0, "existing WLST5 counters untouched");
+  });
+
+  it("migration is idempotent: repeated migration does not duplicate the columns", () => {
+    const PRE_IFLB_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-iflb-idempotent-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V8_DDL}
+      PRAGMA user_version = ${PRE_IFLB_SCHEMA_VERSION};
+    `);
+    legacyDb.close();
+
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const count = (n) => db.prepare("PRAGMA table_info(runs)").all().filter((c) => c.name === n).length;',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      "console.log(JSON.stringify({ status: count('harness_probe_status'), at: count('harness_probe_at'), user_version: ver.user_version }));",
+    ].join("\n");
+
+    // Migrate twice (two separate subprocesses) — second run must not error or duplicate.
+    const first = JSON.parse(runInSubprocess(th, dbPath, script)) as {
+      status: number;
+      at: number;
+      user_version: number;
+    };
+    const second = JSON.parse(runInSubprocess(th, dbPath, script)) as {
+      status: number;
+      at: number;
+      user_version: number;
+    };
+    assert.equal(first.status, 1, "harness_probe_status should appear exactly once after first migration");
+    assert.equal(first.at, 1, "harness_probe_at should appear exactly once after first migration");
+    assert.equal(second.status, 1, "harness_probe_status must not be duplicated by repeated migration");
+    assert.equal(second.at, 1, "harness_probe_at must not be duplicated by repeated migration");
+    assert.equal(second.user_version, SCHEMA_VERSION,
+      "repeated migration should keep user_version stamped at SCHEMA_VERSION");
+  });
+});
+
 describe("steps ledger_concession_count migration", () => {
   it("adds the column to a legacy steps table without losing rows", () => {
     const th = createTempHome("tamandua-ledger-concession-migration-");

@@ -576,6 +576,43 @@ function getRedLedgerLanding(runId: string): RedLedgerLanding | undefined {
   return undefined;
 }
 
+/**
+ * Read the last durable launch-time-harness-probe failure keyline block
+ * (IFLB US-004) for a run from its per-run events file. The probe-failing
+ * dispatch round wrote the full mechanical block to the
+ * run.harness_probe_failed event's reason/detail BEFORE force-failing the
+ * run, so the block survives daemon/CLI restarts and can be shown verbatim
+ * by operator surfaces (workflow status, workflow run --wait).
+ *
+ * Falls back to the last run.force_failed event whose reason carries the
+ * mechanical probe signature: the defensive re-force-fail path can emit the
+ * block through forceFailRun without a fresh run.harness_probe_failed (e.g.
+ * after a daemon crash between the record and the force-fail). A
+ * run.force_failed carrying any other reason (operator force-fail, RSPN
+ * escalation) is never treated as a probe failure.
+ *
+ * Returns undefined when the run was never probe-failed.
+ */
+export function readHarnessProbeFailureBlock(runId: string): string | undefined {
+  const events = getRunEvents(runId, 50);
+  for (let i = events.length - 1; i >= 0; i--) {
+    const evt = events[i];
+    if (evt.event === "run.harness_probe_failed") {
+      return evt.reason ?? evt.detail;
+    }
+  }
+  for (let i = events.length - 1; i >= 0; i--) {
+    const evt = events[i];
+    if (evt.event === "run.force_failed") {
+      const text = evt.reason ?? evt.detail;
+      if (typeof text === "string" && text.startsWith("FAILURE_CLASS: harness_unavailable")) {
+        return text;
+      }
+    }
+  }
+  return undefined;
+}
+
 function buildRunDetail(
   db: ReturnType<typeof getDb>,
   row: RunRow,

@@ -7,6 +7,7 @@
 import { resolveRunSelectors } from "../../installer/run-selector.js";
 import { getDb } from "../../db.js";
 import { resolvePiStateDir } from "../../installer/paths.js";
+import { readHarnessProbeFailureBlock } from "../../installer/status.js";
 import { parseDuration, readOption } from "../shared.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -170,6 +171,28 @@ export function formatHumanOutput(result: WaitResult): string {
       return `${snapshot} run-${r.runId.slice(0, 8)} ${r.workflowId} ${r.status} ${duration} ${r.tokensSpent.toLocaleString()} tokens`;
     })
     .join("\n") + "\n";
+}
+
+/**
+ * IFLB US-004: append the durable launch-time-harness-probe failure keyline
+ * block for every terminal-failed run that carries one. Runs without a probe
+ * failure add nothing, so wait's human output for them stays byte-for-byte
+ * unchanged. The block is read from the run's per-run events file (the same
+ * durable read the probe round wrote before force-failing), so a
+ * probe-failed run still renders its reason after a daemon/CLI restart, and
+ * it is the final text an operator sees — FAILURE_CLASS first, STDERR_TAIL
+ * last, no prose after it.
+ */
+export function appendHarnessProbeFailureBlocks(humanOutput: string, runs: RunState[]): string {
+  const blocks: string[] = [];
+  for (const r of runs) {
+    if (r.status !== "failed") continue;
+    const block = readHarnessProbeFailureBlock(r.runId);
+    if (block) blocks.push(block);
+  }
+  if (blocks.length === 0) return humanOutput;
+  const base = humanOutput.endsWith("\n") ? humanOutput.slice(0, -1) : humanOutput;
+  return `${base}\n\n${blocks.join("\n\n")}\n`;
 }
 
 function isDaemonRunning(stateDir: string): boolean {
@@ -376,7 +399,9 @@ export async function handleWait(args: string[]): Promise<number> {
               formatJsonOutput({ runs: states, timedOut: !allDone }),
             );
           } else {
-            process.stdout.write(formatHumanOutput({ runs: states, timedOut: !allDone }));
+            process.stdout.write(
+              appendHarnessProbeFailureBlocks(formatHumanOutput({ runs: states, timedOut: !allDone }), states),
+            );
           }
         }
 
@@ -421,7 +446,9 @@ export async function handleWait(args: string[]): Promise<number> {
           if (jsonFlag) {
             process.stdout.write(formatJsonOutput({ runs: states, timedOut: false }));
           } else {
-            process.stdout.write(formatHumanOutput({ runs: states, timedOut: false }));
+            process.stdout.write(
+              appendHarnessProbeFailureBlocks(formatHumanOutput({ runs: states, timedOut: false }), states),
+            );
           }
         }
         exitCode = computeExitCode(states, false);

@@ -46,6 +46,8 @@ import {
   logInvocation as sharedLogInvocation,
   fatal as sharedFatal,
   applyBehaviorActions,
+  isHarnessProbePrompt,
+  execHarnessProbe,
 } from "./runtime-shared.mjs";
 
 // ── Hermes argv parsing ────────────────────────────────────────────
@@ -298,6 +300,34 @@ function writeSessionRow(sessionId, tokens) {
     });
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// KNOB-REGION-BEGIN — IFLB US-007 launch-time harness probe support
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Launch-time harness probe (IFLB) ────────────────────────────────
+// The probe prompt is NOT a work prompt (no workflow/agent/run header), so it
+// must be answered BEFORE parsePrompt — otherwise this runtime would fatal on
+// it and the daemon would force-fail every run whose harness is this scripted
+// hermes. Run the exact quoted `<launcher> skill-path` command for real and
+// reply with the PATH as the plain-text final message on stdout (the hermes
+// adapter reads stdout as the final assistant text). Exit 0 on success. Never
+// journaled, never writes a state.db session row, and never consumes a work
+// index: the probe is not a work round (zero-token round — the daemon reads
+// no session_id trailer and attributes 0 tokens).
+
+if (isHarnessProbePrompt(prompt)) {
+  const probe = execHarnessProbe(prompt);
+  const reply = probe.ok
+    ? probe.path
+    : `probe command failed (exit ${probe.exitCode ?? "signal"}): ${probe.stderr}`;
+  process.stdout.write(reply.endsWith("\n") ? reply : `${reply}\n`);
+  process.exit(probe.ok ? 0 : 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// KNOB-REGION-END
+// ═══════════════════════════════════════════════════════════════════
 
 // ── Parse the work prompt ───────────────────────────────────────────
 //
