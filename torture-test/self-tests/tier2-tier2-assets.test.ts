@@ -222,21 +222,42 @@ describe("Tier-2 assets + --tier2 ladder rung (US-015)", () => {
     // US-002 red-then-green: a scratch copy of the tree (own git checkout)
     // with ONE tracked scenario dropped from the index must make the gate
     // refuse naming the dir; restoring it must pass again.
+    //
+    // S58 US-007: tt-tier2-assets now validates every manifest-referenced
+    // scenario_path through validate-scenario.mjs + the scenario-workflow
+    // parity guard, so the scratch copy carries the full validation surface:
+    // the scenarios/lib modules, the scenario cell
+    // (w4.21/bare-noninteractive-launch), the bundled workflow yml it
+    // references, and the oracle executables its metadata names. The manifest
+    // references the CELL dir (like the real tier2.jsonl), not the wave
+    // container.
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), `tt-tier2-tracked-${process.pid}-`));
     try {
       const sBin = path.join(scratch, "bin");
       const sCases = path.join(scratch, "cases");
       const sVar = path.join(scratch, "var");
       const sLib = path.join(scratch, "scenarios", "lib");
+      const sOracles = path.join(scratch, "oracles");
+      const sWorkflow = path.join(scratch, "workflows", "bug-fix-merge-worktree");
       fs.mkdirSync(sBin, { recursive: true });
       fs.mkdirSync(sCases, { recursive: true });
       fs.mkdirSync(sVar, { recursive: true });
       fs.mkdirSync(sLib, { recursive: true });
+      fs.mkdirSync(sOracles, { recursive: true });
+      fs.mkdirSync(sWorkflow, { recursive: true });
       fs.copyFileSync(assetsValidator, path.join(sBin, "tt-tier2-assets"));
+      for (const lib of ["tracked-tree.mjs", "validate-scenario.mjs", "scenario-workflow-parity.mjs"]) {
+        fs.copyFileSync(path.join(ttRoot, "scenarios", "lib", lib), path.join(sLib, lib));
+      }
       fs.copyFileSync(
-        path.join(ttRoot, "scenarios", "lib", "tracked-tree.mjs"),
-        path.join(sLib, "tracked-tree.mjs"),
+        path.join(repoRoot, "workflows", "bug-fix-merge-worktree", "workflow.yml"),
+        path.join(sWorkflow, "workflow.yml"),
       );
+      for (const oracle of ["O1", "O3z", "O11"]) {
+        const dst = path.join(sOracles, oracle);
+        fs.copyFileSync(path.join(ttRoot, "oracles", oracle), dst);
+        fs.chmodSync(dst, 0o755);
+      }
       fs.cpSync(path.join(ttRoot, "scenarios", "w4.21"), path.join(scratch, "scenarios", "w4.21"), { recursive: true });
       const init = spawnSync("git", ["init", "-q", scratch], { encoding: "utf8" });
       assert.equal(init.status, 0, init.stderr);
@@ -248,7 +269,7 @@ describe("Tier-2 assets + --tier2 ladder rung (US-015)", () => {
         id: "T2-SCRATCH",
         seed: undefined,
         task: "var/tier2-scratch-task.md",
-        context: { execution_mode: "scripted", scenario_id: "w4.21-bare-noninteractive-launch", scenario_path: "scenarios/w4.21" },
+        context: { execution_mode: "scripted", scenario_id: "w4.21-bare-noninteractive-launch", scenario_path: "scenarios/w4.21/bare-noninteractive-launch" },
       }))}\n`);
       const runScratch = (): RunResult => {
         const res = spawnSync(path.join(sBin, "tt-tier2-assets"), [scratchManifestPath], {

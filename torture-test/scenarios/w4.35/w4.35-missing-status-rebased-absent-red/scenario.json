@@ -52,6 +52,9 @@
     "run_failed_events": 1,
     "run_completed_events": 0,
     "overlapping_dispatches": 0,
-    "system_tokens_spent": 0
+    "system_tokens_spent": 0,
+    "reviewer_auto_completed": 1,
+    "auditor_invocations": 1,
+    "auditor_auto_completed": 0
   }
 }

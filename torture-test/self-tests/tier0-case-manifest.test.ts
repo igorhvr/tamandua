@@ -132,6 +132,44 @@ describe("Tier-0 case manifest", () => {
     assert.deepEqual(hermes?.requires?.toolchains, ["node"]);
 
     assert.ok(cases.reduce((sum, record) => sum + record.caps.tokens, 0) <= 2_000_000, "Tier-0 exceeds 2M tokens");
-    assert.ok(cases.reduce((sum, record) => sum + record.caps.wall_min, 0) <= 180, "Tier-0 exceeds 180 wall minutes");
+    // S58 US-002: the aggregate wall budget grew 180 -> 181 because the
+    // WAVE-A deception_audit round (dispatched on every CANNOT_REPRODUCE
+    // fixer completion) adds ~1 wall minute to each scripted w4.35 corridor —
+    // w4.35-done-rebased-absent-green measured 240.0s natural vs its 240s
+    // pre-WAVE-A budget. Each story adjusts this only by the wall it
+    // legitimately adds (documented in torture-test/impl-tasks/S58-pin-reasons.md).
+    // S58 US-003: 181 -> 186 — the five non-RSTY w4.35-retry-* corridors gained
+    // the WAVE-A auditor round and measured ~360s natural (runner PASS JSON
+    // emitted at the 360s deadline before exit could be reaped), so their
+    // wall_min budgets rose 6 -> 7. w4.35-retry-rebased-true-green (the RSTY
+    // story-loop cell) did NOT get a certified bump: it is RED on the
+    // corrected product — WAVE-A's deception_audit step between the fix loop
+    // and its verify_step deadlocks the verify_each pause (see the US-003
+    // product-finding note in torture-test/impl-tasks/S58-pin-reasons.md); its
+    // wall stays at the pre-existing 7m until the product is fixed.
+    // S58 US-004: 186 -> 192 — all six w4.35-failed-* corridors gained the
+    // WAVE-A auditor round and measured ~360.0s natural on the corrected
+    // product (w4.35-failed-rebased-absent-green's runner emitted its PASS
+    // JSON at the exact 360s deadline and was SIGTERM'd before exit could be
+    // reaped — command.result.json: signal SIGTERM, "case wall limit reached"),
+    // so their wall_min budgets rose 6 -> 7. Runtime-budget adjustment only;
+    // every semantic invariant is unchanged and re-asserted by the runner.
+    // S58 US-005: 192 -> 198 — the six w4.35-missing-status-* corridors show
+    // the identical signature on the corrected product (probe of
+    // w4.35-missing-status-rebased-absent-green: runner PASS JSON emitted at
+    // the exact 360s deadline, SIGTERM before exit reap, wall 360000 ms), so
+    // their wall_min budgets rose 6 -> 7 and every cell re-certified GREEN at
+    // the 7 m budget (~363-364 s natural). Runtime-budget adjustment only.
+    // S58 US-006: 198 -> 200 — W0.2-scripted-e2e (the smoke/scripted e2e
+    // battery + stress-concurrent hook) re-certified GREEN on the corrected
+    // product at a raised budget: its natural run measures ~238s (3m58s,
+    // run-… PASS at wall 5), which exceeds the pre-WAVE-A 3-minute pin the
+    // cell was authored with (its wall_min budget of 3 SIGTERM'd the case at
+    // the exact 180s deadline on the corrected product — command.result.json:
+    // signal SIGTERM, "case wall limit reached"). The hook also now seeds the
+    // contained stub ~/.pi (mirroring run-w0.1) so the smoke battery's
+    // createTempHome symlink unit test passes standalone. Runtime-budget
+    // adjustment only; no semantic invariant changed.
+    assert.ok(cases.reduce((sum, record) => sum + record.caps.wall_min, 0) <= 200, "Tier-0 exceeds 200 wall minutes");
   });
 });

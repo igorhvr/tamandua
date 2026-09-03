@@ -270,6 +270,17 @@ ordered, distinct, actionable validation codes and missing/invalid-key metadata 
 claim attempt; a generic or collapsed rejection is a finding. The submitted output
 body and agent prose are never oracle inputs.
 
+WAVE-A conditional auto-completion: a done step with `steps.auto_completed=1`
+completed IN-PROCESS (the dispatch motor auto-completes a conditional step whose
+activation condition is unset, `auto_complete_reason='condition_unset:<key>'`) with
+ZERO dispatches — no agent output exists, so the per-dispatch accepted-done
+invariant is vacuous by construction on such steps, and the step is not a finding.
+The corridor stays disciplined: an auto-completed step must be a `conditional` step
+with a `condition_unset:` reason and must carry NO dispatch-rendering and NO
+expects-validation telemetry (auto-completion never claims, renders, or validates);
+any telemetry on an auto-completed step is a finding. Evidence snapshots captured
+before WAVE-A (no `auto_completed` column) replay unchanged.
+
 Every `run.tokens.updated` delta must bind mechanically to exactly one
 `(run, step, round)` and one captured harness usage observation. Each run's stored
 `runs.tokens_spent` equals the sum of its attributed deltas; a scripted run equals

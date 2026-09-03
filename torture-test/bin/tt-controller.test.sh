@@ -6713,6 +6713,10 @@ cp "$SCRIPT_DIR/tt-run" "$launcher_root/bin/tt-run"
 cp "$SCRIPT_DIR/tt-tier0-assets" "$launcher_root/bin/tt-tier0-assets"
 cp "$TT_DIR/scenarios/lib/validate-scenario.mjs" "$launcher_root/scenarios/lib/validate-scenario.mjs"
 cp "$TT_DIR/scenarios/lib/tracked-tree.mjs" "$launcher_root/scenarios/lib/tracked-tree.mjs"
+# S58 US-007: tt-tier0-assets now runs the scenario-workflow parity guard
+# (roster + WAVE-A fix-expects) via scenarios/lib/scenario-workflow-parity.mjs,
+# so the launcher fixture must carry that lib too.
+cp "$TT_DIR/scenarios/lib/scenario-workflow-parity.mjs" "$launcher_root/scenarios/lib/scenario-workflow-parity.mjs"
 : > "$launcher_root/cases/smoke.jsonl"
 cat > "$TEST_ROOT/workflows/do-now/workflow.yml" <<'YAML'
 id: do-now
@@ -6828,16 +6832,25 @@ for launcher_bad_args in \
     || fail "tt-run accepted conflicting/unknown arguments '$launcher_bad_args' with exit $launcher_status"
 done
 
+# S58 US-007: an INVALID scenario library (assets PRESENT but the tier0 asset
+# validator fails) is a RED gate — never the exit-3 "not implemented" that
+# masked the WAVE-A drift. --help marks the tier INVALID (not available, not
+# NOT YET IMPLEMENTED) and a requested --tier0 exits 1 carrying the
+# validator's named reason on stderr.
 chmod -x "$launcher_root/scenarios/example/run.sh"
 launcher_help=$("$launcher_root/bin/tt-run" --help)
+printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[INVALID' \
+  || fail "tt-run --help must mark Tier-0 INVALID (assets present but gate red) with an invalid scenario library: $launcher_help"
 printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[NOT YET IMPLEMENTED\]' \
-  || fail "tt-run --help advertised Tier-0 with an invalid scenario library: $launcher_help"
+  && fail "tt-run --help must NOT report an invalid scenario library as NOT YET IMPLEMENTED: $launcher_help"
 set +e
 TT_FAKE_CONTROLLER_LOG="$launcher_log" "$launcher_root/bin/tt-run" --tier0 \
-  >"$TEST_ROOT/tier0-unavailable.stdout" 2>"$TEST_ROOT/tier0-unavailable.stderr"
+  >"$TEST_ROOT/tier0-invalid.stdout" 2>"$TEST_ROOT/tier0-invalid.stderr"
 launcher_status=$?
 set -e
-[ "$launcher_status" -eq 3 ] || fail "unavailable Tier-0 assets exited $launcher_status instead of 3"
+[ "$launcher_status" -eq 1 ] || fail "invalid Tier-0 assets exited $launcher_status instead of 1 (RED)"
+grep -q 'not executable' "$TEST_ROOT/tier0-invalid.stderr" \
+  || fail "invalid Tier-0 assets must surface the validator's named reason on stderr: $(cat "$TEST_ROOT/tier0-invalid.stderr" 2>/dev/null | tail -3)"
 chmod +x "$launcher_root/scenarios/example/run.sh"
 
 for required_asset in "$launcher_root/bin/tt-controller" "$launcher_root/cases/tier0.jsonl"; do
@@ -6845,6 +6858,12 @@ for required_asset in "$launcher_root/bin/tt-controller" "$launcher_root/cases/t
   launcher_help=$("$launcher_root/bin/tt-run" --help)
   printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[NOT YET IMPLEMENTED\]' \
     || fail "tt-run --help advertised Tier-0 without required asset $required_asset: $launcher_help"
+  set +e
+  TT_FAKE_CONTROLLER_LOG="$launcher_log" "$launcher_root/bin/tt-run" --tier0 \
+    >"$TEST_ROOT/tier0-absent.stdout" 2>"$TEST_ROOT/tier0-absent.stderr"
+  absent_status=$?
+  set -e
+  [ "$absent_status" -eq 3 ] || fail "genuinely absent Tier-0 assets exited $absent_status instead of 3"
   mv "$required_asset.missing" "$required_asset"
 done
 pass "tt-run detects validated Tier-0 assets, defaults to zero-token routing, gates real cases, and preserves verdict exits"

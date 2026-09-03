@@ -110,6 +110,12 @@ const allowed = [
   "torture-test/cases/case.schema.json",
   "torture-test/cases/tier1-traceability.md",
   "torture-test/cases/tasks/tier1/",
+  // S58 (US-002..US-006, US-011): the tier0 scripted-scenario parity sweep
+  // legitimately authors the tier0 manifest — mirroring every scenario.json
+  // expected_route change into tier0.jsonl context.scenario_expected_route
+  // (tt-tier0-assets deep-equality enforces the mirror) plus the W0.2 wall
+  // budget bump. Same authoring class as the tier1/tier2 manifests above.
+  "torture-test/cases/tier0.jsonl",
   // Tier-2 roster (US-004): the wave-4 section-A manifest, its
   // traceability skeleton, and its task files are part of the Tier-2
   // authoring surface — exactly like the tier1 manifest/traceability/tasks

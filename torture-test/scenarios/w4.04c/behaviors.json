@@ -26,7 +26,7 @@
         "git add -A",
         "git commit -m \"fix: restore canonical date handling (scripted BUG-T2)\""
       ],
-      "output": "STATUS: done\nCHANGES: restored canonical date handling (scripted BUG-T2 fix)\nREGRESSION_TEST: scripted keyline evidence",
+      "output": "STATUS: done\nCHANGES: restored canonical date handling (scripted BUG-T2 fix)\nREGRESSION_TEST: scripted keyline evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
       "tokens": 0
     },
     "verifier": {

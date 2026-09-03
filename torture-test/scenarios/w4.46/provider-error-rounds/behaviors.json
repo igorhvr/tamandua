@@ -12,7 +12,7 @@
       "commands": [
         "git checkout -b w446-fix"
       ],
-      "output": "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: true\nBASELINE: deterministic fixture ready",
+      "output": "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: npm test\nBASELINE: deterministic fixture ready",
       "tokens": 0
     },
     "fixer": [
@@ -45,7 +45,7 @@
           "git add -A",
           "git commit -m \"fix: restore getByCategory filter (scripted BUG-T1)\""
         ],
-        "output": "STATUS: done\nCHANGES: restored the getByCategory filter (scripted BUG-T1 fix)\nREGRESSION_TEST: scripted stream-torture evidence",
+        "output": "STATUS: done\nCHANGES: restored the getByCategory filter (scripted BUG-T1 fix)\nREGRESSION_TEST: scripted stream-torture evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
         "tokens": 0
       }
     ],

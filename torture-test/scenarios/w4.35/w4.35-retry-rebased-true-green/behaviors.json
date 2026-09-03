@@ -28,11 +28,11 @@
           "git add value.txt",
           "git commit -m \"fix: update scripted retry matrix fixture\""
         ],
-        "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: scripted FMIS retry matrix evidence",
+        "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: scripted FMIS retry matrix evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
         "tokens": 0
       },
       {
-        "output": "STATUS: done\nCHANGES: retained the post-review fixture correction\nREGRESSION_TEST: scripted FMIS retry matrix evidence",
+        "output": "STATUS: done\nCHANGES: retained the post-review fixture correction\nREGRESSION_TEST: scripted FMIS retry matrix evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
         "tokens": 0
       }
     ],

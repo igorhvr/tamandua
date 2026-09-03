@@ -1034,6 +1034,149 @@ else
 fi
 if $all_ok; then pass "failing environment gate => surfaced + non-zero, no bootstrap"; fi
 
+# ===========================================================================
+# US-007 (S58): tt-run RED semantics — three asset states, never conflated.
+#
+# 'assets present but INVALID' (validator exits non-zero) must exit 1 (RED)
+# and surface the validator's captured stderr (its named reason); 'assets
+# absent' keeps exit 3 (not implemented); 'valid assets' runs. There is no
+# path where an invalid-asset tier is silently skipped or reported as
+# not-implemented.
+# ===========================================================================
+US7_HOME="$(mktemp -d)"
+US7_CLEANED=""
+us7_cleanup() {
+  if [ -z "$US7_CLEANED" ]; then
+    US7_CLEANED=1
+    rm -rf "$US7_HOME"
+  fi
+}
+
+# Recording controller stub (whole-script dispatch) + a tier0-assets stub whose
+# behavior is controlled per test.
+mkdir -p "$US7_HOME/bin" "$US7_HOME/cases"
+cp "$TT_RUN" "$US7_HOME/bin/tt-run"
+cat > "$US7_HOME/bin/tt-controller" <<'EOS'
+#!/usr/bin/env bash
+echo "CONTROLLER_ARGS:$*"
+exit 0
+EOS
+chmod +x "$US7_HOME/bin/tt-controller"
+echo '{"id":"dummy"}' > "$US7_HOME/cases/tier0.jsonl"
+echo '{"id":"dummy"}' > "$US7_HOME/cases/smoke.jsonl"
+
+# ---------------------------------------------------------------------------
+# Test: valid assets -> tier_assets_state available; --tier0 runs the
+# controller (whole-script exit 0 via the recording stub).
+# ---------------------------------------------------------------------------
+total_count=$((total_count + 1))
+echo "--- Test: US-007 valid assets -> available + --tier0 runs ---" >&2
+cat > "$US7_HOME/bin/tt-tier0-assets" <<'EOS'
+#!/usr/bin/env bash
+echo "Tier-0 assets OK"
+exit 0
+EOS
+chmod +x "$US7_HOME/bin/tt-tier0-assets"
+us7_avail=$(_run_fn "
+  TT_BIN_DIR='$US7_HOME/bin'
+  TT_DIR='$US7_HOME'
+  export TT_BIN_DIR TT_DIR
+  export PATH=\"\$TT_BIN_DIR:\$PATH\"
+  tier_assets_state tier0
+")
+if [ "$us7_avail" = "available" ]; then
+  pass "tier_assets_state tier0 = available with a passing validator"
+else
+  fail "tier_assets_state tier0 = '$us7_avail', expected available"
+fi
+set +e
+us7_run=$(bash "$US7_HOME/bin/tt-run" --tier0 2>&1)
+us7_ec=$?
+set -e
+if [ "$us7_ec" -eq 0 ] && echo "$us7_run" | grep -q 'CONTROLLER_ARGS' && echo "$us7_run" | grep -q 'scripted-only'; then
+  pass "--tier0 with valid assets runs the controller (--scripted-only, exit 0)"
+else
+  fail "--tier0 with valid assets: exit=$us7_ec out=$(echo "$us7_run" | tail -3)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test: validator exits non-zero -> exit 1 (RED) and stderr carries the
+# validator's named reason (never exit 3 / never swallowed).
+# ---------------------------------------------------------------------------
+total_count=$((total_count + 1))
+echo "--- Test: US-007 invalid assets -> exit 1 with the validator's reason ---" >&2
+cat > "$US7_HOME/bin/tt-tier0-assets" <<'EOS'
+#!/usr/bin/env bash
+echo "Tier-0 assets unavailable: w4.35-done-rebased-absent-green scenario behaviors.json roster drift (expected auditor, fixer, ..., got fixer)" >&2
+exit 1
+EOS
+chmod +x "$US7_HOME/bin/tt-tier0-assets"
+us7_state=$(_run_fn "
+  TT_BIN_DIR='$US7_HOME/bin'
+  TT_DIR='$US7_HOME'
+  export TT_BIN_DIR TT_DIR
+  export PATH=\"\$TT_BIN_DIR:\$PATH\"
+  tier_assets_state tier0
+")
+if [ "$us7_state" = "invalid" ]; then
+  pass "tier_assets_state tier0 = invalid with a failing validator"
+else
+  fail "tier_assets_state tier0 = '$us7_state', expected invalid"
+fi
+set +e
+us7_red=$(bash "$US7_HOME/bin/tt-run" --tier0 2>&1)
+us7_ec=$?
+set -e
+if [ "$us7_ec" -eq 1 ]; then
+  pass "  invalid assets -> exit 1 (RED)"
+else
+  fail "  invalid assets exited $us7_ec, expected 1"
+fi
+if echo "$us7_red" | grep -Fq 'roster drift'; then
+  pass "  stderr carries the validator's named reason"
+else
+  fail "  stderr missing the validator's named reason: $(echo "$us7_red" | tail -4)"
+fi
+if echo "$us7_red" | grep -Fq -- '--tier0 .*\[INVALID' || echo "$us7_red" | grep -q 'asset gate is RED'; then
+  pass "  invalid assets reported as RED (never 'not implemented')"
+else
+  fail "  invalid assets not reported as RED: $(echo "$us7_red" | tail -4)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test: assets ABSENT -> exit 3 (not implemented), never exit 1.
+# ---------------------------------------------------------------------------
+total_count=$((total_count + 1))
+echo "--- Test: US-007 absent assets -> exit 3 (not implemented) ---" >&2
+rm -f "$US7_HOME/bin/tt-tier0-assets"
+us7_absent_state=$(_run_fn "
+  TT_BIN_DIR='$US7_HOME/bin'
+  TT_DIR='$US7_HOME'
+  export TT_BIN_DIR TT_DIR
+  export PATH=\"\$TT_BIN_DIR:\$PATH\"
+  tier_assets_state tier0
+")
+if [ "$us7_absent_state" = "absent" ]; then
+  pass "tier_assets_state tier0 = absent without the validator binary"
+else
+  fail "tier_assets_state tier0 = '$us7_absent_state', expected absent"
+fi
+set +e
+us7_absent=$(bash "$US7_HOME/bin/tt-run" --tier0 2>&1)
+us7_ec=$?
+set -e
+if [ "$us7_ec" -eq 3 ]; then
+  pass "  absent assets -> exit 3 (not implemented)"
+else
+  fail "  absent assets exited $us7_ec, expected 3: $(echo "$us7_absent" | tail -3)"
+fi
+if echo "$us7_absent" | grep -Fq 'not implemented'; then
+  pass "  absent assets reported as not implemented"
+else
+  fail "  absent assets not reported as not implemented: $(echo "$us7_absent" | tail -3)"
+fi
+us7_cleanup
+
 # ---------------------------------------------------------------------------
 # Test: E2.2 fail-closed — a manifest copy with an impossible predicate under
 # --tier2 --include-real exits 2 naming the cause; bare --tier2 stays GREEN

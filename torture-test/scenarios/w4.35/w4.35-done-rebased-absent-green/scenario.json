@@ -36,6 +36,9 @@
     "ledger_concession_count": 0,
     "reroute_events": 8,
     "merger_invocations": 9,
-    "system_tokens_spent": 0
+    "system_tokens_spent": 0,
+    "reviewer_auto_completed": 1,
+    "auditor_invocations": 1,
+    "auditor_auto_completed": 0
   }
 }

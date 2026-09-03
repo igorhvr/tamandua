@@ -67,6 +67,15 @@ const CASES = [
   { name: 'o11-reroute-then-done', expected: 'PASS', retryCorridor: { action: 'reroute' } },
   { name: 'o11-retry-done-transition', expected: 'FAIL', retryCorridor: { action: 'done' }, finding: 'O11_COMPLETED_FROM_RETRY_VERDICT' },
   { name: 'o11-rerouted-two-dispatches', expected: 'PASS', twoDispatches: true },
+  // WAVE-A conditional auto-completion (S58 US-008): a conditional step whose
+  // activation condition is unset is completed IN-PROCESS with
+  // auto_completed=1, auto_complete_reason='condition_unset:<key>', ZERO
+  // dispatches and ZERO expects validations — the done-multiplicity
+  // invariant is vacuous by construction and the step must PASS. The
+  // contradiction arm proves the calibration keeps teeth: an auto-completed
+  // step that ALSO carries an expects validation is a finding.
+  { name: 'o11-auto-completed-conditional', expected: 'PASS', autoCompleted: true },
+  { name: 'o11-auto-completed-contradiction', expected: 'FAIL', autoCompleted: true, autoCompletedValidated: true, finding: 'O11_AUTOCOMPLETED_STEP_VALIDATED' },
 ];
 
 function bare(runId) { return runId.slice(4); }
@@ -130,6 +139,18 @@ function outputContractEvidence(fixture) {
       attempt_number: 1, outcome: 'accepted', verdict: 'done', expects_required: true,
       required_keys: ['STATUS', 'ARTIFACT'], missing_keys: [], invalid_keys: [], key_sources: [],
       diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: 'row-producer' },
+    });
+  }
+  if (fixture.autoCompletedValidated) {
+    // Contradiction red-arm: an auto-completed step must never carry
+    // expects-validation telemetry (auto-completion is in-process, zero
+    // dispatch), so an accepted done validation on row-review is a finding.
+    validations.push({
+      id: 'validation-review-1', observed_at: '2026-08-01T12:00:09.000Z',
+      run_id: RUN_A, step_row_id: 'row-review', step_id: 'test_cmd_review', claim_id: 'claim-review-1',
+      attempt_number: 1, outcome: 'accepted', verdict: 'done', expects_required: true,
+      required_keys: ['STATUS', 'VERDICT'], missing_keys: [], invalid_keys: [], key_sources: [],
+      diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: 'row-review' },
     });
   }
   const rejections = rejected.map((row) => ({
@@ -371,7 +392,7 @@ for (const fixture of CASES) {
   const databasePath = path.join(snapshots, 'database.sqlite');
   const database = new DatabaseSync(databasePath);
   database.exec(`CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, tokens_spent INTEGER NOT NULL);
-    CREATE TABLE steps (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL, expects TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'single', loop_config TEXT);
+    CREATE TABLE steps (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL, expects TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'single', loop_config TEXT, auto_completed INTEGER NOT NULL DEFAULT 0, auto_complete_reason TEXT);
     CREATE TABLE stories (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, status TEXT NOT NULL);
     CREATE TABLE tamandua_stats (id INTEGER PRIMARY KEY, system_tokens_spent INTEGER NOT NULL);`);
   const insertStep = database.prepare('INSERT INTO steps (id, run_id, step_id, status, expects, type, loop_config) VALUES (?, ?, ?, ?, ?, ?, ?)');
@@ -401,6 +422,13 @@ for (const fixture of CASES) {
   } else {
     insertStep.run('row-producer', bare(RUN_A), 'producer', 'done', 'STATUS: done\nARTIFACT:', 'single', null);
     insertStep.run('row-consumer', bare(RUN_A), 'consumer', 'done', 'STATUS: done\nCHANGES:\nTESTS:', 'single', null);
+    if (fixture.autoCompleted) {
+      // WAVE-A conditional reviewer (test_cmd_review): a done conditional
+      // step the dispatch motor auto-completed in-process
+      // (auto_completed=1, condition_unset reason) with zero dispatches.
+      database.prepare('INSERT INTO steps (id, run_id, step_id, status, expects, type, loop_config, auto_completed, auto_complete_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run('row-review', bare(RUN_A), 'test_cmd_review', 'done', 'STATUS: done\nVERDICT:', 'conditional', null, 1, 'condition_unset:test_cmd_review_required');
+    }
   }
   insertStep.run('row-failed', bare(RUN_B), 'consumer', 'failed', 'STATUS: done', 'single', null);
   database.prepare('INSERT INTO tamandua_stats VALUES (1, 0)').run();

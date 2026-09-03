@@ -52,7 +52,11 @@ function containedFile(scenarioDir, relative, label) {
   return resolved;
 }
 
-function workflowAgents(workflowFile) {
+// workflowAgents(workflowFile) — parse the `- id:` agent roster of a bundled
+// workflow.yml (declaration order). Exported for the scenario-workflow-parity
+// guard (S58 US-007) so roster parity always uses the SAME parse as
+// validate-scenario.
+export function workflowAgents(workflowFile) {
   const agents = [];
   let inAgents = false;
   for (const line of fs.readFileSync(workflowFile, "utf8").split(/\r?\n/)) {

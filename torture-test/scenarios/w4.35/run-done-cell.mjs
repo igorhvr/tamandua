@@ -65,6 +65,21 @@ const finalize = db.prepare(`
   SELECT status, retry_count, reroute_count, terminal_reroute_count, ledger_concession_count
   FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'
 `).get(runId);
+// WAVE-A (09c10ce5): bug-fix-merge-worktree gained two conditional steps —
+// deception_audit (agent auditor, condition deception_audit_required) and
+// test_cmd_review (agent reviewer, condition test_cmd_review_required). The
+// scripted done-family cells always emit CANNOT_REPRODUCE (no live repro), so
+// deception_audit_required is set and the auditor dispatches ONE read-only
+// round (VERDICT: HONEST); test_cmd_review_required stays unset (no TEST_CMD
+// rewrite) so the reviewer auto-completes in the zero-token conditional sweep.
+const reviewStep = db.prepare(`
+  SELECT status, auto_completed, auto_complete_reason
+  FROM steps WHERE run_id = ? AND step_id = 'test_cmd_review'
+`).get(runId);
+const auditStep = db.prepare(`
+  SELECT status, auto_completed, auto_complete_reason
+  FROM steps WHERE run_id = ? AND step_id = 'deception_audit'
+`).get(runId);
 const system = db.prepare("SELECT system_tokens_spent FROM tamandua_stats WHERE id = 1").get();
 const suiteCount = db.prepare("SELECT COUNT(*) AS count FROM suite_results WHERE run_id = ?").get(runId).count;
 db.close();
@@ -72,7 +87,10 @@ db.close();
 const eventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
 const events = fs.readFileSync(eventsPath, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
 const countEvent = (name) => events.filter((event) => event.event === name).length;
-const mergerInvocations = events.filter((event) => event.event === "step.running" && event.stepId === "finalize_merge").length;
+const stepRunningCount = (stepId) => events.filter((event) => event.event === "step.running" && event.stepId === stepId).length;
+const mergerInvocations = stepRunningCount("finalize_merge");
+const auditorInvocations = stepRunningCount("deception_audit");
+const reviewerInvocations = stepRunningCount("test_cmd_review");
 const mergeAnnotations = events.filter((event) => [
   "merge.landed", "merge.landed_over_red_suite", "merge.landed_without_suite_evidence",
   "merge.gate_overridden", "merge.accepted_already_landed",
@@ -96,6 +114,20 @@ assert.equal(finalize.terminal_reroute_count, expected.terminal_reroute_count, "
 assert.equal(finalize.ledger_concession_count, expected.ledger_concession_count, "ledger concession count");
 assert.equal(countEvent("step.rerouted"), expected.reroute_events, "step.rerouted event count");
 assert.equal(mergerInvocations, expected.merger_invocations, "merger invocation count");
+// Conditional-step dispositions (WAVE-A 09c10ce5). The reviewer never
+// dispatches in these cells (no TEST_CMD rewrite), so the zero-token
+// conditional sweep must have auto-completed it with the unset-condition
+// reason and zero step.running events; the auditor dispatches exactly
+// expected.auditor_invocations read-only round(s) (CANNOT_REPRODUCE cells:
+// one) and completes done with auto_completed=expected.auditor_auto_completed.
+assert.equal(reviewerInvocations, 0, "test_cmd_review must never dispatch in the done family");
+assert.equal(reviewStep.status, "done", "test_cmd_review terminal status");
+assert.equal(reviewStep.auto_completed, expected.reviewer_auto_completed, "test_cmd_review auto-completion flag");
+assert.match(reviewStep.auto_complete_reason ?? "", /condition_unset:test_cmd_review_required/,
+  "test_cmd_review auto-complete reason");
+assert.equal(auditorInvocations, expected.auditor_invocations, "auditor invocation count");
+assert.equal(auditStep.status, "done", "deception_audit terminal status");
+assert.equal(auditStep.auto_completed, expected.auditor_auto_completed, "auditor auto-completion flag");
 assert.equal(targetAfter, targetBefore, "forbidden target-ref movement");
 assert.deepEqual(mergeAnnotations, [], "failed output-contract cells must not emit landing annotations");
 assert.equal(runRow.tokens_spent, 0, "scripted run tokens");
@@ -115,6 +147,9 @@ process.stdout.write(`${JSON.stringify({
   suite_evidence: metadata.matrix.suite_evidence,
   reroute_events: countEvent("step.rerouted"),
   merger_invocations: mergerInvocations,
+  reviewer_auto_completed: reviewStep.auto_completed,
+  auditor_invocations: auditorInvocations,
+  auditor_auto_completed: auditStep.auto_completed,
   suite_rows: suiteCount,
   tokens_spent: runRow.tokens_spent,
   system_tokens_spent: system.system_tokens_spent,

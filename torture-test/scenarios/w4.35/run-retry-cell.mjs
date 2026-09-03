@@ -85,12 +85,29 @@ const finalize = db.prepare(`
 const system = db.prepare("SELECT system_tokens_spent FROM tamandua_stats WHERE id = 1").get();
 const suiteCount = db.prepare("SELECT COUNT(*) AS count FROM suite_results WHERE run_id = ?").get(runId).count;
 const stories = db.prepare("SELECT COUNT(*) AS count, MAX(status) AS status, COALESCE(MAX(retry_count), 0) AS retry_count FROM stories WHERE run_id = ?").get(runId);
+// WAVE-A (09c10ce5): bug-fix-merge-worktree gained two conditional steps —
+// deception_audit (agent auditor, condition deception_audit_required) and
+// test_cmd_review (agent reviewer, condition test_cmd_review_required). The
+// scripted retry-family cells always emit CANNOT_REPRODUCE (no live repro), so
+// deception_audit_required is set and the auditor dispatches ONE read-only
+// round (VERDICT: HONEST); test_cmd_review_required stays unset (no TEST_CMD
+// rewrite) so the reviewer auto-completes in the zero-token conditional sweep.
+const reviewStep = db.prepare(`
+  SELECT status, auto_completed, auto_complete_reason
+  FROM steps WHERE run_id = ? AND step_id = 'test_cmd_review'
+`).get(runId);
+const auditStep = db.prepare(`
+  SELECT status, auto_completed, auto_complete_reason
+  FROM steps WHERE run_id = ? AND step_id = 'deception_audit'
+`).get(runId);
 db.close();
 
 const eventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
 const events = fs.readFileSync(eventsPath, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
 const countEvent = (name) => events.filter((event) => event.event === name).length;
 const stepInvocations = (stepId) => events.filter((event) => event.event === "step.running" && event.stepId === stepId).length;
+const reviewerInvocations = stepInvocations("test_cmd_review");
+const auditorInvocations = stepInvocations("deception_audit");
 const rerouteEvents = events.filter((event) => event.event === "step.rerouted" && event.stepId === "finalize_merge");
 const finalizeDoneEvents = events.filter((event) => event.event === "step.done" && event.stepId === "finalize_merge");
 const mergeAnnotations = events.filter((event) => [
@@ -135,6 +152,20 @@ assert.equal(system.system_tokens_spent, expected.system_tokens_spent, "system t
 assert.equal(suiteCount, expected.suite_rows, "suite evidence rows must match the cell replay policy");
 assert.equal(countEvent("run.failed"), 1, "exact terminal run event");
 assert.equal(countEvent("run.completed"), 0, "no phantom completion");
+// Conditional-step dispositions (WAVE-A 09c10ce5). The reviewer never
+// dispatches in these cells (no TEST_CMD rewrite), so the zero-token
+// conditional sweep must have auto-completed it with the unset-condition
+// reason and zero step.running events; the auditor dispatches exactly
+// expected.auditor_invocations read-only round(s) (CANNOT_REPRODUCE cells:
+// one) and completes done with auto_completed=expected.auditor_auto_completed.
+assert.equal(reviewerInvocations, 0, "test_cmd_review must never dispatch in the retry family");
+assert.equal(reviewStep.status, "done", "test_cmd_review terminal status");
+assert.equal(reviewStep.auto_completed, expected.reviewer_auto_completed, "test_cmd_review auto-completion flag");
+assert.match(reviewStep.auto_complete_reason ?? "", /condition_unset:test_cmd_review_required/,
+  "test_cmd_review auto-complete reason");
+assert.equal(auditorInvocations, expected.auditor_invocations, "auditor invocation count");
+assert.equal(auditStep.status, "done", "deception_audit terminal status");
+assert.equal(auditStep.auto_completed, expected.auditor_auto_completed, "auditor auto-completion flag");
 
 process.stdout.write(`${JSON.stringify({
   scenario_id: metadata.id,
@@ -147,6 +178,9 @@ process.stdout.write(`${JSON.stringify({
   reroute_events: rerouteEvents.length,
   merger_invocations: stepInvocations("finalize_merge"),
   verifier_invocations: stepInvocations("verify"),
+  reviewer_auto_completed: reviewStep.auto_completed,
+  auditor_invocations: auditorInvocations,
+  auditor_auto_completed: auditStep.auto_completed,
   story_retry_events: countEvent("story.retry"),
   suite_rows: suiteCount,
   tokens_spent: runRow.tokens_spent,

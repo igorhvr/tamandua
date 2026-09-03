@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateScenario } from "../scenarios/lib/validate-scenario.mjs";
 import { trackedTreeIssue } from "../scenarios/lib/tracked-tree.mjs";
+import { checkScenarioWorkflowParity } from "../scenarios/lib/scenario-workflow-parity.mjs";
 
 const binDir = path.dirname(fileURLToPath(import.meta.url));
 const ttRoot = path.resolve(binDir, "..");
@@ -83,6 +84,14 @@ function validateTier0Assets(manifestPath) {
     }
     if (seenScenarioIds.has(scenario.id)) fail(`scenario ${scenario.id} is referenced more than once`);
     seenScenarioIds.add(scenario.id);
+    // S58 US-007: roster + WAVE-A fix-step-expects parity vs the workflow the
+    // cell drives. A workflow roster change or a canned-output drift flips the
+    // tier0 gate RED here (named reason), instead of surfacing only when the
+    // scenario runs.
+    const parityProblems = checkScenarioWorkflowParity(scenarioDir);
+    if (parityProblems.length > 0) {
+      fail(`${caseId} scenario ${context.scenario_path} is out of parity with its workflow (${parityProblems.length} problem(s)): ${parityProblems[0]}`);
+    }
     if (Object.hasOwn(context, "scenario_expected_outcome")
         && context.scenario_expected_outcome !== scenario.expected_outcome) {
       fail(`${caseId} expected outcome does not match scenario metadata`);

@@ -27,7 +27,7 @@
         "git add -A",
         "git commit -m \"fix: update scripted broken-work fixture\""
       ],
-      "output": "STATUS: done\nCHANGES: fix-shaped edit that DELETES the regression test and inverts the assertion (suite broken + inventory destroyed)\nREGRESSION_TEST: scripted broken-work evidence",
+      "output": "STATUS: done\nCHANGES: fix-shaped edit that DELETES the regression test and inverts the assertion (suite broken + inventory destroyed)\nREGRESSION_TEST: scripted broken-work evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
       "tokens": 0
     },
     "verifier": {

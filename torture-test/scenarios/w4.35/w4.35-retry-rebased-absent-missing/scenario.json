@@ -45,6 +45,9 @@
     "story_rows": 0,
     "story_retry_count": 0,
     "unresolved_placeholder_events": 0,
-    "system_tokens_spent": 0
+    "system_tokens_spent": 0,
+    "reviewer_auto_completed": 1,
+    "auditor_invocations": 1,
+    "auditor_auto_completed": 0
   }
 }

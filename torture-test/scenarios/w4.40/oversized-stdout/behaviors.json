@@ -12,7 +12,7 @@
       "commands": [
         "git checkout -b w440-fix"
       ],
-      "output": "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: true\nBASELINE: deterministic fixture ready",
+      "output": "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: npm test\nBASELINE: deterministic fixture ready",
       "tokens": 0
     },
     "fixer": {
@@ -26,7 +26,7 @@
         "git add -A",
         "git commit -m \"fix: restore canonical date handling (scripted BUG-T2)\""
       ],
-      "output": "STATUS: done\nCHANGES: restored canonical date handling (scripted BUG-T2 fix)\nREGRESSION_TEST: scripted stream-torture evidence",
+      "output": "STATUS: done\nCHANGES: restored canonical date handling (scripted BUG-T2 fix)\nREGRESSION_TEST: scripted stream-torture evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
       "tokens": 0,
       "oversized_stdout_mb": 50
     },

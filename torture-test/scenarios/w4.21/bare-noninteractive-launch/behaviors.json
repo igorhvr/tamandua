@@ -27,7 +27,7 @@
         "git add value.txt",
         "git commit -m \"fix: update w4.21 bare-noninteractive fixture\""
       ],
-      "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: w4.11 scripted evidence",
+      "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: w4.11 scripted evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
       "tokens": 0
     },
     "verifier": {

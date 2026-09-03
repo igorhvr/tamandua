@@ -21,7 +21,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { trackedTreeIssue } from "../scenarios/lib/tracked-tree.mjs";
+import { gitRepoRoot, trackedTreeIssue } from "../scenarios/lib/tracked-tree.mjs";
+import { validateScenario } from "../scenarios/lib/validate-scenario.mjs";
+import { checkScenarioWorkflowParity } from "../scenarios/lib/scenario-workflow-parity.mjs";
 
 const binDir = path.dirname(fileURLToPath(import.meta.url));
 const ttRoot = path.resolve(binDir, "..");
@@ -271,6 +273,33 @@ function verifyScenarioDirTracked(relative, caseId) {
   }
 }
 
+// validateScenarioCell(scenarioDirAbs, caseId) — S58 US-007: validate one
+// manifest-referenced scenario cell through scenarios/lib/validate-scenario.mjs
+// (metadata + roster parity) and then through the scenario-workflow parity
+// guard (roster + WAVE-A fix-step expects marker), so a roster/fix-expects
+// drift flips the tier2 gate red at gate time instead of surfacing only at
+// scenario runtime. Each unique dir is validated once per invocation.
+const validatedScenarioDirs = new Set();
+
+function validateScenarioCell(scenarioDirAbs, caseId) {
+  if (validatedScenarioDirs.has(scenarioDirAbs)) return;
+  validatedScenarioDirs.add(scenarioDirAbs);
+  const repoRoot = gitRepoRoot(ttRoot);
+  if (repoRoot === null) {
+    fail(`${caseId} cannot resolve the git repository root for workflow parity (is torture-test/ inside a git checkout?)`);
+  }
+  const relative = path.relative(ttRoot, scenarioDirAbs);
+  try {
+    validateScenario(scenarioDirAbs, { repoRoot });
+  } catch (error) {
+    fail(`${caseId} scenario ${relative} failed validate-scenario: ${error.message}`);
+  }
+  const problems = checkScenarioWorkflowParity(scenarioDirAbs, { repoRoot });
+  if (problems.length > 0) {
+    fail(`${caseId} scenario ${relative} is out of parity with its workflow (${problems.length} problem(s)): ${problems[0]}`);
+  }
+}
+
 function validateTier2Assets(manifestPath) {
   const records = readManifest(manifestPath);
   let caseCount = 0;
@@ -282,10 +311,12 @@ function validateTier2Assets(manifestPath) {
     // (b) Validate task file exists
     resolveTaskFile(record.task, caseId);
 
-    // (b2) Validate every manifest-referenced scenario dir is TRACKED
-    // (US-002 — an on-disk-but-untracked scenario dir must fail closed)
+    // (b2) Validate every manifest-referenced scenario dir: TRACKED (US-002 —
+    // an on-disk-but-untracked scenario dir must fail closed) AND scenario
+    // metadata/roster parity (S58 US-007).
     for (const scenarioDir of collectScenarioDirs(record)) {
       verifyScenarioDirTracked(scenarioDir, caseId);
+      validateScenarioCell(path.resolve(ttRoot, scenarioDir), caseId);
     }
 
     // (c) Validate probes

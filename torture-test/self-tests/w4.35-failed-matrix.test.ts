@@ -23,6 +23,24 @@ describe("W4.35 STATUS failed verdict matrix", () => {
       "managed worktree cleanup must precede assertions so a finding cannot leak state");
   });
 
+  it("asserts the WAVE-A conditional-step dispositions from the run DB", () => {
+    const runner = fs.readFileSync(path.join(matrixRoot, "run-failed-cell.mjs"), "utf8");
+    // test_cmd_review must auto-complete (condition_unset, zero dispatches) and
+    // deception_audit's dispatched/auto-completed disposition must be pinned.
+    assert.match(runner, /step_id = 'test_cmd_review'/,
+      "runner must read the test_cmd_review step row");
+    assert.match(runner, /condition_unset:test_cmd_review_required/,
+      "runner must assert the reviewer auto-complete reason");
+    assert.match(runner, /reviewerInvocations, 0, "test_cmd_review must never dispatch/,
+      "runner must assert the reviewer never dispatches");
+    assert.match(runner, /step_id = 'deception_audit'/,
+      "runner must read the deception_audit step row");
+    assert.match(runner, /assert\.equal\(auditorInvocations, expected\.auditor_invocations/,
+      "runner must pin the auditor invocation count");
+    assert.match(runner, /assert\.equal\(auditStep\.auto_completed, expected\.auditor_auto_completed/,
+      "runner must pin the auditor auto-completion flag");
+  });
+
   it("declares exactly the six rebased-by-suite-evidence failed cells", () => {
     const expectedIds = rebasedValues.flatMap((rebased) =>
       evidenceValues.map((evidence) => `w4.35-failed-rebased-${rebased}-${evidence}`),
@@ -76,6 +94,13 @@ describe("W4.35 STATUS failed verdict matrix", () => {
           run_failed_events: 1,
           run_completed_events: 0,
           system_tokens_spent: 0,
+          // WAVE-A (09c10ce5) additive pins: the failed family always emits
+          // CANNOT_REPRODUCE, so deception_audit dispatches exactly one
+          // read-only auditor round (auto_completed=0) and test_cmd_review
+          // auto-completes (no TEST_CMD rewrite -> auto_completed=1).
+          reviewer_auto_completed: 1,
+          auditor_invocations: 1,
+          auditor_auto_completed: 0,
         });
 
         assert.equal(behaviors.heartbeatTokens, 0);

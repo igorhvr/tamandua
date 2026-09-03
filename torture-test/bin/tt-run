@@ -19,7 +19,20 @@ TT_VAR="$TT_DIR/var"
 # Tier registry: name | available(0/1) | est. tokens | est. wall | descr.
 # Availability flips as implementation phases land (A: smoke; D: scripted
 # scenario battery folds INTO smoke; E: tier0; campaigns: tier1/tier2).
-tier_available() {
+#
+# ── S58 US-007: tier asset availability has THREE states, never conflated ──
+#   absent    — a prerequisite (validator binary / case manifest) is missing:
+#               the tier is genuinely NOT YET IMPLEMENTED (requested run
+#               exits 3). The historic exit-3 "unavailable" path is kept
+#               ONLY for this state.
+#   invalid   — prerequisites exist but the tier's asset validator(s) exited
+#               non-zero: the tier gate is RED (requested run exits 1 and
+#               prints the validator's captured stderr — its named reason).
+#               This is the state that previously fell through tier_available
+#               to the confusing exit-3 "Tier ... unavailable" and silently
+#               masked WAVE-A-class asset drift (tt-run:217-221).
+#   available — prerequisites exist and the asset gate is green.
+tier_prereqs_present() {
   case "$1" in
     smoke)
       [ -x "$TT_BIN_DIR/tt-controller" ] \
@@ -29,29 +42,83 @@ tier_available() {
     tier0)
       [ -x "$TT_BIN_DIR/tt-controller" ] \
         && [ -x "$TT_BIN_DIR/tt-tier0-assets" ] \
-        && [ -f "$TT_DIR/cases/tier0.jsonl" ] \
-        && "$TT_BIN_DIR/tt-tier0-assets" "$TT_DIR/cases/tier0.jsonl" >/dev/null 2>&1
+        && [ -f "$TT_DIR/cases/tier0.jsonl" ]
       ;;
     tier1)
       [ -x "$TT_BIN_DIR/tt-controller" ] \
         && [ -x "$TT_BIN_DIR/tt-tier1-assets" ] \
-        && [ -f "$TT_DIR/cases/tier1.jsonl" ] \
-        && "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier1.jsonl" --validate-only >/dev/null 2>&1 \
-        && "$TT_BIN_DIR/tt-tier1-assets" "$TT_DIR/cases/tier1.jsonl" >/dev/null 2>&1
+        && [ -f "$TT_DIR/cases/tier1.jsonl" ]
       ;;
     tier2)
-      # US-015: the --tier2 ladder rung. Availability mirrors tier1 (controller
+      # US-015: the --tier2 ladder rung. Prereqs mirror tier1 (controller
       # validate-only + the tier2 asset validator + the manifest exists); the
       # tier2 asset validator additionally pins seed-vs-SEEDS.md (E3.A S2) and
       # requires.capabilities well-formedness incl. dsh.
       [ -x "$TT_BIN_DIR/tt-controller" ] \
         && [ -x "$TT_BIN_DIR/tt-tier2-assets" ] \
-        && [ -f "$TT_DIR/cases/tier2.jsonl" ] \
-        && "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier2.jsonl" --validate-only >/dev/null 2>&1 \
-        && "$TT_BIN_DIR/tt-tier2-assets" "$TT_DIR/cases/tier2.jsonl" >/dev/null 2>&1
+        && [ -f "$TT_DIR/cases/tier2.jsonl" ]
       ;;
     *) return 1 ;;
   esac
+}
+
+# TIER_VALIDATOR_OUTPUT — combined stdout+stderr of the last tier_validate
+# run. When the gate is RED it carries the validator's named reason (never
+# swallowed by >/dev/null 2>&1 as the pre-S58 tier_available did).
+TIER_VALIDATOR_OUTPUT=""
+
+# tier_validate <tier> — run the tier's asset validator(s), capturing combined
+# output into TIER_VALIDATOR_OUTPUT. Returns 0 only when every validator exits
+# 0 (assets available). smoke has no validator — prerequisite presence is its
+# whole gate, so it is always valid once present.
+tier_validate() {
+  TIER_VALIDATOR_OUTPUT=""
+  case "$1" in
+    smoke)
+      return 0
+      ;;
+    tier0)
+      if ! TIER_VALIDATOR_OUTPUT="$("$TT_BIN_DIR/tt-tier0-assets" "$TT_DIR/cases/tier0.jsonl" 2>&1)"; then
+        return 1
+      fi
+      ;;
+    tier1)
+      if ! TIER_VALIDATOR_OUTPUT="$("$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier1.jsonl" --validate-only 2>&1)"; then
+        return 1
+      fi
+      if ! TIER_VALIDATOR_OUTPUT="$("$TT_BIN_DIR/tt-tier1-assets" "$TT_DIR/cases/tier1.jsonl" 2>&1)"; then
+        return 1
+      fi
+      ;;
+    tier2)
+      if ! TIER_VALIDATOR_OUTPUT="$("$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier2.jsonl" --validate-only 2>&1)"; then
+        return 1
+      fi
+      if ! TIER_VALIDATOR_OUTPUT="$("$TT_BIN_DIR/tt-tier2-assets" "$TT_DIR/cases/tier2.jsonl" 2>&1)"; then
+        return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# tier_assets_state <tier> — prints absent|invalid|available (S58 US-007).
+tier_assets_state() {
+  if ! tier_prereqs_present "$1"; then
+    printf '%s\n' absent
+    return 0
+  fi
+  if tier_validate "$1"; then
+    printf '%s\n' available
+  else
+    printf '%s\n' invalid
+  fi
+}
+
+# tier_available <tier> — 0 iff the tier's assets are present AND valid.
+tier_available() {
+  [ "$(tier_assets_state "$1")" = "available" ]
 }
 
 tier_info() {
@@ -82,7 +149,13 @@ EOF
   local t avail info
   for t in smoke tier0 tier1 tier2; do
     info="$(tier_info "$t")"
-    if tier_available "$t"; then avail="available"; else avail="NOT YET IMPLEMENTED"; fi
+    # S58 US-007: surface the third availability state — assets PRESENT but
+    # INVALID (gate RED) is never reported as NOT YET IMPLEMENTED.
+    case "$(tier_assets_state "$t")" in
+      available) avail="available" ;;
+      invalid) avail="INVALID - asset gate red" ;;
+      *) avail="NOT YET IMPLEMENTED" ;;
+    esac
     printf '  --%-6s %-28s %-9s %s [%s]\n' "$t" \
       "$(printf '%s' "$info" | cut -d'|' -f1)" \
       "$(printf '%s' "$info" | cut -d'|' -f2)" \
@@ -214,10 +287,20 @@ run_tier() {
   local tier="$1"
   local include_real="${2:-false}"
   local case_id="${3:-}"
-  if ! tier_available "$tier"; then
+  # S58 US-007: distinguish 'assets ABSENT (not implemented)' from 'assets
+  # present but INVALID (gate RED)'. Absent keeps the historic exit 3; invalid
+  # exits 1 and surfaces the validator's captured named reason — never a
+  # silent skip, never the confusing exit-3 'Tier ... unavailable' that masked
+  # the WAVE-A-class asset drift.
+  if ! tier_prereqs_present "$tier"; then
     info="$(tier_info "$tier")"
-    echo "Tier '$tier' is unavailable because its required assets are not installed or valid ($(printf '%s' "$info" | cut -d'|' -f3))." >&2
+    echo "Tier '$tier' is not implemented: its required assets (controller/validator binary or case manifest) are missing ($(printf '%s' "$info" | cut -d'|' -f3))." >&2
     exit 3
+  fi
+  if ! tier_validate "$tier"; then
+    echo "Tier '$tier' asset gate is RED: its assets are present but INVALID (validator exited non-zero)." >&2
+    printf '%s\n' "$TIER_VALIDATOR_OUTPUT" | sed 's/^/    /' >&2
+    exit 1
   fi
   local manifest="$TT_DIR/cases/$tier.jsonl"
   if [ "$tier" = "smoke" ]; then

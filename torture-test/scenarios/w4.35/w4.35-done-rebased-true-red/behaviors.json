@@ -27,7 +27,7 @@
         "git add value.txt",
         "git commit -m \"fix: update scripted matrix fixture\""
       ],
-      "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: scripted FMIS matrix evidence",
+      "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: scripted FMIS matrix evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
       "tokens": 0
     },
     "verifier": {

@@ -58,12 +58,22 @@ function readDatabaseState(invocation) {
     const runs = database.prepare('SELECT id, status, tokens_spent FROM runs ORDER BY id').all().map((row) => ({
       run_id: canonicalRunId(row.id), status: row.status, tokens_spent: integer(row.tokens_spent, `run ${row.id} tokens_spent`),
     }));
-    const steps = database.prepare('SELECT id, run_id, step_id, status, expects, type, loop_config FROM steps ORDER BY run_id, id').all().map((row) => ({
+    // WAVE-A (09c10ce5) conditional auto-completion: steps.auto_completed /
+    // steps.auto_complete_reason were introduced with the conditional-step
+    // primitive. The column pair is OPTIONAL — evidence snapshots captured
+    // before WAVE-A lack it and must keep replaying unchanged (absent means
+    // nothing was auto-completed). When present, the output-contract leg
+    // models the zero-dispatch auto-complete corridor (o11-output-contract.mjs).
+    const stepsColumns = new Set(database.prepare('PRAGMA table_info(steps)').all().map((row) => row.name));
+    const hasAutoCompleteColumns = stepsColumns.has('auto_completed') && stepsColumns.has('auto_complete_reason');
+    const steps = database.prepare(`SELECT id, run_id, step_id, status, expects, type, loop_config${hasAutoCompleteColumns ? ', auto_completed, auto_complete_reason' : ''} FROM steps ORDER BY run_id, id`).all().map((row) => ({
       step_row_id: nonempty(row.id, 'steps.id'), run_id: canonicalRunId(row.run_id),
       step_id: nonempty(row.step_id, `step ${row.id}.step_id`), status: nonempty(row.status, `step ${row.id}.status`),
       expects_required: typeof row.expects === 'string' && row.expects.trim().length > 0,
       type: typeof row.type === 'string' && row.type.length > 0 ? row.type : 'single',
       loop_config: row.loop_config,
+      auto_completed: hasAutoCompleteColumns ? (row.auto_completed === 1 ? 1 : 0) : 0,
+      auto_complete_reason: hasAutoCompleteColumns && typeof row.auto_complete_reason === 'string' ? row.auto_complete_reason : null,
     }));
     const stories = database.prepare('SELECT id, run_id, status FROM stories ORDER BY run_id, id').all().map((row) => ({
       story_row_id: nonempty(row.id, 'stories.id'), run_id: canonicalRunId(row.run_id),

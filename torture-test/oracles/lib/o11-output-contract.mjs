@@ -202,6 +202,7 @@ export function evaluateO11OutputContract(invocation, projected, databaseSteps, 
       && row.transition.target_step_row_id === step.step_row_id);
     const isLoopStep = loopStepRowIdsByRun.get(step.run_id)?.has(step.step_row_id) ?? false;
     const isDecisionStep = decisionStepRowIdsByRun.get(step.run_id)?.has(step.step_row_id) ?? false;
+    const isAutoCompleted = step.auto_completed === 1;
     if (isLoopStep || isDecisionStep) {
       // A loop step transitions done once per story iteration, and its
       // verify_each decision step once per story verification. Multiplicity
@@ -210,6 +211,39 @@ export function evaluateO11OutputContract(invocation, projected, databaseSteps, 
       if (successes.length < required) findings.add('O11_DONE_WITHOUT_EXPECTS_SUCCESS', 'loop/verify_each step does not have one accepted done transition per completed story', {
         run_id: step.run_id, step_row_id: step.step_row_id, observed: successes.length, required,
       });
+    } else if (isAutoCompleted) {
+      // WAVE-A conditional auto-completion corridor (09c10ce5 + WAVE-A.1): a
+      // conditional step whose activation condition is unset is completed
+      // IN-PROCESS by the dispatch motor (steps.auto_completed=1,
+      // auto_complete_reason='condition_unset:<key>') with ZERO dispatches —
+      // no agent output exists, so the per-dispatch accepted-done invariant
+      // below is vacuous by construction, not a violation. The corridor is
+      // still disciplined: an auto-completed step must be a conditional step
+      // with a condition_unset reason, and it must carry NO dispatch-rendering
+      // and NO expects-validation telemetry (auto-completion never claims,
+      // renders, or validates). Any such telemetry on an auto-completed step
+      // is a contradiction finding.
+      if (step.type !== 'conditional' || typeof step.auto_complete_reason !== 'string' || step.auto_complete_reason.trim().length === 0) {
+        findings.add('O11_AUTOCOMPLETED_DISPOSITION_INVALID', 'auto-completed step is not a conditional step with a nonempty auto-complete reason', {
+          run_id: step.run_id, step_row_id: step.step_row_id, type: step.type, auto_complete_reason: step.auto_complete_reason ?? null,
+        });
+      } else if (!step.auto_complete_reason.startsWith('condition_unset:')) {
+        findings.add('O11_AUTOCOMPLETED_DISPOSITION_INVALID', 'auto-completed step reason is not a condition_unset disposition', {
+          run_id: step.run_id, step_row_id: step.step_row_id, auto_complete_reason: step.auto_complete_reason,
+        });
+      }
+      const autoRenderings = renderings.filter((row) => row.run_id === step.run_id && row.step_row_id === step.step_row_id);
+      if (autoRenderings.length > 0) {
+        findings.add('O11_AUTOCOMPLETED_STEP_DISPATCHED', 'auto-completed step carries dispatch-rendering telemetry', {
+          run_id: step.run_id, step_row_id: step.step_row_id, observed: autoRenderings.length,
+        });
+      }
+      const autoValidations = validations.filter((row) => row.run_id === step.run_id && row.step_row_id === step.step_row_id);
+      if (autoValidations.length > 0) {
+        findings.add('O11_AUTOCOMPLETED_STEP_VALIDATED', 'auto-completed step carries expects-validation telemetry', {
+          run_id: step.run_id, step_row_id: step.step_row_id, observed: autoValidations.length,
+        });
+      }
     } else {
       // S22A: done-multiplicity is PER DISPATCH, not per step row. A step
       // may legally re-execute across multiple dispatches — an honest retry

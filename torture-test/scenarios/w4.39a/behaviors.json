@@ -26,7 +26,7 @@
         "git add -A",
         "git commit -m \"fix: update scripted union-honest fixture\""
       ],
-      "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: scripted union-day evidence",
+      "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: scripted union-day evidence\nCANNOT_REPRODUCE: scripted scenario — no live reproduction; behavior fixed per plan",
       "tokens": 0
     },
     "verifier": {

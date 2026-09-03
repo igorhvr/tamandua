@@ -34,7 +34,7 @@ test('O11 enforces output contracts, formula, exact ownership, ledger reconcilia
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o11-')).sort();
-    assert.equal(names.length, 28);
+    assert.equal(names.length, 30);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -92,6 +92,22 @@ test('O11 enforces output contracts, formula, exact ownership, ledger reconcilia
         const consumerRenderings = observation.output_contract.renderings.filter((row) => row.step_id === 'consumer');
         assert.equal(doneRows.length, 2, `${name} must carry two accepted dones on the consumer step`);
         assert.equal(consumerRenderings.length, 2, `${name} must carry two consumer dispatch renderings`);
+      }
+      if (expectation.autoCompleted) {
+        // WAVE-A conditional auto-completion (S58 US-008): the fixture must
+        // carry the auto-completed reviewer (auto_completed=1, condition_unset
+        // reason, type conditional) and the observation must surface it.
+        const reviewer = observation.output_contract.steps.find((step) => step.step_id === 'test_cmd_review');
+        assert.ok(reviewer, `${name} auto-completed reviewer step missing from observation`);
+        assert.equal(reviewer.auto_completed, 1, `${name} reviewer must be auto_completed`);
+        assert.equal(reviewer.type, 'conditional', `${name} reviewer must be a conditional step`);
+        assert.equal(reviewer.auto_complete_reason, 'condition_unset:test_cmd_review_required', `${name} reviewer auto-complete reason`);
+        const reviewerValidations = observation.output_contract.validations.filter((row) => row.step_id === 'test_cmd_review');
+        if (expectation.autoCompletedValidated) {
+          assert.equal(reviewerValidations.length, 1, `${name} contradiction arm must carry one reviewer validation`);
+        } else {
+          assert.equal(reviewerValidations.length, 0, `${name} auto-completed reviewer must carry no validations`);
+        }
       }
       assert.ok(Array.isArray(observation.output_contract.validations));
       assert.ok(Array.isArray(observation.output_contract.rejections));

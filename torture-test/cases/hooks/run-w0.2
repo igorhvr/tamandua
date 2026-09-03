@@ -17,5 +17,15 @@ unset TT_ROOT TT_SCRIPTED_HOME HERMES_HOME \
 # directory strictly inside torture-test/var.
 source "$repo_root/torture-test/cases/hooks/containment-guard.sh"
 
+# The e2e smoke battery (workflows-smoke.test.ts) includes a createTempHome
+# helper unit test whose linkRealAgentDirs path requires os.homedir()/.pi to
+# exist. Under the contained scripted HOME there is no operator ~/.pi, so
+# seed the same deterministic, non-secret stub settings.json that run-w0.1
+# seeds for the unit-test lane. This keeps the W0.2 cell hermetic and
+# standalone-green (not dependent on run-w0.1 having run first in a ladder).
+mkdir -p "$HOME/.pi/agent"
+printf '%s\n' '{"defaultProvider":"stub","defaultModel":"stub"}' \
+  > "$HOME/.pi/agent/settings.json"
+
 ./run-all-e2e-tests
 node --test e2e-tests/workflows-stress-concurrent.test.ts

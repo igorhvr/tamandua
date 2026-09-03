@@ -9,6 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TT_DIR="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(dirname "$TT_DIR")"
 VALIDATOR="$SCRIPT_DIR/tt-tier2-assets"
 
 TMP_CASES="$(mktemp -d "$TT_DIR/cases/tt-tier2-assets-test.XXXXXX")"
@@ -277,17 +278,34 @@ fi
 # A scratch copy of the tree (own git checkout) with ONE tracked scenario
 # dropped from the index must make the gate refuse naming the dir; restoring
 # it must pass again.
+#
+# S58 US-007: tt-tier2-assets now validates every manifest-referenced
+# scenario_path through validate-scenario.mjs + the scenario-workflow parity
+# guard, so the scratch copy must carry the full validation surface: the
+# scenarios/lib modules, the scenario cell (w4.21/bare-noninteractive-launch),
+# the bundled workflow yml it references, and the oracle executables its
+# metadata names. The manifest references the CELL dir (like the real
+# tier2.jsonl), not the wave container.
 SCRATCH_REPO="$(mktemp -d "${TMPDIR:-/tmp}/tt-tier2-tracked-scratch.XXXXXX")"
 mkdir -p "$SCRATCH_REPO/bin" "$SCRATCH_REPO/cases" "$SCRATCH_REPO/var" \
-  "$SCRATCH_REPO/scenarios/lib"
+  "$SCRATCH_REPO/scenarios/lib" "$SCRATCH_REPO/oracles" \
+  "$SCRATCH_REPO/workflows/bug-fix-merge-worktree"
 cp "$VALIDATOR" "$SCRATCH_REPO/bin/tt-tier2-assets"
 cp "$TT_DIR/scenarios/lib/tracked-tree.mjs" "$SCRATCH_REPO/scenarios/lib/tracked-tree.mjs"
+cp "$TT_DIR/scenarios/lib/validate-scenario.mjs" "$SCRATCH_REPO/scenarios/lib/validate-scenario.mjs"
+cp "$TT_DIR/scenarios/lib/scenario-workflow-parity.mjs" "$SCRATCH_REPO/scenarios/lib/scenario-workflow-parity.mjs"
+cp "$REPO_ROOT/workflows/bug-fix-merge-worktree/workflow.yml" \
+  "$SCRATCH_REPO/workflows/bug-fix-merge-worktree/workflow.yml"
+for oracle in O1 O3z O11; do
+  cp "$TT_DIR/oracles/$oracle" "$SCRATCH_REPO/oracles/$oracle"
+  chmod +x "$SCRATCH_REPO/oracles/$oracle"
+done
 cp -r "$TT_DIR/scenarios/w4.21" "$SCRATCH_REPO/scenarios/w4.21"
 git init -q "$SCRATCH_REPO"
 git -C "$SCRATCH_REPO" add -A
 echo "# scratch task" > "$SCRATCH_REPO/var/tier2-scratch-task.md"
 cat > "$SCRATCH_REPO/cases/scratch.jsonl" <<JSONL
-{"id":"T2-SCRATCH","wave":4,"workflow":"bug-fix-merge-worktree","fixture":"tt-ts","harness":"pi","task":"var/tier2-scratch-task.md","context":{"execution_mode":"scripted","scenario_id":"w4.21-bare-noninteractive-launch","scenario_path":"scenarios/w4.21"},"caps":{"tokens":0,"wall_min":1},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification"}
+{"id":"T2-SCRATCH","wave":4,"workflow":"bug-fix-merge-worktree","fixture":"tt-ts","harness":"pi","task":"var/tier2-scratch-task.md","context":{"execution_mode":"scripted","scenario_id":"w4.21-bare-noninteractive-launch","scenario_path":"scenarios/w4.21/bare-noninteractive-launch"},"caps":{"tokens":0,"wall_min":1},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification"}
 JSONL
 
 if "$SCRATCH_REPO/bin/tt-tier2-assets" "$SCRATCH_REPO/cases/scratch.jsonl" >/dev/null 2>&1; then
