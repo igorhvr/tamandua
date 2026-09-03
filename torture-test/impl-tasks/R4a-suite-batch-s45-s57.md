@@ -46,6 +46,10 @@ suite-defects-didn-dres-2026-09-02, triage-decisions-2026-09-01 (item 6: W4.33d/
   row (WORKSPACE_STATE / NEAREST_EVIDENCE / ACTION keylines, LEDGER_EVIDENCE: red, that row's CMD_HASH/TEST_CMD) while
   the oracle expected the declared command's hash and LEDGER_EVIDENCE: missing — model the gate's two branches
   (evidence red vs missing-with-nearest) and compare each key against the row the gate actually cites (LEDGER_ROW_ID).
+  (3) never-executed runs: W4.dsh-fdmw on the mac (dsh instant-failing, 0 tokens, no step.running, canceled at the
+  wall cap) was scored PRODUCT_FAIL by O10_EVENT_SET_MISMATCH ("inexact merge-gate event set" / "step.running stream
+  inconsistent") — O10 must return NOT_EVALUABLE (with the reason) for a run that never reached a claimed step, so the
+  case classifies INCONCLUSIVE/TIF instead of PF.
   Keep the oracle strict: refusal text must still be gate-generated keylines, never agent prose. Product-side format
   nit (GDIA, not in scope here): the red branch emits prose after LOG_TAIL while the missing branch uses an ACTION
   keyline — report only.
