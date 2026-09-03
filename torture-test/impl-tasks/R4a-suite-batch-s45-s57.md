@@ -36,6 +36,19 @@ suite-defects-didn-dres-2026-09-02, triage-decisions-2026-09-01 (item 6: W4.33d/
   classifies as infra with the holder pid/cmdline in the reason.
 - S57: golden validity includes a fixtures-src content hash in the .hashes ledger; drift ⇒ invalid (rebuilt under
   --rebuild-invalid, fail closed otherwise, naming the drifted fixture).
+- S59 (O10 refusal-diagnosis model): O10_REFUSAL_DIAGNOSIS fires on correct strict-ledger refusals on both machines
+  (W4.17-b: the red change never landed, FAILURE_CLASS refused_permanent). Two sub-causes, both in the oracle's
+  "exact mechanical self-diagnosis" model in oracles/lib/o10.mjs: (1) red-evidence branch (mac): the gate appends its
+  remediation sentence after the LOG_TAIL keyline (the last, multi-line key), so the parsed LOG_TAIL value = ledger
+  row log_tail + trailing advice and the exact compare fails — terminate LOG_TAIL at the gate's trailing advice (or
+  prefix-compare against the row's log_tail); (2) missing-evidence branch (linux): the worker produced no ledger row
+  for the declared command (ran plain `pytest`, rows exit 127 then 1), the gate refused citing the NEAREST evidence
+  row (WORKSPACE_STATE / NEAREST_EVIDENCE / ACTION keylines, LEDGER_EVIDENCE: red, that row's CMD_HASH/TEST_CMD) while
+  the oracle expected the declared command's hash and LEDGER_EVIDENCE: missing — model the gate's two branches
+  (evidence red vs missing-with-nearest) and compare each key against the row the gate actually cites (LEDGER_ROW_ID).
+  Keep the oracle strict: refusal text must still be gate-generated keylines, never agent prose. Product-side format
+  nit (GDIA, not in scope here): the red branch emits prose after LOG_TAIL while the missing branch uses an ACTION
+  keyline — report only.
 - MCHA (darwin chaos/kill guard): `tt-chaos` refuses to signal on darwin — mac campaign #1 cells W4.09-pi, W4.09-hermes,
   W4.10-kill-daemon and W4.48a all ended chaos-invocation-failed with exit 3 "GUARD_MISS: cannot read the process group
   of daemon pid N (no procfs) — group disjointness from the caller cannot be verified, refusing to signal". Correct
