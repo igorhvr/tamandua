@@ -79,6 +79,15 @@ suite-defects-didn-dres-2026-09-02, triage-decisions-2026-09-01 (item 6: W4.33d/
   run under the daemon's exact environment (PATH/HOME as the contained daemon sees them) and the roster predicate must
   mark dsh cells NOT_RUN (reason recorded) when it fails; capture the harness's full stderr in the probe evidence
   (the product's log preview truncates it).
+- MLSF (linux-hostile darwin port-evidence self-test): `self-tests/tier1-tt-recorder-darwin-port-evidence.test.ts`
+  (from MDUP) simulates a missing `lsof` by dropping every PATH directory that contains an `lsof` binary. On this
+  linux host `lsof` and `bash` both live in the same system bin directory, so the filtered PATH has no shell and the
+  two "lsof absent" sub-tests fail with a null exit status (spawn failure), red on every linux battery since MDUP
+  merged (160 passed / 1 failed at S58 0b7277c0); on macOS the two binaries live in different directories, which is
+  why the mac battery was green. Simulate absence without losing the interpreter: build a scratch PATH directory of
+  symlinks to the tools the script needs (bash, coreutils, awk/grep/sed, node) and make it the ONLY PATH entry, so
+  `lsof` resolution fails while everything else resolves; assert the scratch dir has no `lsof`. Keep both sub-tests'
+  expectations (degradation line, return 1, `start` exits 0) unchanged.
 - MCHA (darwin chaos/kill guard): `tt-chaos` refuses to signal on darwin — mac campaign #1 cells W4.09-pi, W4.09-hermes,
   W4.10-kill-daemon and W4.48a all ended chaos-invocation-failed with exit 3 "GUARD_MISS: cannot read the process group
   of daemon pid N (no procfs) — group disjointness from the caller cannot be verified, refusing to signal". Correct
