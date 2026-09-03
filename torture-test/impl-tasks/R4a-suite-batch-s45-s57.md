@@ -49,6 +49,13 @@ suite-defects-didn-dres-2026-09-02, triage-decisions-2026-09-01 (item 6: W4.33d/
   Keep the oracle strict: refusal text must still be gate-generated keylines, never agent prose. Product-side format
   nit (GDIA, not in scope here): the red branch emits prose after LOG_TAIL while the missing branch uses an ACTION
   keyline — report only.
+- S60 (O8 formatter-realignment false positive): W4.06-colleague-rebase on the mac scored O8_SEEDED_TEST_CHANGED on
+  pool_test.go (+88/-4/4 modified) but the four "modified" lines are gofmt column realignment of a struct's field
+  alignment (`git diff -w` shows +84 additive only). O8's additive/modified classification must ignore whitespace-only
+  line changes (formatter realignment: gofmt, prettier, black) — classify modified/deleted on a whitespace-insensitive
+  compare (and keep the byte-level pin only where a case declares it, e.g. the W4.17 red tests, where a whitespace-only
+  change is still reported as informational, never as FAIL). Add a fixture-backed self-test with a gofmt-realigned
+  seeded test (additive feature test + realigned struct) expecting O8 PASS with O8_SEEDED_TEST_EXTENDED.
 - MCHA (darwin chaos/kill guard): `tt-chaos` refuses to signal on darwin — mac campaign #1 cells W4.09-pi, W4.09-hermes,
   W4.10-kill-daemon and W4.48a all ended chaos-invocation-failed with exit 3 "GUARD_MISS: cannot read the process group
   of daemon pid N (no procfs) — group disjointness from the caller cannot be verified, refusing to signal". Correct
