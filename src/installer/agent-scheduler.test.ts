@@ -920,6 +920,10 @@ describe("executeDispatchRound instant-fail classification and escalation (RSPN)
       // as TAMANDUA_PI_BINARY is managed — keeping every RSPN assertion
       // unchanged (the run's instant-fail loop is the behavior under test).
       TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+      // Debug lines (the backoff/in-flight skip reasons are logged at
+      // debug level); flipped on inside the regression tests that assert
+      // on skip-reason log output.
+      TAMANDUA_DEBUG: process.env.TAMANDUA_DEBUG,
     };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
@@ -1006,6 +1010,25 @@ process.exit(1);
     return { runId, jobId, workdir };
   }
 
+  /** Read this test's isolated scheduler log (skip reasons are debug lines). */
+  function readStateLog(): string {
+    const logPath = path.join(tempHome, ".tamandua", "tamandua.log");
+    return fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf-8") : "";
+  }
+
+  /**
+   * Real-tick driver: advance time until any armed instant-fail backoff
+   * window for `jobId` has elapsed (past `nextAllowedDispatchAt`), so the
+   * next executeDispatchRound tick relaunches instead of being gated. No-op
+   * when no window is armed (streak below K or already escalated).
+   */
+  async function waitPastInstantFailBackoff(jobId: string): Promise<void> {
+    const streak = _instantFailStreakFor(jobId);
+    const untilMs = streak?.nextAllowedDispatchAt ?? 0;
+    const waitMs = Math.max(0, untilMs - Date.now()) + 150;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+
   it("classifies instant-fail rounds: ticks instant_fail_count and never touches WLST5 counters", async () => {
     const { runId, jobId, workdir } = setupInstantFailRound("instant");
 
@@ -1057,6 +1080,109 @@ process.exit(1);
     assert.equal(row.status, "running", "backoff alone must not fail the run");
   });
 
+  it("relaunches the harness once the backoff window elapses — a backoff-gated tick must not leak the in-flight mark", async () => {
+    // IFLB-mid regression (US-001): executeDispatchRound used to mark the
+    // job in-flight BEFORE evaluating the instant-fail backoff gate. The
+    // gate's early return precedes the round try, whose `finally` is the
+    // only place the mark is released, so a tick inside the backoff window
+    // leaked the mark and every later tick was skipped as
+    // previous_round_in_flight — no relaunch after the window, N
+    // unreachable, run idle with a pending step. The gate must run before
+    // the mark: a gated tick leaves the job absent from the in-flight set,
+    // and the first tick past nextAllowedDispatchAt MUST spawn again.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    // Short window so the test can advance past it in real time; round 3
+    // runs synchronously up to the gate right after round 2 resolves, so
+    // it deterministically lands inside the window.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "1500";
+    process.env.TAMANDUA_DEBUG = "1"; // the skip reasons are debug-level log lines
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+    const db = getDb();
+    const counter = () => (db.prepare("SELECT instant_fail_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number }).instant_fail_count;
+
+    // Rounds 1-2: instant fails, the streak climbs to K=2 and the next
+    // relaunch is delayed (backoff armed).
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+    let streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "streak must reach K after K instant-fail rounds");
+    const backoffUntilMs = streak?.nextAllowedDispatchAt ?? 0;
+    assert.ok(backoffUntilMs > Date.now(), "after K consecutive instant-fails the next relaunch must be delayed (backoff armed)");
+
+    // Tick 3 inside the backoff window: skipped at the gate — no spawn, no
+    // streak change, and (the regression) no in-flight mark leaked.
+    await executeDispatchRound(job, agent);
+    streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "an in-window tick must not increment the streak");
+    assert.equal(counter(), 2, "an in-window tick must not spawn a harness");
+
+    // Advance past nextAllowedDispatchAt, then tick: the relaunch MUST
+    // happen (counter 2 → 3). On the pre-fix code this tick was skipped as
+    // previous_round_in_flight and the counter stayed 2 forever.
+    const waitMs = Math.max(0, backoffUntilMs - Date.now()) + 500;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    await executeDispatchRound(job, agent);
+
+    const row = db.prepare("SELECT instant_fail_count, status FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; status: string };
+    assert.equal(row.instant_fail_count, 3, "once the backoff window elapses the next tick must relaunch the harness (counter must tick)");
+    assert.equal(row.status, "running", "the run must not be force-failed below the escalation threshold");
+    streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 3, "the relaunched round is another instant fail — the streak must advance");
+
+    // No tick in this sequence may have been skipped as
+    // previous_round_in_flight: a backoff-gated tick must not leak the
+    // mark (pre-fix, tick 3 leaked it and every later tick skipped here).
+    const log = readStateLog();
+    assert.match(log, /Dispatch round skipped — instant-fail backoff/, "the in-window tick must log the instant_fail_backoff skip reason");
+    assert.doesNotMatch(log, /previous round still in flight/, "no tick may be skipped as previous_round_in_flight after a backoff-gated tick");
+    // Direct membership probe: tryMarkJobInFlight returns true only when
+    // the job is NOT already in flight (pre-fix the leaked mark made it
+    // return false). The probe marks the job; afterEach's shutdownAllCrons
+    // clears it.
+    assert.equal(tryMarkJobInFlight(jobId), true, "after the relaunch round the job must not be in the in-flight set");
+  });
+
+  it("never marks a job in-flight when the backoff gate skips the tick", async () => {
+    // Same leaked-mark regression, asserted directly at the skip site with
+    // a long backoff window so the gated tick deterministically lands
+    // inside it: after the tick, tryMarkJobInFlight must still succeed —
+    // the gate returned BEFORE the mark, so nothing is in flight.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "60000"; // window far in the future
+    process.env.TAMANDUA_DEBUG = "1";
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+    const db = getDb();
+    const counter = () => (db.prepare("SELECT instant_fail_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number }).instant_fail_count;
+
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+    let streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "streak must reach K after K instant-fail rounds");
+    assert.ok(
+      (streak?.nextAllowedDispatchAt ?? 0) > Date.now(),
+      "after K consecutive instant-fails the next relaunch must be delayed (backoff armed)",
+    );
+
+    // Tick 3 inside the window: skipped at the gate, no spawn, no streak
+    // change — and afterwards the job must NOT be in the in-flight set.
+    await executeDispatchRound(job, agent);
+    streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "the backoff-gated round must not increment the streak");
+    assert.equal(counter(), 2, "the backoff-gated round must not spawn a harness");
+    const log = readStateLog();
+    assert.match(log, /Dispatch round skipped — instant-fail backoff/, "the in-window tick must log the instant_fail_backoff skip reason");
+    // tryMarkJobInFlight returns false only when the job is already marked
+    // in flight. Pre-fix, the gate ran after the mark and its early return
+    // leaked the mark, so this probe returned false.
+    assert.equal(tryMarkJobInFlight(jobId), true, "a backoff-gated tick must leave the job absent from the in-flight set");
+  });
+
   it("force-fails the run at N consecutive instant-fail rounds with the precise reason and alert event", async () => {
     process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "3";
     process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "3";
@@ -1091,6 +1217,98 @@ process.exit(1);
     assert.equal(streak?.consecutive, 3, "the streak must persist at N for surfacing");
   });
 
+  it("reaches the escalation force-fail through REAL widening backoff windows (K=2, N=4)", async () => {
+    // US-002: the RSPN escalation path must be reachable through real
+    // successive dispatch ticks that pass through the widening backoff
+    // windows — the direct N-round test above bypasses the backoff with
+    // base=0, which is exactly the coverage gap this closes (US-001 proved
+    // the relaunch happens once, this proves the loop keeps relaunching
+    // through every window until N escalates). K=2: rounds 1-2 arm the
+    // first window (1×base); an in-window tick is gated; after the window
+    // elapses round 3 spawns and widens the window (2×base); after that
+    // window round 4 is the N-th consecutive instant fail → escalate.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "4";
+    // 600ms base: the first window (1×base) is comfortably larger than any
+    // event-loop stall between the K-th round and the in-window gated tick,
+    // while both windows stay short enough to cross in real time.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "600";
+    process.env.TAMANDUA_DEBUG = "1"; // the backoff-gated skip is a debug-level log line
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+    const db = getDb();
+    const count = () => (db.prepare("SELECT instant_fail_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number }).instant_fail_count;
+
+    // Rounds 1-2: consecutive instant fails climb to K=2 and arm the first
+    // backoff window (1×base = 600ms).
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+    let streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "two instant-fail rounds must reach K=2");
+    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > Date.now(), "the relaunch must be backed off after the K-th round");
+    assert.equal(count(), 2);
+
+    // A real tick inside the first window is gated at the backoff gate —
+    // no spawn, streak and counter unchanged.
+    await executeDispatchRound(job, agent);
+    streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "an in-window tick must not increment the streak");
+    assert.equal(count(), 2, "an in-window tick must not spawn a harness");
+
+    // Advance past the first window, then tick: round 3 relaunches, climbs
+    // to streak 3, and widens the window to 2×base (1200ms).
+    await waitPastInstantFailBackoff(jobId);
+    await executeDispatchRound(job, agent);
+    streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 3, "the relaunched round must advance the streak to 3");
+    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > Date.now(), "the relaunch must be backed off again (widened window)");
+    assert.equal(count(), 3);
+
+    // Advance past the widened window, then tick: round 4 is the N=4th
+    // consecutive instant fail → escalation (run.instant_fail_loop + the
+    // sanctioned force-fail path).
+    await waitPastInstantFailBackoff(jobId);
+    await executeDispatchRound(job, agent);
+    const row = db.prepare("SELECT instant_fail_count, status FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; status: string };
+    assert.equal(row.status, "failed", "the N-th consecutive instant fail must force-fail the run");
+    assert.equal(row.instant_fail_count, 4, "instant_fail_count must equal the consecutive round count");
+
+    const events = getRunEvents(runId);
+    const loopAlerts = events.filter((e) => e.event === "run.instant_fail_loop");
+    assert.equal(loopAlerts.length, 1, "escalation must emit exactly one run.instant_fail_loop alert");
+    assert.equal(loopAlerts[0].consecutiveInstantFails, 4, "the alert must carry the consecutive count N");
+    const forceFailures = events.filter((e) => e.event === "run.force_failed");
+    assert.equal(forceFailures.length, 1, "escalation must force-fail through the sanctioned path");
+    assert.match(
+      forceFailures[0].reason ?? "",
+      /^worker instant-fail loop: 4 consecutive sub-\d+s exit-1 rounds; last command: /,
+      "the force-fail reason must be precise about the loop shape (consecutive count + command preview)",
+    );
+
+    // Dispatch stops for this run: a further tick spawns no harness (the
+    // run is terminal — the tick is torn down at the run-status check) and
+    // the streak persists at N for surfacing.
+    await executeDispatchRound(job, agent);
+    assert.equal(count(), 4, "a post-escalation tick must not spawn a harness");
+    const streakAtN = _instantFailStreakFor(jobId);
+    assert.equal(streakAtN?.consecutive, 4, "the streak must persist at N for surfacing");
+    assert.equal(
+      getRunEvents(runId).filter((e) => e.event === "run.instant_fail_loop").length,
+      1,
+      "no second run.instant_fail_loop alert after a post-escalation tick",
+    );
+
+    // The windows really widened (1×base then 2×base) and every real gated
+    // tick went through the backoff gate — none leaked into the in-flight
+    // guard (the US-001 leaked-mark regression shape).
+    const log = readStateLog();
+    assert.match(log, /Dispatch round skipped — instant-fail backoff/, "a real tick inside the backoff window must log the instant_fail_backoff skip");
+    assert.match(log, /"backoffDelayMs":600/, "the first window must be 1×base");
+    assert.match(log, /"backoffDelayMs":1200/, "the second window must be widened to 2×base");
+    assert.doesNotMatch(log, /previous round still in flight/, "no tick may be skipped as previous_round_in_flight");
+  });
+
   it("resets the streak on any non-instant-fail round (output round and clean round)", async () => {
     process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "3";
     process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
@@ -1117,6 +1335,57 @@ process.exit(1);
     const row = db.prepare("SELECT instant_fail_count, status FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; status: string };
     assert.equal(row.instant_fail_count, 1, "only classified instant-fail rounds tick instant_fail_count");
     assert.equal(row.status, "running", "the run must still be running after reset rounds");
+  });
+
+  it("resets the streak on a successful round between instant fails — the real-tick driver restarts counting from 1 (K=2)", async () => {
+    // US-002: through the same real-tick driver, a successful (non-instant)
+    // round between instant fails must reset the per-job streak — backoff
+    // and escalation count CONSECUTIVE instant-fail rounds only. Drive
+    // K-1 = 1 instant fail (below K, so no backoff), one output-producing
+    // round (reset), then fail again: the streak restarts from 1 (no
+    // backoff armed) and only re-arms after K consecutive instant fails
+    // from the restart — proving the pre-reset count did not carry over.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+    const db = getDb();
+    const count = () => (db.prepare("SELECT instant_fail_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number }).instant_fail_count;
+
+    // K-1 = 1 instant fail → streak 1, still below the backoff threshold.
+    await executeDispatchRound(job, agent);
+    assert.equal(_instantFailStreakFor(jobId)?.consecutive, 1, "one instant-fail round must set the streak to 1");
+    assert.equal(count(), 1);
+
+    // An exit-1 round that produced output is NOT an instant fail → reset.
+    process.env.FAKE_PI_MODE = "output";
+    await executeDispatchRound(job, agent);
+    assert.equal(_instantFailStreakFor(jobId), undefined, "an output-producing round must reset the streak");
+    assert.equal(count(), 1, "the reset round must not tick instant_fail_count");
+
+    // Fail again through the same tick driver: counting restarts from 1 —
+    // the streak does not accumulate across the reset, so no backoff is
+    // armed at streak 1.
+    process.env.FAKE_PI_MODE = "instant";
+    await executeDispatchRound(job, agent);
+    let streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 1, "after a reset the streak must restart from 1 (not accumulate across the reset)");
+    assert.ok((streak?.nextAllowedDispatchAt ?? 0) <= Date.now(), "below K the relaunch must not be backed off");
+    assert.equal(count(), 2);
+
+    // One more instant fail reaches K=2 from the restart and re-arms the
+    // backoff — had the reset not happened, this round would have been the
+    // 3rd consecutive fail, not the K-th from a fresh count.
+    await executeDispatchRound(job, agent);
+    streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "K consecutive instant fails from the restart must re-arm the backoff");
+    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > Date.now(), "the relaunch must be backed off at K from the restart");
+    assert.equal(count(), 3);
+
+    const row = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(row.status, "running", "the run must not be force-failed below N");
+    assert.equal(getRunEvents(runId).filter((e) => e.event === "run.instant_fail_loop").length, 0, "no escalation before N consecutive instant fails");
   });
 
   it("surfaces the instant-fail loop through the status data layer (workflow status / runs)", async () => {
@@ -1948,7 +2217,7 @@ process.exit(0);
 // run's harness through the probe prompt and force-fails the run
 // immediately and legibly when the harness cannot work (a launch-broken
 // harness — pi with invalidated credentials, dsh boot failure — used to
-// strand the run in three instant-fail backoff rounds that never
+// strand the run in consecutive instant-fail backoff rounds that never
 // escalated). These tests drive the gate at the scheduler level: (a) a
 // failing harness force-fails with the keyline block and zero steps
 // started; (b/c) a probe-aware harness is probed exactly once (probe ok

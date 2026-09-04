@@ -175,11 +175,19 @@ The probe's wall clock defaults to **180 seconds**
 `TAMANDUA_HARNESS_PROBE=0` to disable the probe entirely (escape hatch;
 the probe is on by default).
 
-> **Known-open (IFLB-mid):** a harness that passes the launch-time probe
-> but breaks MID-run is still handled by the existing instant-fail
-> backoff (after consecutive instant-fail rounds the scheduler backs off
-> and stops relaunching); that backoff's relaunch behavior is known-open
-> and deliberately unchanged by the launch-time probe.
+A harness that passes the launch-time probe but breaks MID-run is handled
+by the instant-fail relaunch policy (RSPN). A round is an instant fail
+when the harness exits nonzero (or dies by signal) with zero output in
+under 2 s without claiming a step. After **K** consecutive instant-fail
+rounds (default **K = 6**) the scheduler starts an escalating relaunch
+backoff instead of respawning on the fixed 15 s tick: relaunch delays
+grow 30 s → 60 s → 120 s (capped). After **N** consecutive instant-fail
+rounds (default **N = 20**) the run is force-failed with a precise reason
+(`worker instant-fail loop: N consecutive sub-2s exit-1 rounds; last
+command: …`) and a `run.instant_fail_loop` event. With the defaults the
+horizon is about 27 minutes: six rounds on the 15 s tick, then 30 s /
+60 s / 120 s backoffs up through the 20th round. Any non-instant-fail
+round between failures resets the consecutive count.
 
 ### Feature Development
 

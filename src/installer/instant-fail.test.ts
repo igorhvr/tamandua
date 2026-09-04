@@ -212,10 +212,10 @@ describe("instant-fail classification boundaries (RSPN)", () => {
     );
   });
 
-  it("default thresholds are conservative (2s wall, K=3 backoff, N=10 escalation)", () => {
+  it("default thresholds are conservative (2s wall, K=6 backoff, N=20 escalation)", () => {
     assert.equal(DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS, 2_000);
-    assert.equal(DEFAULT_INSTANT_FAIL_BACKOFF_THRESHOLD, 3);
-    assert.equal(DEFAULT_INSTANT_FAIL_ESCALATION_THRESHOLD, 10);
+    assert.equal(DEFAULT_INSTANT_FAIL_BACKOFF_THRESHOLD, 6);
+    assert.equal(DEFAULT_INSTANT_FAIL_ESCALATION_THRESHOLD, 20);
     assert.equal(DEFAULT_INSTANT_FAIL_BACKOFF_BASE_MS, 30_000);
   });
 
@@ -261,11 +261,11 @@ describe("instant-fail backoff delays and reason (RSPN)", () => {
   });
 
   it("formats the precise force-fail reason with the wall threshold and last command", () => {
-    const reason = formatInstantFailReason(10, "pi --print --mode json <prompt>");
-    assert.match(reason, /^worker instant-fail loop: 10 consecutive sub-2s exit-1 rounds; last command: pi --print/);
+    const reason = formatInstantFailReason(20, "pi --print --mode json <prompt>");
+    assert.match(reason, /^worker instant-fail loop: 20 consecutive sub-2s exit-1 rounds; last command: pi --print/);
   });
 
   it("falls back to 'unknown' when no last command is available", () => {
-    assert.match(formatInstantFailReason(10), /last command: unknown$/);
+    assert.match(formatInstantFailReason(20), /last command: unknown$/);
   });
 });

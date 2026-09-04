@@ -1300,16 +1300,19 @@ async function escalateInstantFailLoop(
 /**
  * One dispatch round for a (runId, agentId) job:
  *
- *   1. in-flight guard (one round per job at a time)
- *   2. run-status check (terminal → graceful teardown; paused/draining → skip)
- *   3. stale-claim sweep (recover steps whose worker silently died)
- *   4. deterministic peek — `peekStep` IN-PROCESS. No spawn, no model, no
+ *   1. instant-fail backoff gate (skip the tick while the backoff window is
+ *      open — evaluated BEFORE the in-flight mark so a gated tick leaks
+ *      nothing; see the gate comment for the race-safety argument)
+ *   2. in-flight guard (one round per job at a time)
+ *   3. run-status check (terminal → graceful teardown; paused/draining → skip)
+ *   4. stale-claim sweep (recover steps whose worker silently died)
+ *   5. deterministic peek — `peekStep` IN-PROCESS. No spawn, no model, no
  *      tokens when idle. This is the entire point of the dispatch motor.
- *   5. work spawn — only on HAS_WORK: pi/hermes/dsh runs the work prompt
+ *   6. work spawn — only on HAS_WORK: pi/hermes/dsh runs the work prompt
  *      (claim → execute → report)
- *   6. post-round processing — token attribution to the run, STATUS
+ *   7. post-round processing — token attribution to the run, STATUS
  *      classification, auto-complete fallback, orphaned-step recovery
- *   7. instant-fail classification — streak/backoff/escalation (RSPN)
+ *   8. instant-fail classification — streak/backoff/escalation (RSPN)
  */
 export async function executeDispatchRound(
   job: CronJobInfo,
@@ -1338,24 +1341,22 @@ export async function executeDispatchRound(
     return;
   }
 
-  // ── Race-safe in-flight guard ───────────────────────────────────
-  // Must happen synchronously *before* any awaited async work so
-  // concurrent nudge + timer tick invocations cannot launch duplicate
-  // harness processes.
-  if (!tryMarkJobInFlight(job.id)) {
-    logger.debug("Dispatch round skipped — previous round still in flight", {
-      ...context,
-      reason: "previous_round_in_flight",
-    });
-    return;
-  }
-
   // ── Instant-fail backoff gate (RSPN) ────────────────────────────
   // After K consecutive instant-fail rounds the motor backs off the
   // broken harness's relaunch: subsequent ticks are skipped until
   // nextAllowedDispatchAt passes, instead of respawning every 15s
   // forever. Idle peeks are never delayed by this — a streak is only
   // recorded for rounds that actually spawned a harness and instant-failed.
+  //
+  // The gate runs BEFORE the in-flight mark on purpose: it reads only the
+  // synchronous instantFailStreaks map and awaits nothing, so the
+  // race-safety invariant below (the mark must happen synchronously before
+  // any awaited async work) still holds. Marking first would leak the mark
+  // on this early return — the round try's `finally` (the only place the
+  // mark is released) never runs for a gated tick, so every later tick
+  // would be skipped as previous_round_in_flight: no relaunch after the
+  // window elapses, N unreachable, run idle with a pending step (IFLB-mid
+  // regression).
   const backoff = instantFailStreaks.get(job.id);
   if (backoff && backoff.nextAllowedDispatchAt > Date.now()) {
     logger.debug("Dispatch round skipped — instant-fail backoff", {
@@ -1364,6 +1365,20 @@ export async function executeDispatchRound(
       consecutiveInstantFails: backoff.consecutive,
       backoffUntilMs: backoff.nextAllowedDispatchAt,
       backoffRemainingMs: backoff.nextAllowedDispatchAt - Date.now(),
+    });
+    return;
+  }
+
+  // ── Race-safe in-flight guard ───────────────────────────────────
+  // Must happen synchronously *before* any awaited async work so
+  // concurrent nudge + timer tick invocations cannot launch duplicate
+  // harness processes. Between this mark and the round `try` below there
+  // is intentionally NO early return (and no await): the only pre-try
+  // exit after marking is via the `try`'s own `finally`.
+  if (!tryMarkJobInFlight(job.id)) {
+    logger.debug("Dispatch round skipped — previous round still in flight", {
+      ...context,
+      reason: "previous_round_in_flight",
     });
     return;
   }
@@ -1593,8 +1608,8 @@ export async function executeDispatchRound(
     // reply with the PATH — a real tool call that fails fast when the
     // harness cannot work at all (pi with invalidated credentials, dsh boot
     // failure under a contained daemon). Without it, a launch-broken
-    // harness used to strand the run in three instant-fail backoff rounds
-    // (RSPN) that never escalated. Exactly ONE probe runs per run: the DB
+    // harness used to strand the run in consecutive instant-fail backoff
+    // rounds (RSPN) that never escalated. Exactly ONE probe runs per run: the DB
     // reserve below is atomic across the run's dispatch jobs and a recorded
     // 'ok'/'failed' row survives a daemon restart, so a passed run is never
     // re-probed. The probe round is NOT a work round: it never claims a

@@ -1325,7 +1325,7 @@ describe("RSPN instant-fail loop surfacing", () => {
     const db = new DatabaseSync(dbPath);
     db.exec(RUNS_DDL);
     db.prepare(
-      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, instant_fail_count) VALUES (?, 'feature-dev', 'instant fail loop', 'running', '{}', 100, 3)"
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, instant_fail_count) VALUES (?, 'feature-dev', 'instant fail loop', 'running', '{}', 100, 6)"
     ).run(runId);
     db.close();
 
@@ -1335,7 +1335,7 @@ describe("RSPN instant-fail loop surfacing", () => {
     );
     await new Promise<void>((resolve) => child.on("close", () => resolve()));
     const stdout = getStdout();
-    assert.match(stdout, /Worker instant-fail loop: 3 consecutive sub-\d+s exit-1 rounds/);
+    assert.match(stdout, /Worker instant-fail loop: 6 consecutive sub-\d+s exit-1 rounds/);
 
     try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
   });
@@ -1371,7 +1371,7 @@ describe("RSPN instant-fail loop surfacing", () => {
     const db = new DatabaseSync(dbPath);
     db.exec(RUNS_DDL);
     db.prepare(
-      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, instant_fail_count) VALUES (?, 'feature-dev', 'instant fail loop', 'running', '{}', 100, 4)"
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, instant_fail_count) VALUES (?, 'feature-dev', 'instant fail loop', 'running', '{}', 100, 6)"
     ).run(runId);
     db.close();
 
@@ -1381,7 +1381,7 @@ describe("RSPN instant-fail loop surfacing", () => {
     );
     await new Promise<void>((resolve) => child.on("close", () => resolve()));
     const stdout = getStdout();
-    assert.match(stdout, /if:4/);
+    assert.match(stdout, /if:6/);
 
     try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
   });

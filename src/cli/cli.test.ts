@@ -2244,14 +2244,14 @@ describe("formatRunsSummary", () => {
     const now = new Date().toISOString();
     const result = formatRunsSummary({
       listRuns: () => [
-        // At/above the backoff threshold K (default 3) → annotated.
-        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Looping run", status: "running", createdAt: now, updatedAt: now, tokensSpent: 100, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 3 },
+        // At/above the backoff threshold K (default 6) → annotated.
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Looping run", status: "running", createdAt: now, updatedAt: now, tokensSpent: 100, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 6 },
         // Below the threshold → NOT annotated (a lone instant fail is not a loop).
         { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "One-off", status: "running", createdAt: now, updatedAt: now, tokensSpent: 50, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 2 },
       ],
       isDaemonRunning: () => true,
     });
-    assert.match(result, /INSTANT-FAIL LOOP \(3 consecutive\)/);
+    assert.match(result, /INSTANT-FAIL LOOP \(6 consecutive\)/);
     assert.match(result, /aaaaaaa/);
     assert.doesNotMatch(result, /INSTANT-FAIL LOOP \(2 consecutive\)/);
   });

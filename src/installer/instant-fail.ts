@@ -39,14 +39,18 @@ export const DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS = 2_000;
 /**
  * Consecutive instant-fail rounds (K) after which the motor applies an
  * escalating delay between relaunches instead of the fixed 15s tick.
+ * Default 6: the first K rounds relaunch on the 15s tick, then the delay
+ * escalates 30s → 60s → 120s (capped).
  */
-export const DEFAULT_INSTANT_FAIL_BACKOFF_THRESHOLD = 3;
+export const DEFAULT_INSTANT_FAIL_BACKOFF_THRESHOLD = 6;
 
 /**
  * Consecutive instant-fail rounds (N) after which the run is force-failed
  * through the sanctioned forceFailRun path with a precise reason.
+ * Default 20: with the default base delay the backoff/escalation horizon
+ * from the first instant fail to the force-fail is about 27 minutes.
  */
-export const DEFAULT_INSTANT_FAIL_ESCALATION_THRESHOLD = 10;
+export const DEFAULT_INSTANT_FAIL_ESCALATION_THRESHOLD = 20;
 
 /**
  * Base backoff delay (ms) applied at the K-th consecutive instant-fail.

@@ -134,18 +134,26 @@ describe("README launch-time harness probe documentation (IFLB)", () => {
     );
   });
 
-  it("records the IFLB-mid known-open note (mid-run breakage handled by existing backoff, unchanged)", () => {
+  it("documents the fixed mid-run instant-fail relaunch policy (K and N defaults + horizon)", () => {
     assertFlatPhrase(
-      "**Known-open (IFLB-mid):**",
-      "README must record the IFLB-mid known-open note"
+      "A harness that passes the launch-time probe but breaks MID-run is handled by the instant-fail relaunch policy (RSPN)",
+      "README must state mid-run harness breakage is handled by the instant-fail relaunch policy"
     );
     assertFlatPhrase(
-      "breaks MID-run is still handled by the existing instant-fail backoff",
-      "README must state mid-run harness breakage is still handled by the existing instant-fail backoff"
+      "After **K** consecutive instant-fail rounds (default **K = 6**) the scheduler starts an escalating relaunch backoff",
+      "README must explain K: consecutive instant-fail rounds at which the escalating relaunch backoff starts, default 6"
     );
     assertFlatPhrase(
-      "that backoff's relaunch behavior is known-open and deliberately unchanged by the launch-time probe",
-      "README must state the backoff relaunch behavior is known-open and unchanged by this change"
+      "After **N** consecutive instant-fail rounds (default **N = 20**) the run is force-failed with a precise reason",
+      "README must explain N: consecutive instant-fail rounds at which the run is force-failed, default 20"
+    );
+    assertFlatPhrase(
+      "six rounds on the 15 s tick, then 30 s / 60 s / 120 s backoffs up through the 20th round",
+      "README must state the ~27-minute default horizon (six 15s-tick rounds then 30/60/120s backoffs to the 20th round)"
+    );
+    assertFlatPhrase(
+      "about 27 minutes",
+      "README must state the default escalation horizon is about 27 minutes"
     );
   });
 });

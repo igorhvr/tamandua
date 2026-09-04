@@ -2,7 +2,7 @@
  * Launch-time harness probe policy (IFLB).
  *
  * The dispatch motor used to discover a launch-broken harness only through
- * three consecutive instant-fail rounds (RSPN): pi exiting in ~300ms with
+ * consecutive instant-fail rounds (RSPN): pi exiting in ~300ms with
  * "No API key found for the selected model" after the scenario invalidated
  * the copied credentials, dsh exiting in 100–500ms with a boot error under
  * the contained daemon — and then backed off forever, leaving the run

@@ -350,7 +350,8 @@ recognize the `TAMANDUA_HARNESS_PROBE: skill-path` marker line, run the
 quoted `<launcher> skill-path` command for real, and reply with the PATH;
 shared by the pi/dsh/hermes runtimes in `e2e-tests/helpers`) ANSWER probe
 prompts, so daemon e2e suites (workflows-scripted/-hermes/-dsh,
-workflows-harness-probe, autoresearch-scripted, stress-concurrent) run with
+workflows-harness-probe, workflows-instant-fail-loop, autoresearch-scripted,
+stress-concurrent) run with
 the probe ENABLED by default — the probe round is never journaled and never
 consumes a canned-behaviors invocation index, so per-agent invocation/round
 assertions are unaffected. A probe answer must be emitted in the runtime's
@@ -358,6 +359,22 @@ own output contract (pi: a message_end JSON line; dsh/hermes: plain-text
 final message) and exits 0. Npm daemon suites whose scenario is NOT the
 probe (dashboard-crash-isolation, pause-kill-resume-regression) still launch
 with `TAMANDUA_HARNESS_PROBE=0` to keep the behavior under test focused.
+
+Mid-run instant-fail rounds (a harness that passed the launch probe but
+exits fast with zero output without claiming a step) now RELAUNCH after
+the backoff window: after K consecutive instant-fail rounds the scheduler
+skips ticks inside an escalating backoff window but spawns again once it
+elapses, and after N consecutive rounds it force-fails the run with a
+`run.instant_fail_loop` event. Defaults are K = 6 / N = 20
+(`TAMANDUA_INSTANT_FAIL_BACKOFF_K` / `TAMANDUA_INSTANT_FAIL_ESCALATION_N`
+override them); a non-instant-fail round between failures resets the
+consecutive count. Do not pin the old 3/10 defaults anywhere. The fast e2e
+`e2e-tests/workflows-instant-fail-loop.test.ts` (registered in both
+`run-all-scripted-e2e-tests` and `run-all-e2e-tests`) pins the MID-RUN
+relaunch end-to-end: a probe-passing shim that exit-1s on every work round,
+with env K=2 / N=4 / base 3s, must force-fail with `run.instant_fail_loop`
+within about a minute and show no `previous_round_in_flight` skip after a
+backoff-gated tick.
 
 The torture-test scripted tiers have their own FORK of these runtimes
 (`torture-test/scripted-runtimes/` — runtime-pi.mjs / runtime-hermes.mjs /
