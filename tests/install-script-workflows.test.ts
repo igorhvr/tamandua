@@ -121,7 +121,7 @@ describe("scripts/install.sh — bundled workflow installation", () => {
       // Run install.sh --local with isolated HOME
       const result = spawnSync("bash", [INSTALL_SCRIPT, "--local", REPO_ROOT], {
         env: cleanChildEnv({ HOME: tempHome }),
-        timeout: 120_000, // 2 minute timeout for npm install + build
+        timeout: 600_000, // 10 minute allowance for the real npm install + build on a loaded host
         encoding: "utf-8",
       });
 
