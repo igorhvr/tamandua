@@ -19,7 +19,32 @@ Implementation belongs under `torture-test/`. Do not change product source,
 product tests, package dependencies, installer behavior, or bundled personas.
 RISO and RJSON have separate runs: use their reviewed landed interfaces when
 available, and report an integration dependency rather than duplicating them.
-TSCP, MSIG and KHYG are separate product decisions, not this batch's scope.
+TSCP, MSIG, RCOB and KHYG are separate product decisions, not this batch's scope.
+
+### Separate scenario-cleanup safety prerequisite (SOGI)
+
+Beads `tamandua-6sy.5.1` tracks the preexisting scenario-helper defect that
+permits group signals when the current leader identity is unreadable. The
+actual helper's recording-only proof is red on both Linux and system macOS
+Bash 3.2; this is unsafe signal-selection evidence, not a historical kill
+attribution. See the retained `scenario-group-identity-E2Ihak` review evidence.
+
+SOGI is a SEPARATE bounded suite-only preflight, not a twelfth R4b story or
+another R4a reroute. It may be prepared and corrected before the full R4a
+scenario ladder, avoiding a circular dependency on this batch's launch.
+Do not duplicate its implementation here or resume incident-held runs.
+
+Before any real child/group experiment or scenario-containing ladder, the
+coordinator must independently accept SOGI's COMMITTED current-source
+recording proof. That proof must cover unknown/changed identity, loss between
+TERM and KILL, and a viable owned-survivor/interrupt cleanup path. Only then
+may the unchanged actual-child compatibility assertions run on Linux and
+actual macOS. Keep those positive assertions and the original w4.35 fossil;
+omitting cleanup or weakening tests is not acceptance. This prerequisite
+also applies to the scenario tests reached by US-011's regular battery.
+Read-only review and recording-only preparation do not exercise that path.
+No product fix, permission profile, command shim or KHYG workaround is
+authorized by this prerequisite.
 
 ## Non-negotiable operating rules
 
