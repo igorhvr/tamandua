@@ -17,17 +17,30 @@ their old tree, but do not prove the newly identified negative cases.
 ## Tester: return the review finding through the normal protocol
 
 Do not mark integration accepted while this finding remains.
-Inspect the source and the retained recording-only proof below, then use the
-normal step report to return STATUS: retry with ISSUES explicitly citing
-US-014 and this task record. The existing test on_fail.retry_step=implement
-path resets cited stories. Cite ONLY US-014 as the story needing correction,
-so unrelated completed stories are not reopened. Do not edit the live DB,
-story rows, retry counters, or run context directly.
+Inspect the source and retained recording-only proof below, then use the
+normal `tamandua step fail` command ONCE for the step you actually claimed,
+with the failure reason beginning `US-014 SGRD:` and naming this task record.
+The existing test on_fail.retry_step=implement path preserves that reason
+and resets cited stories when normal retries are exhausted. Cite ONLY US-014
+as the story needing correction, so unrelated stories are not reopened.
+Do not edit the live DB, story rows, retry counters, or run context directly.
 
-Suggested concise feedback content (not a shell command):
+Protocol correction to the first version of this addendum: the actual
+stored tester expects STATUS: done plus TESTED_TREE. A STATUS: retry
+completion is rejected by expects validation BEFORE retry-verdict handling,
+and that rejection can replace the useful story-specific reason. Therefore
+do NOT submit a retry completion or add a fake done marker to satisfy expects.
+Use `step fail`, whose explicit reason survives the failure/reroute path.
 
-    STATUS: retry
-    ISSUES: US-014 SGRD: unknown caller pgid or incomplete ancestry is accepted by the signal guard. See origin torture-test/impl-tasks/R4a-SGRD-review-correction.md and its raw VM proof. Correct fail-closed handling before acceptance.
+Suggested concise failure reason (not a shell command):
+
+    US-014 SGRD: unknown caller pgid or incomplete ancestry is accepted by the signal guard. See /home/igorhvr/idm/tamandua/torture-test/impl-tasks/R4a-SGRD-review-correction.md and its raw VM proof. Correct fail-closed handling before acceptance.
+
+One failure report per legitimately claimed round. If the ordinary response
+is retrying/pending, that is the existing bounded retry policy; the next
+tester round may report the still-unfixed failure again after checking the
+recorded source. Do not repeatedly fail an unclaimed step or manipulate the
+counter to accelerate the policy. Finish the worker round with STATUS: failed.
 
 The tester stays read-only. The developer performs the suite correction,
 the verifier reviews it, and integration resumes through the workflow.
