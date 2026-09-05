@@ -1,5 +1,30 @@
 # KHYG: best-effort native signal isolation for each harness execution
 
+## Coordinator clarification after story-plan review, 2026-09-05 UTC
+
+These are clarifications of the original contract, not additional stories:
+
+- The generated US-002 criteria contain conflicting shorthand. The invariant
+  is AT MOST one actual harness execution. Success or safe fallback normally
+  executes once; cancellation before release executes ZERO times. A setup
+  failure before release may fall back once from the unchanged parent AFTER
+  the setup attempt is settled. Missing/malformed readiness never authorizes
+  release; it may qualify as a pre-release setup failure, not as evidence the
+  harness ran. Once release may have been sent, NEVER retry unprotected.
+- The generated US-002 shell snippet has a transcription typo: preserve the
+  actual source's double-dollar PID expansion for TAMANDUA_WORKER_PGID, not
+  a literal single dollar. Preserve behavior, not that erroneous snippet.
+- The shared lock also covers focused MCP/get-ready tests and fast e2e, as
+  stated below. The plan's generic focused-test exemption does not override
+  those specifically identified cleanup-capable suites.
+- Require ZERO unexpected test-isolation violations / enforced ledger entries.
+  Deliberate isolated guard-negative tests can print expected violation text;
+  a blind string search must not misclassify those as failed containment.
+- Existing behavioral assertions stay intact. Necessary updates to structural
+  spawn fakes for the new launch seam are not permission to weaken behavior.
+  Fallback warnings need user-visible output as well as durable records;
+  logger.warn alone only appends a file in the current implementation.
+
 ## Authorization and objective
 
 Igor approved this product feature on 2026-09-05 and requested coordinator-run
