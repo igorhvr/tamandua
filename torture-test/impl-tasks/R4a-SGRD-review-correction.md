@@ -1,5 +1,20 @@
 # R4a independent review correction: SGRD (US-014)
 
+## Current recording-only test order — 2026-09-05T06:41Z
+
+The proposed "existing chaos/identity tests" are NOT recording-only:
+`torture-test/bin/tt-process-identity.test.mjs` spawns real detached children
+and calls child.kill(SIGKILL); `torture-test/self-tests/tier1-mcha-tt-chaos-darwin-kill-guard.test.ts`
+invokes the real chaos tool against child PIDs, including SIGKILL actions.
+Defer those two compatibility files until the coordinator has independently
+reviewed the COMMITTED correction's recording-only proof. This merely makes
+the existing no-real-PID/signals boundary explicit; it does not waive their
+positive compatibility coverage or authorize removing/weaking assertions.
+The ONE synthetic SGRD gate, ordinary isolated build/typecheck and normal
+committed-tree npm under the shared lock remain permitted. A node/Bash child
+used only to run a recording VM is not a real-target fault experiment.
+No broad oracle/self-test battery inside this corrective story.
+
 ## Authority and scope
 
 Beads tamandua-6sy.4.1, child of the already approved suite batch
