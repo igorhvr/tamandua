@@ -1,5 +1,49 @@
 # R4a independent review: OMCX shared marker-context correction
 
+## Review of 7d9573d2: new for-header regressions — 2026-09-05T05:05Z
+
+The committed operand correction passes ALL original eight and ALL ten
+consolidated slash/operand cases. Preserve those improvements. Source review
+of its NEW for-header bookkeeping found two regressions relative to be5d72e0:
+
+- `(function () { for (const item of /test.only(example)/.exec(text) ?? []) {} });`
+  contains a regex literal, no focused registration. Old focus=0; new focus=1.
+  A genuine for-of header can be nested inside another open parenthesis;
+  requiring the entire parenthesis stack to have length one loses it.
+- `async function sample() { for await (const item of /test.skip(example)/.exec(text) ?? []) {} }`
+  likewise contains no skipped registration. Old skip=0; new skip=1.
+  The new header identification does not recognize the for-await header.
+
+One adjacent negative arm in the SAME six-case check remains wrong in BOTH
+versions: `for (let of = 8; of / test.only('focus', () => {}) / 2; of--) {}`
+must keep focus=1, but returns 0. Here `of` is an ordinary variable in a
+semicolon-delimited for header, not the for-of separator. Merely treating
+every `of` inside a for header as a keyword is not sufficient. The other
+three arms preserve top-level genuine for-of regex opacity, the now-fixed
+ordinary `of` division outside a header, and genuine typeof-regex opacity.
+
+Exact current commit: 7d9573d244fc7c0069630d95a157fc845ed8a27a; tree
+6ceeb55ac5417d1eba3e7441714fbd385541a719. Actual helper SHA256:
+88459a5d2b3ad0b9e7e40b89bf4c166976fca20fbf49c169b7dbed959884231c.
+The preceding be5d72e0 helper hash is 437aac6a9445b1b282b193ce902728afa3d830276b9d39e59964f93e2c00818d.
+All six inputs were syntax-compiled, NEVER executed. Actual committed modules
+were loaded in memory. This is helper proof, not a full-oracle verdict claim.
+Retained proof in the origin's r4a-signal-guard-T7yG5O review directory:
+`marker-for-context-7d9573d2-{driver.txt,evidence.jsonl}`. Original-eight and
+consolidated-ten passing records are `marker-context-7d9573d2-*` and
+`marker-slash-operands-7d9573d2-*` in that same directory.
+
+This feedback corrects the newly introduced for-header handling within SAME
+US-006. Extend the SAME focused O8 gate with these controls; keep the existing
+fixture-backed branches, no additional broad battery or parser project.
+Preserve current genuine-keyword regex behavior AND ordinary-identifier
+division. Do not edit while the committed-tree npm gate is running. The
+normal VERIFIER STATUS: retry / ISSUES: US-006 protocol below still applies
+if these failures remain; do not reopen already-fixed cases or US-014 here.
+No direct state/counter writes, missing-ledger waiver, product edit, pause,
+origin push or live refresh. Scope is bounded regression repair, not a claim
+that this hand-written scanner supports every JavaScript grammar production.
+
 ## Same slash correction: operand preservation — 2026-09-05T04:22:44Z
 
 A consolidated ten-case differential check of the SAME committed 08a9933a
