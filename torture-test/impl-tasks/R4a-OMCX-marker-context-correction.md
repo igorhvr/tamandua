@@ -1,5 +1,37 @@
 # R4a independent review: OMCX shared marker-context correction
 
+## Same slash correction: operand preservation — 2026-09-05T04:22:44Z
+
+A consolidated ten-case differential check of the SAME committed 08a9933a
+lexer adds three closely related regressions to the four cases below.
+Each is syntax-valid JavaScript; the actual OLD module sees the registration
+but 08a9933a wrongly swallows it as regex contents:
+
+- `const RETURN = 8; const ratio = RETURN / test.only('focus', () => {}) / 2;`
+  must keep focus=1. JavaScript keywords are case-sensitive; `RETURN` here
+  is an ordinary identifier, not the `return` keyword.
+- `const of = 8; const ratio = of / test.skip('skip', () => {}) / 2;`
+  must keep skip=1. Contextual `of` here is an identifier operand, not
+  an operator or the separator of a for-of header.
+- `const holder = { return: 8 }; const ratio = holder.return / test.only('focus', () => {}) / 2;`
+  must keep focus=1. A keyword-spelled property in a member expression
+  is an operand; treating its spelling as an unconditional regex prefix
+  hides the actual registration after the division sign.
+
+The added genuine-regex control `const kind = typeof /test.only(example)/;`
+correctly returns focus=0 on 08a9933a; keep it correct. The consolidated
+driver also retains all six previous slash cases. Old/new source hashes
+are unchanged; all inputs were syntax-compiled, NEVER executed. Proof:
+r4a-signal-guard-T7yG5O/marker-slash-operands-08a9933a-{driver.txt,evidence.jsonl}.
+This is still actual-helper evidence, not a full-oracle verdict claim.
+
+These are additional regression arms in the SAME bounded US-006 slash/token
+correction and SAME designated focused O8 gate, not extra stories or a
+request for a general JS parser. Add these unit controls alongside the four
+below and existing original eight. The two requested fixture-backed branches
+below remain sufficient for that gate; do not add a broad battery here.
+The same normal verifier retry protocol below applies if any remain broken.
+
 ## Follow-up on committed correction 08a9933a — 2026-09-05T04:07:59Z
 
 The first correction passes ALL eight original examples. Independent review
