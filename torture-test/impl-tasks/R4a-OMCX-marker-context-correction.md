@@ -1,5 +1,54 @@
 # R4a independent review: OMCX shared marker-context correction
 
+## Review of fc303847: preserve a binding actually named `of` — 2026-09-05T06:17Z
+
+The latest committed correction passes ALL three earlier corpora (8, 10,
+and 6 cases, with overlapping preservation controls). Those findings are
+fixed; do not reopen them. Inspection of the NEW binding-end discriminator
+found one newly introduced regression in the same for-of handling:
+
+`for (var of of /test.only(example)/.exec(text) ?? []) {}`
+
+This is syntax-valid JavaScript. The first `of` is the declared variable;
+the second is the genuine for-of separator. There is NO focused registration.
+Actual 7d9573d2 returns focus=0; actual fc303847 returns focus=1. The new
+discriminator rejects the preceding binding identifier merely because its
+spelling is in JS_REGEX_AFTER, although that occurrence of `of` is not a
+keyword. Preserve the difference between spelling and the token's role;
+do not revert the now-correct classic-for operand distinction.
+
+Exact new commit fc303847a30f477c1b97a5301726e7a4c3ef939e, tree
+2f67ca3ca3e0c53fd9066b1031d484d39b6e88a6. Actual helper SHA256:
+b384da778eccc0df521a67eeee11a17066d8d5c6f317b98e033d9a3ed86cbbc7.
+Old helper SHA256: 88459a5d2b3ad0b9e7e40b89bf4c166976fca20fbf49c169b7dbed959884231c.
+The three-case A/B also retains the ordinary `item` binding regex control
+and the newly fixed classic-for `of` division control. All snippets were
+syntax-compiled, NEVER executed; actual dependency-free helpers were loaded
+in memory. This is helper proof, not a full-oracle verdict. Evidence:
+origin review-logs/r4a-signal-guard-T7yG5O/marker-of-binding-fc303847-*
+(driver.txt and evidence.jsonl). Passing earlier corpora are retained as
+marker-context-fc303847-*, marker-operands-fc303847-*, and
+marker-for-context-fc303847-* in that same directory.
+
+Keep this ONE additional binding-role control in the SAME US-006 focused
+O8 gate. No general grammar project, new story, new broad battery, or
+unrelated speculative cases. Existing fixture-backed branches stay intact.
+The current developer may address this after its in-flight npm finishes,
+before reporting completion, if it reads the feedback in time. Do not edit
+the committed source while that gate runs. Otherwise the normal verifier
+STATUS: retry / ISSUES: US-006 route applies; do not waive the regression,
+manually reset counters, or turn a failed helper check into a done report.
+
+The current npm attempt began without the shared lock. Let it finish; do
+not cancel or signal it, and do not retroactively claim it was serialized.
+EVERY subsequent full npm gate MUST start under the EXISTING exact lock:
+`/home/igorhvr/idm/tamandua/torture-test/var/review-logs/suite-cleanup-prefix-5nLG3O/linux-npm.lock`.
+Wrap the normal tamandua-test command with `flock -x` on that path; do not
+unlink/recreate the lock. Commit source first, use a fresh owned distinct
+retained log, capture the actual command exit, and keep TEST_CMD: npm test.
+No product edits, real fault probes, origin push, deployment, extra cleanup,
+or new process-management workaround. US-014 remains separately pending.
+
 ## Review of 7d9573d2: new for-header regressions — 2026-09-05T05:05Z
 
 The committed operand correction passes ALL original eight and ALL ten
