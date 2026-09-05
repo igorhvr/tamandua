@@ -1,5 +1,62 @@
 # R4a independent review: OMCX shared marker-context correction
 
+## Follow-up on committed correction 08a9933a — 2026-09-05T04:07:59Z
+
+The first correction passes ALL eight original examples. Independent review
+of signed commit 08a9933a55cfad31143af1b764b8f4f99efd20e8, tree
+609072cd9a6ac7a7221327820a78b2a27a3fcd28, nevertheless finds two NEW
+regressions and two remaining regex-context miscounts. Actual helper SHA256:
+fde1dab3ab1af2863bc82d1dfb7789cd774aaf0a7fd98c5bbeea330753c84afe.
+
+Exact retained proofs in the same r4a-signal-guard-T7yG5O review directory:
+marker-context-08a9933a-{driver.txt,evidence.jsonl} (8/8 original controls),
+marker-slash-08a9933a-{driver.txt,evidence.jsonl} (old/new actual modules).
+All six additional JavaScript samples were syntax-compiled, NEVER executed.
+The diagnostic runs only the actual dependency-free marker module in memory.
+These are helper-level findings, not claimed full-oracle verdicts.
+
+- `n++ / test.only('focus', () => {}) / 2` contains a REAL registration.
+  The old module counts focus=1; the new module wrongly returns focus=0.
+- `n-- / test.skip('skip', () => {}) / 2` likewise changes from correct
+  skip=1 to incorrect skip=0. The preceding postfix token makes the new
+  slash heuristic swallow division operands as a regex literal.
+- `if (enabled) /test.only(example)/.test(text);` is a regex literal,
+  not a focused registration; both versions wrongly count focus=1.
+- `while (enabled) /test.skip(example)/.test(text);` similarly wrongly
+  counts skip=1. Closing a control-condition parenthesis does not have
+  the same slash context as closing an ordinary call/expression.
+- Ordinary division retains its real registration, and the original
+  assignment-regex example is now correctly opaque: keep these controls.
+
+This remains US-006, not a new story or general JavaScript parser project.
+Correct the bounded token/context handling; do not mask all slashes, drop
+real registrations, weaken assertions, or claim universal regex exclusion
+while these cases remain. Extend the SAME designated focused O8 gate with
+these controls and oracle-backed cases for a genuine divided registration
+and a benign control-statement regex. Keep the original eight cases green.
+No broad oracle battery in this corrective story. Normal build/npm and
+source-pinned evidence remain required.
+
+VERIFIER routing for the current per-story loop: read-only DB inspection
+at04:07:59 confirms this run's verify step explicitly accepts STATUS: retry
+(unlike its done-only integration tester). If these defects are still
+present, submit the normal verifier completion with STATUS: retry and
+ISSUES naming US-006 plus this signed task. Do not approve this commit or
+edit implementation as verifier. Use the actually claimed step only.
+This lets the existing verify-each loop return US-006 normally; no direct
+story/DB/counter writes or coordinator pause are needed. US-014 remains
+separately pending. If the finding reaches the integration TESTER instead,
+its done-only expects still requires the step-fail protocol below.
+
+Canonical progress remains at:
+/home/igorhvr/.tamandua/runs/80049f1f-cd69-4835-a21a-32da90b13ca4/progress.txt
+Read its current top notices and preserve ALL history. The whole-file-write
+persona convention does not authorize discarding existing entries. Restore
+the declared command only through a legitimate TEST_CMD: npm test report;
+do not directly repair context or use the missing-ledger concession.
+
+## Original correction and routing
+
 Beads tamandua-6sy.4.2. This is suite-only corrective feedback within the
 already approved S48/S52 contract. Use the SAME R4a dsh workflow; no product
 files, new dependencies, permission profiles, or live fault probes.
