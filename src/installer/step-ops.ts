@@ -2362,6 +2362,12 @@ export function autoCompleteConditionalStep(runId: string, agentId: string): Aut
   // order, mirroring claimStep's eligibility filter: no upstream step may be
   // incomplete (a pending step whose predecessors are not all done/skipped
   // is not actually claimable, so it must never be auto-completed either).
+  // VEDL note (w4.35 / tamandua-6sy.19): claimStep gained a narrow exception
+  // letting a paused verify_each loop's designated verifier claim past
+  // *waiting* intermediates — that bypass is intentionally NOT mirrored here.
+  // Auto-complete must stay fail-closed: it must never pre-empt a waiting
+  // step, and conditional-verifier semantics are out of scope, so this query
+  // keeps the plain paused-loop exemption only.
   const step = db.prepare(
     `SELECT s.id, s.step_id, s.conditional_condition, s.step_index
      FROM steps s
@@ -2716,8 +2722,23 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   //    verify step needs to be claimable. Without this exception, completeStep's
   //    verify_each branch sets verify=pending while the loop stays running, but
   //    claimStep refuses to claim verify because the loop isn't done — deadlock.
+  //  - VEDL (w4.35 / tamandua-6sy.19): verify_each names its verifier by step id —
+  //    adjacency is NOT required (the public verify_each/verify_step contract).
+  //    A step declared between the loop and its named verifier (e.g. a
+  //    deception_audit between a fix loop and verify) sits in 'waiting' and used
+  //    to block the verifier forever: the audit waits for the loop to finish, so
+  //    the verifier could never claim past it. The narrow exception below also
+  //    ignores a *waiting* predecessor when it sits strictly between (step_index)
+  //    a paused verify_each loop and that loop's explicitly designated verifier.
+  //    Nothing else changes: the intermediate stays exactly 'waiting' (never
+  //    dispatched/skipped/auto-completed/advanced) and runs in pipeline order
+  //    after the whole loop finishes; non-waiting unfinished intermediates,
+  //    earlier unfinished prerequisites, and any pending step that is not the
+  //    designated verifier still block.
   // Run-scoped claim: concurrent runs of the same workflow + agent never
-  // cross-claim because the WHERE clause pins to a specific run_id.
+  // cross-claim because the WHERE clause pins to a specific run_id (and the
+  // bypass below pins vloop.run_id = s.run_id, so a paused loop in another run
+  // can never authorize a claim here).
   const step = db.prepare(
     `SELECT s.id, s.step_id, s.run_id, s.input_template, s.type, s.loop_config, s.step_index, s.retry_count, s.claim_invalidated_by, s.output
      FROM steps s
@@ -2732,6 +2753,28 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
            AND NOT (prev.type = 'loop'
                     AND prev.status = 'running'
                     AND prev.current_story_id IS NULL)
+           AND NOT (
+             -- VEDL bypass: the candidate step s is a paused verify_each loop's
+             -- explicitly designated verifier, and prev is a waiting step
+             -- strictly between that loop and s. The loop's loop_config is
+             -- normalized the same way the rest of the file normalizes it
+             -- (verifyEach ?? verify_each, verifyStep ?? verify_step — mirrored
+             -- here with COALESCE over the two JSON keys).
+             prev.status = 'waiting'
+             AND EXISTS (
+               SELECT 1 FROM steps vloop
+               WHERE vloop.run_id = s.run_id
+                 AND vloop.type = 'loop'
+                 AND vloop.status = 'running'
+                 AND vloop.current_story_id IS NULL
+                 AND vloop.step_index < prev.step_index
+                 AND COALESCE(json_extract(vloop.loop_config, '$.verifyEach'),
+                              json_extract(vloop.loop_config, '$.verify_each'),
+                              0) != 0
+                 AND COALESCE(json_extract(vloop.loop_config, '$.verifyStep'),
+                              json_extract(vloop.loop_config, '$.verify_step')) = s.step_id
+             )
+           )
        )
     ORDER BY s.step_index ASC, s.step_id ASC
      LIMIT 1`,
