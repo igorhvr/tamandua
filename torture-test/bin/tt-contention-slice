@@ -1,0 +1,716 @@
+#!/usr/bin/env node
+// tt-contention-slice — STORM-I interim contention-slice preparation and
+// observation helper (suite-only; this tool NEVER launches a campaign itself).
+//
+// US-001 `prepare`: reads the CURRENT source case catalogs and copies the
+// four canonical interim W3/W4 rows COMPLETE and byte-identical into a
+// controller input manifest under a FRESH unique directory in
+// torture-test/var, writes provenance alongside (selection, catalog/row/task
+// hashes, source commit + tracked-tree cleanliness, manifest hash, and the
+// exact controller executable/cwd/argv), prints that argv legibly WITHOUT
+// executing it, and then hands the generated manifest to the existing
+// controller's --validate-only path. A validation failure returns non-zero
+// and RETAINS the failure artifacts. The source pin is captured BEFORE any
+// source byte is read and re-checked (catalogs + required task files +
+// commit/tree) after validation; a content-drifted preparation is rejected
+// (artifacts retained), and a tree that was dirty at start is never upgraded
+// to pinned-clean. All of this logic lives in runPrepare (shared module); the
+// real CLI always reads this checkout's current catalogs — no substitution
+// option exists on the operator path.
+//
+// US-002 `sample`: a strictly read-only simultaneity observer. Given an
+// explicit prepared manifest/provenance directory (US-001 output), a
+// controller campaign directory (state.json under torture-test/var/results),
+// and the contained campaign DB (under torture-test/var), it samples every 15
+// seconds until the selected cases are terminal or an explicit bounded
+// observation window ends, recording timestamped samples scoped EXACTLY to
+// the run ids recorded on the selected cases' attempts (including explicitly
+// recorded replacement attempts). The campaign DB is opened strictly
+// read-only (node:sqlite DatabaseSync({ readOnly: true })); nothing is ever
+// created, migrated, bound, executed, or repaired by the observer, and a
+// missing run / read error is UNKNOWN evidence — never zero active work.
+// An interruption (SIGINT/SIGTERM) settles the loop, retains the partial
+// samples, records the interruption in observer.json, and exits non-zero —
+// it never stops/resumes/repairs the observed campaign.
+//
+// US-003 `summarize`: consumes the US-001 prepared directory (provenance +
+// manifest) and a US-002 observation directory (samples.jsonl +
+// observer.json) and reports the CONFIGURED case concurrency (from the
+// recorded controller argv, --concurrency 4) SEPARATELY from the OBSERVED
+// claimed-step peak across the persisted samples (scoped, decoy-proof),
+// plus per-case executed/NOT_RUN/terminal counts and coverage gaps. The
+// report is honest by construction: a peak below 3, UNKNOWN run/case
+// observations, corrupt/missing sample evidence, or a late observer start
+// are all stated explicitly and never present an unqualified passed-storm
+// claim. summary.json + summary.txt are written INTO the observation
+// directory (never overwriting/removing the samples/observer artifacts, and
+// refusing to overwrite an existing summary.json); a corrupt/missing
+// evidence file is reported and a partial summary is still produced. The
+// command never opens a campaign DB, never mutates or repairs the campaign,
+// and is strictly read-only over everything except its own summary outputs.
+//
+// Safety posture: writes ONLY under this checkout's torture-test/var; never
+// overwrites/reuses/deletes a previous preparation/observation directory;
+// refuses path traversal, symlink escapes, and any destination outside
+// torture-test/var; never defaults to the operator's HOME; performs no
+// automatic provisioning, credential copying, daemon startup, catalog
+// refresh, or environment mutation. macOS/BSD-portable: Node built-ins only,
+// no shell glue.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  DEFAULT_SAMPLE_INTERVAL_MS,
+  MANIFEST_NAME,
+  OBSERVER_NAME,
+  PROVENANCE_NAME,
+  SAMPLES_NAME,
+  SUMMARY_JSON_NAME,
+  SUMMARY_TXT_NAME,
+  VAR_ROOT,
+  allocFreshOutDir,
+  buildContentionSummary,
+  composeSample,
+  ensureVarRoot,
+  parseSamplesEvidence,
+  pathIsWithin,
+  refusal,
+  renderSummaryText,
+  resolveContainedInput,
+  resolveExplicitOutDir,
+  runPrepare,
+  sampleDelayMs,
+  sha256,
+  utcTimestamp,
+} from './tt-contention-slice-shared.mjs';
+
+const USAGE = `Usage: tt-contention-slice <command> [options]
+
+Prepare and observe the interim STORM-I W3/W4 contention slice (suite-only;
+never launches a campaign itself).
+
+Commands:
+  prepare     Copy the four canonical W3/W4 case rows byte-identical from the
+              current catalogs into a controller input manifest under a fresh
+              unique directory in torture-test/var, write provenance, print
+              the controller launch argv, and --validate-only the manifest.
+  sample      Strictly read-only observer: sample the selected cases' recorded
+              runs every 15s (state.json + the contained campaign DB) into a
+              fresh unique observation directory under torture-test/var.
+  summarize   Honest summary of a persisted observation: reports the
+              configured case concurrency separately from the observed
+              claimed-step peak, per-case executed/NOT_RUN/terminal counts,
+              and coverage gaps. summary.json + summary.txt are written INTO
+              the observation directory; the campaign is never touched.
+
+Options:
+  -h, --help  Print this help
+
+prepare options:
+  --out <dir> Destination directory to create (must not exist). Defaults to a
+              fresh unique torture-test/var/contention-slice-<ts>-<rand>/
+              directory. Any destination outside torture-test/var, a path
+              traversal, an existing destination symlink, a symlink escape,
+              or an already-existing directory is refused.
+
+sample options:
+  --prep <dir>        Prepared directory (US-001 output) carrying
+                      manifest.jsonl + provenance.json.
+  --campaign <dir>    Controller campaign directory (state.json under
+                      torture-test/var/results/campaign-<ts>-<uuid>/).
+  --db <path>         Contained campaign DB (e.g.
+                      torture-test/var/home/.tamandua/tamandua.db). Opened
+                      STRICTLY read-only; never created or migrated.
+  --out <dir>         Observation destination (must not exist). Defaults to a
+                      fresh unique torture-test/var/contention-observation-
+                      <ts>-<rand>/ directory.
+  --once              Take a single sample and exit (test/fast mode).
+  --interval-ms <ms>  Delay between samples (default 15000).
+  --window-ms <ms>    Bounded observation window from the first sample.
+
+summarize options:
+  --prep <dir>        Prepared directory (US-001 output) carrying
+                      manifest.jsonl + provenance.json.
+  --obs <dir>         Observation directory (US-002 output) carrying
+                      samples.jsonl + observer.json. summary.json and
+                      summary.txt are written into this directory; an
+                      existing summary.json is refused (never overwrite).
+
+Every supplied path is resolved and validated (realpath containment inside
+torture-test/var; traversal and symlink escapes refused) before it is opened.
+The operator's HOME is never used as a default.
+`;
+
+function usage(out) {
+  out.write(USAGE);
+}
+
+function parsePositiveInt(value, label, { defaultMs = null, min = 1 } = {}) {
+  if (value === null || value === undefined) return defaultMs;
+  if (!/^[0-9]+$/.test(String(value))) {
+    throw new Error(`${label} must be a positive integer, got: ${value}`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min) {
+    throw new Error(`${label} must be a positive integer >= ${min}, got: ${value}`);
+  }
+  return parsed;
+}
+
+// ── prepare command (thin wrapper over the shared runPrepare core) ──
+
+function cmdPrepare(argv, env = process.env) {
+  let outArg = null;
+  for (let index = 1; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--out') {
+      if (outArg !== null) throw new Error('--out may be specified only once');
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith('--')) throw new Error('--out requires a destination directory path');
+      outArg = value;
+      index += 1;
+      continue;
+    }
+    throw new Error(`unknown prepare option: ${arg}`);
+  }
+  return runPrepare({ outArg, env });
+}
+
+// ── sample command (STORM-I US-002) ────────────────────────────────
+
+function parseSampleArgs(argv) {
+  const options = {
+    prep: null,
+    campaign: null,
+    db: null,
+    out: null,
+    once: false,
+    intervalMs: DEFAULT_SAMPLE_INTERVAL_MS,
+    windowMs: null,
+  };
+  for (let index = 1; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const value = () => {
+      const next = argv[index + 1];
+      if (next === undefined || next.startsWith('--')) throw new Error(`${arg} requires a value`);
+      index += 1;
+      return next;
+    };
+    if (arg === '--prep') options.prep = value();
+    else if (arg === '--campaign') options.campaign = value();
+    else if (arg === '--db') options.db = value();
+    else if (arg === '--out') options.out = value();
+    else if (arg === '--once') options.once = true;
+    else if (arg === '--interval-ms') options.intervalMs = parsePositiveInt(value(), '--interval-ms');
+    else if (arg === '--window-ms') options.windowMs = parsePositiveInt(value(), '--window-ms');
+    else throw new Error(`unknown sample option: ${arg}`);
+  }
+  for (const key of ['prep', 'campaign', 'db']) {
+    if (options[key] === null) throw new Error(`sample requires --${key}`);
+  }
+  if (options.once && options.windowMs !== null) {
+    throw new Error('--once cannot be combined with --window-ms');
+  }
+  return options;
+}
+
+function assertRegularReadableFile(absPath, label) {
+  let details;
+  try {
+    details = fs.lstatSync(absPath, { throwIfNoEntry: false });
+  } catch (error) {
+    throw new Error(`cannot inspect ${label}: ${error.message}`);
+  }
+  if (details === undefined) throw new Error(`${label} does not exist: ${absPath}`);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw new Error(`${label} is not a plain regular file: ${absPath}`);
+  }
+  const varReal = fs.realpathSync(VAR_ROOT);
+  const real = fs.realpathSync(absPath);
+  if (!pathIsWithin(varReal, real)) {
+    throw refusal(`${label} escapes torture-test/var: ${absPath}`, 'TT_ESCAPE');
+  }
+}
+
+// Load the selected case ids from a prepared directory: provenance.json
+// `selection` is authoritative; manifest.jsonl row ids must agree (same ids,
+// same order). Returns { prepDir, ids, manifestSha256 }.
+function loadPreparedSelection(prepDir) {
+  const manifestPath = path.join(prepDir, MANIFEST_NAME);
+  const provenancePath = path.join(prepDir, PROVENANCE_NAME);
+  assertRegularReadableFile(manifestPath, 'prepared manifest');
+  assertRegularReadableFile(provenancePath, 'prepared provenance');
+  let provenance;
+  try {
+    provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`cannot parse prepared provenance ${provenancePath}: ${error.message}`);
+  }
+  if (provenance === null || typeof provenance !== 'object' || Array.isArray(provenance)) {
+    throw new Error(`prepared provenance ${provenancePath} is not a JSON object`);
+  }
+  const selectionEntries = Array.isArray(provenance.selection) ? provenance.selection : null;
+  if (selectionEntries === null || selectionEntries.length === 0) {
+    throw new Error(`prepared provenance ${provenancePath} carries no selection`);
+  }
+  const ids = [];
+  for (const entry of selectionEntries) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string' || entry.id === '') {
+      throw new Error(`prepared provenance ${provenancePath} carries a malformed selection entry`);
+    }
+    ids.push(entry.id);
+  }
+  const seen = new Set();
+  for (const id of ids) {
+    if (seen.has(id)) throw new Error(`prepared provenance ${provenancePath} repeats selected id ${id}`);
+    seen.add(id);
+  }
+  // manifest.jsonl row ids must agree with provenance selection.
+  let manifestIds = [];
+  try {
+    const text = fs.readFileSync(manifestPath, 'utf8');
+    for (const lineText of text.split(/\r?\n/)) {
+      if (lineText.trim() === '') continue;
+      const record = JSON.parse(lineText);
+      if (record === null || typeof record !== 'object' || typeof record.id !== 'string') {
+        throw new Error(`manifest row is not an object with an id: ${lineText.slice(0, 80)}`);
+      }
+      manifestIds.push(record.id);
+    }
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error(`prepared manifest ${manifestPath} is not valid JSONL: ${error.message}`);
+    throw error;
+  }
+  if (JSON.stringify(manifestIds) !== JSON.stringify(ids)) {
+    throw new Error('prepared manifest row ids do not match the provenance selection (same ids, same order required)');
+  }
+  return {
+    prepDir,
+    ids,
+    manifestPath,
+    manifestSha256: sha256(fs.readFileSync(manifestPath)),
+    provenance,
+  };
+}
+
+// Append one sample line (read-only evidence) to the samples JSONL.
+function appendSample(samplesPath, sample) {
+  fs.appendFileSync(samplesPath, `${JSON.stringify(sample)}\n`, { mode: 0o600 });
+}
+
+// Single-sample + windowed/interval observation loop. Never spawns a child,
+// never writes outside the observation directory, and never stops, resumes,
+// restarts, kills, deletes, or repairs the campaign it observes — an
+// observation-window end or interruption is NOT a run failure or permission
+// to terminate the campaign.
+async function cmdSample(argv) {
+  const options = parseSampleArgs(argv);
+
+  // Path resolution + validation BEFORE anything is opened or written.
+  const prepDir = resolveContainedInput(options.prep, { label: 'preparation directory', varRoot: VAR_ROOT, kind: 'dir' });
+  const campaignDir = resolveContainedInput(options.campaign, { label: 'campaign directory', varRoot: VAR_ROOT, kind: 'dir' });
+  const dbPath = resolveContainedInput(options.db, {
+    label: 'campaign database',
+    varRoot: VAR_ROOT,
+    kind: 'file',
+    allowMissing: true, // a missing DB is evidence (UNKNOWN), never created
+  });
+  const selection = loadPreparedSelection(prepDir);
+
+  // Output allocation (fresh unique; never overwrite/remove prior dirs). The
+  // explicit destination goes through resolveExplicitOutDir BEFORE mkdir.
+  ensureVarRoot();
+  const explicitOut = options.out !== null ? resolveExplicitOutDir(options.out, { varRoot: VAR_ROOT }) : null;
+  const created = explicitOut !== null
+    ? (fs.mkdirSync(explicitOut, { mode: 0o700 }), explicitOut)
+    : allocFreshOutDir({ varRoot: VAR_ROOT, prefix: 'contention-observation-' });
+  const samplesPath = path.join(created, SAMPLES_NAME);
+  const observerPath = path.join(created, OBSERVER_NAME);
+
+  const startedAt = utcTimestamp();
+  const startedMs = Date.now();
+  let sampleIndex = 0;
+  let stopReason = null;
+  let stopDetail = null;
+  let samplesWithReadErrors = 0;
+  let unknownRunObservations = 0;
+  let consecutiveUnreadableState = 0;
+  let firstSampleAllTerminal = false;
+  let interrupted = null;
+  let pendingTimer = null;
+  let wakeResolver = null;
+  const MAX_CONSECUTIVE_UNREADABLE_STATE = 6;
+
+  const finalize = (error) => {
+    const observer = {
+      tool: 'tt-contention-slice',
+      subcommand: 'sample',
+      story: 'STORM-I US-002',
+      started_at: startedAt,
+      finished_at: utcTimestamp(),
+      observation_dir: created,
+      samples_file: SAMPLES_NAME,
+      sample_count: sampleIndex,
+      interval_ms: options.intervalMs,
+      window_ms: options.windowMs,
+      selected_case_ids: selection.ids,
+      first_sample_all_terminal: firstSampleAllTerminal,
+      stop_reason: stopReason,
+      stop_detail: stopDetail,
+      samples_with_read_errors: samplesWithReadErrors,
+      unknown_run_observations: unknownRunObservations,
+      error: error !== null ? error.message : null,
+    };
+    try {
+      fs.writeFileSync(observerPath, `${JSON.stringify(observer, null, 2)}\n`, { mode: 0o600 });
+    } catch {
+      // The samples themselves are already preserved on disk.
+    }
+  };
+  let finishing = false;
+  const finishOnce = (reason, detail, error) => {
+    if (finishing) return;
+    finishing = true;
+    stopReason = reason;
+    stopDetail = detail ?? null;
+    if (pendingTimer !== null) clearTimeout(pendingTimer);
+    // Wake any in-flight sleep so an interruption actually settles the loop.
+    if (wakeResolver !== null) {
+      const resolveWake = wakeResolver;
+      wakeResolver = null;
+      resolveWake();
+    }
+    finalize(error);
+  };
+  const onSignal = (signal) => {
+    // An interruption finalizes the observer (partial samples preserved) and
+    // settles the loop with a non-zero outcome — but NEVER stops/resumes/
+    // repairs the observed campaign.
+    interrupted = signal;
+    finishOnce('interrupted', `received ${signal}`, null);
+  };
+  process.on('SIGINT', () => onSignal('SIGINT'));
+  process.on('SIGTERM', () => onSignal('SIGTERM'));
+  const sleep = (ms) => new Promise((resolve) => {
+    wakeResolver = resolve;
+    pendingTimer = setTimeout(() => {
+      wakeResolver = null;
+      pendingTimer = null;
+      resolve();
+    }, ms);
+  });
+
+  try {
+    for (;;) {
+      if (interrupted !== null) break;
+      // The explicit observation window bounds BOTH sampling and sleeping:
+      // once the window has elapsed we stop at that boundary — never compose a
+      // sample past the window and never sleep a whole interval to discover it.
+      // The first sample is always recorded (sampleIndex > 0 guard): the window
+      // governs continuation, not whether the observer starts at all.
+      if (options.windowMs !== null && sampleIndex > 0 && Date.now() - startedMs >= options.windowMs) {
+        finishOnce('window-expired', `observation window of ${options.windowMs}ms elapsed`, null);
+        break;
+      }
+      const sampledAt = utcTimestamp();
+      let sample;
+      try {
+        sample = composeSample({
+          sampleIndex,
+          sampledAt,
+          selectedCaseIds: selection.ids,
+          campaignDir,
+          dbPath,
+          prep: { dir: prepDir, manifest_sha256: selection.manifestSha256 },
+        });
+      } catch (error) {
+        // An unexpected per-sample failure is EVIDENCE, not a license to
+        // stop/resume/repair the campaign. Record an explicit error sample.
+        sample = {
+          sample_index: sampleIndex,
+          sampled_at: sampledAt,
+          selected_case_ids: [...selection.ids],
+          error: error.message,
+          aggregates: { observation_errors: [error.message] },
+          all_selected_cases_terminal: false,
+        };
+        samplesWithReadErrors += 1;
+      }
+      appendSample(samplesPath, sample);
+      const aggregateErrors = sample.aggregates?.observation_errors ?? [];
+      if (aggregateErrors.length > 0) samplesWithReadErrors += 1;
+      unknownRunObservations += sample.aggregates?.unknown_run_ids?.length ?? 0;
+      if (sampleIndex === 0 && sample.all_selected_cases_terminal === true) firstSampleAllTerminal = true;
+      sampleIndex += 1;
+
+      if (options.once) {
+        finishOnce('single-sample', null, null);
+        break;
+      }
+      // Terminality/observability is judged from the campaign state.
+      const stateReadable = sample.campaign?.state_present === true;
+      const allTerminal = sample.all_selected_cases_terminal === true;
+      if (stateReadable && allTerminal) {
+        finishOnce('all-cases-terminal', null, null);
+        break;
+      }
+      const allAbsent = stateReadable
+        && sample.cases.length > 0
+        && sample.cases.every((caseEntry) => caseEntry.present_in_state === false);
+      if (stateReadable && allAbsent) {
+        finishOnce('cases-absent-from-campaign', 'none of the selected cases exist in the campaign state', null);
+        break;
+      }
+      if (!stateReadable) {
+        consecutiveUnreadableState += 1;
+        if (consecutiveUnreadableState >= MAX_CONSECUTIVE_UNREADABLE_STATE) {
+          finishOnce('state-unreadable-limit', `campaign state unreadable for ${consecutiveUnreadableState} consecutive samples; terminality could not be determined`, null);
+          break;
+        }
+      } else {
+        consecutiveUnreadableState = 0;
+      }
+      // Sleep until the next due sample (interval cadence), but never past the
+      // window boundary — a bounded window must not overshoot through a whole
+      // interval sleep. An interruption resolves the sleep so the loop settles
+      // promptly. The delay contract lives in the pure sampleDelayMs helper
+      // (unit-tested with synthetic timestamps, no real time needed).
+      const waitMs = sampleDelayMs({
+        startedMs,
+        nowMs: Date.now(),
+        sampleIndex,
+        intervalMs: options.intervalMs,
+        windowMs: options.windowMs,
+      });
+      if (waitMs > 0) await sleep(waitMs);
+    }
+  } catch (error) {
+    finishOnce('observer-error', error.message, error);
+    process.stderr.write(`tt-contention-slice: sample observation failed after ${sampleIndex} sample(s); partial samples preserved in ${created}: ${error.message}\n`);
+    return 1;
+  }
+
+  process.stdout.write('Contention-slice observation complete.\n');
+  process.stdout.write(`Selected cases: ${selection.ids.join(', ')}\n`);
+  process.stdout.write(`Observation directory: ${created}\n`);
+  process.stdout.write(`Samples: ${samplesPath} (${sampleIndex} sample(s))\n`);
+  process.stdout.write(`Stop reason: ${stopReason ?? 'unknown'}\n`);
+  if (interrupted !== null) {
+    process.stderr.write(`tt-contention-slice: observation interrupted by ${interrupted}; samples preserved in ${created}\n`);
+    return 128 + (interrupted === 'SIGINT' ? 2 : 15);
+  }
+  return 0;
+}
+
+// ── summarize command (STORM-I US-003) ─────────────────────────────
+// Honest summary of a persisted observation. Consumes an explicit prepared
+// directory (US-001: provenance.json + manifest.jsonl) and an explicit
+// observation directory (US-002: samples.jsonl + observer.json). Writes
+// summary.json + summary.txt INTO the observation directory (never
+// overwriting/removing the samples/observer artifacts and refusing to
+// overwrite an existing summary.json), prints the human-readable report, and
+// stays strictly read-only over the campaign — no DB is even opened.
+
+function parseSummarizeArgs(argv) {
+  const options = { prep: null, obs: null };
+  for (let index = 1; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const value = () => {
+      const next = argv[index + 1];
+      if (next === undefined || next.startsWith('--')) throw new Error(`${arg} requires a value`);
+      index += 1;
+      return next;
+    };
+    if (arg === '--prep') options.prep = value();
+    else if (arg === '--obs') options.obs = value();
+    else throw new Error(`unknown summarize option: ${arg}`);
+  }
+  for (const key of ['prep', 'obs']) {
+    if (options[key] === null) throw new Error(`summarize requires --${key}`);
+  }
+  return options;
+}
+
+// Parse observer.json into { observer, issue } — a MISSING observer record is
+// an evidence issue (a partial summary may still be produced), but a symlinked
+// or non-plain observer file is REFUSED (a symlink escape would read outside
+// the contained observation directory).
+function readObserverRecord(obsDir) {
+  const observerPath = path.join(obsDir, OBSERVER_NAME);
+  let details;
+  try {
+    details = fs.lstatSync(observerPath, { throwIfNoEntry: false });
+  } catch (error) {
+    throw new Error(`cannot inspect observer metadata ${observerPath}: ${error.message}`);
+  }
+  if (details === undefined) {
+    return { observer: null, issue: `${OBSERVER_NAME} does not exist in the observation directory` };
+  }
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw refusal(
+      `${OBSERVER_NAME} is not a plain regular file (symlink escapes refused): ${observerPath}`,
+      'TT_SYMLINK',
+    );
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(observerPath, 'utf8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { observer: null, issue: `${OBSERVER_NAME} is not a JSON object` };
+    }
+    return { observer: parsed, issue: null };
+  } catch (error) {
+    return { observer: null, issue: `cannot parse ${OBSERVER_NAME}: ${error.message}` };
+  }
+}
+
+// Assert a contained evidence FILE (samples.jsonl / observer.json) inside the
+// validated observation directory is a plain regular file — never a symlink.
+function assertContainedEvidenceFile(obsDir, name, label) {
+  const absPath = path.join(obsDir, name);
+  let details;
+  try {
+    details = fs.lstatSync(absPath, { throwIfNoEntry: false });
+  } catch (error) {
+    throw new Error(`cannot inspect ${label} ${absPath}: ${error.message}`);
+  }
+  if (details === undefined) return false; // absent is EVIDENCE, handled by the caller
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw refusal(`${label} is not a plain regular file (symlink escapes refused): ${absPath}`, 'TT_SYMLINK');
+  }
+  return true;
+}
+
+// The CONFIGURED case concurrency comes from the RECORDED controller argv
+// (--concurrency 4), with provenance.controller.concurrency as the fallback.
+function configuredFromProvenance(provenance) {
+  const controller = (provenance !== null && typeof provenance === 'object' && !Array.isArray(provenance))
+    ? (isPlainObjectLike(provenance.controller) ? provenance.controller : {})
+    : {};
+  const argv = Array.isArray(controller.argv)
+    ? controller.argv.filter((arg) => typeof arg === 'string')
+    : null;
+  let concurrency = null;
+  let stagger = null;
+  let source = null;
+  if (argv !== null) {
+    for (let index = 0; index + 1 < argv.length; index += 1) {
+      if (argv[index] === '--concurrency') {
+        const parsed = Number(argv[index + 1]);
+        if (Number.isSafeInteger(parsed) && parsed > 0) {
+          concurrency = parsed;
+          source = 'recorded controller argv (--concurrency)';
+        }
+      } else if (argv[index] === '--stagger' && stagger === null) {
+        stagger = argv[index + 1];
+      }
+    }
+  }
+  if (concurrency === null && Number.isSafeInteger(controller.concurrency) && controller.concurrency > 0) {
+    concurrency = Number(controller.concurrency);
+    source = 'provenance.controller.concurrency';
+  }
+  return { concurrency, stagger, argv, source };
+}
+
+function isPlainObjectLike(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function cmdSummarize(argv) {
+  const options = parseSummarizeArgs(argv);
+
+  // Path resolution + validation BEFORE anything is opened or written.
+  const prepDir = resolveContainedInput(options.prep, { label: 'preparation directory', varRoot: VAR_ROOT, kind: 'dir' });
+  const obsDir = resolveContainedInput(options.obs, { label: 'observation directory', varRoot: VAR_ROOT, kind: 'dir' });
+  const selection = loadPreparedSelection(prepDir);
+  const provenance = selection.provenance;
+
+  const samplesPath = path.join(obsDir, SAMPLES_NAME);
+  const samplesFilePresent = assertContainedEvidenceFile(obsDir, SAMPLES_NAME, 'sample evidence');
+  const samplesFileMissing = !samplesFilePresent;
+  const observer = readObserverRecord(obsDir);
+
+  // An observation directory with NEITHER samples.jsonl NOR observer.json is
+  // not a US-002 observation output at all.
+  if (samplesFileMissing && observer.observer === null) {
+    throw new Error(`observation directory ${obsDir} carries neither ${SAMPLES_NAME} nor ${OBSERVER_NAME}; nothing to summarize`);
+  }
+
+  // Never overwrite/remove prior results: a summary already written to this
+  // observation directory is refused before any write happens.
+  const summaryJsonPath = path.join(obsDir, SUMMARY_JSON_NAME);
+  if (fs.existsSync(summaryJsonPath)) {
+    throw new Error(`refusing to overwrite an existing summary (never overwrite prior results): ${summaryJsonPath}`);
+  }
+
+  const configured = configuredFromProvenance(provenance);
+
+  let samples = [];
+  let corruptLines = [];
+  if (!samplesFileMissing) {
+    const parsed = parseSamplesEvidence(fs.readFileSync(samplesPath, 'utf8'));
+    samples = parsed.samples;
+    corruptLines = parsed.corruptLines;
+  }
+
+  const summary = buildContentionSummary({
+    selectedCaseIds: selection.ids,
+    configured,
+    observer: observer.observer,
+    observerReadIssue: observer.issue,
+    samples,
+    corruptLines,
+    samplesFileMissing,
+    prepManifestSha256: selection.manifestSha256,
+  });
+
+  const reportText = renderSummaryText(summary);
+  fs.writeFileSync(path.join(obsDir, SUMMARY_TXT_NAME), reportText, { mode: 0o600 });
+  fs.writeFileSync(summaryJsonPath, `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
+
+  process.stdout.write('Contention-slice observation summarized.\n');
+  process.stdout.write(`Prepared manifest: ${path.join(prepDir, MANIFEST_NAME)}\n`);
+  process.stdout.write(`Observation directory: ${obsDir}\n`);
+  process.stdout.write(`Summary: ${summaryJsonPath}\n`);
+  process.stdout.write(reportText);
+
+  // A summary was produced whenever the observation directory is a genuine
+  // US-002 output. When ZERO valid sample records could be read (missing or
+  // fully corrupt sample evidence) the summary is PARTIAL — the exit code
+  // says so, and the partial artifacts are retained.
+  return samples.length > 0 ? 0 : 1;
+}
+
+// ── Entry point ────────────────────────────────────────────────────
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.includes('--help') || argv.includes('-h')) {
+    usage(process.stdout);
+    return 0;
+  }
+  const command = argv[0];
+  if (command === undefined) {
+    usage(process.stdout);
+    return 0;
+  }
+  try {
+    switch (command) {
+      case 'prepare':
+        return cmdPrepare(argv, process.env);
+      case 'sample':
+        return await cmdSample(argv);
+      case 'summarize':
+        return cmdSummarize(argv);
+      default:
+        process.stderr.write(`tt-contention-slice: unknown command: ${command}\n`);
+        usage(process.stderr);
+        return 2;
+    }
+  } catch (error) {
+    process.stderr.write(`tt-contention-slice: ${error.message}\n`);
+    return 1;
+  }
+}
+
+process.exitCode = await main();
