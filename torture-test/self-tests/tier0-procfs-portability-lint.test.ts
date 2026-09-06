@@ -289,6 +289,12 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     requiredMarker: "MACP3 US-004",
     reason: "US-004: /proc text carries a MACP3 US-004 linux-only marker; harness tolerates /proc-less hosts (reads are mocked/platform-gated).",
   },
+  "bin/tt-recorder-selftest-guards.sh": {
+    category: "us004-harness-guarded",
+    requiredMarker: "MACP3 US-004",
+    reason:
+      "RISO US-001: the shared ownership/fixture guard library sourced by bin/tt-recorder.test.sh and bin/tt-recorder-isolation.test.sh — every /proc runtime read (/proc/<pid>/stat start token, /proc/<pid>/cmdline, /proc/<pid>/cwd readlink) carries an inline MACP3 US-004 linux-only marker and fails safe (2>/dev/null) on a /proc-less host; all other /proc text is prose covered by the library's US-004 header note.",
+  },
   "bin/tt-recorder.test.sh": {
     category: "us004-harness-guarded",
     requiredMarker: "MACP3 US-004",
@@ -403,6 +409,11 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     category: "documentation",
     reason:
       "MDUP task description doc — its '/proc' occurrences ('port evidence reads /proc/net/tcp + /proc/<pid>/fd (linux-only)', 'never fail the recorder start on a /proc-less host') are prose in the task narrative describing the linux-only tt-recorder evidence and the darwin degradation plan; the doc performs no runtime procfs access.",
+  },
+  "impl-tasks/RISO-recorder-self-test-isolation.md": {
+    category: "documentation",
+    reason:
+      "RISO task/evidence doc — its '/proc' occurrences are prose in the US-003 proof and the Test 73/91 correction narrative ('/proc-or-ps NUL-to-space read', 'a /proc-less host (Darwin) skips it') plus the verbatim recorded harness line 'PASS: port guard uses /proc/net/tcp'; the doc performs no runtime procfs access.",
   },
   "self-tests/tier0-gnu-portability-lint.test.ts": {
     category: "documentation",

@@ -350,6 +350,11 @@ const ALLOWLIST: Record<string, AllowEntry> = {
       "Linux-side-only test harness for tt-provision-home (E2.6 US-004): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (never on the Darwin campaign). GNU stat -c '%a' (with a BSD stat -f '%Lp' fallback) asserts the surfaced pi auth.json mode is 0600; the GNU -c form is linux-side-only (the mac-reachable tt-provision-home TOOL is portable).",
     allowedClasses: ["stat -c (GNU format)"],
   },
+  "torture-test/bin/tt-recorder-selftest-guards.sh": {
+    reason:
+      "RISO US-001: shared ownership/fixture guard library sourced by bin/tt-recorder.test.sh and bin/tt-recorder-isolation.test.sh — linux-side-only like its harness family (bin/*.test.sh battery, never on the Darwin campaign). readlink -f canonicalizes the temp base (TMPDIR) and TT_ROOT_VAR — GNU/Linux-only, with no macOS equivalent.",
+    allowedClasses: ["readlink -f (canonicalize)"],
+  },
   "torture-test/bin/tt-recorder.test.sh": {
     reason:
       "Linux-side-only test harness for tt-recorder: runs only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). GNU timeout bounds waits on recorder pids (timeout 2/3/5 wait ...); readlink -f canonicalizes TT_ROOT_VAR and resolves cwd realpaths (linux-only /proc); GNU stat -c%s reads recorder output/db sizes — all GNU/Linux-only.",

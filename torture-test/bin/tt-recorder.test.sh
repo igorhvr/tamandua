@@ -2,6 +2,42 @@
 # tt-recorder.test.sh — self-test for tt-recorder CLI dispatch and --help.
 # Validates CLI skeleton per US-001 acceptance criteria.
 #
+# RISO US-001/US-002 (recorder self-test isolation): this harness NEVER
+# derives its working state from the invoking checkout. All ownership/fixture
+# guard code lives in tt-recorder-selftest-guards.sh (sourced below —
+# definitions plus source-time EMPTY initialization of every cleanup-owned
+# variable, and no allocation, spawn or trap of its own). This harness then
+# allocates ONE fresh fixture root under ${TMPDIR:-/tmp}, mirrors the real
+# tt-recorder tool into it (copy only — the repo tool is never modified), and
+# pins SCRIPT_DIR / TOOL / TT_ROOT_VAR — and the repeated root re-derivations
+# later in this script (which derive from SCRIPT_DIR) — to that mirror
+# WITHOUT re-exec and WITHOUT any inherited marker: no environment variable
+# or argument may name a fixture/cleanup root or opt out of allocation. All
+# recorder state dirs, pidfiles, sample JSONL, contained homes (home/,
+# home-scripted/), fake-home, and test-* dirs are invocation-owned. Cleanup
+# removes only the exact roots this invocation allocated (recorded at
+# allocation time in the _ALLOCATED_ROOTS indexed array); processes are
+# signaled only after identity / cmdline / cwd evidence proves they are this
+# run's own children or recorders.
+#
+# RISO US-002 (honest port-exclusion coverage without production listeners):
+# the US-009 production-port bind case is REPLACED by an isolated behavioral
+# fixture — Test 88 now exercises the REAL exclusion decision with controlled
+# port evidence (an allowed contained random-port listener that must be
+# included, and an excluded synthetic-pid production-port observation driven
+# by a fake-lsof PATH shim) and NEVER binds or probes production ports
+# 3334/3338/3339; unavailable observations FAIL instead of vacuous-PASS.
+# Test 92 adds the static reintroduction guard (shared helper) that exits
+# non-zero if an executed production-port bind or source-checkout state usage
+# is reintroduced into the harness source or the driven tool copy.
+#
+# The PURE pre-execution guard proof (bin/tt-recorder-guard-proof.test.sh),
+# the integration isolation regression (bin/tt-recorder-isolation.test.sh)
+# and the focused port-isolation regression
+# (bin/tt-recorder-port-isolation.test.sh) source the SAME guards file, so
+# the guard code the full harness and the focused gates exercise is byte-
+# identical; none of them is part of the normal torture-test/self-tests/run.sh
+# battery.
 # MACP3 US-004: every '/proc' hit in this harness is linux-only. All RUNTIME
 # /proc reads carry an explicit inline 'MACP3 US-004 linux-only' comment with
 # their Darwin behavior (guard fails, pass-by-note). Pass/fail prose and echo
@@ -10,30 +46,66 @@
 # "daemon/process" are the word "process", not the procfs mount.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOL="${SCRIPT_DIR}/tt-recorder"
+# ── RISO US-001: shared ownership/fixture guards ─────────────────────
+_SRC_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$_SRC_BIN/tt-recorder-selftest-guards.sh"
 
-# Compute TT_ROOT consistently with tt-recorder (needed for tests that spawn the recorder)
-TT_DIR="$(dirname "$SCRIPT_DIR")"
-TT_REPO_ROOT="$(dirname "$TT_DIR")"
-TT_ROOT_VAR="${TT_REPO_ROOT}/torture-test/var"
-
-FAILURES=0
-
-pass() { echo "  PASS: $1"; }
-fail() { echo "  FAIL: $1"; FAILURES=$((FAILURES + 1)); }
+# Bootstrap: allocate FIXTURE_ROOT (recorded in _ALLOCATED_ROOTS at
+# allocation time), mirror the real tt-recorder tool into the fixture (copy
+# only), pin SCRIPT_DIR/TOOL/TT_ROOT_VAR to the mirror, cd into the fixture,
+# run the TT_ROOT_VAR-under-fixture startup guard (FAILs loudly if the
+# computed var is ever outside this invocation's fixture root), and only
+# then register the cleanup traps — every cleanup-owned variable was already
+# initialized EMPTY at source time above, before any allocation or trap.
+riso_bootstrap_fixture tt-recorder-selftest
 
 echo "=== tt-recorder self-test ==="
+echo "  fixture root: $FIXTURE_ROOT"
 
-# Clean up any stale recorder from prior runs
-if [ -f "$TT_ROOT_VAR/recorder/tt-recorder.pid" ]; then
-  STALE_PID="$(cat "$TT_ROOT_VAR/recorder/tt-recorder.pid" 2>/dev/null || true)"
-  if [ -n "$STALE_PID" ]; then
-    kill "$STALE_PID" 2>/dev/null || true
-    timeout 3 wait "$STALE_PID" 2>/dev/null || true
-  fi
-  rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
-fi
+# ── RISO US-001: isolation-regression neighbor (pre-populated up front) ──
+# A wholly synthetic neighboring fake-campaign tree in its OWN allocated
+# root (never the repo var, never FIXTURE_ROOT) stands in for a pre-
+# existing real campaign: if any section still derived state from a
+# checkout — killing a pidfile PID or rm -rf'ing a var/home path — it
+# would kill the sentinel process or mutate these files. The isolation
+# regression near the end of this run verifies every file is byte-identical
+# and the sentinel is still alive. Baseline copies are kept inside the
+# fixture for cmp.
+NEIGHBOR_ROOT="$(_riso_new_root tt-recorder-neighbor)"
+_ALLOCATED_ROOTS+=("$NEIGHBOR_ROOT")
+mkdir -p "$NEIGHBOR_ROOT/torture-test/var/recorder"
+mkdir -p "$NEIGHBOR_ROOT/torture-test/var/home/.tamandua"
+mkdir -p "$NEIGHBOR_ROOT/torture-test/var/home-scripted/.tamandua"
+NEIGHBOR_SENTINEL_DIR="$NEIGHBOR_ROOT/torture-test/var/home/sentinel-cwd-$$"
+mkdir -p "$NEIGHBOR_SENTINEL_DIR"
+
+# Sentinel bytes — distinct, identifiable content, never real campaign data.
+printf '%s' 'neighbor-real-db-sentinel'     > "$NEIGHBOR_ROOT/torture-test/var/home/.tamandua/tamandua.db"
+printf '%s' 'neighbor-real-wal-sentinel'    > "$NEIGHBOR_ROOT/torture-test/var/home/.tamandua/tamandua.db-wal"
+printf '%s' 'neighbor-scripted-db-sentinel' > "$NEIGHBOR_ROOT/torture-test/var/home-scripted/.tamandua/tamandua.db"
+printf '%s' 'neighbor-identifiable-sentinel' > "$NEIGHBOR_ROOT/torture-test/var/home/.tamandua/identifiable-file"
+
+# Sentinel process: a sleep whose cwd sits inside the neighbor var/home
+# subtree (like a live contained campaign daemon would have). It is
+# REGISTERED as an owned child so exit cleanup stops it (identity-rechecked)
+# and then removes the neighbor root — while the run lives, nothing may stop
+# it just because a pre-existing pidfile names it (the regression proves it).
+(cd "$NEIGHBOR_SENTINEL_DIR" && sleep 600) &
+SENTINEL_PID=$!
+_register_owned "$SENTINEL_PID"
+
+# Pre-existing neighbor pidfile pointing at the sentinel PID — a pre-
+# existing PID file must NEVER authorize killing anything (the regression
+# proves it).
+printf '%s\n' "$SENTINEL_PID" > "$NEIGHBOR_ROOT/torture-test/var/recorder/tt-recorder.pid"
+
+# Baseline copies for the end-of-run byte-identity checks.
+mkdir -p "$FIXTURE_ROOT/isolation-baseline"
+cp "$NEIGHBOR_ROOT/torture-test/var/recorder/tt-recorder.pid" "$FIXTURE_ROOT/isolation-baseline/neighbor.pidfile"
+cp "$NEIGHBOR_ROOT/torture-test/var/home/.tamandua/tamandua.db" "$FIXTURE_ROOT/isolation-baseline/neighbor-real.db"
+cp "$NEIGHBOR_ROOT/torture-test/var/home/.tamandua/tamandua.db-wal" "$FIXTURE_ROOT/isolation-baseline/neighbor-real.db-wal"
+cp "$NEIGHBOR_ROOT/torture-test/var/home-scripted/.tamandua/tamandua.db" "$FIXTURE_ROOT/isolation-baseline/neighbor-scripted.db"
+cp "$NEIGHBOR_ROOT/torture-test/var/home/.tamandua/identifiable-file" "$FIXTURE_ROOT/isolation-baseline/neighbor-identifiable-file"
 
 # ── Test 1: --help prints usage and exits 0 ───────────────────────────
 echo ""
@@ -157,13 +229,9 @@ else
   fail "start --interval 10 did not pass interval=10 (got: $int10_out)"
 fi
 
-# Clean up after this test
-if [ -f "$TT_ROOT_VAR/recorder/tt-recorder.pid" ]; then
-  US006_T6_PID="$(cat "$TT_ROOT_VAR/recorder/tt-recorder.pid" 2>/dev/null || true)"
-  kill "$US006_T6_PID" 2>/dev/null || true
-  timeout 3 wait "$US006_T6_PID" 2>/dev/null || true
-  rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
-fi
+# Clean up after this test (evidence-verified teardown; fixture-scoped)
+_teardown_recorder_pidfile "$TT_ROOT_VAR/recorder/tt-recorder.pid"
+rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
 
 # ── Test 7: --interval default (5) when not provided ─────────────────
 echo ""
@@ -185,13 +253,9 @@ else
   fail "start (no --interval) did not default to 5 (got: $int_default_out)"
 fi
 
-# Clean up after this test
-if [ -f "$TT_ROOT_VAR/recorder/tt-recorder.pid" ]; then
-  US006_T7_PID="$(cat "$TT_ROOT_VAR/recorder/tt-recorder.pid" 2>/dev/null || true)"
-  kill "$US006_T7_PID" 2>/dev/null || true
-  timeout 3 wait "$US006_T7_PID" 2>/dev/null || true
-  rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
-fi
+# Clean up after this test (evidence-verified teardown; fixture-scoped)
+_teardown_recorder_pidfile "$TT_ROOT_VAR/recorder/tt-recorder.pid"
+rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
 
 # ── Test 8: --interval rejects non-integer value ──────────────────────
 echo ""
@@ -301,13 +365,9 @@ for cmd in start stop status; do
     else
       fail "'$cmd' did not dispatch to cmd_$cmd (rc=$cmd_rc)"
     fi
-    # Clean up the started recorder
-    if [ -f "$TT_ROOT_VAR/recorder/tt-recorder.pid" ]; then
-      US006_T13_PID="$(cat "$TT_ROOT_VAR/recorder/tt-recorder.pid" 2>/dev/null || true)"
-      kill "$US006_T13_PID" 2>/dev/null || true
-      timeout 3 wait "$US006_T13_PID" 2>/dev/null || true
-      rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
-    fi
+    # Clean up the started recorder (evidence-verified; fixture-scoped)
+    _teardown_recorder_pidfile "$TT_ROOT_VAR/recorder/tt-recorder.pid"
+    rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
   elif [ "$cmd" = "stop" ]; then
     if [ "$cmd_rc" -eq 0 ]; then
       pass "'$cmd' dispatches to cmd_$cmd (exits 0 = idempotent, no recorder)"
@@ -449,11 +509,23 @@ echo ""
 # linux-only process-discovery source (MACP3 US-004 doc note; no procfs access).
 echo "=== US-002: Process discovery via /proc ==="
 
-# Compute TT_ROOT consistently with tt-recorder
+# Compute TT_ROOT consistently with tt-recorder. RISO US-001: this
+# re-derivation recomputes the SAME fixture-owned values as startup —
+# SCRIPT_DIR is pinned to the fixture mirror (no re-exec, no inherited
+# marker), so TT_ROOT_VAR stays under FIXTURE_ROOT. Re-assert the
+# fixture-root guard here too, so later sections can never silently fall
+# back to a checkout-derived var.
 TT_DIR="$(dirname "$SCRIPT_DIR")"
 TT_REPO_ROOT="$(dirname "$TT_DIR")"
 TT_ROOT_VAR="${TT_REPO_ROOT}/torture-test/var"
 TT_ROOT_VAR_RESOLVED="$(readlink -f "$TT_ROOT_VAR" 2>/dev/null || printf '%s' "$TT_ROOT_VAR")"
+case "$TT_ROOT_VAR_RESOLVED" in
+  "$FIXTURE_ROOT"/*) : ;;
+  *)
+    echo "FAIL: TT_ROOT_VAR ($TT_ROOT_VAR_RESOLVED) is not under the invocation fixture root $FIXTURE_ROOT" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$TT_ROOT_VAR"
 
 # Test 24: Create a dummy process with cwd under TT_ROOT — MUST be discovered
@@ -464,15 +536,27 @@ DUMMY_DIR="$TT_ROOT_VAR/test-discover-cwd-$$"
 mkdir -p "$DUMMY_DIR"
 (cd "$DUMMY_DIR" && sleep 120) &
 DUMMY_PID=$!
+_register_owned "$DUMMY_PID"
 
 # Create a decoy process with cwd OUTSIDE TT_ROOT — must NOT be discovered
-(cd /tmp && sleep 120) &
+(cd "$FIXTURE_ROOT" && sleep 120) &
 DECOY_PID=$!
+_register_owned "$DECOY_PID"
 
-# Create a process whose cmdline contains TT_ROOT but cwd is OUTSIDE — MUST be discovered
-# Use trap '' EXIT to prevent bash from exec'ing sleep (which would replace cmdline)
-bash -c "trap '' EXIT; echo '$TT_ROOT_VAR/cmdline-marker' > /dev/null; sleep 120" &
+# Create a process whose cmdline contains the fixture var path — MUST be
+# discovered via the cmdline evidence arm of discover_processes. Its cwd is
+# EXPLICITLY OUTSIDE TT var (inside another owned fixture subdirectory), so
+# only its command line names TT var: the two discovery arms stay independent
+# red arms (a broken cmdline arm cannot pass via the cwd arm, and vice versa).
+# The bash -c process keeps its marker-bearing argv alive with an in-shell
+# loop (trap '' EXIT prevents exec-optimization from replacing that cmdline
+# with 'sleep'); the only children it forks are 0.2s sleeps that self-exit,
+# so stopping the registered process never orphans a long-lived grandchild.
+CMDLINE_CWD_DIR="$FIXTURE_ROOT/cmdline-only-cwd-$$"
+mkdir -p "$CMDLINE_CWD_DIR"
+(cd "$CMDLINE_CWD_DIR" && exec bash -c "trap '' EXIT; echo '$TT_ROOT_VAR/cmdline-marker' > /dev/null; while :; do sleep 0.2; done") &
 CMDLINE_PID=$!
+_register_owned "$CMDLINE_PID"
 
 # Wait for all processes to start
 sleep 0.5
@@ -585,15 +669,12 @@ else
   pass "discover_processes does NOT use name-based process discovery"
 fi
 
-# Cleanup test processes
-kill "$DUMMY_PID" 2>/dev/null || true
-kill "$DECOY_PID" 2>/dev/null || true
-kill "$CMDLINE_PID" 2>/dev/null || true
+# Cleanup test processes (identity-verified stop; fixture-scoped dir removal)
+_stop_registered_pid "$DUMMY_PID"
+_stop_registered_pid "$DECOY_PID"
+_stop_registered_pid "$CMDLINE_PID"
 rm -rf "$DUMMY_DIR" 2>/dev/null || true
-# Wait only for our known children with timeout
-for _pid in "$DUMMY_PID" "$DECOY_PID" "$CMDLINE_PID"; do
-  [ -n "$_pid" ] && timeout 2 wait "$_pid" 2>/dev/null || true
-done
+rm -rf "$CMDLINE_CWD_DIR" 2>/dev/null || true
 
 # ── US-003: Per-process metric collection ──────────────────────────
 echo ""
@@ -609,10 +690,12 @@ mkdir -p "$METRIC_DUMMY_DIR"
 # Spawn a dummy process whose cwd IS under TT_ROOT for metric collection
 (cd "$METRIC_DUMMY_DIR" && sleep 120) &
 METRIC_DUMMY_PID=$!
+_register_owned "$METRIC_DUMMY_PID"
 
 # Spawn a decoy process outside TT_ROOT — must NOT appear in samples
-(cd /tmp && sleep 120) &
+(cd "$FIXTURE_ROOT" && sleep 120) &
 METRIC_DECOY_PID=$!
+_register_owned "$METRIC_DECOY_PID"
 
 sleep 0.5
 
@@ -893,14 +976,10 @@ else
   fail "collect_sample did NOT include dummy process under TT_ROOT (pid=$METRIC_DUMMY_PID)"
 fi
 
-# Cleanup metric test processes
-kill "$METRIC_DUMMY_PID" 2>/dev/null || true
-kill "$METRIC_DECOY_PID" 2>/dev/null || true
+# Cleanup metric test processes (identity-verified stop; fixture-scoped)
+_stop_registered_pid "$METRIC_DUMMY_PID"
+_stop_registered_pid "$METRIC_DECOY_PID"
 rm -rf "$METRIC_DUMMY_DIR" 2>/dev/null || true
-# Wait only for our known children with timeout
-for _pid in "$METRIC_DUMMY_PID" "$METRIC_DECOY_PID"; do
-  [ -n "$_pid" ] && timeout 2 wait "$_pid" 2>/dev/null || true
-done
 
 # ── US-004: JSONL output with rotation at 50MB ─────────────────────
 echo ""
@@ -915,6 +994,7 @@ US004_DUMMY_DIR="$TT_ROOT_VAR/test-us004-$$"
 mkdir -p "$US004_DUMMY_DIR"
 (cd "$US004_DUMMY_DIR" && sleep 300) &
 US004_DUMMY_PID=$!
+_register_owned "$US004_DUMMY_PID"
 sleep 0.3
 
 # Start _run_loop in background with 1s interval
@@ -924,13 +1004,13 @@ bash -c "
   _run_loop 1
 " &
 US004_LOOP_PID=$!
+_register_owned "$US004_LOOP_PID"
 
 # Wait for at least 2 intervals (2+ seconds) to accumulate samples
 sleep 3
 
-# Kill the loop
-kill "$US004_LOOP_PID" 2>/dev/null || true
-wait "$US004_LOOP_PID" 2>/dev/null || true
+# Kill the loop (identity-verified stop; registered at spawn)
+_stop_registered_pid "$US004_LOOP_PID"
 
 # Find the output file
 US004_OUTPUT_FILE="$(ls -t "$US004_RECORDER_DIR"/samples-*.jsonl 2>/dev/null | head -1)"
@@ -1062,9 +1142,9 @@ bash -c "
   _run_loop 1
 " &
 US004_LOOP_PID2=$!
+_register_owned "$US004_LOOP_PID2"
 sleep 2.5
-kill "$US004_LOOP_PID2" 2>/dev/null || true
-wait "$US004_LOOP_PID2" 2>/dev/null || true
+_stop_registered_pid "$US004_LOOP_PID2"
 
 # Check if a NEW file was created (different name from original)
 US004_files_after=($(ls -t "$US004_RECORDER_DIR"/samples-*.jsonl 2>/dev/null || true))
@@ -1107,12 +1187,10 @@ else
   fail "US-004: cannot verify new file timestamp — rotation did not occur"
 fi
 
-# Cleanup US-004 test resources
-kill "$US004_DUMMY_PID" 2>/dev/null || true
+# Cleanup US-004 test resources (identity-verified stop; fixture-scoped)
+_stop_registered_pid "$US004_DUMMY_PID"
 rm -rf "$US004_DUMMY_DIR" 2>/dev/null || true
 rm -rf "$US004_RECORDER_DIR" 2>/dev/null || true
-# Wait only for our known child with timeout
-[ -n "$US004_DUMMY_PID" ] && timeout 2 wait "$US004_DUMMY_PID" 2>/dev/null || true
 
 # ── US-005: Daemon detection and db/wal size collection ──────────────
 echo ""
@@ -1142,18 +1220,21 @@ US005_REAL_DIR="$US005_REAL_HOME/test-daemon-$$"
 mkdir -p "$US005_REAL_DIR"
 (cd "$US005_REAL_DIR" && sleep 120) &
 US005_REAL_PID=$!
+_register_owned "$US005_REAL_PID"
 
 # Spawn a scripted daemon process (cwd under home-scripted/)
 US005_SCRIPTED_DIR="$US005_SCRIPTED_HOME/test-daemon-$$"
 mkdir -p "$US005_SCRIPTED_DIR"
 (cd "$US005_SCRIPTED_DIR" && sleep 120) &
 US005_SCRIPTED_PID=$!
+_register_owned "$US005_SCRIPTED_PID"
 
 # Spawn a non-daemon process (cwd under TT_ROOT but NOT under home/ or home-scripted/)
 US005_NON_DAEMON_DIR="$TT_ROOT_VAR/test-non-daemon-$$"
 mkdir -p "$US005_NON_DAEMON_DIR"
 (cd "$US005_NON_DAEMON_DIR" && sleep 120) &
 US005_NON_DAEMON_PID=$!
+_register_owned "$US005_NON_DAEMON_PID"
 
 sleep 0.5
 
@@ -1415,17 +1496,14 @@ print(json.loads(sys.stdin.read())['db_path'])
   fi
 fi
 
-# Cleanup US-005 test processes and dirs
-kill "$US005_REAL_PID" 2>/dev/null || true
-kill "$US005_SCRIPTED_PID" 2>/dev/null || true
-kill "$US005_NON_DAEMON_PID" 2>/dev/null || true
+# Cleanup US-005 test processes and dirs (identity-verified stop; the home
+# dirs live under the fixture var, so removal is fixture-scoped)
+_stop_registered_pid "$US005_REAL_PID"
+_stop_registered_pid "$US005_SCRIPTED_PID"
+_stop_registered_pid "$US005_NON_DAEMON_PID"
 rm -rf "$US005_REAL_HOME" 2>/dev/null || true
 rm -rf "$US005_SCRIPTED_HOME" 2>/dev/null || true
 rm -rf "$US005_NON_DAEMON_DIR" 2>/dev/null || true
-# Wait only for our known children with timeout
-for _pid in "$US005_REAL_PID" "$US005_SCRIPTED_PID" "$US005_NON_DAEMON_PID"; do
-  [ -n "$_pid" ] && timeout 2 wait "$_pid" 2>/dev/null || true
-done
 
 # ── US-006: Start command with nohup detach and pidfile ─────────────
 echo ""
@@ -1496,13 +1574,8 @@ echo ""
 echo "--- Test: stale pidfile is cleaned ---"
 
 # Stop the current recorder to simulate a dead process
-# linux-only /proc/$US006_PID existence check (MACP3 US-004): guarded here —
-# Darwin has no /proc, so the block is skipped and the stale-pidfile cleanup
-# proceeds (pass-by-note).
-if [ -n "${US006_PID:-}" ] && [ -d "/proc/$US006_PID" ]; then
-  kill "$US006_PID" 2>/dev/null || true
-  timeout 3 wait "$US006_PID" 2>/dev/null || true
-fi
+# (evidence-verified teardown of this run's fixture-owned recorder)
+_teardown_recorder_pidfile "$US006_PIDFILE"
 rm -rf "$US006_RECORDER_DIR" 2>/dev/null || true
 
 # Create a fake pidfile with a definitely-dead PID (99999 is unlikely to exist)
@@ -1524,13 +1597,8 @@ else
   fail "pidfile not updated after stale cleanup (got: $US006_NEW_PID)"
 fi
 
-# Clean up for next test
-# linux-only /proc/$US006_NEW_PID existence check (MACP3 US-004): guarded here
-# — Darwin has no /proc, so the block is skipped (pass-by-note).
-if [ -n "$US006_NEW_PID" ] && [ -d "/proc/$US006_NEW_PID" ]; then
-  kill "$US006_NEW_PID" 2>/dev/null || true
-  timeout 3 wait "$US006_NEW_PID" 2>/dev/null || true
-fi
+# Clean up for next test (evidence-verified teardown; fixture-scoped)
+_teardown_recorder_pidfile "$US006_PIDFILE"
 rm -rf "$US006_RECORDER_DIR" 2>/dev/null || true
 
 # Test 62: pidfile held by non-tt-recorder process triggers refusal
@@ -1538,8 +1606,9 @@ echo ""
 echo "--- Test: pidfile held by non-tt-recorder triggers refusal ---"
 
 # Create a non-tt-recorder dummy process
-(cd /tmp && sleep 300) &
+(cd "$FIXTURE_ROOT" && sleep 300) &
 US006_NONREC_PID=$!
+_register_owned "$US006_NONREC_PID"
 sleep 0.3
 
 # Verify the non-recorder process is alive
@@ -1564,9 +1633,8 @@ else
   pass "skipped: non-recorder dummy PID not alive"
 fi
 
-# Clean up
-kill "$US006_NONREC_PID" 2>/dev/null || true
-timeout 2 wait "$US006_NONREC_PID" 2>/dev/null || true
+# Clean up (identity-verified stop; fixture-scoped)
+_stop_registered_pid "$US006_NONREC_PID"
 rm -rf "$US006_RECORDER_DIR" 2>/dev/null || true
 
 # Test 63: background process writes samples to JSONL file
@@ -1578,6 +1646,7 @@ US006_DUMMY_DIR="$TT_ROOT_VAR/test-us006-$$"
 mkdir -p "$US006_DUMMY_DIR"
 (cd "$US006_DUMMY_DIR" && sleep 120) &
 US006_DUMMY_PID=$!
+_register_owned "$US006_DUMMY_PID"
 sleep 0.3
 
 # Start recorder with fast interval
@@ -1619,40 +1688,45 @@ US006_BG_PID="$(cat "$US006_PIDFILE" 2>/dev/null || true)"
 # the SIGTERM wait logic behaves conservatively (treated as exited; pass-by-note)
 # on the wait loop and the negation below.
 if [ -n "$US006_BG_PID" ] && [ -d "/proc/$US006_BG_PID" ]; then
-  # Send SIGTERM
-  kill -TERM "$US006_BG_PID" 2>/dev/null || true
+  # Evidence gate (RISO US-001): only TERM a pid proven to be this run's
+  # fixture recorder (alive + cmdline naming the exact fixture tool + cwd
+  # under the fixture root).
+  if _recorder_pid_evidence "$US006_BG_PID"; then
+    # Send SIGTERM (via the harness's single signal choke point)
+    _kill -TERM "$US006_BG_PID" 2>/dev/null || true
 
-  # Wait for process to exit (polling)
-  US006_WAITED=0
-  while [ -d "/proc/$US006_BG_PID" ] && [ "$US006_WAITED" -lt 10 ]; do
-    sleep 0.5
-    US006_WAITED=$((US006_WAITED + 1))
-  done
+    # Wait for process to exit (polling)
+    US006_WAITED=0
+    while [ -d "/proc/$US006_BG_PID" ] && [ "$US006_WAITED" -lt 10 ]; do
+      sleep 0.5
+      US006_WAITED=$((US006_WAITED + 1))
+    done
 
-  if [ ! -d "/proc/$US006_BG_PID" ]; then
-    pass "SIGTERM caused clean shutdown (process exited)"
+    if [ ! -d "/proc/$US006_BG_PID" ]; then
+      pass "SIGTERM caused clean shutdown (process exited)"
+    else
+      fail "process still alive after SIGTERM + 5s wait (pid=$US006_BG_PID)"
+    fi
+
+    # Verify pidfile was NOT removed (stop handles that)
+    if [ -f "$US006_PIDFILE" ]; then
+      pass "pidfile preserved after SIGTERM (stop handles cleanup)"
+    else
+      fail "pidfile was removed after SIGTERM (should be preserved)"
+    fi
   else
-    fail "process still alive after SIGTERM + 5s wait (pid=$US006_BG_PID)"
-  fi
-
-  # Verify pidfile was NOT removed (stop handles that)
-  if [ -f "$US006_PIDFILE" ]; then
-    pass "pidfile preserved after SIGTERM (stop handles cleanup)"
-  else
-    fail "pidfile was removed after SIGTERM (should be preserved)"
+    fail "pidfile PID $US006_BG_PID lacks tt-recorder/fixture-cwd evidence — refusing SIGTERM"
   fi
 else
   pass "skipped: background recorder PID not available"
 fi
 
-# Cleanup US-006 resources
-kill "$US006_DUMMY_PID" 2>/dev/null || true
-kill "$US006_BG_PID" 2>/dev/null || true
+# Cleanup US-006 resources (identity-verified stop + evidence-verified
+# recorder teardown; fixture-scoped)
+_stop_registered_pid "$US006_DUMMY_PID"
+_teardown_recorder_pidfile "$US006_PIDFILE"
 rm -rf "$US006_DUMMY_DIR" 2>/dev/null || true
 rm -rf "$US006_RECORDER_DIR" 2>/dev/null || true
-for _pid in "$US006_DUMMY_PID" "${US006_BG_PID:-}"; do
-  [ -n "$_pid" ] && timeout 2 wait "$_pid" 2>/dev/null || true
-done
 
 # Test 65: start --help still works after cmd_start implementation
 echo ""
@@ -1798,8 +1872,9 @@ echo ""
 echo "--- Test: pidfile with non-tt-recorder process ---"
 
 # Spawn a non-tt-recorder process
-(cd /tmp && sleep 300) &
+(cd "$FIXTURE_ROOT" && sleep 300) &
 US007_NONREC_PID=$!
+_register_owned "$US007_NONREC_PID"
 sleep 0.3
 
 # linux-only /proc/$US007_NONREC_PID existence checks (MACP3 US-004): guarded —
@@ -1844,8 +1919,8 @@ else
   pass "skipped: non-recorder dummy PID not alive"
 fi
 
-kill "$US007_NONREC_PID" 2>/dev/null || true
-timeout 2 wait "$US007_NONREC_PID" 2>/dev/null || true
+# Clean up the non-tt-recorder dummy (identity-verified stop; fixture-scoped)
+_stop_registered_pid "$US007_NONREC_PID"
 rm -rf "$US007_RECORDER_DIR" 2>/dev/null || true
 
 # ── Test 72: Stop after successful stop is idempotent (exit 0) ──────
@@ -1884,17 +1959,20 @@ else
   fail "could not verify idempotent stop (recorder not started)"
 fi
 
-# Clean up from test 72
+# Clean up from test 72 (evidence-verified teardown; fixture-scoped — the
+# recorder was already stopped twice via the tool, so teardown is a no-op)
+_recorder_teardown_pid "$US007_PID2"
 rm -rf "$US007_RECORDER_DIR" 2>/dev/null || true
-kill "$US007_PID2" 2>/dev/null || true
-timeout 2 wait "$US007_PID2" 2>/dev/null || true
 
 # ── Test 73: cmd_stop implementation structure ──────────────────────
 echo ""
 echo "--- Test: cmd_stop implementation structure ---"
 
-# Source includes evidence-based cmdline check
-if grep -A 60 '^cmd_stop()' "$TOOL" | grep -q 'tr.*\\0.* .*<.*cmdline'; then
+# Source includes evidence-based cmdline check. cmd_stop reads the target's
+# cmdline either inline (tr NUL->space from the /proc cmdline) or through the
+# shared _pid_cmdline evidence helper (same read; the merged tool delegates
+# to it) — either form is an evidence-based check before any signal.
+if grep -A 60 '^cmd_stop()' "$TOOL" | grep -qE '_pid_cmdline|tr.*\\0.* .*<.*cmdline'; then
   pass "cmd_stop has evidence-based cmdline check"
 else
   fail "cmd_stop missing evidence-based cmdline check"
@@ -2198,6 +2276,7 @@ mkdir -p "$US009_WORKTREES_DIR"
 # Its cwd is under TT_ROOT (via fake-home) so _find_pids would normally discover it
 (cd "$US009_TAMANDUA_DIR/test-prod-dir" && sleep 120) &
 US009_PROD_PID=$!
+_register_owned "$US009_PROD_PID"
 sleep 0.3
 
 # Call discover_processes with TT_REAL_HOME set to our fake home
@@ -2223,9 +2302,8 @@ else
   fail "production cwd exclusion: process died — guard check invalid (pid not alive)"
 fi
 
-# Cleanup
-kill "$US009_PROD_PID" 2>/dev/null || true
-timeout 2 wait "$US009_PROD_PID" 2>/dev/null || true
+# Cleanup (identity-verified stop; fixture-scoped)
+_stop_registered_pid "$US009_PROD_PID"
 rm -rf "$US009_TAMANDUA_DIR/test-prod-dir" 2>/dev/null || true
 
 # ── Test 87: Process cwd under ~/.tamandua/worktrees/ is NOT excluded ──
@@ -2237,6 +2315,7 @@ mkdir -p "$US009_WT_DIR"
 
 (cd "$US009_WT_DIR" && sleep 120) &
 US009_WT_PID=$!
+_register_owned "$US009_WT_PID"
 sleep 0.3
 
 US009_DISCOVER_WT="$(bash -c "
@@ -2252,83 +2331,40 @@ else
   fail "worktree cwd safety: process under ~/.tamandua/worktrees/ was INCORRECTLY excluded (pid=$US009_WT_PID)"
 fi
 
-kill "$US009_WT_PID" 2>/dev/null || true
-timeout 2 wait "$US009_WT_PID" 2>/dev/null || true
+# Cleanup (identity-verified stop; fixture-scoped)
+_stop_registered_pid "$US009_WT_PID"
 rm -rf "$US009_WT_DIR" 2>/dev/null || true
 
-# ── Test 88: Process listening on production port 3334 is excluded ──
+# ── Test 88: Process/port exclusion — isolated behavioral fixture ──
+# RISO US-002: replaces the legacy production-port bind case (which bound the
+# real dashboard port 127.0.0.1:3334 and PASSed vacuously when the bind
+# failed, the listener died, or coverage could not be established). The
+# legacy case must never run again and is GONE: this harness never binds or
+# probes production ports 3334/3338/3339 — no socket is ever created on them
+# and nothing connects to a production listener. The section exercises the
+# REAL exclusion decision (the unchanged runtime functions in the fixture
+# mirror of bin/tt-recorder) with controlled port evidence at the narrowest
+# existing process/port observation boundary, and unavailable observations
+# FAIL (increment FAILURES) — never a vacuous PASS. The shared scenario
+# helpers (tt-recorder-selftest-guards.sh) print the PASS/FAIL lines:
+#   * ALLOWED contained-process observation (negative control): a contained
+#     process whose cwd is under the fixture var and that listens on an
+#     OS-selected random high port must be DISCOVERED and INCLUDED — the
+#     exclusion logic must NOT drop it (an always-exclude implementation
+#     fails this).
+#   * EXCLUDED production-port observation (positive control): a synthetic
+#     NON-EXISTENT pid (no live process, no real listener — no procfs fd
+#     evidence (MACP3 US-004 doc note), so the linux inode arm yields no
+#     evidence and the function consults its darwin lsof arm) plus a PATH
+#     shim whose fake lsof reports that pid listening on production port
+#     3334 makes the real _is_production_ports return 0 — and with
+#     TT_RECORDER_VERBOSE set the verbose 'excluding production process'
+#     exclusion line fires (an always-include implementation fails this).
 echo ""
-echo "--- Test: production port exclusion ---"
+echo "--- Test: production port exclusion — isolated behavioral fixture ---"
 
-# Spawn a process with cwd under TT_ROOT (passes cwd check) that listens on port 3334
-US009_PORT_DIR="$TT_ROOT_VAR/test-port-$$"
-mkdir -p "$US009_PORT_DIR"
-
-# Start a TCP listener on port 3334 using python3
-python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    s.bind(('127.0.0.1', 3334))
-    s.listen(1)
-    time.sleep(120)
-except Exception:
-    pass
-" &
-US009_PORT_PID=$!
-sleep 0.5
-
-# Verify the listener is actually alive
-# linux-only /proc/$US009_PORT_PID reads below incl. the /proc/<pid>/fd glob
-# (MACP3 US-004): guarded here — Darwin has no /proc, so the whole block is
-# skipped (pass-by-note; never hard-fails).
-if [ -d "/proc/$US009_PORT_PID" ]; then
-  # Verify it actually has a socket on port 3334
-  US009_HAS_PORT=false
-  for _fd in "/proc/$US009_PORT_PID/fd"/*; do
-    if [ -L "$_fd" ]; then
-      _target="$(readlink "$_fd" 2>/dev/null || true)"
-      if [[ "$_target" == socket:* ]]; then
-        US009_HAS_PORT=true
-        break
-      fi
-    fi
-  done
-
-  if [ "$US009_HAS_PORT" = true ]; then
-    # Now call _find_pids via collect_sample and verify exclusion
-    US009_SAMPLE="$(bash -c "
-      set -euo pipefail
-      source '$TOOL'
-      collect_sample
-    " 2>/dev/null)"
-
-    if echo "$US009_SAMPLE" | grep -q "\"pid\":$US009_PORT_PID"; then
-      # Check: was it listening on 3334? If the port 3334 wasn't actually bound
-      # (e.g., port already in use), the guard wouldn't filter it
-      # linux-only /proc/net/tcp read (MACP3 US-004): unguarded but degrades via
-      # 2>/dev/null — on a /proc-less host awk reads empty input and exits 1,
-      # so this falls to the else (pass-by-note). Darwin branch; never hard-fails.
-      if awk '$4 == "0A" && $2 ~ /:0D06$/ {found=1} END {exit !found}' /proc/net/tcp 2>/dev/null; then
-        fail "production port exclusion: process listening on port 3334 was NOT excluded (pid=$US009_PORT_PID)"
-      else
-        pass "production port exclusion: port 3334 listener not filtered (port not actually bound — likely already in use; guard correctly skipped)"
-      fi
-    else
-      pass "production port exclusion: process on production port is excluded from samples (pid=$US009_PORT_PID)"
-    fi
-  else
-    pass "production port exclusion: listener process has no sockets — port 3334 may be in use by another process; skipping port guard verification"
-  fi
-else
-  pass "production port exclusion: listener died (port 3334 may be in use); cannot verify port guard"
-fi
-
-# Cleanup
-kill "$US009_PORT_PID" 2>/dev/null || true
-timeout 2 wait "$US009_PORT_PID" 2>/dev/null || true
-rm -rf "$US009_PORT_DIR" 2>/dev/null || true
+riso_port_allowed_contained "$US009_FAKE_HOME" "harness-88a"
+riso_port_excluded_production "harness-88b"
 
 # ── Test 89: Production exclusion is logged when TT_RECORDER_VERBOSE is set ──
 echo ""
@@ -2339,6 +2375,7 @@ mkdir -p "$US009_VERB_DIR"
 
 (cd "$US009_VERB_DIR" && sleep 120) &
 US009_VERB_PID=$!
+_register_owned "$US009_VERB_PID"
 sleep 0.3
 
 US009_VERB_STDERR="$(bash -c "
@@ -2370,8 +2407,8 @@ else
   fail "verbose logging: unexpected stderr when verbose not set (got: '$US009_NO_VERB_STDERR')"
 fi
 
-kill "$US009_VERB_PID" 2>/dev/null || true
-timeout 2 wait "$US009_VERB_PID" 2>/dev/null || true
+# Cleanup (identity-verified stop; fixture-scoped)
+_stop_registered_pid "$US009_VERB_PID"
 rm -rf "$US009_VERB_DIR" 2>/dev/null || true
 
 # ── Test 90: Source code structure — production exclusion functions exist ──
@@ -2454,12 +2491,31 @@ else
   fail "production exclusion guard not in _find_pids (may collect production process data)"
 fi
 
-# Production exclusion never uses name-only matching
-if ! grep -A 30 '^_is_production_ports()' "$TOOL" | grep -qiE 'ss |netstat.*grep|pgrep.*port|lsof.*grep'; then
+# Production exclusion never uses name-only matching. The scan masks
+# '#'-comment text (the tool's own doc prose mentions ss/lsof — e.g. a
+# "/proc-less host" comment) so only executable lines are inspected; a real
+# executed ss/netstat/pgrep/lsof name-match (reintroduction) still FAILs.
+if ! grep -A 30 '^_is_production_ports()' "$TOOL" | sed 's/[[:space:]]*#.*$//' | grep -qiE 'ss |netstat.*grep|pgrep.*port|lsof.*grep'; then
   pass "port guard does NOT use ss/netstat/lsof for process matching (evidence-based)"
 else
   fail "port guard uses ss/netstat/lsof for matching (not evidence-based)"
 fi
+
+# ── Test 92: RISO reintroduction guard (production binds + checkout state) ─
+# RISO US-002: the static reintroduction guard (shared helper in
+# tt-recorder-selftest-guards.sh) scans this harness's own source and the
+# driven fixture tool copy and exits non-zero when either reintroduces (a) an
+# EXECUTED socket bind to a literal production port 3334/3338/3339 or (b)
+# source-checkout state usage (mutable TT_ROOT_VAR/recorder/home derived from
+# the repo checkout via $_SRC_BIN / BASH_SOURCE rather than the invocation
+# fixture root). Comments/strings are masked (prose may mention the ports),
+# mirroring the mask style of the Tests 17-18/90-91 greps. A violation FAILs
+# the run with the offending lines printed.
+echo ""
+echo "--- Test: RISO reintroduction guard ---"
+
+riso_reintroduction_guard "$_SRC_BIN/tt-recorder.test.sh" "harness source"
+riso_reintroduction_guard "$TOOL" "fixture tool copy"
 
 # Cleanup US-009 test dirs
 rm -rf "$US009_FAKE_HOME" 2>/dev/null || true
@@ -2471,19 +2527,12 @@ echo "=== US-010: End-to-end integration test ==="
 
 US010_RECORDER_DIR="$TT_ROOT_VAR/recorder"
 
-# Clean up any stale state before the E2E test
+# Clean up any stale state before the E2E test (fixture-scoped reset; the
+# fixture is fresh per invocation, so any pidfile here was created by this
+# run — teardown still requires tt-recorder cmdline + fixture-cwd evidence
+# before signaling, and never signals an unrelated process).
+_teardown_recorder_pidfile "$US010_RECORDER_DIR/tt-recorder.pid"
 rm -rf "$US010_RECORDER_DIR" 2>/dev/null || true
-# Kill only running tt-recorder background processes (not this test script).
-# Match on the pattern used by _run_loop in tt-recorder.
-# linux-only /proc/$US010_STALE_PID existence check (MACP3 US-004): guarded —
-# Darwin has no /proc, so the block is skipped (pass-by-note).
-if [ -f "$US010_RECORDER_DIR/tt-recorder.pid" ]; then
-  US010_STALE_PID="$(cat "$US010_RECORDER_DIR/tt-recorder.pid" 2>/dev/null || true)"
-  if [ -n "$US010_STALE_PID" ] && [ -d "/proc/$US010_STALE_PID" ]; then
-    kill "$US010_STALE_PID" 2>/dev/null || true
-    timeout 3 wait "$US010_STALE_PID" 2>/dev/null || true
-  fi
-fi
 
 # ── Test 92: Start recorder, sample dummy+decoy, verify samples, stop, verify cleanup ──
 echo ""
@@ -2491,17 +2540,19 @@ echo "--- Test: US-010 — full E2E pipeline ---"
 
 # Create dummy and decoy directories
 US010_DUMMY_DIR="$TT_ROOT_VAR/test-us010-dummy-$$"
-US010_DECOY_DIR="/tmp/test-us010-decoy-$$"
+US010_DECOY_DIR="$FIXTURE_ROOT/test-us010-decoy-$$"
 mkdir -p "$US010_DUMMY_DIR"
 mkdir -p "$US010_DECOY_DIR"
 
 # Spawn dummy process (cwd under TT_ROOT/var/) — MUST be sampled
 (cd "$US010_DUMMY_DIR" && sleep 120) &
 US010_DUMMY_PID=$!
+_register_owned "$US010_DUMMY_PID"
 
 # Spawn decoy process (cwd outside TT_ROOT/var/) — must NOT be sampled
 (cd "$US010_DECOY_DIR" && sleep 120) &
 US010_DECOY_PID=$!
+_register_owned "$US010_DECOY_PID"
 
 sleep 0.3
 
@@ -2677,22 +2728,347 @@ if true; then
   pass "US-010: test exercises all three commands: start, status, stop"
 fi
 
-# Cleanup E2E test processes and dirs
-kill "$US010_DUMMY_PID" 2>/dev/null || true
-kill "$US010_DECOY_PID" 2>/dev/null || true
+# Cleanup E2E test processes and dirs (identity-verified stop; fixture-scoped)
+_stop_registered_pid "$US010_DUMMY_PID"
+_stop_registered_pid "$US010_DECOY_PID"
 rm -rf "$US010_DUMMY_DIR" 2>/dev/null || true
 rm -rf "$US010_DECOY_DIR" 2>/dev/null || true
 rm -rf "$US010_RECORDER_DIR" 2>/dev/null || true
-# Wait for background processes with timeout
-for _pid in "$US010_DUMMY_PID" "$US010_DECOY_PID"; do
-  [ -n "$_pid" ] && timeout 2 wait "$_pid" 2>/dev/null || true
-done
 
 # ── US-010: Note on second-pass verification ────────────────────────
 echo ""
 echo "--- Test: US-010 — note on second-pass verification ---"
 echo "  Second consecutive pass is verified by running the test script twice."
 echo "  Run: bash torture-test/bin/tt-recorder.test.sh && bash torture-test/bin/tt-recorder.test.sh"
+
+# ── RISO US-001: cleanup-root trust and process-ownership sub-tests ────
+# Focused, non-destructive regressions that pin the ownership guards with
+# wholly synthetic fixtures and a deny-and-record signal boundary (the seam
+# _SELFTEST_SIGNAL_LOG records intended signals instead of delivering them
+# and is cleared before every real teardown). These run near the end of the
+# harness, after every section above stopped the children it spawned.
+echo ""
+echo "=== RISO US-001: cleanup-root trust and process-ownership guards ==="
+
+# (a) An inherited cleanup-root marker can never choose a deletion root:
+#     cleanup removes ONLY the roots _ALLOCATED_ROOTS recorded by this
+#     invocation's successful allocations. Build a synthetic "inherited
+#     neighbor" whose name matches the tmp prefix but that this invocation
+#     did NOT allocate, then prove (i) the REAL guards' source-time init
+#     clears exported markers of the same names (and of the seam variables)
+#     and allocation stays fresh under the real _riso_new_root, (ii) the
+#     marker is not in the recorded cleanup set — real iteration over the
+#     indexed array, the exact registry the cleanup loop expands — and
+#     (iii) the marker's sentinel file is untouched.
+MARKER_ROOT="$(mktemp -d "$_fixbase/tt-recorder-neighbor.inherited-$$.XXXXXX")"
+printf '%s' 'inherited-marker-sentinel' > "$MARKER_ROOT/keep-me"
+
+# (i) the child sources the REAL guards file with hostile exported markers:
+#     source-time init must clear FIXTURE_ROOT / NEIGHBOR_ROOT /
+#     _ALLOCATED_ROOTS and both seam variables before any allocation.
+set +e
+FRESH_ALLOC="$(MARKER="$MARKER_ROOT" LIBPATH="$_SRC_BIN/tt-recorder-selftest-guards.sh" bash -c '
+  set -euo pipefail
+  export FIXTURE_ROOT="$MARKER" NEIGHBOR_ROOT="$MARKER"
+  export _ALLOCATED_ROOTS="$MARKER"
+  export _SELFTEST_SIGNAL_LOG="$MARKER/external-seam" _SELFTEST_RM_LOG="$MARKER/external-rm"
+  source "$LIBPATH"
+  # the source-time init above must have clobbered every inherited marker
+  if [ -n "$FIXTURE_ROOT" ] || [ -n "$NEIGHBOR_ROOT" ] || \
+     [ -n "$_SELFTEST_SIGNAL_LOG" ] || [ -n "$_SELFTEST_RM_LOG" ] || \
+     [ "${#_ALLOCATED_ROOTS[@]}" -ne 0 ]; then
+    exit 8
+  fi
+  r="$(_riso_new_root tt-recorder-selftest)"
+  case "$r" in "$_fixbase"/tt-recorder-selftest.*) ;; *) exit 9 ;; esac
+  printf "%s" "$r"
+')"
+FRESH_ALLOC_RC=$?
+set -e
+if [ "$FRESH_ALLOC_RC" -eq 0 ] && [ -n "$FRESH_ALLOC" ] && [ "$FRESH_ALLOC" != "$MARKER_ROOT" ] && [ -f "$MARKER_ROOT/keep-me" ]; then
+  pass "inherited marker env cleared at guards source time — real allocation stays fresh"
+else
+  fail "inherited cleanup-root marker influenced allocation (rc=$FRESH_ALLOC_RC fresh='$FRESH_ALLOC' marker='$MARKER_ROOT')"
+fi
+# the child bash allocated a fresh root of its own; remove that exact,
+# prefix-guarded mktemp result (never an unvalidated path)
+if [ -n "$FRESH_ALLOC" ]; then
+  case "$FRESH_ALLOC" in
+    "$_fixbase"/tt-recorder-selftest.*) rm -rf -- "$FRESH_ALLOC" ;;
+  esac
+fi
+
+# (ii) the recorded cleanup set holds exactly this invocation's roots and
+#      never the marker — real iteration over the indexed array registry
+RISO_REG_FIXTURE=0
+RISO_REG_NEIGHBOR=0
+RISO_REG_MARKER=0
+for _reg_r in "${_ALLOCATED_ROOTS[@]+"${_ALLOCATED_ROOTS[@]}"}"; do
+  [ -n "$_reg_r" ] || continue
+  [ "$_reg_r" = "$FIXTURE_ROOT" ] && RISO_REG_FIXTURE=1
+  [ "$_reg_r" = "$NEIGHBOR_ROOT" ] && RISO_REG_NEIGHBOR=1
+  [ "$_reg_r" = "$MARKER_ROOT" ] && RISO_REG_MARKER=1
+done
+if [ "$RISO_REG_FIXTURE" -eq 1 ] && [ "$RISO_REG_NEIGHBOR" -eq 1 ] && [ "$RISO_REG_MARKER" -eq 0 ]; then
+  pass "cleanup-owned root registry holds only roots this invocation allocated (never the marker)"
+else
+  fail "cleanup-owned root registry is wrong (fixture=$RISO_REG_FIXTURE neighbor=$RISO_REG_NEIGHBOR marker=$RISO_REG_MARKER marker_path=$MARKER_ROOT)"
+fi
+
+# (iii) the synthetic inherited-neighbor sentinel file is intact
+if [ -f "$MARKER_ROOT/keep-me" ] && [ "$(cat "$MARKER_ROOT/keep-me" 2>/dev/null || true)" = "inherited-marker-sentinel" ]; then
+  pass "synthetic inherited-neighbor sentinel file untouched"
+else
+  fail "synthetic inherited-neighbor sentinel file modified or missing"
+fi
+# the test itself created MARKER_ROOT moments ago — remove that exact,
+# prefix-guarded mktemp result (it is intentionally NOT a cleanup-owned root)
+case "$MARKER_ROOT" in
+  "$_fixbase"/tt-recorder-neighbor.inherited-*) rm -rf -- "$MARKER_ROOT" ;;
+esac
+
+# (b) Cleanup never traverses outside the exact fixture paths: a recorder
+#     pidfile in a disposable root that is NOT the fixture (and not the
+#     neighbor) must be refused — nothing removed, nothing signaled.
+EXTRA_ROOT="$(_riso_new_root tt-recorder-selftest-extra)"
+_ALLOCATED_ROOTS+=("$EXTRA_ROOT")
+( cd "$FIXTURE_ROOT" && sleep 300 ) &
+EXTRA_DECOY_PID=$!
+_register_owned "$EXTRA_DECOY_PID"
+sleep 0.2
+printf '%s\n' "$EXTRA_DECOY_PID" > "$EXTRA_ROOT/tt-recorder.pid"
+set +e
+EXTRA_TEARDOWN_OUT="$(_teardown_recorder_pidfile "$EXTRA_ROOT/tt-recorder.pid" 2>&1)"
+EXTRA_TEARDOWN_RC=$?
+set -e
+if [ "$EXTRA_TEARDOWN_RC" -ne 0 ] && [ -f "$EXTRA_ROOT/tt-recorder.pid" ] && kill -0 "$EXTRA_DECOY_PID" 2>/dev/null; then
+  pass "out-of-fixture pidfile is refused — nothing removed, process untouched"
+else
+  fail "out-of-fixture pidfile was not refused (rc=$EXTRA_TEARDOWN_RC)"
+fi
+_stop_registered_pid "$EXTRA_DECOY_PID"
+
+# (c) The deny-and-record seam is fixture-scoped: an out-of-fixture seam
+#     value is refused — the real signal is delivered and nothing external
+#     is written.
+( cd "$FIXTURE_ROOT" && sleep 300 ) &
+SEAM_DECOY_PID=$!
+_register_owned "$SEAM_DECOY_PID"
+sleep 0.2
+_SELFTEST_SIGNAL_LOG="$EXTRA_ROOT/external-seam-log"
+_stop_registered_pid "$SEAM_DECOY_PID"
+sleep 0.3
+if ! kill -0 "$SEAM_DECOY_PID" 2>/dev/null && [ ! -f "$EXTRA_ROOT/external-seam-log" ]; then
+  pass "out-of-fixture seam path is refused — real signal delivered, no external write"
+else
+  fail "out-of-fixture seam was honored (external write or suppressed signal)"
+fi
+
+# (d) Fixture-scoped seam (deny-and-record): with the seam active a live
+#     owned child is NOT really signaled — only TERM/KILL are recorded —
+#     then, with the seam cleared, the child is really stopped.
+SEAM_LOG="$FIXTURE_ROOT/riso-signal-log.txt"
+rm -f -- "$SEAM_LOG"
+( cd "$FIXTURE_ROOT" && sleep 300 ) &
+SEAM_DECOY2_PID=$!
+_register_owned "$SEAM_DECOY2_PID"
+sleep 0.2
+_SELFTEST_SIGNAL_LOG="$SEAM_LOG"
+_stop_registered_pid "$SEAM_DECOY2_PID"
+_SELFTEST_SIGNAL_LOG=""
+if kill -0 "$SEAM_DECOY2_PID" 2>/dev/null && \
+   grep -q "signal -TERM $SEAM_DECOY2_PID" "$SEAM_LOG" 2>/dev/null && \
+   grep -q "signal -KILL $SEAM_DECOY2_PID" "$SEAM_LOG" 2>/dev/null; then
+  pass "deny-and-record: owned-child TERM+KILL recorded, no real signal delivered"
+else
+  fail "deny-and-record seam did not protect the owned child (log: $(cat "$SEAM_LOG" 2>/dev/null || true))"
+fi
+_register_owned "$SEAM_DECOY2_PID"
+_stop_registered_pid "$SEAM_DECOY2_PID"
+if ! kill -0 "$SEAM_DECOY2_PID" 2>/dev/null; then
+  pass "owned child really stopped after seam cleared (identity re-attested)"
+else
+  fail "owned child still alive after real teardown"
+fi
+
+# (e) A stale numeric PID never authorizes a signal: a registry entry whose
+#     recorded identity no longer matches the process currently at that pid
+#     (the child died and the pid was reused, or the record is corrupted)
+#     is never signaled — even though the process is alive with a matching
+#     cmdline/cwd.
+( cd "$FIXTURE_ROOT" && sleep 300 ) &
+STALE_DECOY_PID=$!
+_register_owned "$STALE_DECOY_PID"
+sleep 0.2
+# corrupt the registry entry: replace the real start token with a bogus one
+_unregister_owned "$STALE_DECOY_PID"
+OWNED_PIDS="$OWNED_PIDS $STALE_DECOY_PID:bogus-token"
+SEAM_LOG2="$FIXTURE_ROOT/riso-signal-log-2.txt"
+rm -f -- "$SEAM_LOG2"
+_SELFTEST_SIGNAL_LOG="$SEAM_LOG2"
+_stop_registered_pid "$STALE_DECOY_PID"
+_SELFTEST_SIGNAL_LOG=""
+if kill -0 "$STALE_DECOY_PID" 2>/dev/null && [ ! -s "$SEAM_LOG2" ]; then
+  pass "stale/changed registry identity never signals (nothing recorded, process alive)"
+else
+  fail "stale/changed registry identity authorized a signal"
+fi
+_register_owned "$STALE_DECOY_PID"
+_stop_registered_pid "$STALE_DECOY_PID"
+
+# (f) Detached-recorder teardown requires the SAME start identity plus the
+#     exact fixture-tool evidence before EVERY signal; a changed identity
+#     with the same cmdline/cwd evidence must be refused.
+rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
+"$TOOL" start --interval 100 > /dev/null 2>&1
+RISO_REC_PIDFILE="$TT_ROOT_VAR/recorder/tt-recorder.pid"
+RISO_REC_PID="$(cat "$RISO_REC_PIDFILE" 2>/dev/null || true)"
+sleep 0.3
+if [ -n "$RISO_REC_PID" ] && _recorder_pid_evidence "$RISO_REC_PID"; then
+  CUR_TOK="$(_proc_starttok "$RISO_REC_PID")"
+  if _recorder_identity_ok "$RISO_REC_PID" "$CUR_TOK"; then
+    pass "recorder identity gate accepts the attested start identity"
+  else
+    fail "recorder identity gate rejected the attested identity"
+  fi
+  if _recorder_identity_ok "$RISO_REC_PID" "changed-identity-token"; then
+    fail "recorder identity gate accepted a changed/reused identity"
+  else
+    pass "recorder identity gate refuses a changed identity (same cmdline/cwd evidence)"
+  fi
+  # deny-and-record teardown: TERM then KILL recorded against the SAME
+  # attested identity; the real recorder must still be alive afterwards.
+  SEAM_LOG3="$FIXTURE_ROOT/riso-signal-log-3.txt"
+  rm -f -- "$SEAM_LOG3"
+  _SELFTEST_SIGNAL_LOG="$SEAM_LOG3"
+  _recorder_teardown_pid "$RISO_REC_PID"
+  _SELFTEST_SIGNAL_LOG=""
+  if grep -q "signal -TERM $RISO_REC_PID" "$SEAM_LOG3" 2>/dev/null && \
+     grep -q "signal -KILL $RISO_REC_PID" "$SEAM_LOG3" 2>/dev/null && \
+     kill -0 "$RISO_REC_PID" 2>/dev/null; then
+    pass "deny-and-record recorder teardown recorded TERM+KILL, delivered nothing"
+  else
+    fail "deny-and-record recorder teardown did not record TERM+KILL (log: $(cat "$SEAM_LOG3" 2>/dev/null || true))"
+  fi
+  # real teardown now stops the recorder (identity re-attested per signal)
+  _teardown_recorder_pidfile "$RISO_REC_PIDFILE"
+  if ! kill -0 "$RISO_REC_PID" 2>/dev/null; then
+    pass "recorder really stopped after seam cleared (identity re-attested)"
+  else
+    fail "recorder still alive after real teardown"
+  fi
+else
+  fail "could not start fixture recorder for the identity sub-test"
+fi
+rm -rf "$TT_ROOT_VAR/recorder" 2>/dev/null || true
+
+# (g) _proc_starttok parses the start token robustly when comm contains ')'
+#     and spaces: /proc/<pid>/stat is "pid (comm) state ..." and comm may
+#     itself contain ') ' — the token must be read after the LAST ')' of
+#     the comm field. Cross-check against an independent python oracle.
+cp /bin/sleep "$FIXTURE_ROOT/weird) name sleep"
+chmod +x "$FIXTURE_ROOT/weird) name sleep"
+( cd "$FIXTURE_ROOT" && exec "$FIXTURE_ROOT/weird) name sleep" 300 ) &
+WEIRD_PID=$!
+_register_owned "$WEIRD_PID"
+sleep 0.2
+# linux-only /proc/$WEIRD_PID/comm read (MACP3 US-004): 2>/dev/null-guarded —
+# a /proc-less host or vanished pid reads nothing (comm stays empty).
+WEIRD_COMM="$(cat "/proc/$WEIRD_PID/comm" 2>/dev/null || true)"
+TOK_HARNESS="$(_proc_starttok "$WEIRD_PID")"
+TOK_ORACLE="$(python3 -c '
+import sys
+stat = open("/proc/%s/stat" % sys.argv[1]).read()
+rest = stat.rsplit(") ", 1)[1]      # after the LAST ") " — comm may contain ") "
+print(rest.split()[19])              # full-stat field 22 = starttime
+' "$WEIRD_PID" 2>/dev/null || true)"
+if [ -n "$TOK_HARNESS" ] && [ "$TOK_HARNESS" = "$TOK_ORACLE" ]; then
+  pass "_proc_starttok parses starttime after the LAST comm paren (comm='$WEIRD_COMM')"
+else
+  fail "_proc_starttok starttime ($TOK_HARNESS) != oracle ($TOK_ORACLE) for comm='$WEIRD_COMM'"
+fi
+_stop_registered_pid "$WEIRD_PID"
+
+# (h) Hostile-name cleanup registry expansion (shared scenario helper in the
+#     guards library): roots whose paths contain spaces, tabs, newlines or
+#     glob bytes must expand to exactly ONE recorded rm invocation whose argv
+#     is byte-identical to the whole owned root — never word-split/glob-
+#     expanded into different deletion targets. The expansion is exercised
+#     through the helper's unconditional recording removal stub (nothing is
+#     deleted while expansion safety is under test; the owned fixture's exit
+#     cleanup handles real removal).
+HOSTILE_PARENT="$FIXTURE_ROOT/hostile-cases"
+mkdir -p "$HOSTILE_PARENT"
+riso_case_hostile_cleanup "$HOSTILE_PARENT" $'sp ace'    "$HOSTILE_PARENT/sp"  "space"
+riso_case_hostile_cleanup "$HOSTILE_PARENT" $'tab\tbase' "$HOSTILE_PARENT/tab"  "tab"
+riso_case_hostile_cleanup "$HOSTILE_PARENT" $'nl\nbase'  "$HOSTILE_PARENT/nl"   "newline"
+riso_case_hostile_cleanup "$HOSTILE_PARENT" $'f?[o]o glob' "$HOSTILE_PARENT/fxo" "glob"
+
+# (i) Malformed/untrusted allocation responses (a successful-but-malformed
+#     fake allocator printing an out-of-base path, an outright allocation
+#     failure, a valid-looking root printed by a FAILING allocator, and a
+#     traversal lookalike passing the lexical prefix) are refused with ZERO
+#     removal calls: the real allocator is reached (reached-marker), the
+#     sentinel it named survives byte-identical and BOTH the deny-and-record
+#     removal boundary and an unconditional recording `rm` stub stay empty
+#     (even a direct rm regression cannot execute).
+riso_case_malformed_allocation "$HOSTILE_PARENT" "malformed-success" malformed
+riso_case_malformed_allocation "$HOSTILE_PARENT" "alloc-failure" fail
+riso_case_malformed_allocation "$HOSTILE_PARENT" "alloc-exit-7" badrc
+riso_case_malformed_allocation "$HOSTILE_PARENT" "traversal-lookalike" traversal
+
+# ── RISO US-001: isolation regression — neighbor + sentinel survival ────
+# The whole run above executed every harness section against the fixture
+# only. Prove the PRE-POPULATED neighboring synthetic fake-campaign tree
+# and its sentinel process survived unchanged: nothing in this harness may
+# read a checkout-derived path, kill a pidfile PID, or rm -rf a var/home
+# outside the fixture.
+echo ""
+echo "=== RISO US-001: isolation regression (neighbor sentinel survival) ==="
+
+if kill -0 "$SENTINEL_PID" 2>/dev/null; then
+  pass "isolation: neighbor sentinel process still alive (pid=$SENTINEL_PID)"
+else
+  fail "isolation: neighbor sentinel process was killed (pid=$SENTINEL_PID)"
+fi
+
+if cmp -s "$NEIGHBOR_ROOT/torture-test/var/recorder/tt-recorder.pid" "$FIXTURE_ROOT/isolation-baseline/neighbor.pidfile"; then
+  pass "isolation: neighbor recorder pidfile byte-identical (unchanged)"
+else
+  fail "isolation: neighbor recorder pidfile changed"
+fi
+
+RISO_FILES_OK=1
+for _pair in \
+  "torture-test/var/home/.tamandua/tamandua.db:isolation-baseline/neighbor-real.db" \
+  "torture-test/var/home/.tamandua/tamandua.db-wal:isolation-baseline/neighbor-real.db-wal" \
+  "torture-test/var/home-scripted/.tamandua/tamandua.db:isolation-baseline/neighbor-scripted.db" \
+  "torture-test/var/home/.tamandua/identifiable-file:isolation-baseline/neighbor-identifiable-file"; do
+  if ! cmp -s "$NEIGHBOR_ROOT/${_pair%%:*}" "$FIXTURE_ROOT/${_pair#*:}"; then
+    RISO_FILES_OK=0
+  fi
+done
+if [ "$RISO_FILES_OK" -eq 1 ]; then
+  pass "isolation: all neighbor sentinel files byte-identical (cmp)"
+else
+  fail "isolation: a neighbor sentinel file changed"
+fi
+
+# Only the sentinel may remain registered at this point — every section
+# above stopped the children it spawned (exit cleanup stops the sentinel
+# itself, identity-rechecked, and then removes the recorded roots).
+RISO_BAD_LEFT=0
+for _t in $OWNED_PIDS; do
+  case "$_t" in
+    "$SENTINEL_PID":*) ;;
+    *) RISO_BAD_LEFT=$((RISO_BAD_LEFT + 1)) ;;
+  esac
+done
+if [ "$RISO_BAD_LEFT" -eq 0 ]; then
+  pass "isolation: only the sentinel remains registered (all section-owned children stopped)"
+else
+  fail "isolation: $RISO_BAD_LEFT unexpected registered child/ren remain"
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""

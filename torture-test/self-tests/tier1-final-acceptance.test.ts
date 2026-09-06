@@ -275,6 +275,23 @@ const allowed = [
   // scenarios/w4.49/) are never touched by MACP3 — only allowlisted.
   "torture-test/bin/tt-recorder",
   "torture-test/bin/tt-recorder.test.sh",
+  // RISO (US-001): the recorder self-test isolation repair adds the shared
+  // ownership/fixture guard library sourced by bin/tt-recorder.test.sh, the
+  // PURE pre-execution guard-only proof (bin/tt-recorder-guard-proof
+  // .test.sh — hostile-name cleanup-registry expansion, malformed-
+  // allocation zero-removal and pidfile/identity gates with all destructive
+  // operations denied/recorded) and the standalone integration regression
+  // (bin/tt-recorder-isolation.test.sh) that gates the repair BEFORE the
+  // full legacy harness may run — all under torture-test/bin, the same
+  // authoring surface as the harness itself. RISO (US-002) adds the focused
+  // port-isolation regression (bin/tt-recorder-port-isolation.test.sh —
+  // allowed contained random-port listener + excluded synthetic-pid
+  // production-port observation with a fake-lsof shim, plus the
+  // reintroduction-guard trip proofs) to that same surface.
+  "torture-test/bin/tt-recorder-selftest-guards.sh",
+  "torture-test/bin/tt-recorder-guard-proof.test.sh",
+  "torture-test/bin/tt-recorder-isolation.test.sh",
+  "torture-test/bin/tt-recorder-port-isolation.test.sh",
   "torture-test/bin/tt-daemon-up",
   "torture-test/bin/tt-daemon-up.test.sh",
   // MACP5 (US-004): bin/tt-provision-home's audited-content rewrite is now
