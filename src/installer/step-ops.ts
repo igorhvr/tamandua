@@ -3201,9 +3201,16 @@ export function validateExpects(output: string, expects: string): string | null 
 export function finalizeDrainingPause(runId: string): void {
   const db = getDb();
   const run = db
-    .prepare("SELECT scheduling_status, workflow_id FROM runs WHERE id = ?")
-    .get(runId) as { scheduling_status: string; workflow_id: string } | undefined;
+    .prepare("SELECT status, scheduling_status, workflow_id FROM runs WHERE id = ?")
+    .get(runId) as { status: string; scheduling_status: string; workflow_id: string } | undefined;
   if (!run || run.scheduling_status !== "draining_pause") return;
+
+  // DRVP terminal guard: a completed/failed/canceled run is never flipped to
+  // paused by any drain-finalization call. Terminal transitions normally wipe
+  // scheduling_status via scheduleRunCronTeardown before finalize runs, but
+  // the drain finalizer is invoked from many completion paths — this guard
+  // keeps terminal outcomes safe regardless of call ordering.
+  if (run.status === "completed" || run.status === "failed" || run.status === "canceled") return;
 
   const runningSteps = db
     .prepare("SELECT type, current_story_id, loop_config FROM steps WHERE run_id = ? AND status = 'running'")
@@ -3767,7 +3774,32 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     const lcVerifyEach = lc.verifyEach ?? lc.verify_each;
     const lcVerifyStep = lc.verifyStep ?? lc.verify_step;
     if (lcVerifyEach && lcVerifyStep === step.step_id) {
-      const verifyResult = handleVerifyEachCompletion(step, loopStepRow.id, output, context);
+      // VSRP: the verifier's STATUS is an independent single-line verdict
+      // control. Extract the verdict from the RAW output (never the
+      // multi-line context merge that parseOutputKeyValues builds when
+      // unrecognized headings such as "VERIFIED-OK:" or "ISSUES (...):"
+      // follow the STATUS line). Validation and routing must agree on ONE
+      // unambiguous 'done' (approve) or 'retry' (story reset). Missing,
+      // invalid, or conflicting verdicts are rejected through the existing
+      // bounded step-retry handling — never a silent story approval
+      // (KHYG incident 2026-09-06: standalone 'STATUS: retry' followed by
+      // VERIFIED-OK:/ISSUES (...) headings was treated as approval).
+      const verdict = extractVerifierVerdict(output);
+      if ("error" in verdict) {
+        return rejectVerifyEachCompletionForInvalidVerdict(step, verdict.error);
+      }
+      const verifyResult = handleVerifyEachCompletion(step, loopStepRow.id, output, context, verdict.verdict);
+      // DRVP (R4a drain-verify-pause): a successful verify_each completion can
+      // end the drain's last in-flight work. handleVerifyEachCompletion →
+      // checkLoopContinuation → advancePipeline finalize the drain pause only
+      // on their failure/terminal paths; when the final story verifies and the
+      // pipeline promotes a downstream waiting step (or re-pends the loop for
+      // a story retry), the run would otherwise stay running/draining_pause
+      // with zero running steps and a pending step the drain never dispatches.
+      // finalizeDrainingPause is idempotent + self-guarding (draining_pause
+      // only, terminal runs excluded, in-flight steps excluded) — same shape
+      // as the single-step done branch below.
+      finalizeDrainingPause(step.run_id);
       return { status: verifyResult.runCompleted ? "completed" : "advanced" };
     }
   }
@@ -4322,16 +4354,118 @@ function routeDeceptionAuditVerdict(
 }
 
 /**
+ * VSRP: verifier verdict extraction for the verify_each completion path.
+ *
+ * The verifier's STATUS line is an INDEPENDENT single-line control field:
+ * validation (validateExpects' honest-verdict shortcut and the step's expects
+ * regex) and routing must agree on one unambiguous verdict read from an
+ * anchored full-line 'STATUS: <variant>' in the RAW output — never from the
+ * context['status'] merge, which parseOutputKeyValues pollutes by appending
+ * unrecognized continuation headings (e.g. 'VERIFIED-OK:' or 'ISSUES (...):')
+ * to the pending STATUS value (KHYG incident 2026-09-06).
+ *
+ * Verifier verdicts are exactly 'done' (approve: story.verified + normal
+ * continuation) and 'retry' (story retry/reset within the existing story
+ * retry budget). A missing STATUS line, an invalid/unknown variant, or
+ * conflicting verdicts (multiple differing full-line STATUS values in one
+ * output) yield { error } so the caller can reject through the existing
+ * bounded step-retry handling instead of silently approving a story.
+ */
+type VerifierVerdict = "done" | "retry";
+
+function extractVerifierVerdict(output: string): { verdict: VerifierVerdict } | { error: string } {
+  const variants: VerifierVerdict[] = [];
+  for (const rawLine of output.split("\n")) {
+    // Tolerate CRLF line endings from Windows-authored reports.
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const match = line.match(/^STATUS:[ \t]*([A-Za-z0-9_]+)[ \t]*$/);
+    if (match) {
+      const variant = match[1]!.toLowerCase();
+      if (variant !== "done" && variant !== "retry") {
+        return {
+          error: `invalid verifier STATUS verdict "${variant}" — the full-line STATUS control must be exactly 'done' or 'retry'`,
+        };
+      }
+      variants.push(variant as VerifierVerdict);
+    }
+  }
+
+  if (variants.length === 0) {
+    return {
+      error:
+        "missing verifier STATUS verdict — the output must carry exactly one full-line 'STATUS: done' or 'STATUS: retry' control field",
+    };
+  }
+
+  const distinct = [...new Set(variants)];
+  if (distinct.length > 1) {
+    return {
+      error: `conflicting verifier STATUS verdicts (${distinct.join(", ")}) — the output must carry exactly one unambiguous full-line 'STATUS: done' or 'STATUS: retry' control field`,
+    };
+  }
+
+  return { verdict: distinct[0]! };
+}
+
+/**
+ * Bounded rejection for a verify_each completion whose STATUS verdict is
+ * missing, invalid, or conflicting. The verify step itself is re-pended with
+ * the reason as retry feedback, bounded by the step's own max_retries; when
+ * retries exhaust, the run fails. The story is NEVER verified or advanced by
+ * an unusable verdict (VSRP), and no lifecycle event claims otherwise.
+ */
+function rejectVerifyEachCompletionForInvalidVerdict(
+  verifyStep: { id: string; run_id: string; step_id: string },
+  reason: string,
+): { status: string; detail?: string } {
+  const db = getDb();
+  const meta = db.prepare(
+    "SELECT retry_count, max_retries FROM steps WHERE id = ?",
+  ).get(verifyStep.id) as { retry_count: number; max_retries: number } | undefined;
+  const newRetry = (meta?.retry_count ?? 0) + 1;
+  const maxRetries = meta?.max_retries ?? 0;
+  const wfId = getWorkflowId(verifyStep.run_id);
+  const errorDetail =
+    `Verifier verdict rejected: ${reason}. The story was NOT verified — resubmit with exactly one full-line "STATUS: done" or "STATUS: retry" verdict (retry ${newRetry}/${maxRetries}).`;
+
+  if (newRetry > maxRetries) {
+    db.prepare(
+      "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?",
+    ).run(errorDetail, newRetry, verifyStep.id);
+    db.prepare(
+      "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+    ).run(verifyStep.run_id);
+    emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: verifyStep.run_id, workflowId: wfId, stepId: verifyStep.step_id, detail: errorDetail });
+    emitRunTerminalEvent({ event: "run.failed", runId: verifyStep.run_id, workflowId: wfId, detail: "Verifier STATUS verdict missing/invalid/conflicting and retries exhausted" });
+    scheduleRunCronTeardown(verifyStep.run_id);
+    finalizeDrainingPause(verifyStep.run_id);
+    return { status: "failed", detail: errorDetail };
+  }
+
+  db.prepare(
+    "UPDATE steps SET status = 'pending', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?",
+  ).run(errorDetail, newRetry, verifyStep.id);
+  emitEvent({ ts: new Date().toISOString(), event: "step.retry", runId: verifyStep.run_id, workflowId: wfId, stepId: verifyStep.step_id, detail: errorDetail });
+  logger.warn(errorDetail, { runId: verifyStep.run_id, stepId: verifyStep.step_id });
+  finalizeDrainingPause(verifyStep.run_id);
+  return { status: "retrying", detail: errorDetail };
+}
+
+/**
  * Handle verify-each completion: pass or fail the story.
+ *
+ * `verdict` is the caller-extracted single-line STATUS verdict ('done' or
+ * 'retry') from the RAW output (VSRP) — never the polluted context['status']
+ * multi-line merge.
  */
 function handleVerifyEachCompletion(
   verifyStep: { id: string; run_id: string; step_id: string; step_index: number },
   loopStepId: string,
   output: string,
-  context: Record<string, string>
+  context: Record<string, string>,
+  verdict: VerifierVerdict
 ): { advanced: boolean; runCompleted: boolean } {
   const db = getDb();
-  const status = context["status"]?.toLowerCase();
 
   // Reset verify step to waiting for next use, with a fresh retry budget.
   // Each story gets its own verify retry budget — retry_count is story-scoped.
@@ -4339,11 +4473,11 @@ function handleVerifyEachCompletion(
     "UPDATE steps SET status = 'waiting', retry_count = 0, output = ?, updated_at = datetime('now') WHERE id = ?"
   ).run(output, verifyStep.id);
 
-  if (status !== "retry") {
+  if (verdict !== "retry") {
     emitEvent({ ts: new Date().toISOString(), event: "story.verified", runId: verifyStep.run_id, workflowId: getWorkflowId(verifyStep.run_id), stepId: verifyStep.step_id });
   }
 
-  if (status === "retry") {
+  if (verdict === "retry") {
     const lastDoneStory = db.prepare(
       "SELECT id, retry_count, max_retries FROM stories WHERE run_id = ? AND status = 'done' ORDER BY updated_at DESC LIMIT 1"
     ).get(verifyStep.run_id) as { id: string; retry_count: number; max_retries: number } | undefined;
