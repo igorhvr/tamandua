@@ -1,5 +1,32 @@
 # SOGI: bounded scenario-cleanup identity preflight
 
+## Current launch instructions — 2026-09-06 UTC
+
+Igor explicitly requested continuation of all autonomous/unblocked torture
+work. The earlier incident holds mentioned below were superseded by the
+approved native signal-isolation rollout; SOGI's source and proof boundaries
+are unchanged. This task does NOT depend on product runs 914 or 915. The
+coordinator launches it on Linux with dsh and native isolation enabled.
+
+Use /home/igorhvr/idm/tamandua/bin/tamandua for live step protocol. Worktree
+binaries may touch only isolated test state. Keep TEST_CMD exactly npm test.
+All full npm, MCP/get-ready, and fast e2e gates use the EXISTING shared lock:
+/home/igorhvr/idm/tamandua/torture-test/var/review-logs/suite-cleanup-prefix-5nLG3O/linux-npm.lock
+Wrap the normal tamandua-test command with flock; never recreate the lock.
+Allow at least 30 minutes for a full gate and additional time while queued;
+do not mistake waiting for the lock for a hung test or kill its owner.
+Commit first and freeze the tree through queueing/execution. Retain full logs.
+For isolated npm use the existing TAMANDUA_HERMES_BINARY=/usr/bin/false seam;
+do not fix the separately pending HTPN product-test issue in this run.
+
+The current live verifier needs standalone STATUS: done or STATUS: retry
+followed by simple VERIFIED: / ISSUES: keys. Do not annotate STATUS or use
+hyphenated report keys. Product VSRP/DRVP/TZPI/TIME/RCOB fixes are out of scope.
+No full scenario battery or real child/group experiment before independent
+coordinator review of the committed recording gate. The new gate may spawn
+an isolated Bash interpreter with ALL dangerous operations recorded; that
+does not authorize real cleanup experiments. Normal isolated npm is allowed.
+
 ## Authority and launch boundary
 
 Beads `tamandua-6sy.5.1` is the durable task and acceptance record. This is

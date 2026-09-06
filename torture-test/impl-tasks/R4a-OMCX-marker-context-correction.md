@@ -1,5 +1,35 @@
 # R4a independent review: OMCX shared marker-context correction
 
+## Current normal-resume correction — 2026-09-06 UTC
+
+The approved native-isolation rollout superseded the earlier safety hold.
+R4a run 80049f1f-cd69-4835-a21a-32da90b13ca4 subsequently failed normally
+at 2026-09-06T05:24:21Z with US-006 failed and the other 19 stories done.
+Its clean worktree still contains 119a4827 and the ONE unresolved `var of`
+binding regression below. No replacement run or reimplementation is needed.
+The coordinator may use normal workflow resume on the current live CLI,
+whose already-approved YSE behavior requeues the failed story. Do not edit
+DB rows, retry counters, or reset any unrelated completed story yourself.
+
+Read THIS current task from the origin checkout before correcting US-006:
+/home/igorhvr/idm/tamandua/torture-test/impl-tasks/R4a-OMCX-marker-context-correction.md
+Keep this one binding-role correction and its controls in the existing
+focused O8 gate. SGRD/US-014 is already independently green; historical
+instructions saying it is pending are superseded. Preserve all old evidence.
+Do not add speculative grammar cases, a new parser dependency, or stories.
+
+Live step CLI: /home/igorhvr/idm/tamandua/bin/tamandua. Never open live
+schema-9 state using this old worktree's binaries. Native isolation stays on.
+Standalone STATUS: done/retry with simple VERIFIED: / ISSUES: fields for
+the verifier; integration tester remains done-only and must normal-step-fail
+if its gate is red. Keep exact TEST_CMD: npm test and normal ledger gates.
+Full npm uses the existing shared flock path below, at least 30-minute
+command budget plus queue time, committed frozen tree and complete logs.
+Use TAMANDUA_HERMES_BINARY=/usr/bin/false only in isolated test environments.
+No live update/restart, remote push, broad kills, ad-hoc removal, or product
+changes. Full combined torture/scenario acceptance remains coordinator-owned
+and waits for SOGI/RJSO safety preflights; no broad extra battery in US-006.
+
 ## Review of fc303847: preserve a binding actually named `of` — 2026-09-05T06:17Z
 
 The latest committed correction passes ALL three earlier corpora (8, 10,
