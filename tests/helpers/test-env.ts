@@ -126,6 +126,23 @@ export function createTempHome(prefix?: string): TempHome {
   return { root, homeDir, tamanduaDir };
 }
 
+/**
+ * Read-only accessor for the exact canonical temp roots owned by the
+ * current invocation (every root THIS process registered via
+ * createTempHome, in no particular order).
+ *
+ * Used by the invocation-ownership cleanup decision
+ * (tests/helpers/invocation-owned-cleanup.ts): an after hook must only
+ * signal a leaked survivor whose current ownership evidence points exactly
+ * inside one of these roots — never a shared-prefix/substring match that
+ * would also select a concurrent invocation's roots.
+ *
+ * Returns a fresh copy each call so callers cannot mutate the registry.
+ */
+export function ownedTempRoots(): string[] {
+  return [..._cleanupDirs];
+}
+
 const BASE_ENV_KEYS = [
   "PATH",
   "PATHEXT",
@@ -141,6 +158,11 @@ const BASE_ENV_KEYS = [
   "LANG",
   "LC_ALL",
   "TERM",
+  // TZ passes through so test children (CLI daemons, standalone
+  // MCP/dashboard, scripts) inherit the invocation's timezone instead of
+  // silently defaulting to UTC or the host zone. No zone value is forced
+  // here — ambient TZ is preserved only when the invoker set one.
+  "TZ",
   "SSH_AUTH_SOCK",
   "GIT_SSH_COMMAND",
   "GIT_CONFIG_GLOBAL",

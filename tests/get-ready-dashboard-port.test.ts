@@ -29,6 +29,7 @@ import path from "node:path";
 import { spawn, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cleanChildEnv, createTempHome, reservePortHandle } from "./helpers/test-env.ts";
+import { sweepInvocationOwnedLeakedSurvivors } from "./helpers/invocation-owned-cleanup.ts";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import type { PortHandle } from "./helpers/test-env.ts";
 
@@ -164,7 +165,13 @@ async function teardown(cliEnv: Record<string, string>, tempEnv: TempEnv, cleanu
 
 describe("tamandua get-ready TAMANDUA_DASHBOARD_PORT", () => {
   // Belt-and-suspenders: kill any leaked daemon/dashboard/MCP orphans from a
-  // hard failure that skipped the per-test finally cleanup.
+  // hard failure that skipped the per-test finally cleanup. Only survivors
+  // whose CURRENT ownership evidence (HOME on linux, open log fds on darwin)
+  // points EXACTLY inside a temp root created by THIS invocation are
+  // signalled — the kill decision is delegated to the invocation-ownership
+  // helper (tests/helpers/invocation-owned-cleanup.ts). A shared-prefix
+  // match would also select a concurrent invocation's survivors (see
+  // US-002), so no prefix/substring check happens here anymore.
   after(() => {
     try {
       const pids = execSync(
@@ -175,31 +182,8 @@ describe("tamandua get-ready TAMANDUA_DASHBOARD_PORT", () => {
         .split("\n")
         .filter(Boolean);
 
-      for (const pid of pids) {
-        try {
-          // Only kill processes whose HOME env (read from the Linux environ
-          // pseudo-file) or open log fds reference this test's temp prefix.
-          // macOS hides other processes' envs, but services keep their log fd
-          // open under the temp home, which lsof reports.
-          let belongsToTest = false;
-          if (process.platform === "linux") {
-            const env = execSync(
-              `cat /proc/${pid}/environ 2>/dev/null | tr '\\0' '\\n' | grep '^HOME='`,
-              { encoding: "utf8" },
-            );
-            belongsToTest = env.includes(TEST_TMP_PREFIX);
-          } else {
-            const fds = execSync(`lsof -p ${pid} -Fn 2>/dev/null || true`, {
-              encoding: "utf8",
-            });
-            belongsToTest = fds.includes(TEST_TMP_PREFIX);
-          }
-          if (belongsToTest) {
-            process.kill(Number(pid), "SIGKILL");
-          }
-        } catch {
-          // Process may have exited between pgrep and the evidence read
-        }
+      if (pids.length > 0) {
+        sweepInvocationOwnedLeakedSurvivors(pids);
       }
     } catch {
       // pgrep may fail if no processes match — that's fine

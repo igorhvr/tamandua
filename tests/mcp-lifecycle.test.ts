@@ -18,6 +18,7 @@ import {
   reservePortHandles,
   reservePortHandle,
 } from "./helpers/test-env.ts";
+import { sweepInvocationOwnedLeakedSurvivors } from "./helpers/invocation-owned-cleanup.ts";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { spawn, execSync } from "node:child_process";
@@ -252,7 +253,13 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
   after(() => {
     // Belt-and-suspenders: kill any leaked mcp-standalone/daemon orphans
     // that survived because a prior test run was SIGKILL'd before its
-    // finally block could execute.
+    // finally block could execute. Only survivors whose CURRENT ownership
+    // evidence (HOME on linux, open log fds on darwin) points EXACTLY
+    // inside a temp root created by THIS invocation are signalled — the
+    // kill decision is delegated to the invocation-ownership helper
+    // (tests/helpers/invocation-owned-cleanup.ts). A shared-prefix match
+    // would also select a concurrent invocation's survivors (see US-002),
+    // so no prefix/substring check happens here anymore.
     try {
       const pids = execSync(
         "pgrep -f 'mcp-standalone\\.js|daemon\\.js'",
@@ -262,36 +269,12 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
         .split("\n")
         .filter(Boolean);
 
-      for (const pid of pids) {
-        try {
-          // Only kill processes bound to a test temp dir. On Linux the
-          // HOME= env entry says so; macOS hides other processes' envs,
-          // but the services keep their log fd open under the temp home,
-          // which lsof reports.
-          let belongsToTest = false;
-          if (process.platform === "linux") {
-            const env = execSync(
-              `cat /proc/${pid}/environ 2>/dev/null | tr '\\0' '\\n' | grep '^HOME='`,
-              { encoding: "utf8" },
-            );
-            belongsToTest = env.includes("tamandua-mcp-lifecycle");
-          } else {
-            const fds = execSync(`lsof -p ${pid} -Fn 2>/dev/null || true`, {
-              encoding: "utf8",
-            });
-            belongsToTest = fds.includes("tamandua-mcp-lifecycle");
-          }
-          if (belongsToTest) {
-            process.kill(Number(pid), "SIGKILL");
-          }
-        } catch {
-          // Process may have exited between pgrep and the evidence read
-        }
+      if (pids.length > 0) {
+        sweepInvocationOwnedLeakedSurvivors(pids);
       }
     } catch {
       // pgrep may fail if no processes match — that's fine
     }
-
   });
 
   // ────────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ import http from "node:http";
 import { tamanduaTempRoot } from "../../src/lib/temp-dir.ts";
 import {
   createTempHome,
+  ownedTempRoots,
   reservePortHandle,
   reservePortHandles,
   withReservedPorts,
@@ -192,6 +193,35 @@ describe("createTempHome", () => {
     const testFile = `${capturedRoot}/test-file`;
     fs.writeFileSync(testFile, "test content");
     assert.ok(fs.existsSync(testFile), "test file should exist");
+  });
+
+  it("ownedTempRoots() reports every root this invocation registered (read-only snapshot)", () => {
+    const before = ownedTempRoots();
+    const th = createTempHome("tamandua-owned-roots-");
+    const after = ownedTempRoots();
+
+    assert.ok(
+      after.includes(th.root),
+      "the newly created root must be registered as owned by this invocation",
+    );
+    assert.equal(
+      after.length,
+      before.length + 1,
+      "exactly one new owned root should be registered",
+    );
+
+    // The accessor returns a fresh copy: caller mutation must not corrupt
+    // the module-level registry used by process-exit cleanup and by the
+    // invocation-ownership cleanup decision.
+    after.length = 0;
+    assert.ok(
+      ownedTempRoots().includes(th.root),
+      "mutating the returned snapshot must not affect the registry",
+    );
+    assert.ok(
+      ownedTempRoots().every((root) => typeof root === "string" && root.length > 0),
+      "owned roots are non-empty canonical paths",
+    );
   });
 });
 
