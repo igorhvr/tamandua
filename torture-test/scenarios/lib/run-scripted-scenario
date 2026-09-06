@@ -136,6 +136,9 @@ COMMAND_STARTTIME=""
 COMMAND_GROUP_PROVEN=0
 COMMAND_READY_FILE=""
 COMMAND_RELEASE_FILE=""
+COMMAND_ANCHOR_PID=""
+COMMAND_ANCHOR_STARTTIME=""
+COMMAND_ANCHOR_PID_FILE=""
 DAEMON_TOUCHED=0
 
 process_starttime() {
@@ -180,21 +183,53 @@ process_group() {
   printf '%s\n' "$pgid"
 }
 
+# group_identity_authorized <leader_pid> — returns 0 ONLY when CURRENT,
+# readable identity evidence proves the saved dedicated process group is
+# still scenario-owned at this instant:
+#   * the live leader with an unchanged start time (the historical control),
+#     OR
+#   * the live disowned group identity anchor (spawned before release — see
+#     scenario-group-anchor.sh) with an unchanged start time, which stays a
+#     member of the group and outlives a fast-exiting leader.
+# Unknown/unreadable identity and changed identity return 1: a stale saved
+# group id alone is never proof of ownership (SOGI).
+group_identity_authorized() {
+  local leader_pid="$1" current anchor_current
+  current="$(process_starttime "$leader_pid" 2>/dev/null || true)"
+  if [ -n "$COMMAND_STARTTIME" ] && [ "$current" = "$COMMAND_STARTTIME" ]; then
+    return 0
+  fi
+  if [ -n "$COMMAND_ANCHOR_PID" ] && [ -n "$COMMAND_ANCHOR_STARTTIME" ]; then
+    anchor_current="$(process_starttime "$COMMAND_ANCHOR_PID" 2>/dev/null || true)"
+    if [ "$anchor_current" = "$COMMAND_ANCHOR_STARTTIME" ]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 stop_owned_command() {
   [ -n "$COMMAND_PID" ] && [ "$COMMAND_GROUP_PROVEN" = "1" ] || return 0
-  local current leader_pid="${COMMAND_LEADER_PID:-$COMMAND_PID}"
-  current="$(process_starttime "$leader_pid" 2>/dev/null || true)"
-  # Once the dedicated process group is proven while its leader is alive, it
-  # remains scenario-owned even if that leader exits before its descendants.
-  # A live leader with a changed start time means PID/PGID reuse, so fail closed.
-  if [ -z "$current" ] || [ "$current" = "$COMMAND_STARTTIME" ]; then
+  local leader_pid="${COMMAND_LEADER_PID:-$COMMAND_PID}"
+  # SOGI: EVERY group signal — the TERM round AND the later KILL escalation —
+  # requires current readable identity evidence authorizing that exact target
+  # (group_identity_authorized above). The old branch that treated an EMPTY
+  # current start time as permission to signal the saved group is gone: an
+  # unreadable or changed identity refuses the signal. Owned-survivor cleanup
+  # after a fast leader exit stays achievable through the disowned group
+  # anchor, whose identity was recorded before release — see the anchor arm of
+  # group_identity_authorized.
+  if group_identity_authorized "$leader_pid"; then
     kill -TERM -- "-$leader_pid" 2>/dev/null || true
     local attempt
     for attempt in 1 2 3 4 5 6 7 8 9 10; do
       kill -0 -- "-$leader_pid" 2>/dev/null || break
       sleep 0.05
     done
-    kill -KILL -- "-$leader_pid" 2>/dev/null || true
+    # The KILL escalation is itself a group signal — re-prove before it.
+    if group_identity_authorized "$leader_pid"; then
+      kill -KILL -- "-$leader_pid" 2>/dev/null || true
+    fi
     wait "$COMMAND_PID" 2>/dev/null || true
   fi
   COMMAND_PID=""
@@ -318,6 +353,7 @@ BEHAVIORS_FILE="$INVOCATION_DIR/behaviors.json"
 COMMAND_READY_FILE="$INVOCATION_DIR/command-group-ready"
 COMMAND_RELEASE_FILE="$INVOCATION_DIR/command-group-release"
 COMMAND_LEADER_PID_FILE="$INVOCATION_DIR/command-group-leader-pid"
+COMMAND_ANCHOR_PID_FILE="$INVOCATION_DIR/command-group-anchor-pid"
 mkdir -p "$COUNTER_DIR"
 
 # Resolve child state without sourcing the scripted env into this shell.
@@ -428,6 +464,13 @@ printf '%s\n' "$DAEMON_STATUS" | grep -q 'STATUS: RUNNING' \
   # (covers a tampered env script or a direct invocation outside the
   # harness); the same guard is also sourced by every scenarios/*/run.sh.
   export TT_SCENARIO_CONTAINMENT_GUARD="$LIB_DIR/scenario-containment-guard.sh"
+  # SOGI: hand the pre-exec leader the disowned in-group identity anchor
+  # (scenario-group-anchor.sh) plus this shell's bash binary, so the leader
+  # can spawn the anchor as a member of the dedicated group BEFORE release.
+  # Cleanup later re-proves group ownership through that anchor when the
+  # leader has already fast-exited (see group_identity_authorized).
+  export BASH_BIN
+  export TT_SCENARIO_ANCHOR="$LIB_DIR/scenario-group-anchor.sh"
   # Publish readiness from inside the dedicated session, then wait until the
   # parent has proven process-group ownership before executing scenario code.
   # Portable session-leader spawn (MACP4 US-003): macOS ships no util-linux
@@ -443,11 +486,18 @@ printf '%s\n' "$DAEMON_STATUS" | grep -q 'STATUS: RUNNING' \
       ready_file=$1
       release_file=$2
       command_path=$3
+      anchor_pid_file=$4
       : >"$ready_file"
+      # SOGI: spawn the disowned in-group identity anchor (double-fork — the
+      # intermediate subshell exits at once, so the scenario command never
+      # sees the anchor as a child and a bare wait cannot block on it). The
+      # anchor publishes its pid, waits boundedly for this release file, then
+      # holds the dedicated group until the cleanup group KILL reaps it.
+      ( "$BASH_BIN" "$TT_SCENARIO_ANCHOR" "$anchor_pid_file" "$release_file" & ) &
       while [ ! -f "$release_file" ]; do sleep 0.01; done
       export TT_SCENARIO_COMMAND_GROUP_PROVEN=1
       exec "$command_path"
-    ' scripted-scenario-command "$COMMAND_READY_FILE" "$COMMAND_RELEASE_FILE" "$COMMAND_PATH"
+    ' scripted-scenario-command "$COMMAND_READY_FILE" "$COMMAND_RELEASE_FILE" "$COMMAND_PATH" "$COMMAND_ANCHOR_PID_FILE"
 ) &
 COMMAND_PID=$!
 # The direct child is now the node wrapper; the REAL session/group leader
@@ -483,6 +533,33 @@ done
 if [ "$COMMAND_GROUP_PROVEN" != "1" ]; then
   stop_unreleased_command
   fail "could not prove the scenario command process group before release"
+fi
+# SOGI: before release, prove the disowned in-group identity anchor — its
+# published pid, a CURRENT readable start time, and its membership in the
+# dedicated group (pgid == leader pid). The recorded identity is what
+# authorizes group signals at cleanup when the leader has already exited.
+COMMAND_ANCHOR_PID=""
+COMMAND_ANCHOR_STARTTIME=""
+for _attempt in $(seq 1 500); do
+  if [ -s "$COMMAND_ANCHOR_PID_FILE" ]; then
+    COMMAND_ANCHOR_PID="$(cat "$COMMAND_ANCHOR_PID_FILE" 2>/dev/null || true)"
+    case "$COMMAND_ANCHOR_PID" in
+      ''|*[!0-9]*) COMMAND_ANCHOR_PID="" ;;
+    esac
+    if [ -n "$COMMAND_ANCHOR_PID" ]; then
+      COMMAND_ANCHOR_STARTTIME="$(process_starttime "$COMMAND_ANCHOR_PID" 2>/dev/null || true)"
+      if [ -n "$COMMAND_ANCHOR_STARTTIME" ] \
+         && [ "$(process_group "$COMMAND_ANCHOR_PID" 2>/dev/null || true)" = "$COMMAND_LEADER_PID" ]; then
+        break
+      fi
+    fi
+  fi
+  kill -0 "$COMMAND_PID" 2>/dev/null || break
+  sleep 0.01
+done
+if [ -z "$COMMAND_ANCHOR_PID" ] || [ -z "$COMMAND_ANCHOR_STARTTIME" ]; then
+  stop_unreleased_command
+  fail "could not prove the scenario command group identity anchor before release"
 fi
 : >"$COMMAND_RELEASE_FILE"
 wait "$COMMAND_PID"
