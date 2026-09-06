@@ -1,0 +1,6 @@
+
+> tamandua@0.1.0 check-test-syntax
+> tsx scripts/syntax-check-tests.ts
+
+Syntax gate passed: 265 test file(s) parsed cleanly
+check-test-syntax exit: 0

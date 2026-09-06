@@ -1,0 +1,8 @@
+
+> tamandua@0.1.0 build
+> tsc -p tsconfig.json && cp src/server/index.html dist/server/index.html && cp src/server/kanban.html dist/server/kanban.html && chmod +x dist/cli/cli.js && chmod +x dist/server/mcp-standalone.js && chmod +x dist/server/dashboard-standalone.js && chmod +x dist/suite/shim.js && node scripts/inject-version.js && node scripts/build-native.mjs && rm -rf dist/www && cp -r www dist/www
+
+Build version: 20260906T203744Z_6fa9c58d6959a05d17e750e47ba22592c32b958e
+Injected version into dist/cli/commands/standalone.js
+{"backend":"landlock","artifact":"landlock-helper","path":"dist/native/landlock-helper"}
+build exit: 0

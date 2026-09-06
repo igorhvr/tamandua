@@ -18,6 +18,26 @@
 //     cleanup removes only those exact paths/pids (no inherited cleanup
 //     roots, no stale-PID signals, no broad/name-pattern kills, no deletion
 //     of pre-existing state).
+//   * Every owned child argv carries a fresh per-invocation launch token
+//     (the fixture's mkdtemp suffix, never a fixed marker that recurs across
+//     invocations), and the launch identity (ps cmdline + birth start) is
+//     captured at spawn on the exact handle this invocation created. Every
+//     cleanup signal revalidates the CURRENT identity against that captured
+//     evidence first — a changed/stale/foreign/unreadable/reused pid refuses
+//     the signal and preserves evidence (US-002 fixed ownership semantics).
+//   * The fixture recorder is owned the same way (US-003): its launch
+//     identity (ps cmdline + birth start) is captured at start for the exact
+//     pid this invocation's `start` wrote to the fixture pidfile, with a
+//     fresh per-invocation token riding the start-subprocess env and the
+//     fixture-exact pidfile path. Every recorder cleanup decision (normal
+//     stop pre-check, startup-error cleanup, finally leftover cleanup)
+//     revalidates the CURRENT identity — pidfile content, liveness, cmdline
+//     and birth start — before EACH signal (TERM, then again before the KILL
+//     escalation); a stale/foreign/changed/unreadable/unproven recorder is
+//     never signaled and its evidence is preserved. The recorder's own `stop`
+//     subcommand stays byte-identical (its runtime semantics are out of
+//     scope; this file only guards when it may be invoked and performs its
+//     own guarded direct stop in the finally).
 //   * Discovery boundary is the recorder's own (unchanged) scope: a process
 //     is in scope when its procfs cwd symlink resolves under
 //     */torture-test/var* or its argv contains the literal torture-test/var.
@@ -126,6 +146,13 @@ function psCommand(pid: number): string {
   return run(["ps", "-p", String(pid), "-o", "command="], { timeoutMs: 5_000 }).stdout;
 }
 
+/** ps start time of an owned pid — the launch-time birth identity captured
+ *  at spawn and revalidated before every cleanup signal (a reused pid gets a
+ *  new start time). Empty when the pid is already gone or unreadable. */
+function psStart(pid: number): string {
+  return run(["ps", "-p", String(pid), "-o", "lstart="], { timeoutMs: 5_000 }).stdout;
+}
+
 /** Fresh hermetic fixture with the repo recorder copied to
  *  <root>/torture-test/bin/tt-recorder (its computed TT_ROOT therefore lands
  *  under <root>/torture-test/var). Returns the root, tool path, and the
@@ -148,21 +175,75 @@ const PERSIST_SCRIPT = "trap 'exit 0' TERM INT; while :; do sleep 1; done";
 
 interface OwnedChild {
   pid: number;
-  argv: string[]; // the exact exec argv (["bash","-c",PERSIST_SCRIPT,...tail])
+  argv: string[]; // the exact exec argv (["bash","-c",PERSIST_SCRIPT, token, ...argvTail])
   stderr: string;
+  // Launch identity evidence captured at spawn time for the handle this
+  // invocation ACTUALLY created (ps cmdline + birth start, read right after
+  // the child was first seen alive). Cleanup revalidates the CURRENT
+  // identity against these before EVERY signal; "" means the evidence was
+  // never captured (the child died before capture) — such a handle can never
+  // authorize a signal.
+  launchCmdline: string; // trimmed `ps -o command=` of the launched argv
+  launchStart: string; // trimmed `ps -o lstart=` birth identity
+}
+
+/** Fresh per-invocation launch token for owned children: the fixture's
+ *  mkdtemp suffix, unique to THIS invocation, so the child argv carries an
+ *  exact binding to the fresh fixture that spawned it — never a fixed marker
+ *  that recurs across invocations. */
+function launchToken(fixtureRoot: string): string {
+  return path.basename(fixtureRoot);
+}
+
+/** One synchronized identity read of an owned pid: liveness + ps command
+ *  line + ps start time (birth identity). cmdline/start are "" when the pid
+ *  is gone or the read raced (unreadable). */
+function readChildIdentity(pid: number): { alive: boolean; cmdline: string; start: string } {
+  if (!pidAlive(pid)) return { alive: false, cmdline: "", start: "" };
+  return { alive: true, cmdline: psCommand(pid).trim(), start: psStart(pid).trim() };
+}
+
+/** ONE guarded identity decision for every test-owned child cleanup site:
+ *  is the CURRENT process at owned.pid provably the exact process this
+ *  invocation spawned (liveness + argv token/fixture cmdline + captured
+ *  birth identity)? "owned" is the ONLY verdict that may receive a signal;
+ *  dead / foreign / unreadable REFUSE the signal — the caller preserves
+ *  evidence instead of risking an unrelated process. */
+function currentChildVerdict(owned: OwnedChild): "owned" | "dead" | "foreign" | "unreadable" {
+  const cur = readChildIdentity(owned.pid);
+  if (!cur.alive) return "dead";
+  if (cur.cmdline === "" || cur.start === "") return "unreadable";
+  if (owned.launchCmdline === "" || owned.launchStart === "") return "foreign"; // never captured: cannot prove
+  if (cur.cmdline === owned.launchCmdline && cur.start === owned.launchStart) return "owned";
+  return "foreign";
+}
+
+/** Rich refusal context for an unverifiable signal target. Never signals:
+ *  raises so a refusal is loud and the caller's finally cleanup cannot
+ *  silently remove the refusal evidence. */
+function refuseChildSignal(owned: OwnedChild, signal: "SIGTERM" | "SIGKILL", verdict: string): never {
+  assert.fail(
+    `refusing to deliver ${signal} to pid ${owned.pid}: current identity verdict ${JSON.stringify(verdict)} is not "owned" — ` +
+      `launch evidence was cmdline=${JSON.stringify(owned.launchCmdline)} start=${JSON.stringify(owned.launchStart)}; ` +
+      `a changed/stale/foreign/unreadable pid is never signaled (refusal evidence preserved)`,
+  );
 }
 
 /** Spawn one exactly owned persistence child whose cwd is `cwd` and whose
- *  argv continues with `argvTail`. Retries with a short backoff on an
- *  abnormal immediate exit (capturing stderr) — exec denial on a shared host
- *  can be transient — then verifies liveness via kill -0. Never kills
- *  anything but the pids this function created. */
-async function spawnOwnedChild(cwd: string, argvTail: string[]): Promise<OwnedChild> {
+ *  argv is ["bash","-c",PERSIST_SCRIPT, token, ...argvTail] with a fresh
+ *  per-invocation `token`. Retries with a short backoff on an abnormal
+ *  immediate exit (capturing stderr) — exec denial on a shared host can be
+ *  transient. A child that dies before identity capture is NEVER signaled (a
+ *  stale pid must not be killed merely because our handle once contained
+ *  it): its disposal routes through the SAME guarded decision
+ *  (currentChildVerdict), the evidence is recorded and the spawn is retried. */
+async function spawnOwnedChild(token: string, cwd: string, argvTail: string[]): Promise<OwnedChild> {
   // Full exec argv INCLUDING argv[0]; node's spawn() prepends `file` itself,
   // so pass argv.slice(1) — passing the whole argv would double-prepend
   // "bash" and make the child exec `/usr/bin/bash /usr/bin/bash -c ...`
   // ("cannot execute binary file", observed in the US-002 draft).
-  const argv = ["bash", "-c", PERSIST_SCRIPT, ...argvTail];
+  const argv = ["bash", "-c", PERSIST_SCRIPT, token, ...argvTail];
+  const attempts: string[] = []; // retained rejection evidence (recorded, never lost)
   let lastErr = "";
   for (let attempt = 0; attempt < 5; attempt++) {
     const child = spawn(argv[0], argv.slice(1), {
@@ -175,37 +256,51 @@ async function spawnOwnedChild(cwd: string, argvTail: string[]): Promise<OwnedCh
     });
     await sleep(300);
     const pid = child.pid;
-    if (typeof pid === "number" && pid > 0 && pidAlive(pid)) {
-      return { pid, argv, stderr: err };
+    if (typeof pid === "number" && pid > 0) {
+      const identity = readChildIdentity(pid);
+      if (identity.alive && identity.cmdline !== "" && identity.start !== "" && identity.cmdline.includes(token)) {
+        // Alive with THIS launch's token and a readable birth identity:
+        // capture the launch evidence on the exact handle we return.
+        return { pid, argv, stderr: err, launchCmdline: identity.cmdline, launchStart: identity.start };
+      }
+      // Not provably this launch (immediate exit before identity capture,
+      // unreadable evidence, or the pid reused within the settle window).
+      // Route the disposal through the SAME guarded decision every cleanup
+      // site uses; it never signals anything but a revalidated "owned" pid,
+      // so this rejected child gets no signal. Record the verdict + stderr
+      // and retry.
+      const rejected: OwnedChild = { pid, argv, stderr: err, launchCmdline: "", launchStart: "" };
+      const verdict = currentChildVerdict(rejected);
+      attempts.push(
+        `attempt ${attempt + 1}: rejected (guarded verdict=${verdict}, identity alive=${identity.alive} ` +
+          `cmdline=${JSON.stringify(identity.cmdline)} start=${JSON.stringify(identity.start)}, stderr=${JSON.stringify(err)})`,
+      );
+    } else {
+      attempts.push(`attempt ${attempt + 1}: spawn returned no pid (stderr=${JSON.stringify(err)})`);
     }
     lastErr = err;
-    // The child died immediately — it is our own handle, so stopping it is
-    // exact-ownership cleanup. Back off and retry before failing.
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      /* already gone */
-    }
     await sleep(400 * (attempt + 1));
   }
   assert.fail(
-    `owned persistence child failed to stay alive after 5 attempts (cwd=${cwd}, argvTail=${JSON.stringify(argvTail)}): ${JSON.stringify(lastErr)}`,
+    `owned persistence child failed to stay alive after 5 attempts (cwd=${cwd}, argvTail=${JSON.stringify(argvTail)}): ` +
+      `${JSON.stringify(lastErr)}; retained attempt evidence: ${JSON.stringify(attempts)}`,
   );
 }
 
-/** Stop an owned child after identity verification (kill -0 + ps cmdline
- *  evidence): SIGTERM first (the trap exits cleanly within ~1 s), escalate to
- *  SIGKILL only for the exact pid if it is still alive. Its transient
- *  `sleep 1` grandchildren self-terminate within a second. */
+/** Stop an owned child under EXACT invocation ownership. The ONE guarded
+ *  decision (currentChildVerdict) revalidates the CURRENT identity against
+ *  the launch evidence captured at spawn BEFORE EACH signal: SIGTERM first
+ *  (the trap exits cleanly within ~1 s), then — if the child survives —
+ *  identity is revalidated AGAIN before the SIGKILL escalation. A pid whose
+ *  identity changed or was lost between TERM and KILL (process gone, PID
+ *  possibly reused) never receives a KILL; unknown/changed/stale/foreign/
+ *  unreadable evidence REFUSES the signal with rich context and the refusal
+ *  propagates so evidence is preserved (the caller's finally stops before
+ *  any removal). Its transient `sleep 1` grandchildren self-terminate. */
 function stopOwnedChild(owned: OwnedChild): void {
-  if (!pidAlive(owned.pid)) return;
-  const cmd = psCommand(owned.pid);
-  // The ps command must identify THIS child: it runs bash with the
-  // persistence script and carries this child's unique argv0 marker.
-  assert.ok(
-    cmd.includes("bash") && cmd.includes(owned.argv[2]) && cmd.includes(owned.argv[3]),
-    `refusing to signal unverified pid ${owned.pid}: ps cmdline ${JSON.stringify(cmd)}`,
-  );
+  const beforeTerm = currentChildVerdict(owned);
+  if (beforeTerm === "dead") return; // already gone — nothing to do
+  if (beforeTerm !== "owned") refuseChildSignal(owned, "SIGTERM", beforeTerm);
   try {
     process.kill(owned.pid, "SIGTERM");
   } catch {
@@ -214,13 +309,180 @@ function stopOwnedChild(owned: OwnedChild): void {
   for (let i = 0; i < 30 && pidAlive(owned.pid); i++) {
     sleepSync(100);
   }
-  if (pidAlive(owned.pid)) {
-    try {
-      process.kill(owned.pid, "SIGKILL");
-    } catch {
-      /* already gone */
-    }
+  const beforeKill = currentChildVerdict(owned);
+  if (beforeKill === "dead") return; // TERM worked — clean exit, no KILL
+  if (beforeKill !== "owned") refuseChildSignal(owned, "SIGKILL", beforeKill);
+  try {
+    process.kill(owned.pid, "SIGKILL");
+  } catch {
+    /* already gone */
   }
+}
+
+// ── fixture-recorder ownership (US-003) ──────────────────────────────
+// The fixture recorder is started by this invocation through its own copied
+// `start` subcommand (recorder runtime semantics unchanged — out of scope).
+// The pidfile it writes is mutable and the generic tt-recorder name is
+// shared across invocations, so every test-owned recorder cleanup decision
+// binds the recorder to THIS invocation's exact fresh fixture + launch: the
+// launch identity (ps cmdline + birth start) is captured at start on the
+// exact pid this invocation's `start` wrote to the fixture pidfile, and the
+// CURRENT identity (pidfile content + liveness + cmdline + birth start) is
+// revalidated before EVERY signal — TERM and the KILL escalation alike. The
+// recorder's own `stop` subcommand stays byte-identical; the test guards the
+// decision to invoke it (normal stop pre-check) and performs its own guarded
+// direct stop in the finally leftover cleanup.
+
+/** A fixture recorder THIS invocation STARTED, carrying the launch identity
+ *  evidence captured at start (ps cmdline + birth start). Cleanup revalidates
+ *  the CURRENT identity against this captured evidence before every signal. */
+interface OwnedRecorder {
+  pid: number; // the pid this invocation's `start` wrote to the fixture pidfile
+  varRoot: string; // the fixture-exact recorder var root (owned path)
+  token: string; // per-invocation launch token (the fixture's mkdtemp suffix)
+  launchCmdline: string; // trimmed `ps -o command=` read at start
+  launchStart: string; // trimmed `ps -o lstart=` birth identity read at start
+}
+
+type RecorderVerdict = "owned" | "dead" | "foreign" | "unreadable";
+
+/** Exact pidfile path of the fixture recorder (this invocation's own path —
+ *  the pidfile the `start` subcommand writes under the fresh fixture var). */
+function recorderPidfilePath(varRoot: string): string {
+  return path.join(varRoot, "recorder", "tt-recorder.pid");
+}
+
+/** Trimmed content of the fixture recorder pidfile; null when absent. */
+function readRecorderPidfile(varRoot: string): string | null {
+  const pidfile = recorderPidfilePath(varRoot);
+  if (!fs.existsSync(pidfile)) return null;
+  return fs.readFileSync(pidfile, "utf8").trim();
+}
+
+/** ONE guarded identity decision for every test-owned recorder cleanup site
+ *  (normal-stop pre-check, startup-error cleanup and finally leftover
+ *  cleanup): is the CURRENT process named by the fixture pidfile provably the
+ *  recorder THIS invocation started? Requires the pidfile (at the exact
+ *  fixture path) to hold a numeric pid, the handle (when captured) to still
+ *  match that pid, and the live pid's ps cmdline + birth start to still
+ *  exactly equal the launch evidence captured at start. "owned" is the ONLY
+ *  verdict that may receive a signal; dead / foreign / unreadable REFUSE it
+ *  (evidence preserved). A missing pidfile and a dead captured pid are
+ *  "dead"; a non-numeric pidfile is "unreadable"; a pidfile naming a live pid
+ *  this invocation never captured (startup failure) or any changed/reused/
+ *  stale/foreign pid is "foreign". */
+function currentRecorderVerdict(rec: OwnedRecorder | null, varRoot: string): RecorderVerdict {
+  const content = readRecorderPidfile(varRoot);
+  if (content === null) return "dead"; // no pidfile: no recorder running under this fixture
+  if (!/^[0-9]+$/.test(content)) return "unreadable"; // non-numeric pidfile content
+  const pid = Number(content);
+  if (rec === null) {
+    // Startup failure / never captured: without captured launch evidence no
+    // pid is provably this invocation's recorder. A DEAD pid is the crashed
+    // start's stale pidfile (nothing live to signal -> dead); a LIVE pid is
+    // unproven and is never signaled (foreign).
+    return pidAlive(pid) ? "foreign" : "dead";
+  }
+  if (rec.pid !== pid) return "foreign"; // stale/foreign pidfile: no longer names the captured pid
+  const cur = readChildIdentity(pid);
+  if (!cur.alive) return "dead"; // recorder exited (crashed): stale pidfile naming our pid
+  if (cur.cmdline === "" || cur.start === "") return "unreadable"; // identity read raced/unreadable
+  if (rec.launchCmdline === "" || rec.launchStart === "") return "foreign"; // evidence never captured
+  if (cur.cmdline === rec.launchCmdline && cur.start === rec.launchStart) return "owned";
+  return "foreign"; // pid reused or cmdline/start changed since the capture
+}
+
+/** Rich refusal context for an unverifiable recorder signal target. Never
+ *  signals: raises so a refusal is loud and a caller's finally stops before
+ *  removing the refusal evidence. */
+function refuseRecorderSignal(
+  rec: OwnedRecorder | null,
+  varRoot: string,
+  signal: "SIGTERM" | "SIGKILL",
+  verdict: string,
+  reason: string,
+): never {
+  assert.fail(
+    `refusing to deliver ${signal} for the fixture recorder at ${recorderPidfilePath(varRoot)}: current identity verdict ${JSON.stringify(verdict)} is not "owned" — ` +
+      `reason: ${reason}; captured launch evidence was cmdline=${JSON.stringify(rec === null ? "" : rec.launchCmdline)} ` +
+      `start=${JSON.stringify(rec === null ? "" : rec.launchStart)}; a changed/stale/foreign/unreadable/unproven recorder ` +
+      `is never signaled (refusal evidence preserved)`,
+  );
+}
+
+/** Normal-stop pre-check: the recorder's own `stop` subcommand signals the
+ *  pidfile pid itself, so the CURRENT identity must still prove THIS
+ *  invocation's recorder before the stop may run. "owned" (and "dead" — no
+ *  live target; the recorder's own stale-pidfile handling just removes the
+ *  file) proceed; a stale/foreign pidfile or changed/unreadable identity
+ *  REFUSES with evidence preserved — a guarded finally cannot be bypassed
+ *  through an unguarded normal stop. */
+function assertRecorderStopProceeds(rec: OwnedRecorder | null, varRoot: string): void {
+  const verdict = currentRecorderVerdict(rec, varRoot);
+  if (verdict === "owned" || verdict === "dead") return;
+  refuseRecorderSignal(rec, varRoot, "SIGTERM", verdict, "normal recorder stop pre-check");
+}
+
+/** Stop the fixture recorder under EXACT invocation ownership (the finally
+ *  leftover cleanup — a stop that raced/failed above, or a failed start's
+ *  leftover pidfile). The ONE guarded decision (currentRecorderVerdict)
+ *  revalidates the CURRENT identity — pidfile content, liveness, ps cmdline
+ *  + birth start against the launch evidence captured at start — BEFORE EACH
+ *  signal: SIGTERM first, then — if the recorder survives — identity is
+ *  revalidated AGAIN before the SIGKILL escalation. A pid whose identity
+ *  changed or was lost between TERM and KILL (process gone, PID possibly
+ *  reused) never receives a KILL; unknown/changed/stale/foreign/unreadable
+ *  evidence REFUSES the signal (evidence preserved — this finally stops
+ *  before the fixture rm). With no captured identity (rec === null, e.g. a
+ *  crashed start) nothing can ever be "owned", so no signal is issued. */
+function stopOwnedRecorder(rec: OwnedRecorder | null, varRoot: string): void {
+  const beforeTerm = currentRecorderVerdict(rec, varRoot);
+  if (beforeTerm === "dead") return; // nothing live under this fixture — nothing to do
+  if (beforeTerm !== "owned") refuseRecorderSignal(rec, varRoot, "SIGTERM", beforeTerm, "recorder stop");
+  if (rec === null) return; // unreachable: "owned" requires a captured handle
+  try {
+    process.kill(rec.pid, "SIGTERM");
+  } catch {
+    /* already gone */
+  }
+  for (let i = 0; i < 50 && pidAlive(rec.pid); i++) {
+    sleepSync(100);
+  }
+  const beforeKill = currentRecorderVerdict(rec, varRoot);
+  if (beforeKill === "dead") return; // TERM worked — clean exit, no KILL
+  if (beforeKill !== "owned") refuseRecorderSignal(rec, varRoot, "SIGKILL", beforeKill, "recorder stop KILL escalation");
+  try {
+    process.kill(rec.pid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+}
+
+/** Capture the invocation-owned recorder handle right after `start` returns:
+ *  the exact fixture pidfile already names the started recorder pid, so bind
+ *  launch identity evidence (ps cmdline + birth start) read at start to THIS
+ *  invocation's fixture + launch token and retain it on the handle — a
+ *  mutable pidfile plus a generic tt-recorder name alone never authorize a
+ *  later signal. A recorder that cannot be proven alive with THIS fixture's
+ *  token and a readable birth identity within a short window is a startup
+ *  failure: assert.fail with the retained attempt evidence and NO handle is
+ *  returned (cleanup then never signals an unproven pid). */
+function captureRecorderIdentity(varRoot: string, token: string, pid: number): OwnedRecorder {
+  const attempts: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    const id = readChildIdentity(pid);
+    if (id.alive && id.cmdline !== "" && id.start !== "" && id.cmdline.includes(token)) {
+      return { pid, varRoot, token, launchCmdline: id.cmdline, launchStart: id.start };
+    }
+    attempts.push(
+      `attempt ${i + 1}: identity alive=${id.alive} cmdline=${JSON.stringify(id.cmdline)} start=${JSON.stringify(id.start)}`,
+    );
+    sleepSync(100);
+  }
+  assert.fail(
+    `startup failure: could not capture this invocation's recorder identity (pid=${pid}, fixture=${varRoot}): ` +
+      `${JSON.stringify(attempts)} — an unproven recorder is never signaled`,
+  );
 }
 
 /** Parse every physical line of a JSONL payload; asserts each line is
@@ -369,6 +631,8 @@ describe("RJSON US-002 — isolated emission-level recorder JSONL framing regres
 
   it("collect_sample emits one parseable JSONL line per owned child with exact fields", { skip: emissionSkip }, async () => {
     const fixture = makeFixture();
+    // Per-invocation launch token bound to this exact fresh fixture.
+    const fxToken = launchToken(fixture.root);
     const children: OwnedChild[] = [];
     try {
       // Multiline command text in the argv (child A), a multiline fixture
@@ -384,14 +648,14 @@ describe("RJSON US-002 — isolated emission-level recorder JSONL framing regres
       const dbBody = "synthetic tamandua.db for the RJSON US-002 db-arm assertion";
       fs.writeFileSync(dbPath, dbBody);
 
-      const a = await spawnOwnedChild(childACwd, [
+      const a = await spawnOwnedChild(fxToken, childACwd, [
         "rjson-argv0-A",
         "line1\nline2\ttabbed torture-test/var in-scope marker",
       ]);
       children.push(a);
-      const b = await spawnOwnedChild(childBDir, ["rjson-argv0-B", "plain-arg-B"]);
+      const b = await spawnOwnedChild(fxToken, childBDir, ["rjson-argv0-B", "plain-arg-B"]);
       children.push(b);
-      const c = await spawnOwnedChild(childCCwd, ["rjson-argv0-C", "daemon-child torture-test/var"]);
+      const c = await spawnOwnedChild(fxToken, childCCwd, ["rjson-argv0-C", "daemon-child torture-test/var"]);
       children.push(c);
 
       // Independent pgid cross-check BEFORE any child is stopped.
@@ -442,11 +706,17 @@ describe("RJSON US-002 — isolated emission-level recorder JSONL framing regres
 
   it("a started recorder frames multiline command text into its samples file (output-file path)", { skip: emissionSkip }, async () => {
     const fixture = makeFixture();
+    // Per-invocation launch token bound to this exact fresh fixture.
+    const fxToken = launchToken(fixture.root);
     const children: OwnedChild[] = [];
+    // Invocation-owned recorder handle: null until THIS invocation's `start`
+    // succeeded AND the launch identity was captured (a failed start leaves it
+    // null — nothing is then provably owned, so cleanup never signals).
+    let recorder: OwnedRecorder | null = null;
     try {
       const childCwd = path.join(fixture.varRoot, "childF");
       fs.mkdirSync(childCwd, { recursive: true });
-      const f = await spawnOwnedChild(childCwd, [
+      const f = await spawnOwnedChild(fxToken, childCwd, [
         "rjson-argv0-F",
         "multi\nline cmd torture-test/var out-file marker",
       ]);
@@ -456,18 +726,24 @@ describe("RJSON US-002 — isolated emission-level recorder JSONL framing regres
       assert.ok(/^[0-9]+$/.test(pgid), `ps pgid for owned pid ${f.pid} must be numeric`);
 
       // Start the fixture recorder at the minimum interval and let it run for
-      // a few real sample rounds.
+      // a few real sample rounds. The fresh per-invocation launch token rides
+      // the start-subprocess env into the detached recorder (the recorder
+      // runtime ignores it — it is identity evidence for this invocation only).
       const start = run(["bash", fixture.tool, "start", "--interval", "1"], {
         cwd: fixture.root,
+        env: { ...process.env, RJSON_RECORDER_LAUNCH_TOKEN: fxToken },
         timeoutMs: 20_000,
       });
       assert.equal(start.status, 0, `start failed (rc=${start.status}): ${start.stderr}`);
-      const pidfile = path.join(fixture.varRoot, "recorder", "tt-recorder.pid");
+      const pidfile = recorderPidfilePath(fixture.varRoot);
       assert.ok(fs.existsSync(pidfile), `pidfile must exist at ${pidfile}`);
       const recPid = fs.readFileSync(pidfile, "utf8").trim();
       assert.match(recPid, /^[0-9]+$/, `pidfile must hold a numeric pid, got ${JSON.stringify(recPid)}`);
-      // Identity evidence for the recorder handle we will stop.
-      assert.ok(psCommand(Number(recPid)).includes("tt-recorder"), `recorded pid ${recPid} must be a tt-recorder process`);
+      // Invocation-owned recorder handle: launch identity evidence (ps cmdline
+      // + birth start) captured at start for the EXACT pid this invocation's
+      // `start` wrote to the fixture pidfile, bound to this fixture+token —
+      // never a bare re-read of the mutable pidfile or a generic name match.
+      recorder = captureRecorderIdentity(fixture.varRoot, fxToken, Number(recPid));
 
       // The statefile records the startedAt + output file (generate_output_filename).
       const statefile = path.join(fixture.varRoot, "recorder", "current-state");
@@ -498,7 +774,14 @@ describe("RJSON US-002 — isolated emission-level recorder JSONL framing regres
 
       // Evidence-based stop of the exact recorder pid BEFORE the strict
       // every-record parse, so the samples file is stable (no mid-append
-      // partial line can race the read).
+      // partial line can race the read). The recorder's own `stop` subcommand
+      // signals the pidfile pid itself, so the CURRENT identity must still
+      // prove THIS invocation's recorder before it may run — the ONE guarded
+      // decision (assertRecorderStopProceeds); a stale/foreign pidfile or a
+      // changed/unreadable identity REFUSES with evidence preserved. The
+      // subcommand's internal stop semantics are the recorder's own
+      // (unchanged, out of scope).
+      assertRecorderStopProceeds(recorder, fixture.varRoot);
       const stop = run(["bash", fixture.tool, "stop"], { cwd: fixture.root, timeoutMs: 30_000 });
       assert.equal(stop.status, 0, `stop failed (rc=${stop.status}): ${stop.stderr}`);
       assert.match(stop.stdout, /tt-recorder stopped/, `stop must report stopped. stdout: ${stop.stdout}`);
@@ -526,30 +809,16 @@ describe("RJSON US-002 — isolated emission-level recorder JSONL framing regres
       }
     } finally {
       for (const ch of children) stopOwnedChild(ch);
-      // Exact-path cleanup: the fixture recorder's own pidfile, if a stop
-      // raced/failed above, holds only our own pid — stop it precisely.
-      const pidfile = path.join(fixture.varRoot, "recorder", "tt-recorder.pid");
-      if (fs.existsSync(pidfile)) {
-        const leftover = fs.readFileSync(pidfile, "utf8").trim();
-        if (/^[0-9]+$/.test(leftover) && pidAlive(Number(leftover))) {
-          const cmd = psCommand(Number(leftover));
-          if (cmd.includes("tt-recorder")) {
-            try {
-              process.kill(Number(leftover), "SIGTERM");
-            } catch {
-              /* already gone */
-            }
-            for (let i = 0; i < 50 && pidAlive(Number(leftover)); i++) sleepSync(100);
-            if (pidAlive(Number(leftover))) {
-              try {
-                process.kill(Number(leftover), "SIGKILL");
-              } catch {
-                /* already gone */
-              }
-            }
-          }
-        }
-      }
+      // Invocation-owned recorder cleanup (a stop that raced/failed above, or
+      // a failed start's leftover pidfile): the ONE guarded decision inside
+      // stopOwnedRecorder revalidates the CURRENT identity — pidfile content,
+      // liveness, ps cmdline + birth start vs the launch evidence captured at
+      // start — BEFORE EACH signal (TERM, then again before the KILL
+      // escalation). A stale/foreign/changed/unreadable pidfile or identity,
+      // or a recorder this invocation never captured (startup failure), never
+      // receives a signal; the refusal stops this block BEFORE the fixture rm
+      // so the refusal evidence survives.
+      stopOwnedRecorder(recorder, fixture.varRoot);
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
   });

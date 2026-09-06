@@ -1,0 +1,44 @@
+stop-owned-term-then-dead | stopOwnedChild |  | ["SIGTERM"] | - | no-rm
+stop-owned-alive-term-then-kill | stopOwnedChild |  | ["SIGTERM","SIGKILL"] | - | no-rm
+stop-pid-reuse-between-term-and-kill | stopOwnedChild |  | ["SIGTERM"] | AssertionError@refused at KILL (foreign) | no-rm
+stop-other-invocation-same-names | stopOwnedChild |  | [] | AssertionError@refused at TERM (foreign) | no-rm
+stop-changed-identity | stopOwnedChild |  | [] | AssertionError@refused at TERM (foreign) | no-rm
+stop-unreadable-identity | stopOwnedChild |  | [] | AssertionError@refused at TERM (unreadable) | no-rm
+stop-foreign-pid | stopOwnedChild |  | [] | AssertionError@refused at TERM (foreign) | no-rm
+stop-never-captured-handle | stopOwnedChild |  | [] | AssertionError@refused at TERM (foreign) | no-rm
+stop-dead-at-entry | stopOwnedChild |  | [] | - | no-rm
+stop-sibling-fixture-prefix | stopOwnedChild |  | [] | AssertionError@refused at TERM (foreign) | no-rm
+spawn-owned-captured | spawnOwnedChild |  | [] | - | no-rm
+spawn-startup-failure | spawnOwnedChild |  | [] | AssertionError@raised | no-rm
+spawn-reuse-recovery | spawnOwnedChild |  | [] | - | no-rm
+spawn-no-pid-exhausted | spawnOwnedChild |  | [] | AssertionError@raised | no-rm
+finally-children-delegation-owned | recorderFinally |  | ["SIGTERM"] | - | rm
+recorder-owned-term-then-dead | recorderStop | finally | ["SIGTERM"] | - | no-rm
+recorder-owned-term-then-kill | recorderStop | finally | ["SIGTERM","SIGKILL"] | - | no-rm
+recorder-pid-reuse-between-term-and-kill | recorderStop | finally | ["SIGTERM"] | AssertionError@refused at KILL (foreign) | no-rm
+recorder-other-invocation-same-names | recorderStop | normal-stop | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-changed-identity | recorderStop | normal-stop | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-unreadable-identity | recorderStop | finally | [] | AssertionError@refused at TERM (unreadable) | no-rm
+recorder-foreign-pid | recorderStop | normal-stop | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-stale-foreign-pidfile | recorderStop | finally | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-pidfile-nonnumeric | recorderStop | finally | [] | AssertionError@refused at TERM (unreadable) | no-rm
+recorder-no-pidfile | recorderStop | finally | [] | - | no-rm
+recorder-never-captured-handle | recorderStop | startup-error | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-sibling-fixture-prefix | recorderStop | finally | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-startup-error-live-foreign | recorderStop | startup-error | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-startup-error-dead-pidfile | recorderStop | startup-error | [] | - | no-rm
+recorder-startup-error-no-pidfile | recorderStop | startup-error | [] | - | no-rm
+recorder-normal-owned-proceeds | recorderNormalStop | normal-stop | [] | - | no-rm
+recorder-normal-dead-proceeds | recorderNormalStop | normal-stop | [] | - | no-rm
+recorder-normal-other-invocation-refuses | recorderNormalStop | normal-stop | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-normal-stale-pidfile-refuses | recorderNormalStop | normal-stop | [] | AssertionError@refused at TERM (foreign) | no-rm
+recorder-normal-unreadable-refuses | recorderNormalStop | normal-stop | [] | AssertionError@refused at TERM (unreadable) | no-rm
+recorder-normal-changed-refuses | recorderNormalStop | normal-stop | [] | AssertionError@refused at TERM (foreign) | no-rm
+finally-recorder-owned-leftover-stopped | recorderFinally | finally | ["SIGTERM"] | - | rm
+finally-recorder-owned-kill-escalation | recorderFinally | finally | ["SIGTERM","SIGKILL"] | - | rm
+finally-recorder-foreign-pidfile-refuses | recorderFinally | finally | [] | AssertionError@refused at TERM (foreign) | no-rm
+finally-recorder-foreign-identity-refuses | recorderFinally | finally | [] | AssertionError@refused at TERM (foreign) | no-rm
+finally-startup-error-live-foreign-refuses | recorderFinally | startup-error | [] | AssertionError@refused at TERM (foreign) | no-rm
+finally-startup-error-dead-pidfile | recorderFinally | startup-error | [] | - | rm
+finally-nonnumeric-pidfile-refuses | recorderFinally | finally | [] | AssertionError@refused at TERM (unreadable) | no-rm
+finally-no-pidfile | recorderFinally | finally | [] | - | rm
