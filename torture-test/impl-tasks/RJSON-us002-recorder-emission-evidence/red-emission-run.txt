@@ -1,0 +1,60 @@
+▶ RJSON US-002 — isolated emission-level recorder JSONL framing regression
+  ✖ portable: the FIXTURE recorder's pure _json_escape round-trips on every host (22.697718ms)
+  ✖ collect_sample emits one parseable JSONL line per owned child with exact fields (10664.659182ms)
+  ✖ a started recorder frames multiline command text into its samples file (output-file path) (5816.334996ms)
+✖ RJSON US-002 — isolated emission-level recorder JSONL framing regression (16504.377316ms)
+ℹ tests 3
+ℹ suites 1
+ℹ pass 0
+ℹ fail 3
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 16594.208566
+
+✖ failing tests:
+
+test at torture-test/self-tests/tier1-rjson-recorder-emission-isolation.test.ts:324:3
+✖ portable: the FIXTURE recorder's pure _json_escape round-trips on every host (22.697718ms)
+  AssertionError [ERR_ASSERTION]: leading/embedded/trailing LF: escaped output contains a physical line-break byte: "\nfirst\nsecond\n"
+      at TestContext.<anonymous> (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier1-rjson-recorder-emission-isolation.test.ts:345:16)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1325:25)
+      at Test.start (node:internal/test_runner/test:1191:17)
+      at node:internal/test_runner/test:1792:71
+      at node:internal/per_context/primordials:466:82
+      at new Promise (<anonymous>)
+      at new SafePromise (node:internal/per_context/primordials:435:3)
+      at node:internal/per_context/primordials:466:9
+      at Array.map (<anonymous>) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at torture-test/self-tests/tier1-rjson-recorder-emission-isolation.test.ts:370:3
+✖ collect_sample emits one parseable JSONL line per owned child with exact fields (10664.659182ms)
+  AssertionError [ERR_ASSERTION]: collect_sample: a physical line is not valid JSON: "{\"ts\":\"2026-09-06T05:50:29Z\",\"pid\":2576633,\"pgid\":2576591,\"ppid\":2576598,\"cwd\":\"/tmp/tt-recorder-rjson-YpBkf3/torture-test/var/childA\",\"cmdline\":\"bash -c trap 'exit 0' TERM INT; while :; do sleep 1; done rjson-argv0-A line1" — SyntaxError: Unterminated string in JSON at position 223 (line 1 column 224)
+      at parseEveryLine (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier1-rjson-recorder-emission-isolation.test.ts:244:14)
+      at TestContext.<anonymous> (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier1-rjson-recorder-emission-isolation.test.ts:410:23)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:911:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: undefined,
+    operator: 'fail',
+    diff: 'simple'
+  }
+
+test at torture-test/self-tests/tier1-rjson-recorder-emission-isolation.test.ts:443:3
+✖ a started recorder frames multiline command text into its samples file (output-file path) (5816.334996ms)
+  SyntaxError: Unterminated string in JSON at position 223 (line 1 column 224)
+      at JSON.parse (<anonymous>)
+      at parseCompleteLines (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier1-rjson-recorder-emission-isolation.test.ts:267:31)
+      at TestContext.<anonymous> (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier1-rjson-recorder-emission-isolation.test.ts:489:23)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:911:7)

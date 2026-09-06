@@ -1,0 +1,21 @@
+▶ tier0 bash-3.2 compatibility lint
+  ✔ scans the tracked shell surface and finds zero violations (hard gate) (255.553656ms)
+  ✔ excludes its own source file from the scan (21.36079ms)
+  ✔ flags declare -A in a temp file (0.15422ms)
+  ✔ flags mapfile and readarray in temp files (0.072522ms)
+  ✔ flags the case-modifying expansions in temp files (0.06243ms)
+  ✔ flags an unguarded command-argument @-expansion under set -u (0.064683ms)
+  ✔ does NOT flag the guarded expansion form (0.048544ms)
+  ✔ does NOT flag @-expansions in `for x in` headers (single- and multi-line) (0.069561ms)
+  ✔ does NOT flag @-expansions in files that do not set -u (0.074024ms)
+  ✔ tt-kill-sentinel spawns the suite via the guarded array idiom (KSNT regression) (0.146172ms)
+  ✔ does NOT flag pattern literals in comments or single-quoted strings (0.055925ms)
+✔ tier0 bash-3.2 compatibility lint (278.176569ms)
+ℹ tests 11
+ℹ suites 1
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 342.146003

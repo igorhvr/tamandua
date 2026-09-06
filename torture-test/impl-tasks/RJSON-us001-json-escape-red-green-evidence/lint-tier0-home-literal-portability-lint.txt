@@ -1,0 +1,22 @@
+▶ tier0 home-literal portability lint (MACP6 US-003)
+  ✔ hard gate: the tracked shell surface has zero machine-specific home literals (live tree, post-US-001/002) (61.203251ms)
+  ✔ scans the tracked shell surface and excludes itself (20.009567ms)
+  ✔ the ALLOWLIST is intentionally empty on the live tree (sorted; every future entry is a reviewed diff) (0.066375ms)
+  ✔ RED (synthetic fixture): a temp shell file containing '/home/fakeuser/' is flagged with the expected finding (0.261502ms)
+  ✔ RED (synthetic fixture): a temp shell file containing '/Users/fakeuser/' is flagged with the expected finding (0.113918ms)
+  ✔ POSITIVE PIN: comment-only and single-quoted mentions of /home/<user> are NOT flagged (masking) (0.058ms)
+  ✔ POSITIVE PIN: portable dynamic home resolutions are NOT flagged (0.06425ms)
+  ✔ POSITIVE PIN: a clean file is not flagged (0.054208ms)
+  ✔ MUTATION: a NEW machine-specific home literal in a currently-clean file trips G1 (no allowlist entry) (107.023261ms)
+  ✔ MUTATION: a stale allowlist entry (home literals removed) trips G2 (53.778111ms)
+  ✔ MUTATION: an allowlist entry outside the scanned shell surface trips G2 (51.731388ms)
+  ✔ the pattern classes are structurally sound (both names resolve, both arms fire on their canonical literal) (0.113167ms)
+✔ tier0 home-literal portability lint (MACP6 US-003) (295.047461ms)
+ℹ tests 12
+ℹ suites 1
+ℹ pass 12
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 345.403881

@@ -1,0 +1,16 @@
+▶ tier0 macp5 gnu-ism sweep (US-004)
+  ✔ hard gate: the strict scripted scenario path has zero GNU-isms on comment-masked lines (11.890589ms)
+  ✔ grep pin: daemon-control contains no grep -oP / grep -P anywhere (comments included) (0.538629ms)
+  ✔ install-scenario-workflows rewrites the workflow.yml id WITH a BSD-sed shim on PATH (green) (6.453423ms)
+  ✔ red proof: the pre-fix installer fails with the same BSD-sed shim (command i expects) (4.150781ms)
+  ✔ tt-provision-home's sed -i is fixed portably (mac-reachable via the bare-tier1 preflight) (0.637796ms)
+  ✔ scripted-runtimes/test.sh timing uses the portable node clock (no GNU date %N) (0.863631ms)
+✔ tier0 macp5 gnu-ism sweep (US-004) (25.00602ms)
+ℹ tests 6
+ℹ suites 1
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 70.98474

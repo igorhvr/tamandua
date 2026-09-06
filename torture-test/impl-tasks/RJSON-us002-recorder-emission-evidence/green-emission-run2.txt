@@ -1,0 +1,13 @@
+▶ RJSON US-002 — isolated emission-level recorder JSONL framing regression
+  ✔ portable: the FIXTURE recorder's pure _json_escape round-trips on every host (70.968597ms)
+  ✔ collect_sample emits one parseable JSONL line per owned child with exact fields (10664.91317ms)
+  ✔ a started recorder frames multiline command text into its samples file (output-file path) (5789.038327ms)
+✔ RJSON US-002 — isolated emission-level recorder JSONL framing regression (16525.51044ms)
+ℹ tests 3
+ℹ suites 1
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 16576.233518

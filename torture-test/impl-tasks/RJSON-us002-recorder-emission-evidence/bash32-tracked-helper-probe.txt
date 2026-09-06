@@ -1,0 +1,9 @@
+PASS empty rc=0 escLen=0
+PASS plain rc=0 escLen=17
+PASS quotes+backslash rc=0 escLen=19
+PASS leading/embedded/trailing LF rc=0 escLen=17
+PASS CRLF+tab+controls rc=0 escLen=25
+PASS unicode rc=0 escLen=15
+PASS trailing LF after unicode rc=0 escLen=6
+PASS kitchen sink rc=0 escLen=54
+PASS dense 47,500-byte mixed rc=0 elapsedMs=96.1 escLen=55000

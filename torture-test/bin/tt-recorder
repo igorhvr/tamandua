@@ -133,19 +133,81 @@ EOF
 
 # ── helpers ──────────────────────────────────────────────────────────
 
-# _json_escape — properly escape a string for inclusion in JSON.
-# Handles backslash, double-quote, and all control characters.
+# _json_escape — print JSON string CONTENT (no surrounding quotes) for "$1".
+# Escapes `"`, `\`, and every C0 control + DEL per RFC 8259 (`\"` `\\` `\b`
+# `\t` `\n` `\f` `\r` and the `\u00XX` hex form); bytes >= 0x80 pass through
+# untouched, so non-ASCII UTF-8 text is preserved byte-for-byte. Controls are
+# escaped — never dropped, never replaced with '?'. A NUL byte (0x00) cannot
+# be carried in a shell variable, so it can never reach this helper.
+#
+# Guarded chunked escaping, Bash 3.2-safe on Linux and Darwin: a line-oriented
+# text filter (the original sed) can never see the LF bytes that s/\x0a/\\n/
+# intends to escape, so embedded/trailing LF survived as literal line breaks
+# and the quoted record failed JSON.parse (Beads tamandua-0j7.4.2). A
+# per-byte substring/append loop fixes that but costs seconds on long
+# cmdlines (one bash statement per input byte), and a whole-string
+# ${s//pat/rep} chain (34 passes) is bounded in pass count yet measures
+# poorly on dense escape-heavy input under Darwin's system Bash 3.2.57 (a
+# 47,500-byte mixed record exceeded 10 s — coordinator Mac red). This helper
+# therefore processes the input in bounded 512-byte chunks: a pure chunk
+# (no byte needing escape) is emitted verbatim through one `case` guard, and
+# only chunks containing an escape byte run the 34 whole-string substitutions
+# below — per-chunk work is bounded regardless of input length or density,
+# all bash builtins under LC_ALL=C (byte-oriented; chunk boundaries never
+# corrupt multibyte UTF-8 because bytes >= 0x80 pass through untouched). No
+# external runtime per field, no $(...) command substitution (which would
+# strip a trailing LF). Escaped output contains no physical LF/CR byte,
+# preserving JSONL's one-physical-line-per-record contract. Order matters:
+# `\` is doubled FIRST so the backslashes this function introduces for later
+# escapes are never re-doubled.
 _json_escape() {
-    printf '%s' "$1" | LC_ALL=C sed '
-        s/\\/\\\\/g
-        s/"/\\"/g
-        s/\x0a/\\n/g
-        s/\x0d/\\r/g
-        s/\x09/\\t/g
-        s/\x08/\\b/g
-        s/\x0c/\\f/g
-        s/[\x00-\x07\x0b\x0e-\x1f]/?/g
-    '
+    local s="$1"
+    local LC_ALL=C
+    local chunk
+    while [ -n "$s" ]; do
+        chunk="${s:0:512}"
+        s="${s:512}"
+        # Fast path: a chunk with no byte that needs escaping emits verbatim.
+        case "$chunk" in
+            *[\\\"$'\001'-$'\037'$'\177']*) ;;   # has an escape byte -> fall through
+            *) printf '%s' "$chunk"; continue ;;
+        esac
+        chunk="${chunk//\\/\\\\}"          # 0x5c  backslash    -> \\
+        chunk="${chunk//\"/\\\"}"          # 0x22  double quote -> \"
+        chunk="${chunk//$'\b'/\\b}"        # 0x08  backspace    -> \b
+        chunk="${chunk//$'\t'/\\t}"        # 0x09  tab          -> \t
+        chunk="${chunk//$'\n'/\\n}"        # 0x0a  line feed    -> \n
+        chunk="${chunk//$'\f'/\\f}"        # 0x0c  form feed    -> \f
+        chunk="${chunk//$'\r'/\\r}"        # 0x0d  carriage ret -> \r
+        chunk="${chunk//$'\001'/\\u0001}"
+        chunk="${chunk//$'\002'/\\u0002}"
+        chunk="${chunk//$'\003'/\\u0003}"
+        chunk="${chunk//$'\004'/\\u0004}"
+        chunk="${chunk//$'\005'/\\u0005}"
+        chunk="${chunk//$'\006'/\\u0006}"
+        chunk="${chunk//$'\007'/\\u0007}"
+        chunk="${chunk//$'\013'/\\u000b}"  # 0x0b vertical tab
+        chunk="${chunk//$'\016'/\\u000e}"
+        chunk="${chunk//$'\017'/\\u000f}"
+        chunk="${chunk//$'\020'/\\u0010}"
+        chunk="${chunk//$'\021'/\\u0011}"
+        chunk="${chunk//$'\022'/\\u0012}"
+        chunk="${chunk//$'\023'/\\u0013}"
+        chunk="${chunk//$'\024'/\\u0014}"
+        chunk="${chunk//$'\025'/\\u0015}"
+        chunk="${chunk//$'\026'/\\u0016}"
+        chunk="${chunk//$'\027'/\\u0017}"
+        chunk="${chunk//$'\030'/\\u0018}"
+        chunk="${chunk//$'\031'/\\u0019}"
+        chunk="${chunk//$'\032'/\\u001a}"
+        chunk="${chunk//$'\033'/\\u001b}"
+        chunk="${chunk//$'\034'/\\u001c}"
+        chunk="${chunk//$'\035'/\\u001d}"
+        chunk="${chunk//$'\036'/\\u001e}"
+        chunk="${chunk//$'\037'/\\u001f}"
+        chunk="${chunk//$'\177'/\\u007f}"  # 0x7f DEL
+        printf '%s' "$chunk"
+    done
 }
 
 # canonicalize_path — resolve a filesystem path to a canonical absolute

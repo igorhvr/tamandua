@@ -1,0 +1,16 @@
+long plain input (64 KiB, nothing to escape): escaped 65536 input chars in 14.4 ms
+long mixed-escape input (64 KiB): escaped 65536 input chars in 42.5 ms
+▶ RJSON US-001 — _json_escape valid lossless JSON string content (pure red/green)
+  ✔ round-trips every representable input exactly through JSON.parse (99.647247ms)
+  ✔ escapes every C0 control and DEL losslessly in one sweep (no raw bytes, no '?') (49.303495ms)
+  ✔ emits exactly one physical output line for multiline framing (4.566576ms)
+  ✔ handles long inputs in bounded time (no per-byte blowup) with exact round trips (57.99656ms)
+✔ RJSON US-001 — _json_escape valid lossless JSON string content (pure red/green) (211.980173ms)
+ℹ tests 4
+ℹ suites 1
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 260.57487

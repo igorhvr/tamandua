@@ -1,0 +1,28 @@
+▶ tier0 GNU-ism portability lint (MACP5 US-005 + US-006)
+  ✔ hard gate: the tracked shell surface has zero unallowlisted GNU-isms (live tree, post-US-006) (106.007044ms)
+  ✔ scans the tracked shell surface and excludes itself (19.184978ms)
+  ✔ the strict scripted scenario path is enumerated explicitly and is GNU-ism-free (G4 live sub-gate) (23.612886ms)
+  ✔ MUTATION: flags every GNU-ism class in a synthetic temp shell file (0.141584ms)
+  ✔ POSITIVE PIN: comments, single quotes, --timeout flags, variables and portable forms are NOT flagged (0.094418ms)
+  ✔ POSITIVE PIN: BSD-portable `sed -i.bak` suffix form is NOT flagged (0.051751ms)
+  ✔ POSITIVE PIN: `sed i\` mentioned in a comment is NOT flagged (comment-only masking) (0.064626ms)
+  ✔ MUTATION: each US-006 class trips G1 when injected into a bin/* shell file (bin/* coverage) (270.792696ms)
+  ✔ MUTATION: the old GNU `timeout 1 bash -c "echo >/dev/tcp/localhost/$port"` probe trips the timeout class in a bin/* file (83.639711ms)
+  ✔ GREEN PIN: the live swept tools (tt-daemon-up, tt-recorder, tt-provision-home, tt-harness-auth-probe) carry none of the US-006 classes (3.383984ms)
+  ✔ GREEN PIN: tt-controller's real-case preflight path tools carry none of the US-006 classes (3.15669ms)
+  ✔ MUTATION: a GNU-ism added under env/ trips the strict gate even with an allowlist entry (strict-path escape) (88.842083ms)
+  ✔ MUTATION: an allowlist entry for a strict-path file is rejected outright (G4) (82.577327ms)
+  ✔ MUTATION: a NEW GNU-ism class in an allowlisted file trips the class-coverage gate (G5) (82.724787ms)
+  ✔ MUTATION: dropping an allowlist entry trips the coverage gate (G1) (82.187324ms)
+  ✔ MUTATION: a stale allowlist entry (GNU-isms removed) trips staleness (G2) (82.063782ms)
+  ✔ MUTATION: the pre-US-004 tree's GNU-isms are exactly what the lint flags (synthetic red proof) (0.104792ms)
+  ✔ allowlist entries are structurally sound and cover only linux-side-only files outside the strict path (50.735047ms)
+✔ tier0 GNU-ism portability lint (MACP5 US-005 + US-006) (980.238515ms)
+ℹ tests 18
+ℹ suites 1
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1035.661264

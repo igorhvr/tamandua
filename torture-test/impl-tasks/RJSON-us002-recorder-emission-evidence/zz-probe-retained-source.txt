@@ -1,0 +1,30 @@
+import { test } from "node:test";
+import { spawn } from "node:child_process";
+import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+test("exact repro", async () => {
+  const fx = fs.mkdtempSync(path.join(os.tmpdir(), "zzprobe-"));
+  fs.mkdirSync(path.join(fx, "torture-test", "var", "childA"), { recursive: true });
+  const variants = [
+    ["A", "line1\nline2\ttabbed torture-test/var in-scope marker"],
+    ["F", "multi\nline cmd torture-test/var out-file marker"],
+    ["B", "plain-arg-B"],
+  ];
+  for (const [a0, a1] of variants) {
+    const child = spawn("bash", ["-c", "trap 'exit 0' TERM INT; while :; do sleep 1; done", a0, a1], {
+      cwd: path.join(fx, "torture-test", "var", "childA"),
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let err = "";
+    child.stderr.on("data", (d) => { err += String(d); });
+    let exited: any = null;
+    child.on("exit", (code, sig) => { exited = { code, sig }; });
+    await sleep(400);
+    console.log(a0, exited ? "EXITED " + JSON.stringify(exited) + " err=" + JSON.stringify(err.slice(0,100)) : "alive pid=" + child.pid);
+    if (!exited) child.kill("SIGKILL");
+    await sleep(150);
+  }
+  fs.rmSync(fx, { recursive: true, force: true });
+});

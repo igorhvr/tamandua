@@ -1,0 +1,96 @@
+long plain input (64 KiB, nothing to escape): escaped 65536 input chars in 6.6 ms
+▶ RJSON US-001 — _json_escape valid lossless JSON string content (pure red/green)
+  ✖ round-trips every representable input exactly through JSON.parse (39.865307ms)
+  ✖ escapes every C0 control and DEL losslessly in one sweep (no raw bytes, no '?') (5.380083ms)
+  ✖ emits exactly one physical output line for multiline framing (5.081789ms)
+  ✖ handles long inputs in bounded time (no per-byte blowup) with exact round trips (16.363835ms)
+✖ RJSON US-001 — _json_escape valid lossless JSON string content (pure red/green) (67.316602ms)
+ℹ tests 4
+ℹ suites 1
+ℹ pass 0
+ℹ fail 4
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 116.290397
+
+✖ failing tests:
+
+test at torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:128:3
+✖ round-trips every representable input exactly through JSON.parse (39.865307ms)
+  AssertionError [ERR_ASSERTION]: leading LF: escaped output contains a physical line-break byte: "\nlead"
+      at assertRoundTrip (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:100:10)
+      at TestContext.<anonymous> (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:157:7)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1325:25)
+      at Test.start (node:internal/test_runner/test:1191:17)
+      at node:internal/test_runner/test:1792:71
+      at node:internal/per_context/primordials:466:82
+      at new Promise (<anonymous>)
+      at new SafePromise (node:internal/per_context/primordials:435:3)
+      at node:internal/per_context/primordials:466:9 {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:161:3
+✖ escapes every C0 control and DEL losslessly in one sweep (no raw bytes, no '?') (5.380083ms)
+  AssertionError [ERR_ASSERTION]: full C0 + DEL sweep: escaped output contains a physical line-break byte: "???????\\b\\t\n?\\f\\r??????????????????"
+      at assertRoundTrip (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:100:10)
+      at TestContext.<anonymous> (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:167:21)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1325:25)
+      at Suite.processPendingSubtests (node:internal/test_runner/test:911:18)
+      at Test.postRun (node:internal/test_runner/test:1465:19)
+      at Test.run (node:internal/test_runner/test:1390:12)
+      at async Promise.all (index 0)
+      at async Suite.run (node:internal/test_runner/test:1794:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:188:3
+✖ emits exactly one physical output line for multiline framing (5.081789ms)
+  AssertionError [ERR_ASSERTION]: multiline framing: escaped output contains a physical line-break byte: "first \\\"line\\\" \\\\ here\nsecond line\\r\nthird\\ttabbed\n"
+      at assertRoundTrip (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:100:10)
+      at TestContext.<anonymous> (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:190:21)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1325:25)
+      at Suite.processPendingSubtests (node:internal/test_runner/test:911:18)
+      at Test.postRun (node:internal/test_runner/test:1465:19)
+      at Test.run (node:internal/test_runner/test:1390:12)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:911:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:202:3
+✖ handles long inputs in bounded time (no per-byte blowup) with exact round trips (16.363835ms)
+  AssertionError [ERR_ASSERTION]: long mixed-escape input (64 KiB): escaped output contains a physical line-break byte
+      at TestContext.<anonymous> (file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/912-b74a8b52/torture-test/self-tests/tier0-rjson-json-escape-red-green.test.ts:221:14)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1325:25)
+      at Suite.processPendingSubtests (node:internal/test_runner/test:911:18)
+      at Test.postRun (node:internal/test_runner/test:1465:19)
+      at Test.run (node:internal/test_runner/test:1390:12)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:911:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }

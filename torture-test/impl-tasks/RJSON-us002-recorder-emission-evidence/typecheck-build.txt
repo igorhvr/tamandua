@@ -1,0 +1,6 @@
+
+> tamandua@0.1.0 build
+> tsc -p tsconfig.json && cp src/server/index.html dist/server/index.html && cp src/server/kanban.html dist/server/kanban.html && chmod +x dist/cli/cli.js && chmod +x dist/server/mcp-standalone.js && chmod +x dist/server/dashboard-standalone.js && chmod +x dist/suite/shim.js && node scripts/inject-version.js && rm -rf dist/www && cp -r www dist/www
+
+Build version: 20260904T234746Z_494631aef1af79d8bf2fa81e5e9166b9b18a81ba
+Injected version into dist/cli/commands/standalone.js
