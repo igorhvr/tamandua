@@ -9,7 +9,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { execSync, spawnSync } from 'node:child_process';
-import { verifyRecordedTarget, getProcessGroup, getProcessParent, ownProcessGroup } from './tt-process-identity.mjs';
+import {
+  getProcessCmdline,
+  getProcessCwd,
+  getProcessGroup,
+  getProcessParent,
+  ownProcessGroup,
+  verifyRecordedTarget,
+} from './tt-process-identity.mjs';
 import {
   stringMarkerVocabularyError,
   workflowVocabularyFor,
@@ -394,9 +401,21 @@ function killDaemon(opts) {
  * kill(pid, 0) alone is not enough because a zombie answers it.
  */
 function isProcessAlive(pid) {
+  // A killed-but-unreaped process lingers as a zombie that still answers
+  // kill(pid, 0), so the precise probe also requires the linux process-table
+  // entry (/proc/<pid>). On a /proc-less host (Darwin) the probe degrades to
+  // "alive = kill(0) alone" (MCHA US-014 — kill(0) is the portable liveness
+  // base on every host).
+  const platform = process.env.TT_PROCESS_IDENTITY_PLATFORM ?? process.platform;
+  if (platform === 'darwin') {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   try {
-    // linux-only /proc/<pid> existence check (MACP3 US-003): absent on
-    // Darwin, so this degrades to "alive = kill(0) alone" via the catch.
     fs.accessSync(`/proc/${pid}`, fs.constants.F_OK);
   } catch {
     return false;
@@ -1913,7 +1932,11 @@ function resolveTargetRecord(action, opts) {
       }
       if (args['target-start-time'] !== undefined && args['target-start-time'] !== '') {
         const raw = String(args['target-start-time']);
-        record.startTime = raw.startsWith('proc:') ? raw : `proc:${raw}`;
+        // linux identities arrive bare (the controller strips the 'proc:'
+        // prefix); darwin identities arrive fully-prefixed ('darwin:<lstart>',
+        // MCHA US-014) and must NEVER gain a 'proc:' prefix — the recorded
+        // identity is compared verbatim against the CURRENT one.
+        record.startTime = raw.startsWith('proc:') || raw.startsWith('darwin:') ? raw : `proc:${raw}`;
       }
       return record;
     }
@@ -2035,7 +2058,9 @@ function readDaemonPidfile() {
  * the contained var tree IS the daemon trust boundary. A daemon target that
  * fails any of those refuses fail-closed with a precise one-line reason
  * (never a silent fallback to a process scan), and a daemon whose process
- * group is UNREADABLE (a /proc-less host) is refused too — group
+ * group is UNREADABLE (no procfs AND no portable ps arm — MCHA US-014
+ * replaced the old /proc-only refusal with the ps -o pgid= arm, so a live
+ * daemon on a /proc-less host IS verifiable) is refused too — group
  * disjointness is part of the identity contract and cannot be waived.
  *
  * S33 (US-004) harness chain: the REAL pi worker's process shape carries no
@@ -2048,6 +2073,16 @@ function readDaemonPidfile() {
  * claim_pgid match / parent-chain walk to a TT_ROOT-owned ancestor / open-fd
  * into var) — see below. A harness target with NO positive proof still
  * refuses fail-closed with the precise provenance reason (never weakened).
+ *
+ * SGRD (R4a US-014): every gate here that asserts group disjointness must
+ * PROVE it. An unreadable CALLER pgid (ownProcessGroup → null) is not
+ * disjointness — comparing the target's pgid with null passes vacuously —
+ * so both the daemon and the harness branches refuse when the caller's own
+ * pgid cannot be read, and a later unreadable caller observation is never
+ * accepted because an earlier check succeeded. The ancestry gate lives in
+ * verifyRecordedTarget (above), which refuses unless the caller's ppid walk
+ * to the root is fully observed (classifyAncestry: 'disjoint'); unreadable
+ * parent evidence, cycles and depth exhaustion are 'unknown' and refuse.
  */
 function verifyKillTarget(record, runId, kind = 'harness') {
   const base = verifyRecordedTarget({ pid: record.pid, pgid: record.pgid, startTime: record.startTime });
@@ -2062,15 +2097,32 @@ function verifyKillTarget(record, runId, kind = 'harness') {
       return { ok: false, reason: `daemon pidfile ${record.pidfile ?? '(none)'} is not under ${TT_ROOT} — refusing to signal an out-of-scope daemon target` };
     }
     if (pgid === null) {
-      return { ok: false, reason: `cannot read the process group of daemon pid ${record.pid} (no /proc) — group disjointness from the caller cannot be verified, refusing to signal` };
+      return { ok: false, reason: `cannot read the process group of daemon pid ${record.pid} (no procfs and the portable pgid arm is unavailable) — group disjointness from the caller cannot be verified, refusing to signal` };
     }
-    if (pgid === ownProcessGroup()) {
+    const ownPgid = ownProcessGroup();
+    if (ownPgid === null) {
+      // SGRD (R4a US-014): an unreadable CALLER pgid is not disjointness —
+      // the guard must refuse whenever it cannot prove the target's group is
+      // disjoint from the caller's own (a later unreadable caller read is
+      // never excused by an earlier successful one).
+      return { ok: false, reason: `cannot read the caller's own process group (the portable pgid arm is unavailable) — group disjointness from the caller cannot be verified, refusing to signal daemon pid ${record.pid}` };
+    }
+    if (pgid === ownPgid) {
       return { ok: false, reason: `target pid ${record.pid} shares the caller's own pgid ${pgid} — refusing to signal own group` };
     }
     return { ok: true, reason: `recorded daemon pid ${record.pid} verified (alive, identity, group disjointness, pidfile-under-TT_ROOT checks passed)` };
   }
-  if (pgid !== null && pgid === ownProcessGroup()) {
-    return { ok: false, reason: `target pid ${record.pid} shares the caller's own pgid ${pgid} — refusing to signal own group` };
+  if (pgid !== null) {
+    const ownPgid = ownProcessGroup();
+    if (ownPgid === null) {
+      // SGRD (R4a US-014): same fail-closed rule on the harness path — a
+      // target whose group is readable cannot be proven disjoint from a
+      // caller whose own pgid is unreadable.
+      return { ok: false, reason: `cannot read the caller's own process group (the portable pgid arm is unavailable) — group disjointness from the caller cannot be verified, refusing to signal target pid ${record.pid}` };
+    }
+    if (pgid === ownPgid) {
+      return { ok: false, reason: `target pid ${record.pid} shares the caller's own pgid ${pgid} — refusing to signal own group` };
+    }
   }
   if (!verifyProcessProvenance(record.pid, runId)) {
     // S33 (US-004): the strict belt-and-suspenders check failed — try the
@@ -2098,18 +2150,16 @@ function verifyKillTarget(record, runId, kind = 'harness') {
  * used to RESOLVE a target.
  */
 function verifyProcessProvenance(pid, runId) {
-  try {
-    // linux-only /proc/<pid>/cwd + cmdline reads (MACP3 US-003): absent on
-    // Darwin — the catch degrades to "provenance unproven" (returns false)
-    // instead of hard-failing.
-    const cwdPath = `/proc/${pid}/cwd`;
-    const cmdlinePath = `/proc/${pid}/cmdline`;
-    const cwd = fs.readlinkSync(cwdPath);
-    const cmdline = fs.readFileSync(cmdlinePath, 'utf-8').replace(/\0/g, ' ');
-    return cwd.includes(TT_ROOT) && (cmdline.includes(runId) || cmdline.includes(TT_ROOT));
-  } catch {
-    return false;
-  }
+  // Portable cwd/cmdline evidence (MCHA US-014): /proc/<pid>/cwd + cmdline
+  // on linux; lsof cwd + ps command on /proc-less hosts — the same portable
+  // arm daemon-control's TT-ownership check uses. Unreadable evidence (dead
+  // pid, absent /proc AND absent lsof/ps) degrades to "provenance unproven"
+  // (returns false) — never a hard-fail, never a false positive.
+  const cwd = getProcessCwd(pid);
+  if (cwd === null) return false;
+  const cmdline = getProcessCmdline(pid);
+  if (cmdline === null) return false;
+  return cwd.includes(TT_ROOT) && (cmdline.includes(runId) || cmdline.includes(TT_ROOT));
 }
 
 /**
@@ -2177,16 +2227,15 @@ function verifyHarnessIdentityChain(record, runId) {
 function parentChainOwnershipProof(targetPid) {
   let cur = getProcessParent(targetPid);
   for (let i = 0; i < 1024 && cur !== null && cur > 0; i += 1) {
-    try {
-      // linux-only /proc/<pid>/cwd + cmdline reads (MACP3 US-003): absent on
-      // Darwin — the catch degrades to "ancestor unproven" (never proven).
-      const ancestorCwd = fs.readlinkSync(`/proc/${cur}/cwd`);
-      const ancestorCmdline = fs.readFileSync(`/proc/${cur}/cmdline`, 'utf-8').replace(/\0/g, ' ');
-      if (ancestorCwd.includes(TT_ROOT) || ancestorCmdline.includes(TT_ROOT)) {
-        return { ok: true, detail: `ancestor pid ${cur} cwd/cmdline is under ${TT_ROOT}` };
-      }
-    } catch {
-      // unreadable ancestor — the walk cannot prove this ancestor; continue
+    // Portable ancestor cwd/cmdline reads (MCHA US-014): /proc on linux;
+    // lsof cwd + ps command on /proc-less hosts — the same portable arm
+    // daemon-control's TT-ownership check uses. An ancestor whose cwd/cmdline
+    // is unreadable is "unproven" for that ancestor (never proven).
+    const ancestorCwd = getProcessCwd(cur);
+    const ancestorCmdline = getProcessCmdline(cur);
+    if (ancestorCwd !== null && (ancestorCwd.includes(TT_ROOT)
+        || (ancestorCmdline !== null && ancestorCmdline.includes(TT_ROOT)))) {
+      return { ok: true, detail: `ancestor pid ${cur} cwd/cmdline is under ${TT_ROOT}` };
     }
     const parent = getProcessParent(cur);
     if (parent === null || parent === cur || parent <= 0) break; // unreadable / cycle / init

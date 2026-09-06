@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { ORACLE_EVIDENCE_KEYS, OPTIONAL_ORACLE_EVIDENCE_KEYS } from './oracle-context.mjs';
+import { countTestMarkers } from '../oracles/lib/test-markers.mjs';
 
 const MECHANICAL_EVENT_FIELDS = new Set([
   'ts', 'event', 'runId', 'run_id', 'parentRunId', 'childRunId', 'workflowId', 'stepId',
@@ -356,13 +357,18 @@ function isSeededTest(file) {
     || file.split('/').some((segment) => ['test', 'tests', '__tests__'].includes(segment.toLowerCase()));
 }
 
+// S48 (US-006, 2026-09-03): marker counts for inventory test_markers now come
+// from the shared context-aware extractor (oracles/lib/test-markers.mjs) —
+// test-definition/decorator contexts only, comments/docstrings/string
+// literals masked first. The pre-S48 whole-text word regexes
+// (/\bskip(?:ped)?\b/gi etc.) counted prose/docstring content ('skipped
+// 07-31' in W4.17-a) and inflated counts, tripping O8_TEST_MARKER_INTRODUCED
+// on legitimately additive changes. This CAPTURE site is where those
+// inventory counts originate in real campaigns; the oracle rebuild leg and
+// the fixture generator use the same shared function so all three derive
+// identical counts for the same (path, bytes).
 function testMarkerCounts(file) {
-  const text = fs.readFileSync(file, 'utf8');
-  return {
-    skip: (text.match(/\bskip(?:ped)?\b/giu) ?? []).length,
-    todo: (text.match(/\btodo\b/giu) ?? []).length,
-    xfail: (text.match(/\bxfail\b/giu) ?? []).length,
-  };
+  return countTestMarkers(file, fs.readFileSync(file));
 }
 
 // Fixture-source-relative declarations (e.g. 'fixtures-src/tt-python/src')

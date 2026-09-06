@@ -1314,6 +1314,174 @@ else
   fail "cases/tier2.jsonl NOT restored byte-identical"
 fi
 
+# ===========================================================================
+# US-009 (S51): host-capability gate + --allow-partial — explicit --tierN
+# refuses (exit 2) when the recorded host profile has profile_result RESULT
+# FAIL; --allow-partial overrides; PASS/legacy/missing profiles proceed.
+#
+# run-torture-test is a one-line exec into tt-run, so these fake-tree
+# whole-script tests exercise the exact gate run-torture-test delegates to.
+# ===========================================================================
+S51_HOME="$(mktemp -d)"
+S51_CLEANED=""
+s51_cleanup() {
+  if [ -z "$S51_CLEANED" ]; then
+    S51_CLEANED=1
+    rm -rf "$S51_HOME"
+  fi
+}
+# Extend the trap (the E2.2 cleanup trap may already be installed; keep it).
+trap 's51_cleanup' EXIT
+
+mkdir -p "$S51_HOME/bin" "$S51_HOME/cases" "$S51_HOME/var/w0"
+cp "$TT_RUN" "$S51_HOME/bin/tt-run"
+cat > "$S51_HOME/bin/tt-controller" <<'EOS'
+#!/usr/bin/env bash
+echo "CONTROLLER_ARGS:$*"
+exit 0
+EOS
+cat > "$S51_HOME/bin/tt-tier1-assets" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+chmod +x "$S51_HOME/bin/tt-controller" "$S51_HOME/bin/tt-tier1-assets"
+echo '{"id":"dummy"}' > "$S51_HOME/cases/tier1.jsonl"
+
+# ---------------------------------------------------------------------------
+# Test: FAIL profile -> explicit --tier1 refuses with exit 2 and names the
+# recorded failure; --allow-partial proceeds to the controller.
+# ---------------------------------------------------------------------------
+total_count=$((total_count + 1))
+echo "--- Test: FAIL host profile -> exit 2 refusal; --allow-partial proceeds (S51) ---" >&2
+cat > "$S51_HOME/var/w0/host-profile.json" <<'JSON'
+{
+  "platform": { "os": "darwin", "arch": "arm64", "label": "darwin" },
+  "profile_result": {
+    "result": "FAIL",
+    "exit_code": 1,
+    "failed_required_checks": ["port-5334", "capability-daemon-scripted"],
+    "generated_at": "2026-09-03T00:00:00.000Z"
+  }
+}
+JSON
+set +e
+s51_refuse=$(bash "$S51_HOME/bin/tt-run" --tier1 2>&1)
+s51_refuse_ec=$?
+set -e
+all_ok=true
+if [ "$s51_refuse_ec" -eq 2 ]; then
+  pass "  FAIL profile --tier1 exits 2"
+else
+  fail "  FAIL profile --tier1 exited $s51_refuse_ec, expected 2"
+  all_ok=false
+fi
+if echo "$s51_refuse" | grep -q 'profile_result.result=FAIL' && echo "$s51_refuse" | grep -q 'port-5334'; then
+  pass "  refusal names the recorded profile FAIL and its failed required check"
+else
+  fail "  refusal text missing profile FAIL / failed check: $(echo "$s51_refuse" | tail -2)"
+  all_ok=false
+fi
+if echo "$s51_refuse" | grep -qv 'CONTROLLER_ARGS'; then
+  pass "  no controller launch on refusal"
+else
+  fail "  controller was launched despite the refusal"
+  all_ok=false
+fi
+if $all_ok; then pass "FAIL host profile -> exit 2 refusal (S51)"; fi
+
+total_count=$((total_count + 1))
+echo "--- Test: --allow-partial overrides the FAIL gate and reaches the controller (S51) ---" >&2
+set +e
+s51_allow=$(bash "$S51_HOME/bin/tt-run" --tier1 --allow-partial 2>&1)
+s51_allow_ec=$?
+set -e
+if [ "$s51_allow_ec" -eq 0 ] && echo "$s51_allow" | grep -q 'CONTROLLER_ARGS' && echo "$s51_allow" | grep -q 'scripted-only'; then
+  pass "  --tier1 --allow-partial proceeds (CONTROLLER_ARGS, exit 0)"
+else
+  fail "  --allow-partial did not proceed: exit=$s51_allow_ec out=$(echo "$s51_allow" | tail -2)"
+fi
+
+total_count=$((total_count + 1))
+echo "--- Test: --allow-partial also works before the tier flag (S51) ---" >&2
+set +e
+s51_allow2=$(bash "$S51_HOME/bin/tt-run" --allow-partial --tier1 2>&1)
+s51_allow2_ec=$?
+set -e
+if [ "$s51_allow2_ec" -eq 0 ] && echo "$s51_allow2" | grep -q 'CONTROLLER_ARGS'; then
+  pass "  --allow-partial --tier1 proceeds"
+else
+  fail "  --allow-partial --tier1: exit=$s51_allow2_ec out=$(echo "$s51_allow2" | tail -2)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test: PASS profile, legacy profile (no profile_result), and a missing
+# profile all proceed (the gate only refuses a RECORDED FAIL).
+# ---------------------------------------------------------------------------
+total_count=$((total_count + 1))
+echo "--- Test: PASS profile proceeds (S51) ---" >&2
+cat > "$S51_HOME/var/w0/host-profile.json" <<'JSON'
+{
+  "platform": { "os": "linux", "arch": "arm64", "label": "linux" },
+  "profile_result": { "result": "PASS", "exit_code": 0, "failed_required_checks": [], "generated_at": "2026-09-03T00:00:00.000Z" }
+}
+JSON
+set +e
+s51_pass=$(bash "$S51_HOME/bin/tt-run" --tier1 2>&1)
+s51_pass_ec=$?
+set -e
+if [ "$s51_pass_ec" -eq 0 ] && echo "$s51_pass" | grep -q 'CONTROLLER_ARGS'; then
+  pass "  PASS profile --tier1 proceeds"
+else
+  fail "  PASS profile --tier1: exit=$s51_pass_ec out=$(echo "$s51_pass" | tail -2)"
+fi
+
+total_count=$((total_count + 1))
+echo "--- Test: legacy profile (no profile_result) proceeds (S51) ---" >&2
+printf '{"platform":{"os":"linux","arch":"arm64","label":"linux"}}\n' > "$S51_HOME/var/w0/host-profile.json"
+set +e
+s51_legacy=$(bash "$S51_HOME/bin/tt-run" --tier1 2>&1)
+s51_legacy_ec=$?
+set -e
+if [ "$s51_legacy_ec" -eq 0 ] && echo "$s51_legacy" | grep -q 'CONTROLLER_ARGS'; then
+  pass "  legacy profile (no profile_result) --tier1 proceeds"
+else
+  fail "  legacy profile --tier1: exit=$s51_legacy_ec out=$(echo "$s51_legacy" | tail -2)"
+fi
+
+total_count=$((total_count + 1))
+echo "--- Test: missing host profile proceeds (gate is recorded-FAIL-only) (S51) ---" >&2
+rm -f "$S51_HOME/var/w0/host-profile.json"
+set +e
+s51_noprofile=$(bash "$S51_HOME/bin/tt-run" --tier1 2>&1)
+s51_noprofile_ec=$?
+set -e
+if [ "$s51_noprofile_ec" -eq 0 ] && echo "$s51_noprofile" | grep -q 'CONTROLLER_ARGS'; then
+  pass "  missing host profile --tier1 proceeds"
+else
+  fail "  missing host profile --tier1: exit=$s51_noprofile_ec out=$(echo "$s51_noprofile" | tail -2)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test: --allow-partial conflicts (mirror --include-real): with --provision,
+# --report, or without a tier flag -> usage error exit 4.
+# ---------------------------------------------------------------------------
+total_count=$((total_count + 1))
+echo "--- Test: --allow-partial conflicts exit 4 (S51) ---" >&2
+all_ok=true
+for combo in "--provision --allow-partial" "--allow-partial --provision" "--report --allow-partial" "--allow-partial"; do
+  set +e
+  bash "$TT_RUN" $combo >/dev/null 2>&1
+  ec=$?
+  set -e
+  if [ "$ec" -eq 4 ]; then
+    pass "  '$combo' exits 4"
+  else
+    fail "  '$combo' exited $ec, expected 4"
+    all_ok=false
+  fi
+done
+if $all_ok; then pass "--allow-partial conflicts exit 4 with usage"; fi
+
 echo ""
 echo "--- Results: $((total_count - fail_count))/$total_count passed ---"
 [ "$fail_count" -eq 0 ] && exit 0 || exit 1

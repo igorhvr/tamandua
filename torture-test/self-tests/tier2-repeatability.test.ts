@@ -11,8 +11,8 @@
 //     TWICE with IDENTICAL per-case outcomes. With a synthesized host
 //     profile that satisfies every real-case predicate (all toolchains +
 //     pi/hermes/dsh harness presence + node_min 22) MINUS node-sqlite, the
-//     45 real cases are NOT_RUN(pending-real) (execution-selection policy,
-//     applied before predicates) and the 25 scripted cells gate honestly as
+//     43 real cases are NOT_RUN(pending-real) (execution-selection policy,
+//     applied before predicates) and the 29 scripted cells gate honestly as
 //     NOT_RUN(predicate) with evidence naming the missing capability — the
 //     "every scripted case PASS or NOT_RUN(predicate)" contract, exercised
 //     on the honest-gating arm. tokens_observed is 0 per case and per
@@ -20,7 +20,7 @@
 //     scripted daemon stays STOPPED and the 533x/433x ports stay free.
 //
 //   AC2 (dry-run argv): TT_DRY_RUN_REAL_LAUNCH over cases/tier2.jsonl with
-//     the same satisfying profile records the exact launch argv for all 45
+//     the same satisfying profile records the exact launch argv for all 43
 //     real cases — including the FIRST real W4 case
 //     (W4.01-missing-evidence-reroute, pi) with --pi-as-harness and one
 //     dsh-lane case (W4.dsh-do-now) with --dsh-as-harness — and marks each
@@ -75,17 +75,18 @@ const CONTAINED_REAL_PORTS = [4334, 4338, 4339];
 const FIRST_REAL_W4 = "W4.01-missing-evidence-reroute";
 const DSH_LANE_CASE = "W4.dsh-do-now";
 
-// The roster's real-case population: 45 real (pi/hermes/dsh) + 25 scripted
-// cells. Pinned here so a manifest edit that changes the population fails
+// The roster's real-case population: 43 real (pi/hermes/dsh) + 29 scripted
+// cells (S49: the W4.33d/W4.48b split retired two real rows and added four
+// scripted cells). Pinned here so a manifest edit that changes the population fails
 // loudly instead of silently weakening the proof.
-const EXPECTED_TOTAL_CASES = 70;
-const EXPECTED_REAL_CASES = 45;
-const EXPECTED_SCRIPTED_CASES = 25;
+const EXPECTED_TOTAL_CASES = 72;
+const EXPECTED_REAL_CASES = 43;
+const EXPECTED_SCRIPTED_CASES = 29;
 
 // Synthesized host profile: satisfies EVERY real-case predicate in
 // tier2.jsonl (node/python3/go/rust/cargo/java+maven toolchains present,
 // pi/hermes/dsh harness presence, node_min 22) MINUS node-sqlite
-// (sqliteAvailable: false on the single runtime) so the 25 scripted cells
+// (sqliteAvailable: false on the single runtime) so the 29 scripted cells
 // gate honestly as NOT_RUN(predicate) — the zero-token, deterministic,
 // idempotent proof shape (the tt-tier1-proof pattern). containment
 // systemd-user-scope + platform linux match the scripted cells' predicates
@@ -248,9 +249,9 @@ const scriptedIds = new Set(
 describe("US-016 Tier-2 zero-token proof", () => {
   it("AC1: bare --tier2 exits 0 GREEN twice with identical per-case outcomes and zero tokens",
     { timeout: 30 * 60 * 1000 }, async () => {
-      assert.equal(tier2Records.length, EXPECTED_TOTAL_CASES, "tier2.jsonl must keep 70 cases");
-      assert.equal(realIds.size, EXPECTED_REAL_CASES, "tier2.jsonl must keep 45 real cases");
-      assert.equal(scriptedIds.size, EXPECTED_SCRIPTED_CASES, "tier2.jsonl must keep 25 scripted cells");
+      assert.equal(tier2Records.length, EXPECTED_TOTAL_CASES, "tier2.jsonl must keep 72 cases");
+      assert.equal(realIds.size, EXPECTED_REAL_CASES, "tier2.jsonl must keep 43 real cases");
+      assert.equal(scriptedIds.size, EXPECTED_SCRIPTED_CASES, "tier2.jsonl must keep 29 scripted cells");
       assert.equal(realIds.size + scriptedIds.size, tier2Records.length,
         "every tier2 case must be exactly one of real/scripted");
 
@@ -269,7 +270,7 @@ describe("US-016 Tier-2 zero-token proof", () => {
       try {
         const validation = run(controller, ["--manifest", tier2Manifest, "--validate-only"]);
         assert.equal(validation.status, 0, `${validation.stdout}\n${validation.stderr}`);
-        assert.match(validation.stdout, /Validated 70 case\(s\)/);
+        assert.match(validation.stdout, /Validated 72 case\(s\)/);
 
         const outcomes: string[] = [];
         for (let runNumber = 1; runNumber <= 2; runNumber += 1) {

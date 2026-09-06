@@ -205,6 +205,15 @@ const allowed = [
   // the golden bootstrap module itself (ensureGoldenBare + its CLI) — part of
   // the provisioning authoring surface alongside tt-fixture-provision.mjs.
   "torture-test/bin/tt-golden-bootstrap.mjs",
+  // S57 (US-013, R4a): golden validity includes a fixtures-src content hash in
+  // the .hashes ledger — the baseline verifier (bin/tt-verify-fixture-
+  // baselines, the CLI boundary of the golden-bootstrap module) now
+  // special-cases the FIXTURES_SRC record and FAILs a drifted real fixture,
+  // naming it — the golden-bootstrap authoring surface extended to the
+  // verifier boundary (the self-test battery under self-tests/ is already
+  // authorized wholesale).
+  "torture-test/bin/tt-verify-fixture-baselines",
+  "torture-test/bin/tt-verify-fixture-baselines.test.sh",
   "torture-test/bin/tt-controller",
   "torture-test/bin/tt-controller.test.sh",
   "torture-test/bin/tt-chaos",
@@ -330,6 +339,15 @@ const allowed = [
   // extension added in the same story that fixed the parity, exactly like
   // the roster stories that created the other w4.* scenario cells.
   "torture-test/scenarios/w4.35/",
+  // S49 (US-010): the W4.33d/W4.48b split cells live under
+  // scenarios/w4.33d-reroute-absorption/, scenarios/w4.33d-resume-force-fail/,
+  // scenarios/w4.48b-move-during-hold/ and scenarios/w4.48b-park-absorption/
+  // (the tier0 scenario-cell shape) — new scenario surfaces added in the
+  // same story that created them.
+  "torture-test/scenarios/w4.33d-reroute-absorption/",
+  "torture-test/scenarios/w4.33d-resume-force-fail/",
+  "torture-test/scenarios/w4.48b-move-during-hold/",
+  "torture-test/scenarios/w4.48b-park-absorption/",
   "torture-test/scenarios/lib/run-scripted-scenario",
   // MACP4 US-004: the four W2 scripted cells (scenarios/w2.21/run.mjs,
   // w2.23a/run.mjs, w2.23b/run.mjs, w2.23c/run.mjs) and the spawn env

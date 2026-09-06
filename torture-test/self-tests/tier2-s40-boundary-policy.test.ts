@@ -126,7 +126,7 @@ function taskText(record: Case): string {
 describe("Tier-2 S40 per-case boundary_files policy", () => {
   it("AC1: every tier2 boundary entry resolves to an existing path under torture-test/", () => {
     const rows = readManifest();
-    assert.equal(rows.length, 70, "tier2.jsonl must keep 70 rows");
+    assert.equal(rows.length, 72, "tier2.jsonl must keep 72 rows");
     for (const record of rows) {
       assert.ok(Array.isArray(record.boundary_files) && record.boundary_files.length > 0,
         `${record.id} must declare a nonempty boundary_files list`);

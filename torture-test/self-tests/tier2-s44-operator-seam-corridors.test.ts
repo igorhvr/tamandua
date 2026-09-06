@@ -27,11 +27,15 @@
 //     before/after evidence); the resumed run completes (O16 PASS).
 //   * W4.47-auth-expiry-copy — invalidate_credentials fires at launch
 //     (contained home .pi/agent/auth.json replaced, backup created), the
-//     do-now's first round fails with a diagnosable provider error (the
-//     invalidated launch — a provider-error instant-fail, so no step event
-//     is emitted), restore_credentials fires on event:step.running (the
-//     retried round's dispatch — the relaunch; byte-identical restore) and
-//     the retried round completes.
+//     do-now's first round is a genuine ZERO-OUTPUT sub-2s instant-fail (the
+//     scripted runtime's die-before-claim shape — the invalidated launch
+//     round exits before claiming, so no step.running event is ever emitted
+//     and the product daemon logs the "Worker round classified as instant
+//     fail" classification), restore_credentials fires on the run's first
+//     instant-fail classification in the contained daemon's log (S62 re-arm:
+//     the awaited {"daemon_log":...} trigger — the old event:step.running
+//     arming can never fire under an instant-fail loop; byte-identical
+//     restore) and the retried round completes.
 //
 // Mechanics follow the E3.C US-011 tier1-scripted-probe-battery /
 // tier2-s29-fired-trigger-corridor pattern: the CALIBRATED manifest rows are
@@ -227,9 +231,11 @@ function buildScriptedManifest(): string {
 // shape; the merger physically lands via merge-branch so the origin target
 // ref genuinely moves). The fixer sleeps SLOW_SLEEP_SECONDS so the
 // step:fixer:running marker fires mid-round AND the fixer round survives the
-// daemon death (survivor guard) and completes after the restart. do-now: the
-// doer's FIRST invocation emits a 429 provider error (the invalidated
-// round — the product recovers it as step.worker_lost) and the SECOND
+// daemon death (survivor guard) and completes after the restart. do-now (S62
+// re-arm): the doer's FIRST invocation is a genuine ZERO-OUTPUT sub-2s
+// instant-fail (die-before-claim — the invalidated round exits before
+// claiming, so the product daemon logs the instant-fail classification the
+// restore trigger awaits; no step.running is ever emitted) and the SECOND
 // invocation succeeds (the restored round). Zero tokens.
 function writeBehaviors(): string {
   const behaviorsPath = path.join(workRoot, "behaviors.json");
@@ -275,6 +281,22 @@ function writeBehaviors(): string {
           "STATUS: done",
           "CHANGES: scripted s44b probe change",
           "REGRESSION_TEST: scripted s44b corridor regression",
+          // The current bundled bfmw workflow requires the fixer to account
+          // for the bug reproduction (REPRO_EVIDENCE | CANNOT_REPRODUCE key)
+          // and ALWAYS runs the deception_audit step after the fix (WAVE-A.1
+          // PHNT always-audit) — the corridor scripts the honest account
+          // (probe-marker.txt IS the demonstrated pre-fix failure) and the
+          // auditor's HONEST verdict so the scripted bfmw pipeline flows.
+          "REPRO_EVIDENCE: probe-marker.txt",
+        ].join("\n"),
+      },
+      // WAVE-A.1 PHNT always-audit: the bfmw workflow audits the fixer's
+      // reproduction account after EVERY fix completion — the corridor
+      // scripts the honest HONEST verdict so the run proceeds.
+      auditor: {
+        output: [
+          "STATUS: done",
+          "VERDICT: HONEST",
         ].join("\n"),
       },
       verifier: {
@@ -306,11 +328,15 @@ function writeBehaviors(): string {
           "MERGED_TREE: {{input.TESTED_TREE}}",
         ].join("\n"),
       },
-      // do-now: first invocation = the invalidated round (provider error);
-      // second invocation = the restored round (success). The behavior
-      // ARRAY is consumed per work invocation (last entry repeats).
+      // do-now (S62 re-arm): first invocation = the invalidated round — a
+      // genuine ZERO-OUTPUT sub-2s instant-fail (die-before-claim, so the
+      // product daemon logs the instant-fail classification the restore's
+      // {"daemon_log":...} trigger awaits; no step.running is ever emitted
+      // by this round); second invocation = the restored round (success).
+      // The behavior ARRAY is consumed per work invocation (last entry
+      // repeats).
       doer: [
-        { provider_error: { shape: "429" } },
+        { mode: "die-before-claim", exitCode: 3 },
         {
           output: [
             "STATUS: done",
@@ -567,13 +593,15 @@ describe("S44b (US-010) — operator-seam cell corridors against the contained s
           assertOracleVerdict(cs, "PASS");
         }
 
-        // ── W4.47-auth-expiry-copy: invalidate_credentials fires at launch
-        //    (contained auth.json replaced + backup), the do-now's first
-        //    round fails with a diagnosable provider error (the scripted
-        //    runtime's provider_error shape — the invalidated launch),
-        //    restore_credentials fires on event:step.running (the retried
-        //    round's dispatch — the relaunch; byte-identical restore) and the
-        //    retried round completes. ──
+        // ── W4.47-auth-expiry-copy (S62 re-arm): invalidate_credentials
+        //    fires at launch (contained auth.json replaced + backup), the
+        //    do-now's first round is a genuine ZERO-OUTPUT sub-2s
+        //    instant-fail (die-before-claim — the invalidated launch round
+        //    exits before claiming, so no step.running is ever emitted),
+        //    restore_credentials fires on the run's first instant-fail
+        //    classification in the contained daemon's log (the awaited
+        //    {"daemon_log":...} trigger) and the retried round completes
+        //    (byte-identical restore). ──
         {
           const cs = caseState(state, "W4.47-auth-expiry-copy");
           assert.equal(cs.outcome, "PASS", `W4.47: ${cs.outcome} ${JSON.stringify(cs.reason ?? null)}`);
@@ -595,8 +623,9 @@ describe("S44b (US-010) — operator-seam cell corridors against the contained s
             "W4.47: the invalidate must change the contained auth.json bytes");
           assert.equal(invalidate.effect?.backup_created, true);
           assert.equal(restore.op, "restore_credentials");
-          assert.equal(restore.trigger, "event:step.running",
-            "W4.47: the restore must arm on event:step.running (the retried round's dispatch — the relaunch)");
+          assert.deepEqual(restore.trigger,
+            { daemon_log: "Worker round classified as instant fail", timeout_s: 600 },
+            "W4.47: the restore must arm on the daemon-log instant-fail classification trigger (S62 re-arm — event:step.running can never fire under an instant-fail loop)");
           assert.equal(restore.effect?.restored, true);
           assert.equal(restore.effect?.backup_removed, true);
           assert.equal(restore.target_sha256_after, invalidate.target_sha256_before,
@@ -607,25 +636,37 @@ describe("S44b (US-010) — operator-seam cell corridors against the contained s
           assert.ok(finalBytes.includes("s44b-contained-original-key"),
             "W4.47: the contained auth.json must hold the original credential after the restore");
 
-          // The invalidated round's diagnosable provider/auth error (the
-          // "invalidated launch fails with a diagnosable auth error"
-          // premise): the scripted runtime's invocation journal records the
-          // provider_error shape for the doer. (The provider-error round is
-          // an instant-fail — it exits before claiming, so the run's event
-          // stream carries NO step.worker_lost; the retry is silent.)
+          // The invalidated round (the "invalidated launch fails" premise):
+          // the scripted runtime's invocation journal records the
+          // die-before-claim shape for the doer — a genuine zero-output
+          // sub-2s instant-fail (it exits before claiming, so the run's event
+          // stream carries NO step.running and NO step.worker_lost; the retry
+          // is silent), and the CONTAINED daemon's product log must carry the
+          // "Worker round classified as instant fail" line for the run — the
+          // signal the restore's daemon_log trigger fired on.
           const invocationLog = path.join(behaviorsEnv.TAMANDUA_SCRIPTED_STATE as string, "invocations.jsonl");
           assert.ok(fs.existsSync(invocationLog), "W4.47: the scripted runtime journal must exist");
           const invocationText = fs.readFileSync(invocationLog, "utf8");
-          const providerErrors = invocationText.split(/\r?\n/).filter((line) => line.trim() !== "")
+          const instantFailRounds = invocationText.split(/\r?\n/).filter((line) => line.trim() !== "")
             .map((line) => JSON.parse(line))
-            .filter((entry) => String(entry.note ?? "").includes("provider_error shape=429"));
-          assert.ok(providerErrors.length >= 1,
-            "W4.47: the scripted runtime journal must record the invalidated round's diagnosable provider error (provider_error shape=429)");
+            .filter((entry) => String(entry.note ?? "").includes("exiting before claim"));
+          assert.ok(instantFailRounds.length >= 1,
+            "W4.47: the scripted runtime journal must record the invalidated round's instant-fail (exiting before claim)");
           const doerRounds = invocationText.split(/\r?\n/).filter((line) => line.trim() !== "")
             .map((line) => JSON.parse(line))
             .filter((entry) => String(entry.agentId ?? "").endsWith("_doer"));
           assert.ok(doerRounds.length >= 2,
             "W4.47: the doer must be invoked at least twice (the invalidated round + the restored round)");
+          // The contained daemon's product log recorded the classification
+          // the daemon_log trigger consumed (the product logs it per
+          // instant-fail round, keyed by the run id).
+          const daemonLog = path.join(scriptedStateDir, "tamandua.log");
+          assert.ok(fs.existsSync(daemonLog), "W4.47: the contained daemon log must exist (the daemon_log trigger's source)");
+          const logText = fs.readFileSync(daemonLog, "utf8");
+          const shortRunId = String(attempt.run_id ?? "").replace(/^run-/, "");
+          assert.ok(logText.includes("Worker round classified as instant fail")
+              && (logText.includes(shortRunId) || logText.includes(String(attempt.run_id ?? ""))),
+            "W4.47: the contained daemon log must record the instant-fail classification for this run (the daemon_log trigger's signal)");
         }
 
         // ── Zero tokens: campaign-wide + the scripted runtime journal. ──

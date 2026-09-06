@@ -352,6 +352,21 @@ for seed_id in "${SEED_ORDER[@]}"; do
 done
 printf "%-20s %s\n" "BRANCH broken-tests" "$BROKEN_TESTS_HEAD"
 
+# ── Fixtures-src content hash (S57) ────────────────────────────────
+# Canonical sha256 over the fixture SOURCE tree this golden is built from
+# (FIXTURE_SRC=../tt-python — the shared python source; the master variant
+# has no source copy of its own), recorded as the FIXTURES_SRC ledger record.
+# Golden validity compares it against the current fixtures-src content, so
+# fixtures-src drift invalidates the golden. Computed by the shared bootstrap
+# binary so builders and verifiers agree on the exact same value.
+FIXTURES_SRC_HASH="$(
+    "$SCRIPT_DIR/../../bin/tt-golden-bootstrap.mjs" --hash-fixtures-src-dir "$FIXTURE_SRC" 2>/dev/null
+)" || {
+    echo "  ✗ could not compute the fixtures-src content hash (S57)" >&2
+    exit 1
+}
+printf "%-20s %s\n" "FIXTURES_SRC" "$FIXTURES_SRC_HASH"
+
 # ── Deterministic verification (on re-run) ─────────────────────────
 current_hashes="$(
     printf "BASELINE %s\n" "$BASELINE_HASH"
@@ -360,6 +375,7 @@ current_hashes="$(
         printf "SEED %s %s\n" "$seed_id" "$h"
     done
     printf "BRANCH broken-tests %s\n" "$BROKEN_TESTS_HEAD"
+    printf "FIXTURES_SRC %s\n" "$FIXTURES_SRC_HASH"
 )"
 
 if [ -f "$HASH_FILE" ]; then

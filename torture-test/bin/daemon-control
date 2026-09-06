@@ -53,7 +53,11 @@
 #     -d cwd -Fn` for the cwd, `ps -p <pid> -o command=` for the cmdline),
 #     so CLI-auto-daemon stop (stop_cli_auto_daemon, the W2.21 restart
 #     corridor) and the escalation paths still verify TT-ownership on the
-#     mac. Unavailable evidence -> refuse, exactly as on linux.
+#     mac. Unavailable evidence -> refuse, exactly as on linux. The cmdline
+#     arm does NOT require the literal 'tamandua' (S54): it accepts the
+#     CLI-wrapper argv OR this repo's built daemon entry
+#     ($TT_REPO_ROOT/dist/server/daemon.js — a checkout named e.g. by run
+#     id carries no 'tamandua' in argv).
 #   - Operator home: _tt_operator_home (REAL_TAMANDUA_STATE + the S24
 #     operator_bin_dirs reorder) resolves via getent -> dscl (macOS
 #     NFSHomeDirectory) -> `eval echo ~<user>` -> $HOME — the mac's
@@ -77,17 +81,19 @@
 #     alone (the linux-only `[ -d /proc/<pid> ]` requirement dropped), and
 #     cmdline verification via the portable ps arm on Darwin
 #     (`ps -p <pid> -o command=`) behind the TT_DC_PLATFORM seam, with the
-#     /proc read retained on linux. RUNNING still requires alive AND cmdline
-#     containing 'tamandua' AND a listening port; unverifiable -> UNKNOWN.
+#     /proc read retained on linux. RUNNING still requires alive AND a TT
+#     daemon cmdline (S54: the literal 'tamandua' OR this repo's built
+#     daemon argv under $TT_REPO_ROOT/dist/server/) AND a listening port;
+#     unverifiable -> UNKNOWN.
 #
 # T2.1 US-009: scope unit names are PER-WORKTREE (tamandua-tt-<kind>-<hash>
 # derived from the repo root), never the old fixed per-user name — a
 # concurrent campaign in another worktree must not be able to stop or
 # collide with this worktree's daemon scope. cmd_start additionally waits
-# (bounded, TT_DAEMON_PORT_WAIT_SECONDS, default 180) for the kind's FIXED
-# ports to free before launching, so concurrent worktrees serialize on the
-# shared ports instead of failing their bootstrap with EADDRINUSE, and
-# clears a stale tamandua.pid left by a killed daemon.
+# (bounded, TT_DAEMON_PORT_WAIT_SECONDS, default 30 — S56) for the kind's
+# FIXED ports to free before launching, so concurrent worktrees serialize
+# on the shared ports instead of failing their bootstrap with EADDRINUSE,
+# and clears a stale tamandua.pid left by a killed daemon.
 set -euo pipefail
 
 # ── path resolution ──────────────────────────────────────────────────
@@ -536,6 +542,124 @@ run_under_env() {
   env -i $(env_for_kind "$kind") PATH="$(contained_path_for_kind "$kind")" "$@"
 }
 
+# ── S55: the contained daemon MUST run the WORKTREE/checkout dist ─────
+#
+# Every contained daemon launch (cmd_start launch script, the graceful
+# dashboard/mcp CLI stops) invokes the repo's OWN bin/tamandua by ABSOLUTE
+# path — NEVER a PATH lookup. A PATH lookup could resolve an installed build
+# from ANOTHER checkout (the S55 defect: a campaign's contained daemon
+# silently ran the operator's installed dist — tt-daemon-up's S15 parity
+# guard only caught it AFTER the fact on the real kind, and the scripted
+# kind had no guard at all). bin/tamandua is a wrapper around
+# <TT_REPO_ROOT>/dist/cli/cli.js, so launching it by absolute path guarantees
+# the daemon runs the checkout's OWN dist.
+#
+# Test seam: hermetic fake-CLI fixtures (tier1-s56-daemon-stop-wait and the
+# tier1-s54 lifecycle arm) model the product CLI with a fake shim and point
+# TT_DC_TAMANDUA_BIN at it — the fake cannot live at the real
+# $TT_REPO_ROOT/bin/tamandua.
+
+# resolve_tt_cli: print the resolved contained-daemon launcher CLI —
+# TT_DC_TAMANDUA_BIN (test seam / hermetic fake fixtures) or
+# $TT_REPO_ROOT/bin/tamandua (the worktree's own CLI, never a PATH lookup).
+resolve_tt_cli() {
+  printf '%s' "${TT_DC_TAMANDUA_BIN:-$TT_REPO_ROOT/bin/tamandua}"
+}
+
+# fetch_dc_health_version: GET <ctrl>/control/health via `node -e` fetch (no
+# curl dependency; node is guaranteed — daemon-control already requires it).
+# Prints the trimmed buildVersion on success, NOTHING on failure (non-JSON,
+# connection refused, timeout, missing field). Never exits non-zero so set -e
+# can not be tripped by a degraded daemon.
+fetch_dc_health_version() {
+  local port="$1"
+  node -e '
+    const port = Number(process.argv[1]);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2000);
+    const done = () => clearTimeout(timer);
+    fetch(`http://127.0.0.1:${port}/control/health`, { signal: ctrl.signal })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error("http " + res.status))))
+      .then((body) => {
+        if (body && typeof body.buildVersion === "string") process.stdout.write(body.buildVersion.trim());
+      })
+      .catch(() => {})
+      .finally(done);
+  ' "$port"
+}
+
+# resolve_dc_expected_version: the LAUNCHING CLI's own dist version — the
+# version file of the checkout whose bin/tamandua launches the daemon
+# (TT_DC_EXPECTED_VERSION_FILE test seam, default <TT_REPO_ROOT>/dist/version,
+# mirroring tt-daemon-up's TT_DAEMON_EXPECTED_VERSION_FILE). Empty when the
+# file is missing/empty (caller fails closed — an unverifiable expected
+# version is never a silent pass).
+resolve_dc_expected_version() {
+  local vf="${TT_DC_EXPECTED_VERSION_FILE:-$TT_REPO_ROOT/dist/version}"
+  if [ -f "$vf" ]; then
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$vf"
+  fi
+}
+
+# verify_launch_dist_parity: S55 dist/version parity gate — the daemon a
+# launch produced must report a /control/health buildVersion EQUAL to the
+# launching CLI's dist version (the checkout whose bin/tamandua launched it).
+# A mismatch or an unverifiable health response is a parity failure (a
+# worktree whose dist differs from the installed checkout must never make a
+# campaign run against the WRONG daemon). Sets the global DC_PARITY_OBSERVED
+# (observed version, or empty when the health query failed) for the
+# fail-closed DETAILS and the provenance record. Returns 0 on parity, 1 on
+# mismatch OR unverifiable health OR unresolvable expected version.
+DC_PARITY_OBSERVED=""
+verify_launch_dist_parity() {
+  local ctrl_port="$1"
+  DC_PARITY_OBSERVED="$(fetch_dc_health_version "$ctrl_port")"
+  local expected
+  expected="$(resolve_dc_expected_version)"
+  if [ -z "$expected" ]; then
+    echo "daemon-control: dist/version parity: no expected version (TT_DC_EXPECTED_VERSION_FILE / <TT_REPO_ROOT>/dist/version missing or empty) — cannot verify, fail closed (classified as infrastructure, never a product fault)" >&2
+    return 1
+  fi
+  if [ -z "$DC_PARITY_OBSERVED" ]; then
+    echo "daemon-control: dist/version parity: health query on control port $ctrl_port failed (non-JSON/refused/timeout) — fail closed, never launch against an unverifiable daemon (classified as infrastructure, never a product fault)" >&2
+    return 1
+  fi
+  if [ "$DC_PARITY_OBSERVED" != "$expected" ]; then
+    echo "daemon-control: dist/version parity: MISMATCH — daemon reports '$DC_PARITY_OBSERVED', the launching CLI dist is '$expected' (control port $ctrl_port): the contained daemon did NOT run this checkout dist (classified as infrastructure, never a product fault)" >&2
+    return 1
+  fi
+  echo "daemon-control: dist/version parity: OK (daemon build '$DC_PARITY_OBSERVED' matches the launching CLI dist '$expected')." >&2
+  return 0
+}
+
+# read_lifecycle_daemon_start: parse the NEWEST "daemon.start" entry from the
+# contained daemon's lifecycle.log (<state_dir>/lifecycle.log — the product
+# journals one JSON line per daemon lifecycle action; the daemon.start entry
+# carries the running dist version AND callerArgv = the daemon entry argv
+# `node <TT_REPO_ROOT>/dist/server/daemon.js`, which names the dist that
+# ran). Prints compact JSON {"version": "...", "callerArgv": [...]} — both
+# fields empty when the journal is absent or has no daemon.start entry yet
+# (hermetic fake-CLI fixtures journal nothing). Never exits non-zero.
+read_lifecycle_daemon_start() {
+  local state_dir="$1"
+  node -e '
+    const fs = require("fs");
+    const stateDir = process.argv[1];
+    const file = stateDir + "/lifecycle.log";
+    let last = null;
+    try {
+      const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+      for (const line of lines) {
+        if (line.indexOf("daemon.start") < 0) continue;
+        try { last = JSON.parse(line); } catch (e) { /* skip unparseable line */ }
+      }
+    } catch (e) { /* no journal */ }
+    const version = last && typeof last.version === "string" ? last.version : "";
+    const callerArgv = last && Array.isArray(last.callerArgv) ? last.callerArgv : [];
+    process.stdout.write(JSON.stringify({ version, callerArgv }));
+  ' "$state_dir"
+}
+
 # ── directory setup ──────────────────────────────────────────────────
 
 ensure_prov_dir() {
@@ -673,7 +797,7 @@ Containment (T2.1 US-009):
     derived from the repo root), so concurrent campaigns in different
     worktrees never stop or collide with each other's daemon scope.
   - The kind's ports are FIXED (shared per user); cmd_start waits (bounded,
-    TT_DAEMON_PORT_WAIT_SECONDS, default 180s) for them to free before
+    TT_DAEMON_PORT_WAIT_SECONDS, default 30s — S56) for them to free before
     launching, so concurrent worktrees serialize instead of failing the
     bootstrap with EADDRINUSE. A stale tamandua.pid left by a killed daemon
     is cleared before launch.
@@ -746,8 +870,18 @@ Environment:
     operator home.
   TT_DAEMON_PORT_WAIT_SECONDS: bounded seconds cmd_start waits for the
     kind's fixed ports (scripted 5334/5338/5339, real 4334/4338/4339) to be
-    free before launching (default 10) — concurrent worktrees serialize on
-    the shared ports instead of EADDRINUSE-failing their bootstrap.
+    free before launching (default 30 — S56: the start path must wait a
+    bounded, configurable interval of >= 30s by default for port release) —
+    concurrent worktrees serialize on the shared ports instead of
+    EADDRINUSE-failing their bootstrap. A busy-port refusal after the bound
+    is classified INFRA and names every holder's pid + cmdline.
+  TT_DAEMON_STOP_WAIT_SECONDS: bounded seconds cmd_stop waits AFTER its
+    graceful/escalation/scope-teardown work for the kind's fixed ports to be
+    free AND the recorded dashboard/mcp/control-plane children to exit
+    before it returns (default 30 — S56). A stop NEVER returns success
+    while a listener is still bound or a child is still alive: residue at
+    the bound is classified INFRA with the holder pid/cmdline and fails the
+    stop (exit 1), so the next start cannot collide with EADDRINUSE.
   TT_FORCE_NO_SYSTEMD=1 (MACP4 US-001): force the plain-background fallback
     launch path even on a systemd host — has_systemd_scope() returns false
     so cmd_start uses the nohup spawn (marker: "systemd not available —
@@ -756,6 +890,31 @@ Environment:
     with cgroupVerified=false. This is the launch path Darwin always takes;
     the override is the mechanical linux-side forcing for the W2 scripted
     cells' dual-path proof. Default behavior on systemd hosts is unchanged.
+  S55 (which dist the contained daemon runs):
+  - Contained daemons are launched by the WORKTREE's OWN bin/tamandua
+    (resolve_tt_cli) — an ABSOLUTE path, never a PATH lookup that could
+    resolve an installed build from another checkout. The graceful CLI stops
+    use the same resolved launcher.
+  - TT_DC_TAMANDUA_BIN=<path> (self-test seam, S55): point the launcher at a
+    hermetic fake-CLI shim (tier1-s54/s56 lifecycle fixtures). Unset in
+    production = $TT_REPO_ROOT/bin/tamandua.
+  - TT_DC_HEALTH_PARITY=<0|1> (S55): when 1 (default), cmd_start fails
+    closed as INFRA unless the launched daemon's /control/health
+    buildVersion equals the launching CLI's dist version
+    (TT_DC_EXPECTED_VERSION_FILE, default <TT_REPO_ROOT>/dist/version) — a
+    daemon built from a DIFFERENT checkout is stopped and never recorded.
+    Hermetic fake-CLI fixtures that cannot serve /control/health set it to 0
+    (documented test seam, never a production path).
+  - TT_DC_EXPECTED_VERSION_FILE=<file> (self-test seam, S55): the expected
+    dist version compared against the daemon's health buildVersion (default
+    <TT_REPO_ROOT>/dist/version). Mirrors tt-daemon-up's
+    TT_DAEMON_EXPECTED_VERSION_FILE.
+  - The provenance record (<var>/daemon-control/<kind>.json) carries which
+    dist ran: daemonVersion (the parity-observed /control/health
+    buildVersion), callerArgv (the daemon entry argv recorded in the
+    daemon.start lifecycle journal of the contained daemon — it names the
+    exact dist that ran), and launchCli (the absolute CLI that launched the
+    daemon). Campaign evidence writers (state.json/report) surface these.
   Port liveness probes (wait_for_port/is_port_listening) use a PORTABLE
     node net.connect probe (port_probe) — no GNU timeout(1) dependency, so
     start/status/stop work on Darwin (macOS ships no timeout(1)).
@@ -836,6 +995,24 @@ verify_cgroup() {
 #     lsof cannot introspect) the function REFUSES exactly as the linux
 #     path does — TT-ownership must be PROVEN, never assumed.
 #
+# Cmdline acceptance (S54): the cmdline must NOT require the literal
+# 'tamandua'. The real daemon's argv is `node <TT_REPO_ROOT>/dist/server/
+# daemon.js` (daemonctl.ts startDaemon) — under a checkout whose directory
+# name does not contain 'tamandua' (e.g. a worktree named by run id) that
+# argv carries no 'tamandua' at all, yet the process IS this repo's daemon
+# (cwd already proven under TT_REPO_ROOT). Two arms, either proves the
+# cmdline:
+#   (a) the literal 'tamandua' (the CLI wrapper argv — `tamandua daemon
+#       start`, `node .../bin/tamandua daemon ...` — and the fake scripted
+#       CLI shims, which embed 'tamandua' in argv), OR
+#   (b) a script path under THIS repo's built product
+#       ($TT_REPO_ROOT/dist/server/ — daemon.js, dashboard-standalone.js,
+#       mcp-standalone.js, control-standalone.js — the real daemon family).
+# A foreign cmdline (`node /usr/bin/server.js`, a bare `bash -c ...` with
+# no repo path) is REFUSED exactly as before — TT-ownership must be PROVEN,
+# never assumed; the 'tamandua' grep arm is unchanged and keeps every
+# pre-S54 acceptance intact.
+#
 # TT_DC_PLATFORM (MACP4 US-002 test seam): forces the evidence branch on
 # any host ('Darwin' | anything else = linux /proc) so the Darwin branch
 # is hermetic-testable on linux (see
@@ -851,8 +1028,8 @@ verify_process_tt_owned() {
   case "$platform" in
     Darwin)
       # /proc-less host (macOS): portable evidence. `lsof -a -p <pid>
-      # -d cwd -Fn` prints the cwd as an `n<path>` row (the 'p<pid>' row
-      # and lsof's fd-name row, if any, are ignored); `ps -p <pid>
+      # -d cwd -Fn` prints the cwd as an `n<path>` row (the p<pid> row
+      # and lsof fd-name row, if any, are ignored); `ps -p <pid>
       # -o command=` prints the full command line. Both are mechanical
       # and present on macOS by default (/usr/sbin/lsof, /bin/ps).
       actual_cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)"
@@ -864,7 +1041,8 @@ verify_process_tt_owned() {
       if [ -L "/proc/$pid/cwd" ]; then
         actual_cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
       fi
-      # Check /proc/$PID/cmdline — must contain tamandua
+      # Check /proc/$PID/cmdline (linux /proc read — never reached on
+      # /proc-less hosts)
       cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
       ;;
   esac
@@ -882,8 +1060,12 @@ verify_process_tt_owned() {
   if [ -z "$cmdline" ]; then
     return 1  # cannot read cmdline — refuse
   fi
-  if ! echo "$cmdline" | grep -q 'tamandua'; then
-    return 1  # cmdline doesn't contain tamandua — refuse
+  # S54: accept the CLI-wrapper tamandua argv arm OR the repo built daemon
+  # entry ($TT_REPO_ROOT/dist/server/… — grep -F: the path is a literal,
+  # never a regex) — never the literal-tamandua-only refusal.
+  if ! { echo "$cmdline" | grep -q 'tamandua' \
+      || echo "$cmdline" | grep -Fq "$TT_REPO_ROOT/dist/server/"; }; then
+    return 1  # cmdline neither names tamandua nor the repo dist — refuse
   fi
 
   return 0
@@ -898,7 +1080,8 @@ verify_process_tt_owned() {
 #       process-start identity ('proc:<n>' on linux, 'darwin:<lstart>' on
 #       /proc-less hosts — MACP4 US-002);
 #   (c) verify_process_tt_owned <pid> <state_dir> — the pid is PROVEN
-#       TT-owned (cwd under TT_REPO_ROOT + cmdline containing tamandua).
+#       TT-owned (cwd under TT_REPO_ROOT + a TT daemon cmdline — the
+#       literal 'tamandua' OR $TT_REPO_ROOT/dist/server/…, S54).
 #
 # MACP5 US-001: on Darwin the nohup/background chain double-forks, so the
 # pidfile can name a WRAPPER pid (or a stale/zombie pid) that exits while
@@ -998,6 +1181,14 @@ update_provenance_after_stop() {
 # write_provenance: write JSON provenance record to
 # $PROV_DIR/$NAME.json. Uses jq if available, otherwise writes a
 # minimal JSON with printf.
+#
+# S55 (which dist ran): the record additionally carries the daemon's dist
+# version (daemonVersion — the /control/health buildVersion the launch's
+# parity gate observed, or the lifecycle.log daemon.start version), the
+# lifecycle callerArgv (the daemon entry argv from the daemon.start journal —
+# names the exact dist that ran), and launchCli (the absolute CLI that
+# launched this daemon — the worktree's own bin/tamandua). Empty/absent on
+# hermetic fake-CLI fixtures (no real product journal).
 write_provenance() {
   local name="$1"
   local kind="$2"
@@ -1009,6 +1200,9 @@ write_provenance() {
   local cmdline="$8"
   local cwd="$9"
   local start_time="${10}"  # 'proc:<n>' process-start identity (US-004)
+  local daemon_version="${11:-}"
+  local caller_argv_json="${12:-[]}"
+  local launch_cli="${13:-}"
   local prov_file="$PROV_DIR/$name.json"
 
   # MACP5 US-001: provenance MUST carry the daemon's process-start identity
@@ -1047,6 +1241,9 @@ write_provenance() {
       --arg cmdline "$cmdline" \
       --arg cwd "$cwd" \
       --arg startTime "$start_time" \
+      --arg daemonVersion "$daemon_version" \
+      --argjson callerArgv "$caller_argv_json" \
+      --arg launchCli "$launch_cli" \
       '{
         name: $name,
         kind: $kind,
@@ -1057,7 +1254,10 @@ write_provenance() {
         startedAt: $startedAt,
         cmdline: $cmdline,
         cwd: $cwd,
-        startTime: $startTime
+        startTime: $startTime,
+        daemonVersion: $daemonVersion,
+        callerArgv: $callerArgv,
+        launchCli: $launchCli
       }' > "$prov_file"
   else
     # Fallback: write JSON with printf (no jq dependency for basic operation)
@@ -1072,7 +1272,10 @@ write_provenance() {
   "startedAt": "$started_at",
   "cmdline": "$cmdline",
   "cwd": "$cwd",
-  "startTime": "$start_time"
+  "startTime": "$start_time",
+  "daemonVersion": "$daemon_version",
+  "callerArgv": $caller_argv_json,
+  "launchCli": "$launch_cli"
 }
 PROVEOF
   fi
@@ -1173,8 +1376,21 @@ cmd_start() {
 
   # Build the launch command: start daemon (control-plane+motor),
   # then dashboard, then MCP — all under the spawn env.
+  #
+  # S55: the launch invokes the WORKTREE's OWN bin/tamandua by ABSOLUTE path
+  # (resolve_tt_cli — TT_DC_TAMANDUA_BIN seam or $TT_REPO_ROOT/bin/tamandua),
+  # NEVER a bare `tamandua` PATH lookup: a PATH lookup could resolve an
+  # installed build from another checkout and the campaign would silently run
+  # the WRONG dist. Fail closed (INFRA) when the resolved launcher is missing
+  # or not executable — no PATH-lookup fallback, ever.
+  local tt_cli
+  tt_cli="$(resolve_tt_cli)"
+  if [ ! -f "$tt_cli" ] || [ ! -x "$tt_cli" ]; then
+    echo "daemon-control: INFRA — the contained daemon launcher '$tt_cli' is missing or not executable (TT_DC_TAMANDUA_BIN / \$TT_REPO_ROOT/bin/tamandua); refusing to launch via a PATH lookup that could resolve a foreign checkout's dist — classified as infrastructure (a launch/infra failure, never a product fault)" >&2
+    exit 1
+  fi
   local launch_script
-  launch_script="tamandua daemon start && tamandua dashboard start --port $dash_port && tamandua mcp start --port $mcp_port"
+  launch_script="\"$tt_cli\" daemon start && \"$tt_cli\" dashboard start --port $dash_port && \"$tt_cli\" mcp start --port $mcp_port"
 
   # E3.C.2 US-002: bounded port-free wait BEFORE launching (both launch
   # paths). With per-worktree scope names a concurrent worktree's daemon can
@@ -1182,13 +1398,15 @@ cmd_start() {
   # and holding this kind's FIXED ports (scripted 5334/5338/5339, real
   # 4334/4338/4339) — launching into a busy control port would fail the
   # daemon start with EADDRINUSE. Wait (bounded; env-overridable
-  # TT_DAEMON_PORT_WAIT_SECONDS with a small default so self-tests stay
-  # fast) for the ports to free — the other worktree's scenario ends and
-  # stops its daemon — then launch; fail with a clear diagnostic if the
-  # bound is exceeded (a stuck foreign daemon).
-  local port_wait_seconds="${TT_DAEMON_PORT_WAIT_SECONDS:-10}"
+  # TT_DAEMON_PORT_WAIT_SECONDS, default >= 30s — S56 requires the start
+  # path to wait a bounded, configurable interval of at least 30s by
+  # default) for the ports to free — the other worktree's scenario ends and
+  # stops its daemon — then launch; fail with a clear INFRA diagnostic
+  # naming the holder pid/cmdline if the bound is exceeded (a stuck foreign
+  # daemon).
+  local port_wait_seconds="${TT_DAEMON_PORT_WAIT_SECONDS:-30}"
   case "$port_wait_seconds" in
-    ''|*[!0-9]*) port_wait_seconds=10 ;;
+    ''|*[!0-9]*) port_wait_seconds=30 ;;
   esac
   local port_wait_deadline; port_wait_deadline=$(($(date +%s) + port_wait_seconds))
   # E3.C.2 US-004 FINDING: a busy port here may be held by the CLI-auto-
@@ -1333,7 +1551,7 @@ cmd_start() {
         echo "daemon-control: daemon PID $daemon_pid (identity-verified)" >&2
         break
       fi
-      echo "daemon-control: pidfile candidate '$candidate_pid' is not an identity-verified TT-owned daemon — treating the launch attempt as failed" >&2
+      echo "daemon-control: pidfile candidate '$candidate_pid' is not an identity-verified TT-owned daemon — treating the launch attempt as failed (classified as infrastructure: an unverifiable/foreign pidfile candidate is a launch/infra condition, never a product fault)" >&2
     fi
     # Launch attempt failed (a foreign daemon won a shared port in the instant
     # between the settle-recheck and our bind — EADDRINUSE — or the daemon
@@ -1351,8 +1569,20 @@ cmd_start() {
   if [ -z "$daemon_pid" ]; then
     if [ -n "$still_busy" ]; then
       echo "daemon-control: ERROR — $kind ports$still_busy are still in use after ${port_wait_seconds}s (a concurrent worktree daemon or a stuck listener); refusing to launch into a busy port" >&2
+      # S56: a 'ports still in use' outcome classifies as INFRA and carries
+      # the holder pid + cmdline in the reason (never a silent race, never a
+      # product-fault classification).
+      local busy_port holder
+      for busy_port in $still_busy; do
+        holder="$(describe_port_holder "$busy_port")"
+        echo "daemon-control: INFRA — $holder is not a TT daemon this tool can stop; a concurrent worktree's start/stop must clear it first — classified as infrastructure" >&2
+      done
     else
-      echo "daemon-control: ERROR — $kind daemon did not start within ${port_wait_seconds}s: no identity-verified daemon pid appeared (launch attempts collided, the daemon crashed, or every pidfile candidate was an unverifiable wrapper); failing closed with no provenance written" >&2
+      # S54: a deadline expiry with NO identity-verified daemon pid (launch
+      # collisions, a daemon crash, or every pidfile candidate refused) is a
+      # LAUNCH/INFRA failure — classified INFRA with a non-zero exit, never
+      # anything a consumer could read as a product fault.
+      echo "daemon-control: INFRA — $kind daemon did not start within ${port_wait_seconds}s: no identity-verified daemon pid appeared (launch attempts collided, the daemon crashed, or every pidfile candidate was an unverifiable wrapper); failing closed with no provenance written — classified as infrastructure (a launch/infra failure, never a product fault)" >&2
     fi
     exit 1
   fi
@@ -1373,7 +1603,7 @@ cmd_start() {
   # FAIL CLOSED (exit non-zero, no provenance written) instead of the old
   # WARNING-and-continue.
   if [ -z "$daemon_start_time" ]; then
-    echo "daemon-control: FATAL — cannot read startTime identity for daemon PID $daemon_pid; refusing to write provenance without an identity (fail closed). The daemon may have died mid-launch." >&2
+    echo "daemon-control: FATAL — cannot read startTime identity for daemon PID $daemon_pid; refusing to write provenance without an identity (fail closed). The daemon may have died mid-launch — classified as infrastructure (a launch failure, never a product fault)." >&2
     exit 1
   fi
 
@@ -1400,6 +1630,77 @@ cmd_start() {
     fi
   done
 
+  # ── S55: dist/version parity + which-dist-ran evidence ─────────────
+  # The launch is complete and every port is listening. The daemon MUST
+  # report the launching CLI's own dist version (/control/health
+  # buildVersion == <TT_REPO_ROOT>/dist/version) — a campaign must never run
+  # against a daemon built from a DIFFERENT checkout (the S55 defect). Fail
+  # closed as INFRA when the parity check fails or the health response is
+  # unverifiable, and stop the daemon this launch produced (identity-
+  # verified; the scope teardown reaps the dashboard/MCP siblings on the
+  # systemd path). Hermetic fake-CLI fixtures (which cannot serve
+  # /control/health) disable the gate with TT_DC_HEALTH_PARITY=0 — a
+  # documented test seam, never a production path.
+  if [ "${TT_DC_HEALTH_PARITY:-1}" = "1" ]; then
+    if ! verify_launch_dist_parity "$ctrl_port"; then
+      echo "daemon-control: INFRA — dist/version parity FAILED for the $kind daemon PID $daemon_pid (expected '$(resolve_dc_expected_version)', observed '${DC_PARITY_OBSERVED:-<health query failed>}'): stopping the mismatched daemon and failing closed with no provenance — classified as infrastructure (never a product fault)" >&2
+      if $use_systemd; then
+        # The scope teardown reaps the daemon AND the dashboard/MCP siblings.
+        systemctl --user stop "${scope_unit%.scope}.scope" 2>/dev/null || true
+        systemctl --user reset-failed "${scope_unit%.scope}.scope" 2>/dev/null || true
+      else
+        # Plain-background path (the only path Darwin can take): TERM the
+        # identity-verified mismatched daemon (read from the state-dir
+        # tamandua.pid — the recorded registry of this launch attempt — under
+        # the SAME var name the registry stop paths use), then stop the
+        # dashboard/MCP standalones via the same resolved launcher (never
+        # leave a foreign-dist daemon or its siblings holding the shared
+        # ports).
+        local lingering_pid
+        lingering_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+        if [ -n "$daemon_start_time" ] && [ -n "$lingering_pid" ] && verify_recorded_identity "$lingering_pid" "$daemon_start_time"; then
+          echo "daemon-control: sending SIGTERM to identity-verified mismatched daemon PID $lingering_pid" >&2
+          kill -TERM "$lingering_pid" 2>/dev/null || true
+        fi
+        run_under_env "$kind" "$tt_cli" dashboard stop >/dev/null 2>&1 || true
+        run_under_env "$kind" "$tt_cli" mcp stop >/dev/null 2>&1 || true
+      fi
+      rm -f -- "$daemon_pid_file"
+      exit 1
+    fi
+  fi
+
+  # Which dist ran (S55 evidence): the product journals a daemon.start
+  # lifecycle line in <state_dir>/lifecycle.log carrying the running dist
+  # version and callerArgv (the daemon entry argv `node <TT_REPO_ROOT>/dist/
+  # server/daemon.js`). Read it best-effort; the provenance record surfaces
+  # it for the campaign evidence writers (state.json/report). The bounded
+  # wait for the journal only runs on a REAL launch (parity enabled) — the
+  # journal lands around the port bind; hermetic fake-CLI fixtures journal
+  # nothing and get a single read (empty fields, no stall).
+  local lc_json
+  lc_json="$(read_lifecycle_daemon_start "$state_dir")"
+  if [ "${TT_DC_HEALTH_PARITY:-1}" = "1" ] && ! printf '%s' "$lc_json" | grep -q '"version":"[^"]'; then
+    local dc_lifecycle_deadline; dc_lifecycle_deadline=$(($(date +%s) + 8))
+    while [ "$(date +%s)" -lt "$dc_lifecycle_deadline" ]; do
+      sleep 0.5
+      lc_json="$(read_lifecycle_daemon_start "$state_dir")"
+      if printf '%s' "$lc_json" | grep -q '"version":"[^"]'; then
+        break
+      fi
+    done
+  fi
+  local dc_daemon_version="" dc_caller_argv_json="[]"
+  if [ -n "$lc_json" ]; then
+    dc_daemon_version="$(printf '%s' "$lc_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).version??"")}catch{}})' 2>/dev/null || true)"
+    dc_caller_argv_json="$(printf '%s' "$lc_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const a=JSON.parse(s).callerArgv||[];process.stdout.write(JSON.stringify(a))}catch{process.stdout.write("[]")}})' 2>/dev/null || true)"
+  fi
+  # Prefer the parity-observed version when the journal is silent (e.g. a
+  # reuse path where the health query is authoritative).
+  if [ -z "$dc_daemon_version" ] && [ -n "$DC_PARITY_OBSERVED" ]; then
+    dc_daemon_version="$DC_PARITY_OBSERVED"
+  fi
+
   local started_at; started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   # Write provenance
@@ -1413,7 +1714,10 @@ cmd_start() {
     "$started_at" \
     "tamandua daemon start" \
     "$state_dir" \
-    "$daemon_start_time"
+    "$daemon_start_time" \
+    "$dc_daemon_version" \
+    "$dc_caller_argv_json" \
+    "$tt_cli"
 
   echo "daemon-control: $kind daemon started on ports $dash_port (dashboard) $mcp_port (MCP) $ctrl_port (control)" >&2
 
@@ -1435,7 +1739,8 @@ cmd_start() {
 # the stop is identity-verified and per-worktree-scoped: the pid must be
 # alive, must NOT be the provenance pid (the recorded daemon is handled by
 # the provenance path), /proc cwd must be under TT_REPO_ROOT + cmdline must
-# contain tamandua (verify_process_tt_owned), and /proc environ must name
+# be a TT daemon cmdline (verify_process_tt_owned — the literal 'tamandua'
+# OR $TT_REPO_ROOT/dist/server/…, S54), and /proc environ must name
 # the state dir OF THIS WORKTREE (a foreign-worktree daemon has a different
 # TAMANDUA_STATE_DIR and is REFUSED, never stopped). The startTime identity
 # is captured and re-verified before every signal (ABA-safe, E3.C.1
@@ -1516,6 +1821,159 @@ stop_cli_auto_daemon() {
   return 0
 }
 
+# ── S56 helpers: bounded stop residue gate ─────────────────────────────
+#
+# A scripted/real daemon stop must NOT return while a listener is still
+# bound or a dashboard/mcp/control-plane child is still alive: a stop that
+# returns early lets the NEXT start collide with EADDRINUSE on the kind's
+# FIXED ports (the bare --tier0 33/33 gate; scenario stop->start barriers
+# such as w4.12-port-squatter). The helpers below give cmd_stop a bounded
+# final gate over (ports free AND children exited), and give every
+# 'ports still in use' outcome an INFRA classification that names the
+# holder pid + cmdline — never a silent race, never a product-fault
+# classification.
+
+# listener_pid_for_port <port>: print the pid of the process listening on
+# port <port>, or nothing when the port is free. lsof is the portable
+# source (linux + macOS); the netstat fallback is linux-only (the same pair
+# cmd_stop's lingering-listener cleanup and daemon-control's status use).
+listener_pid_for_port() {
+  local port="$1"
+  local pid
+  pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+  if [ -z "$pid" ]; then
+    pid="$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | grep -Eo '[0-9]+' | head -1 || true)"
+  fi
+  printf '%s' "$pid"
+}
+
+# cmdline_for_pid <pid>: print the process command line, or nothing when it
+# cannot be read. linux /proc read; a portable `ps -p <pid> -o command=`
+# arm on /proc-less hosts (the same portable evidence
+# verify_process_tt_owned / cmd_status use behind the TT_DC_PLATFORM seam).
+cmdline_for_pid() {
+  local pid="$1"
+  local platform
+  platform="${TT_DC_PLATFORM:-$(uname -s)}"
+  case "$platform" in
+    Darwin) ps -p "$pid" -o command= 2>/dev/null | head -1 || true ;;
+    *) tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true ;;
+  esac
+}
+
+# describe_port_holder <port>: one-line holder evidence for a busy port —
+# the pid AND the command line (S56: 'ports still in use' must classify as
+# INFRA with the holder pid/cmdline in the reason), e.g.
+#   port 5334 (pid 1234: node .../dist/server/dashboard-standalone.js 5334)
+describe_port_holder() {
+  local port="$1"
+  local pid
+  pid="$(listener_pid_for_port "$port")"
+  if [ -z "$pid" ]; then
+    printf 'port %s is in use (no listener pid resolved)' "$port"
+    return 0
+  fi
+  local cmdline
+  cmdline="$(cmdline_for_pid "$pid" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  printf 'port %s (pid %s: %s)' "$port" "$pid" "${cmdline:-cmdline unavailable}"
+}
+
+# gate_children_for_state <state_dir> <extra_pid>: the pids a stop must
+# wait to EXIT before returning — the recorded daemon pid (<extra_pid>,
+# when > 0 and alive) plus every pid recorded in the state-dir pid files
+# (tamandua.pid / dashboard.pid / mcp.pid). Only LIVE pids that are PROVEN
+# TT-owned at capture time are included (verify_process_tt_owned): a
+# foreign/recycled pidfile pid is never waited on, so the bounded gate can
+# never hang on a process that is not the contained daemon's own child.
+# Prints one pid per line.
+gate_children_for_state() {
+  local state_dir="$1"
+  local extra_pid="$2"
+  local seen=""
+  if [ -n "$extra_pid" ] && echo "$extra_pid" | grep -qE '^[0-9]+$' && kill -0 "$extra_pid" 2>/dev/null; then
+    seen="$extra_pid"
+    printf '%s\n' "$extra_pid"
+  fi
+  if [ -z "$state_dir" ] || [ ! -d "$state_dir" ]; then
+    return 0
+  fi
+  local pidfile cand
+  for pidfile in "$state_dir"/tamandua.pid "$state_dir"/dashboard.pid "$state_dir"/mcp.pid; do
+    [ -f "$pidfile" ] || continue
+    cand="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -z "$cand" ] || ! echo "$cand" | grep -qE '^[0-9]+$'; then
+      continue
+    fi
+    if ! kill -0 "$cand" 2>/dev/null; then
+      continue
+    fi
+    if ! verify_process_tt_owned "$cand" "$state_dir"; then
+      continue
+    fi
+    case " $seen " in
+      *" $cand "*) continue ;;
+    esac
+    seen="$seen $cand"
+    printf '%s\n' "$cand"
+  done
+}
+
+# wait_stop_gate <kind> <label> <state_dir> <extra_pid> <ports>: the S56
+# final gate. Waits (bounded, TT_DAEMON_STOP_WAIT_SECONDS, default 30) until
+# none of <ports> (space-separated) is listening AND every captured child
+# pid (gate_children_for_state) has exited, then returns 0. If the bound
+# expires with a listener or a live child, prints the INFRA classification
+# (each busy port's holder pid + cmdline, plus any surviving child's pid +
+# cmdline) and returns 1 — a stop never returns success while a listener or
+# child survives.
+wait_stop_gate() {
+  local kind="$1"
+  local label="$2"
+  local state_dir="$3"
+  local extra_pid="$4"
+  shift 4
+  local ports="$*"
+  local wait_seconds="${TT_DAEMON_STOP_WAIT_SECONDS:-30}"
+  case "$wait_seconds" in
+    ''|*[!0-9]*) wait_seconds=30 ;;
+  esac
+  local deadline
+  deadline=$(($(date +%s) + wait_seconds))
+  local children
+  children="$(gate_children_for_state "$state_dir" "$extra_pid")"
+  local busy=""
+  local survivors=""
+  local port child
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    busy=""
+    for port in $ports; do
+      if [ -n "$port" ] && is_port_listening "$port"; then busy="$busy $port"; fi
+    done
+    survivors=""
+    for child in $children; do
+      if kill -0 "$child" 2>/dev/null; then survivors="$survivors $child"; fi
+    done
+    if [ -z "$busy" ] && [ -z "$survivors" ]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  # Bound expired with residue: INFRA classification with holder evidence.
+  local detail=""
+  local holder
+  for port in $busy; do
+    holder="$(describe_port_holder "$port")"
+    detail="$detail $holder"
+  done
+  local child_cmdline
+  for child in $survivors; do
+    child_cmdline="$(cmdline_for_pid "$child" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    detail="$detail child-pid $child (${child_cmdline:-cmdline unavailable})"
+  done
+  echo "daemon-control: INFRA — $label: listeners/children still in use after ${wait_seconds}s:$detail (a later start on the $kind fixed ports would collide with EADDRINUSE; the holder is not a process this tool may stop — classified as infrastructure, never as a product fault)" >&2
+  return 1
+}
+
 cmd_stop() {
   local kind="$1"
   local name="$kind"
@@ -1530,13 +1988,16 @@ cmd_stop() {
     # declaring the ports unknown — a foreign-worktree daemon is never
     # touched (stop_cli_auto_daemon refuses it).
     stop_cli_auto_daemon "$kind"
-    local ports; ports="$(ports_for_kind "$kind")"
-    for port in $ports; do
-      if is_port_listening "$port"; then
-        echo "daemon-control: ERROR — port $port is in use but no provenance record exists; refusing to stop unknown process" >&2
-        exit 1
-      fi
-    done
+    # S56: even without provenance the stop must not return while a
+    # listener/child survives — wait the bounded gate, then classify any
+    # residue as INFRA with the holder pid/cmdline (never a silent single-
+    # shot check that races the killed CLI daemon's port release).
+    local no_prov_state_dir
+    no_prov_state_dir="$(env_for_kind "$kind" | grep '^TAMANDUA_STATE_DIR=' | cut -d= -f2-)"
+    if ! wait_stop_gate "$kind" "$kind daemon stop (no provenance record)" "$no_prov_state_dir" "" "$(ports_for_kind "$kind")"; then
+      echo "daemon-control: ERROR — port(s) in use but no provenance record exists; refusing to report a clean stop while an unidentified process holds the kind ports" >&2
+      exit 1
+    fi
     echo "daemon-control: $kind daemon is already stopped (no provenance, ports free)" >&2
     return 0
   fi
@@ -1586,6 +2047,17 @@ cmd_stop() {
     fi
     local has_stopped_at
     has_stopped_at=$(jq -r '.stoppedAt // ""' "$prov_file" 2>/dev/null)
+    # S56: even the idempotent 'already stopped' path must not return while
+    # a just-stopped CLI-auto daemon's listeners/children are still dying —
+    # run the bounded final gate so the caller's next start cannot collide
+    # with EADDRINUSE on the kind's fixed ports.
+    local idle_state_dir
+    idle_state_dir="$(env_for_kind "$kind" | grep '^TAMANDUA_STATE_DIR=' | cut -d= -f2-)"
+    if ! wait_stop_gate "$kind" "$kind daemon stop (already stopped)" "$idle_state_dir" "$prov_pid" "$(ports_for_kind "$kind")"; then
+      echo "daemon-control: ERROR — $kind did not fully stop (see INFRA classification above); not reporting a clean stop" >&2
+      update_provenance_after_stop "$prov_file" "1"
+      return 1
+    fi
     if [ -z "$has_stopped_at" ]; then
       update_provenance_after_stop "$prov_file" "0"
     fi
@@ -1638,8 +2110,13 @@ cmd_stop() {
   # pid-file + canSignalPid gated (no identity weakening); the recorded-
   # identity escalation below remains the backstop.
   echo "daemon-control: graceful stop via tamandua dashboard/mcp stop..." >&2
-  run_under_env "$kind" tamandua dashboard stop >/dev/null 2>&1 || true
-  run_under_env "$kind" tamandua mcp stop >/dev/null 2>&1 || true
+  # S55: the CLI stop invokes the same resolved launcher as the start
+  # (resolve_tt_cli — the worktree's own bin/tamandua by absolute path, never
+  # a PATH lookup that could stop a DIFFERENT checkout's daemon).
+  local tt_cli
+  tt_cli="$(resolve_tt_cli)"
+  run_under_env "$kind" "$tt_cli" dashboard stop >/dev/null 2>&1 || true
+  run_under_env "$kind" "$tt_cli" mcp stop >/dev/null 2>&1 || true
 
   # ── Step 2: Poll for graceful shutdown (up to 10s) ─────────────────
   local all_stopped=false
@@ -1756,23 +2233,28 @@ cmd_stop() {
     fi
   fi
 
-  # ── Step 6: Update provenance with stop metadata ───────────────────
-  sleep 0.5  # brief settle for ports to release
-  local final_exit_code=0
-  for port in $prov_ports; do
-    if [ -n "$port" ] && is_port_listening "$port"; then
-      final_exit_code=1
-      break
-    fi
-  done
-
-  if [ "$final_exit_code" -eq 0 ]; then
-    echo "daemon-control: $kind daemon stopped successfully" >&2
+  # ── Step 6 (S56): bounded final gate — listeners released AND the
+  #    dashboard/mcp/control-plane children have exited BEFORE the stop
+  #    returns. The OLD tail checked the ports ONCE after a 0.5s settle and
+  #    returned 0 (a WARNING only) while a listener/child survived — the
+  #    silent race that let the NEXT start collide with EADDRINUSE on the
+  #    kind's fixed ports (the bare --tier0 33/33 gate; scenario stop->start
+  #    barriers such as w4.12-port-squatter). The gate waits (bounded,
+  #    TT_DAEMON_STOP_WAIT_SECONDS, default 30s) for BOTH conditions; any
+  #    residue is classified INFRA with the holder pid/cmdline and fails the
+  #    stop (exit 1) — never a silent success.
+  local final_state_dir
+  final_state_dir="$(env_for_kind "$kind" | grep '^TAMANDUA_STATE_DIR=' | cut -d= -f2-)"
+  local kind_ports
+  kind_ports="$(ports_for_kind "$kind")"
+  if wait_stop_gate "$kind" "$kind daemon stop" "$final_state_dir" "$prov_pid" "$kind_ports"; then
+    echo "daemon-control: $kind daemon stopped successfully (all listeners released, dashboard/mcp/control-plane children exited)" >&2
+    update_provenance_after_stop "$prov_file" "0"
   else
-    echo "daemon-control: WARNING — one or more ports still in use after stop" >&2
+    echo "daemon-control: ERROR — $kind daemon did not fully stop within the bound (see INFRA classification above); not reporting a clean stop" >&2
+    update_provenance_after_stop "$prov_file" "1"
+    return 1
   fi
-
-  update_provenance_after_stop "$prov_file" "$final_exit_code"
 }
 
 cmd_restart() {
@@ -1934,14 +2416,19 @@ cmd_status() {
     ports_active=true
   fi
 
-  # ── Cmdline verification (must contain tamandua for RUNNING) ────
+  # ── Cmdline verification (S54: TT daemon argv — not literal 'tamandua') ─
   # MACP5 US-001: PORTABLE cmdline evidence behind the TT_DC_PLATFORM seam
   # (mirroring verify_process_tt_owned): on Darwin (no procfs) the cmdline
   # comes from `ps -p <pid> -o command=` (BSD + procps portable); on linux
   # the /proc/<pid>/cmdline read is retained (linux-only — never reached on
-  # /proc-less hosts). RUNNING still requires the cmdline to contain
-  # 'tamandua'; unavailable cmdline evidence -> cmdline_ok=false -> UNKNOWN
-  # (never RUNNING on ports alone — fail-closed unchanged).
+  # /proc-less hosts). RUNNING requires the cmdline to be a TT daemon
+  # cmdline: it must contain the literal 'tamandua' (the CLI wrapper argv
+  # and fake scripted shims) OR reference THIS repo's built product
+  # ($TT_REPO_ROOT/dist/server/… — the real daemon's `node
+  # <TT_REPO_ROOT>/dist/server/daemon.js` argv, which carries no 'tamandua'
+  # under a checkout named e.g. by run id — S54). Unavailable cmdline
+  # evidence -> cmdline_ok=false -> UNKNOWN (never RUNNING on ports alone —
+  # fail-closed unchanged).
   local cmdline_ok=false
   if $pid_alive; then
     local actual_cmdline
@@ -1957,7 +2444,8 @@ cmd_status() {
         actual_cmdline=$(tr '\0' ' ' < "/proc/$prov_pid/cmdline" 2>/dev/null || true)
         ;;
     esac
-    if echo "$actual_cmdline" | grep -q 'tamandua'; then
+    if echo "$actual_cmdline" | grep -q 'tamandua' \
+       || echo "$actual_cmdline" | grep -Fq "$TT_REPO_ROOT/dist/server/"; then
       cmdline_ok=true
     fi
   fi

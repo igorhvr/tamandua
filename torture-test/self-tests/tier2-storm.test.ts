@@ -198,7 +198,7 @@ describe("Tier-2 W5 storm (US-014) — the capacity-scaled two-round storm contr
     // AC1: the manifest validates (exit 0).
     const res = runTt(controller, ["--manifest", "cases/tier2.jsonl", "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("the seed/storm composite ref exists in the tt-poly-lite SEEDS.md catalog and the task file is the full two-round briefing (Round A roster, simultaneity sampling, queue admission snapshot, Round B chaos schedule, success bands)", () => {
@@ -324,10 +324,10 @@ describe("Tier-2 W5 storm (US-014) — the capacity-scaled two-round storm contr
     // The machinery-deltas table carries the same gap.
     assert.match(trace, /W5\.storm-capacity-scaled/, "the machinery-deltas table must name the storm row");
     // The manifest summary counts the storm row.
-    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*/,
-      "manifest summary must show 70 cases incl. the W5 storm");
-    assert.match(trace, /\| Real \(token-bearing\) cases \| 45 \|/,
-      "manifest summary must show 45 real cases (the storm row is real)");
+    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*/,
+      "manifest summary must show 72 cases incl. the W5 storm");
+    assert.match(trace, /\| Real \(token-bearing\) cases \| 43 \|/,
+      "manifest summary must show 43 real cases (the storm row is real)");
     assert.match(trace, /Wave 5 storm \(capacity-scaled, two-round briefing\) \| 1 \(W5\.storm-capacity-scaled\)/,
       "manifest summary must list the W5 storm row");
     assert.match(trace, /## Token Budget Note \(wave-5 storm\)/,

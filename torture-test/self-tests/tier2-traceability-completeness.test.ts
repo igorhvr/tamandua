@@ -83,7 +83,7 @@ describe("US-016 Tier-2 traceability completeness", () => {
   const sections = docSections(doc);
 
   it("every tier2.jsonl id has a traceability row and every row carries a spec_ref", () => {
-    assert.equal(manifest.length, 70, "tier2.jsonl must keep 70 cases");
+    assert.equal(manifest.length, 72, "tier2.jsonl must keep 72 cases");
     const missingRows: string[] = [];
     const missingSpecRefs: string[] = [];
     for (const record of manifest) {

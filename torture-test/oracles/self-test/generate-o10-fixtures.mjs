@@ -281,7 +281,23 @@ function realEvent(workflow, name, extra = {}, seconds = 0) {
 
 // spec: { name, expected, finding, workflow, mode, evidence, lands,
 //         steps, stream: [{event, stepId?, agentId?, storyId?}], terminalReroutes,
-//         dispatchRenderings?: [{...dispatch_renderings row fields}] }
+//         dispatchRenderings?: [{...dispatch_renderings row fields}],
+//         rowOverrides?: {...suite row field overrides for the base exact row},
+//         ledgerRows?: [...] (replaces the evidence-derived suite row set),
+//         runStatus?: 'completed'|'failed'|'canceled', projectionStatus?,
+//         tokens?, instantFailCount? }
+// Each steps entry may additionally carry per-row overrides (S47 US-005):
+//   rowKey             uniquifies the step row id (`${rowKey}-row`; default
+//                      `${step_id}-row`) so one step can hold multiple
+//                      attempt rows,
+//   status             overrides the lands-derived step status,
+//   output             overrides the lands-derived step output,
+//   terminalReroutes   overrides the finalize terminal_reroute_count.
+// S59 (US-017): ledgerRows models the missing-with-nearest evidence shape
+// (red rows for a DIFFERENT tree/command that the gate grounds its refusal
+// on while the declared exact key has no row); runStatus/projectionStatus
+// model the canceled never-executed run; rowOverrides model the red exact
+// row whose log_tail is multi-line.
 // The stream is the ordered run_events sequence: one step.running per step
 // execution, step.rerouted BEFORE the reroute target's re-execution (matching
 // the captured attempt-2 stream shape), story events per iteration, the
@@ -305,8 +321,13 @@ function writeRealCellFixture(workspace, spec) {
     exit_code: spec.evidence === 'green' ? 0 : 17, duration_ms: 321, log_tail: 'synthetic red',
     run_id: 'writer-run', step_id: 'test',
     created_at: '2026-08-02T12:04:00.000Z',
+    ...(spec.rowOverrides ?? {}),
   };
-  const rows = spec.evidence === 'missing' ? [] : [row];
+  // S59 (US-017): spec.ledgerRows replaces the default row derivation so a
+  // missing-evidence refusal can still carry the NEAREST red rows the gate
+  // grounded its refusal on (rows whose cmd/tree differ from the declared
+  // exact key).
+  const rows = spec.ledgerRows ?? (spec.evidence === 'missing' ? [] : [row]);
 
   const databasePath = path.join(snapshots, 'database.sqlite');
   const database = new DatabaseSync(databasePath);
@@ -318,28 +339,30 @@ function writeRealCellFixture(workspace, spec) {
   `);
   database.prepare('INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, notify_url, parent_run_id, created_at, updated_at, scheduling_status, scheduling_requested_at, scheduling_error, worker_lost_count, ceiling_expiry_count, instant_fail_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
     REAL_DB_RUN_ID, 1, spec.workflow, null,
-    spec.lands ? 'completed' : 'failed',
+    spec.runStatus ?? (spec.lands ? 'completed' : 'failed'),
     JSON.stringify({
       merge_gate: spec.mode.mergeGate,
       fail_missing: spec.mode.failMissing,
       test_cmd_raw: TEST_CMD, tested_tree: TREE,
     }),
-    1000, null, null, '2026-08-02T12:00:00.000Z', REAL_CAPTURED_AT,
-    'idle', null, null, 0, 0, 0,
+    spec.tokens ?? 1000, null, null, '2026-08-02T12:00:00.000Z', REAL_CAPTURED_AT,
+    'idle', null, null, 0, 0, spec.instantFailCount ?? 0,
   );
   let stepIndex = 0;
   for (const step of spec.steps) {
     const isFinalize = step.step_id === 'finalize_merge';
-    const stepStatus = spec.lands ? 'done' : 'failed';
-    const stepOutput = spec.lands
+    const stepStatus = step.status ?? (spec.lands ? 'done' : 'failed');
+    const stepOutput = step.output !== undefined ? step.output : (spec.lands
       ? `STATUS: done\nMERGED_COMMIT: ${AFTER}\nMERGED_TREE: ${TREE}`
-      : refusalText(spec.evidence, row);
+      : refusalText(spec.evidence, row));
+    const stepTerminalReroutes = step.terminalReroutes !== undefined
+      ? step.terminalReroutes : (isFinalize ? spec.terminalReroutes : 0);
     database.prepare('INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, output, retry_count, max_retries, type, loop_config, current_story_id, abandoned_count, created_at, updated_at, claim_job_id, claim_pid, claim_pgid, claim_updated_at, reroute_count, terminal_reroute_count, ledger_concession_count, claim_invalidated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-      `${step.step_id}-row`, REAL_DB_RUN_ID, step.step_id, step.agent_id, stepIndex, null, null,
+      `${step.rowKey ?? step.step_id}-row`, REAL_DB_RUN_ID, step.step_id, step.agent_id, stepIndex, null, null,
       stepStatus, stepOutput, step.retries ?? 0, 4,
       step.type ?? 'single', step.loop_config ?? null, null, 0,
       '2026-08-02T12:00:00.000Z', REAL_CAPTURED_AT, null, null, null, null,
-      0, isFinalize ? spec.terminalReroutes : 0, isFinalize && spec.evidence === 'missing' && spec.mode.id === 'default' ? spec.terminalReroutes : 0,
+      0, stepTerminalReroutes, isFinalize && spec.evidence === 'missing' && spec.mode.id === 'default' ? stepTerminalReroutes : 0,
       null,
     );
     stepIndex += 1;
@@ -404,7 +427,7 @@ function writeRealCellFixture(workspace, spec) {
     campaign: { id: `campaign-${spec.name}`, created_at: '2026-08-02T11:50:00.000Z', manifest: { sha256: '9'.repeat(64), case_count: 1, case_ids: [spec.name] } },
     case: { id: spec.name, wave: 4, workflow: spec.workflow, fixture: 'synthetic', harness: 'pi', class: 'verification', caps: { tokens: 100, wall_min: 10 }, boundary_files: [], forbidden: [], chaos: null },
     run_id: REAL_RUN_ID,
-    attempts: [{ id: 'attempt-o10', kind: 'workflow', phase: 'terminal', execution_mode: 'real', run_id: REAL_RUN_ID, started_at: '2026-08-02T12:00:00.000Z', terminal_at: REAL_CAPTURED_AT, terminal_status: spec.lands ? 'completed' : 'failed', tokens_observed: 1000, command_result: { exit_code: spec.lands ? 0 : 1, signal: null }, steps_snapshot: null, straggler_capture: null }],
+    attempts: [{ id: 'attempt-o10', kind: 'workflow', phase: 'terminal', execution_mode: 'real', run_id: REAL_RUN_ID, started_at: '2026-08-02T12:00:00.000Z', terminal_at: REAL_CAPTURED_AT, terminal_status: spec.projectionStatus ?? (spec.lands ? 'completed' : 'failed'), tokens_observed: spec.tokens ?? 1000, command_result: { exit_code: spec.lands ? 0 : 1, signal: null }, steps_snapshot: null, straggler_capture: null }],
     discovered_runs: [],
     o1_wave: { schema_version: 1, wave: 4, duration_floors: [], runs: [] },
     mechanical_evidence: { schema_version: 1, references },
@@ -595,4 +618,263 @@ writeRealCellFixture(workspace, {
   name: 'o10-real-reroute-count-mismatch', expected: 'FAIL', finding: 'O10_REROUTE_COUNT',
   workflow: 'bug-fix-merge-worktree', mode: MODES[1], evidence: 'missing', lands: true,
   steps: BUGFIX_STEPS, stream: LEGAL_REROUTE_STREAM, terminalReroutes: 0,
+});
+
+// 8. S47 (US-005): the W4.30 refusal-corridor shape — a refused finalize that
+//    was rerouted and re-dispatched. The workflow keeps its ONE
+//    finalize_merge step, but the refusal/reroute corridor legitimately
+//    accrued TWO finalize_merge step ROWS (attempts): attempt 1 refused
+//    (terminal_reroute_count 0), the step.rerouted event (the obstructing
+//    reroute) re-armed the producer, and the re-dispatched attempt 2 refused
+//    terminally (terminal_reroute_count 1 — the strict refusal doctrine's
+//    exactly-one-obstructing-reroute bound lives on the TERMINAL attempt row).
+//    Under the strict green/missing refusal cell the merger is never invoked
+//    (0 finalize_merge step.running), the target never moves, and the run
+//    ends failed. Pre-fix O10 threw `run <id> must have exactly one
+//    finalize_merge step` on this shape (an oracle runtime error voiding the
+//    cell); post-fix the attempt-aware model evaluates it PASS.
+writeRealCellFixture(workspace, {
+  name: 'o10-real-w4.30-refused-rerouted-finalize', expected: 'PASS',
+  workflow: 'bug-fix-merge-worktree', mode: MODES[3], evidence: 'missing', lands: false,
+  terminalReroutes: 1,
+  steps: [
+    { step_id: 'triage', agent_id: 'bug-fix-merge-worktree_triager', type: 'single' },
+    { step_id: 'investigate', agent_id: 'bug-fix-merge-worktree_investigator', type: 'single' },
+    { step_id: 'setup', agent_id: 'bug-fix-merge-worktree_setup', type: 'single' },
+    { step_id: 'fix', agent_id: 'bug-fix-merge-worktree_fixer', type: 'single' },
+    { step_id: 'verify', agent_id: 'bug-fix-merge-worktree_verifier', type: 'single' },
+    // Attempt 1: refused (superseded by the reroute; no terminal allowance spent).
+    { step_id: 'finalize_merge', agent_id: 'bug-fix-merge-worktree_merger', type: 'single',
+      rowKey: 'finalize-attempt-1', terminalReroutes: 0 },
+    // Attempt 2 (terminal): re-dispatched after the obstructing reroute; the
+    // strict refusal bound (exactly one reroute) lives on this row.
+    { step_id: 'finalize_merge', agent_id: 'bug-fix-merge-worktree_merger', type: 'single',
+      rowKey: 'finalize-attempt-2', terminalReroutes: 1 },
+  ],
+  stream: [
+    RUN('triage', 'bug-fix-merge-worktree_triager'),
+    RUN('investigate', 'bug-fix-merge-worktree_investigator'),
+    RUN('setup', 'bug-fix-merge-worktree_setup'),
+    RUN('fix', 'bug-fix-merge-worktree_fixer'),
+    RUN('verify', 'bug-fix-merge-worktree_verifier'),
+    // Attempt 1 refused: the strict gate refuses at dispatch (no step.running)
+    // and the terminal-class reroute re-arms the producer.
+    { event: 'step.rerouted', stepId: 'finalize_merge' },
+    RUN('verify', 'bug-fix-merge-worktree_verifier'),
+    // Attempt 2 refused permanently -> the run fails with no landing.
+    { event: 'run.failed' },
+  ],
+});
+
+// 9. S47 (US-005): the W4.30 launch/setup-time refusal corridor — a run that
+//    refused BEFORE any step row was created (e.g. the detached-HEAD origin
+//    refusal thrown from worktree creation, before run.ts inserts step rows),
+//    so the terminal snapshot holds a failed run with NO finalize_merge step
+//    at all. Pre-fix O10 threw `run <id> must have exactly one finalize_merge
+//    step` (length 0 != 1) — an oracle runtime error on a CORRECT product
+//    refusal; post-fix the run is NOT_EVALUABLE with the reason (no
+//    step-level gate evidence to apply the FMIS decision table), never a
+//    runtime error and never a PRODUCT_FAIL over evidence the table cannot
+//    apply.
+writeRealCellFixture(workspace, {
+  name: 'o10-real-launch-refused-no-finalize-step', expected: 'NOT_EVALUABLE',
+  workflow: 'bug-fix-merge-worktree', mode: MODES[3], evidence: 'missing', lands: false,
+  steps: [],
+  stream: [{ event: 'run.failed' }],
+});
+
+// ---- S59 (US-017): exact refusal self-diagnosis fixtures ----
+// Three sub-causes of O10_REFUSAL_DIAGNOSIS firing spuriously on CORRECT
+// strict-ledger refusals, plus a strictness pin:
+//   (1) red-evidence branch (mac): the gate appends its remediation sentence
+//       after the multi-line LOG_TAIL keyline, so the parsed LOG_TAIL value =
+//       ledger row log_tail + trailing advice and the pre-fix exact compare
+//       failed. o10-real-w4.17b-red-refusal-log-tail reproduces the W4.17-b
+//       shape (green gate, red exact-key evidence, refused_permanent) with a
+//       MULTI-LINE log tail plus the gate's trailing advice; pre-fix O10
+//       yields O10_REFUSAL_DIAGNOSIS (LOG_TAIL), post-fix it PASSes via the
+//       prefix compare.
+//   (2) missing-with-nearest branch (linux): the worker produced no ledger
+//       row for the DECLARED command (ran plain pytest; the ledger holds exit
+//       127 then exit 1 rows for the raw command), and the gate grounded its
+//       refusal on the NEAREST red row (LEDGER_ROW_ID / LEDGER_EVIDENCE: red
+//       / that row's CMD_HASH/TEST_CMD) while the oracle expected
+//       LEDGER_EVIDENCE: missing and the declared command's hash.
+//       o10-real-missing-nearest-refusal-diagnosis models the gate's red-
+//       cited-row branch; post-fix every key is compared against the row the
+//       gate actually cites (LEDGER_ROW_ID 8) and the refusal PASSes.
+//   (3) never-executed runs: W4.dsh-fdmw on the mac (dsh instant-failing
+//       under the contained daemon, 0 tokens, no step.running, canceled at
+//       the wall cap) was scored PRODUCT_FAIL by O10_EVENT_SET_MISMATCH.
+//       o10-real-never-executed-canceled reproduces the shape (FDMW step
+//       rows exist, none executed, run canceled); post-fix O10 returns
+//       NOT_EVALUABLE with the reason so the case classifies
+//       INCONCLUSIVE/TIF, never PRODUCT_FAIL.
+//   Strictness pin: o10-real-refusal-prose-output puts agent prose where the
+//   gate keyline block belongs on a strict red refusal — the oracle must
+//   still FAIL with O10_REFUSAL_DIAGNOSIS (refusal text is only accepted as
+//   gate-generated keylines).
+
+// The gate's trailing remediation sentence (S59 (1): appended after the
+// multi-line LOG_TAIL value).
+const S59_ADVICE = 'Please re-run the exact shim-wrapped test command on the committed tree so fresh suite evidence is recorded for the merge gate, then resubmit finalize_merge.';
+// A real multi-line log tail (the W4.17-b red row's tail is several lines).
+const S59_MULTILINE_TAIL = 'synthetic red\n\n=== FAILURES ===\n____ test_yearly_interval ____\nassert yearly(2) == 1';
+// A red-evidence refusal block whose LOG_TAIL value is the (multi-line) cited
+// row's log_tail followed by the gate's trailing advice, then the diagnostic
+// keylines. ORIGIN_REPO/TREE_HASH/CMD_HASH/TEST_CMD and the row-identity keys
+// all name the CITED row (the shape O10 must compare against).
+function s59RedRefusalBlock(row, advice = null) {
+  const lines = [
+    'FAILURE_CLASS: refused_permanent',
+    'LEDGER_EVIDENCE: red',
+    `ORIGIN_REPO: ${row.origin_repo}`,
+    `TREE_HASH: ${row.tree_hash}`,
+    `CMD_HASH: ${row.cmd_hash}`,
+    `TEST_CMD: ${row.cmd_display}`,
+    `LEDGER_ROW_ID: ${row.id}`,
+    `EXIT_CODE: ${row.exit_code}`,
+    `TIMESTAMP: ${row.created_at}`,
+    `DURATION_MS: ${row.duration_ms}`,
+    `LEDGER_RUN_ID: ${row.run_id ?? ''}`,
+    `LEDGER_STEP_ID: ${row.step_id ?? ''}`,
+    `LOG_TAIL: ${row.log_tail ?? ''}`,
+  ];
+  if (advice !== null) lines.push(advice);
+  lines.push(
+    'WORKSPACE_STATE: clean',
+    `NEAREST_EVIDENCE: ${row.origin_repo === ORIGIN && row.tree_hash === TREE && row.cmd_hash === CMD_HASH
+      ? `exact-key red row ${row.id}` : `tree ${row.tree_hash.slice(0, 7)} exit ${row.exit_code} recorded ${row.created_at}`}`,
+    'ACTION: execute the test suite via the provided shim-wrapped test command so evidence is recorded for the current tree, then resubmit.',
+  );
+  return lines.join('\n');
+}
+
+// 10. S59 (1): W4.17-b red-evidence refusal with a multi-line LOG_TAIL plus
+//     the gate's trailing advice -> the refusal diagnosis PASSes.
+writeRealCellFixture(workspace, {
+  name: 'o10-real-w4.17b-red-refusal-log-tail', expected: 'PASS',
+  workflow: 'bug-fix-merge-worktree', mode: MODES[3], evidence: 'red', lands: false,
+  terminalReroutes: 1,
+  rowOverrides: { log_tail: S59_MULTILINE_TAIL },
+  steps: [
+    { step_id: 'triage', agent_id: 'bug-fix-merge-worktree_triager', type: 'single' },
+    { step_id: 'investigate', agent_id: 'bug-fix-merge-worktree_investigator', type: 'single' },
+    { step_id: 'setup', agent_id: 'bug-fix-merge-worktree_setup', type: 'single' },
+    { step_id: 'fix', agent_id: 'bug-fix-merge-worktree_fixer', type: 'single' },
+    { step_id: 'verify', agent_id: 'bug-fix-merge-worktree_verifier', type: 'single' },
+    { step_id: 'finalize_merge', agent_id: 'bug-fix-merge-worktree_merger', type: 'single',
+      rowKey: 'finalize-attempt-1', terminalReroutes: 0 },
+    { step_id: 'finalize_merge', agent_id: 'bug-fix-merge-worktree_merger', type: 'single',
+      rowKey: 'finalize-attempt-2', terminalReroutes: 1,
+      output: s59RedRefusalBlock({
+        id: 1, origin_repo: ORIGIN, tree_hash: TREE, cmd_hash: CMD_HASH, cmd_display: TEST_CMD,
+        exit_code: 17, duration_ms: 321, log_tail: S59_MULTILINE_TAIL,
+        run_id: 'writer-run', step_id: 'test', created_at: '2026-08-02T12:04:00.000Z',
+      }, S59_ADVICE) },
+  ],
+  stream: [
+    RUN('triage', 'bug-fix-merge-worktree_triager'),
+    RUN('investigate', 'bug-fix-merge-worktree_investigator'),
+    RUN('setup', 'bug-fix-merge-worktree_setup'),
+    RUN('fix', 'bug-fix-merge-worktree_fixer'),
+    RUN('verify', 'bug-fix-merge-worktree_verifier'),
+    { event: 'step.rerouted', stepId: 'finalize_merge' },
+    RUN('verify', 'bug-fix-merge-worktree_verifier'),
+    { event: 'run.failed' },
+  ],
+});
+
+// 11. S59 (2): missing-with-nearest refusal — the gate grounds its refusal on
+//     the NEAREST red row (raw pytest rows, exit 127 then 1) while the
+//     declared exact key has no ledger row -> every key is compared against
+//     the row the gate cites (LEDGER_ROW_ID 8) and the refusal PASSes.
+const PYTEST_HASH = createHash('sha256').update('pytest').digest('hex');
+writeRealCellFixture(workspace, {
+  name: 'o10-real-missing-nearest-refusal-diagnosis', expected: 'PASS',
+  workflow: 'bug-fix-merge-worktree', mode: MODES[3], evidence: 'missing', lands: false,
+  terminalReroutes: 1,
+  // The worker ran plain `pytest` (never the shim-wrapped declared command):
+  // the ledger holds exit 127 then exit 1 rows for the raw command on trees
+  // that are NOT the attested gate tree — nearest red evidence only.
+  ledgerRows: [
+    { id: 7, origin_repo: ORIGIN, tree_hash: 'e'.repeat(40), cmd_hash: PYTEST_HASH, cmd_display: 'pytest',
+      exit_code: 127, duration_ms: 12, log_tail: 'bash: pytest: command not found',
+      run_id: 'writer-run', step_id: 'test', created_at: '2026-08-02T12:07:00.000Z' },
+    { id: 8, origin_repo: ORIGIN, tree_hash: 'd'.repeat(40), cmd_hash: PYTEST_HASH, cmd_display: 'pytest',
+      exit_code: 1, duration_ms: 900, log_tail: '1 failed, 12 passed in 0.9s',
+      run_id: 'writer-run', step_id: 'test', created_at: '2026-08-02T12:08:30.000Z' },
+  ],
+  steps: [
+    { step_id: 'triage', agent_id: 'bug-fix-merge-worktree_triager', type: 'single' },
+    { step_id: 'investigate', agent_id: 'bug-fix-merge-worktree_investigator', type: 'single' },
+    { step_id: 'setup', agent_id: 'bug-fix-merge-worktree_setup', type: 'single' },
+    { step_id: 'fix', agent_id: 'bug-fix-merge-worktree_fixer', type: 'single' },
+    { step_id: 'verify', agent_id: 'bug-fix-merge-worktree_verifier', type: 'single' },
+    { step_id: 'finalize_merge', agent_id: 'bug-fix-merge-worktree_merger', type: 'single',
+      rowKey: 'finalize-attempt-1', terminalReroutes: 0 },
+    { step_id: 'finalize_merge', agent_id: 'bug-fix-merge-worktree_merger', type: 'single',
+      rowKey: 'finalize-attempt-2', terminalReroutes: 1,
+      output: s59RedRefusalBlock({
+        id: 8, origin_repo: ORIGIN, tree_hash: 'd'.repeat(40), cmd_hash: PYTEST_HASH, cmd_display: 'pytest',
+        exit_code: 1, duration_ms: 900, log_tail: '1 failed, 12 passed in 0.9s',
+        run_id: 'writer-run', step_id: 'test', created_at: '2026-08-02T12:08:30.000Z',
+      }, S59_ADVICE) },
+  ],
+  stream: [
+    RUN('triage', 'bug-fix-merge-worktree_triager'),
+    RUN('investigate', 'bug-fix-merge-worktree_investigator'),
+    RUN('setup', 'bug-fix-merge-worktree_setup'),
+    RUN('fix', 'bug-fix-merge-worktree_fixer'),
+    RUN('verify', 'bug-fix-merge-worktree_verifier'),
+    { event: 'step.rerouted', stepId: 'finalize_merge' },
+    RUN('verify', 'bug-fix-merge-worktree_verifier'),
+    { event: 'run.failed' },
+  ],
+});
+
+// 12. S59 (3): never-executed canceled run (the W4.dsh-fdmw shape). The dsh
+//     harness instant-failed under the contained daemon (0 tokens, no
+//     step.running — every dispatch round exits before claiming), and the
+//     controller canceled the run at the wall cap. The workflow's step rows
+//     exist but NONE executed (canceled). Pre-fix O10 scored the run
+//     PRODUCT_FAIL (O10_EVENT_SET_MISMATCH over the empty step.running
+//     stream); post-fix the run is NOT_EVALUABLE with the reason.
+writeRealCellFixture(workspace, {
+  name: 'o10-real-never-executed-canceled', expected: 'NOT_EVALUABLE',
+  workflow: 'feature-dev-merge-worktree', mode: MODES[1], evidence: 'missing', lands: false,
+  terminalReroutes: 0, runStatus: 'canceled', projectionStatus: 'canceled',
+  tokens: 0, instantFailCount: 3,
+  steps: FDMW_STEPS.map((entry) => ({ ...entry, status: 'canceled', retries: 0 })),
+  stream: [{ event: 'run.canceled' }],
+});
+
+// 13. Strictness pin (S59 AC4): agent prose where the gate keyline block
+//     belongs on a strict red refusal -> O10_REFUSAL_DIAGNOSIS still fires.
+writeRealCellFixture(workspace, {
+  name: 'o10-real-refusal-prose-output', expected: 'FAIL', finding: 'O10_REFUSAL_DIAGNOSIS',
+  workflow: 'bug-fix-merge-worktree', mode: MODES[3], evidence: 'red', lands: false,
+  terminalReroutes: 1,
+  steps: [
+    { step_id: 'triage', agent_id: 'bug-fix-merge-worktree_triager', type: 'single' },
+    { step_id: 'investigate', agent_id: 'bug-fix-merge-worktree_investigator', type: 'single' },
+    { step_id: 'setup', agent_id: 'bug-fix-merge-worktree_setup', type: 'single' },
+    { step_id: 'fix', agent_id: 'bug-fix-merge-worktree_fixer', type: 'single' },
+    { step_id: 'verify', agent_id: 'bug-fix-merge-worktree_verifier', type: 'single' },
+    { step_id: 'finalize_merge', agent_id: 'bug-fix-merge-worktree_merger', type: 'single',
+      rowKey: 'finalize-attempt-1', terminalReroutes: 0 },
+    { step_id: 'finalize_merge', agent_id: 'bug-fix-merge-worktree_merger', type: 'single',
+      rowKey: 'finalize-attempt-2', terminalReroutes: 1,
+      output: 'STATUS: failed\nThe change is correct and should land despite the pre-existing red tests.' },
+  ],
+  stream: [
+    RUN('triage', 'bug-fix-merge-worktree_triager'),
+    RUN('investigate', 'bug-fix-merge-worktree_investigator'),
+    RUN('setup', 'bug-fix-merge-worktree_setup'),
+    RUN('fix', 'bug-fix-merge-worktree_fixer'),
+    RUN('verify', 'bug-fix-merge-worktree_verifier'),
+    { event: 'step.rerouted', stepId: 'finalize_merge' },
+    RUN('verify', 'bug-fix-merge-worktree_verifier'),
+    { event: 'run.failed' },
+  ],
 });

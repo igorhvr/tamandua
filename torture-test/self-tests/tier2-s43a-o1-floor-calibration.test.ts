@@ -175,7 +175,7 @@ describe("S43a US-006: O1 duration-floor calibration", () => {
     // The real manifest stays schema-valid through the production controller.
     const res = runController(["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `${res.stdout}\n${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("GREEN-ARM: O1 clears the per-cell floor, passes the all-flagged family, and still fails an un-flagged too-fast run", () => {

@@ -425,11 +425,48 @@ stop_daemon_for_restart() {
   return 0
 }
 
-# print_up: the uniform success contract of ensure-up.
+# prov_json_value: read one value from the daemon-control provenance JSON
+# (var/daemon-control/real.json) with node (no jq dependency). Prints the
+# scalar for version/cli keys, or the space-joined array for callerArgv.
+# Empty when the file or key is absent (older provenance predates S55).
+prov_json_value() { # file key
+  local file="$1" key="$2"
+  node -e '
+    const fs = require("node:fs");
+    const file = process.argv[1];
+    const key = process.argv[2];
+    let value = "";
+    try {
+      const record = JSON.parse(fs.readFileSync(file, "utf8"));
+      const v = record[key];
+      if (Array.isArray(v)) value = v.join(" ");
+      else if (typeof v === "string" || typeof v === "number") value = String(v);
+    } catch (e) { /* absent or unparseable provenance */ }
+    process.stdout.write(value);
+  ' "$file" "$key"
+}
+
+# print_up: the uniform success contract of ensure-up. S55: additionally
+# prints which dist the contained daemon runs — TT_DAEMON_DIST_VERSION (the
+# parity-verified /control/health buildVersion), TT_DAEMON_CLI (the
+# launcher daemon-control used — the worktree own bin/tamandua), and, when
+# the daemon-control provenance records them, TT_DAEMON_LAUNCH_CLI and
+# TT_DAEMON_CALLER_ARGV (the lifecycle daemon.start callerArgv — the daemon
+# entry argv naming the exact dist that ran). The campaign evidence writers
+# (state.json/report) surface these lines.
 print_up() {
+  local dist_version="${PARITY_OBSERVED:-$(resolve_expected_version)}"
+  local prov_file="$TT_DIR/var/daemon-control/real.json"
+  local launch_cli caller
+  launch_cli="$(prov_json_value "$prov_file" launchCli 2>/dev/null)"
+  [ -n "$launch_cli" ] || launch_cli="$TT_REPO_ROOT/bin/tamandua"
+  caller="$(prov_json_value "$prov_file" callerArgv 2>/dev/null)"
   echo "TT_DAEMON: up"
   echo "TT_DAEMON_PORT: $1"
   echo "TT_DAEMON_PATH_PREPEND: $ADAPTERS_BIN_DIR"
+  echo "TT_DAEMON_DIST_VERSION: $dist_version"
+  echo "TT_DAEMON_CLI: $launch_cli"
+  [ -n "$caller" ] && echo "TT_DAEMON_CALLER_ARGV: $caller"
 }
 
 # wait_for_daemon_up: poll (up to $1 seconds) until the real daemon reports
@@ -730,7 +767,14 @@ tt-controller status SQL surface), or — under ensure-up --fresh only —
 'REASON: suite-state-not-clean' (the contained suite_results ledger is not
 empty at FRESH campaign start) on stderr and exits non-zero.
 A successful ensure-up additionally prints 'TT_DAEMON_PATH_PREPEND: <path>'
-(the contained adapters bin dir prepended to the daemon's PATH).
+(the contained adapters bin dir prepended to the daemon's PATH) and — S55 —
+'TT_DAEMON_DIST_VERSION: <version>' (the parity-verified /control/health
+buildVersion), 'TT_DAEMON_CLI: <absolute launcher>' (the worktree's own
+bin/tamandua daemon-control launches by absolute path — never a PATH
+lookup), and, when the daemon-control provenance records them,
+'TT_DAEMON_LAUNCH_CLI' / 'TT_DAEMON_CALLER_ARGV' (the lifecycle
+daemon.start callerArgv naming the exact dist that ran). The campaign
+evidence writers (state.json/report) surface these lines.
 EOF
 }
 

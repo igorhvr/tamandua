@@ -2,7 +2,7 @@
 //
 // Pins the section-E batch of cases/tier2.jsonl:
 //   * the 3 new rows exist and tt-controller --manifest cases/tier2.jsonl
-//     --validate-only exits 0 (Validated 70 case(s) after US-012);
+//     --validate-only exits 0 (Validated 72 case(s) after US-012);
 //   * W4.19 is a zero-token scripted local-command cell (harness local,
 //     workflow local, execution_mode scripted, caps.tokens 0) whose scenario
 //     cell scenarios/w4.19/stale-catalog-warn-not-block/ overwrites the
@@ -106,7 +106,7 @@ describe("Tier-2 US-009 — section-E roster (update/migration/staleness)", () =
     }
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("W4.19/20/34 are zero-token scripted local-command cases in the tier0 w4.49 cell shape", () => {
@@ -319,8 +319,8 @@ describe("Tier-2 US-009 — section-E roster (update/migration/staleness)", () =
     assert.match(trace, /## Case ↔ Spec Reference Map — Wave 4 Section E/, "section-E reference map header");
     assert.match(trace, /## Excluded Scenarios — Complete Enumeration \(section E\)/, "section-E exclusion enumeration");
     assert.match(trace, /## Token Budget Note \(section E\)/, "section-E token budget note");
-    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*/,
-      "manifest summary must show 70 cases");
+    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*/,
+      "manifest summary must show 72 cases");
     assert.match(trace, /| Wave 4 section E \(update\/migration\/staleness\) \| 3 /,
       "manifest summary must show the 3 section-E rows");
     for (const id of SECTION_E_IDS) {

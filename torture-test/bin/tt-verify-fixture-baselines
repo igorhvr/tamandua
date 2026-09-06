@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { FIXTURE_META } from './tt-golden-bootstrap.mjs';
+import { FIXTURE_META, FIXTURES_SRC_KEY, hashFixtureSourceDir } from './tt-golden-bootstrap.mjs';
 
 const BIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TT_ROOT = path.resolve(BIN_DIR, '..');
@@ -32,6 +32,12 @@ for (let i = 0; i < argv.length; i++) {
 
 if (showHelp) {
   console.log(`Usage: tt-verify-fixture-baselines [options]
+
+Verifies every golden bare under the golden root: the repo must be bare, fsck
+clean, every recorded ref hash in its .hashes ledger must resolve and match,
+and (S57) for real fixtures (FIXTURE_META) the ledger's FIXTURES_SRC record
+must equal the current fixtures-src content hash — fixtures-src drift
+invalidates the golden, naming the drifted fixture.
 
 Options:
   --expect <name>[,<name>...]  Fixtures that MUST be present (missing = FAIL).
@@ -150,6 +156,11 @@ for (const entry of entries) {
   // US-003: parse the ledger and verify every recorded ref
   evidence.hash_check = { passed: true, total: 0, matched: 0, failures: [] };
   let hashCheckPassed = false;
+  // S57 (R4a): the ledger's FIXTURES_SRC record (a 64-hex sha256 content hash
+  // of the fixture SOURCE the golden was built from) is NOT a git ref — it is
+  // captured here and compared against the current fixtures-src tree after
+  // the bare/fsck checks.
+  let recordedFixturesSrc = null;
   try {
     const content = fs.readFileSync(hashesPath, 'utf8');
     const lines = content.split('\n');
@@ -170,6 +181,15 @@ for (const entry of entries) {
       }
 
       if (!key || !expectedHash) continue;
+
+      // S57: the FIXTURES_SRC key names the recorded fixture-source content
+      // hash — never a git ref. Validate its shape and skip ref resolution.
+      if (key === FIXTURES_SRC_KEY) {
+        if (/^[0-9a-f]{64}$/.test(expectedHash)) {
+          recordedFixturesSrc = expectedHash;
+        }
+        continue;
+      }
       evidence.hash_check.total++;
 
       // Resolve the key to an actual git ref.
@@ -270,6 +290,40 @@ for (const entry of entries) {
   } catch (error) {
     evidence.error = error.message;
   }
+
+  // S57 (R4a): golden validity includes the fixtures-src CONTENT hash. For a
+  // fixture whose source is part of this checkout (FIXTURE_META), the ledger
+  // MUST record FIXTURES_SRC and it MUST equal the current fixtures-src
+  // content — drift between the golden tree and its source invalidates the
+  // golden, fail-closed and naming the drifted fixture. Unknown/self-test
+  // fixtures (no FIXTURE_META, no fixtures-src source) are untouched: the
+  // record is only meaningful for real fixture goldens. Runs only when the
+  // ref/bare checks already passed, so the primary defect keeps its error.
+  const sourceMeta = FIXTURE_META[fixtureName];
+  if (sourceMeta !== undefined && evidence.result === 'PASS') {
+    const sourceDir = path.join(TT_ROOT, 'fixtures-src', sourceMeta.srcDir);
+    const srcCheck = { source_dir: path.relative(TT_ROOT, sourceDir) };
+    try {
+      srcCheck.recorded = recordedFixturesSrc;
+      if (recordedFixturesSrc === null) {
+        throw new Error('golden hash ledger records no fixtures-src content hash — rebuild the golden to record FIXTURES_SRC (S57)');
+      }
+      const current = hashFixtureSourceDir(sourceDir);
+      srcCheck.current = current;
+      srcCheck.matched = current === recordedFixturesSrc;
+      if (!srcCheck.matched) {
+        throw new Error(
+          `fixtures-src drift for fixture ${fixtureName}: golden was built from different source content than fixtures-src/${sourceMeta.srcDir} (recorded ${recordedFixturesSrc}, current ${current})`,
+        );
+      }
+    } catch (srcErr) {
+      srcCheck.error = srcErr.message;
+      evidence.error = srcErr.message;
+      evidence.result = 'FAIL';
+    }
+    evidence.fixtures_src_check = srcCheck;
+  }
+
   fixtures.push(evidence);
 }
 

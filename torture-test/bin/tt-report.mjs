@@ -59,7 +59,7 @@ function oracleFindings(caseState) {
   return findings;
 }
 
-function hasInfrastructureFailure(state) {
+export function hasInfrastructureFailure(state) {
   return state.cases.some((item) => item.outcome === 'TEST_INFRA_FAIL'
     // MACP3 US-006: host-profile-missing is infrastructure failure REGARDLESS
     // of how it was persisted — applyHostRequirements records it as
@@ -144,9 +144,47 @@ export function verdictExitCode(state) {
   }
   const hasFinding = state.cases.some((item) =>
     !['PASS', 'NOT_RUN'].includes(item.outcome) || (item.findings ?? []).length > 0);
-  return hasFinding
-    ? { verdict: 'FINDINGS', exitCode: 1 }
-    : { verdict: 'GREEN', exitCode: 0 };
+  if (hasFinding) return { verdict: 'FINDINGS', exitCode: 1 };
+  // S51 (R4a US-009): executed/expected verdict. GREEN requires executed ==
+  // expected-executable (the in-scope cells the campaign recorded it would
+  // execute under the loaded host profile). When a recorded expected cell
+  // ended with zero attempts the campaign executed FEWER cells than it was
+  // capable of — the partial-execution 'green' the 2026-09-02 mac runs
+  // reported (1/35, 4/28, 1/70). That is INCONCLUSIVE (exit 1), never GREEN,
+  // and the report names the shortfall cells. Real findings (above) keep
+  // precedence: a product defect proven is FINDINGS, not INCONCLUSIVE.
+  const execution = executedExpectedCounts(state);
+  if (execution !== null && execution.executed !== execution.expected) {
+    return { verdict: 'INCONCLUSIVE', exitCode: 1 };
+  }
+  return { verdict: 'GREEN', exitCode: 0 };
+}
+
+// S51 (R4a US-009): executed/expected counts against the campaign's recorded
+// expected-executable scope (state.expected_executable.ids, recorded by
+// tt-controller at campaign start after the selection + host-requirement
+// gates). 'executed' = recorded-expected cells with at least one attempt;
+// shortfall = recorded-expected cells that ended with zero attempts (the
+// cells INCONCLUSIVE names). Returns null for legacy states without the
+// recorded scope (they keep the pre-S51 verdict math unchanged) and an
+// object for every S51-era state — an empty scope (no executable in-scope
+// cells, e.g. a scripted-only run of a real-only manifest) yields
+// executed 0 == expected 0, which stays GREEN.
+export function executedExpectedCounts(state) {
+  const expectedIds = state?.expected_executable?.ids;
+  if (!Array.isArray(expectedIds)) return null;
+  const byId = new Map((state?.cases ?? []).map((item) => [item.id, item]));
+  const executed = [];
+  const shortfall = [];
+  for (const id of expectedIds) {
+    const item = byId.get(id);
+    if (item !== undefined && Array.isArray(item.attempts) && item.attempts.length > 0) {
+      executed.push(id);
+    } else {
+      shortfall.push(id);
+    }
+  }
+  return { expected: expectedIds.length, executed: executed.length, shortfall };
 }
 
 function hygieneCanaryFiles(hygieneCanary) {
@@ -215,6 +253,7 @@ export function buildCampaignReport(state) {
   const verdict = verdictExitCode(state);
   const failClosedCause = zeroRealLaunchesCause(state);
   const vacuityCause = bareVacuityCause(state);
+  const executionCounts = executedExpectedCounts(state);
   // MACP3 US-008: the vacuous-campaign finding is surfaced ONLY when it is the
   // operative fail-closed signal (the verdict is a non-INFRA FINDINGS). When an
   // infrastructure failure drives the verdict, INFRA FAILURES already names the
@@ -329,6 +368,13 @@ export function buildCampaignReport(state) {
         },
     verdict: verdict.verdict,
     exit_code: verdict.exitCode,
+    // S51 (R4a US-009): executed/expected verdict ledger. executed ==
+    // expected_executable is required for GREEN; a shortfall (an expected
+    // cell that never executed) renders INCONCLUSIVE and is named in
+    // shortfall_cells. null/[] for legacy states without the recorded scope.
+    executed: executionCounts === null ? null : executionCounts.executed,
+    expected_executable: executionCounts === null ? null : executionCounts.expected,
+    shortfall_cells: executionCounts === null ? [] : executionCounts.shortfall,
     fail_closed: {
       triggered: failClosedCause !== null,
       cause: failClosedCause,
@@ -344,6 +390,12 @@ export function buildCampaignReport(state) {
       triggered: vacuousFinding.length > 0,
       cause: vacuityCause,
     },
+    // S55: which dist the contained real daemon ran — surfaced from the
+    // real-case preflight state (state.real_preflight.daemon, recorded by
+    // tt-controller from tt-daemon-up's TT_DAEMON_* lines). null unless a
+    // real campaign's daemon-up leg recorded the evidence, so synthetic and
+    // legacy states render byte-identically to pre-S55.
+    real_daemon: clone(state.real_preflight?.daemon ?? null),
   };
 }
 
@@ -405,6 +457,23 @@ export function renderCampaignReport(report) {
     `Manifest: ${report.campaign.manifest.path}`,
     `Created: ${report.campaign.created_at}`,
     `Completed: ${report.campaign.completed_at}`,
+    // S55: which dist the contained real daemon ran (recorded only when a
+    // real campaign's daemon-up preflight leg surfaced the evidence — absent
+    // on synthetic/legacy/scripted-only states, which render byte-identically
+    // to pre-S55).
+    ...(report.real_daemon && typeof report.real_daemon === 'object'
+      ? [
+          '',
+          'CONTAINED DAEMON (S55)',
+          `Daemon dist version: ${report.real_daemon.version ?? '(unknown)'}`,
+          ...(report.real_daemon.cli
+            ? [`Daemon launcher CLI: ${report.real_daemon.cli}`]
+            : []),
+          ...(Array.isArray(report.real_daemon.caller_argv) && report.real_daemon.caller_argv.length > 0
+            ? [`Daemon caller argv: ${report.real_daemon.caller_argv.join(' ')}`]
+            : []),
+        ]
+      : []),
     '',
     'SCENARIO OUTCOMES',
     table(report.rows),
@@ -466,6 +535,18 @@ export function renderCampaignReport(report) {
     '',
     'VERDICT',
     `${report.verdict} (exit ${report.exit_code})`,
+    // S51 (R4a US-009): every S51-era campaign prints its executed/expected
+    // verdict line (GREEN requires executed == expected-executable). A
+    // shortfall line names the expected-but-never-executed cells. Legacy
+    // states (no recorded scope) render exactly as before.
+    ...(report.executed === null || report.executed === undefined
+      ? []
+      : [
+          `executed/expected: ${report.executed}/${report.expected_executable}`,
+          ...(Array.isArray(report.shortfall_cells) && report.shortfall_cells.length > 0
+            ? [`shortfall cells (expected but not executed): ${report.shortfall_cells.join(', ')}`]
+            : []),
+        ]),
     ...(report.fail_closed?.triggered && report.fail_closed.cause
       ? [`Cause: ${report.fail_closed.cause}`, '']
       : ['']),

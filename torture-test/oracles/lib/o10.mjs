@@ -154,9 +154,9 @@ function readDatabase(invocation) {
     const stepLoopSelect = stepColumns.has('loop_config') ? ', loop_config' : '';
     return {
       runs: database.prepare('SELECT id, workflow_id, status, context, updated_at FROM runs ORDER BY id').all(),
-      steps: database.prepare(`SELECT run_id, step_id, agent_id, status, output, reroute_count,
+      steps: database.prepare(`SELECT id, run_id, step_id, agent_id, status, output, reroute_count,
         terminal_reroute_count, ledger_concession_count, updated_at${stepTypeSelect}${stepLoopSelect}
-        FROM steps ORDER BY run_id, step_id`).all(),
+        FROM steps ORDER BY run_id, step_id, updated_at, id`).all(),
       ledger: database.prepare(`SELECT id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code,
         duration_ms, log_tail, run_id, step_id, created_at FROM suite_results ORDER BY id`).all(),
     };
@@ -210,6 +210,34 @@ function expectedCell(mode, strictMissing, evidence) {
   if (evidence === 'red' && mode === 'default') return { lands: true, reroutes: 0, merger_invocations: 1, annotations: ['merge.landed_over_red_suite'] };
   if (evidence === 'missing' && !strictMissing) return { lands: true, reroutes: 1, merger_invocations: 1, annotations: ['merge.landed_without_suite_evidence'] };
   return { lands: false, reroutes: 1, merger_invocations: 0, annotations: [] };
+}
+
+// S47 (US-005): attempt-aware finalize-step ordering. A legitimately
+// refused/rerouted finalize can accrue MULTIPLE finalize_merge step ROWS (one
+// per attempt on the refusal/reroute corridor) while the workflow keeps its
+// single finalize_merge step, so rows are ordered by (updated_at, id) and the
+// LAST row is the TERMINAL attempt — the row that carries the run's final
+// finalize disposition and drives the decision table.
+function attemptRowOrder(left, right) {
+  const leftAt = timestamp(left.updated_at, `run step ${left.step_id ?? ''} updated_at`);
+  const rightAt = timestamp(right.updated_at, `run step ${right.step_id ?? ''} updated_at`);
+  if (leftAt !== rightAt) return leftAt - rightAt;
+  return String(left.id ?? '').localeCompare(String(right.id ?? ''));
+}
+
+// S47 (US-005): the attempt-aware finalize-step model for one run.
+//   runSteps: the run's terminal steps rows (ALL rows, finalize_merge
+//             included), as read from the terminal database snapshot.
+// Returns { rows, terminal, attempts } where rows are the run's finalize_merge
+// rows in attempt order (updated_at, id) ascending, attempts is their count,
+// and terminal is the last row — or null when the run has NO finalize_merge
+// row at all (the launch/setup-time refusal or never-executed corridor, which
+// is NOT_EVALUABLE, never an oracle runtime error).
+export function finalizeStepModel(runSteps) {
+  const rows = runSteps
+    .filter((step) => step.step_id === 'finalize_merge')
+    .toSorted(attemptRowOrder);
+  return { rows, terminal: rows.length === 0 ? null : rows[rows.length - 1], attempts: rows.length };
 }
 function eventNames(events) {
   return events.map((event) => event.event).filter((name) => FMIS_EVENTS.has(name)).sort();
@@ -412,6 +440,15 @@ function readOptionalDispatchRenderings(invocation) {
 // corridor rows (the shared on_fail.retry_step discipline O11 recognizes),
 // the corridor rows naming the step must cover its step.rerouted events;
 // otherwise the DB-counter reconciliation is the attestation (fallback).
+// S47 (US-005): rows are grouped by step_id. A refused/rerouted finalize can
+// legitimately accrue MULTIPLE finalize_merge rows (per-attempt rows on the
+// refusal/reroute corridor) while the workflow keeps its single finalize_merge
+// step. Within a group the rows are ordered by (updated_at, id) — the LAST row
+// is the TERMINAL attempt that carries the step's final disposition and is the
+// only row reconciled against the DB counter and the strict decision-table
+// bounds; earlier rows are SUPERSEDED attempts, reconciled as attempts (each
+// must be separated from the next attempt by a step.rerouted event of the
+// step, and a done/landed attempt can never be superseded by a later row).
 // Returns { anomalies, per_step, corridor_evidence } with no side effects.
 export function reconcileReroutes(events, runSteps, corridor, refusalExpectedReroutes) {
   const perStepEvents = new Map();
@@ -433,10 +470,28 @@ export function reconcileReroutes(events, runSteps, corridor, refusalExpectedRer
       anomalies.push({ kind: 'unknown-step-rerouted', step_id: stepId, reroute_events: count });
     }
   }
+  const groups = new Map();
   for (const step of runSteps) {
-    const observed = perStepEvents.get(step.step_id) ?? 0;
-    const database = step.terminal_reroute_count ?? 0;
-    const bounded = step.step_id === 'finalize_merge' && refusalExpectedReroutes !== null;
+    const group = groups.get(step.step_id) ?? [];
+    group.push(step);
+    groups.set(step.step_id, group);
+  }
+  for (const [stepId, rows] of groups) {
+    let ordered = rows;
+    if (ordered.length > 1) {
+      try {
+        ordered = [...rows].toSorted(attemptRowOrder);
+      } catch {
+        // rows without canonical updated_at keep their snapshot order (only
+        // reachable from direct unit-test rows, never from the DB evidence).
+        ordered = rows;
+      }
+    }
+    const terminal = ordered[ordered.length - 1];
+    const superseded = ordered.slice(0, -1);
+    const observed = perStepEvents.get(stepId) ?? 0;
+    const database = terminal.terminal_reroute_count ?? 0;
+    const bounded = stepId === 'finalize_merge' && refusalExpectedReroutes !== null;
     const expected = bounded ? refusalExpectedReroutes : database;
     const countMismatch = bounded
       ? observed !== expected || database !== expected
@@ -444,29 +499,63 @@ export function reconcileReroutes(events, runSteps, corridor, refusalExpectedRer
     if (countMismatch) {
       anomalies.push({
         kind: bounded ? 'refusal-count-mismatch' : 'count-mismatch',
-        step_id: step.step_id,
+        step_id: stepId,
         expected,
         database,
         observed,
       });
     }
-    const corridorCount = corridorByStep.get(step.step_id) ?? 0;
+    const corridorCount = corridorByStep.get(stepId) ?? 0;
     if (observed > 0 && corridorPresent && corridorCount < observed) {
       anomalies.push({
         kind: 'corridor-missing',
-        step_id: step.step_id,
+        step_id: stepId,
         corridor_rows: corridorCount,
         reroute_events: observed,
       });
     }
+    // S47 attempt corridor: every superseded attempt row must be separated
+    // from the next attempt by a step.rerouted event (each refusal re-arms the
+    // upstream producer through on_fail.retry_step and the re-dispatch
+    // produces the next attempt row), and a done (landed) attempt can never be
+    // superseded by a later finalize row.
+    if (superseded.length > 0 && observed < superseded.length) {
+      anomalies.push({
+        kind: 'attempt-without-reroute',
+        step_id: stepId,
+        superseded_rows: superseded.length,
+        reroute_events: observed,
+      });
+    }
+    for (const attempt of superseded) {
+      if (attempt.status === 'done') {
+        anomalies.push({
+          kind: 'superseded-done-attempt',
+          step_id: stepId,
+          attempt_row_id: attempt.id ?? null,
+        });
+      }
+    }
     per_step.push({
-      step_id: step.step_id,
+      step_id: terminal.step_id,
       terminal_reroute_count: database,
       reroute_events: observed,
       corridor_rows: corridorCount,
       corridor: corridorPresent ? 'corroborated' : 'fallback',
       decision_table_bound: bounded ? expected : null,
+      attempts: ordered.length,
+      superseded_rows: superseded.length,
     });
+    for (const [index, attempt] of superseded.entries()) {
+      per_step.push({
+        step_id: attempt.step_id,
+        attempt_index: index + 1,
+        superseded: true,
+        terminal_reroute_count: attempt.terminal_reroute_count ?? 0,
+        status: attempt.status ?? null,
+        corridor: corridorPresent ? 'corroborated' : 'fallback',
+      });
+    }
   }
   return {
     anomalies,
@@ -477,40 +566,130 @@ export function reconcileReroutes(events, runSteps, corridor, refusalExpectedRer
 function outputValues(output) {
   const values = new Map();
   if (typeof output !== 'string') return values;
+  let currentKey = null;
+  let currentValue = null;
   for (const line of output.split('\n')) {
     const match = /^([A-Z_]+): (.*)$/.exec(line);
-    if (match) values.set(match[1], match[2]);
+    if (match) {
+      if (currentKey !== null) values.set(currentKey, currentValue);
+      currentKey = match[1];
+      currentValue = match[2];
+    } else if (currentKey === 'LOG_TAIL' && currentValue !== null) {
+      // S59 (US-017): LOG_TAIL is the gate's multi-line key. Its value runs
+      // from the LOG_TAIL keyline until the next KEYLINE (or the end of the
+      // block), so a multi-line ledger log_tail — plus any gate-generated
+      // remediation advice the gate appends after the tail — is captured
+      // whole instead of stopping at the first line.
+      currentValue += `\n${line}`;
+    }
   }
+  if (currentKey !== null) values.set(currentKey, currentValue);
   return values;
 }
-function verifyDiagnosis(findings, runId, step, evidence, key, tree, row) {
-  const values = outputValues(step.output);
-  const expected = new Map([
-    ['FAILURE_CLASS', 'refused_permanent'], ['LEDGER_EVIDENCE', evidence],
-    ['ORIGIN_REPO', key.origin_repo], ['TREE_HASH', tree], ['CMD_HASH', key.cmd_hash],
-  ]);
-  if (evidence === 'red' && row !== null) {
-    expected.set('LEDGER_ROW_ID', String(row.id));
-    expected.set('EXIT_CODE', String(row.exit_code));
-    expected.set('TIMESTAMP', row.created_at);
-    expected.set('DURATION_MS', String(row.duration_ms));
-    expected.set('LEDGER_RUN_ID', row.run_id ?? '');
-    expected.set('LEDGER_STEP_ID', row.step_id ?? '');
-    expected.set('LOG_TAIL', row.log_tail ?? '');
+// S59 (US-017): O10's exact refusal self-diagnosis model. verifyDiagnosis was
+// a single-branch model: it compared the refusal keylines against the oracle's
+// OWN decision evidence (the exact-key row when the oracle found one red, or
+// the DECLARED command identity when the oracle concluded missing). Real
+// strict-ledger refusals do not always take that shape:
+//   (1) red-evidence branch: the gate appends its remediation sentence after
+//       the LOG_TAIL keyline (a multi-line key), so the parsed LOG_TAIL value
+//       = the ledger row log_tail + trailing advice and an exact compare
+//       failed. O10 captures the full multi-line value and PREFIX-compares it
+//       against the cited row's log_tail (terminating at the trailing advice).
+//   (2) missing-with-nearest branch: the worker produced no ledger row for the
+//       DECLARED command, so the gate grounded its refusal on the NEAREST red
+//       evidence row it could find (LEDGER_ROW_ID / LEDGER_EVIDENCE: red plus
+//       THAT row's CMD_HASH/TEST_CMD), while the oracle expected the declared
+//       command's hash and LEDGER_EVIDENCE: missing. O10 now models the gate's
+//       two branches and compares every key against the row the gate ACTUALLY
+//       cites (LEDGER_ROW_ID).
+// The oracle stays strict: refusal text must still be gate-generated keylines
+// (never agent prose), LEDGER_ROW_ID must name a real row of the case's scoped
+// ledger, and the cited row must reconcile with the oracle's own decision
+// evidence (an exact-key red row the oracle found must be the row the gate
+// cites; a row the gate cites as exact while the oracle concluded missing is
+// an inconsistent diagnosis).
+// Returns { branch: 'red-cited-row' | 'missing', cited_row_id, mismatched_keys }.
+export function refusalDiagnosis(output, evidence, key, tree, oracleRow, ledgerRows) {
+  const values = outputValues(output);
+  const mismatched = [];
+  const check = (keyName, value) => { if (values.get(keyName) !== value) mismatched.push(keyName); };
+  const requireNonempty = (keyName) => {
+    if (!values.has(keyName) || values.get(keyName) === '') mismatched.push(keyName);
+  };
+  const addUnique = (keyName) => { if (!mismatched.includes(keyName)) mismatched.push(keyName); };
+
+  check('FAILURE_CLASS', 'refused_permanent');
+
+  const citedRowId = values.get('LEDGER_ROW_ID');
+  const citedRow = citedRowId !== undefined && citedRowId !== ''
+    ? (ledgerRows.find((candidate) => String(candidate.id) === citedRowId) ?? null)
+    : null;
+  if (citedRowId !== undefined && citedRowId !== '' && citedRow === null) addUnique('LEDGER_ROW_ID');
+  const branch = citedRow === null ? 'missing' : 'red-cited-row';
+
+  let commandHash = key.cmd_hash;
+  if (branch === 'red-cited-row') {
+    const row = citedRow;
+    check('LEDGER_EVIDENCE', 'red');
+    check('ORIGIN_REPO', row.origin_repo);
+    check('TREE_HASH', row.tree_hash);
+    check('CMD_HASH', row.cmd_hash);
+    commandHash = row.cmd_hash;
+    check('LEDGER_ROW_ID', String(row.id));
+    check('EXIT_CODE', String(row.exit_code));
+    check('TIMESTAMP', row.created_at);
+    check('DURATION_MS', String(row.duration_ms));
+    check('LEDGER_RUN_ID', row.run_id ?? '');
+    check('LEDGER_STEP_ID', row.step_id ?? '');
+    // S59 (1): prefix-compare the multi-line LOG_TAIL value against the cited
+    // row's log_tail so a gate-appended remediation sentence after the tail
+    // never fails the exact compare.
+    const logTail = row.log_tail ?? '';
+    const parsedLogTail = values.get('LOG_TAIL');
+    if (typeof parsedLogTail !== 'string' || !parsedLogTail.startsWith(logTail)) addUnique('LOG_TAIL');
+    // S59 (2): reconcile the cited row with the oracle's own decision evidence.
+    const isExact = row.origin_repo === key.origin_repo
+      && row.tree_hash === tree && row.cmd_hash === key.cmd_hash;
+    if (evidence === 'red') {
+      // The oracle found an exact-key red row: a correct refusal on the red
+      // branch must cite THAT row (never a nearest or foreign row).
+      if (oracleRow === null || String(oracleRow.id) !== String(row.id) || !isExact) addUnique('LEDGER_ROW_ID');
+    } else if (isExact) {
+      // The oracle concluded missing but the gate cites the exact-key row the
+      // oracle could not find: the refusal diagnosis does not reconcile with
+      // the oracle's decision evidence.
+      addUnique('LEDGER_EVIDENCE');
+    }
+  } else {
+    check('LEDGER_EVIDENCE', 'missing');
+    check('ORIGIN_REPO', key.origin_repo);
+    check('TREE_HASH', tree);
+    check('CMD_HASH', key.cmd_hash);
   }
-  const missing = [...expected].filter(([keyName, value]) => values.get(keyName) !== value)
-    .map(([keyName]) => keyName);
-  for (const keyName of ['TEST_CMD', 'WORKSPACE_STATE', 'NEAREST_EVIDENCE', 'ACTION']) {
-    if (!values.has(keyName) || values.get(keyName) === '') missing.push(keyName);
-  }
+  for (const keyName of ['TEST_CMD', 'WORKSPACE_STATE', 'NEAREST_EVIDENCE', 'ACTION']) requireNonempty(keyName);
   const testCommand = values.get('TEST_CMD');
   if (typeof testCommand === 'string'
-      && createHash('sha256').update(testCommand).digest('hex') !== key.cmd_hash) {
-    missing.push('TEST_CMD');
+      && createHash('sha256').update(testCommand).digest('hex') !== commandHash) {
+    addUnique('TEST_CMD');
   }
-  if (missing.length > 0) findings.add('O10_REFUSAL_DIAGNOSIS', 'strict ledger refusal lacks exact mechanical self-diagnosis evidence', {
-    run_id: runId, evidence, missing_or_mismatched_keys: [...new Set(missing)].sort(),
-  });
+  return {
+    branch,
+    cited_row_id: citedRowId !== undefined && citedRowId !== '' ? citedRowId : null,
+    mismatched_keys: [...new Set(mismatched)].sort(),
+  };
+}
+function verifyDiagnosis(findings, runId, step, evidence, key, tree, oracleRow, ledgerRows) {
+  const diagnosis = refusalDiagnosis(step.output, evidence, key, tree, oracleRow, ledgerRows);
+  if (diagnosis.mismatched_keys.length > 0) {
+    findings.add('O10_REFUSAL_DIAGNOSIS', 'strict ledger refusal lacks exact mechanical self-diagnosis evidence', {
+      run_id: runId,
+      evidence,
+      missing_or_mismatched_keys: diagnosis.mismatched_keys,
+      refusal_diagnosis: { branch: diagnosis.branch, cited_row_id: diagnosis.cited_row_id },
+    });
+  }
+  return diagnosis;
 }
 
 export function evaluateO10(invocation) {
@@ -568,6 +747,13 @@ export function evaluateO10(invocation) {
     else if (!runRegimes.has(runId)) runRegimes.set(runId, 'scripted');
   }
   const observations = [];
+  // S47 (US-005) / S59 (US-017): projected runs with no applicable
+  // step-level gate evidence are recorded here — NEVER as oracle runtime
+  // errors and never as PRODUCT_FAIL verdicts over evidence the FMIS decision
+  // table cannot apply: runs with no finalize_merge step row (launch/setup-time
+  // refusal) and runs that never reached a claimed step (S59 never-executed
+  // arm — no step.running and no executed steps row).
+  const notEvaluable = [];
 
   for (const projection of projected) {
     const runId = canonicalRunId(projection.run_id);
@@ -577,13 +763,51 @@ export function evaluateO10(invocation) {
       findings.add('O10_DB_RUN_MISSING', 'merge-run projection is absent from the terminal database snapshot', { run_id: runId });
       continue;
     }
-    const finalize = database.steps.filter((step) => step.run_id === dbRunId && step.step_id === 'finalize_merge');
-    if (finalize.length !== 1) throw new OracleRuntimeError(`run ${runId} must have exactly one finalize_merge step`);
-    const [step] = finalize;
-    const effectiveContext = runContext(run.context, runId);
-    verifyLaunchInvariance(findings, launch, effectiveContext, runId);
+    const regime = runRegimes.get(runId) ?? 'scripted';
+    const runSteps = database.steps.filter((step) => step.run_id === dbRunId);
     const runEvents = events.filter((event) => typeof (event.runId ?? event.run_id) === 'string'
       && canonicalRunId(event.runId ?? event.run_id) === runId);
+    // S47 (US-005): attempt-aware finalize-step selection. The workflow
+    // defines ONE finalize_merge step, but a refused/rerouted finalize
+    // legitimately accrues MULTIPLE finalize_merge step ROWS (per-attempt rows
+    // on the refusal/reroute corridor); finalizeStepModel selects the TERMINAL
+    // attempt (the row carrying the run's final finalize disposition) and the
+    // decision table is applied to that row.
+    const finalize = finalizeStepModel(runSteps);
+    if (finalize.terminal === null) {
+      notEvaluable.push({
+        run_id: runId,
+        regime,
+        reason: 'run has no finalize_merge step row: no step-level gate evidence to apply the FMIS decision table (launch/setup-time refusal or never-executed run)',
+      });
+      continue;
+    }
+    // S59 (US-017) never-executed arm: a run that NEVER reached a claimed
+    // step — no step.running event was ever captured for it and no steps row
+    // of the run is in an executed state (the W4.dsh-fdmw shape: a dsh
+    // harness instant-failing under the contained daemon, 0 tokens, canceled
+    // at the wall cap with the workflow's step rows still waiting/pending/
+    // canceled) has no step-level gate evidence the FMIS decision table can
+    // apply. O10 records it run-level NOT_EVALUABLE with the reason so the
+    // case classifies INCONCLUSIVE/TIF — never a PRODUCT_FAIL via
+    // O10_EVENT_SET_MISMATCH over a stream that never executed. Refusal cells
+    // DO reach a claimed step (their pre-finalize steps execute; only the
+    // finalize dispatch is refused), and canceled runs whose steps executed
+    // keep the canceled-run anomaly doctrine — this arm is scoped to REAL
+    // cells, where an executed run always emits step.running events.
+    const executedStepRows = runSteps.some((candidate) => ['done', 'failed', 'running'].includes(candidate.status));
+    if (regime === 'real' && !executedStepRows
+        && !runEvents.some((event) => event.event === 'step.running')) {
+      notEvaluable.push({
+        run_id: runId,
+        regime,
+        reason: 'run never reached a claimed step: no step.running event was captured and no steps row executed (waiting/pending/canceled rows only — the 0-token canceled-before-dispatch class), so no step-level gate evidence exists to apply the FMIS decision table',
+      });
+      continue;
+    }
+    const step = finalize.terminal;
+    const effectiveContext = runContext(run.context, runId);
+    verifyLaunchInvariance(findings, launch, effectiveContext, runId);
     const landings = runEvents.filter((event) => event.event === 'merge.landed');
     const landing = landings[0];
     const acceptedEvents = runEvents.filter((event) => event.event === 'merge.accepted_already_landed');
@@ -671,10 +895,10 @@ export function evaluateO10(invocation) {
     //    dispatch_renderings when present; DB-counter reconciliation as the
     //    fallback). The strict refusal doctrine keeps the decision table's
     //    exact bound on refusal cells: strict missing/green refusal prescribes
-    //    exactly one obstructing reroute before refusing, so finalize_merge's
-    //    counter and event count must BOTH equal expected.reroutes there.
-    const regime = runRegimes.get(runId) ?? 'scripted';
-    const runSteps = database.steps.filter((step) => step.run_id === dbRunId);
+    //    exactly one obstructing reroute before refusing, so the TERMINAL
+    //    finalize_merge row's counter and the event count must BOTH equal
+    //    expected.reroutes there (superseded attempt rows are reconciled as
+    //    attempts — S47 — never against the bound).
     let rerouteReconciliation = null;
     if (regime === 'real') {
       const corridor = rerouteCorridorByStep(dispatchRenderings, runId);
@@ -691,6 +915,17 @@ export function evaluateO10(invocation) {
         } else if (anomaly.kind === 'unknown-step-rerouted') {
           findings.add('O10_REROUTE_COUNT', 'step.rerouted event names a step absent from the run terminal step evidence', {
             run_id: runId, step_id: anomaly.step_id, reroute_events: anomaly.reroute_events,
+          });
+        } else if (anomaly.kind === 'attempt-without-reroute') {
+          // S47: a superseded finalize attempt row must be separated from the
+          // next attempt by a reroute of the step — a multi-attempt finalize
+          // with no matching reroute stream is never absorbed.
+          findings.add('O10_REROUTE_COUNT', 'multi-attempt finalize must be separated by a reroute: every superseded attempt row is re-dispatched through the on_fail.retry_step corridor', {
+            run_id: runId, step_id: anomaly.step_id, superseded_rows: anomaly.superseded_rows, reroute_events: anomaly.reroute_events,
+          });
+        } else if (anomaly.kind === 'superseded-done-attempt') {
+          findings.add('O10_TERMINAL_DISPOSITION', 'a done finalize_merge attempt row is superseded by a later finalize row: the finalize step disposition is ambiguous', {
+            run_id: runId, step_id: anomaly.step_id, attempt_row_id: anomaly.attempt_row_id,
           });
         } else {
           findings.add('O10_REROUTE_COUNT', 'step reroute is not corroborated by a legal dispatch_renderings corridor row', {
@@ -737,12 +972,25 @@ export function evaluateO10(invocation) {
         run_id: runId, expected: expectedEvents, observed: actualEvents,
       });
     }
-    if (!expected.lands) verifyDiagnosis(findings, runId, step, evidence.status, launch.gateKey, tree, evidence.row);
+    let refusalDiagnosisObservation = null;
+    if (!expected.lands) {
+      // S59 (US-017): the exact refusal self-diagnosis model — the gate's
+      // red-cited-row and missing branches, compared against the row the gate
+      // actually cites (LEDGER_ROW_ID) with the multi-line LOG_TAIL prefix
+      // compared against the cited row's log_tail.
+      const diagnosis = verifyDiagnosis(findings, runId, step, evidence.status, launch.gateKey, tree, evidence.row, scopedArtifactLedger);
+      refusalDiagnosisObservation = {
+        branch: diagnosis.branch,
+        cited_row_id: diagnosis.cited_row_id,
+        mismatched_keys: diagnosis.mismatched_keys,
+      };
+    }
 
     observations.push({
       run_id: runId,
       regime,
       ...eventSetObservation,
+      ...(refusalDiagnosisObservation !== null ? { refusal_diagnosis: refusalDiagnosisObservation } : {}),
       ...(rerouteReconciliation !== null ? {
         reroute_reconciliation: {
           decision_table_reroutes: expected.reroutes,
@@ -753,6 +1001,12 @@ export function evaluateO10(invocation) {
       } : {}),
       launch: { mode: launch.mode, fail_missing: launch.fail_missing, strict_missing: launch.strictMissing },
       exact_key: { ...launch.gateKey, tree_hash: tree },
+      finalize_step: {
+        step_id: 'finalize_merge',
+        rows: finalize.attempts,
+        terminal_attempt: finalize.attempts,
+        terminal_row_id: step.id ?? null,
+      },
       expected: {
         mode: launch.mode === 'default' && launch.strictMissing ? 'fail-missing' : launch.mode,
         evidence: evidence.status, already_landed: acceptedAlreadyLanded, ...expected,
@@ -765,8 +1019,22 @@ export function evaluateO10(invocation) {
     });
   }
 
+  // S47 (US-005) + S59 (US-017): a case whose every projected run is
+  // not-evaluable (no finalize_merge step evidence — launch/setup-time
+  // refusal — or a never-executed run that never reached a claimed step)
+  // answers NOT_EVALUABLE with the reason, mirroring the gate-key-null
+  // evidence shape. Never a runtime error, never a PRODUCT_FAIL verdict over
+  // evidence the FMIS decision table cannot apply.
+  if (observations.length === 0 && notEvaluable.length > 0) {
+    const evidence = [writeEvidenceJson(invocation, 'o10-fmis-decision-table.json', {
+      schema_version: 1, captured_at: new Date().toISOString(), not_evaluable: true,
+      reason: notEvaluable[0].reason, run_count: 0, runs: [], not_evaluable_runs: notEvaluable,
+    }, 'sqlite-events-launch-refs-ledger')];
+    return { result: 'NOT_EVALUABLE', findings: [], evidence };
+  }
   const evidence = [writeEvidenceJson(invocation, 'o10-fmis-decision-table.json', {
     schema_version: 1, captured_at: new Date().toISOString(), run_count: observations.length, runs: observations,
+    ...(notEvaluable.length > 0 ? { not_evaluable_runs: notEvaluable } : {}),
   }, 'sqlite-events-launch-refs-ledger')];
   return { result: findings.length === 0 ? 'PASS' : 'FAIL', findings: findings.toJSON(), evidence };
 }

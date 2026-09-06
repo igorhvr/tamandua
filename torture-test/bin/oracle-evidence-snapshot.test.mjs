@@ -16,6 +16,7 @@ import {
   projectSubmitRejections,
 } from './oracle-evidence-snapshot.mjs';
 import { ORACLE_EVIDENCE_KEYS } from './oracle-context.mjs';
+import { countTestMarkers } from '../oracles/lib/test-markers.mjs';
 import { evaluateO9 } from '../oracles/lib/o9.mjs';
 
 const TT_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
@@ -960,4 +961,71 @@ test('S22B: a standalone rejected validation without a preceding rejection still
   ];
   assert.deepEqual(projectSubmitRejections(events), []);
   assert.deepEqual(projectExpectsValidations(events).map((row) => row.attempt_number), [1]);
+});
+
+// S48 (US-006): the checksum CAPTURE site (testMarkerCounts →
+// oracles/lib/test-markers.mjs countTestMarkers) must record test_markers
+// from test-definition/decorator contexts only — never prose/docstrings/
+// comments. RED-ARM: the embedded pre-fix whole-text replica inflates the
+// skip count on the 'skipped 07-31' prose (>= 1 over baseline 0), exactly the
+// W4.17-a O8_TEST_MARKER_INTRODUCED false-positive shape. GREEN-ARM: the
+// captured terminal inventory records {skip:0,todo:0,xfail:0} for the
+// prose-extended file, while a REAL @pytest.mark.xfail decorator introduced
+// in the same terminal commit is still counted (xfail:1).
+test('S48: the checksum capture records context-only test markers (prose/docstrings never count, real decorators still do)', () => {
+  const data = fixture();
+  try {
+    const request = input(data);
+    const legacyWholeTextMarkers = (content) => {
+      const text = content.toString('utf8');
+      return {
+        skip: (text.match(/\bskip(?:ped)?\b/giu) ?? []).length,
+        todo: (text.match(/\btodo\b/giu) ?? []).length,
+        xfail: (text.match(/\bxfail\b/giu) ?? []).length,
+      };
+    };
+    fs.writeFileSync(`${data.databasePath}-wal`, '');
+    const started = beginOracleEvidenceSnapshot(request);
+    assert.equal(started.status, 'BASELINE_CAPTURED');
+    fs.rmSync(`${data.databasePath}-wal`);
+    // Terminal commit: (a) the seeded TS test gains an additive trailing
+    // comment whose prose says 'skipped 07-31' (W4.17-a shape — must NOT
+    // count); (b) a NEW python seeded test carries a real @pytest.mark.xfail
+    // decorator next to prose that mentions 'skipped' (must count xfail only).
+    fs.writeFileSync(
+      path.join(data.repoDir, 'test', 'value.test.ts'),
+      'test("value", () => {});\n/* Regression coverage added 07-31 (BUG-P1 fix). This corridor was\n   previously skipped in the mac campaign — see the "skipped 07-31" notes. */\ntest("extended", () => {});\n',
+    );
+    fs.mkdirSync(path.join(data.repoDir, 'tests'));
+    fs.writeFileSync(
+      path.join(data.repoDir, 'tests', 'test_value.py'),
+      '# W4.17-a regression note (added 07-31): the fix was previously skipped\n@pytest.mark.xfail(reason="known flaky on mac")\ndef test_value():\n    assert True\n',
+    );
+    run('git', ['add', '-A'], data.repoDir);
+    run('git', ['commit', '-m', 'terminal'], data.repoDir);
+    fs.writeFileSync(`${data.databasePath}-wal`, '');
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    assert.equal(completed.status, 'COMPLETE');
+    const terminal = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.checksum_terminal.path), 'utf8',
+    ));
+    const markers = (file) => terminal.entries.find((entry) => entry.path === file).test_markers;
+    // GREEN-ARM: prose-only extension records zero markers; the real xfail
+    // decorator records xfail:1 and no skip from the '# ... skipped' comment.
+    assert.deepEqual(markers('test/value.test.ts'), { skip: 0, todo: 0, xfail: 0 },
+      'S48: prose-only extension must record zero markers in the terminal capture');
+    assert.deepEqual(markers('tests/test_value.py'), { skip: 0, todo: 0, xfail: 1 },
+      'S48: a real @pytest.mark.xfail decorator counts while prose comments do not');
+    // RED-ARM: the PRE-FIX whole-text counting inflated the skip counts on
+    // the very same bytes (the W4.17-a false-positive shape).
+    const tsBytes = fs.readFileSync(path.join(data.repoDir, 'test', 'value.test.ts'));
+    const pyBytes = fs.readFileSync(path.join(data.repoDir, 'tests', 'test_value.py'));
+    assert.ok(legacyWholeTextMarkers(tsBytes).skip >= 1, 'S48: pre-fix counting inflated skip on the TS prose comment');
+    assert.ok(legacyWholeTextMarkers(pyBytes).skip >= 1, 'S48: pre-fix counting inflated skip on the python prose comment');
+    assert.ok(legacyWholeTextMarkers(pyBytes).xfail >= 1, 'S48: pre-fix counting saw the real xfail decorator');
+    assert.deepEqual(countTestMarkers('test/value.test.ts', tsBytes), { skip: 0, todo: 0, xfail: 0 });
+    assert.deepEqual(countTestMarkers('tests/test_value.py', pyBytes), { skip: 0, todo: 0, xfail: 1 });
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
 });

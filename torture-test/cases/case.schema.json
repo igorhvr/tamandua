@@ -447,7 +447,7 @@
       },
       {
        "type": "object",
-       "description": "AWAITED trigger (S18b): the probe action arms only when the contained run reaches the declared status or the declared event type lands in the contained event stream, bounded by timeout_s. Exactly ONE of status|event is allowed (both at once is rejected). NOTE: the two alternatives are expressed as an anyOf of complete object forms (NOT oneOf) because the controller's bundled schema validator implements anyOf but not oneOf — the per-arm additionalProperties:false makes both-at-once fail BOTH arms, and the per-arm required enforces timeout_s.",
+       "description": "AWAITED trigger (S18b / S62): the probe action arms only when the contained run reaches the declared status, the declared event type lands in the contained event stream, or the declared daemon-log needle appears on a contained-daemon log line naming the run, bounded by timeout_s. Exactly ONE of status|event|daemon_log is allowed (more than one is rejected). NOTE: the alternatives are expressed as an anyOf of complete object forms (NOT oneOf) because the controller's bundled schema validator implements anyOf but not oneOf — the per-arm additionalProperties:false makes two-at-once fail ALL arms, and the per-arm required enforces timeout_s.",
        "anyOf": [
         {
          "type": "object",
@@ -488,11 +488,31 @@
           "event",
           "timeout_s"
          ]
+        },
+        {
+         "type": "object",
+         "additionalProperties": false,
+         "properties": {
+          "daemon_log": {
+           "type": "string",
+           "minLength": 1,
+           "description": "S62 (US-019) daemon-log needle: the trigger fires when the CONTAINED daemon's product log (<TAMANDUA_STATE_DIR>/tamandua.log) gains a line carrying BOTH this needle (substring) and the run's id — the signal that EXISTS under an instant-fail loop (W4.47: the product emits no step.running for rounds that exit before claiming, but the daemon logs every 'Worker round classified as instant fail' classification for the run)."
+          },
+          "timeout_s": {
+           "type": "number",
+           "exclusiveMinimum": 0,
+           "description": "How long (seconds) to await the trigger before the probe fails (probe-trigger-unreached)."
+          }
+         },
+         "required": [
+          "daemon_log",
+          "timeout_s"
+         ]
         }
        ]
       }
      ],
-     "description": "Phase marker arming the probe: a string marker ('now' | 'step:<role>:<state>' | 'event:<type>') or an awaited object trigger ({\"status\":\"paused\",\"timeout_s\":120} awaiting the run status, or {\"event\":\"run.process_cleanup\",\"timeout_s\":120} awaiting the event type)."
+     "description": "Phase marker arming the probe: a string marker ('now' | 'step:<role>:<state>' | 'event:<type>') or an awaited object trigger ({\"status\":\"paused\",\"timeout_s\":120} awaiting the run status, {\"event\":\"run.process_cleanup\",\"timeout_s\":120} awaiting the event type, or {\"daemon_log\":\"Worker round classified as instant fail\",\"timeout_s\":600} awaiting the run's instant-fail classification in the contained daemon's log)."
     },
     "hold_seconds": {
      "type": "number",

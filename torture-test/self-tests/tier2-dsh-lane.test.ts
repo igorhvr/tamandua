@@ -228,7 +228,7 @@ describe("Tier-2 dsh lane (US-013) — four operator-directed dsh-harness cases"
     }
     const res = runTt(controller, ["--manifest", "cases/tier2.jsonl", "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("every dsh task file names the DSH_PERMISSION_MODE=danger-full-access injection and the profile-pin caveat, plus its fixture and (where bug-fix) its seed", () => {
@@ -392,9 +392,9 @@ describe("Tier-2 dsh lane (US-013) — four operator-directed dsh-harness cases"
     assert.match(trace, /## Excluded Scenarios — Complete Enumeration \(dsh lane\)/, "dsh-lane exclusion enumeration");
     assert.match(trace, /## Token Budget Note \(dsh lane\)/, "dsh-lane token budget note");
     // The manifest summary counts the dsh lane.
-    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*/,
-      "manifest summary must show 70 cases incl. the dsh lane");
-    assert.match(trace, /\| Real \(token-bearing\) cases \| 45 \|/,
-      "manifest summary must show 45 real cases (the four dsh rows + the W5 storm row are real)");
+    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*/,
+      "manifest summary must show 72 cases incl. the dsh lane");
+    assert.match(trace, /\| Real \(token-bearing\) cases \| 43 \|/,
+      "manifest summary must show 43 real cases (the four dsh rows + the W5 storm row are real)");
   });
 });

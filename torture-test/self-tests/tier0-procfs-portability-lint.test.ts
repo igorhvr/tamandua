@@ -440,6 +440,16 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     reason:
       "MACP3.1 US-009 landing-report pin — its '/proc' occurrences are prose in the header narrative and the acceptance-item names (portability fix, '/proc sweep completeness'); the test only reads the MACP3.1 salvage doc, no runtime procfs access.",
   },
+  "self-tests/tier1-mcha-tt-chaos-darwin-kill-guard.test.ts": {
+    category: "documentation",
+    reason:
+      "MCHA US-014 darwin kill-guard pin — its '/proc' occurrences are prose in the header narrative describing the mac's missing /proc (the defect context), the pre-fix /proc-only evidence source the portable arms replaced, and structural-assert regex literals pinning the tools' /proc-free darwin arms; the test performs no runtime procfs access of its own (its evidence is ps/lsof + the guarded tools).",
+  },
+  "self-tests/tier1-mvpt-tt-verify-darwin-port-ownership.test.ts": {
+    category: "documentation",
+    reason:
+      "MVPT US-015 darwin env-gate pin — its '/proc' occurrences are prose in the header narrative and structural-assert regex literals pinning the guarded linux procfs arm of tt-verify-environment's ownership evidence reader (the runtime procfs/lsof/ps reads live inside the tool under test, allowlisted separately); the test performs no runtime procfs access of its own.",
+  },
   "self-tests/tier1-tt-recorder-darwin-port-evidence.test.ts": {
     category: "documentation",
     reason:

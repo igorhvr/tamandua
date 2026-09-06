@@ -5,7 +5,7 @@
 // Pins the section-A batch of cases/tier2.jsonl (US-004), the shared
 // manifest invariants that hold once sections B + G (US-005), C1 (US-006),
 // C2 (US-007) and H (US-011) are appended:
-//   * the manifest exists with the 10 section-A + 11 section-B/G + 6
+//   * the manifest exists with the 10 section-A + 13 section-B/G + 6
 //     section-C1 + 3 section-C2 + 10 section-D + 3 section-E + 6 section-F
 //     + 4 section-H cases and
 //     tt-controller --manifest cases/tier2.jsonl --validate-only exits 0
@@ -73,8 +73,10 @@ const SECTION_A_IDS = [
   "W4.37-keyline-spoof-repo-content",
 ];
 
-// The 11 section-B/G cases (spec 08 §B + §G, US-005): W4.06, W4.07,
-// W4.08-no-relaunch, W4.08-control, W4.33a-d, W4.48a-c.
+// The 13 section-B/G cases (spec 08 §B + §G, US-005): W4.06, W4.07,
+// W4.08-no-relaunch, W4.08-control, W4.33a-c + the S49 split W4.33d pair
+// (reroute-absorption / resume-force-fail), W4.48a + the S49 split W4.48b
+// pair (park-absorption / move-during-hold), W4.48c.
 const SECTION_BG_IDS = [
   "W4.06-colleague-rebase",
   "W4.07-conflicting-colleague-commit",
@@ -83,9 +85,11 @@ const SECTION_BG_IDS = [
   "W4.33a-daemon-restart-resume",
   "W4.33b-update-under-it-resume",
   "W4.33c-deleted-worktree-refusal",
-  "W4.33d-reroute-exhaustion-resume",
+  "W4.33d-reroute-absorption",
+  "W4.33d-resume-force-fail",
   "W4.48a-daemon-kill-mid-park",
-  "W4.48b-pause-rugpull-window",
+  "W4.48b-park-absorption",
+  "W4.48b-move-during-hold",
   "W4.48c-compound-gate-degradation",
 ];
 
@@ -274,17 +278,17 @@ function seedInCatalog(seedsMd: string, seed: string): boolean {
 }
 
 describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + I/J/K + dsh-lane + W5-storm roster (wave-4 gate corridor + moving targets + composition + process/daemon/launch violence + contract & behavioral traps + weird-git target repos + platform-conditional lanes + harness-stream/launch-hostility/provider-auth + operator-directed dsh lane + capacity-scaled two-round storm)", () => {
-  it("cases/tier2.jsonl exists with the 10 section-A + 11 section-B/G + 6 section-C1 + 3 section-C2 + 10 section-D + 3 section-E + 6 section-F + 4 section-H + 12 section-I/J/K + 4 dsh-lane + 1 W5-storm cases and --validate-only exits 0", () => {
+  it("cases/tier2.jsonl exists with the 10 section-A + 13 section-B/G + 6 section-C1 + 3 section-C2 + 10 section-D + 3 section-E + 6 section-F + 4 section-H + 12 section-I/J/K + 4 dsh-lane + 1 W5-storm cases and --validate-only exits 0", () => {
     const records = readManifest();
     const ids = records.map((record) => record.id);
     assert.deepEqual(
       [...ids].sort(),
       [...SECTION_A_IDS, ...SECTION_BG_IDS, ...SECTION_C1_IDS, ...SECTION_C2_IDS, ...SECTION_D_IDS, ...SECTION_E_IDS, ...SECTION_F_IDS, ...SECTION_H_IDS, ...SECTION_IJK_IDS, ...SECTION_DSH_IDS, ...SECTION_W5_IDS].sort(),
-      `tier2.jsonl must contain exactly the 10 section-A + 11 section-B/G + 6 section-C1 + 3 section-C2 + 10 section-D + 3 section-E + 6 section-F + 4 section-H + 12 section-I/J/K + 4 dsh-lane + 1 W5-storm cases (got ${ids.join(", ")})`,
+      `tier2.jsonl must contain exactly the 10 section-A + 13 section-B/G + 6 section-C1 + 3 section-C2 + 10 section-D + 3 section-E + 6 section-F + 4 section-H + 12 section-I/J/K + 4 dsh-lane + 1 W5-storm cases (got ${ids.join(", ")})`,
     );
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("every W4 case carries gates [TIER2,W4] and every W5 case gates [TIER2,W5]; all mandatory=true, shed_ok=false per spec 11", () => {
@@ -324,22 +328,28 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
       assert.equal(record.context?.test_cmd, canonical,
         `${record.id}: context.test_cmd must be the fixture's canonical TEST_CMD (${canonical}), got ${JSON.stringify(record.context?.test_cmd)}`);
     }
-    // All 45 real cases are workflow-launching (8 section-A + 11 section-B/G
+    // All 43 real cases are workflow-launching (8 section-A + 9 section-B/G
     // + 5 section-C1 + 1 section-C2/W4.13 + 8 section-D: W4.14/15/16/17-a/17-b/
     // 18/38-real/39-b + 6 section-F: W4.26/28/30/31/45-gc/45-branch-delete
     // + 1 section-K: W4.47-auth-expiry-copy real do-now
     // + 4 dsh-lane rows: W4.dsh-do-now / W4.dsh-bfmw / W4.dsh-fdmw /
     // W4.dsh-lifecycle
     // + 1 W5-storm row: W5.storm-capacity-scaled);
-    // the 25 scripted cases (W4.04c, W4.36,
-    // W4.38-hostile-task-scripted, W4.39-a-union-honest scripted-pi,
+    // S49 (igorhvr item 6): the real W4.33d-reroute-exhaustion-resume and
+    // W4.48b-pause-rugpull-window rows are retired and SPLIT into FOUR
+    // SCRIPTED cells (W4.33d-reroute-absorption, W4.33d-resume-force-fail,
+    // W4.48b-park-absorption, W4.48b-move-during-hold — absorption-assertion
+    // + directly-constructed-state pairs), so the real count drops 45 -> 43
+    // and the scripted count rises 25 -> 29 (W4.04c, W4.36,
+    // W4.38-hostile-task-scripted, W4.39-a-union-honest + the four S49 split
+    // cells scripted-pi,
     // W4.27/W4.11/W4.12/W4.19/W4.20/W4.34/W4.21/W4.22/W4.23/W4.24
     // local-command, W4.40 x4 + W4.41 x2 scripted-hermes,
     // W4.42/W4.43/W4.44a/W4.44b local-command, W4.46 scripted-pi) are
     // excluded from the
     // REAL harness check but still carry test_cmd (checked below for the
     // scripted-pi ones).
-    assert.equal(realWorkflowCases, 45, "expected 45 workflow-launching real cases");
+    assert.equal(realWorkflowCases, 43, "expected 43 workflow-launching real cases");
   });
 
   it("every workflow-launching scripted section-A case also carries context.test_cmd (E3.A contract)", () => {
@@ -505,11 +515,15 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
     // their base rows' chaos:null where the base corridor is a machinery
     // delta (W4.dsh-fdmw's colleague-commit; W4.dsh-do-now's reset-hook
     // planted diagnostics; W4.dsh-lifecycle's operator restart seam).
-    // EXCEPTION (US-004 S29 premise redesign): W4.33d and W4.48b now carry
-    // the TYPED move-branch chaos block — the colleague target-move the
-    // controller genuinely executes, making event:run.failed /
-    // event:merge.target_moved reachable (previously chaos:null, so the
-    // premise events never fired — the S29 probe-trigger-unreached defect).
+    // EXCEPTION (US-004 S29 premise redesign): the W4.33d/W4.48b corridors
+    // carry the TYPED move-branch chaos block — the colleague target-move the
+    // controller genuinely executes (previously chaos:null, so the premise
+    // events never fired — the S29 probe-trigger-unreached defect). S49
+    // (igorhvr item 6) SPLITS the two corridors: the ABSORPTION-ASSERTION
+    // cells (W4.33d-reroute-absorption, W4.48b-park-absorption) keep the
+    // typed chaos and pin the graceful absorption; the DIRECTLY-CONSTRUCTED-
+    // STATE cells (W4.33d-resume-force-fail, W4.48b-move-during-hold)
+    // construct the failure/moved-target state without a chaos race.
     for (const id of [
       "W4.03-red-adjacent-commit",
       "W4.04a-mechanical-override",
@@ -524,37 +538,47 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
       const record = records.find((item) => item.id === id);
       assert.equal(record.chaos, null, `${id}: chaos must be null (injection is a documented machinery delta)`);
     }
-    for (const id of ["W4.33d-reroute-exhaustion-resume", "W4.48b-pause-rugpull-window"]) {
+    // Absorption-assertion cells carry the typed move-branch rearm chaos on
+    // the case's target ref (seed/BUG-T4 for W4.33d's BUG-T4, seed/BUG-T2 for
+    // W4.48b's BUG-T2 — NOT main).
+    for (const id of ["W4.33d-reroute-absorption", "W4.48b-park-absorption"]) {
       const rec = records.find((item) => item.id === id);
       assert.ok(rec, `${id}: must exist in tier2.jsonl`);
       assert.ok(rec.chaos && typeof rec.chaos === "object",
-        `${id}: the US-004 premise redesign must wire a typed chaos block (the colleague target-move is now executed, not a machinery delta)`);
+        `${id}: the absorption cell must wire the typed move-branch chaos block`);
       assert.equal(rec.chaos.type, "move-branch", `${id}: typed injection must be move-branch`);
       assert.equal(rec.chaos.target, "origin_target_ref", `${id}: move-branch targets the origin target ref`);
-      // The target ref is the branch the bfmw merger actually merges into:
-      // for seeded tt-ts cells that is the SEEDED branch (seed/BUG-T4 for
-      // W4.33d's BUG-T4 seed, seed/BUG-T2 for W4.48b's BUG-T2) — NOT main.
-      const expectedRef = id === "W4.33d-reroute-exhaustion-resume"
+      const expectedRef = id === "W4.33d-reroute-absorption"
         ? "refs/heads/seed/BUG-T4"
         : "refs/heads/seed/BUG-T2";
       assert.equal(rec.chaos.ref, expectedRef, `${id}: target ref must be ${expectedRef} (the merger's merge target)`);
       assert.equal(rec.chaos.trigger, "step:finalize_merge:running", `${id}: wave-4 arming on the finalize step`);
       assert.ok(rec.chaos.repeat > 1 && rec.chaos.interval_s > 0 && rec.chaos.wait_timeout_s > 0,
         `${id}: the persistent-move budget + interval + wait bound must be declared`);
-      // US-007 (S36): W4.33d's premise is per-attempt deterministic re-arm —
-      // the free-running cadence never re-armed per finalize attempt, so the
-      // real rerun completed cleanly (S36 root cause). W4.33d must declare
-      // rearm: true + a positive rearm_hold_s; W4.48b keeps the free-running
-      // cadence (a single target move in the pause window is its premise).
-      if (id === "W4.33d-reroute-exhaustion-resume") {
-        assert.equal(rec.chaos.rearm, true,
-          "W4.33d: the S36 redesign must declare rearm: true (each fresh step:finalize_merge:running occurrence triggers the next move)");
-        assert.ok(Number.isInteger(rec.chaos.rearm_hold_s) && rec.chaos.rearm_hold_s > 0,
-          "W4.33d: rearm must declare a positive rearm_hold_s (the post-marker hold so the tip capture precedes the move)");
-      } else {
-        assert.equal(rec.chaos.rearm, undefined, "W4.48b: must keep the free-running cadence (no rearm)");
-      }
+      // US-007 (S36): the per-attempt deterministic re-arm premise — each
+      // fresh step:finalize_merge:running occurrence triggers the next move
+      // (the free-running cadence never re-armed per finalize attempt).
+      assert.equal(rec.chaos.rearm, true,
+        `${id}: the S36 redesign must declare rearm: true (each fresh step:finalize_merge:running occurrence triggers the next move)`);
+      assert.ok(Number.isInteger(rec.chaos.rearm_hold_s) && rec.chaos.rearm_hold_s > 0,
+        `${id}: rearm must declare a positive rearm_hold_s (the post-marker hold so the tip capture precedes the move)`);
     }
+    // The directly-constructed-state W4.33d cell constructs the failed state
+    // with the CLI force-fail (no chaos); the W4.48b cell moves the target
+    // DURING the pause hold (free-running cadence, no rearm).
+    const w433dResume = records.find((item) => item.id === "W4.33d-resume-force-fail");
+    assert.ok(w433dResume, "W4.33d-resume-force-fail must exist in tier2.jsonl");
+    assert.equal(w433dResume.chaos.type ?? null, null,
+      "W4.33d-resume-force-fail: no chaos — the failure is CONSTRUCTED with the CLI force-fail");
+    assert.equal(w433dResume.probe_sequence[0].actions[0].op, "fail_force",
+      "W4.33d-resume-force-fail: the CLI force-fail probe action");
+    assert.equal(w433dResume.probe_sequence[0].actions[1].op, "resume",
+      "W4.33d-resume-force-fail: the resume probe action");
+    const w448bHold = records.find((item) => item.id === "W4.48b-move-during-hold");
+    assert.ok(w448bHold, "W4.48b-move-during-hold must exist in tier2.jsonl");
+    assert.equal(w448bHold.chaos.type, "move-branch", "W4.48b-move-during-hold carries the typed move-branch chaos");
+    assert.equal(w448bHold.chaos.rearm, undefined,
+      "W4.48b-move-during-hold keeps the free-running cadence (moves land during the pause hold — no rearm)");
     // W4.dsh-lifecycle carries the W4.33a-shaped pause_drain + resume probe
     // (operator restart seam during the hold; O16 judges run_completes).
     const dshLifecycle = records.find((item) => item.id === "W4.dsh-lifecycle");
@@ -569,7 +593,7 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
     assert.ok(dshLifecycle.oracles.includes("O16"), "W4.dsh-lifecycle must declare O16");
   });
 
-  it("task files exist under cases/tasks/tier2/ for all 70 cases and describe the fixture's actual contents", () => {
+  it("task files exist under cases/tasks/tier2/ for all 72 cases and describe the fixture's actual contents", () => {
     const records = readManifest();
     for (const record of records) {
       assert.equal(typeof record.task, "string", `${record.id}: task path required`);
@@ -593,10 +617,10 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
           `${record.id}: task must describe the ${record.fixture} fixture's actual contents`);
       }
     }
-    // No leftover extra files in the task dir beyond the 70 authored.
+    // No leftover extra files in the task dir beyond the 72 authored.
     const authored = fs.readdirSync(tasksDir).filter((name) => name.endsWith(".md")).sort();
     const expected = records.map((record) => path.basename(record.task)).sort();
-    assert.deepEqual(authored, expected, "cases/tasks/tier2/ must contain exactly the 70 authored task files");
+    assert.deepEqual(authored, expected, "cases/tasks/tier2/ must contain exactly the 72 authored task files");
   });
 
   it("the traceability report carries the section maps, the tier0-referenced W4 cells, and the exclusion-list headers", () => {

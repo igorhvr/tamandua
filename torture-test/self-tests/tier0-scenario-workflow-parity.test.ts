@@ -19,8 +19,8 @@
 // the S58 drift.
 //
 // Green arm: every scenario cell referenced by cases/tier0.jsonl +
-// cases/tier2.jsonl (54 unique dirs; 39 drive the bug-fix-merge-worktree
-// WAVE-A roster/fix-expects contract) passes both checks.
+// cases/tier2.jsonl (58 unique dirs; 43 drive the bug-fix-merge-worktree
+// WAVE-A roster/fix-expects contract — incl. the four S49 split cells) passes both checks.
 // Red arms: temp copies with (1) a workflow.yml gaining a phantom agent id,
 // (2) a behaviors.json gaining a stale agent key, and (3) a behaviors.json
 // whose fixer output lost the CANNOT_REPRODUCE marker each report a named
@@ -65,8 +65,9 @@ function manifestScenarioCells(): Array<{ caseId: string; relative: string }> {
 }
 
 // Number of manifest-referenced cells whose workflow declares the WAVE-A
-// REPRO_EVIDENCE|CANNOT_REPRODUCE fix-expects contract (the 39
-// bug-fix-merge-worktree cells: 24 w4.35 + 15 tier2 cells).
+// REPRO_EVIDENCE|CANNOT_REPRODUCE fix-expects contract (the 43
+// bug-fix-merge-worktree cells: 24 w4.35 + 19 tier2 cells — the S49 split
+// added the four W4.33d/W4.48b cells).
 function countMarkerWorkflowCells(): number {
   const markerWorkflowBases = new Set<string>();
   for (const { relative } of manifestScenarioCells()) {
@@ -97,9 +98,9 @@ function scratchDir(): string {
 describe("Tier-0/2 scenario<->workflow roster/fix-step parity guard (S58 US-007)", () => {
   it("green arm: every manifest-referenced cell (tier0.jsonl + tier2.jsonl) matches its workflow roster and, where the fix step expects the WAVE-A marker, every canned fixer output carries it", () => {
     const cells = manifestScenarioCells();
-    assert.ok(cells.length >= 54, `expected the 54 manifest-referenced scenario cells, got ${cells.length}`);
-    assert.equal(countMarkerWorkflowCells(), 39,
-      `expected exactly the 39 bug-fix-merge-worktree cells to drive a marker-workflow, got ${countMarkerWorkflowCells()}`);
+    assert.ok(cells.length >= 58, `expected the 58 manifest-referenced scenario cells, got ${cells.length}`);
+    assert.equal(countMarkerWorkflowCells(), 43,
+      `expected exactly the 43 bug-fix-merge-worktree cells to drive a marker-workflow, got ${countMarkerWorkflowCells()}`);
     const problems: string[] = [];
     for (const { caseId, relative } of cells) {
       const cellProblems = checkScenarioWorkflowParity(path.join(ttRoot, relative));

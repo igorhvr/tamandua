@@ -738,11 +738,16 @@ EOF
 chmod +x "$STUBBIN/tamandua"
 
 # Baseline: stop the real daemon, then pre-start the STUB daemon (reports the
-# STALE version) via daemon-control with the stub first on PATH.
+# STALE version) via daemon-control. S55: the launch uses the ABSOLUTE
+# launcher, so the stub is injected through the TT_DC_TAMANDUA_BIN seam (a
+# PATH-first stub is bypassed — daemon-control launches the worktree's own
+# bin/tamandua). TT_DC_HEALTH_PARITY=0: the STALE stub must be allowed to
+# START so tt-daemon-up's own S15 guard (the gate under test here) can detect
+# and heal the skew — daemon-control's own parity gate would front-run it.
 set +e
 "$DC" real stop >/dev/null 2>&1
 sleep 2
-( cd "$TT_REPO_ROOT" && PATH="$STUBBIN:$PATH" TT_DAEMON_PORT_WAIT_SECONDS=3 "$DC" real start >/dev/null 2>&1 ); STUB_START_RC=$?
+( cd "$TT_REPO_ROOT" && PATH="$STUBBIN:$PATH" TT_DC_TAMANDUA_BIN="$STUBBIN/tamandua" TT_DC_HEALTH_PARITY=0 TT_DAEMON_PORT_WAIT_SECONDS=3 "$DC" real start >/dev/null 2>&1 ); STUB_START_RC=$?
 set -e
 if [ "$STUB_START_RC" -eq 0 ]; then ok "AC9 stub daemon pre-start exits 0"; else fail "AC9 stub pre-start rc=$STUB_START_RC"; fi
 sleep 1
@@ -758,7 +763,7 @@ fi
 # The guard must see the mismatch, restart the daemon, and heal: the
 # restarted stub reports the CURRENT (expected) build version -> TT_DAEMON: up.
 set +e
-HEAL_OUT="$(cd "$TT_REPO_ROOT" && PATH="$STUBBIN:$PATH" TT_DAEMON_EXPECTED_VERSION_FILE="$TT_REPO_ROOT/dist/version" "$HELPER" ensure-up 2>&1)"; HEAL_RC=$?
+HEAL_OUT="$(cd "$TT_REPO_ROOT" && PATH="$STUBBIN:$PATH" TT_DC_TAMANDUA_BIN="$STUBBIN/tamandua" TT_DC_HEALTH_PARITY=0 TT_DAEMON_EXPECTED_VERSION_FILE="$TT_REPO_ROOT/dist/version" "$HELPER" ensure-up 2>&1)"; HEAL_RC=$?
 set -e
 if [ "$HEAL_RC" -eq 0 ]; then ok "AC9 heal-arm ensure-up exits 0 (rc=$HEAL_RC)"; else fail "AC9 heal-arm ensure-up rc=$HEAL_RC"; echo "$HEAL_OUT" | tail -10; fi
 if echo "$HEAL_OUT" | grep -q "TT_DAEMON: up"; then ok "AC9 heal-arm reports TT_DAEMON: up"; else fail "AC9 heal-arm missing TT_DAEMON: up"; echo "$HEAL_OUT" | grep -E 'TT_DAEMON|REASON' || true; fi
@@ -813,16 +818,18 @@ else
 fi
 
 # ── AC3: fail closed with distinct reason tt-daemon-down ─────────────
-# With the daemon now down, force a start failure by putting a failing
-# `tamandua` stub first on PATH (daemon-control reconstructs the launch PATH
-# from the caller PATH remainder — adapters-bin and the env-script PATH
-# contain no `tamandua`, so the stub is the first `tamandua` resolved and
-# makes the daemon fail to come up).
+# With the daemon now down, force a start failure by pointing daemon-control
+# at a failing `tamandua` stub. S55: daemon-control launches the WORKTREE's
+# OWN bin/tamandua by ABSOLUTE path (never a PATH lookup), so the failure
+# stub is injected through the TT_DC_TAMANDUA_BIN seam (the S55 test seam for
+# fake CLIs) — a PATH-first stub would be bypassed. TT_DC_HEALTH_PARITY=0:
+# the failing stub can never serve /control/health (hermetic fake seam); the
+# fail-closed guarantee under test is tt-daemon-up's own tt-daemon-down.
 STUBBIN="$TMP/bin"; mkdir -p "$STUBBIN"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$STUBBIN/tamandua"
 chmod +x "$STUBBIN/tamandua"
 set +e
-FAIL_OUT="$(PATH="$STUBBIN:$PATH" "$HELPER" ensure-up 2>&1)"; FAIL_RC=$?
+FAIL_OUT="$(PATH="$STUBBIN:$PATH" TT_DC_TAMANDUA_BIN="$STUBBIN/tamandua" TT_DC_HEALTH_PARITY=0 "$HELPER" ensure-up 2>&1)"; FAIL_RC=$?
 set -e
 if [ "$FAIL_RC" -ne 0 ]; then
   ok "AC3 cannot-come-up exits non-zero (rc=$FAIL_RC)"

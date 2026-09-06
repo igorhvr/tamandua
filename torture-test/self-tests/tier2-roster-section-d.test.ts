@@ -2,7 +2,7 @@
 //
 // Pins the section-D batch of cases/tier2.jsonl:
 //   * the 10 new rows exist and tt-controller --manifest cases/tier2.jsonl
-//     --validate-only exits 0 (Validated 70 case(s));
+//     --validate-only exits 0 (Validated 72 case(s));
 //   * W4.17 has BOTH merge-gate variants as distinct terminal rows
 //     (W4.17-a merge_gate UNSET -> land-annotated corridor; W4.17-b
 //     --context merge_gate=green -> refused corridor);
@@ -137,7 +137,7 @@ describe("Tier-2 US-008 — section-D roster (contract & behavioral traps)", () 
     }
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("W4.17 has BOTH merge-gate variants (unset / green) as distinct terminal rows", () => {
@@ -357,8 +357,8 @@ describe("Tier-2 US-008 — section-D roster (contract & behavioral traps)", () 
     assert.match(trace, /## Case ↔ Spec Reference Map — Wave 4 Section D/, "section-D reference map header");
     assert.match(trace, /## Excluded Scenarios — Complete Enumeration \(section D\)/, "section-D exclusion enumeration");
     assert.match(trace, /## Token Budget Note \(section D\)/, "section-D token budget note");
-    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*/,
-      "manifest summary must show 70 cases");
+    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*/,
+      "manifest summary must show 72 cases");
     // Every section-D id has a traceability row.
     for (const id of SECTION_D_IDS) {
       assert.match(trace, new RegExp(id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),

@@ -815,6 +815,16 @@ echo ""
 echo "--- Phase 8: Hash stability ---"
 
 # Collect current hashes
+# S57: the ledger also records the canonical sha256 of the fixture SOURCE tree
+# (FIXTURES_SRC) — golden validity compares it against the current fixtures-src
+# content, so fixtures-src drift invalidates the golden. Computed by the shared
+# bootstrap binary so builders and verifiers agree on the exact same value.
+FIXTURES_SRC_HASH="$(
+    "$SCRIPT_DIR/../../bin/tt-golden-bootstrap.mjs" --hash-fixtures-src-dir "$FIXTURE_SRC" 2>/dev/null
+)" || {
+    echo "  ✗ could not compute the fixtures-src content hash (S57)" >&2
+    exit 1
+}
 NEW_HASHES="$(mktemp "${TMPDIR:-/tmp}/.hashes-tt-poly-lite.XXXXXX")"
 {
     echo "baseline=$BASELINE_SHA"
@@ -824,6 +834,7 @@ NEW_HASHES="$(mktemp "${TMPDIR:-/tmp}/.hashes-tt-poly-lite.XXXXXX")"
     done
     echo "broken-tests=$BROKEN_TESTS_HEAD"
     echo "seed/storm=$STORM_SHA"
+    echo "FIXTURES_SRC=$FIXTURES_SRC_HASH"
 } > "$NEW_HASHES"
 
 echo "  Current hashes:"

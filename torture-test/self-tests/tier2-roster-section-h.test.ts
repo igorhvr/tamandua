@@ -4,7 +4,7 @@
 //   * the 4 new rows exist (W4.21-bare-noninteractive-launch,
 //     W4.22-symlink-path-parity, W4.23-daemon-cross-runtime-restart,
 //     W4.24-serial-lane-concurrent) and tt-controller --manifest
-//     cases/tier2.jsonl --validate-only exits 0 (Validated 70 case(s));
+//     cases/tier2.jsonl --validate-only exits 0 (Validated 72 case(s));
 //   * every `requires` key in the section-H cases is one of the CANONICAL
 //     host-profile keys (E2.2 contract): platform / toolchains /
 //     capabilities / containment / node_min — anything else is a validation
@@ -26,7 +26,7 @@
 //     prove the symlink-parity corridor machinery (the platform-generic
 //     runner, the section-F reset-hook-execution pattern);
 //   * traceability rows + the section-H map + exclusion enumeration +
-//     machinery-delta rows + token budget exist; manifest summary shows 70.
+//     machinery-delta rows + token budget exist; manifest summary shows 72.
 //
 // Confined to torture-test/ (writes only under gitignored var/). Zero tokens.
 // NOTE: this file REWRITES the shared var/w0/host-profile.json with
@@ -224,7 +224,7 @@ describe("Tier-2 US-011 — section-H roster (platform-conditional lanes)", () =
     }
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("every requires key in the section-H cases is one of the canonical host-profile keys (AC2)", () => {
@@ -525,8 +525,8 @@ describe("Tier-2 US-011 — section-H roster (platform-conditional lanes)", () =
     assert.match(trace, /## Case ↔ Spec Reference Map — Wave 4 Section H/, "section-H reference map header");
     assert.match(trace, /## Excluded Scenarios — Complete Enumeration \(section H\)/, "section-H exclusion enumeration");
     assert.match(trace, /## Token Budget Note \(section H\)/, "section-H token budget note");
-    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*/,
-      "manifest summary must show 70 cases");
+    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*/,
+      "manifest summary must show 72 cases");
     assert.match(trace, /| Wave 4 section H \(platform-conditional lanes\) \| 4 /,
       "manifest summary must show the 4 section-H rows");
     for (const id of SECTION_H_IDS) {

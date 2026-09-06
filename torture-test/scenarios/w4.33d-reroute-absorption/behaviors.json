@@ -1,0 +1,67 @@
+{
+  "agents": {
+    "triager": {
+      "output": "STATUS: done\nREPO: {{cwd}}\nBRANCH: s49-w4.33d-reroute-absorption-fix\nSEVERITY: high\nAFFECTED_AREA: src/s49-w4.33d-reroute-absorption-marker.ts\nREPRODUCTION: fixture carries the seeded defect\nPROBLEM_STATEMENT: exercise the S49 w4.33d-reroute-absorption corridor (BUG-T4 reroute-absorption)",
+      "tokens": 0
+    },
+    "investigator": {
+      "output": "STATUS: done\nROOT_CAUSE: fixture carries the seeded defect\nFIX_APPROACH: apply the documented seed fix inside src/",
+      "tokens": 0
+    },
+    "setup": {
+      "commands": [
+        "git checkout -b s49-w4.33d-reroute-absorption-fix"
+      ],
+      "output": "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: npm test\nBASELINE: deterministic fixture ready",
+      "tokens": 0
+    },
+    "fixer": {
+      "writes": [
+        {
+          "file": "src/s49-w4.33d-reroute-absorption-marker.ts",
+          "content": "// S49 w4.33d-reroute-absorption scripted BUG-T4 reroute-absorption corridor change\n"
+        }
+      ],
+      "commands": [
+        "git add -A",
+        "git commit -m 'fix: scripted w4.33d-reroute-absorption change'"
+      ],
+      "output": "STATUS: done\nCHANGES: scripted w4.33d-reroute-absorption fix-shaped change (BUG-T4 reroute-absorption)\nREGRESSION_TEST: scripted S49 corridor regression evidence\nCANNOT_REPRODUCE: scripted scenario - no live reproduction; behavior fixed per plan",
+      "tokens": 0
+    },
+    "verifier": {
+      "commands": [
+        "sleep 2"
+      ],
+      "output": "STATUS: done\nVERIFIED: scripted fixture tree verified\nTESTED_TREE: {{gitTree}}",
+      "tokens": 0
+    },
+    "merger": [
+      {
+        "commands": [
+          "EXPECT_TIP=\"$(git -C '{{input.WORKTREE_ORIGIN_REPOSITORY}}' rev-parse 'refs/heads/{{input.ORIGINAL_BRANCH}}')\"; sleep 6; tamandua merge-branch --origin '{{input.WORKTREE_ORIGIN_REPOSITORY}}' --branch '{{input.BRANCH}}' --into '{{input.ORIGINAL_BRANCH}}' --expect-tip \"$EXPECT_TIP\" --message 'fix: scripted S49 absorption merge' || true"
+        ],
+        "output": "STATUS: retry\nREBASED: false\nRETRY_STEP: verify",
+        "tokens": 0
+      },
+      {
+        "commands": [
+          "EXPECT_TIP=\"$(git -C '{{input.WORKTREE_ORIGIN_REPOSITORY}}' rev-parse 'refs/heads/{{input.ORIGINAL_BRANCH}}')\"; tamandua merge-branch --origin '{{input.WORKTREE_ORIGIN_REPOSITORY}}' --branch '{{input.BRANCH}}' --into '{{input.ORIGINAL_BRANCH}}' --expect-tip \"$EXPECT_TIP\" --message 'fix: scripted s49 absorption landing'"
+        ],
+        "includeCommandOutput": true,
+        "output": "STATUS: done\nREBASED: false\nMERGED_INTO: {{input.ORIGINAL_BRANCH}}\nMERGED_TREE: {{input.TESTED_TREE}}",
+        "tokens": 0
+      }
+    ],
+    "reviewer": {
+      "output": "STATUS: done\nVERDICT: ACCEPT - scripted scenario TEST_CMD contract unchanged (no rewrite to review)",
+      "tokens": 0
+    },
+    "auditor": {
+      "output": "STATUS: done\nVERDICT: HONEST - scripted scenario fix account is honest (no deception)",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

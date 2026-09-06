@@ -2,7 +2,7 @@
 //
 // Pins the section-C2 batch of cases/tier2.jsonl:
 //   * the 3 new rows exist and tt-controller --manifest cases/tier2.jsonl
-//     --validate-only exits 0 (Validated 70 case(s));
+//     --validate-only exits 0 (Validated 72 case(s));
 //   * W4.11-sigkill-launch-matrix is a NEW zero-token scripted local-command
 //     case (harness local, workflow local, execution_mode scripted,
 //     caps.tokens 0) whose scenario cell scenarios/w4.11/sigkill-launch-matrix/
@@ -115,7 +115,7 @@ describe("Tier-2 US-007 — section-C2 roster (daemon & launch violence)", () =>
     }
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("W4.11 is a NEW zero-token scripted local-command case whose cell covers all three SIGKILL phase markers + the three Ctrl-C process-group arms", () => {
@@ -321,8 +321,8 @@ describe("Tier-2 US-007 — section-C2 roster (daemon & launch violence)", () =>
     // silently trimmed.
     assert.match(trace, /W4\.11 \/ W4\.12 \/ W4\.13 are authored in \*\*section C2\*\* \(US-007\)/,
       "the C1 exclusion enumeration must document that W4.11/12/13 moved to section C2");
-    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*/,
-      "manifest summary must show 70 cases");
+    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*/,
+      "manifest summary must show 72 cases");
     // Machinery deltas for the C2 rows.
     assert.match(trace, /W4\.11-sigkill-launch-matrix/, "traceability must document the W4.11 PTY/group-signal delta");
     assert.match(trace, /W4\.12-port-squatter/, "traceability must document the W4.12 port-substitution + O13 deltas");

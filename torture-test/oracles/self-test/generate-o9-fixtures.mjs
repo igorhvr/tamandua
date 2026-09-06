@@ -66,6 +66,32 @@ const CASES = [
   { name: 'o9-in-scope-mismatch', expected: 'ERROR', mutation: 'in-scope-mismatch' },
   { name: 'o9-empty-observations', expected: 'NOT_EVALUABLE', mutation: 'empty-observations' },
   { name: 'o9-null-gate-key', expected: 'NOT_EVALUABLE', mutation: 'null-gate-key' },
+  // S46 (US-004): O9 resolves ledger trees against the S38-pinned target ref
+  // (the identity pinned at before-capture and threaded through
+  // refs_before/refs_after/target_reflog), NOT against every branch in the
+  // captured snapshot. `git log --all` also walks the branch that MOVED
+  // during the run, so a tree committed only on the moving branch was wrongly
+  // accepted as a captured committed fixture tree (W4.09-pi / W4.10-restart /
+  // W4.17-b tripped O9_LEDGER_TREE_UNRESOLVED when tree resolution disagreed
+  // with the S38 pinning). Each fixture carries NAMED refs evidence
+  // (target_ref = refs/heads/main + the captured target tips / reflog) plus
+  // the run's git topology at terminal capture:
+  //   o9-pinned-target-green — rows whose trees ARE reachable from the pinned
+  //     target ref resolve cleanly (no false O9_LEDGER_TREE_UNRESOLVED).
+  //   o9-moving-branch-tree — a row whose tree is reachable ONLY via the
+  //     run's moving (bugfix) branch, never the pinned target: post-fix FAIL
+  //     with O9_LEDGER_TREE_UNRESOLVED (pre-fix the tree was wrongly
+  //     accepted through `git log --all`).
+  //   o9-w4.09-pi-kill-replay / o9-w4.10-restart-replay / o9-w4.17-b-refusal-
+  //     replay — the W4.09/W4.10/W4.17-b replay shapes: rows reachable from
+  //     the pinned target (for w4.10-restart via the SUPERSEDED landing that
+  //     only the target reflog still records) must not trip the unresolved-
+  //     tree failure the item describes.
+  { name: 'o9-pinned-target-green', expected: 'PASS', mutation: 'pinned-target-green' },
+  { name: 'o9-moving-branch-tree', expected: 'FAIL', mutation: 'moving-branch-tree', finding: 'O9_LEDGER_TREE_UNRESOLVED' },
+  { name: 'o9-w4.09-pi-kill-replay', expected: 'PASS', mutation: 'w4.09-pi-kill-replay' },
+  { name: 'o9-w4.10-restart-replay', expected: 'PASS', mutation: 'w4.10-restart-replay' },
+  { name: 'o9-w4.17-b-refusal-replay', expected: 'PASS', mutation: 'w4.17-b-refusal-replay' },
   // S35 (US-005): the detached-HEAD snapshot contract (US-009) — a synthetic
   // repo whose HEAD is DETACHED at a commit OID (no symbolic ref checked out),
   // with refs_before/refs_after/target_reflog carrying target_ref = <40-hex
@@ -86,6 +112,26 @@ const CASES = [
   { name: 'o9-detached-wrong-tree', expected: 'FAIL', mutation: 'detached-wrong-tree', finding: 'O9_LEDGER_TREE_UNRESOLVED' },
   { name: 'o9-detached-launch-refused', expected: 'PASS', mutation: 'detached-launch-refused' },
 ];
+
+// S46 (US-004): fixture mutations that carry the S38-pinned NAMED target-ref
+// evidence (target_ref = refs/heads/main + captured tips / reflog). All of
+// them resolve rows against the pinned target; the moving-branch / superseded
+// sub-sets model the git topology that distinguishes wrongly-accepted trees
+// (reachable only via the branch that moved during the run) from legitimately
+// captured committed fixture trees (reachable from the pinned target — for
+// w4.10-restart only through the target's own captured reflog after a
+// superseding landing displaced the earlier one).
+const S46_PINNED_TARGET = new Set([
+  'pinned-target-green', 'moving-branch-tree',
+  'w4.09-pi-kill-replay', 'w4.10-restart-replay', 'w4.17-b-refusal-replay',
+]);
+// Fixtures that leave the run's moving (bugfix) worktree branch in the
+// terminal snapshot with a commit that never reached the pinned target.
+const S46_MOVING_BRANCH = new Set(['moving-branch-tree', 'w4.09-pi-kill-replay', 'w4.17-b-refusal-replay']);
+// w4.10-restart: a landing commit that WAS the pinned-target tip but was
+// superseded by a later landing from the pre-run baseline; its tree is the
+// ledger row's tree and is reachable ONLY through the target reflog.
+const S46_SUPERSEDED_LANDING = new Set(['w4.10-restart-replay']);
 
 function run(command, args, cwd) {
   const result = spawnSync(command, args, {
@@ -145,6 +191,7 @@ for (const fixture of CASES) {
   run('git', ['add', '.'], repo);
   run('git', ['commit', '-m', 'baseline'], repo);
   const committedTree = run('git', ['rev-parse', 'HEAD^{tree}'], repo);
+  const baselineCommit = run('git', ['rev-parse', 'HEAD'], repo);
   fs.writeFileSync(path.join(repo, 'value.txt'), 'two\n');
   run('git', ['add', '.'], repo);
   run('git', ['commit', '-m', 'second committed tree'], repo);
@@ -172,9 +219,64 @@ for (const fixture of CASES) {
       throw new Error('detached fixture must not carry refs/heads/main');
     }
   }
+  // S46 (US-004): model the run's git topology at terminal capture for the
+  // pinned-target-ref fixtures. bfmw/fdmw run in a worktree on a bugfix
+  // branch created from the pinned target; ledger rows can be recorded at
+  // trees committed on that MOVING branch that never reached the target.
+  //   moving-branch fixtures: leave the run's bugfix worktree branch in the
+  //     snapshot with a commit whose tree never reaches refs/heads/main.
+  //   w4.10-restart (concurrent-runs corridor): run A LANDS on the target
+  //     (its tree becomes a captured target tip), then run B — restarted
+  //     against the PRE-A baseline — lands and SUPERSEDES A; main's terminal
+  //     tip is B's landing and A's landing commit is reachable ONLY through
+  //     the pinned target's captured reflog.
+  let movingBranchRef = null;   // refs/heads/... run worktree branch (terminal state)
+  let movingTree = null;
+  let supersededCommit = null;  // the landing later displaced from main
+  let supersededTree = null;
+  let terminalMainTip = secondCommit;
+  if (S46_MOVING_BRANCH.has(fixture.mutation)) {
+    movingBranchRef = 'refs/heads/fix/BUG-T1-worktree';
+    run('git', ['checkout', '-q', '-b', 'fix/BUG-T1-worktree'], repo);
+    fs.writeFileSync(path.join(repo, 'value.txt'), 'three\n');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'bugfix worktree commit (never landed)'], repo);
+    movingTree = run('git', ['rev-parse', 'HEAD^{tree}'], repo);
+    run('git', ['checkout', '-q', 'main'], repo);
+    // Self-check: the moving branch must exist at terminal capture and main
+    // must NOT have moved (the bugfix commit never landed on the target).
+    run('git', ['rev-parse', '--verify', movingBranchRef], repo);
+    const mainAfter = run('git', ['rev-parse', '--verify', 'refs/heads/main'], repo);
+    if (mainAfter !== secondCommit) throw new Error('moving-branch fixture must keep main at the pre-run tip');
+  }
+  if (S46_SUPERSEDED_LANDING.has(fixture.mutation)) {
+    run('git', ['checkout', '-q', '-b', 'tmp/run-a'], repo);
+    fs.writeFileSync(path.join(repo, 'value.txt'), 'three\n');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'run A landing (squash)'], repo);
+    supersededCommit = run('git', ['rev-parse', 'HEAD'], repo);
+    supersededTree = run('git', ['rev-parse', 'HEAD^{tree}'], repo);
+    run('git', ['update-ref', 'refs/heads/main', supersededCommit], repo); // run A lands
+    run('git', ['checkout', '-q', '-b', 'tmp/run-b', secondCommit], repo); // run B re-bases on the PRE-A baseline
+    fs.writeFileSync(path.join(repo, 'value.txt'), 'four\n');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'run B landing (supersedes A)'], repo);
+    const runBLanding = run('git', ['rev-parse', 'HEAD'], repo);
+    run('git', ['update-ref', 'refs/heads/main', runBLanding], repo); // run B supersedes A
+    terminalMainTip = runBLanding;
+    run('git', ['checkout', '-q', 'main'], repo);
+    run('git', ['branch', '-D', 'tmp/run-a', 'tmp/run-b'], repo);
+    const terminalHead = run('git', ['rev-parse', 'HEAD'], repo);
+    if (terminalHead !== runBLanding) {
+      throw new Error(`w4.10-restart fixture main tip mismatch: ${terminalHead} != ${runBLanding}`);
+    }
+  }
   const ledgerTree = fixture.mutation === 'wrong-tree' ? 'f'.repeat(committedTree.length)
     : fixture.mutation === 'detached-wrong-tree' ? 'f'.repeat(40)
-    : fixture.mutation?.startsWith('detached-') ? detachedTree : committedTree;
+    : fixture.mutation?.startsWith('detached-') ? detachedTree
+    : fixture.mutation === 'moving-branch-tree' ? movingTree
+    : fixture.mutation === 'w4.10-restart-replay' ? supersededTree
+    : committedTree;
   const rowCreatedAt = fixture.mutation === 'stale' ? '2026-07-30T11:59:59.000Z' : '2026-08-01T12:00:00.000Z';
   const firstExit = fixture.mutation === 'red-replay' ? 1 : 0;
   const rows = [{
@@ -186,7 +288,12 @@ for (const fixture of CASES) {
   // S35 (US-005): for the detached-HEAD fixtures the mechanically committed
   // tree is the detached HEAD commit's tree (reachable only via the detached
   // HEAD per US-009) — the replay must bind to that tree.
-  const committedTreeHash = fixture.mutation?.startsWith('detached-') ? detachedTree : committedTree;
+  // S46 (US-004): for the moving-branch / superseded-landing fixtures the
+  // replay binds to the SAME tree the ledger row records (the tree the shim
+  // executed and replayed while the run's branch held it).
+  const committedTreeHash = fixture.mutation?.startsWith('detached-') ? detachedTree
+    : fixture.mutation === 'moving-branch-tree' || fixture.mutation === 'w4.10-restart-replay' ? ledgerTree
+    : committedTree;
   // S26 (US-003): `missing-replay-row` names a positive row id (999) that
   // exists nowhere — neither in the captured ledger nor in the database
   // snapshot — which keeps O9_REPLAY_ROW_MISSING fail-closed. An
@@ -479,6 +586,44 @@ for (const fixture of CASES) {
         action: 'checkout: moving from main to HEAD',
         raw: `${secondCommit} ${detachedCommit} O9 Fixture <o9@example.invalid> 1788076643 -0300\tcheckout: moving from main to HEAD`,
       }],
+    }, 'controller-reflog');
+  }
+  // S46 (US-004): NAMED (non-detached) S38 target-ref pinning — the refs
+  // snapshots pin target_ref = refs/heads/main and record the target tips
+  // captured at before/after plus the pinned target's reflog entries. The
+  // fixture's terminal tar state matches the after capture (main @
+  // terminalMainTip); refs_before.target_tip is the pre-run position.
+  // moving-branch-tree / w4.17-b-refusal-replay carry NO landing entries
+  // (the change never reached the pinned target); w4.10-restart-replay
+  // records run A's superseded landing (its tree is the row's tree).
+  if (S46_PINNED_TARGET.has(fixture.mutation)) {
+    const repository = {
+      fixture_path: 'var/fixtures/work/o9-s46/tt-ts',
+      git_common_dir: 'var/fixtures/work/o9-s46/tt-ts/.git',
+      object_format: 'sha1',
+    };
+    const refsShape = (phase, tip) => ({
+      schema_version: 1, phase, repository,
+      target_ref: 'refs/heads/main', target_tip: tip, for_each_ref: '',
+    });
+    const landingEntry = (oldOid, newOid, action) => {
+      const raw = `${oldOid} ${newOid} O9 Fixture <o9@example.invalid> 1785585720 +0000\t${action}`;
+      return {
+        old_oid: oldOid, new_oid: newOid, actor: 'O9 Fixture <o9@example.invalid>',
+        timestamp: 1785585720, timezone: '+0000', action, raw,
+      };
+    };
+    const reflogEntries = fixture.mutation === 'w4.10-restart-replay'
+      ? [landingEntry(secondCommit, supersededCommit, 'run A landed (superseded by run B)'),
+        landingEntry(supersededCommit, terminalMainTip, 'run B landed (terminal tip)')]
+      : fixture.mutation === 'pinned-target-green' || fixture.mutation === 'w4.09-pi-kill-replay'
+        ? [landingEntry(baselineCommit, terminalMainTip, 'run landed (squash)')]
+        : [];
+    references.refs_before = writeSnapshot(campaign, snapshots, 'refs-before.json', refsShape('before', secondCommit), 'controller-refs');
+    references.refs_after = writeSnapshot(campaign, snapshots, 'refs-after.json', refsShape('after', terminalMainTip), 'controller-refs');
+    references.target_reflog = writeSnapshot(campaign, snapshots, 'target-reflog.json', {
+      schema_version: 1, captured_at: CAPTURED_AT, repository,
+      target_ref: 'refs/heads/main', entries: reflogEntries,
     }, 'controller-reflog');
   }
 

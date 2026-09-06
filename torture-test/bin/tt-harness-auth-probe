@@ -43,6 +43,25 @@
 #                  the enumerated sources (env -> operator ~/.hermes/.env)
 #                  exported into the invocation env.
 #
+# MDSH (R4a US-016) — dsh FUNCTIONAL boot smoke (--dsh-smoke): the tier
+# roster needs to know whether dsh can actually BOOT under the contained
+# daemon's spawn environment (PATH/HOME as that daemon sees them) — the
+# W4.dsh-* cells ran on the mac although dsh cannot boot there ("dsh: plugin
+# tree failed t...", while `dsh --profile headless --help` works under the
+# interactive shell with the contained HOME), so each idled to its cap as
+# INCONCLUSIVE. --dsh-smoke runs a boot-level, non-spending
+# `dsh --profile headless --help` under a reconstruction of the contained
+# daemon env (the S24/US-006 PATH reconstruction: adapters-bin first, then
+# the env-script PATH, then the caller PATH with operator bin dirs moved
+# last) and reports the outcome as machine markers on stdout — DSH_SMOKE:
+# ok|fail, DSH_SMOKE_COMMAND, DSH_SMOKE_EXIT, and the FULL harness stderr
+# between DSH_SMOKE_STDERR_BEGIN / DSH_SMOKE_STDERR_END (never the product's
+# truncated preview). Distinct from the --spend answer leg (auth, model);
+# the smoke is boot-only and spends nothing. The roster machinery
+# (tt-controller applyHostRequirements / capability predicates) invokes this
+# mode when a real dsh-requiring cell is in scope and marks those cells
+# NOT_RUN with a recorded reason when the smoke fails.
+#
 # Fail-closed (non-zero exit + DISTINCT machine-parseable REASON on stderr):
 #   harness-auth-missing: pi       pi auth/config absent OR cannot answer
 #   harness-auth-missing: hermes   hermes auth/config absent OR cannot answer
@@ -382,6 +401,154 @@ present_files_for() {
   fi
 }
 
+# ── MDSH (R4a US-016): dsh boot smoke under the contained daemon env ────
+#
+# The contained daemon is launched under `env -i $(env/tt-env.sh print)` with
+# a RECONSTRUCTED PATH (the daemon-control S24/US-006 reconstruction):
+# var/adapters-bin FIRST, then the env-script PATH, then the caller PATH with
+# the operator's personal bin dirs moved AFTER the contained dirs. A harness
+# that boots fine under an interactive shell can fail under that env (the mac
+# W4.dsh-* defect: "dsh: plugin tree failed t..."), so the boot smoke MUST
+# reproduce the daemon env — env lines from env/tt-env.sh `print` (contained
+# HOME/TT_HOME/TAMANDUA_STATE_DIR etc.) plus the reconstructed PATH. The
+# helpers below mirror the daemon-control reconstruction so a smoke that
+# passes here passes under the daemon; a smoke that fails here is why the
+# W4.dsh-* cells must be marked NOT_RUN (reason recorded) instead of idling
+# to their cap as INCONCLUSIVE.
+#
+# smoke_operator_bin_dirs: the operator's personal bin dirs that must never
+# precede the contained dirs on the reconstructed PATH. Resolved from the
+# REAL operator home (OPERATOR_HOME — the same getent/dscl/tilde source
+# resolve_operator_home uses, so the contained spawn HOME never
+# misidentifies var/home as the operator home) AND from $HOME (when $HOME is
+# the contained home the dirs are contained — not on the contained PATH in
+# practice — and reordering them is harmless). Mirrors the daemon-control
+# operator_bin_dirs.
+smoke_operator_bin_dirs() {
+  if [ -n "${OPERATOR_HOME:-}" ]; then
+    printf '%s\n' "$OPERATOR_HOME/.local/bin" "$OPERATOR_HOME/bin"
+  fi
+  if [ -n "${HOME:-}" ]; then
+    printf '%s\n' "$HOME/.local/bin" "$HOME/bin"
+  fi
+}
+
+# path_has_component: 0 iff the colon-list $1 contains component $2.
+path_has_component() {
+  case ":$1:" in
+    *":$2:"*) return 0 ;;
+  esac
+  return 1
+}
+
+# contained_daemon_path: print the reconstructed PATH the contained daemon
+# is launched with (the daemon-control S24/US-006 reconstruction, mirrored
+# verbatim so the smoke env equals the daemon env):
+#   1. var/adapters-bin FIRST (created empty, idempotent; inert when empty)
+#   2. the env-script PATH (the real env's node-bin prepend) when it prints one
+#   3. the remaining caller PATH with any OPERATOR bin dirs (e.g.
+#      ~/.local/bin) REORDERED AFTER the contained dirs — an operator binary
+#      can never precede the contained prepend on the daemon's PATH.
+contained_daemon_path() {
+  local adapters_bin="$TT_DIR/var/adapters-bin"
+  mkdir -p "$adapters_bin"   # inert when empty; safe when it does not exist yet
+  local env_path
+  env_path="$(env -i bash "$TT_ENV_REAL" print 2>/dev/null | grep '^PATH=' | head -n1 | cut -d= -f2- || true)"
+  local -a operator_bins=()
+  local op_bin
+  while IFS= read -r op_bin; do
+    [ -n "$op_bin" ] && operator_bins+=("$op_bin")
+  done < <(smoke_operator_bin_dirs)
+  local parts=("$adapters_bin")
+  local seen="$adapters_bin"
+  local seg
+  # env-script PATH (node-bin prepend) comes right after the contained prepend
+  local -a env_segs=()
+  IFS=':' read -r -a env_segs <<< "${env_path:-}"
+  for seg in "${env_segs[@]:-}"; do
+    [ -n "$seg" ] || continue
+    if ! path_has_component "$seen" "$seg"; then
+      parts+=("$seg")
+      seen="$seen:$seg"
+    fi
+  done
+  # caller PATH: operator bin dirs are pulled out and appended LAST
+  local -a caller_segs=()
+  IFS=':' read -r -a caller_segs <<< "${PATH:-}"
+  local -a extra=()
+  local is_operator=false
+  for seg in "${caller_segs[@]:-}"; do
+    [ -n "$seg" ] || continue
+    if path_has_component "$seen" "$seg"; then continue; fi
+    is_operator=false
+    for op_bin in "${operator_bins[@]:-}"; do
+      if [ "$seg" = "$op_bin" ]; then is_operator=true; break; fi
+    done
+    if $is_operator; then
+      extra+=("$seg")          # moved AFTER the contained dirs
+    else
+      parts+=("$seg")
+    fi
+    seen="$seen:$seg"
+  done
+  # operator bin dirs LAST — never before the contained prepend
+  for op_bin in "${extra[@]:-}"; do
+    parts+=("$op_bin")
+  done
+  local out=""
+  for seg in "${parts[@]:-}"; do
+    out="$out${out:+:}$seg"
+  done
+  printf '%s' "$out"
+}
+
+# run_dsh_boot_smoke <home> <bin>: run the dsh boot smoke under the contained
+# daemon env and print the machine markers on STDOUT:
+#   DSH_SMOKE: ok|fail
+#   DSH_SMOKE_COMMAND: <argv...>
+#   DSH_SMOKE_EXIT: <exit code>
+#   DSH_SMOKE_STDERR_BEGIN ... DSH_SMOKE_STDERR_END
+# The block between DSH_SMOKE_STDERR_BEGIN/END carries the harness's FULL
+# stderr — never truncated (the product's log preview truncates it, which is
+# exactly why the smoke evidence must carry the full stream). Boot-level and
+# non-spending (`--profile headless --help` exits before any model work) —
+# distinct from the --spend answer leg. Returns the smoke exit code.
+run_dsh_boot_smoke() {
+  local home="$1" bin="$2"
+  local err
+  err="$(mktemp "${TMPDIR:-/tmp}/tt-dsh-smoke.XXXXXX")"
+  local rc
+  set +e
+  if [ -f "$TT_ENV_REAL" ]; then
+    env -i $(env -i bash "$TT_ENV_REAL" print) \
+      PATH="$(contained_daemon_path)" \
+      "$bin" --profile headless --help >/dev/null 2>"$err"
+  else
+    # No env script: fall back to the resolved contained home (the TT_VAR
+    # test-seam convention) with the reconstructed PATH.
+    env -i \
+      HOME="$home" \
+      TAMANDUA_STATE_DIR="$home/.tamandua" \
+      HERMES_HOME="$home/.hermes" \
+      PATH="$(contained_daemon_path)" \
+      "$bin" --profile headless --help >/dev/null 2>"$err"
+  fi
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    printf 'DSH_SMOKE: ok\n'
+  else
+    printf 'DSH_SMOKE: fail\n'
+  fi
+  printf 'DSH_SMOKE_COMMAND: %s --profile headless --help\n' "$bin"
+  printf 'DSH_SMOKE_EXIT: %s\n' "$rc"
+  printf 'DSH_SMOKE_STDERR_BEGIN\n'
+  cat "$err"
+  printf 'DSH_SMOKE_STDERR_END\n'
+  rm -f -- "$err"
+  return "$rc"
+}
+
 # run_answer_check: invoke the harness binary one-shot under the contained
 # spawn env. Returns the harness's exit code (captured by the caller).
 # The prompt is a single trivial completion — near-zero tokens on success,
@@ -468,6 +635,31 @@ probe_harness() {
   if [ -z "$bin" ] || [ ! -x "$bin" ]; then
     echo "REASON: harness-auth-missing: $harness" >&2
     echo "DETAILS: $harness binary not found (set TAMANDUA_$(printf '%s' "$harness" | tr '[:lower:]' '[:upper:]')_BINARY or add to PATH)" >&2
+    return 1
+  fi
+
+  # ── MDSH (R4a US-016): dsh boot smoke (--dsh-smoke) ──
+  # The roster machinery asks "can dsh actually BOOT under the contained
+  # daemon env?" — presence is the binary (leg 2 above); the smoke then runs
+  # `dsh --profile headless --help` (boot-level, non-spending) under a
+  # reconstruction of that env and prints the machine markers on stdout. A
+  # boot failure fails closed with the DISTINCT reason `harness-boot-failed:
+  # dsh` (exit 1) so the caller can mark dsh cells NOT_RUN with a recorded
+  # reason instead of launching them into INCONCLUSIVE idling — distinct from
+  # the auth failures below (harness-auth-missing). The answer/credential
+  # legs are NOT run in this mode (they are not boot checks).
+  if [ "$harness" = "dsh" ] && [ "${DSH_SMOKE_FLAG:-0}" = "1" ]; then
+    local smoke_rc
+    set +e
+    run_dsh_boot_smoke "$home" "$bin"
+    smoke_rc=$?
+    set -e
+    if [ "$smoke_rc" -eq 0 ]; then
+      log "OK: dsh boot smoke passed under the contained daemon env"
+      return 0
+    fi
+    echo "REASON: harness-boot-failed: dsh" >&2
+    echo "DETAILS: dsh cannot boot under the contained daemon env (full stderr in the DSH_SMOKE_STDERR block on stdout)" >&2
     return 1
   fi
 
@@ -571,7 +763,7 @@ usage() {
   cat <<EOF
 tt-harness-auth-probe — cheap preflight harness-auth probe (E2.6 US-005; Tier-2 dsh lane US-002).
 
-Usage: tt-harness-auth-probe [--help] [--spend] [--from-manifest] [pi|hermes|dsh ...]
+Usage: tt-harness-auth-probe [--help] [--spend] [--dsh-smoke] [--from-manifest] [pi|hermes|dsh ...]
 
 For each requested harness (pi, hermes, and/or dsh), verify the contained TT
 home's surfaced harness auth can actually resolve a model + API key and
@@ -598,6 +790,21 @@ answer, via:
      never on a command line, never printed). A MISSING_CREDENTIAL-shaped
      failure fails closed with harness-auth-missing: dsh. Never starts the
      real contained daemon.
+  3. BOOT SMOKE (dsh only, --dsh-smoke; MDSH/R4a US-016) — the roster
+     machinery's functional predicate: run \`dsh --profile headless --help\`
+     (boot-level, NON-spending — distinct from the --spend answer leg) under
+     a reconstruction of the contained daemon env (env/tt-env.sh \`print\`
+     lines: the daemon's contained HOME/TT_HOME/TAMANDUA_STATE_DIR, plus the
+     S24/US-006 reconstructed PATH: var/adapters-bin first, then the env-
+     script PATH, then the caller PATH with operator bin dirs moved last), so
+     "dsh boots under the daemon env" is decided BEFORE cells launch. The
+     outcome is reported as machine markers on stdout (DSH_SMOKE: ok|fail,
+     DSH_SMOKE_COMMAND, DSH_SMOKE_EXIT, and the FULL harness stderr between
+     DSH_SMOKE_STDERR_BEGIN / DSH_SMOKE_STDERR_END — never a truncated
+     preview). A boot failure exits 1 with the DISTINCT reason
+     \`harness-boot-failed: dsh\`; the roster marks dsh cells NOT_RUN (reason
+     recorded) instead of idling them INCONCLUSIVE. Requires exactly one
+     harness: dsh.
 
 Credential source (CRED-SURF US-002): for each probed harness, the primary
 credential key (dsh: DEEPSEEK_API_KEY; pi/hermes: the env var of the default
@@ -622,6 +829,11 @@ Fail-closed reasons (non-zero exit, on stderr):
                                  cannot answer under --spend (real answer
                                  leg; a MISSING_CREDENTIAL-shaped failure
                                  fails closed, DETAILS naming the credential)
+  harness-boot-failed: dsh       --dsh-smoke: dsh cannot BOOT under the
+                                 contained daemon env (full harness stderr in
+                                 the DSH_SMOKE_STDERR block on stdout — the
+                                 roster marks dsh cells NOT_RUN, reason
+                                 recorded)
   manifest-unreadable: <name>    a required manifest cannot be read
   manifest-invalid: <name>: line <n>  a manifest line is not valid JSON
 
@@ -646,6 +858,7 @@ main() {
   local from_manifest=0
   local harnesses=()
   local arg
+  DSH_SMOKE_FLAG="${DSH_SMOKE_FLAG:-0}"
 
   for arg in "$@"; do
     case "$arg" in
@@ -662,6 +875,13 @@ main() {
         # one tiny model generation), run ONLY on explicit operator opt-in.
         # pi/hermes answer legs are unaffected (always run).
         SPEND_ANSWER=1
+        ;;
+      --dsh-smoke)
+        # MDSH (R4a US-016): dsh FUNCTIONAL boot smoke mode — run ONLY the
+        # presence + boot-smoke legs for dsh (see probe_harness). The roster
+        # machinery (tt-controller) invokes this to decide whether real dsh
+        # cells can boot under the contained daemon env before they launch.
+        DSH_SMOKE_FLAG=1
         ;;
       pi|hermes|dsh)
         harnesses+=("$arg")
@@ -698,6 +918,17 @@ main() {
     # probe — success (a no-op, not a failure).
     log "no real harnesses required — nothing to probe"
     exit 0
+  fi
+
+  # MDSH (R4a US-016): the dsh boot-smoke mode is single-harness — it probes
+  # exactly dsh and runs only the presence + boot legs. Any other selection is
+  # a caller error (never a silent half-probe of the wrong harness set).
+  if [ "${DSH_SMOKE_FLAG:-0}" = "1" ]; then
+    if [ "${#harnesses[@]}" -ne 1 ] || [ "${harnesses[0]}" != "dsh" ]; then
+      echo "tt-harness-auth-probe: --dsh-smoke requires exactly one harness: dsh" >&2
+      usage >&2
+      exit 2
+    fi
   fi
 
   local home

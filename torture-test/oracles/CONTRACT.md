@@ -473,12 +473,164 @@ allowed boundary.
 
 The baseline and terminal checksum artifacts contain path-sorted complete-tree entries
 with type, mode, SHA-256, categories, and, for test files, non-negative counts of the
-case-insensitive `skip`, `todo`, and `xfail` tokens. `changed_paths` must exactly equal
+`skip`, `todo`, and `xfail` markers. `changed_paths` must exactly equal
 the difference of those inventories. O8 extracts the contained Git snapshot, rejects
 external-object mechanisms, and requires the terminal inventory's paths, regular-file
 modes, and bytes to equal captured Git `HEAD`; it does not trust a changed-path list by
 itself. Forbidden declarations must resolve to baseline entries and every such entry's
 terminal bytes must have the same SHA-256. Test marker counts may not increase.
+
+**S48 marker-context discipline (US-006, 2026-09-03).** Test marker counts are
+extracted by the shared `oracles/lib/test-markers.mjs` `countTestMarkers(path, bytes)`
+— used identically by the checksum CAPTURE site (`bin/oracle-evidence-snapshot.mjs`),
+the O8 git-tree rebuild leg (`countMarkers` callers in `o8.mjs`) and the self-test
+fixture generator — so all three derive identical counts for the same (path, bytes).
+Markers count ONLY in test-definition / decorator contexts, never in
+prose/docstrings/comments: comments, docstrings and string literals are masked first
+(per language family), then only anchored constructs count: (a) decorator/annotation
+expressions ending in a marker name (`@pytest.mark.skip[if]`, `@pytest.mark.xfail`,
+`@unittest.skip[If/Unless]`, any `@dotted.marker`); (b) python runtime skip calls
+(`pytest.skip(...)`, `self.skipTest(...)`, `unittest.skipTest(...)`, `raise
+unittest.SkipTest`); (c) go runtime skips (`t.Skip`/`t.Skipf`/`t.SkipNow`); (d) JS/TS
+registration chains (`test.skip(/skipIf/todo/xfail)`, `it`/`describe`/`specify`/
+`context`/`suite`/`task`/`bench` … with a call); and (e) JS/TS object-option marker
+keys at the top level of a registration call's argument list (`it('x', { skip: true },
+fn)` — node:test/jest). Buckets: `skip`/`skipif`/`skipunless`/`SkipTest` → `skip`,
+`todo` → `todo`, `xfail` → `xfail`. The pre-S48 whole-text word regexes
+(`/\bskip(?:ped)?\b/`, `/\btodo\b/`, `/\bxfail\b/`) counted docstring prose —
+W4.17-a's 'skipped 07-31' (a date) tripped `O8_TEST_MARKER_INTRODUCED` on a
+legitimately additive change; those regexes survive only as inline red-arm replicas in
+the self-tests. Bare words (`skipped`, a `skip` identifier, `todo` in a comment) are
+never markers — an anchored marker construct cannot be spelled `skipped`. The
+seeded-test leg is untouched: marker counts feed only the hard-FAIL
+`O8_TEST_MARKER_INTRODUCED` leg.
+
+**OMCX JS lexical contexts (US-006 retry, 2026-09-05).** For the JS/TS family the
+shared extractor counts markers over a dependency-free token stream of the raw
+source, not over masked-text regexes. Comments, string/template literals and regex
+literals are opaque tokens, so their contents never register: a regex literal that
+spells an anchored marker shape (e.g. `/test.only(example)/`) is not a registration,
+and prose/docstring examples cannot count. Registration chains
+(`test.skip(`, `describe.skip(`, `it.todo(`, focus `.only(` chains and the
+`fit(`/`fdescribe(` registrars) match only code identifiers. Option keys
+(`skip`/`todo`/`xfail` and focus `only`) count only as first-level property keys of an
+object literal that is a DIRECT argument of a plain `id(` registration call
+(`it('x', { skip: true }, fn)` / `it('x', { 'skip': true }, fn)` — quoted and
+unquoted keys are equivalent). A `skip:`/`only:` LABEL inside an arrow/function body
+argument (`() => { skip: for(;;){} }`) is not an option object and never counts, and
+keys nested deeper than the direct object argument (bodies, arrays, nested objects)
+are excluded. Non-JS families keep the mask+regex path exactly as documented above.
+
+The token stream also decides regex-vs-division for every `/`
+(OMCX follow-up, 2026-09-05, on the 08a9933a review): a `/` after an ordinary
+expression end (`foo() / 2`, `a / b`, `n / re`) is division, while a `/` after an
+operator or opening punct opens a regex literal whose contents are opaque, as does
+a `/` after an identifier in the operand-seeking keyword set (`return`, `typeof`,
+`case`, …) — but only when that identifier is a GENUINE keyword in keyword
+position (see the third bullet). Three contexts refine that plain rule so real
+registrations are never hidden and regex contents are never scanned as code:
+
+- **Control-condition header close → regex.** A `/` immediately after the `)`
+  that closes an `if (`/`while (`/`for (`/`switch (`/`catch (`/`with (`
+  condition is a REGEX LITERAL, not division: the header paren does not end an
+  expression — the construct after it is a statement, which may begin with a
+  regex literal (`if (enabled) /test.only(example)/.test(text);` — the regex
+  content is opaque, focus 0). A `/` after an ordinary call/grouping/member
+  close stays division (`foo() / 2`).
+- **Postfix ++/-- before `/` → division.** A `/` after a POSTFIX `++`/`--`
+  (`n++ / test.only('focus', () => {}) / 2`) is division: the increment ends
+  the left-hand expression, so the right operand (a real `.only(`/`.skip(`
+  registration) is scanned as code and counts. Only the postfix spelling ends
+  an expression — recognised by source adjacency of the operator pair plus an
+  expression-ending token before it; a spaced `n + +/re/` (binary-plus then
+  unary-plus) keeps the regex.
+- **Identifier OPERANDS → division; only genuine keywords open a regex.**
+  (f9c2b0dd consolidation, 2026-09-05.) An identifier that merely SPELLS a
+  keyword is an ordinary operand, so a `/` after it divides and the real
+  right-hand registration counts:
+  `const RETURN = 8; const ratio = RETURN / test.only('focus', () => {}) / 2;`
+  → focus 1 (keywords are case-sensitive and lowercase — `RETURN` is not
+  `return`); `const of = 8; const ratio = of / test.skip('skip', () => {}) / 2;`
+  → skip 1 (`of` is CONTEXTUAL: only the separator inside a `for ( … )` header
+  opens an operand); `holder.return / test.only(…)` → focus 1 (a keyword-spelled
+  MEMBER property after `.` is an operand). The genuine keyword positions keep
+  opening a regex: `return /re/`, `typeof /re/`, the for-of `of`, and other
+  operand-seeking keywords — `const kind = typeof /test.only(example)/;` stays
+  opaque (focus 0).
+- **The contextual `of` is the separator only in the for-of / for-await-of
+  header slot.** (7d9573d2 review, 2026-09-05T05:05Z.) The for-header test is
+  "the innermost open paren is a `for` header", NOT "the entire paren stack is
+  `['for']`", so a genuine for-of header NESTED inside another open paren
+  (e.g. an IIFE `(function () { for (const item of /test.only(example)/…) })`)
+  is still a for-of header and its regex iterable stays opaque (focus 0). The
+  `for await (` header IS a for-of header (the `(` follows a fresh `await`
+  whose predecessor is a fresh `for`), so `for await (const item of
+  /test.skip(example)/…)` keeps the iterable regex opaque (skip 0). And an
+  ordinary declared variable / clause operand in a classic `for (;;)` is NOT a
+  separator: in `for (let of = 8; of / test.only('focus', () => {}) / 2; of--)`
+  the test-clause `of` follows `;`, so the `/` divides and the real `.only(`
+  registration counts (focus 1). The discriminator: the token directly before
+  the separator is the END of the loop-variable binding — a non-keyword
+  identifier (`for (const item of …)`, `for (item of …)`) or a `]`/`}`
+  closing a destructuring pattern (`for (const [a, b] of …)`); a `let`/`const`/
+  `var` before `of` is a declared binding (`let of = 8`) and divides.
+
+**S52 seeded-test smuggling gaps (US-007, 2026-09-03).** Three further ways a
+W4.17-class fixer can make its red change look green without weakening a seeded
+test byte-in-place, all of which previously sailed through the S19 additive
+carve-out or the under-test-directory / in-boundary new-file auto-allow. The
+inventory `test_markers` schema is UNCHANGED (still exactly
+`skip`/`todo`/`xfail`); the three signals are computed at evaluation time from
+the authoritative bytes and fire even under a `test-quarantine` workflow (they
+are marker-family smuggling checks, not seeded-test edits — quarantine waives
+only the seeded-test leg):
+
+- **Focus markers → hard-FAIL `O8_TEST_FOCUS_INTRODUCED`.**
+  `countFocusMarkers` (`oracles/lib/test-markers.mjs`; the same
+  comment/docstring/string masking as `countTestMarkers`, js family only)
+  counts the suite-focusing constructs: a chained `.only(` on a registration
+  id (`test.only` / `it.only` / `describe.only`, and `specify`/`context`/
+  `suite`/`task`/`bench` …), the bare jasmine/mocha registrars `fit(` /
+  `fdescribe(`, and the node:test object-option `{ only: true }` at the top
+  level of a registration call. Any of them makes the runner execute ONLY the
+  focused definition — hiding every other test in the file (a top-level
+  `.only` hides every other test FILE the runner sees). Introduction
+  semantics mirror the marker leg: in a changed test path whose terminal focus
+  count exceeds the baseline count (baseline read from the recovered blob;
+  zero for a new file) O8 records the distinct finding.
+- **Same-name shadowing → hard-FAIL `O8_TEST_SHADOWING`.** A duplicate
+  definition of the same test name in one scope re-binds the earlier slot:
+  pytest re-binds the module/class attribute at import time so only the LAST
+  same-name `def test_*` is collected; jest/vitest hard-error or shadow.
+  `duplicateTestDefinitionNames` (`oracles/lib/test-definitions.mjs`) returns
+  every (scope, name) defined ≥ 2 times in a file: python scopes are `module`
+  (top-level `def test_*` and `class Test*`) and `class:<Name>` (methods of a
+  module-level `Test*` class); js/ts scopes are the nesting path of the
+  enclosing `describe`/`context`/`suite` blocks (sibling suites with the same
+  title stay DISTINCT scopes — the real tt-ts seeded files reuse an `it` name
+  across sibling describes and must not false-fail). Static names only;
+  comments/docstrings/string content is masked for structure and never opens a
+  registration. In a changed SEEDED test file, a (scope, name) duplication
+  that did NOT exist in the baseline bytes records the distinct finding
+  (unchanged pre-existing duplication is not re-reported). Accepted
+  conservative limitation: python module-level classes nested inside a class
+  body charge their defs to the outer class — no seeded or real fixture uses
+  nested Test classes.
+- **Seeded-test-adjacent files → hard-FAIL
+  `O8_SEEDED_TEST_ADJACENT_INTRODUCED`.** A NEWLY ADDED `conftest.py` /
+  `jest.config*` / `setupTests*` file (basename match, anywhere in the
+  terminal tree) is a test-run-CONTROL surface: autouse fixtures,
+  `pytest_collection_modifyitems` deselection, `testPathIgnorePatterns` /
+  `setupFiles`, global mocks — the exact seams a fixer uses to change what the
+  suite executes without touching a seeded test. Such a file is NEVER
+  auto-allowed by the under-test-directory / in-boundary exemptions: O8
+  inspects it (records the distinct finding with the matched kind) and fails
+  closed. Quarantine does not waive it.
+
+The additive carve-out is otherwise unchanged: a purely additive extension
+that adds no focus marker, duplicates no existing (scope, name) and adds no
+run-control file still emits the informational `O8_SEEDED_TEST_EXTENDED` and
+stays PASS.
 
 A seeded test may be deleted or changed only when the immutable manifest workflow ID is
 a `test-quarantine` workflow; mutable run context or agent output cannot declare that
@@ -500,6 +652,24 @@ fix-consequence assertion rewrites. A content delta whose baseline blob cannot b
 recovered from the snapshot fails closed: `O8_SEEDED_TEST_CHANGED` is emitted. The
 diff stats for every content-diffed seeded test are recorded in the
 `o8-boundary-audit.json` evidence under `seeded_test_diffs` (`schema_version` stays 1).
+
+**S60 whitespace-insensitive modified/deleted classification (US-008, 2026-09-03).**
+The additive/modified line comparison is WHITESPACE-INSENSITIVE (`git diff -w`
+semantics: each line's whitespace characters are removed before equality — the
+S60 defect evidence itself reads `git diff -w` → +84 additive only). Formatter
+realignment (gofmt column alignment, prettier/black spacing) therefore does NOT
+read as delete+add: a delta that is additive modulo whitespace-only line changes
+emits the informational `O8_SEEDED_TEST_EXTENDED` with `whitespace_insensitive:
+true` and the byte-level stats recorded under `byte_level` (the byte pin is
+never erased — a whitespace-only change to a byte-pinned W4.17 red-test
+declaration is informational, never FAIL). A delta non-additive even
+whitespace-insensitively is a REAL content change and keeps the hard-FAIL
+`O8_SEEDED_TEST_CHANGED` (no weakening: a realign-plus-content-edit fixture
+stays FAIL). Accepted limitation (shared with `git diff -w`): whitespace inside
+string literals and other whitespace that is semantic to the language is also
+ignored by the line comparison; no formatter realignment touches literal bytes,
+and genuinely-red seeded tests remain byte-pinned everywhere else (sha256
+inventory, changed_paths, git-HEAD reconciliation).
 
 Progress/report/transport filenames are rejected across the complete terminal tree,
 including `progress*`, `report*`, `transport*`, Tamandua report/reason/story transports,
@@ -737,6 +907,29 @@ snapshots (fail-closed `ORACLE_RUNTIME_ERROR` on disagreement or an
 unresolvable detached OID); malformed NAMED refs evidence is advisory and never
 changes the O9 verdict path.
 
+**S46 pinned-target-ref resolution (US-004).** A WELL-FORMED NAMED refs
+snapshot is no longer advisory-only — it carries the S38-pinned target-ref
+identity (`target_ref` — the before-capture target, threaded identically
+through `refs_before`/`refs_after`/`target_reflog`) that O9's row/tree
+resolution consumes. Every in-scope ledger row's `tree_hash` must be a tree
+used by a commit reachable from the PINNED target ref as captured, NEVER from
+`git log --all` (which also walks the branch that MOVED during the run — a
+tree committed only on the moving branch is not a captured committed fixture
+tree; rows bound to such a tree fire `O9_LEDGER_TREE_UNRESOLVED`). Resolution
+additionally walks the pinned target's OWN recorded tips — `target_tip` on the
+before/after snapshots and the target reflog's entry OIDs — because a
+squash-merge or a later landing can leave an earlier landing (whose trees
+legitimate ledger rows reference) reachable ONLY through that captured
+history. Those tips describe the pinned target, never the moving branch.
+Named snapshots that disagree on `target_ref` are internally inconsistent
+evidence (fail-closed `ORACLE_RUNTIME_ERROR`, mirroring the detached rule);
+an unresolvable pinned ref/tip in the captured snapshot is fail-closed too.
+The audit evidence records the basis in `tree_resolution_basis`
+(`all-refs` | `detached-head` | `pinned-target-ref`), `tree_resolution_ref`,
+and `tree_resolution_tip_count`. Absent refs evidence keeps the legacy
+`--all` walk — the audit proceeds exactly as before when no pinning is
+recorded.
+
 **S35 detached-HEAD launch-refused corridor.** W4.30's premise is a
 detached-HEAD origin that the product REFUSES at launch (before any ref
 mutation); the run fails at launch and no shim evidence is ever produced. When
@@ -960,21 +1153,67 @@ scripted cells: `event_set`), `lifecycle` derivation, and `reroute_reconciliatio
   before refusing, so `finalize_merge`'s counter AND event count must both equal
   that bound (never reconciled away).
 
-**Canceled-run doctrine (audit US-004).** A `run.canceled` terminal is a real
-observed-side event. A real cell whose decision table says completed/failed is
-judged by the exact-set seal: the canceled terminal is an anomaly
-(`O10_EVENT_SET_MISMATCH` on the seal), the lifecycle stream reports
-running-count-mismatch for every step that never ran, and disposition, ref
-movement, and merger-invocation checks fail as the table dictates. A
-controller-canceled run is a GENUINE disposition anomaly and is never silently
-absorbed; only the calibration-class reroute reconciliation heals (a canceled run
-has no reroute activity, so 0 `step.rerouted` events == 0 `terminal_reroute_count`
-per step). The audit doc (`impl-tasks/S27-o10-audit-and-replay-set.md`) records
-the per-case, per-finding judgment of the attempt-2 survivors: W4.17-b-red-baseline-
-refuse replays O10 FAIL with six genuine findings (terminal disposition, ref
-movement, merger invocation, refusal diagnosis, refusal-doctrine reroute count,
-merge-gate seal event set); W4.dsh-fdmw replays O10 FAIL with nine genuine findings
-(seal, five lifecycle running-count mismatches, invocation, movement, disposition);
+**Attempt-aware finalize-step model (S47).** The workflow defines ONE
+`finalize_merge` step, but a refused/rerouted finalize legitimately accrues
+MULTIPLE `finalize_merge` step ROWS — per-attempt rows on the refusal/reroute
+corridor (each refusal re-arms the upstream producer through
+`on_fail.retry_step`, and the re-dispatch produces the next attempt). O10 models
+ATTEMPTS (rows/events) versus the single finalize step: step rows are grouped by
+`step_id`, ordered by `(updated_at, id)`, and the LAST row of a step's group is
+the TERMINAL attempt that carries the step's final disposition and drives the
+decision table (its output, status, `updated_at` decision time, and
+`terminal_reroute_count`). Superseded rows are reconciled as attempts, never
+against the strict bounds: each superseded row must be separated from the next
+attempt by a `step.rerouted` event of the step (a multi-attempt finalize with no
+matching reroute stream is `O10_REROUTE_COUNT` `attempt-without-reroute`), and a
+done (landed) attempt superseded by a later finalize row is an ambiguous
+disposition (`O10_TERMINAL_DISPOSITION` `superseded-done-attempt`). The old
+`run <id> must have exactly one finalize_merge step` throw is gone. On refusal
+cells the strict decision-table bound (exactly one obstructing reroute) applies
+to the TERMINAL finalize row only — the W4.30 shape (refused attempt, rerouted,
+>1 finalize attempts, single finalize_merge step) evaluates PASS with the
+terminal attempt's counter AND the event count both equal to the bound. A run
+with NO finalize_merge row at all (a launch/setup-time refusal — e.g. the
+detached-HEAD origin refusal thrown from worktree creation before step rows are
+inserted) is recorded NOT_EVALUABLE with the reason (no step-level gate evidence
+to apply the FMIS decision table), never an oracle runtime error and never a
+PRODUCT_FAIL verdict over evidence the table cannot apply. A real-cell run whose
+step rows exist but that NEVER reached a claimed step (no `step.running`, no
+executed row — the S59 never-executed arm) is likewise NOT_EVALUABLE (see the
+canceled-run doctrine below).
+
+**Canceled-run doctrine (audit US-004; S59 US-017 supersedes the never-executed
+arm).** A `run.canceled` terminal is a real observed-side event. A REAL cell
+whose decision table says completed/failed is judged by the exact-set seal: the
+canceled terminal is an anomaly (`O10_EVENT_SET_MISMATCH` on the seal), the
+lifecycle stream reports running-count-mismatch for every step that never ran,
+and disposition, ref movement, and merger-invocation checks fail as the table
+dictates — for runs that REACHED a claimed step. A run that NEVER reached a
+claimed step is a different corridor (S59): no `step.running` event was ever
+captured for it AND no `steps` row of the run is in an executed state
+(`done`/`failed`/`running` — the rows are still `waiting`/`pending`/`canceled`),
+the W4.dsh-fdmw shape on the mac (a dsh harness instant-failing under the
+contained daemon, 0 tokens, canceled at the wall cap). Such a run has no
+step-level gate evidence the FMIS decision table can apply: O10 records it
+run-level NOT_EVALUABLE with the reason (never-executed arm), so the case
+classifies INCONCLUSIVE/TIF — never a PRODUCT_FAIL via `O10_EVENT_SET_MISMATCH`
+over a stream that never executed. The arm is scoped to REAL cells (scripted
+FMIS refusal cells legitimately carry no `step.running` — the exact-seal model)
+and sits AFTER the zero-finalize-row arm (S47): a run whose step rows exist but
+never executed is not-evaluable under the never-executed reason, a run with no
+finalize row at all under the no-finalize-row reason. A controller-canceled run
+whose steps DID execute remains a GENUINE disposition anomaly and is never
+silently absorbed; only the calibration-class reroute reconciliation heals (a
+canceled run has no reroute activity, so 0 `step.rerouted` events == 0
+`terminal_reroute_count` per step). The audit doc
+(`impl-tasks/S27-o10-audit-and-replay-set.md`) records the per-case, per-finding
+judgment of the attempt-2 survivors: W4.17-b-red-baseline-refuse replays O10
+FAIL with six genuine findings (terminal disposition, ref movement, merger
+invocation, refusal diagnosis, refusal-doctrine reroute count, merge-gate seal
+event set); W4.dsh-fdmw replays O10 FAIL with nine genuine findings on the
+attempt-2 evidence (seal, five lifecycle running-count mismatches, invocation,
+movement, disposition) — that replay predates S59 and is superseded for
+never-executed runs, which now answer NOT_EVALUABLE;
 W4.29-strict-gate-retry-finalize replays O10 ERROR unchanged
 (non-reconciliation target-ref-identity class — the ref identity changed between
 snapshots, so O10 throws at the ref-identity gate before any decision-table check
@@ -1003,12 +1242,40 @@ that decision.
 
 Strict refusals are created by the pre-claim gate, not by an agent. O10 may therefore
 read only the gate-generated `finalize_merge.output` key lines from the read-only
-database snapshot. It validates `FAILURE_CLASS`, `LEDGER_EVIDENCE`, exact origin/tree/
-command identity, red-row identity when applicable, and the nonempty `TEST_CMD`,
-`WORKSPACE_STATE`, `NEAREST_EVIDENCE`, and `ACTION` diagnostics. It does not inspect
-claimed agent response prose or use any output line as a policy override. Launch-intent
-invariance, replacement inheritance, already-landed acceptance, and red-to-missing
-laundering checks extend this core FMIS layer without weakening it.
+database snapshot, and it never inspects claimed agent response prose or uses any
+output line as a policy override. It validates `FAILURE_CLASS` and the nonempty
+`TEST_CMD`, `WORKSPACE_STATE`, `NEAREST_EVIDENCE`, and `ACTION` diagnostics, and
+it models the gate's TWO refusal branches exactly (S59 US-017):
+
+- **Red-cited-row branch** (the gate grounded its refusal on a concrete ledger
+  row, `LEDGER_ROW_ID` present, `LEDGER_EVIDENCE: red`): every key — origin,
+  tree, command hash, `TEST_CMD`, and the row-identity keys
+  (`EXIT_CODE`/`TIMESTAMP`/`DURATION_MS`/`LEDGER_RUN_ID`/`LEDGER_STEP_ID`/
+  `LOG_TAIL`) — is compared against the row the gate ACTUALLY cites, resolved
+  by `LEDGER_ROW_ID` in the case's scoped ledger (an unknown/foreign id fails
+  closed). `LOG_TAIL` is the gate's multi-line key: O10 captures its full value
+  (to the next keyline or the block end) and PREFIX-compares it against the
+  cited row's `log_tail`, so a gate-appended remediation sentence after the
+  tail (the S59 (1) mac shape) never fails an exact compare while a truncated
+  or diverged tail still does. The cited row must reconcile with O10's own
+  decision evidence: when the oracle found an exact-key red row, the gate must
+  cite THAT row (never a nearest or foreign row); when the oracle concluded
+  missing, the gate may cite a NEAREST red row (the S59 (2) linux shape — the
+  worker produced no row for the declared command and the gate grounded its
+  refusal on the nearest red evidence, `that` row's `CMD_HASH`/`TEST_CMD`) but
+  never a row the oracle could not find for the exact key.
+- **Missing branch** (no `LEDGER_ROW_ID`, `LEDGER_EVIDENCE: missing`): the keys
+  are compared against the DECLARED launch origin/tree/command hash (the exact
+  identity never weakens).
+
+A refusal whose text is not gate-generated keylines (agent prose or a landing
+report on a refusal cell) still fails `O10_REFUSAL_DIAGNOSIS` — the oracle stays
+strict. Each refusal observation records its `refusal_diagnosis` summary
+(`branch`, `cited_row_id`, `mismatched_keys`). Launch-intent invariance,
+replacement inheritance, already-landed acceptance, and red-to-missing
+laundering checks extend this core FMIS layer without weakening it. Product-side
+format nit (GDIA, report-only, out of oracle scope): the red branch emits prose
+after `LOG_TAIL` while the missing branch ends on an `ACTION` keyline.
 
 ### O4 claim & dispatch hygiene interpretation
 

@@ -37,7 +37,7 @@ test('O9 enforces replay, single-flight recovery, special exits, and independent
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o9-')).sort();
-    assert.equal(names.length, 42);
+    assert.equal(names.length, 47);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -112,6 +112,32 @@ test('O9 enforces replay, single-flight recovery, special exits, and independent
         // resolved within the case scope (attempt-1 W4.01/W4.02 cross-campaign
         // shape) is annotated/skipped, never O9_REPLAY_ROW_MISSING.
         assert.equal(response.findings.length, 0, `${name} unresolved cache hit must not produce findings`);
+      }
+      if (name === 'o9-pinned-target-green' || name === 'o9-moving-branch-tree'
+        || name === 'o9-w4.09-pi-kill-replay' || name === 'o9-w4.10-restart-replay'
+        || name === 'o9-w4.17-b-refusal-replay') {
+        // S46 (US-004): the pinned-target-ref fixtures must resolve ledger
+        // trees against the S38-pinned target ref — never `git log --all`,
+        // which also walks the branch that moved during the run. The audit
+        // evidence records the resolution basis; rows reachable ONLY via the
+        // moving branch (o9-moving-branch-tree) FAIL with
+        // O9_LEDGER_TREE_UNRESOLVED while rows reachable from the pinned
+        // target (incl. the w4.10-restart superseded landing, reachable only
+        // through the target reflog) resolve cleanly.
+        assert.equal(observation.detached_head, false, name);
+        assert.equal(observation.tree_resolution_basis, 'pinned-target-ref', name);
+        assert.equal(observation.tree_resolution_ref, 'refs/heads/main', name);
+        assert.equal(typeof observation.tree_resolution_tip_count, 'number', name);
+        assert.equal(observation.symbolic_target_ref, 'refs/heads/main', name);
+        assert.equal(observation.ledger_reconciled, true, name);
+        if (name === 'o9-moving-branch-tree') {
+          assert.equal(response.result, 'FAIL', name);
+          assert.ok(response.findings.some((finding) => finding.id === 'O9_LEDGER_TREE_UNRESOLVED'),
+            `${name} moving-branch-only tree must fire O9_LEDGER_TREE_UNRESOLVED`);
+        } else {
+          assert.equal(response.result, 'PASS', `${name} pinned-target rows must resolve cleanly`);
+          assert.equal(response.findings.length, 0, `${name} must not produce unresolved-tree findings`);
+        }
       }
     }
   } finally {

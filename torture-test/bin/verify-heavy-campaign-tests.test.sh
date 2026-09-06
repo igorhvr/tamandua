@@ -80,7 +80,8 @@ HEAVY_TESTS=(
     # US-010 (S44b): operator-seam cell corridors — must stay in lock-step
     # with run.sh + e2e-golden-integrity.
     'tier2-s44-operator-seam-corridors.test.ts'
-    # US-004 (S29): premise-redesign corridor — must stay in lock-step with
+    # US-010 (S49): W4.33d/W4.48b split corridor battery (supersedes the S29
+    # premise-redesign corridor) — must stay in lock-step with
     # run.sh + e2e-golden-integrity.
     'tier2-s29-premise-redesign-corridor.test.ts'
 )

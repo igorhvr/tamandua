@@ -107,11 +107,25 @@ describe('tt-process-identity.mjs', () => {
   describe('Darwin identity source (MACP4 US-002, /proc-less simulation)', () => {
     const LSTART = 'Sun Aug 23 18:20:05 2026';
 
-    /** Write a ps shim: prints $output and exits $exitCode. */
+    /** Write a ps shim. Deterministic field output: any `-o <field>=` whose
+     *  field is NOT pgid/ppid/command (i.e. lstart=) prints $output — the
+     *  deterministic darwin identity. The numeric process fields (pgid=,
+     *  ppid=, command=) are delegated to the REAL ps binary: MCHA (US-014)
+     *  made the pgid/ppid gates portable, so on the /proc-less simulation
+     *  they read the SAME mechanical ps evidence a darwin host would. A
+     *  failing shim (exitCode 1) simulates a dead/unreadable pid (every
+     *  field yields null -> fail-closed refusal). */
     function writePsShim(output, exitCode = 0) {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tti-ps-shim-'));
       const shim = path.join(dir, 'ps');
-      fs.writeFileSync(shim, `#!/bin/sh\n${exitCode === 0 ? `printf '%s\\n' "${output}"` : `exit ${exitCode}`}\n`);
+      fs.writeFileSync(shim, `#!/bin/sh\n` +
+        `if [ "${exitCode}" -ne 0 ]; then exit ${exitCode}; fi\n` +
+        `for arg in "$@"; do\n` +
+        `  case "$arg" in\n` +
+        `    pgid=*|ppid=*|command=*) exec ps "$@" ;;\n` +
+        `  esac\n` +
+        `done\n` +
+        `printf '%s\\n' "${output}"\n`);
       fs.chmodSync(shim, 0o755);
       return { dir, shim };
     }
@@ -241,17 +255,18 @@ describe('tt-process-identity.mjs', () => {
       }
     });
 
-    it('verifyRecordedTarget uses the darwin identity and keeps the fail-closed refusals when the identity is unreadable', () => {
+    it('verifyRecordedTarget uses the darwin identity and portable pgid evidence and keeps the fail-closed refusals when the identity is unreadable', () => {
       const shim = writePsShim(LSTART);
       try {
         const child = spawnDetachedChild();
         try {
           const result = withDarwinSeam(shim.shim, () =>
             verifyRecordedTarget({ pid: child.pid, startTime: `darwin:${LSTART}`, group: true }));
-          // On the /proc-less SIMULATION the pgid/ancestry gates still read
-          // /proc (they are linux-only helpers); the darwin identity must
-          // satisfy the identity portion and the full verification must
-          // succeed for a live detached target.
+          // MCHA (US-014): on the /proc-less SIMULATION the pgid/ancestry
+          // gates read the PORTABLE ps evidence (the shim delegates pgid=/
+          // ppid= to real ps), so the darwin identity + the disjoint-group
+          // verification must succeed for a live detached target — the shape
+          // the fixed kill-harness/kill-daemon corridors rely on.
           assert.equal(result.ok, true, result.reason);
         } finally {
           killChild(child);

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-import { isStrictMissing, lifecycleRunning, mergeGateSubset, expectedMergeGateNames, reconcileReroutes } from '../lib/o10.mjs';
+import { isStrictMissing, lifecycleRunning, mergeGateSubset, expectedMergeGateNames, reconcileReroutes, finalizeStepModel, refusalDiagnosis } from '../lib/o10.mjs';
 import { legalRerouteTransition, rerouteCorridorByStep } from '../lib/reroute-discipline.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
@@ -53,8 +53,10 @@ test('O10 enforces FMIS cells, launch inheritance, scoped already-landed accepta
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o10-')).sort();
     // 29 scripted FMIS probe cells + 5 S27 real-cell fixtures (US-001)
-    // + 2 S27 real-cell reroute-reconciliation fixtures (US-002).
-    assert.equal(names.length, 36);
+    // + 2 S27 real-cell reroute-reconciliation fixtures (US-002)
+    // + 2 S47 attempt-aware finalize fixtures (US-005)
+    // + 4 S59 refusal-diagnosis fixtures (US-017).
+    assert.equal(names.length, 42);
     assert.equal(names.filter((name) => name.includes('-mutation')).length, 10);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
@@ -147,6 +149,362 @@ test('US-003 real-cell fixtures pin the two-regime model with exact exit codes a
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }
+});
+
+// ---- S47 (US-005): attempt-aware finalize-step model ----
+// The two US-005 fixtures pin the attempt model end to end:
+//  - o10-real-w4.30-refused-rerouted-finalize reproduces the W4.30 shape the
+//    item names (refused finalize, rerouted, >1 finalize attempts, single
+//    finalize_merge step): pre-fix O10 threw `run <id> must have exactly one
+//    finalize_merge step` (an oracle runtime error on a CORRECT refusal);
+//    post-fix the attempt-aware model evaluates PASS with the terminal
+//    attempt driving the decision table.
+//  - o10-real-launch-refused-no-finalize-step reproduces the launch/setup-time
+//    refusal corridor (a run that refused before any step row existed — the
+//    detached-HEAD origin refusal): pre-fix the same throw fired (0 != 1);
+//    post-fix the run is NOT_EVALUABLE with the reason.
+
+const S47_NAMED = [
+  ['o10-real-w4.30-refused-rerouted-finalize', 'PASS', 0, null],
+  ['o10-real-launch-refused-no-finalize-step', 'NOT_EVALUABLE', 3, null],
+];
+
+test('US-005 S47 fixtures pin the attempt-aware finalize model with exact exit codes and no runtime errors', () => {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
+  try {
+    const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
+    assert.equal(generated.status, 0, generated.stderr);
+    for (const [name, expected, exitCode, finding] of S47_NAMED) {
+      const { expectation, response, status } = invokeFixture(workspace, name);
+      assert.equal(expectation.expected, expected, `${name} expectation`);
+      assert.equal(response.result, expected, `${name}: ${JSON.stringify(response)}`);
+      assert.equal(status, exitCode, `${name} exit code`);
+      assert.equal(response.findings.length, 0, `${name} must carry no findings/runtime errors`);
+      if (finding) {
+        assert.ok(response.findings.some((entry) => entry.id === finding), `${name} omitted ${finding}`);
+      }
+    }
+    // The multi-attempt refusal fixture must record the attempt model: 2
+    // finalize rows, the terminal attempt driving the strict refusal bound
+    // (terminal_reroute_count 1 == one step.rerouted event == decision-table
+    // bound 1), and the superseded attempt reconciled as an attempt.
+    const refusalObs = JSON.parse(fs.readFileSync(
+      path.join(workspace, 'o10-real-w4.30-refused-rerouted-finalize', 'evidence', 'o10-fmis-decision-table.json'), 'utf8'));
+    assert.equal(refusalObs.run_count, 1);
+    assert.equal(refusalObs.runs[0].finalize_step.rows, 2, 'two finalize attempts');
+    assert.equal(refusalObs.runs[0].finalize_step.terminal_attempt, 2);
+    assert.equal(refusalObs.runs[0].expected.reroutes, 1, 'strict refusal decision-table bound');
+    const finalizeRows = refusalObs.runs[0].reroute_reconciliation.per_step.filter((entry) => entry.step_id === 'finalize_merge');
+    assert.equal(finalizeRows.length, 2, 'both attempt rows surfaced in the reconciliation');
+    const terminal = finalizeRows.find((entry) => entry.attempt_index === undefined);
+    const superseded = finalizeRows.find((entry) => entry.attempt_index === 1);
+    assert.ok(terminal && superseded, 'terminal + superseded attempt rows present');
+    assert.equal(terminal.attempts, 2);
+    assert.equal(terminal.superseded_rows, 1);
+    assert.equal(terminal.terminal_reroute_count, 1);
+    assert.equal(terminal.reroute_events, 1);
+    assert.equal(terminal.decision_table_bound, 1, 'strict bound enforced on the terminal attempt');
+    assert.equal(superseded.terminal_reroute_count, 0, 'superseded attempt is not counted against the bound');
+    assert.equal(superseded.status, 'failed');
+    // The launch-refused fixture records NOT_EVALUABLE with the reason.
+    const refusedEvidence = JSON.parse(fs.readFileSync(
+      path.join(workspace, 'o10-real-launch-refused-no-finalize-step', 'evidence', 'o10-fmis-decision-table.json'), 'utf8'));
+    assert.equal(refusedEvidence.not_evaluable, true);
+    assert.ok(refusedEvidence.reason.includes('no finalize_merge step row'));
+    assert.equal(refusedEvidence.run_count, 0);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+// ---- S59 (US-017): exact refusal self-diagnosis ----
+// The four S59 fixtures pin the two-branch refusal-diagnosis model end to
+// end:
+//  - o10-real-w4.17b-red-refusal-log-tail (PASS): the W4.17-b red-evidence
+//    refusal (green gate, exact red row) whose multi-line LOG_TAIL value
+//    carries the gate's trailing remediation advice — pre-fix O10 raised
+//    O10_REFUSAL_DIAGNOSIS (LOG_TAIL exact compare); post-fix the prefix
+//    compare accepts the tail-with-advice reproduction.
+//  - o10-real-missing-nearest-refusal-diagnosis (PASS): the missing-evidence
+//    refusal that grounded on the NEAREST red row (plain `pytest` runs, exit
+//    127 then 1) — pre-fix O10 expected LEDGER_EVIDENCE: missing and the
+//    declared command's hash; post-fix every key is compared against the row
+//    the gate actually cites (LEDGER_ROW_ID 8).
+//  - o10-real-never-executed-canceled (NOT_EVALUABLE): the W4.dsh-fdmw
+//    shape — 0 tokens, no step.running, canceled at the wall cap — pre-fix
+//    scored PRODUCT_FAIL via O10_EVENT_SET_MISMATCH; post-fix the run is
+//    NOT_EVALUABLE with the reason.
+//  - o10-real-refusal-prose-output (FAIL O10_REFUSAL_DIAGNOSIS): agent prose
+//    where the gate keyline block belongs stays a strict failure.
+
+const S59_NAMED = [
+  ['o10-real-w4.17b-red-refusal-log-tail', 'PASS', 0, null],
+  ['o10-real-missing-nearest-refusal-diagnosis', 'PASS', 0, null],
+  ['o10-real-never-executed-canceled', 'NOT_EVALUABLE', 3, null],
+  ['o10-real-refusal-prose-output', 'FAIL', 1, 'O10_REFUSAL_DIAGNOSIS'],
+];
+
+test('US-017 S59 fixtures pin the exact refusal-diagnosis model with exact exit codes and findings', () => {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
+  try {
+    const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
+    assert.equal(generated.status, 0, generated.stderr);
+    const responses = new Map();
+    for (const [name, expected, exitCode, finding] of S59_NAMED) {
+      const { expectation, response, status } = invokeFixture(workspace, name);
+      responses.set(name, response);
+      assert.equal(expectation.expected, expected, `${name} expectation`);
+      assert.equal(response.result, expected, `${name}: ${JSON.stringify(response)}`);
+      assert.equal(status, exitCode, `${name} exit code`);
+      if (finding) {
+        assert.ok(response.findings.some((entry) => entry.id === finding), `${name} omitted ${finding}`);
+      }
+    }
+    // The two PASS refusal fixtures must record the exact refusal-diagnosis
+    // branch with zero mismatched keys (no spurious O10_REFUSAL_DIAGNOSIS).
+    const logTailObs = JSON.parse(fs.readFileSync(
+      path.join(workspace, 'o10-real-w4.17b-red-refusal-log-tail', 'evidence', 'o10-fmis-decision-table.json'), 'utf8'));
+    assert.equal(logTailObs.run_count, 1);
+    assert.equal(logTailObs.runs[0].refusal_diagnosis.branch, 'red-cited-row');
+    assert.equal(logTailObs.runs[0].refusal_diagnosis.cited_row_id, '1');
+    assert.deepEqual(logTailObs.runs[0].refusal_diagnosis.mismatched_keys, []);
+    assert.equal(logTailObs.runs[0].expected.evidence, 'red');
+    const nearestObs = JSON.parse(fs.readFileSync(
+      path.join(workspace, 'o10-real-missing-nearest-refusal-diagnosis', 'evidence', 'o10-fmis-decision-table.json'), 'utf8'));
+    assert.equal(nearestObs.runs[0].refusal_diagnosis.branch, 'red-cited-row');
+    assert.equal(nearestObs.runs[0].refusal_diagnosis.cited_row_id, '8');
+    assert.deepEqual(nearestObs.runs[0].refusal_diagnosis.mismatched_keys, []);
+    assert.equal(nearestObs.runs[0].expected.evidence, 'missing');
+    // The never-executed run records NOT_EVALUABLE with the reason.
+    const neverExecutedEvidence = JSON.parse(fs.readFileSync(
+      path.join(workspace, 'o10-real-never-executed-canceled', 'evidence', 'o10-fmis-decision-table.json'), 'utf8'));
+    assert.equal(neverExecutedEvidence.not_evaluable, true);
+    assert.ok(neverExecutedEvidence.reason.includes('never reached a claimed step'), neverExecutedEvidence.reason);
+    assert.equal(neverExecutedEvidence.run_count, 0);
+    // The prose-output refusal fails on the refusal-diagnosis leg (strict):
+    // the refusal text must still be gate-generated keylines.
+    const proseFindings = responses.get('o10-real-refusal-prose-output').findings;
+    assert.ok(proseFindings.some((entry) => entry.id === 'O10_REFUSAL_DIAGNOSIS'));
+    assert.ok(proseFindings.some((entry) => entry.id === 'O10_REFUSAL_DIAGNOSIS'
+      && Array.isArray(entry.missing_or_mismatched_keys) && entry.missing_or_mismatched_keys.includes('FAILURE_CLASS')));
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+// ---- S59 (US-017): refusalDiagnosis unit model ----
+
+const S59_KEY = {
+  origin_repo: '/torture-test/fixtures/synthetic-o10',
+  cmd_hash: createHash('sha256').update('npm test').digest('hex'),
+};
+const S59_TREE = 'a'.repeat(40);
+const S59_ROW = {
+  id: 3, origin_repo: S59_KEY.origin_repo, tree_hash: S59_TREE, cmd_hash: S59_KEY.cmd_hash,
+  cmd_display: 'npm test', exit_code: 17, duration_ms: 321,
+  log_tail: 'tail line 1\ntail line 2', run_id: 'writer-run', step_id: 'test',
+  created_at: '2026-08-02T12:04:00.000Z',
+};
+function s59Block(row, { advice = null, logTail = null, cmdHash = null, testCmd = null, ledgerEvidence = 'red', extra = [] } = {}) {
+  const lines = [
+    'FAILURE_CLASS: refused_permanent',
+    `LEDGER_EVIDENCE: ${ledgerEvidence}`,
+    `ORIGIN_REPO: ${row.origin_repo}`,
+    `TREE_HASH: ${row.tree_hash}`,
+    `CMD_HASH: ${cmdHash ?? row.cmd_hash}`,
+    `TEST_CMD: ${testCmd ?? row.cmd_display}`,
+  ];
+  if (ledgerEvidence === 'red') lines.push(
+    `LEDGER_ROW_ID: ${row.id}`,
+    `EXIT_CODE: ${row.exit_code}`,
+    `TIMESTAMP: ${row.created_at}`,
+    `DURATION_MS: ${row.duration_ms}`,
+    `LEDGER_RUN_ID: ${row.run_id}`,
+    `LEDGER_STEP_ID: ${row.step_id}`,
+    `LOG_TAIL: ${logTail ?? row.log_tail}`,
+  );
+  if (advice !== null) lines.push(advice);
+  lines.push(
+    'WORKSPACE_STATE: clean',
+    'NEAREST_EVIDENCE: nearest evidence line',
+    'ACTION: run the suite',
+    ...extra,
+  );
+  return lines.join('\n');
+}
+
+test('refusalDiagnosis accepts a multi-line LOG_TAIL carrying the gate trailing advice (S59 sub-cause 1)', () => {
+  // The gate appends its remediation sentence after the multi-line LOG_TAIL
+  // value, so a full-value parse sees row log_tail + advice. The prefix
+  // compare against the cited row's log_tail must not fail.
+  const output = s59Block(S59_ROW, { advice: 'Please re-run the exact shim-wrapped test command on the committed tree, then resubmit.' });
+  const diagnosis = refusalDiagnosis(output, 'red', S59_KEY, S59_TREE, S59_ROW, [S59_ROW]);
+  assert.equal(diagnosis.branch, 'red-cited-row');
+  assert.equal(diagnosis.cited_row_id, '3');
+  assert.deepEqual(diagnosis.mismatched_keys, []);
+});
+
+test('refusalDiagnosis compares every key against the row the gate cites (S59 sub-cause 2)', () => {
+  // The worker produced no row for the declared command; the gate refused on
+  // the NEAREST red row (plain pytest, a different tree/command) with
+  // LEDGER_EVIDENCE: red and THAT row's CMD_HASH/TEST_CMD. The oracle's own
+  // decision evidence is missing (no exact row), so every key must be
+  // compared against the cited row (id 9), never the declared key.
+  const nearest = {
+    id: 9, origin_repo: S59_KEY.origin_repo, tree_hash: 'd'.repeat(40),
+    cmd_hash: createHash('sha256').update('pytest').digest('hex'), cmd_display: 'pytest',
+    exit_code: 1, duration_ms: 900, log_tail: '1 failed, 12 passed in 0.9s',
+    run_id: 'writer-run', step_id: 'test', created_at: '2026-08-02T12:08:30.000Z',
+  };
+  const output = s59Block(nearest);
+  const diagnosis = refusalDiagnosis(output, 'missing', S59_KEY, S59_TREE, null, [nearest]);
+  assert.equal(diagnosis.branch, 'red-cited-row');
+  assert.equal(diagnosis.cited_row_id, '9');
+  assert.deepEqual(diagnosis.mismatched_keys, []);
+});
+
+test('refusalDiagnosis keeps the missing branch exact against the declared command identity', () => {
+  const output = s59Block(S59_ROW, { ledgerEvidence: 'missing', advice: null });
+  // A missing-branch block has no LEDGER_ROW_ID: the keys are compared
+  // against the DECLARED origin/tree/command.
+  const diagnosis = refusalDiagnosis(output, 'missing', S59_KEY, S59_TREE, null, [S59_ROW]);
+  assert.equal(diagnosis.branch, 'missing');
+  assert.equal(diagnosis.cited_row_id, null);
+  assert.deepEqual(diagnosis.mismatched_keys, []);
+});
+
+test('refusalDiagnosis stays strict: prose output and wrong-command blocks still mismatch', () => {
+  // Agent prose where the gate keyline block belongs -> every gate key is
+  // missing from the diagnosis.
+  const prose = refusalDiagnosis('STATUS: failed\nThe change is correct, please merge it.', 'red', S59_KEY, S59_TREE, S59_ROW, [S59_ROW]);
+  assert.equal(prose.mismatched_keys.includes('FAILURE_CLASS'), true);
+  assert.equal(prose.mismatched_keys.includes('LEDGER_EVIDENCE'), true);
+  assert.equal(prose.mismatched_keys.includes('WORKSPACE_STATE'), true);
+  // A missing-branch block that cites the DECLARED command's hash while the
+  // oracle concluded missing is consistent — but a block carrying a
+  // TEST_CMD/CMD_HASH that does not hash to the expected command identity
+  // (declared on missing, cited row's on red-cited-row) is a mismatch.
+  const wrongCmd = refusalDiagnosis(
+    s59Block(S59_ROW, { cmdHash: 'f'.repeat(64), testCmd: 'pytest', ledgerEvidence: 'missing' }),
+    'missing', S59_KEY, S59_TREE, null, [S59_ROW],
+  );
+  assert.equal(wrongCmd.mismatched_keys.includes('CMD_HASH'), true);
+  assert.equal(wrongCmd.mismatched_keys.includes('TEST_CMD'), true);
+});
+
+test('refusalDiagnosis reconciles the cited row with the oracle decision evidence (S59 sub-cause 2 strictness)', () => {
+  // Exact red evidence exists (id 3) but the gate cites a DIFFERENT (nearest)
+  // row -> the red-branch refusal is not grounded on the exact row the oracle
+  // found.
+  const nearest = {
+    id: 9, origin_repo: S59_KEY.origin_repo, tree_hash: 'd'.repeat(40),
+    cmd_hash: createHash('sha256').update('pytest').digest('hex'), cmd_display: 'pytest',
+    exit_code: 1, duration_ms: 900, log_tail: '1 failed', run_id: 'writer-run', step_id: 'test',
+    created_at: '2026-08-02T12:08:30.000Z',
+  };
+  const output = s59Block(nearest);
+  const diagnosis = refusalDiagnosis(output, 'red', S59_KEY, S59_TREE, S59_ROW, [S59_ROW, nearest]);
+  assert.equal(diagnosis.mismatched_keys.includes('LEDGER_ROW_ID'), true);
+  // The oracle concluded missing but the gate cites the exact-key row the
+  // oracle could not find -> inconsistent diagnosis.
+  const exactCitedUnderMissing = refusalDiagnosis(s59Block(S59_ROW), 'missing', S59_KEY, S59_TREE, null, [S59_ROW]);
+  assert.equal(exactCitedUnderMissing.mismatched_keys.includes('LEDGER_EVIDENCE'), true);
+  // An unknown LEDGER_ROW_ID (no such row in the scoped ledger) fails closed.
+  const unknown = refusalDiagnosis(s59Block({ ...S59_ROW, id: 77 }), 'red', S59_KEY, S59_TREE, S59_ROW, [S59_ROW]);
+  assert.equal(unknown.mismatched_keys.includes('LEDGER_ROW_ID'), true);
+});
+
+test('refusalDiagnosis flags a LOG_TAIL that does not reproduce the cited row log_tail at its head', () => {
+  // Truncated tail (the gate cut the row's log_tail short) and a tail whose
+  // text diverges are both mismatches — the prefix compare is strict about
+  // the row's log_tail being reproduced verbatim at the head of the value.
+  const truncated = refusalDiagnosis(s59Block(S59_ROW, { logTail: 'tail line 1' }), 'red', S59_KEY, S59_TREE, S59_ROW, [S59_ROW]);
+  assert.equal(truncated.mismatched_keys.includes('LOG_TAIL'), true);
+  const diverged = refusalDiagnosis(s59Block(S59_ROW, { logTail: 'other tail' }), 'red', S59_KEY, S59_TREE, S59_ROW, [S59_ROW]);
+  assert.equal(diverged.mismatched_keys.includes('LOG_TAIL'), true);
+  // A missing LOG_TAIL keyline is a mismatch too (the gate's full row-identity
+  // keyline block must be present).
+  const missingTail = refusalDiagnosis(
+    s59Block(S59_ROW, { logTail: '', extra: [] }).split('\n').filter((line) => !line.startsWith('LOG_TAIL:')).join('\n'),
+    'red', S59_KEY, S59_TREE, S59_ROW, [S59_ROW],
+  );
+  assert.equal(missingTail.mismatched_keys.includes('LOG_TAIL'), true);
+});
+
+test('finalizeStepModel orders finalize rows by (updated_at, id) and selects the terminal attempt', () => {
+  const late = { id: 'row-b', step_id: 'finalize_merge', updated_at: '2026-08-02T12:10:00.000Z', status: 'failed', terminal_reroute_count: 1 };
+  const early = { id: 'row-a', step_id: 'finalize_merge', updated_at: '2026-08-02T12:06:00.000Z', status: 'failed', terminal_reroute_count: 0 };
+  const other = { id: 'verify-row', step_id: 'verify', updated_at: '2026-08-02T12:05:00.000Z', status: 'done' };
+  const model = finalizeStepModel([other, late, early]);
+  assert.equal(model.attempts, 2);
+  assert.equal(model.rows[0].id, 'row-a');
+  assert.equal(model.rows[1].id, 'row-b');
+  assert.equal(model.terminal.id, 'row-b');
+  // No finalize rows -> terminal null (never a throw).
+  const empty = finalizeStepModel([{ id: 'verify-row', step_id: 'verify', updated_at: '2026-08-02T12:05:00.000Z', status: 'done' }]);
+  assert.equal(empty.attempts, 0);
+  assert.equal(empty.terminal, null);
+});
+
+test('reconcileReroutes reconciles a multi-attempt finalize on a refusal cell without weakening the strict bound', () => {
+  // The W4.30 shape: two finalize rows (attempts), one step.rerouted event,
+  // terminal row counter 1. The strict refusal bound (exactly one obstructing
+  // reroute) applies to the TERMINAL row only; the superseded attempt is an
+  // attempt, not a second bound violation.
+  const events = [
+    { event: 'step.running', stepId: 'verify' },
+    { event: 'step.rerouted', stepId: 'finalize_merge' },
+    { event: 'step.running', stepId: 'verify' },
+    { event: 'run.failed' },
+  ];
+  const rows = [
+    { id: 'finalize-attempt-1-row', step_id: 'finalize_merge', status: 'failed', terminal_reroute_count: 0, updated_at: '2026-08-02T12:06:00.000Z' },
+    { id: 'finalize-attempt-2-row', step_id: 'finalize_merge', status: 'failed', terminal_reroute_count: 1, updated_at: '2026-08-02T12:10:00.000Z' },
+  ];
+  const result = reconcileReroutes(events, rows, { rows: [], byStepId: new Map() }, 1);
+  assert.deepEqual(result.anomalies, [], 'the legitimate rerouted multi-attempt finalize must reconcile cleanly');
+  const finalizeRows = result.per_step.filter((entry) => entry.step_id === 'finalize_merge');
+  assert.equal(finalizeRows.length, 2);
+  const terminal = finalizeRows.find((entry) => entry.superseded !== true);
+  const superseded = finalizeRows.find((entry) => entry.attempt_index === 1);
+  assert.equal(terminal.terminal_reroute_count, 1);
+  assert.equal(terminal.decision_table_bound, 1);
+  assert.equal(terminal.attempts, 2);
+  assert.equal(terminal.superseded_rows, 1);
+  assert.equal(superseded.terminal_reroute_count, 0);
+});
+
+test('reconcileReroutes flags a multi-attempt finalize whose attempts lack a separating reroute', () => {
+  // Two finalize rows with NO step.rerouted event -> the second attempt is not
+  // re-dispatched through the corridor -> attempt-without-reroute.
+  const events = [{ event: 'step.running', stepId: 'verify' }, { event: 'run.failed' }];
+  const rows = [
+    { id: 'finalize-attempt-1-row', step_id: 'finalize_merge', status: 'failed', terminal_reroute_count: 0, updated_at: '2026-08-02T12:06:00.000Z' },
+    { id: 'finalize-attempt-2-row', step_id: 'finalize_merge', status: 'failed', terminal_reroute_count: 0, updated_at: '2026-08-02T12:10:00.000Z' },
+  ];
+  const result = reconcileReroutes(events, rows, { rows: [], byStepId: new Map() }, 1);
+  const anomaly = result.anomalies.find((entry) => entry.kind === 'attempt-without-reroute');
+  assert.ok(anomaly, 'attempt-without-reroute expected');
+  assert.equal(anomaly.superseded_rows, 1);
+  assert.equal(anomaly.reroute_events, 0);
+});
+
+test('reconcileReroutes flags a done finalize attempt superseded by a later finalize row', () => {
+  const events = [
+    { event: 'step.rerouted', stepId: 'finalize_merge' },
+    { event: 'merge.landed' },
+    { event: 'run.completed' },
+  ];
+  const rows = [
+    { id: 'finalize-attempt-1-row', step_id: 'finalize_merge', status: 'done', terminal_reroute_count: 0, updated_at: '2026-08-02T12:06:00.000Z' },
+    { id: 'finalize-attempt-2-row', step_id: 'finalize_merge', status: 'done', terminal_reroute_count: 1, updated_at: '2026-08-02T12:10:00.000Z' },
+  ];
+  const result = reconcileReroutes(events, rows, { rows: [], byStepId: new Map() }, null);
+  const anomaly = result.anomalies.find((entry) => entry.kind === 'superseded-done-attempt');
+  assert.ok(anomaly, 'superseded-done-attempt expected');
+  assert.equal(anomaly.attempt_row_id, 'finalize-attempt-1-row');
 });
 
 test('US-003 fixture generation is deterministic: two independent generations produce byte-identical trees', () => {

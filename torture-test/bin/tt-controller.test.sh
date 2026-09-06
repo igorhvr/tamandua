@@ -59,6 +59,12 @@ S44A_AUTH_FILE=""
 S44A_AUTH_BACKUP=""
 S44A_AUTH_BACKUP_LEFTOVER=""
 S44A_OUTSIDE_DIR=""
+# S62 (US-019): the daemon-log trigger fixtures SEED the CONTAINED home's
+# product daemon log (var/home/.tamandua/tamandua.log) with a synthetic
+# instant-fail classification line; the pre-test bytes are captured and
+# restored in cleanup so the shared contained home stays byte-identical.
+S62_DAEMON_LOG=""
+S62_DAEMON_LOG_BACKUP=""
 # E3.C US-008: the chaos runner's stub operator appends to the shared
 # var/chaos/chaos.log (the oracle snapshot's chaos_log source); back it up
 # before the chaos fixtures and restore in cleanup so the shared file is
@@ -188,6 +194,14 @@ cleanup() {
   fi
   if [ -n "$S44A_OUTSIDE_DIR" ]; then
     rm -rf -- "$S44A_OUTSIDE_DIR"
+  fi
+  # S62 (US-019): restore the contained daemon log to its pre-test bytes
+  # (the daemon-log trigger fixtures seed a synthetic classification line).
+  if [ -n "$S62_DAEMON_LOG" ]; then
+    rm -f -- "$S62_DAEMON_LOG"
+    if [ -n "$S62_DAEMON_LOG_BACKUP" ] && [ -f "$S62_DAEMON_LOG_BACKUP" ]; then
+      cp "$S62_DAEMON_LOG_BACKUP" "$S62_DAEMON_LOG"
+    fi
   fi
   rm -rf -- "$TEST_ROOT"
   if [ -n "$DANGLING_LINK" ]; then rm -f -- "$DANGLING_LINK"; fi
@@ -1063,6 +1077,11 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "status" ]; then
     # (never a scheduler-execution-failed).
     detached-head-refusal) printf '{"runId":"run-99999998-9999-4999-8999-999999999998","status":"failed","tokensSpent":0,"steps":[]}\n' ;;
     stdout) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
+    # S45 (W4.29/W4.33a): the resume-transport-exit fixture. The run reports
+    # the terminal 'completed' state for harvest (the daemon-side resume is
+    # proven by the run.resumed event the resume stub lands in the contained
+    # event stream, not by the status line).
+    s45-resume-transport-exit) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
     # S28 (US-005): chaos fixtures that prove the INVOCATION (not the
     # terminal-run refusal) need the run to report 'running' at invocation
     # time — the fail-closed terminal guard refuses to spawn an operator
@@ -1264,6 +1283,25 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "resume" ]; then
   if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "probe-status-trigger" ]; then
     : > "${CONTROLLER_STATUS_TRIGGER_FIRED:?}"
   fi
+  # S45 (W4.29/W4.33a) fixture: the resume CLI transport exits 1 AFTER the
+  # contained daemon already APPLIED the resume (the product's control-plane
+  # request times out while the daemon is still re-validating/re-registering).
+  # The stub mirrors that shape: it lands a run.resumed event in the contained
+  # event stream (TAMANDUA_STATE_DIR/events/<short-run-id>.jsonl) and prints
+  # the product's transport-failure line to stderr, then exits 1. The probe
+  # action must reflect the DAEMON-REPORTED status (resumed), not the CLI's
+  # transport exit.
+  if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "s45-resume-transport-exit" ]; then
+    s45_rid="${3:-run-11111111-1111-4111-8111-111111111111}"
+    s45_short="${s45_rid#run-}"
+    s45_events_dir="${TAMANDUA_STATE_DIR:-}/events"
+    mkdir -p "$s45_events_dir"
+    s45_ts="$(node -e 'process.stdout.write(new Date().toISOString())')"
+    printf '%s\n' "{\"ts\":\"$s45_ts\",\"event\":\"run.resumed\",\"runId\":\"$s45_rid\",\"workflowId\":\"bug-fix-merge-worktree\"}" \
+      >> "$s45_events_dir/$s45_short.jsonl"
+    printf 'Daemon is unreachable. Is the daemon running? Try: tamandua daemon start\n' >&2
+    exit 1
+  fi
   exit 0
 fi
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "fail" ]; then
@@ -1380,7 +1418,7 @@ case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
     fi
     printf '{"status":"completed"}\n'
     ;;
-  probe-status-trigger|probe-event-trigger|chaos-running)
+  probe-status-trigger|probe-event-trigger|chaos-running|s45-resume-transport-exit)
     printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
     printf '{"status":"completed"}\n'
     ;;
@@ -2067,6 +2105,79 @@ NODE
 pass "a >8KB probe CLI stderr flood is captured bounded at 8192 bytes with the truncation marker (refusal head preserved)"
 remove_probe_step
 
+# ── S45 (W4.29/W4.33a): probe resume returns the daemon-reported status ──
+# The resume CLI transport can exit 1 AFTER the contained daemon already
+# applied the resume (the product's control-plane request times out while the
+# daemon re-validates the harness / recovers orphans / re-registers). The
+# probe action must reflect the DAEMON-REPORTED status (resumed) — not the
+# CLI transport exit. The stub mode s45-resume-transport-exit mirrors the
+# product shape: `workflow resume` lands a run.resumed event in the contained
+# event stream and exits 1 with the transport-failure line. Old behavior (red
+# arm): the exit 1 classifies TEST_INFRA_FAIL probe-action-failed and stops
+# the run. New behavior: the action records ok with the transport exit
+# preserved (exit_code 1 + stderr tail) plus the daemon_reported block, the
+# sequence completes, and the case PASSes.
+S45_PROBE_EVENTS_DIR="$TT_DIR/var/home/.tamandua/events"
+S45_PROBE_EVENT_FILE="$S45_PROBE_EVENTS_DIR/11111111-1111-4111-8111-111111111111.jsonl"
+mkdir -p "$S45_PROBE_EVENTS_DIR"
+rm -f -- "$S45_PROBE_EVENT_FILE"
+seed_probe_step
+s45_resume_manifest="$TEST_ROOT/manifests/s45-resume-transport-exit.jsonl"
+write_probe_case "$s45_resume_manifest" "S45-RESUME-TRANSPORT-EXIT" \
+  '[{"run":1,"actions":[{"op":"pause","when":"step:developer:running","hold_seconds":1},{"op":"resume","when":"now"}]}]'
+s45_resume_events="$TEST_ROOT/s45-resume-events.jsonl"
+s45_resume_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s45_resume_events" \
+  CONTROLLER_WORKFLOW_MODE=s45-resume-transport-exit run_recorded_campaign "$CONTROLLER" --manifest "$s45_resume_manifest") \
+  || fail "S45 resume transport-exit campaign failed: $s45_resume_output"
+s45_resume_id=$(remember_campaign "$s45_resume_output")
+node --input-type=module - "$TT_DIR/var/results/$s45_resume_id/state.json" "$s45_resume_events" "$PROBE_RUN_ID" "$S45_PROBE_EVENT_FILE" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath, runId, eventFile] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`S45 resume transport-exit case must PASS (daemon-reported status supersedes the CLI transport exit): ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'completed' || evidence.actions.length !== 2) {
+  throw new Error(`S45 resume probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const resume = evidence.actions[1];
+if (resume.op !== 'resume' || resume.trigger !== 'now'
+    || JSON.stringify(resume.argv) !== JSON.stringify(['tamandua', 'workflow', 'resume', runId])) {
+  throw new Error(`S45 resume argv is wrong: ${JSON.stringify(resume)}`);
+}
+// The CLI transport exit is preserved as evidence...
+if (resume.exit_code !== 1 || resume.signal !== null || resume.error !== null) {
+  throw new Error(`S45 resume must keep the CLI transport exit (1) as evidence: ${JSON.stringify(resume)}`);
+}
+if (!resume.stderr_tail || !resume.stderr_tail.text.includes('Daemon is unreachable')) {
+  throw new Error(`S45 resume stderr tail must carry the transport-failure line: ${JSON.stringify(resume.stderr_tail)}`);
+}
+// ...but the ACTION RESULT reflects the daemon-reported status (resumed).
+const dr = resume.daemon_reported;
+if (!dr || dr.superseded_transport_exit !== true || dr.confirmed_by !== 'event:run.resumed'
+    || dr.resumed_event_observed !== true || dr.cli_transport_exit !== 1) {
+  throw new Error(`S45 resume daemon_reported block is wrong: ${JSON.stringify(dr)}`);
+}
+if (resume.effect?.status_after?.status !== 'completed') {
+  throw new Error(`S45 resume observed effect is wrong: ${JSON.stringify(resume.effect)}`);
+}
+// The contained event stream must carry the run.resumed event the stub landed.
+const eventLines = fs.existsSync(eventFile)
+  ? fs.readFileSync(eventFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  : [];
+if (!eventLines.some((entry) => entry.event === 'run.resumed' && (entry.runId ?? '').includes(runId))) {
+  throw new Error(`the contained event stream must carry run.resumed for ${runId}: ${JSON.stringify(eventLines)}`);
+}
+NODE
+pass "probe resume with a CLI transport exit-1 returns the daemon-reported resumed status (S45) and the case PASSes"
+remove_probe_step
+rm -f -- "$S45_PROBE_EVENT_FILE"
+rmdir "$S45_PROBE_EVENTS_DIR" 2>/dev/null || true
+
+
+
 # Fixture 4b (S18c): a probe-action-failed CLI failure terminates the case
 # IMMEDIATELY — the controller stops the underlying run (contained
 # `tamandua workflow stop <runId>`, recorded on the events file + as
@@ -2574,12 +2685,17 @@ if (!stubCalls.some((entry) => JSON.stringify(entry.argv) === JSON.stringify(['u
 NODE
 pass "update_contained_install runs tamandua update --force against the contained install and records argv/exit/catalog-stamp evidence"
 
-# Fixture 5: update_contained_install with a tamandua binary resolving OUTSIDE
-# torture-test/var (an outside-var stub first on the contained PATH — the
-# operator's live checkout shape) is REFUSED with the distinct category
-# 'operator-action-escape-refused' (reason uncontained-install-target) BEFORE
-# any spawn — the operator's live checkout is never updated. The evidence
-# record's argv stays null and the stub events show NO update invocation.
+# Fixture 5 (S45 calibration, W4.33b): update_contained_install with a
+# tamandua binary resolving OUTSIDE torture-test/var (an outside-var stub
+# first on the contained PATH — the operator's live checkout shape, which is
+# ALL a real campaign's contained env ever resolves) is REFUSED with the
+# distinct 'operator-action-escape-refused' (reason uncontained-install-target)
+# BEFORE any spawn — the operator's live checkout is never updated. S45: that
+# escape refusal is the EXPECTED PASS-level outcome for the cell — the action
+# records the `refusal` (argv stays null, nothing was spawned, the stub events
+# show NO update invocation) and the case PASSes; it is NOT the
+# 'update-contained-install-failed' failure of an update that ran and exited
+# non-zero (that genuine-failure arm keeps its distinct TIF classification).
 S44A_OUTSIDE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s44a-outside.XXXXXX")"
 cp "$workflow_bin_dir/tamandua" "$S44A_OUTSIDE_DIR/tamandua"
 s44a_update_escape_manifest="$TEST_ROOT/manifests/s44a-update-escape.jsonl"
@@ -2597,18 +2713,24 @@ import fs from 'node:fs';
 const [statePath, eventsPath, outsideBinary] = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
 const attempt = state.cases[0].attempts[0];
-if (attempt.outcome !== 'TEST_INFRA_FAIL'
-    || attempt.classification_reason?.category !== 'operator-action-escape-refused'
-    || attempt.classification_reason?.reason !== 'uncontained-install-target'
-    || attempt.classification_reason?.op !== 'update_contained_install'
-    || attempt.classification_reason?.binary_path !== outsideBinary) {
-  throw new Error(`uncontained update target must classify TEST_INFRA_FAIL operator-action-escape-refused: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+// S45: the expected-escape refusal is a PASS-level outcome — the cell PASSes
+// (the seam refused before any spawn), never TEST_INFRA_FAIL.
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`uncontained update target must be the expected escape-refusal PASS outcome (not a failure): ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
 }
 const update = attempt.probe_evidence?.actions?.[0];
 if (!update || update.op !== 'update_contained_install' || update.argv !== null
-    || update.exit_code !== null || update.binary_path !== outsideBinary
-    || update.effect !== null) {
+    || update.exit_code !== null || update.binary_path !== outsideBinary) {
   throw new Error(`refused update evidence must show a never-executed action (argv null): ${JSON.stringify(update)}`);
+}
+if (!update.refusal || update.refusal.category !== 'operator-action-escape-refused'
+    || update.refusal.reason !== 'uncontained-install-target'
+    || update.refusal.op !== 'update_contained_install'
+    || update.refusal.binary_path !== outsideBinary) {
+  throw new Error(`refused update must carry the operator-action-escape-refused refusal (reason uncontained-install-target): ${JSON.stringify(update)}`);
+}
+if (update.effect?.refused !== true || update.effect?.reason !== 'uncontained-install-target') {
+  throw new Error(`refused update effect must record refused:true with the escape reason: ${JSON.stringify(update.effect)}`);
 }
 const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
   .map((line) => JSON.parse(line));
@@ -2616,7 +2738,7 @@ if (stubCalls.some((entry) => JSON.stringify(entry.argv).includes('"update"'))) 
   throw new Error(`no update invocation may ever be constructed for an uncontained target: ${JSON.stringify(stubCalls)}`);
 }
 NODE
-pass "update_contained_install with an uncontained tamandua binary is refused (operator-action-escape-refused) before any spawn"
+pass "update_contained_install with an uncontained tamandua binary is the expected escape-refusal PASS (operator-action-escape-refused), never a failure (S45)"
 
 # Fixture 6: invalidate_credentials + restore_credentials fire against the
 # CONTAINED home's .pi/agent/auth.json — the invalidate backs the original up
@@ -2752,6 +2874,223 @@ if (!evidence || evidence.failure?.category !== 'invalidate-credentials-failed'
 }
 NODE
 pass "invalidate_credentials with no contained credential file fails closed (invalidate-credentials-failed, unreadable-credential-file)"
+if [ -f "$S44A_AUTH_BACKUP" ]; then cp "$S44A_AUTH_BACKUP" "$S44A_AUTH_FILE"; fi
+
+# Fixture 8b (S61/US-018): probe compensation at case termination. A probe op
+# with a compensating counterpart (invalidate_credentials ->
+# restore_credentials) that FIRED (backup created) must have its compensation
+# executed by the controller when the case terminates for ANY reason if the
+# compensation has not run — W4.47 on the mac was canceled at its wall cap
+# before its restore_credentials action fired, leaving the contained
+# $TT_HOME/.pi copy invalidated for every later pi cell. Here the hermetic run
+# completes instantly (stdout stub) so the restore trigger (event:step.running
+# — no event stream exists) never fires: the probe seq fails probe-trigger-
+# unreached and the case terminates mid-sequence. The controller must consume
+# the invalidate backup at terminal-record time: auth.json restored
+# byte-identical, the .tt-invalidated backup removed, and a `compensation`
+# entry (op restore_credentials, compensates invalidate_credentials, exit_code
+# 0) recorded in probe evidence.
+printf '%s\n' '{"deepseek":{"type":"api_key","key":"s61-fixture-original-key"}}' > "$S44A_AUTH_FILE"
+s61_comp_manifest="$TEST_ROOT/manifests/s61-compensation.jsonl"
+write_probe_case "$s61_comp_manifest" "S61-COMPENSATION" \
+  '[{"run":1,"actions":[{"op":"invalidate_credentials","when":"now"},{"op":"restore_credentials","when":"event:step.running"}]}]'
+s61_comp_events="$TEST_ROOT/s61-compensation-events.jsonl"
+s61_comp_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s61_comp_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s61_comp_manifest") \
+  || fail "S61 compensation campaign failed: $s61_comp_output"
+s61_comp_id=$(remember_campaign "$s61_comp_output")
+node --input-type=module - "$TT_DIR/var/results/$s61_comp_id/state.json" "$S44A_AUTH_FILE" <<'NODE'
+import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+const [statePath, authFile] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+// The case terminated mid-sequence: the restore trigger never fired (run
+// completed with no step.running event), so the probe seq failed probe-trigger-
+// unreached — a terminal record for an infra reason, and compensation must run.
+if (attempt.phase !== 'terminal' || !attempt.terminal_at) {
+  throw new Error(`S61 case must reach a terminal record: ${JSON.stringify(attempt)}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || !Array.isArray(evidence.actions) || evidence.actions.length !== 2) {
+  throw new Error(`S61 probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const [invalidate, restore] = evidence.actions;
+// The invalidate FIRED (backup created) and restore did NOT (trigger-unreached).
+if (invalidate.op !== 'invalidate_credentials' || invalidate.ok !== true
+    || invalidate.effect?.backup_created !== true || invalidate.backup_path === undefined) {
+  throw new Error(`S61 invalidate must have fired (backup created): ${JSON.stringify(invalidate)}`);
+}
+if (restore.op !== 'restore_credentials' || restore.ok !== false
+    || restore.failure?.category !== 'probe-trigger-unreached') {
+  throw new Error(`S61 restore must never have fired (trigger-unreached): ${JSON.stringify(restore)}`);
+}
+// The controller executed the compensation: restore_credentials consumed the
+// backup and recorded a `compensation` entry with its own exit code.
+const comp = evidence.compensation;
+if (!Array.isArray(comp) || comp.length === 0) {
+  throw new Error(`S61 compensation entry missing from probe evidence: ${JSON.stringify(evidence)}`);
+}
+const compEntry = comp[0];
+if (compEntry.op !== 'restore_credentials' || compEntry.compensates !== 'invalidate_credentials'
+    || compEntry.exit_code !== 0 || compEntry.effect?.restored !== true
+    || compEntry.effect?.backup_removed !== true) {
+  throw new Error(`S61 compensation entry is wrong: ${JSON.stringify(comp)}`);
+}
+if (fs.existsSync(`${authFile}.tt-invalidated`)) {
+  throw new Error(`S61 compensation must consume the credential backup (auth.json.tt-invalidated still present)`);
+}
+const finalSha = createHash('sha256').update(fs.readFileSync(authFile)).digest('hex');
+if (finalSha !== invalidate.target_sha256_before) {
+  throw new Error(`S61 compensation must restore auth.json byte-identical: ${finalSha} != ${invalidate.target_sha256_before}`);
+}
+NODE
+pass "a case terminated mid-sequence after invalidate fired (restore never ran) has its compensation executed at terminal record time (backup consumed, compensation entry exit_code 0)"
+rm -f -- "$S44A_AUTH_FILE" "$S44A_AUTH_FILE.tt-invalidated"
+if [ -f "$S44A_AUTH_BACKUP" ]; then cp "$S44A_AUTH_BACKUP" "$S44A_AUTH_FILE"; fi
+
+# ── S62 (US-019): the DAEMON-LOG awaited trigger ────────────────────
+# W4.47's restore_credentials was armed on event:step.running, which can
+# NEVER fire under an instant-fail loop (the product emits no step.running
+# for rounds that exit before claiming). The S62 re-arm waits for the signal
+# that EXISTS: the contained daemon's product log
+# (<TAMANDUA_STATE_DIR>/tamandua.log) gains a "Worker round classified as
+# instant fail" line naming the run. These two hermetic fixtures seed the
+# contained home's daemon log (the file the controller reads for a contained
+# spawn env) with/without the classification line:
+#   * 8c (fired): the restore armed on {"daemon_log":...} fires on the seeded
+#     line, consumes the invalidate backup byte-identical, sequence completes;
+#   * 8d (unreached -> compensation): no classification line — the restore
+#     never fires (the OLD arming shape RED), reports probe-trigger-unreached
+#     at its own timeout, and the S61 compensation restores the contained copy
+#     at terminal-record time (the fail-closed backstop for the NEW arming).
+S62_DAEMON_LOG="$TT_DIR/var/home/.tamandua/tamandua.log"
+mkdir -p "$(dirname "$S62_DAEMON_LOG")"
+S62_DAEMON_LOG_BACKUP="$TEST_ROOT/original-tamandua.log"
+if [ -f "$S62_DAEMON_LOG" ]; then cp "$S62_DAEMON_LOG" "$S62_DAEMON_LOG_BACKUP"; fi
+
+# Fixture 8c: the daemon-log trigger FIRES on the run's instant-fail
+# classification. Seed the contained daemon log with the product's exact
+# classification line shape ([ts] WARN  Worker round classified as instant
+# fail {"jobId":...,"runId":"<run>",...}) naming PROBE_RUN_ID — the stdout
+# stub run id — BEFORE the campaign; the restore action must fire on it.
+printf '%s\n' \
+  '[2026-09-04 20:00:00] WARN  Worker round classified as instant fail {"jobId":"s62-fixture","runId":"'$PROBE_RUN_ID'","workflowId":"do-now","consecutiveInstantFails":1}' \
+  > "$S62_DAEMON_LOG"
+printf '%s\n' '{"deepseek":{"type":"api_key","key":"s62-fixture-original-key"}}' > "$S44A_AUTH_FILE"
+s62_log_manifest="$TEST_ROOT/manifests/s62-daemon-log.jsonl"
+write_probe_case "$s62_log_manifest" "S62-DAEMON-LOG" \
+  '[{"run":1,"actions":[{"op":"invalidate_credentials","when":"now"},{"op":"restore_credentials","when":{"daemon_log":"Worker round classified as instant fail","timeout_s":60}}]}]'
+s62_log_events="$TEST_ROOT/s62-daemon-log-events.jsonl"
+s62_log_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s62_log_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s62_log_manifest") \
+  || fail "daemon-log trigger campaign failed: $s62_log_output"
+s62_log_id=$(remember_campaign "$s62_log_output")
+node --input-type=module - "$TT_DIR/var/results/$s62_log_id/state.json" "$S44A_AUTH_FILE" <<'NODE'
+import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+const [statePath, authFile] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`daemon-log case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'completed' || evidence.actions.length !== 2) {
+  throw new Error(`daemon-log probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const [invalidate, restore] = evidence.actions;
+if (invalidate.op !== 'invalidate_credentials' || invalidate.ok !== true
+    || invalidate.effect?.backup_created !== true) {
+  throw new Error(`daemon-log invalidate must have fired (backup created): ${JSON.stringify(invalidate)}`);
+}
+const expectedTrigger = { daemon_log: 'Worker round classified as instant fail', timeout_s: 60 };
+if (restore.op !== 'restore_credentials' || restore.ok !== true
+    || JSON.stringify(restore.trigger) !== JSON.stringify(expectedTrigger)) {
+  throw new Error(`daemon-log restore must have fired on the daemon_log trigger: ${JSON.stringify(restore)}`);
+}
+if (restore.effect?.restored !== true || restore.effect?.backup_removed !== true) {
+  throw new Error(`daemon-log restore effect is wrong: ${JSON.stringify(restore.effect)}`);
+}
+if (fs.existsSync(`${authFile}.tt-invalidated`)) {
+  throw new Error(`daemon-log restore must consume the credential backup`);
+}
+const finalSha = createHash('sha256').update(fs.readFileSync(authFile)).digest('hex');
+if (finalSha !== invalidate.target_sha256_before) {
+  throw new Error(`daemon-log restore must return auth.json byte-identical: ${finalSha} != ${invalidate.target_sha256_before}`);
+}
+if (Array.isArray(evidence.compensation) && evidence.compensation.length > 0) {
+  throw new Error(`daemon-log corridor must NOT need compensation (restore ran): ${JSON.stringify(evidence.compensation)}`);
+}
+NODE
+pass "a restore_credentials probe armed on the daemon-log instant-fail trigger fires on the run's classification line in the contained daemon log (S62 re-arm, W4.47)"
+rm -f -- "$S62_DAEMON_LOG" "$S44A_AUTH_FILE" "$S44A_AUTH_FILE.tt-invalidated"
+if [ -f "$S44A_AUTH_BACKUP" ]; then cp "$S44A_AUTH_BACKUP" "$S44A_AUTH_FILE"; fi
+
+# Fixture 8d: the daemon-log trigger with NO classification line never fires
+# (the OLD W4.47 arming shape — restore cannot observe an instant-fail loop),
+# the restore reports probe-trigger-unreached at its OWN timeout (object
+# triggers do not exit early on the terminal run), and the S61 compensation
+# restores the contained copy at terminal-record time so no later cell is
+# poisoned. The daemon log is REMOVED (the 8c seed is gone) before arming.
+rm -f -- "$S62_DAEMON_LOG"
+printf '%s\n' '{"deepseek":{"type":"api_key","key":"s62-fixture-original-key"}}' > "$S44A_AUTH_FILE"
+s62_unreached_manifest="$TEST_ROOT/manifests/s62-daemon-log-unreached.jsonl"
+write_probe_case "$s62_unreached_manifest" "S62-DAEMON-LOG-UNREACHED" \
+  '[{"run":1,"actions":[{"op":"invalidate_credentials","when":"now"},{"op":"restore_credentials","when":{"daemon_log":"Worker round classified as instant fail","timeout_s":3}}]}]'
+s62_unreached_events="$TEST_ROOT/s62-daemon-log-unreached-events.jsonl"
+s62_unreached_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s62_unreached_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s62_unreached_manifest") \
+  || fail "daemon-log-unreached campaign failed: $s62_unreached_output"
+s62_unreached_id=$(remember_campaign "$s62_unreached_output")
+node --input-type=module - "$TT_DIR/var/results/$s62_unreached_id/state.json" "$S44A_AUTH_FILE" <<'NODE'
+import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+const [statePath, authFile] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.phase !== 'terminal' || !attempt.terminal_at) {
+  throw new Error(`daemon-log-unreached case must reach a terminal record: ${JSON.stringify(attempt)}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || !Array.isArray(evidence.actions) || evidence.actions.length !== 2) {
+  throw new Error(`daemon-log-unreached probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const [invalidate, restore] = evidence.actions;
+if (invalidate.op !== 'invalidate_credentials' || invalidate.ok !== true
+    || invalidate.effect?.backup_created !== true) {
+  throw new Error(`daemon-log-unreached invalidate must have fired (backup created): ${JSON.stringify(invalidate)}`);
+}
+const expectedTrigger = { daemon_log: 'Worker round classified as instant fail', timeout_s: 3 };
+if (restore.op !== 'restore_credentials' || restore.ok !== false
+    || restore.failure?.category !== 'probe-trigger-unreached'
+    || JSON.stringify(restore.trigger) !== JSON.stringify(expectedTrigger)) {
+  throw new Error(`daemon-log-unreached restore must report probe-trigger-unreached on the daemon_log trigger: ${JSON.stringify(restore)}`);
+}
+// S61 backstop: the controller compensates at terminal-record time.
+const comp = evidence.compensation;
+if (!Array.isArray(comp) || comp.length === 0) {
+  throw new Error(`daemon-log-unreached compensation entry missing from probe evidence: ${JSON.stringify(evidence)}`);
+}
+const compEntry = comp[0];
+if (compEntry.op !== 'restore_credentials' || compEntry.compensates !== 'invalidate_credentials'
+    || compEntry.exit_code !== 0 || compEntry.effect?.restored !== true
+    || compEntry.effect?.backup_removed !== true) {
+  throw new Error(`daemon-log-unreached compensation entry is wrong: ${JSON.stringify(comp)}`);
+}
+if (fs.existsSync(`${authFile}.tt-invalidated`)) {
+  throw new Error(`daemon-log-unreached compensation must consume the credential backup`);
+}
+const finalSha = createHash('sha256').update(fs.readFileSync(authFile)).digest('hex');
+if (finalSha !== invalidate.target_sha256_before) {
+  throw new Error(`daemon-log-unreached compensation must restore auth.json byte-identical: ${finalSha} != ${invalidate.target_sha256_before}`);
+}
+NODE
+pass "a restore armed on the daemon-log trigger with no classification line never fires (probe-trigger-unreached) and the S61 compensation restores the contained copy at terminal (no poisoned later cells)"
+rm -f -- "$S62_DAEMON_LOG" "$S44A_AUTH_FILE" "$S44A_AUTH_FILE.tt-invalidated"
 if [ -f "$S44A_AUTH_BACKUP" ]; then cp "$S44A_AUTH_BACKUP" "$S44A_AUTH_FILE"; fi
 
 # Fixture 9: the during_hold corridor — restart_contained_daemon declared
@@ -6660,6 +6999,19 @@ for fixture_name in tt-python tt-ts tt-go tt-java tt-rust tt-poly-lite tt-poly \
     git --git-dir="$fixture_path" commit-tree "$fixture_tree")
   git --git-dir="$fixture_path" update-ref refs/heads/main "$fixture_commit"
   printf 'BASELINE=%s\n' "$fixture_commit" > "$golden_root/$fixture_name.git.hashes"
+  # S57 (R4a): golden validity includes a FIXTURES_SRC content-hash record for
+  # REAL fixtures (FIXTURE_META in tt-golden-bootstrap.mjs). These scratch
+  # smoke goldens stand in for the real ones, so their ledgers must record the
+  # canonical hash of the current fixtures-src/<fixture> tree or
+  # tt-verify-fixture-baselines fails them closed. Self-test fixtures
+  # (tt-selftest-*) have no fixtures-src source and need no record.
+  if [ -d "$TT_DIR/fixtures-src/$fixture_name" ]; then
+    fixture_src_hash=$(node "$SCRIPT_DIR/tt-golden-bootstrap.mjs" \
+      --hash-fixtures-src-dir "$TT_DIR/fixtures-src/$fixture_name" 2>/dev/null)
+    if [ -n "${fixture_src_hash:-}" ]; then
+      printf 'FIXTURES_SRC=%s\n' "$fixture_src_hash" >> "$golden_root/$fixture_name.git.hashes"
+    fi
+  fi
 done
 set +e
 smoke_output=$(TEST_GOLDEN_ROOT="$golden_root" "$CONTROLLER" --manifest "$smoke_manifest" 2>&1)

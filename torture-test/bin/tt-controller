@@ -38,6 +38,20 @@ import {
 import { chaosNotFiredGate } from './tt-chaos-arming.mjs';
 import { armAbsentGate } from './tt-arming.mjs';
 import { subsumeRunawayFindings } from './tt-subsumption.mjs';
+// MCHA (US-014): the probe-sequence engine's process-group/start-identity
+// recorders (processGroupOf / processStartTimeOf below) delegate to the
+// PORTABLE tt-process-identity arms — /proc on linux, `ps -o pgid=` /
+// `ps -o lstart=` on /proc-less hosts — so the harness/daemon target records
+// handed to tt-chaos as explicit --target-* args carry a real pgid + start
+// identity on Darwin too (the old procfs-only recorders left them null there,
+// silently weakening the fire-time ABA/group gates to "no recorded identity").
+// The delegation reads TT_PROCESS_IDENTITY_PLATFORM at call time, so the
+// darwin branch is hermetically simulatable on linux (same seam as the
+// identity tool).
+import {
+  getProcessGroup as portableProcessGroupOf,
+  getProcessStartIdentity as portableProcessStartTimeOf,
+} from './tt-process-identity.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const BIN_DIR = path.dirname(__filename);
@@ -177,12 +191,31 @@ const OPERATOR_SEAM_SINGLE_RUN_OPS = new Set([
 // invalidate in the same run group (fail-closed declaration, never a runtime
 // no-backup surprise).
 const CREDENTIAL_BACKUP_FILENAME = 'auth.json.tt-invalidated';
+// S61 (US-018): probe ops with a compensating counterpart. When a probe op in
+// this registry FIRES (executes successfully, e.g. invalidate_credentials
+// creates the credential backup) and the CASE terminates for ANY reason
+// (deadline, cap, infra abort, controller shutdown) BEFORE its compensation op
+// ran (e.g. restore_credentials — the backup was never consumed), the
+// controller must execute the compensation itself at terminal-record time so a
+// later cell never inherits the poisoned contained home (W4.47 on the mac was
+// canceled at its wall cap before restore_credentials fired, leaving the
+// contained $TT_HOME/.pi copy invalidated for every later pi cell). The
+// registry is GENERIC — add any future { op, compensation } pair here; the
+// executor below (executeProbeCompensation) dispatches by compensation op.
+const PROBE_COMPENSATION_PAIRS = Object.freeze([
+  { op: 'invalidate_credentials', compensation: 'restore_credentials' },
+]);
 // S44a: probe-action failure categories that terminate the case IMMEDIATELY
 // (stop the underlying run + persist the terminal TEST_INFRA_FAIL record AT
 // FAILURE TIME — the S18c discipline). Every action-execution failure (the
 // pre-S44a 'probe-action-failed' plus the S44a per-action categories and the
 // escape refusal) terminates; 'probe-trigger-unreached' waits out the
-// run/deadline by design.
+// run/deadline by design. S45 (W4.33b): update_contained_install's
+// expected-escape refusal no longer RETURNS ok:false — it is calibrated as
+// the PASS-level outcome the cell pins (recorded on the action as `refusal`,
+// the sequence continues), so it never reaches this set; the category stays
+// listed here for the credential ops' escape refusals (symlink/home escape
+// vectors), which remain genuine infra failures.
 const PROBE_ACTION_TERMINAL_CATEGORIES = new Set([
   'probe-action-failed',
   'restart-contained-daemon-failed',
@@ -196,19 +229,27 @@ const PROBE_WHEN_PATTERN = /^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-
 // S18b (US-003): the probe trigger vocabulary gains AWAITED object triggers —
 // {"status":S,"timeout_s":T} (await the contained run status) and
 // {"event":E,"timeout_s":T} (await an event type in the contained event
-// stream). Defense-in-depth BELOW the schema: a valid object `when` is a plain
-// object with timeout_s > 0 and exactly ONE of status (nonempty string) /
-// event (nonempty string); both-at-once, neither, unknown keys, or a
-// non-positive timeout are all invalid (the distinct 'missing or invalid when'
-// reason keeps its shape). String `when`s must still match PROBE_WHEN_PATTERN.
+// stream). S62 (US-019): a third awaited arm — {"daemon_log":<needle>,
+// "timeout_s":T} awaits a DAEMON-LOG line naming the run with a matching
+// needle — the signal that EXISTS under an instant-fail loop (W4.47:
+// restore_credentials armed on event:step.running can never fire because the
+// product emits no step.running for rounds that exit before claiming, while
+// the daemon DOES log each "Worker round classified as instant fail"
+// classification for the run). Defense-in-depth BELOW the schema: a valid
+// object `when` is a plain object with timeout_s > 0 and exactly ONE of
+// status (nonempty string) / event (nonempty string) / daemon_log (nonempty
+// string needle); two-or-more, neither, unknown keys, or a non-positive
+// timeout are all invalid (the distinct 'missing or invalid when' reason
+// keeps its shape). String `when`s must still match PROBE_WHEN_PATTERN.
 function probeWhenValid(when) {
   if (typeof when === 'string') return PROBE_WHEN_PATTERN.test(when);
   if (!isObject(when)) return false;
   if (!(typeof when.timeout_s === 'number' && Number.isFinite(when.timeout_s) && when.timeout_s > 0)) return false;
   const hasStatus = typeof when.status === 'string' && when.status.length > 0;
   const hasEvent = typeof when.event === 'string' && when.event.length > 0;
-  if (hasStatus === hasEvent) return false;
-  return Object.keys(when).every((key) => key === 'status' || key === 'event' || key === 'timeout_s');
+  const hasDaemonLog = typeof when.daemon_log === 'string' && when.daemon_log.length > 0;
+  if ([hasStatus, hasEvent, hasDaemonLog].filter(Boolean).length !== 1) return false;
+  return Object.keys(when).every((key) => key === 'status' || key === 'event' || key === 'daemon_log' || key === 'timeout_s');
 }
 
 // US-003 (S29): the fail-closed trigger-vocabulary preflight resolves the
@@ -263,6 +304,23 @@ const PROBE_POLL_INTERVAL_MS = 500;
 const PROBE_EVENTS_EXCERPT_MAX = 200;
 const PROBE_EVENTS_EXCERPT_MAX_BYTES = 256 * 1024;
 const PROBE_OUTPUT_TAIL_MAX_BYTES = 8 * 1024;
+// S45 (W4.29/W4.33a): the probe `resume` action must return the
+// DAEMON-REPORTED status, not the CLI's transport exit. The resume CLI talks
+// to the contained daemon control plane with a short request timeout; when
+// the daemon is still applying the resume (harness re-validation, orphan
+// recovery, re-registration) the request can time out and the CLI exits 1
+// AFTER the daemon already flipped the run back to running. probeResumeDaemon
+// Outcome polls the contained event stream + status for a bounded window to
+// confirm the resume actually landed before the action is classified. The
+// window/interval are env-tunable for hermetic tests.
+const PROBE_RESUME_CONFIRM_WINDOW_MS = Number.isFinite(Number(process.env.TT_PROBE_RESUME_CONFIRM_WINDOW_MS))
+  && Number(process.env.TT_PROBE_RESUME_CONFIRM_WINDOW_MS) > 0
+  ? Number(process.env.TT_PROBE_RESUME_CONFIRM_WINDOW_MS)
+  : 4000;
+const PROBE_RESUME_CONFIRM_POLL_MS = Number.isFinite(Number(process.env.TT_PROBE_RESUME_CONFIRM_POLL_MS))
+  && Number(process.env.TT_PROBE_RESUME_CONFIRM_POLL_MS) > 0
+  ? Number(process.env.TT_PROBE_RESUME_CONFIRM_POLL_MS)
+  : 250;
 // E3.C US-007: multi-launch probe orchestration. PROBE_DISPATCH_INTERVAL_MS
 // mirrors the product scheduler's DISPATCH_INTERVAL_MS (15s) — the recovery
 // window O16 judges from a restart_daemon probe is
@@ -422,6 +480,21 @@ Real-case preflight (E2.5 US-004 + S26 US-004):
   requires an empty suite (resume reconciles prior state — MACP7 per-campaign
   minimum). Scripted-only selections and TT_DRY_RUN_REAL_LAUNCH dry runs never
   engage the real preflight.
+
+MDSH (R4a US-016) — dsh functional boot predicate:
+  When the selection still has a PENDING cell that launches the REAL dsh
+  harness (harness 'dsh') and requires the dsh capability, the roster runs the
+  dsh boot smoke (bin/tt-harness-auth-probe --dsh-smoke dsh — a boot-level,
+  non-spending 'dsh --profile headless --help' under the contained daemon's
+  env) BEFORE host-requirement gating. A smoke FAILURE (dsh present but unable
+  to boot where the daemon runs it — the mac W4.dsh-* defect that idled each
+  cell to its cap INCONCLUSIVE) marks every such cell NOT_RUN (predicate) with
+  a recorded reason whose evidence carries the smoke's full harness stderr;
+  the cell is never launched and never counted expected-executable. When the
+  smoke passes (or no real dsh launch is in scope), dsh cells run exactly as
+  before. The harness-auth preflight leg probes only harnesses that still have
+  eligible cells, so a roster-gated dead dsh lane can never abort the campaign
+  at preflight.
 `);
 }
 
@@ -862,7 +935,7 @@ function validateProbeSequence(caseRecord) {
       }
       const when = action.when;
       if (!probeWhenValid(when)) {
-        errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): missing or invalid 'when' phase marker (expected now | step:<role>:<state> | event:<type> | {"status":<status>,"timeout_s":N} | {"event":<type>,"timeout_s":N})`);
+        errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): missing or invalid 'when' phase marker (expected now | step:<role>:<state> | event:<type> | {"status":<status>,"timeout_s":N} | {"event":<type>,"timeout_s":N} | {"daemon_log":<needle>,"timeout_s":N})`);
       }
       // US-003 (S29): fail-closed trigger-vocabulary preflight. A `when`
       // marker naming a step/agent/event not in the case's known vocabulary
@@ -1413,7 +1486,7 @@ function observedHarnessPresence(profile, name) {
   return null;
 }
 
-function observedCapability(profile, name) {
+function observedCapability(profile, name, functional) {
   if (name === 'procfs') return observedContainment(profile, 'procfs');
   if (name === 'systemd-user-scope') return observedContainment(profile, name);
   if (name === 'node-sqlite') {
@@ -1425,17 +1498,31 @@ function observedCapability(profile, name) {
   }
   if (name === 'hermes') return observedHarnessPresence(profile, 'hermes');
   if (name === 'pi') return observedHarnessPresence(profile, 'pi');
-  if (name === 'dsh') return observedHarnessPresence(profile, 'dsh');
+  if (name === 'dsh') {
+    // MDSH (R4a US-016): the dsh FUNCTIONAL predicate. Mechanical presence
+    // (harness.dsh.present) is the base leaf; when the campaign ran the dsh
+    // boot smoke under the contained daemon env (functional evidence present)
+    // and the smoke FAILED, the capability is OBSERVED FALSE for real dsh
+    // launches — the harness is present but cannot boot where the daemon runs
+    // them (the mac W4.dsh-* defect: cells idled to their cap INCONCLUSIVE).
+    // Cells that do not launch the real dsh harness are unaffected (they only
+    // ever consult presence, exactly as before — the smoke decides whether
+    // REAL dsh launches are viable).
+    const present = observedHarnessPresence(profile, 'dsh');
+    if (present !== true) return present;
+    if (functional !== null && functional.ok === false) return false;
+    return true;
+  }
   if (Object.hasOwn(profile.capabilities ?? {}, name)) return profile.capabilities[name];
   const spawnClass = profile.spawnSpeedClass?.class;
   if (typeof spawnClass === 'string' && name === `spawn-${spawnClass}`) return true;
   return null;
 }
 
-function evaluateRequirements(requires, profile) {
+function evaluateRequirements(requires, profile, functional) {
   const failures = [];
-  const fail = (predicate, expected, observed) => {
-    failures.push({ predicate, expected, observed });
+  const fail = (predicate, expected, observed, extra) => {
+    failures.push({ predicate, expected, observed, ...(extra ?? {}) });
   };
 
   if (requires.platform !== undefined) {
@@ -1457,13 +1544,32 @@ function evaluateRequirements(requires, profile) {
     if (observed === null || observed < requires.node_min) fail('node_min', requires.node_min, observed);
   }
   for (const name of requires.capabilities ?? []) {
-    const observed = observedCapability(profile, name);
-    if (observed !== true) fail(`capabilities.${name}`, true, observed);
+    const observed = observedCapability(profile, name, functional);
+    if (observed !== true) {
+      // MDSH (R4a US-016): when the dsh capability is gated by a FAILED dsh
+      // boot smoke (present-but-cannot-boot under the contained daemon env),
+      // the evidence entry carries the full functional detail (the recorded
+      // reason — including the harness's FULL stderr from the smoke, never a
+      // truncated preview).
+      if (name === 'dsh' && functional !== null && functional.ok === false) {
+        fail(`capabilities.${name}`, true, observed, {
+          functional: {
+            check: 'dsh-boot-smoke',
+            ok: false,
+            exit_code: functional.exit_code ?? null,
+            smoke_command: functional.smoke_command ?? null,
+            stderr: functional.stderr ?? '',
+          },
+        });
+      } else {
+        fail(`capabilities.${name}`, true, observed);
+      }
+    }
   }
   return failures;
 }
 
-function applyHostRequirements(manifest, state, profile) {
+function applyHostRequirements(manifest, state, profile, functional) {
   if (profile === null) return;
   let terminalTimestamp = null;
   const profileFailure = isHostProfileFailure(profile) ? profile.hostProfileFailure : null;
@@ -1473,7 +1579,12 @@ function applyHostRequirements(manifest, state, profile) {
     if (!hasRequirements(record)) continue;
     if (profileFailure === null) {
       // Valid profile: exactly the pre-MACP3 behavior is preserved.
-      const evidence = evaluateRequirements(record.requires, profile);
+      // MDSH (R4a US-016): the dsh FUNCTIONAL smoke overlay applies ONLY to
+      // cells that would launch the real dsh harness (harness 'dsh') — a
+      // local-command cell that merely references the dsh capability keeps
+      // the presence-only semantics (its execution never boots dsh).
+      const recordFunctional = record.harness === 'dsh' ? functional : null;
+      const evidence = evaluateRequirements(record.requires, profile, recordFunctional);
       if (evidence.length === 0) continue;
       terminalTimestamp ??= utcTimestamp();
       Object.assign(state.cases[index], {
@@ -1507,6 +1618,124 @@ function applyHostRequirements(manifest, state, profile) {
     });
   }
   if (terminalTimestamp !== null) state.updated_at = terminalTimestamp;
+}
+
+// ── MDSH (R4a US-016): dsh functional boot predicate ────────────────────
+//
+// The tier roster must know whether dsh can actually BOOT under the contained
+// daemon's spawn environment (PATH/HOME as that daemon sees them) BEFORE any
+// real dsh cell launches — the W4.dsh-* cells ran on the mac although dsh
+// cannot boot there ("dsh: plugin tree failed t...", while `dsh --profile
+// headless --help` works under the interactive shell with the contained
+// HOME), so each idled to its cap as INCONCLUSIVE. The controller consults
+// the dsh boot smoke (bin/tt-harness-auth-probe --dsh-smoke dsh, which runs
+// the smoke under a reconstruction of the daemon env and reports the FULL
+// harness stderr in its DSH_SMOKE_STDERR evidence block) at roster time and
+// marks dsh cells NOT_RUN (reason recorded) when the smoke fails — never
+// launching them into INCONCLUSIVE idling.
+//
+// dshFunctionalSmokeRequired: a real dsh boot smoke is needed iff the
+// campaign still has a PENDING cell that launches the REAL dsh harness
+// (harness 'dsh') AND requires the dsh capability (the requires.capabilities
+// predicate the smoke feeds) AND the host profile records the dsh harness
+// present. Cells already terminal (predicate-gated earlier, pending-real
+// under bare --scripted-only, ...) never trigger the smoke — zero extra
+// subprocess when no real dsh launch is in scope. Local-command cells that
+// merely reference the dsh capability never trigger it either (their
+// execution never boots dsh).
+function dshFunctionalSmokeRequired(manifest, state, profile) {
+  if (profile === null || isHostProfileFailure(profile)) return false;
+  if (observedHarnessPresence(profile, 'dsh') !== true) return false;
+  for (let index = 0; index < manifest.cases.length; index += 1) {
+    const record = manifest.cases[index];
+    const caseState = state.cases[index];
+    if (caseState?.phase !== 'pending') continue;
+    if (record.harness !== 'dsh') continue;
+    if (!Array.isArray(record.requires?.capabilities) || !record.requires.capabilities.includes('dsh')) continue;
+    return true;
+  }
+  return false;
+}
+
+// runDshBootSmoke: invoke the probe's dsh boot-smoke mode under the
+// CONTAINED real spawn env (the same env the preflight legs and daemon-
+// control run under — the probe reconstructs the daemon's own env/PATH for
+// the smoke itself). Returns parsed evidence
+//   { ok, exit_code, smoke_command, stderr }
+// or null when the smoke could not be run/parsed (probe missing, spawn
+// failure, no DSH_SMOKE marker) — the roster then falls back to the legacy
+// presence-only semantics (the preflight auth leg still fail-closes later on
+// a genuinely dead dsh lane).
+function runDshBootSmoke() {
+  let env;
+  try {
+    env = loadSpawnEnvironment(false);
+  } catch (error) {
+    return null;
+  }
+  // FIX10 US-003 choke-point: every spawn site must pass through
+  // assertContainedSpawnEnv (pinned by the containment lint).
+  assertContainedSpawnEnv(env);
+  const result = spawnSync('bash', [PREFLIGHT_AUTH_PATH, '--dsh-smoke', 'dsh'], {
+    cwd: TT_ROOT,
+    env,
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 60_000,
+    shell: false,
+  });
+  if (result.error !== undefined) return null;
+  const stdout = result.stdout ?? '';
+  const statusLine = /(?:^|\n)DSH_SMOKE:\s*(ok|fail)(?:\n|$)/.exec(stdout);
+  if (statusLine === null) return null;
+  const exitMatch = /(?:^|\n)DSH_SMOKE_EXIT:\s*(\d+)(?:\n|$)/.exec(stdout);
+  const commandMatch = /(?:^|\n)DSH_SMOKE_COMMAND:\s*(.*?)(?:\n|$)/.exec(stdout);
+  const begin = stdout.indexOf('DSH_SMOKE_STDERR_BEGIN');
+  const end = stdout.indexOf('DSH_SMOKE_STDERR_END');
+  const stderrBlock = begin !== -1 && end !== -1 && end > begin
+    ? stdout.slice(begin + 'DSH_SMOKE_STDERR_BEGIN'.length, end)
+    : '';
+  return {
+    ok: statusLine[1] === 'ok',
+    exit_code: exitMatch === null ? (result.status ?? null) : Number(exitMatch[1]),
+    smoke_command: commandMatch === null ? null : commandMatch[1].trim(),
+    stderr: stderrBlock.replace(/^\r?\n/, '').replace(/\r?\n$/, ''),
+  };
+}
+
+// S51 (R4a US-009): record the campaign's EXPECTED-EXECUTABLE scope — the
+// in-scope cells (post execution-selection AND post host-requirement gating,
+// i.e. phase 'pending') that the controller intends to execute. The verdict
+// fail-closes on this recorded list at report time: GREEN requires executed
+// == expected-executable; a cell recorded here that ends the campaign with
+// zero attempts (an expected-executable cell that was skipped nonetheless —
+// the profile-understates-host drift class behind the mac 2026-09-02 1/35,
+// 4/28, 1/70 'greens') makes the run INCONCLUSIVE by name with
+// executed/expected printed. Cells legitimately excluded up front (pending-
+// real in bare mode, host-requirement predicate skips, host-profile-missing
+// infra) are NOT in the list, so a normal partial host that honestly gates
+// darwin-only/lacking-capability cells keeps executed == expected. Legacy
+// states without the field evaluate exactly as before.
+function recordExpectedExecutable(manifest, state, hostProfile) {
+  const ids = [];
+  for (let index = 0; index < manifest.cases.length; index += 1) {
+    if (state.cases[index].phase === 'pending') ids.push(manifest.cases[index].id);
+  }
+  state.expected_executable = {
+    count: ids.length,
+    ids,
+    basis: 'in-scope host-requirement-satisfiable',
+    profile: isHostProfileFailure(hostProfile)
+      ? { state: 'host-profile-missing' }
+      : hostProfile === null
+        ? { state: 'not-required' }
+        : {
+            state: 'loaded',
+            result: isObject(hostProfile.profile_result)
+              ? hostProfile.profile_result.result ?? null
+              : null,
+          },
+  };
 }
 
 function applyExecutionSelection(manifest, state) {
@@ -1725,40 +1954,22 @@ function processMatchesIdentity(pid, identity) {
   return typeof identity === 'string' && processIsAlive(pid) && processIdentity(pid) === identity;
 }
 
-// E3.C.1 US-003: procfs process-group + start-identity readers used for the
-// launch/harness target records. Mirrors bin/tt-process-identity.mjs
-// semantics: starttime = /proc/<pid>/stat field 22 as 'proc:<n>', pgrp =
-// field 5 (sliced at the LAST ')' because comm may contain spaces/parens).
+// E3.C.1 US-003 + MCHA (US-014): process-group + start-identity readers used
+// for the launch/harness target records. They DELEGATE to the portable
+// tt-process-identity arms (the single canonical implementation — see the
+// import above): starttime = /proc/<pid>/stat field 22 as 'proc:<n>' on
+// linux, 'darwin:<lstart>' via ps on /proc-less hosts; pgrp = /proc field 5
+// on linux, `ps -o pgid=` on /proc-less hosts (sliced at the LAST ')' because
+// comm may contain spaces/parens). A pid whose identity/group is unreadable
+// returns null on every host — callers treat null as "no identity recorded"
+// (fail-closed: the chaos target record then lacks the --target-pgid /
+// --target-start-time args and tt-chaos verifies what it can).
 function processStartTimeOf(pid) {
-  try {
-    // linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by
-    // the catch — on a /proc-less host this returns null (identity
-    // unrecordable), already handled by callers as "no identity recorded".
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const closingParenthesis = stat.lastIndexOf(')');
-    if (closingParenthesis < 0) return null;
-    const fields = stat.slice(closingParenthesis + 2).trim().split(/\s+/);
-    if (fields[19] === undefined || !/^\d+$/.test(fields[19])) return null;
-    return `proc:${fields[19]}`;
-  } catch {
-    return null;
-  }
+  return portableProcessStartTimeOf(pid);
 }
 
 function processGroupOf(pid) {
-  try {
-    // linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by
-    // the catch — on a /proc-less host this returns null (group unknown),
-    // which callers already treat as "no group recorded".
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const closingParenthesis = stat.lastIndexOf(')');
-    if (closingParenthesis < 0) return null;
-    const fields = stat.slice(closingParenthesis + 2).trim().split(/\s+/);
-    const pgid = Number(fields[2]);
-    return Number.isInteger(pgid) && pgid > 0 ? pgid : null;
-  } catch {
-    return null;
-  }
+  return portableProcessGroupOf(pid);
 }
 
 function acquireCampaignLock(campaignDir) {
@@ -3015,6 +3226,18 @@ function outcomeWithOracleEvidence(caseRecord, baseOutcome, baseReason, oracleRe
 }
 
 function persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict) {
+  // S61 (US-018): probe compensation at attempt terminal-record time. The
+  // case terminates for ANY reason (deadline sweep, cap enforcement, infra
+  // abort at probe-failure time, chaos/arming failures, recovery/reconcile,
+  // scheduler catch) through this single funnel — every attempt outcome is
+  // recorded here. If a registered probe op with a compensating counterpart
+  // FIRED (e.g. invalidate_credentials created the contained credential
+  // backup) and the compensation op has not run (restore_credentials never
+  // consumed the backup — W4.47 canceled at its wall cap before restore
+  // fired), the controller executes the compensation now so a later cell
+  // never inherits the invalidated contained home, and records it in probe
+  // evidence as a `compensation` entry with its own exit code.
+  runPendingProbeCompensations(caseState, attempt, state, campaignDir);
   attempt.outcome = verdict.outcome;
   attempt.counts_toward_gate = verdict.outcome === 'PASS' || verdict.outcome === 'PRODUCT_FAIL';
   if (verdict.reason !== undefined) attempt.classification_reason = verdict.reason;
@@ -5896,15 +6119,102 @@ function probeMarkerSatisfied(marker, runId, childEnv) {
   return false;
 }
 
+// S62 (US-019): resolve the CONTAINED daemon's product log file for the
+// awaited {"daemon_log":<needle>,"timeout_s":N} trigger. The product logger
+// (src/lib/logger.ts getLogFile) writes <TAMANDUA_STATE_DIR>/tamandua.log in
+// the daemon's own env, and the daemon and the controller's child spawn env
+// share that state dir, so the trigger reads the SAME file the contained
+// daemon appends. Containment mirrors resolveChildDatabasePath: the state dir
+// must resolve strictly inside TT_ROOT, else null (fail-closed — a daemon-log
+// trigger must never read an operator/foreign log).
+function resolveChildDaemonLogPath(childEnv) {
+  const stateDirectory = childEnv.TAMANDUA_STATE_DIR;
+  if (typeof stateDirectory !== 'string' || !path.isAbsolute(stateDirectory)) return null;
+  const resolvedStateDirectory = path.resolve(stateDirectory);
+  if (!pathIsWithin(fs.realpathSync(TT_ROOT), resolvedStateDirectory)) return null;
+  return path.join(resolvedStateDirectory, 'tamandua.log');
+}
+
+// Per-(log,run,needle) scan-offset cache for the daemon-log trigger. Each
+// awaited trigger scans ONLY the bytes appended since its previous poll (a
+// per-line run-id+needle match is monotonic — the classification line for a
+// run is written once), falling back to a full re-read when the file rotated
+// (size shrank / inode changed). Bounded: entries are evicted (insertion
+// order) when the map exceeds the cap, so a long campaign's short-lived
+// trigger waits cannot grow it without bound.
+const DAEMON_LOG_SCAN_CACHE_MAX = 64;
+const daemonLogScanCache = new Map(); // key -> { ino, size }
+
+function daemonLogScanKey(logPath, runId, needle) {
+  return `${logPath}\u0000${runId}\u0000${needle}`;
+}
+
+// Poll for a DAEMON-LOG line naming this run with the declared needle —
+// the signal that EXISTS under an instant-fail loop (W4.47/S62: the product
+// emits no step.running for rounds that exit before claiming, but the daemon
+// logs every "Worker round classified as instant fail" classification for the
+// run). A line must carry the needle AND the run id (either spelling — raw
+// uuid or run- prefixed) so the trigger is scoped to the run, never another
+// case's classification on the shared contained daemon.
+function probeDaemonLogSatisfied(needle, runId, childEnv) {
+  const logPath = resolveChildDaemonLogPath(childEnv);
+  if (logPath === null) return false;
+  let details;
+  try {
+    details = fs.lstatSync(logPath);
+    if (!details.isFile() || details.isSymbolicLink()) return false;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false; // no log written yet — keep polling
+    return false;
+  }
+  const key = daemonLogScanKey(logPath, runId, needle);
+  const previous = daemonLogScanCache.get(key);
+  if (previous === undefined && daemonLogScanCache.size >= DAEMON_LOG_SCAN_CACHE_MAX) {
+    const oldestKey = daemonLogScanCache.keys().next().value;
+    if (oldestKey !== undefined) daemonLogScanCache.delete(oldestKey);
+  }
+  const startOffset = previous !== undefined && previous.ino === details.ino && previous.size <= details.size
+    ? previous.size
+    : 0; // first scan or rotation — re-read from the top
+  let content = '';
+  try {
+    if (startOffset === 0) {
+      content = fs.readFileSync(logPath, 'utf8');
+    } else if (details.size > startOffset) {
+      const handle = fs.openSync(logPath, 'r');
+      try {
+        const buffer = Buffer.alloc(details.size - startOffset);
+        const bytesRead = fs.readSync(handle, buffer, 0, buffer.length, startOffset);
+        content = buffer.subarray(0, bytesRead).toString('utf8');
+      } finally {
+        fs.closeSync(handle);
+      }
+    }
+  } catch {
+    return false; // transient read failure — keep polling
+  }
+  daemonLogScanCache.set(key, { ino: details.ino, size: details.size });
+  if (content === '') return false;
+  const spellings = [runId, normalizedMarkerRunId(runId)];
+  for (const line of content.split(/\r?\n/)) {
+    if (line === '') continue;
+    if (!line.includes(needle)) continue;
+    if (spellings.some((spelling) => spelling.length > 0 && line.includes(spelling))) return true;
+  }
+  return false;
+}
+
 // S18b (US-003): object-form awaited triggers — {"status":S,"timeout_s":T}
 // polls the contained run status until it equals S (defensive null on a
 // degraded status query keeps polling); {"event":E,"timeout_s":T} polls the
 // contained event stream until an event whose name INCLUDES E appears
-// (substring match, mirroring probeEventMarkerSatisfied). Bounded by the
-// trigger's OWN timeout_s (the case deadline stays the outer ceiling) and
-// deliberately NOT exited early on a terminal run status — the awaited
-// event/status can legitimately occur after terminal (run.process_cleanup
-// fires after a failed run).
+// (substring match, mirroring probeEventMarkerSatisfied). S62 (US-019):
+// {"daemon_log":N,"timeout_s":T} polls the contained daemon's product log
+// for a line naming the run with the needle (probeDaemonLogSatisfied).
+// Bounded by the trigger's OWN timeout_s (the case deadline stays the outer
+// ceiling) and deliberately NOT exited early on a terminal run status — the
+// awaited event/status can legitimately occur after terminal
+// (run.process_cleanup fires after a failed run).
 function probeObjectTriggerSatisfied(trigger, runId, childEnv) {
   if (typeof trigger.status === 'string' && trigger.status.length > 0) {
     const status = probeRunStatusOrNull(runId, childEnv);
@@ -5914,6 +6224,9 @@ function probeObjectTriggerSatisfied(trigger, runId, childEnv) {
     const stream = readRunEventStream(childEnv, runId);
     if (stream === null || stream.unavailable) return false;
     return stream.events.some((event) => event.event.includes(trigger.event));
+  }
+  if (typeof trigger.daemon_log === 'string' && trigger.daemon_log.length > 0) {
+    return probeDaemonLogSatisfied(trigger.daemon_log, runId, childEnv);
   }
   return false;
 }
@@ -5933,6 +6246,77 @@ function probeRunStatusOrNull(runId, childEnv) {
   } catch {
     return null;
   }
+}
+
+// S45 (W4.29/W4.33a): after a probe `resume` whose CLI transport exited
+// non-zero, ask the CONTAINED daemon whether the resume actually landed. The
+// CLI's control-plane request can time out / be lost AFTER the daemon already
+// applied the resume (harness re-validation, orphan recovery and
+// re-registration run after the daemon flips the run back to running), so the
+// transport exit alone is NOT the verdict — the daemon-reported status is.
+// Confirmation is evidence-based, bounded by PROBE_RESUME_CONFIRM_WINDOW_MS:
+//   * the contained event stream carries a `run.resumed` event newer than the
+//     action started (primary — the product emits it only after applying the
+//     resume), or
+//   * the run's status left the paused/draining family for 'running'
+//     (fallback when the event stream is unavailable).
+// A genuinely refused resume (the daemon never resumes the run — e.g. the run
+// went terminal mid-hold) returns not-confirmed and the caller classifies the
+// action probe-action-failed exactly as before (no weakening).
+async function probeResumeDaemonOutcome(runId, childEnv, sinceIso) {
+  const sinceMs = new Date(sinceIso).valueOf();
+  const startedAt = Date.now();
+  let lastStatus = null;
+  while (Date.now() - startedAt < PROBE_RESUME_CONFIRM_WINDOW_MS) {
+    // Primary: a run.resumed event in the contained stream after the action
+    // started (a small skew tolerance absorbs clock jitter between the
+    // action_started_at stamp and the stub/daemon writing the event).
+    const stream = readRunEventStream(childEnv, runId);
+    if (stream !== null) {
+      const resumed = stream.events.find((event) => event.event === 'run.resumed'
+        && typeof event.ts === 'string'
+        && (!Number.isFinite(sinceMs) || new Date(event.ts).valueOf() >= sinceMs - 2000));
+      if (resumed !== undefined) {
+        return {
+          confirmed: true,
+          via: 'event:run.resumed',
+          event: 'run.resumed',
+          status: null,
+          scheduling_status: null,
+          observed_at: utcTimestamp(),
+        };
+      }
+    }
+    // Fallback: the run is back in the schedulable running family (the resume
+    // handler flips status to 'running' with scheduling_status
+    // pending_register/active). A still-paused/draining or terminal run is NOT
+    // a confirmation.
+    const status = probeRunStatusOrNull(runId, childEnv);
+    if (status !== null) {
+      lastStatus = status;
+      const scheduling = status.schedulingStatus ?? null;
+      if (status.status === 'running'
+          && scheduling !== 'paused' && scheduling !== 'draining' && scheduling !== 'draining_pause') {
+        return {
+          confirmed: true,
+          via: 'status:running',
+          event: null,
+          status: status.status,
+          scheduling_status: scheduling,
+          observed_at: utcTimestamp(),
+        };
+      }
+    }
+    await delay(PROBE_RESUME_CONFIRM_POLL_MS);
+  }
+  return {
+    confirmed: false,
+    via: null,
+    event: null,
+    status: lastStatus?.status ?? null,
+    scheduling_status: lastStatus?.schedulingStatus ?? null,
+    observed_at: utcTimestamp(),
+  };
 }
 
 // Arm on the action's `when` phase marker. Polls the contained DB/event
@@ -6023,6 +6407,10 @@ function boundedOutputTail(rawOutput, maxBytes) {
 // FAILS CLOSED with a distinct category naming the action when it cannot be
 // performed; a containment-escape attempt is refused with the distinct
 // category 'operator-action-escape-refused' before anything is executed.
+// S45 (W4.33b) calibration: update_contained_install's escape refusal is the
+// cell's EXPECTED PASS-level outcome (recorded as the action's `refusal`, the
+// sequence continues) — the credential ops' escape refusals stay genuine
+// failures (their corridor cannot run on an escaping home/target).
 
 // Resolve an executable by NAME against a PATH string (the first executable
 // regular file wins — mirrors `command -v`). Returns the candidate path (not
@@ -6174,6 +6562,16 @@ async function executeProbeAction(action, runId, attempt, childEnv, holdAsPendin
     backup_path: null,
     target_sha256_before: null,
     target_sha256_after: null,
+    // S45 (W4.33b): a CONTAINMENT REFUSAL the seam is EXPECTED to produce
+    // (update_contained_install refusing an uncontained install target) is a
+    // PASS-level outcome — recorded here (category + reason + detail), never
+    // a 'failure'. Set only on the expected-escape refusal arm.
+    refusal: null,
+    // S45 (W4.29/W4.33a): when a probe CLI action's TRANSPORT exit is
+    // superseded by the daemon-reported status (the resume CLI exited
+    // non-zero after the contained daemon already applied the resume), this
+    // block records what the daemon reported. Null unless superseded.
+    daemon_reported: null,
   };
   const argv = probeActionArgv(op, runId);
   if (argv === null && !OPERATOR_SEAM_OPS.has(op)) {
@@ -6410,8 +6808,14 @@ async function executeProbeAction(action, runId, attempt, childEnv, holdAsPendin
   // var (a stub/contained install). A binary resolving outside var (the
   // operator's live checkout) is REFUSED with the distinct
   // 'operator-action-escape-refused' category BEFORE any spawn — the
-  // operator's live checkout is never updated. The observed effect records
-  // the contained catalog stamp before/after the update.
+  // operator's live checkout is never updated. S45 (W4.33b) calibration: that
+  // escape refusal is the EXPECTED PASS-level outcome for the cell (a real
+  // campaign's contained env resolves only the operator's live checkout, so
+  // the refusal IS the seam's containment guarantee) — the action records the
+  // `refusal` and the sequence continues; a genuine failure (the update RAN
+  // and exited non-zero / the state dir is unresolvable) keeps the distinct
+  // 'update-contained-install-failed' category. The observed effect records
+  // the contained catalog stamp before/after on the executed arm.
   if (op === 'update_contained_install') {
     const stateDir = typeof childEnv.TAMANDUA_STATE_DIR === 'string' && childEnv.TAMANDUA_STATE_DIR !== ''
       ? childEnv.TAMANDUA_STATE_DIR
@@ -6436,18 +6840,37 @@ async function executeProbeAction(action, runId, attempt, childEnv, holdAsPendin
       };
     }
     if (binaryReal === null || !pathIsWithin(fs.realpathSync(TT_ROOT), binaryReal)) {
-      return {
-        ...record,
-        ok: false,
-        failure: {
-          category: 'operator-action-escape-refused',
-          message: `probe action 'update_contained_install' resolves tamandua to ${resolvedBinary ?? '(not found on the contained PATH)'} (realpath ${binaryReal ?? '(unresolvable)'}), which is NOT inside torture-test/var — refusing to update an uncontained install (the operator's live checkout is never touched)`,
-          op,
-          binary_path: resolvedBinary,
-          state_dir: record.state_dir,
-          reason: 'uncontained-install-target',
-        },
+      // S45 (W4.33b): an ESCAPE REFUSAL for update_contained_install is the
+      // EXPECTED seam outcome, calibrated PASS — NOT a failure. The seam must
+      // refuse before any spawn when the `tamandua` the operator command would
+      // execute is not a CONTAINED install (a real campaign's contained env
+      // resolves only the operator's live checkout, so refusing it is the
+      // correct containment behavior — the operator's live checkout is never
+      // updated). The refusal is recorded on the action (category + reason +
+      // detail; argv stays null — nothing was spawned, the contained catalog
+      // stamp is untouched) and the probe sequence CONTINUES (the W4.33b
+      // resume still fires). A genuine action failure (the update RAN and
+      // exited non-zero, or the contained state dir is unresolvable) keeps the
+      // distinct 'update-contained-install-failed' failure — this branch is
+      // ONLY the never-spawned escape refusal.
+      const refusal = {
+        category: 'operator-action-escape-refused',
+        reason: 'uncontained-install-target',
+        message: `probe action 'update_contained_install' resolves tamandua to ${resolvedBinary ?? '(not found on the contained PATH)'} (realpath ${binaryReal ?? '(unresolvable)'}), which is NOT inside torture-test/var — refusing to update an uncontained install (the operator's live checkout is never touched)`,
+        op,
+        binary_path: resolvedBinary,
+        state_dir: record.state_dir,
       };
+      record.refusal = refusal;
+      record.effect = {
+        refused: true,
+        category: refusal.category,
+        reason: refusal.reason,
+        state_dir: record.state_dir,
+        binary_path: resolvedBinary,
+        note: 'no update was performed — the resolved tamandua escapes containment (expected escape-refusal, PASS)',
+      };
+      return { ...record, ok: true, refusal, pending_hold: null };
     }
     record.catalog_version_before = readCatalogStamp(record.state_dir);
     record.action_started_at = utcTimestamp();
@@ -6510,18 +6933,58 @@ async function executeProbeAction(action, runId, attempt, childEnv, holdAsPendin
   record.stderr_tail = boundedOutputTail(result.stderr, PROBE_OUTPUT_TAIL_MAX_BYTES);
 
   if (result.error !== undefined || result.status !== 0) {
-    const failure = {
-      category: 'probe-action-failed',
-      message: `probe action '${op}' exited ${result.status}${record.error !== null ? `: ${record.error}` : ''}`,
-      op,
-      exit_code: result.status,
-      signal: result.signal ?? null,
-      error: record.error ?? null,
-      argv: record.argv,
-      stdout_tail: record.stdout_tail,
-      stderr_tail: record.stderr_tail,
-    };
-    return { ...record, ok: false, failure };
+    // S45 (W4.29/W4.33a): a probe `resume` whose CLI TRANSPORT exited
+    // non-zero is not scored off the transport exit when the daemon reports
+    // the run resumed. The CLI's control-plane request can time out after the
+    // daemon already applied the resume (harness re-validation, orphan
+    // recovery, re-registration run after the daemon flips the run to
+    // running), so probeResumeDaemonOutcome re-queries the CONTAINED daemon
+    // (event stream + status, bounded) and the daemon-reported status
+    // supersedes the transport exit — the resume record keeps the CLI exit as
+    // evidence (exit_code / stderr tail) and adds the daemon_reported block.
+    // A resume the daemon did NOT apply (still paused/draining/terminal after
+    // the bounded window) stays a genuine probe-action-failed.
+    if (op === 'resume') {
+      const daemonOutcome = await probeResumeDaemonOutcome(runId, childEnv, record.action_started_at);
+      if (daemonOutcome.confirmed) {
+        record.daemon_reported = {
+          superseded_transport_exit: true,
+          cli_transport_exit: result.status,
+          confirmed_by: daemonOutcome.via,
+          resumed_event_observed: daemonOutcome.event !== null,
+          run_status: daemonOutcome.status,
+          run_scheduling_status: daemonOutcome.scheduling_status,
+          observed_at: daemonOutcome.observed_at,
+        };
+      } else {
+        const failure = {
+          category: 'probe-action-failed',
+          message: `probe action 'resume' exited ${result.status} and the contained daemon did NOT report the run resumed within ${PROBE_RESUME_CONFIRM_WINDOW_MS}ms${record.error !== null ? `: ${record.error}` : ''}`,
+          op,
+          exit_code: result.status,
+          signal: result.signal ?? null,
+          error: record.error ?? null,
+          argv: record.argv,
+          stdout_tail: record.stdout_tail,
+          stderr_tail: record.stderr_tail,
+          daemon_status_after: daemonOutcome.status,
+        };
+        return { ...record, ok: false, failure };
+      }
+    } else {
+      const failure = {
+        category: 'probe-action-failed',
+        message: `probe action '${op}' exited ${result.status}${record.error !== null ? `: ${record.error}` : ''}`,
+        op,
+        exit_code: result.status,
+        signal: result.signal ?? null,
+        error: record.error ?? null,
+        argv: record.argv,
+        stdout_tail: record.stdout_tail,
+        stderr_tail: record.stderr_tail,
+      };
+      return { ...record, ok: false, failure };
+    }
   }
 
   if (record.hold_seconds !== null && record.hold_seconds > 0) {
@@ -6557,6 +7020,174 @@ function writeProbeEvidenceArtifact(campaignDir, attempt, evidence) {
   const artifactPath = path.join(evidenceDir, 'probe-evidence.json');
   fs.writeFileSync(artifactPath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
 }
+
+// ── S61 (US-018): probe compensation at case termination ──────────────
+// When a case terminates for ANY reason (deadline, cap, infra abort,
+// controller shutdown), a probe op with a compensating counterpart that FIRED
+// (e.g. invalidate_credentials executed and created the contained credential
+// backup) must have its compensation executed by the controller if the
+// compensation op has not run — W4.47 was canceled at its wall cap before its
+// restore_credentials action fired, leaving the contained $TT_HOME/.pi copy
+// invalidated for every later pi cell in the campaign. The compensation is
+// executed at the attempt terminal-record funnel (persistClassifiedAttempt —
+// every attempt outcome passes through it) and recorded in probe evidence as
+// a `compensation` entry with its own exit code.
+//
+// The registry PROBE_COMPENSATION_PAIRS is generic: { op, compensation } for
+// any future pair; the executor below dispatches by the op that FIRED.
+
+// The actions of a probe-evidence object in execution order. Single-run shape
+// holds evidence.actions; the multi-run shape nests actions per run.
+function probeEvidenceActionRecords(evidence) {
+  if (!isObject(evidence)) return [];
+  if (Array.isArray(evidence.actions)) return evidence.actions;
+  const actions = [];
+  if (Array.isArray(evidence.runs)) {
+    for (const run of evidence.runs) {
+      if (!isObject(run) || !Array.isArray(run.actions)) continue;
+      for (const action of run.actions) actions.push(action);
+    }
+  }
+  return actions;
+}
+
+// Whether a compensation entry has already been recorded on the evidence for a
+// pair (idempotence: persistClassifiedAttempt runs once per attempt, but a
+// retry/recovery record must never double-compensate).
+function probeCompensationAlreadyRecorded(evidence, pair) {
+  return Array.isArray(evidence.compensation)
+    && evidence.compensation.some((entry) => isObject(entry)
+      && entry.op === pair.compensation && entry.compensates === pair.op);
+}
+
+// Execute the compensation for ONE fired initiator op (the credential restore
+// for invalidate_credentials) against the paths recorded on the fired action.
+// Mirrors the seam restore_credentials file op (copy backup over target,
+// remove the backup) with the same containment discipline. Returns the
+// compensation evidence record (with its own exit code) or null when there is
+// nothing to compensate (no backup remains — the compensation already ran or
+// the invalidate left no obligation).
+function executeProbeCompensationForPair(pair, firedAction) {
+  if (pair.compensation === 'restore_credentials') {
+    // The invalidate action record carries the contained target + backup
+    // paths it created. The backup file is the ground truth: it exists only
+    // while the invalidate has not been restored.
+    const backupPath = isObject(firedAction) ? firedAction.backup_path : null;
+    const targetPath = isObject(firedAction) ? firedAction.target_path : null;
+    if (typeof backupPath !== 'string' || backupPath === ''
+        || typeof targetPath !== 'string' || targetPath === ''
+        || !fs.existsSync(backupPath)) {
+      return null;
+    }
+    const startedAt = utcTimestamp();
+    const error = [];
+    try {
+      const varReal = fs.realpathSync(VAR_ROOT);
+      const backupReal = realpathOrNull(backupPath);
+      if (backupReal === null || !pathIsWithin(varReal, backupReal)) {
+        error.push(`credential backup ${backupPath} is not contained in torture-test/var`);
+      } else {
+        const details = fs.lstatSync(backupPath);
+        if (!details.isFile() || details.isSymbolicLink()) {
+          error.push(`credential backup ${backupPath} is not a contained regular file`);
+        } else {
+          const targetReal = realpathOrNull(targetPath);
+          if (targetReal === null || !pathIsWithin(varReal, targetReal)) {
+            error.push(`credential target ${targetPath} is not contained in torture-test/var`);
+          } else {
+            // Restore the original credential file byte-identical and consume
+            // the backup — exactly what the seam restore_credentials action
+            // does, executed by the controller at case termination.
+            const backupBytes = fs.readFileSync(backupPath);
+            fs.copyFileSync(backupPath, targetPath);
+            fs.rmSync(backupPath, { force: true });
+            const endedAt = utcTimestamp();
+            return {
+              op: pair.compensation,
+              compensates: pair.op,
+              exit_code: 0,
+              reason: 'case-terminated',
+              started_at: startedAt,
+              ended_at: endedAt,
+              target_path: targetPath,
+              backup_path: backupPath,
+              effect: {
+                restored: true,
+                backup_removed: true,
+                bytes_restored: backupBytes.length,
+                restored_at: endedAt,
+              },
+            };
+          }
+        }
+      }
+    } catch (cause) {
+      error.push(cause.message);
+    }
+    const endedAt = utcTimestamp();
+    return {
+      op: pair.compensation,
+      compensates: pair.op,
+      exit_code: 1,
+      reason: 'case-terminated',
+      started_at: startedAt,
+      ended_at: endedAt,
+      target_path: targetPath,
+      backup_path: backupPath,
+      error: error.join('; '),
+      effect: { restored: false, backup_removed: false, restored_at: null },
+    };
+  }
+  // A future registered pair needs its own executor arm here.
+  return null;
+}
+
+// Scan an attempt's probe evidence at terminal-record time and run every
+// pending compensation: a registered initiator op that fired (action executed
+// ok) with NO later successful compensation action and no already-recorded
+// compensation entry. Appends `compensation` entries to the evidence object
+// and refreshes the probe-evidence artifact. Never throws — a compensation
+// that cannot execute is recorded with its own non-zero exit code and the
+// terminal record proceeds.
+function runPendingProbeCompensations(caseState, attempt, state, campaignDir) {
+  if (!isObject(attempt) || !isObject(attempt.probe_evidence)) return;
+  const evidence = attempt.probe_evidence;
+  const actions = probeEvidenceActionRecords(evidence);
+  if (actions.length === 0) return;
+  const fired = new Map(); // op -> the fired initiator action record
+  for (const pair of PROBE_COMPENSATION_PAIRS) {
+    // Find the LAST successful initiator action (a failed invalidate creates
+    // no backup/obligation). A successful compensation op action AFTER it
+    // clears the obligation.
+    let pendingInit = null;
+    for (const action of actions) {
+      if (!isObject(action)) continue;
+      if (action.op === pair.op) {
+        if (action.ok === true) pendingInit = action;
+      } else if (action.op === pair.compensation && action.ok === true) {
+        pendingInit = null;
+      }
+    }
+    if (pendingInit !== null && !probeCompensationAlreadyRecorded(evidence, pair)) {
+      fired.set(pair.op, pendingInit);
+    }
+  }
+  if (fired.size === 0) return;
+  const recorded = [];
+  for (const pair of PROBE_COMPENSATION_PAIRS) {
+    if (!fired.has(pair.op)) continue;
+    const entry = executeProbeCompensationForPair(pair, fired.get(pair.op));
+    if (entry !== null) recorded.push(entry);
+  }
+  if (recorded.length === 0) return;
+  evidence.compensation = [...(Array.isArray(evidence.compensation) ? evidence.compensation : []), ...recorded];
+  // The caller (persistClassifiedAttempt) persists the state after this hook
+  // returns (retry-schedule branch or markTerminal both atomicWriteState); the
+  // probe-evidence.json artifact is refreshed here so the oracle snapshot's
+  // probe_evidence copy carries the compensation entries.
+  writeProbeEvidenceArtifact(campaignDir, attempt, evidence);
+}
+
 
 // S18c (US-005): stop the underlying run at probe-action-failed time. The
 // stop is a bounded best-effort (a short retry budget, ~1s max) under the
@@ -10488,11 +11119,22 @@ function persistPreflightState(campaignDir, state, preflight) {
 // preflight probes dsh presence via tt-harness-auth-probe). The controller
 // resolves this from the filtered manifest (not the probe's own full-tier
 // enumeration) so a --case focused pi-only selection probes pi and never
-// hermes/dsh.
-function requiredHarnessesFor(manifest) {
+// hermes/dsh. MDSH (R4a US-016): a harness is counted only while it still has
+// an ELIGIBLE (pending) cell — a harness whose every real cell was already
+// gated at roster time (e.g. dsh cells marked NOT_RUN by the failed dsh boot
+// smoke) must NOT be probed during preflight (probing it would abort the
+// campaign on the very boot failure the roster already recorded as a NOT_RUN
+// reason). `state` is the in-memory campaign state (cells in phase order);
+// when null (legacy callers) every manifest harness is counted as before.
+function requiredHarnessesFor(manifest, state) {
   const harnesses = new Set();
-  for (const caseRecord of manifest.cases) {
+  for (let index = 0; index < manifest.cases.length; index += 1) {
+    const caseRecord = manifest.cases[index];
     if (caseUsesScriptedEnvironment(caseRecord)) continue;
+    if (state !== null && state !== undefined) {
+      const caseState = state.cases[index];
+      if (caseState !== undefined && caseState.phase === 'terminal') continue;
+    }
     if (caseRecord.harness === 'pi' || caseRecord.harness === 'hermes' || caseRecord.harness === 'dsh') {
       harnesses.add(caseRecord.harness);
     }
@@ -10556,7 +11198,7 @@ function runRealPreflight(campaignDir, state, manifest, fresh) {
   const legs = [
     { label: 'home-provision', script: PREFLIGHT_PROVISION_PATH, args: ['--fail-closed'], reason: 'tt-home-unprovisioned' },
   ];
-  const requiredHarnesses = requiredHarnessesFor(manifest);
+  const requiredHarnesses = requiredHarnessesFor(manifest, state);
   if (requiredHarnesses.length > 0) {
     // US-005: the harness-auth leg invokes the probe with --spend so the dsh
     // lane's REAL answer leg runs during preflight — a dead dsh lane
@@ -10587,8 +11229,10 @@ function runRealPreflight(campaignDir, state, manifest, fresh) {
   }
   legs.push({ label: 'daemon-up', script: PREFLIGHT_DAEMON_PATH, args: daemonUpArgs, reason: 'tt-daemon-down' });
   const outcomes = [];
+  let daemonUpStdout = '';
   for (const leg of legs) {
     const result = spawnPreflightLeg(leg.script, leg.args, env);
+    if (leg.label === 'daemon-up') daemonUpStdout = result.stdout ?? '';
     outcomes.push({
       leg: leg.label,
       ok: result.ok,
@@ -10609,8 +11253,49 @@ function runRealPreflight(campaignDir, state, manifest, fresh) {
       throw new Error(`real-case preflight FAILED at ${leg.label}: ${detected}`);
     }
   }
-  persistPreflightState(campaignDir, state, { engaged: true, ok: true, legs: outcomes, started_at: utcTimestamp(), stopped_at: null });
+  // S55: the daemon-up leg (tt-daemon-up ensure-up) prints which dist the
+  // contained daemon runs (TT_DAEMON_DIST_VERSION / TT_DAEMON_CLI /
+  // TT_DAEMON_CALLER_ARGV — the lifecycle daemon.start callerArgv naming the
+  // exact dist that ran). Surface it in the persisted preflight state so the
+  // campaign evidence (state.json/report) records the running dist.
+  const daemonEvidence = parseDaemonUpEvidence(daemonUpStdout);
+  persistPreflightState(campaignDir, state, {
+    engaged: true,
+    ok: true,
+    legs: outcomes,
+    ...(daemonEvidence !== null ? { daemon: daemonEvidence } : {}),
+    started_at: utcTimestamp(),
+    stopped_at: null,
+  });
   for (const o of outcomes) console.log(`Real-case preflight ${o.leg}: ${o.ok ? 'OK' : 'FAILED'}`);
+}
+
+// parseDaemonUpEvidence: extract the S55 which-dist-ran evidence from a
+// successful tt-daemon-up ensure-up stdout (the TT_DAEMON_* machine lines).
+// Returns null when the stdout carries no TT_DAEMON_DIST_VERSION line (an
+// older tt-daemon-up / pre-S55 launch) — the campaign state then records no
+// daemon evidence and the report renders exactly as before.
+function parseDaemonUpEvidence(stdout) {
+  const text = typeof stdout === 'string' ? stdout : '';
+  const grab = (prefix) => {
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith(prefix)) return trimmed.slice(prefix.length).trim();
+    }
+    return null;
+  };
+  const version = grab('TT_DAEMON_DIST_VERSION:');
+  if (version === null) return null;
+  const evidence = {
+    version,
+    cli: grab('TT_DAEMON_CLI:') ?? null,
+    launch_cli: grab('TT_DAEMON_LAUNCH_CLI:') ?? null,
+  };
+  const callerArgv = grab('TT_DAEMON_CALLER_ARGV:');
+  if (callerArgv !== null && callerArgv.length > 0) {
+    evidence.caller_argv = callerArgv.split(/\s+/);
+  }
+  return evidence;
 }
 
 // Campaign-end (and resume) hygiene: stop the contained real daemon so ports
@@ -10714,7 +11399,22 @@ async function startCampaign(options, schema) {
       const state = createInitialState(campaignId, manifestPath, manifest, options);
       campaignState = state;
       applyExecutionSelection(manifest, state);
-      applyHostRequirements(manifest, state, hostProfile);
+      // MDSH (R4a US-016): run the dsh boot smoke (under the contained daemon
+      // env) at ROSTER time when a real dsh launch is in scope, and feed the
+      // evidence into applyHostRequirements so dsh cells are gated NOT_RUN
+      // (reason recorded — full harness stderr in the evidence) when dsh
+      // cannot boot where the daemon would run it. Runs BEFORE
+      // recordExpectedExecutable so a gated cell is never counted expected.
+      // When no real dsh cell is pending (or no profile presence), the smoke
+      // is skipped and the presence-only semantics are preserved exactly.
+      const dshFunctional = dshFunctionalSmokeRequired(manifest, state, hostProfile)
+        ? runDshBootSmoke()
+        : null;
+      applyHostRequirements(manifest, state, hostProfile, dshFunctional);
+      // S51 (R4a US-009): record the expected-executable scope (in-scope
+      // cells that will actually execute) so the report verdict can fail
+      // closed: GREEN requires executed == expected-executable.
+      recordExpectedExecutable(manifest, state, hostProfile);
       atomicWriteState(campaignDir, state);
     } catch (error) {
       try {

@@ -142,7 +142,7 @@ usage() {
   cat <<EOF
 run-torture-test — tamandua torture-test suite (spec: torture-test/tamandua-torture-test-spec/)
 
-Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 [--include-real] | --tier2 [--include-real] | --provision [tier1|tier2] [--rebuild-invalid] | --report | --help]
+Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 [--include-real] | --tier2 [--include-real] | --provision [tier1|tier2] [--rebuild-invalid] | --report | --help] [--allow-partial]
 
 Tiers (explicit flag = run immediately, no countdown):
 EOF
@@ -166,6 +166,18 @@ EOF
 
   --report   Print the most recent results summary and exit.
   --help     This help.
+
+  --allow-partial  Override the S51 host-capability gate: run an explicit
+             tier even when the recorded host capability profile
+             (var/w0/host-profile.json) has profile_result RESULT=FAIL (the
+             environment gate found a REQUIRED check failure). Without this
+             flag run-torture-test refuses (exit 2) on a FAIL profile so a
+             host whose required environment gate is red can never report a
+             GREEN campaign from the cells that happened to run. The verdict
+             still fail-closes: GREEN requires executed == expected-executable
+             (the in-scope cells the host profile can run); otherwise the
+             run is INCONCLUSIVE and names the shortfall cells. The verdict
+             line prints executed/expected on every campaign.
 
   --provision [tier1|tier2]  Single provision entry point (US-009): run the
              environment gate for the tier, then golden-bootstrap every
@@ -283,10 +295,56 @@ run_provision() {
   exit 0
 }
 
+# host_profile_gate <tier> <allow_partial> — S51 (R4a US-009) fail-closed
+# launch gate. An explicit/auto tier run REFUSES (exit 2) when the recorded
+# host capability profile (var/w0/host-profile.json) carries
+# profile_result.result == "FAIL" — the environment gate found a REQUIRED
+# check failure (e.g. a contained port held by a non-TT process, a missing
+# toolchain). Such a host must never report a GREEN campaign from whatever
+# fraction of cells happened to run (the mac 2026-09-02 1/35, 4/28, 1/70
+# 'greens'). --allow-partial=true overrides the refusal (the operator accepts
+# partial coverage; the verdict still fail-closes via executed/expected).
+# A missing profile or a profile without the S51 profile_result record is a
+# legacy/unknown state and proceeds — the controller still fail-closes
+# requires-bound cells (host-profile-missing TEST_INFRA_FAIL) when the file
+# is absent, and tt-verify-environment --provision remains the fix-it path.
+host_profile_gate() {
+  local tier="$1"
+  local allow_partial="${2:-false}"
+  [ "$allow_partial" = "true" ] && return 0
+  local hp="$TT_VAR/w0/host-profile.json"
+  [ -f "$hp" ] || return 0
+  local failed verdict
+  verdict="$(node -e '
+const fs = require("fs");
+try {
+  const p = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const r = p && p.profile_result && p.profile_result.result;
+  process.stdout.write(r === "FAIL" ? "FAIL" : "");
+} catch (e) { /* unreadable profile -> legacy/unknown, proceed */ }
+' "$hp" 2>/dev/null || true)"
+  if [ "$verdict" != "FAIL" ]; then
+    return 0
+  fi
+  failed="$(node -e '
+const fs = require("fs");
+try {
+  const p = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const ids = (p && p.profile_result && Array.isArray(p.profile_result.failed_required_checks))
+    ? p.profile_result.failed_required_checks
+    : [];
+  process.stdout.write(ids.join(", "));
+} catch (e) { /* ignore */ }
+' "$hp" 2>/dev/null || true)"
+  echo "Tier '$tier' refuses to launch (exit 2): the recorded host capability profile ($hp) has profile_result.result=FAIL — the environment gate found REQUIRED check failure(s): ${failed:-unknown}. Fix the environment and re-run tt-verify-environment, or pass --allow-partial to run anyway (the verdict then fail-closes: GREEN only when executed == expected-executable)." >&2
+  exit 2
+}
+
 run_tier() {
   local tier="$1"
   local include_real="${2:-false}"
   local case_id="${3:-}"
+  local allow_partial="${4:-false}"
   # S58 US-007: distinguish 'assets ABSENT (not implemented)' from 'assets
   # present but INVALID (gate RED)'. Absent keeps the historic exit 3; invalid
   # exits 1 and surfaces the validator's captured named reason — never a
@@ -302,6 +360,9 @@ run_tier() {
     printf '%s\n' "$TIER_VALIDATOR_OUTPUT" | sed 's/^/    /' >&2
     exit 1
   fi
+  # S51 (R4a US-009): refuse on a FAILing recorded host capability profile
+  # (exit 2) unless --allow-partial — see host_profile_gate.
+  host_profile_gate "$tier" "$allow_partial"
   local manifest="$TT_DIR/cases/$tier.jsonl"
   if [ "$tier" = "smoke" ]; then
     manifest="$TT_DIR/cases/smoke.jsonl"
@@ -386,6 +447,7 @@ fi
 # half-parse).
 tier=""
 include_real="false"
+allow_partial="false"
 case_id=""
 report_requested="false"
 provision_requested="false"
@@ -396,7 +458,7 @@ while [ "$#" -gt 0 ]; do
   # selection flag after it is a usage error, never a silent half-parse.
   if [ "$provision_requested" = "true" ]; then
     case "$1" in
-      --smoke|--tier0|--tier1|--tier2|--include-real|--case|--report)
+      --smoke|--tier0|--tier1|--tier2|--include-real|--allow-partial|--case|--report)
         echo "--provision cannot be combined with tier flags, --include-real, --case, or --report" >&2
         usage >&2
         exit 4
@@ -414,6 +476,11 @@ while [ "$#" -gt 0 ]; do
       ;;
     --include-real)
       include_real="true"
+      ;;
+    --allow-partial)
+      # S51 (R4a US-009): override the host-capability gate (a recorded
+      # profile_result.result=FAIL otherwise refuses the run with exit 2).
+      allow_partial="true"
       ;;
     --case)
       if [ "$#" -lt 2 ]; then
@@ -466,7 +533,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$provision_requested" = "true" ]; then
-  if [ -n "$tier" ] || [ "$include_real" = "true" ] || [ -n "$case_id" ] || [ "$report_requested" = "true" ]; then
+  if [ -n "$tier" ] || [ "$include_real" = "true" ] || [ "$allow_partial" = "true" ] || [ -n "$case_id" ] || [ "$report_requested" = "true" ]; then
     echo "--provision cannot be combined with tier flags, --include-real, --case, or --report" >&2
     usage >&2
     exit 4
@@ -482,8 +549,8 @@ if [ "$provision_rebuild_invalid" = "true" ]; then
 fi
 
 if [ "$report_requested" = "true" ]; then
-  if [ -n "$tier" ] || [ "$include_real" = "true" ] || [ -n "$case_id" ]; then
-    echo "--report cannot be combined with tier flags, --include-real, or --case" >&2
+  if [ -n "$tier" ] || [ "$include_real" = "true" ] || [ "$allow_partial" = "true" ] || [ -n "$case_id" ]; then
+    echo "--report cannot be combined with tier flags, --include-real, --allow-partial, or --case" >&2
     usage >&2
     exit 4
   fi
@@ -492,7 +559,7 @@ if [ "$report_requested" = "true" ]; then
 fi
 
 if [ -z "$tier" ]; then
-  echo "A tier flag (--smoke/--tier0/--tier1/--tier2) is required when --include-real/--case are used" >&2
+  echo "A tier flag (--smoke/--tier0/--tier1/--tier2) is required when --include-real/--allow-partial/--case are used" >&2
   usage >&2
   exit 4
 fi
@@ -504,9 +571,9 @@ if [ "$include_real" = "true" ] && [ "$tier" != "--tier0" ] && [ "$tier" != "--t
 fi
 
 case "$tier" in
-  --smoke)  run_tier smoke "$include_real" "$case_id" ;;
-  --tier0)  run_tier tier0 "$include_real" "$case_id" ;;
-  --tier1)  run_tier tier1 "$include_real" "$case_id" ;;
-  --tier2)  run_tier tier2 "$include_real" "$case_id" ;;
+  --smoke)  run_tier smoke "$include_real" "$case_id" "$allow_partial" ;;
+  --tier0)  run_tier tier0 "$include_real" "$case_id" "$allow_partial" ;;
+  --tier1)  run_tier tier1 "$include_real" "$case_id" "$allow_partial" ;;
+  --tier2)  run_tier tier2 "$include_real" "$case_id" "$allow_partial" ;;
   *)        echo "internal error: unknown tier flag $tier" >&2; exit 4 ;;
 esac

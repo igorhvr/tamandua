@@ -378,12 +378,31 @@ describe("S29 (US-001) — probe-trigger-vocabulary audit vs the campaign event 
   const records = readManifest();
   const { steps: bfmwSteps, agents: bfmwAgents } = bfmwVocabulary();
 
-  it("the five S29 cells exist in cases/tier2.jsonl with non-empty probe sequences", () => {
-    for (const cell of S29_CELLS) {
+  it("the three calibration S29 cells exist in cases/tier2.jsonl with non-empty probe sequences; the two premise-redesign cells are retired by the S49 split", () => {
+    for (const cell of S29_CELLS.filter((c) => c.classification === "calibration")) {
       const record = recordById(records, cell.id);
       assert.equal(record.workflow, "bug-fix-merge-worktree", `${cell.id} must run bug-fix-merge-worktree`);
       assert.ok(Array.isArray(record.probe_sequence) && record.probe_sequence.length > 0,
         `${cell.id} must carry a probe_sequence`);
+    }
+    // S49 (igorhvr triage item 6): the two premise-redesign cells
+    // (W4.33d-reroute-exhaustion-resume, W4.48b-pause-rugpull-window) are
+    // RETIRED from the roster — three real-campaign redesigns could not make
+    // their premises fire because the product absorbs the injected faults.
+    // They are SPLIT into four SCRIPTED cells (absorption-assertion +
+    // directly-constructed-state pairs) that execute in bare --tier2.
+    for (const cell of S29_CELLS.filter((c) => c.classification === "premise-redesign")) {
+      assert.equal(records.some((r) => r.id === cell.id), false,
+        `${cell.id}: the retired real premise-redesign cell must NOT be in the roster (S49 split)`);
+    }
+    for (const splitId of [
+      "W4.33d-reroute-absorption", "W4.33d-resume-force-fail",
+      "W4.48b-park-absorption", "W4.48b-move-during-hold",
+    ]) {
+      const record = recordById(records, splitId);
+      assert.equal(record.context.execution_mode, "scripted",
+        `${splitId}: the S49 split cell must be scripted (bare --tier2)`);
+      assert.equal(record.caps.tokens, 0, `${splitId}: the S49 split cell must be zero-token`);
     }
   });
 

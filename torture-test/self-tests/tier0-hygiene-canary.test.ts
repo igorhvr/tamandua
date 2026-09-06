@@ -368,7 +368,9 @@ describe("FIX10 US-005 operator-identity hygiene canary", () => {
       assert.match(text, /HYGIENE CANARY/);
       assert.match(text, /- gitconfig: UNCHANGED/);
       assert.match(text, /- operator identity files unchanged/);
-      assert.match(text, /VERDICT\nGREEN \(exit 0\)\n$/);
+      // S51 (R4a US-009): every S51-era controller campaign prints its
+      // executed/expected verdict line after the VERDICT line.
+      assert.match(text, /VERDICT\nGREEN \(exit 0\)\nexecuted\/expected: 1\/1\n$/);
     } finally {
       fs.rmSync(focusedManifest, { force: true });
       fs.rmSync(canaryHome, { recursive: true, force: true });
@@ -428,7 +430,9 @@ describe("FIX10 US-005 operator-identity hygiene canary", () => {
       assert.match(text, /HYGIENE CANARY/);
       assert.match(text, /- gitconfig: CHANGED/);
       assert.match(text, /- FINDING HYGIENE_GITCONFIG/);
-      assert.match(text, /VERDICT\nFINDINGS \(exit 1\)\n$/);
+      // S51 (R4a US-009): every S51-era controller campaign prints its
+      // executed/expected verdict line after the VERDICT line.
+      assert.match(text, /VERDICT\nFINDINGS \(exit 1\)\nexecuted\/expected: 1\/1\n$/);
       assert.equal(sha256OfFile(realGitconfig), gitconfigBefore,
         "the real ~/.gitconfig must never be touched by the simulated breach");
     } finally {

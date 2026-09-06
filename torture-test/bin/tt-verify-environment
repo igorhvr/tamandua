@@ -90,6 +90,9 @@ const OPT = {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const TT_ROOT = path.resolve(__dirname, '..');
+// The checkout root this tool's torture-test tree lives in — the "this
+// worktree" repo root for the port-ownership classifier (MVPT).
+const REPO_ROOT = path.dirname(TT_ROOT);
 const VAR_DIR = path.resolve(TT_ROOT, 'var');
 const W0_DIR = path.resolve(VAR_DIR, 'w0');
 
@@ -1269,35 +1272,159 @@ function probePorts() {
 }
 
 /**
- * Check if a process (by PID) is owned by the torture-test suite.
- * TT-owned means the process cmdline or cwd contains the TT_ROOT path.
- * On Linux, reads from /proc/<pid>/. Returns false if the PID no longer
- * exists or cannot be inspected.
+ * Read a listener pid's cwd + full command line with PORTABLE evidence
+ * (MVPT — the darwin env-gate defect): the ownership decision must never
+ * depend on the procfs mount existing, because it does not on Darwin.
+ * Dispatches on detectedPlatform() (the TT_VERIFY_PLATFORM seam, MACP3
+ * injectable-platform pattern):
+ *   linux (real or seam): /proc/<pid>/cwd readlink + /proc/<pid>/cmdline —
+ *     the pre-MVPT linux evidence, unchanged (MACP3 US-003 linux-only).
+ *   darwin (real or seam): NO procfs — the same PORTABLE evidence
+ *     daemon-control's ownership check uses: `lsof -a -p <pid> -d cwd -Fn`
+ *     (the cwd, first `n<path>` row — the p<pid>/c<cmd> rows are ignored)
+ *     and `ps -p <pid> -o command=` (the full command line). Both are
+ *     mechanical and present on macOS by default (/usr/sbin/lsof, /bin/ps).
+ * Unavailable evidence (tool absent, dead pid, foreign pid) returns null for
+ * that field on EVERY host — TT ownership must be PROVEN, never assumed
+ * (fail-closed, exactly like the linux arm; never a weak accept).
+ * Returns { cwd, cmdline } (string|null each).
  */
-function isProcessTTOwned(pid) {
-  if (pid === null) return false;
+function readProcessEvidence(pid) {
+  if (pid === null) return { cwd: null, cmdline: null };
+  const evidence = { cwd: null, cmdline: null };
+  if (detectedPlatform() === 'darwin') {
+    // /proc-less host (macOS): portable evidence (MVPT). `lsof -a -p <pid>
+    // -d cwd -Fn` prints the cwd as an `n<path>` row (the p<pid> row and
+    // any fd-name row, if present, are ignored — first n row wins); `ps -p
+    // <pid> -o command=` prints the full command line. Unavailable evidence
+    // stays null (refuse) — never a weak accept.
+    try {
+      const lsof = spawnSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
+        encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (lsof.status === 0 && lsof.stdout) {
+        for (const line of String(lsof.stdout).split('\n')) {
+          if (line.startsWith('n') && line.length > 1) {
+            evidence.cwd = line.slice(1);
+            break;
+          }
+        }
+      }
+    } catch (_) { /* lsof unavailable — cwd stays null (refuse) */ }
+    try {
+      const ps = spawnSync('ps', ['-p', String(pid), '-o', 'command='], {
+        encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (ps.status === 0 && ps.stdout) {
+        const first = String(ps.stdout).split(/\r?\n/, 1)[0];
+        if (first !== undefined) evidence.cmdline = first.trim();
+      }
+    } catch (_) { /* ps unavailable — cmdline stays null (refuse) */ }
+    return evidence;
+  }
+  // linux /proc evidence (unchanged — MACP3 US-003 linux-only reads, never
+  // reached on /proc-less hosts; null-byte cmdline separators normalized to
+  // spaces so substring/regex matching is well-defined).
   try {
-    // linux-only /proc/<pid> reads (MACP3 US-003): guarded for Darwin by the
-    // outer catch and per-read !exists/2>/dev/null equivalents below — on a
-    // /proc-less host this returns false (not TT-owned), never hard-fails.
-    // Check /proc/<pid>/cmdline
     const cmdlinePath = `/proc/${pid}/cmdline`;
     if (fs.existsSync(cmdlinePath)) {
-      const cmdline = fs.readFileSync(cmdlinePath, 'utf-8');
-      // cmdline uses null bytes as separators
-      if (cmdline.includes(TT_ROOT)) return true;
+      const raw = fs.readFileSync(cmdlinePath, 'utf-8');
+      if (raw.length > 0) evidence.cmdline = raw.replace(/\0/g, ' ');
     }
-    // Check /proc/<pid>/cwd (symlink target)
-    try {
-      const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
-      if (cwd.startsWith(TT_ROOT)) return true;
-    } catch (_) { /* cwd not readable */ }
-    return false;
-  } catch (_) {
-    // PID may have exited, or /proc not available (there is no procfs on
-    // Darwin — explicit Darwin branch: not TT-owned rather than an error).
-    return false;
+  } catch (_) { /* cmdline unreadable */ }
+  try {
+    const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+    evidence.cwd = cwd;
+  } catch (_) { /* cwd not readable */ }
+  return evidence;
+}
+
+/**
+ * Derive the run id from a tamandua run-worktree path when the path carries
+ * one: the real run worktrees are named `<catalog>/<num>-<runid>` (e.g.
+ * '906-80049f1f' — the run id is the hex segment after the last dash).
+ * Returns the hex string or null when the path has no run-id-shaped segment.
+ */
+function runIdFromWorktreePath(worktreePath) {
+  const base = path.basename(worktreePath);
+  const m = base.match(/(?:^|[-_])([0-9a-f]{8,})(?:[-_]|$)/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Classify a listener pid's TT ownership from its portable cwd/cmdline
+ * evidence (MVPT). Returns one of:
+ *   { kind: 'this-worktree' }      — cwd/cmdline prove THIS worktree's TT
+ *     tree (TT_ROOT — the pre-MVPT acceptance, unchanged) OR this repo
+ *     root's own daemon entry / tamandua CLI (cmdline naming
+ *     <REPO_ROOT>/dist/server/ or <REPO_ROOT>/bin/tamandua, whatever the
+ *     cwd — mirrors daemon-control's S54 two-arm cmdline acceptance).
+ *   { kind: 'other-worktree', worktree, runId } — the listener is a TT
+ *     daemon of ANOTHER checkout of the same repo: its cwd lives under
+ *     <X>/torture-test (the repo's torture-test tree — this product's
+ *     marker) AND its cmdline names <X>'s built daemon entry
+ *     (<X>/dist/server/…) or a tamandua CLI. Reported 'TT-owned by <X>, run
+ *     <id>' instead of 'non-TT' — the listener is TT machinery, never a
+ *     foreign squatter (mac stage-2 attempt-2 held its contained ports with
+ *     the main checkout's own daemon).
+ *   { kind: 'foreign' }            — no TT markers (or evidence unreadable —
+ *     fail-closed, never a weak accept).
+ */
+function classifyProcessOwnership(evidence) {
+  const cwd = evidence.cwd;
+  const cmdline = evidence.cmdline;
+  const hasCwd = cwd !== null && cwd.length > 0;
+  const hasCmd = cmdline !== null && cmdline.length > 0;
+  if (!hasCwd && !hasCmd) return { kind: 'foreign' };
+
+  // THIS worktree's TT tree (pre-MVPT acceptance, unchanged: cwd under
+  // TT_ROOT, cmdline naming TT_ROOT).
+  if ((hasCwd && cwd.startsWith(TT_ROOT)) || (hasCmd && cmdline.includes(TT_ROOT))) {
+    return { kind: 'this-worktree' };
   }
+
+  // Candidate checkouts of this (torture-test) repo named by the evidence:
+  // a `<X>/dist/server/<entry>.js` daemon argv or `<X>/bin/tamandua` CLI in
+  // the cmdline, and the `<X>/torture-test/` tree the cwd lives under.
+  const candidates = new Set();
+  if (hasCmd) {
+    let m;
+    const distRe = /(^|[\s])("?)([^"\s]+?)\/dist\/server\//g;
+    while ((m = distRe.exec(cmdline)) !== null) candidates.add(m[3]);
+    const cliRe = /(^|[\s])("?)([^"\s]+?)\/bin\/tamandua("?)(\s|$)/g;
+    while ((m = cliRe.exec(cmdline)) !== null) candidates.add(m[3]);
+  }
+  if (hasCwd) {
+    const m = cwd.match(/^(.+?)\/torture-test(?:\/|$)/);
+    if (m) candidates.add(m[1]);
+  }
+
+  for (const candidate of candidates) {
+    if (candidate === REPO_ROOT) {
+      // This repo root's OWN daemon entry / tamandua CLI (cmdline arm) —
+      // same-worktree machinery whatever its cwd (mirrors daemon-control).
+      if (hasCmd && (cmdline.includes(`${REPO_ROOT}/dist/server/`)
+        || cmdline.includes(`${REPO_ROOT}/bin/tamandua`) || /\btamandua\b/.test(cmdline))) {
+        return { kind: 'this-worktree' };
+      }
+      continue;
+    }
+    // Another checkout of the same repo: cwd under <X> AND a TT daemon
+    // cmdline naming <X> (its dist entry) or a tamandua CLI.
+    const cwdUnderX = hasCwd && (cwd === candidate || cwd.startsWith(candidate + path.sep));
+    const cmdlineNamesX = hasCmd
+      && (cmdline.includes(`${candidate}/dist/server/`)
+        || cmdline.includes(`${candidate}/bin/tamandua`) || /\btamandua\b/.test(cmdline));
+    if (cwdUnderX && cmdlineNamesX) {
+      return {
+        kind: 'other-worktree',
+        worktree: candidate,
+        runId: runIdFromWorktreePath(candidate),
+      };
+    }
+  }
+
+  return { kind: 'foreign' };
 }
 
 // Run port probe once — all port checks share this data
@@ -1326,22 +1453,49 @@ for (const port of ALL_PORTS) {
       };
     }
 
-    // Port is in use — determine ownership
-    const ttOwned = isProcessTTOwned(portInfo.pid);
+    // Port is in use — determine ownership (MVPT: portable cwd+cmdline
+    // evidence on BOTH platforms; a TT daemon of ANOTHER worktree of the
+    // same repo is TT-owned and named, never 'non-TT').
+    const ownership = classifyProcessOwnership(readProcessEvidence(portInfo.pid));
     const procInfo = `PID ${portInfo.pid}${portInfo.processName ? ` (${portInfo.processName})` : ''}`;
 
-    if (ttOwned) {
+    if (ownership.kind === 'this-worktree' || ownership.kind === 'other-worktree') {
       portStatusRecord[port] = 'in-use-by-TT';
       recordHostProfile('ports', String(port), 'in-use-by-TT');
+
+      if (ownership.kind === 'this-worktree') {
+        // This worktree's TT tree — pre-MVPT wording, unchanged.
+        if (isProduction) {
+          // Production ports are report-only whatever the holder; keep the
+          // 'production port' marker so the row reads as report-only.
+          return {
+            result: 'PASS',
+            evidence: `Port ${port} in use by TT-owned process (production port — report only): ${procInfo}`,
+            remedy: null,
+            skipReason: null,
+          };
+        }
+        return {
+          result: 'PASS',
+          evidence: `Port ${port} in use by TT-owned process: ${procInfo}`,
+          remedy: null,
+          skipReason: null,
+        };
+      }
+
+      // MVPT: another worktree of the same repo owns the listener — name it
+      // ('TT-owned by <worktree path>, run <id>') instead of 'non-TT'.
+      const runPart = ownership.runId !== null ? `, run ${ownership.runId}` : '';
+      const ownerText = `Port ${port} TT-owned by ${ownership.worktree}${runPart}${isProduction ? ' (production port — report only)' : ''}: ${procInfo}`;
       return {
         result: 'PASS',
-        evidence: `Port ${port} in use by TT-owned process: ${procInfo}`,
+        evidence: ownerText,
         remedy: null,
         skipReason: null,
       };
     }
 
-    // Port is in use by a non-TT process
+    // Port is in use by a non-TT process (foreign — no TT markers anywhere)
     portStatusRecord[port] = 'in-use-by-other';
     recordHostProfile('ports', String(port), 'in-use-by-other');
 
@@ -1867,6 +2021,18 @@ function writeProfileFiles(results, exitCode) {
   // ── host-profile.json ───────────────────────────────────
   // Per spec 01/04: platform, containment, toolchains, node runtimes,
   // spawn-speed class, disk headroom.
+  // S51 (R4a US-009): the host capability profile also records the
+  // ENVIRONMENT-GATE RESULT (profile_result.result PASS|FAIL + the failed
+  // REQUIRED check ids + exit code). run-torture-test refuses to launch a
+  // tier (exit 2, unless --allow-partial) when the profile's recorded RESULT
+  // is FAIL — the mac 2026-09-02 1/35, 4/28, 1/70 'greens' ran on hosts whose
+  // required env gate had FAILed (ports held / daemon unlaunchable) yet the
+  // campaign reported GREEN on the fraction of cells that ran. Profiles
+  // written before this field carry no profile_result and are treated as
+  // legacy (no recorded FAIL — the gate lets them through).
+  const failedRequiredChecks = results
+    .filter((r) => r.severity === 'REQUIRED' && r.result === 'FAIL')
+    .map((r) => r.id);
   const hostProfileOut = {
     platform: hostProfile.platform,
     containment: hostProfile.containment,
@@ -1877,6 +2043,12 @@ function writeProfileFiles(results, exitCode) {
     spawnSpeedClass: hostProfile.spawnSpeedClass,
     diskHeadroom: hostProfile.diskHeadroom,
     harness: hostProfile.harness,
+    profile_result: {
+      result: exitCode === 0 ? 'PASS' : 'FAIL',
+      exit_code: exitCode,
+      failed_required_checks: failedRequiredChecks,
+      generated_at: new Date().toISOString(),
+    },
   };
 
   const hpPath = path.join(W0_DIR, 'host-profile.json');

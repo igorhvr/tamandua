@@ -19,7 +19,8 @@
 //   * W4.33a/W4.33b declare the during_hold action after a hold-capable
 //     pause (the W4.33a/W4.33b 'act during the pause hold' shape);
 //   * W4.47 declares invalidate_credentials (now) + restore_credentials
-//     (event:step.retry) in one run group (restore after invalidate);
+//     (S62 re-arm: the daemon-log instant-fail classification trigger) in one
+//     run group (restore after invalidate);
 //   * the task texts describe the WIRED actions (the pre-S44a 'machinery
 //     delta — operator action in the task text' language is gone from the
 //     operator-seam paragraphs);
@@ -132,16 +133,20 @@ describe("S44b — operator-seam cell wiring (US-010)", () => {
     assert.equal(actions[2].op, "resume");
   });
 
-  it("W4.47-auth-expiry-copy declares invalidate_credentials (now) + restore_credentials (event:step.running) in one run group", () => {
+  it("W4.47-auth-expiry-copy declares invalidate_credentials (now) + restore_credentials armed on the daemon-log instant-fail classification (S62 re-arm) in one run group", () => {
     const r = row("W4.47-auth-expiry-copy");
     assert.equal(r.chaos, null, "W4.47 has no chaos block");
     assert.equal(r.workflow, "do-now", "W4.47 is the do-now cell");
+    assert.equal(r.caps.wall_min, 15,
+      "W4.47 wall cap must cover the product's instant-fail escalation horizon (~12-13 min; S62 calibration)");
+    assert.equal(r.expected_fast_failure, true, "W4.47 must keep expected_fast_failure");
     const actions = r.probe_sequence[0].actions;
     assert.equal(actions.length, 2, "W4.47 must carry invalidate_credentials -> restore_credentials");
     assert.equal(actions[0].op, "invalidate_credentials");
     assert.equal(actions[0].when, "now", "the invalidate fires as the run id resolves — before the first dispatch round");
     assert.equal(actions[1].op, "restore_credentials");
-    assert.equal(actions[1].when, "event:step.running", "the restore fires at the RETRIED round's dispatch (the relaunch) — the invalidated first round exits before claiming (provider-error instant-fail), so the first step.running in the run is the relaunch's (the machinery 'restore the copy, launch again')");
+    assert.deepEqual(actions[1].when, { daemon_log: "Worker round classified as instant fail", timeout_s: 600 },
+      "the restore must arm on the run's first instant-fail classification in the contained daemon's log (S62 re-arm) — event:step.running can never fire under an instant-fail loop (the invalidated first round exits before claiming), while the daemon logs every classification");
     assert.deepEqual(actions[1].expect, { run_completes: true });
   });
 
@@ -178,6 +183,19 @@ describe("S44b — operator-seam cell wiring (US-010)", () => {
       "the W4.33a/W4.48a machinery-delta row must be replaced by the wired restart_contained_daemon declaration");
   });
 
+  it("tier2-traceability.md has the S62 W4.47 re-arm section documenting the daemon_log trigger + wall-cap calibration", () => {
+    const doc = fs.readFileSync(traceabilityPath, "utf8");
+    assert.match(doc, /## S62 W4\.47 restore re-arm \+ wall-cap calibration \(US-019, 2026-09-04\)/,
+      "traceability must have the S62 section");
+    assert.match(doc, /daemon_log/, "S62 must name the daemon_log trigger");
+    assert.match(doc, /wall_min.*15|10 → 15/, "S62 must document the wall_min 10 -> 15 calibration");
+    assert.match(doc, /event:step\.running/, "S62 must name the retired event:step.running arming");
+    const w447 = row("W4.47-auth-expiry-copy");
+    const taskText = fs.readFileSync(path.join(ttRoot, w447.task), "utf8");
+    assert.match(taskText, /daemon_log/, "W4.47 task text must describe the daemon_log trigger re-arm");
+    assert.match(taskText, /S62 cap calibration/, "W4.47 task text must document the S62 wall-cap calibration");
+  });
+
   it("tt-controller --validate-only stays green on the full 70-row manifest with the wired probe_sequences", () => {
     const res = spawnSync(controller, ["--manifest", tier2Path, "--validate-only"], {
       cwd: repoRoot,
@@ -187,6 +205,6 @@ describe("S44b — operator-seam cell wiring (US-010)", () => {
       timeout: 120_000,
     });
     assert.equal(res.status, 0, `validate-only must stay green:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/, `validate-only must validate all 70 cases: ${res.stdout}`);
+    assert.match(res.stdout, /Validated 72 case\(s\)/, `validate-only must validate all 70 cases: ${res.stdout}`);
   });
 });

@@ -1090,6 +1090,16 @@ else
   fail "Exit code is 0 with --test-required-fail, expected non-zero"
 fi
 
+# S51 AC2/AC4: the host-profile writer records the environment-gate RESULT.
+# A gate with a REQUIRED failure (the run just above) must write
+# host-profile.json with profile_result.result=FAIL naming the failing
+# required check — run-torture-test refuses (exit 2) on that record.
+if jq -e '.profile_result.result == "FAIL" and (.profile_result.exit_code != 0) and ([.profile_result.failed_required_checks[] | select(. == "test-required-fail")] | length) == 1' "$HP_FILE" > /dev/null 2>&1; then
+  pass "S51: FAIL gate writes profile_result.result=FAIL naming the required check"
+else
+  fail "S51: FAIL gate did not record profile_result FAIL in host-profile.json"
+fi
+
 # AC2b: Verify --test-required-fail is not shown in --help (hidden test flag)
 if "$TOOL" --help 2>&1 | grep -qv "test-required-fail"; then
   pass "--test-required-fail is not advertised in --help output (hidden flag)"
@@ -1674,6 +1684,14 @@ fi
 # restricted-PATH runs above overwrote them with the T1-only simulation).
 "$TOOL" --fast > /dev/null 2>&1 && : || :
 rm -rf -- "$FAKE_BIN_DIR"
+
+# S51: a green gate (the restore run just above) writes profile_result
+# RESULT PASS — the record run-torture-test lets through.
+if jq -e '.profile_result.result == "PASS" and .profile_result.exit_code == 0' "$HP_FILE" > /dev/null 2>&1; then
+  pass "S51: PASS gate writes profile_result.result=PASS in host-profile.json"
+else
+  fail "S51: PASS gate did not record profile_result PASS in host-profile.json"
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────
 echo ""

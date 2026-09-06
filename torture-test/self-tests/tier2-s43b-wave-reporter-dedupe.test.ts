@@ -292,7 +292,7 @@ describe("S43b (US-007) — O1 wave-reporter dedupe: family findings stamped exa
   it("GREEN-ARM: the real manifest stays schema-valid and the dedupe fixture declares the campaign-wide wave_cases membership", () => {
     const res = runController(["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `${res.stdout}\n${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
 
     // The generated dedupe fixture contexts carry wave_cases in manifest
     // order (four do-now cells then the non-do-now cell), so the oracle

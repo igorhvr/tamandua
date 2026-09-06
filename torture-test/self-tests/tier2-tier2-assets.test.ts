@@ -117,8 +117,8 @@ describe("Tier-2 assets + --tier2 ladder rung (US-015)", () => {
   it("AC1: tt-tier2-assets validates cases/tier2.jsonl (task files, requires incl. dsh capability, seeds vs fixture SEEDS.md catalogs) and exits 0", () => {
     const res = run(assetsValidator, [manifestPath]);
     assert.equal(res.status, 0, `tt-tier2-assets must exit 0:\n${res.stdout}\n${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 Tier-2 case asset set\(s\)/,
-      `expected the 70-case tier2 roster to validate: ${res.stdout}`);
+    assert.match(res.stdout, /Validated 72 Tier-2 case asset set\(s\)/,
+      `expected the 72-case tier2 roster to validate: ${res.stdout}`);
     // The dsh lane's seed rows validate against the SEEDS.md catalogs
     // (E3.A S2 arm) — the 4 dsh rows carry seeds BUG-T2/BUG-T3 or probes.
     const records = fs

@@ -258,6 +258,19 @@ function readCaseBundleOrigins(invocation) {
 // well-formed and agree across the refs snapshots (fail-closed), while a
 // malformed/unparseable NAMED refs artifact is advisory-only and never changes
 // the O9 verdict path.
+//
+// S46 (US-004): a well-formed NAMED refs artifact is no longer advisory-only —
+// it carries the S38-pinned target-ref identity that O9's row/tree resolution
+// consumes (resolve ledger trees against the pinned target ref, never the
+// branch that moved during the run). The three snapshots pin the SAME
+// `target_ref` identity (refs_before/refs_after/target_reflog are keyed to
+// the before-capture target), so named artifacts that disagree on the
+// identity are internally inconsistent evidence (fail-closed, mirroring the
+// detached-HEAD agreement rule). The pinned target's own captured tips are
+// also collected: `target_tip` on refs_before/refs_after and the target
+// reflog's entry OIDs describe positions the pinned target ACTUALLY held at
+// capture (a squash-merge or a later landing can leave an earlier landing
+// reachable ONLY through that captured history) — never the moving branch.
 function readDetachedHeadContract(invocation) {
   const artifacts = [];
   for (const key of ['refs_before', 'refs_after', 'target_reflog']) {
@@ -278,8 +291,35 @@ function readDetachedHeadContract(invocation) {
     throw new OracleRuntimeError('refs evidence disagrees on the detached-HEAD contract (some snapshots mark detached_head, others do not)');
   }
   if (detachedArtifacts.length === 0) {
-    const namedTargetRef = namedArtifacts.find(({ artifact }) => typeof artifact.target_ref === 'string')?.artifact.target_ref ?? null;
-    return { detached: false, targetRef: null, namedTargetRef, sources: artifacts.map(({ key }) => key) };
+    // S46: the S38-pinned NAMED target identity (refs_before/refs_after/
+    // target_reflog all key off the before-capture target) plus every target
+    // tip the pinned ref actually held at capture (recorded target_tip and
+    // reflog entry OIDs). Named artifacts that disagree on the identity are
+    // internally inconsistent evidence — fail closed, never a silent fallback
+    // to the moving branch.
+    const namedTargetRefs = [...new Set(namedArtifacts
+      .map(({ artifact }) => artifact.target_ref)
+      .filter((ref) => typeof ref === 'string'))];
+    if (namedTargetRefs.length > 1) {
+      throw new OracleRuntimeError('refs evidence named target_ref must agree across snapshots');
+    }
+    const namedTargetTips = new Set();
+    const ZERO_OID = '0'.repeat(40);
+    for (const { artifact } of namedArtifacts) {
+      // A reflog's first entry records the ref's creation with the all-zero
+      // null OID as old_oid — not a real tip, never resolvable, so skip it.
+      if (typeof artifact.target_tip === 'string' && OID.test(artifact.target_tip) && artifact.target_tip !== ZERO_OID) {
+        namedTargetTips.add(artifact.target_tip);
+      }
+      if (Array.isArray(artifact.entries)) {
+        for (const entry of artifact.entries) {
+          if (typeof entry?.new_oid === 'string' && OID.test(entry.new_oid) && entry.new_oid !== ZERO_OID) namedTargetTips.add(entry.new_oid);
+          if (typeof entry?.old_oid === 'string' && OID.test(entry.old_oid) && entry.old_oid !== ZERO_OID) namedTargetTips.add(entry.old_oid);
+        }
+      }
+    }
+    const namedTargetRef = namedTargetRefs.length === 0 ? null : namedTargetRefs[0];
+    return { detached: false, targetRef: null, namedTargetRef, namedTargetTips, sources: artifacts.map(({ key }) => key) };
   }
   let targetRef = null;
   for (const { key, artifact } of detachedArtifacts) {
@@ -289,7 +329,30 @@ function readDetachedHeadContract(invocation) {
     }
     targetRef = ref;
   }
-  return { detached: true, targetRef, namedTargetRef: null, sources: detachedArtifacts.map(({ key }) => key) };
+  return { detached: true, targetRef, namedTargetRef: null, namedTargetTips: new Set(), sources: detachedArtifacts.map(({ key }) => key) };
+}
+
+// S46 (US-004): the tree-resolution basis. The reachable-tree set that ledger
+// rows are checked against must be the S38-PINNED target, never `git log
+// --all` (which also walks the branch that moved during the run — a tree
+// committed only on the moving branch would be wrongly accepted as a captured
+// committed fixture tree, the W4.09-pi / W4.10-restart / W4.17-b shape that
+// tripped O9_LEDGER_TREE_UNRESOLVED when resolution disagreed with the
+// pinning):
+//   - detached-HEAD contract claimed → the detached HEAD commit OID IS the
+//     target identity (US-009); reachable trees are the detached commit's
+//     (kept idempotent with `--all`, which already includes HEAD — the S35
+//     belt-and-suspenders is preserved, never a weakening of tree resolution);
+//   - a well-formed NAMED pinned target ref → reachable trees are that ref's,
+//     plus the pinned target's captured tips (recorded target_tip / reflog
+//     OIDs) — those positions are the pinned target's own history, not the
+//     moving branch;
+//   - no usable refs evidence → legacy `--all` walk (the audit proceeds
+//     exactly as before when no pinning is recorded).
+function treeResolutionBasis(detached) {
+  if (detached.detached && detached.targetRef !== null) return { mode: 'detached-head', ref: detached.targetRef };
+  if (!detached.detached && detached.namedTargetRef !== null) return { mode: 'pinned-target-ref', ref: detached.namedTargetRef };
+  return { mode: 'all-refs', ref: null };
 }
 
 // S35 (US-005): the launch-refused corridor on a detached-HEAD origin. W4.30's
@@ -568,9 +631,38 @@ export async function evaluateO9(invocation) {
 
   const repository = extractGit(invocation);
   let reachableTrees;
+  let resolutionBasis;
   try {
-    reachableTrees = new Set(runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['log', '--all', '--format=%T'] }).stdout.split(/\r?\n/).filter(Boolean));
-    if (detached.detached && detached.targetRef !== null) {
+    // S46 (US-004): resolve ledger row trees against the S38-pinned target
+    // ref (treeResolutionBasis above) — never `git log --all` when the refs
+    // evidence pins a target, because `--all` also walks the branch that
+    // moved during the run and a tree committed ONLY on the moving branch is
+    // not a captured committed fixture tree.
+    const basis = treeResolutionBasis(detached);
+    resolutionBasis = basis;
+    // `addWalkedTrees` walks a resolution root and folds its reachable trees
+    // into the set. The pinned identity walks are fail-closed (an unresolvable
+    // pinned ref / claimed detached OID is internally inconsistent evidence);
+    // the recorded HISTORY-tip walks are advisory — the refs evidence may
+    // legitimately carry tips whose objects were pruned before capture (e.g.
+    // the all-zero branch-creation OID or a gc'd prior landing), and a
+    // missing historical tip must never hard-fail the whole audit (a row that
+    // needed that tip to resolve simply stays O9_LEDGER_TREE_UNRESOLVED).
+    const addWalkedTrees = (args, label, advisory = false) => {
+      const walk = runGit({ campaignRoot: invocation.campaignRoot, repository, args, acceptedStatuses: [0, 128] });
+      if (walk.status !== 0) {
+        if (advisory) return;
+        throw new OracleRuntimeError(`${label} is not resolvable in the captured git snapshot`);
+      }
+      for (const tree of walk.stdout.split(/\r?\n/).filter(Boolean)) reachableTrees.add(tree);
+    };
+    reachableTrees = new Set();
+    if (basis.mode === 'all-refs') {
+      // No refs evidence was recorded (or none carried a usable target
+      // identity) — the audit proceeds exactly as before with `--all`.
+      const walk = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['log', '--all', '--format=%T'] });
+      for (const tree of walk.stdout.split(/\r?\n/).filter(Boolean)) reachableTrees.add(tree);
+    } else if (basis.mode === 'detached-head') {
       // S35 (US-005): a detached-HEAD origin has NO symbolic target ref — the
       // target identity IS the detached HEAD commit (US-009: target_ref =
       // commit OID). Walk the detached commit's reachable trees explicitly so
@@ -579,11 +671,23 @@ export async function evaluateO9(invocation) {
       // belt-and-suspenders per the contract, never a weakening of tree
       // resolution. An unresolvable detached target_ref is fail-closed
       // (internally inconsistent evidence).
-      const walk = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['log', detached.targetRef, '--format=%T'], acceptedStatuses: [0, 128] });
-      if (walk.status !== 0) {
-        throw new OracleRuntimeError(`detached-HEAD target_ref ${detached.targetRef} is not resolvable in the captured git snapshot`);
-      }
+      const walk = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['log', '--all', '--format=%T'] });
       for (const tree of walk.stdout.split(/\r?\n/).filter(Boolean)) reachableTrees.add(tree);
+      addWalkedTrees(['log', basis.ref, '--format=%T'], `detached-HEAD target_ref ${basis.ref}`);
+    } else {
+      // S46 (US-004): the S38-pinned NAMED target ref. Walk the pinned ref as
+      // captured in the snapshot PLUS the pinned target's recorded history
+      // tips (refs_before/refs_after target_tip and the target reflog entry
+      // OIDs — walked advisory so a pruned historical landing never hard-
+      // fails the audit): a squash-merge or a later landing can leave an
+      // earlier landing reachable ONLY through that captured history. Both
+      // legs describe the PINNED target — the branch that moved during the
+      // run is never walked, so a tree committed only there stays
+      // unresolvable (fail-closed for the pinned ref itself).
+      addWalkedTrees(['log', basis.ref, '--format=%T'], `pinned target ref ${basis.ref}`);
+      for (const tip of detached.namedTargetTips) {
+        addWalkedTrees(['log', tip, '--format=%T'], `pinned target captured tip ${tip}`, true);
+      }
     }
     for (const row of inScopeLedger) {
       const type = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['cat-file', '-t', row.tree_hash], acceptedStatuses: [0, 128] });
@@ -805,6 +909,14 @@ export async function evaluateO9(invocation) {
     detached_head: detached.detached,
     target_ref: detached.targetRef,
     symbolic_target_ref: detached.namedTargetRef,
+    // S46 (US-004): which tree-resolution basis produced the reachable-tree
+    // set — `all-refs` (no refs evidence recorded), `detached-head` (the
+    // US-009 detached contract) or `pinned-target-ref` (the S38-pinned named
+    // target ref + its captured tips). Rows are resolved against the pinned
+    // target, never against the branch that moved during the run.
+    tree_resolution_basis: resolutionBasis.mode,
+    tree_resolution_ref: resolutionBasis.mode === 'all-refs' ? null : resolutionBasis.ref,
+    tree_resolution_tip_count: resolutionBasis.mode === 'pinned-target-ref' ? detached.namedTargetTips.size : 0,
   }, 'sqlite-git-and-shim-state-machine')];
   return { result: findings.length === 0 ? 'PASS' : 'FAIL', findings: findings.toJSON(), evidence };
 }

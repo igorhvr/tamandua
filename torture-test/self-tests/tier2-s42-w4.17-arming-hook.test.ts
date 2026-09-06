@@ -320,7 +320,7 @@ describe("S42 (US-005) — W4.17 red-baseline arming hook + fail-closed absent-a
     }
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("GREEN-ARM: armAbsentGate fires for every absent/mismatched arming shape and never for the armed/non-obligated shapes", () => {

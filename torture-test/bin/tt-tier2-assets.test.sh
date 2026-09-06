@@ -39,7 +39,7 @@ fail() { fail_count=$((fail_count + 1)); total_count=$((total_count + 1)); echo 
 # Helper: create a valid task file (needed for many tests)
 echo "# Test task content" > "$TASK_FILE"
 
-# ---- Test 1: the real tier2 manifest validates (70 cases) ----
+# ---- Test 1: the real tier2 manifest validates (72 cases) ----
 if "$VALIDATOR" "$TT_DIR/cases/tier2.jsonl" >/dev/null 2>&1; then
   pass "real cases/tier2.jsonl exits 0"
 else

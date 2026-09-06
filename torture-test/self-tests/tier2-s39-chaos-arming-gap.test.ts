@@ -336,7 +336,7 @@ describe("S39 (US-003) — fail-closed mandatory-chaos arming + W4.29 corridor w
     // (step:finalize_merge:pending + step:verify:running are both vocabulary).
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `validate-only must pass:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("the traceability S39 section documents the root cause, the fix, and the pinned evidence (AC1)", () => {

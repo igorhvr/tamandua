@@ -23,6 +23,15 @@
 //      returns 1 — and `tt-recorder start` still exits 0 (never fails because
 //      of a missing /proc or lsof).
 //
+// lsof absence is simulated hermetically: the two lsof-absent sub-tests run
+// with a scratch PATH directory that holds ONLY symlinks to the tools the
+// spawned scripts need (shell, coreutils, awk/grep/sed, node) and is the ONLY
+// PATH entry. `lsof` therefore fails to resolve while every other tool keeps
+// resolving. This matters on linux hosts where `lsof` and the shell share one
+// system bin directory (dropping every lsof-bearing PATH dir — the earlier
+// approach — silently dropped the interpreter too, making the spawns fail
+// with a null exit status instead of exercising the degradation path).
+//
 // Picked up by self-tests/run.sh's `tier1-*.test.ts` glob (no run.sh edit).
 // Zero tokens; confined to torture-test/.
 import assert from "node:assert/strict";
@@ -30,7 +39,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 
 const repoRoot = process.cwd();
 const ttRoot = path.join(repoRoot, "torture-test");
@@ -115,23 +124,91 @@ function extractFunction(text: string, name: string): string | null {
   return null;
 }
 
-/** The real PATH with every directory that contains an `lsof` binary removed.
- *  This makes `lsof` genuinely absent for the sourcing child while leaving
- *  bash/awk/ps and the other tools the recorder needs intact. */
-function pathWithoutLsof(): string {
+/** Tool basenames the lsof-absent sub-tests must keep resolving: the shell,
+ *  the coreutils the recorder's source/start paths call, awk/grep/sed, and
+ *  node (MLSF). Only names that resolve on the real PATH are linked — a name
+ *  present on the host (e.g. `lsof` itself) is deliberately NOT in this list. */
+const SHIM_TOOL_NAMES = [
+  // interpreter + env
+  "bash",
+  "sh",
+  "env",
+  // coreutils the recorder spawns on its source/start paths
+  "cat",
+  "echo",
+  "printf",
+  "mkdir",
+  "rm",
+  "mv",
+  "cp",
+  "touch",
+  "nohup",
+  "basename",
+  "dirname",
+  "date",
+  "sleep",
+  "ls",
+  "wc",
+  "head",
+  "tail",
+  "cut",
+  "tr",
+  "sort",
+  "uniq",
+  "readlink",
+  "ps",
+  "kill",
+  // text tools
+  "awk",
+  "grep",
+  "sed",
+  // runtime (recorded telemetry consumers are node processes)
+  "node",
+];
+
+/** Resolve an executable `name` against the real PATH (first executable
+ *  match, like a shell would). Returns the absolute candidate path or null. */
+function resolveTool(name: string): string | null {
   const entries = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
-  const filtered = entries.filter((dir) => {
+  for (const dir of entries) {
+    const candidate = path.join(dir, name);
     try {
-      return !fs.existsSync(path.join(dir, "lsof"));
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
     } catch {
-      return true;
+      /* not here — keep looking */
     }
-  });
+  }
+  return null;
+}
+
+/** Build a scratch PATH directory containing ONLY symlinks to the tools the
+ *  spawned recorder scripts need, and return it as the sole PATH entry. With
+ *  this PATH, `lsof` genuinely fails to resolve while the shell, coreutils,
+ *  awk/grep/sed, and node all keep resolving — the interpreter survives even
+ *  on hosts where `lsof` and the shell share one system bin directory. */
+function makeScratchPathWithoutLsof(): { dir: string; path: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-recorder-no-lsof-"));
+  const linked: string[] = [];
+  for (const name of SHIM_TOOL_NAMES) {
+    const resolved = resolveTool(name);
+    if (!resolved) continue;
+    try {
+      fs.symlinkSync(resolved, path.join(dir, name));
+      linked.push(name);
+    } catch {
+      /* a raced/duplicate link is fine — the dir still resolves the name */
+    }
+  }
   assert.ok(
-    filtered.length > 0,
-    "expected a non-empty PATH after removing lsof-bearing directories",
+    !fs.existsSync(path.join(dir, "lsof")),
+    `the scratch PATH dir must contain no lsof (linked: ${linked.join(", ")})`,
   );
-  return filtered.join(path.delimiter);
+  assert.ok(
+    linked.includes("bash"),
+    `the scratch PATH dir must link the shell (linked: ${linked.join(", ")})`,
+  );
+  return { dir, path: dir };
 }
 
 /** A PATH shim dir whose `lsof` prints a fixed numeric LISTEN table proving
@@ -204,6 +281,22 @@ function killTree(pid: string): void {
 // ── the guard ──────────────────────────────────────────────────────────
 
 describe("MACP5 US-005 (story US-005) — tt-recorder darwin port/fd evidence", () => {
+  // Scratch PATH (symlinks only, no lsof) shared by the two lsof-absent
+  // sub-tests below. Built once up front so the "no lsof" assertion provably
+  // holds BEFORE either sub-test runs; removed after the suite.
+  let noLsofDir = "";
+  let noLsofPath = "";
+
+  before(() => {
+    const shim = makeScratchPathWithoutLsof();
+    noLsofDir = shim.dir;
+    noLsofPath = shim.path;
+  });
+
+  after(() => {
+    if (noLsofDir) fs.rmSync(noLsofDir, { recursive: true, force: true });
+  });
+
   it("structural: _is_production_ports has the lsof arm, degradation line, and the unchanged /proc arm", () => {
     const fn = extractFunction(recorderText, "_is_production_ports");
     assert.ok(fn, "_is_production_ports must exist");
@@ -243,7 +336,7 @@ describe("MACP5 US-005 (story US-005) — tt-recorder darwin port/fd evidence", 
 
   it("missing lsof logs the explicit degradation line and returns 1 (not production)", () => {
     const pid = "987654321";
-    const env = cleanEnv({ PATH: pathWithoutLsof() });
+    const env = cleanEnv({ PATH: noLsofPath });
     const res = callProductionPorts(pid, env);
     assert.equal(res.status, 1, `missing lsof must make _is_production_ports return 1 (not production). rc=${res.status}`);
     assert.match(
@@ -255,7 +348,7 @@ describe("MACP5 US-005 (story US-005) — tt-recorder darwin port/fd evidence", 
 
   it("tt-recorder start exits 0 with lsof absent (never fails because of missing /proc or lsof)", async () => {
     const fixture = makeToolFixture();
-    const env = cleanEnv({ PATH: pathWithoutLsof() });
+    const env = cleanEnv({ PATH: noLsofPath });
     try {
       const out = run(["bash", fixture.tool, "start", "--interval", "30"], {
         env,

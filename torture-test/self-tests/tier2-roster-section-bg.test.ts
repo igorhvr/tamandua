@@ -2,16 +2,19 @@
 // (composition & resume) roster.
 //
 // Pins the section-B/G batch of cases/tier2.jsonl:
-//   * the manifest exists with the 11 section-B/G rows and
+//   * the manifest exists with the 13 section-B/G rows and
 //     tt-controller --manifest cases/tier2.jsonl --validate-only exits 0;
 //   * W4.08's two variants (no-relaunch flag / control) are DISTINCT rows
 //     carrying opposite no_relaunch_upon_rugpull context values; W4.06/07
 //     are fdmw rows with wall caps at/above the family p50 138-min floor;
 //   * W4.33's four resume legs (a daemon-restart, b update-under-it,
-//     c deleted-worktree refusal, d reroute-exhaustion) and W4.48's three
-//     composed-fault arms (a daemon-kill mid-PARK, b pause-rugpull-window,
-//     c compound gate degradation) are each represented by a manifest row,
-//     with the exclusive-window sequencing note in the task text;
+//     c deleted-worktree refusal, d split into the S49 absorption-assertion
+//     reroute-absorption + directly-constructed-state resume-force-fail pair)
+//     and W4.48's three composed-fault arms (a daemon-kill mid-PARK, b split
+//     into the S49 absorption-assertion park-absorption + directly-
+//     constructed-state move-during-hold pair, c compound gate degradation)
+//     are each represented by a manifest row, with the exclusive-window
+//     sequencing note in the task text;
 //   * every workflow-launching case carries context.test_cmd matching its
 //     fixture's canonical TEST_CMD (incl. tt-go "go test ./...");
 //   * every bug-fix case's seed exists in the fixture SEEDS.md catalog and
@@ -44,7 +47,8 @@ const FIXTURE_TEST_CMD: Record<string, string> = {
   "tt-poly": "./run-all-tests",
 };
 
-// The 11 section-B/G cases (spec 08 §B + §G, US-005).
+// The 13 section-B/G cases (spec 08 §B + §G, US-005; the S49 split makes
+// W4.33d and W4.48b each a pair — absorption-assertion + constructed-state).
 const SECTION_BG_IDS = [
   "W4.06-colleague-rebase",
   "W4.07-conflicting-colleague-commit",
@@ -53,9 +57,11 @@ const SECTION_BG_IDS = [
   "W4.33a-daemon-restart-resume",
   "W4.33b-update-under-it-resume",
   "W4.33c-deleted-worktree-refusal",
-  "W4.33d-reroute-exhaustion-resume",
+  "W4.33d-reroute-absorption",
+  "W4.33d-resume-force-fail",
   "W4.48a-daemon-kill-mid-park",
-  "W4.48b-pause-rugpull-window",
+  "W4.48b-park-absorption",
+  "W4.48b-move-during-hold",
   "W4.48c-compound-gate-degradation",
 ];
 
@@ -67,9 +73,11 @@ const SEEDED_CASES: Record<string, { fixture: string; seed: string }> = {
   "W4.33a-daemon-restart-resume": { fixture: "tt-ts", seed: "BUG-T3" },
   "W4.33b-update-under-it-resume": { fixture: "tt-ts", seed: "BUG-T1" },
   "W4.33c-deleted-worktree-refusal": { fixture: "tt-ts", seed: "BUG-T2" },
-  "W4.33d-reroute-exhaustion-resume": { fixture: "tt-ts", seed: "BUG-T4" },
+  "W4.33d-reroute-absorption": { fixture: "tt-ts", seed: "BUG-T4" },
+  "W4.33d-resume-force-fail": { fixture: "tt-ts", seed: "BUG-T4" },
   "W4.48a-daemon-kill-mid-park": { fixture: "tt-ts", seed: "BUG-T1" },
-  "W4.48b-pause-rugpull-window": { fixture: "tt-ts", seed: "BUG-T2" },
+  "W4.48b-park-absorption": { fixture: "tt-ts", seed: "BUG-T2" },
+  "W4.48b-move-during-hold": { fixture: "tt-ts", seed: "BUG-T2" },
   "W4.48c-compound-gate-degradation": { fixture: "tt-poly", seed: "POLY-BUG-T1" },
 };
 
@@ -131,10 +139,11 @@ describe("Tier-2 US-005 — section-B/G roster (moving targets & rugpull + compo
     for (const id of SECTION_BG_IDS) {
       assert.ok(ids.includes(id), `section-B/G case ${id} must be present`);
     }
-    // Exactly the 11 new rows beyond section A (checked in the section-A test).
+    // The 13 section-B/G rows (the S49 split added two: the W4.33d/W4.48b
+    // pairs replace the retired real reroute-exhaustion / pause-rugpull rows).
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("W4.08's two variants are distinct rows with opposite no_relaunch_upon_rugpull context", () => {
@@ -178,10 +187,15 @@ describe("Tier-2 US-005 — section-B/G roster (moving targets & rugpull + compo
 
   it("W4.33's four resume legs and W4.48's three composed-fault arms are each manifest rows with the exclusive-window note in task text", () => {
     const records = readManifest();
+    // S49 (igorhvr item 6): W4.33d and W4.48b are each SPLIT into an
+    // absorption-assertion cell and a directly-constructed-state cell (the
+    // former real reroute-exhaustion / pause-rugpull premises are retired —
+    // the product absorbs the injected faults in real runs).
     const w433 = ["W4.33a-daemon-restart-resume", "W4.33b-update-under-it-resume",
-      "W4.33c-deleted-worktree-refusal", "W4.33d-reroute-exhaustion-resume"];
-    const w448 = ["W4.48a-daemon-kill-mid-park", "W4.48b-pause-rugpull-window",
-      "W4.48c-compound-gate-degradation"];
+      "W4.33c-deleted-worktree-refusal", "W4.33d-reroute-absorption",
+      "W4.33d-resume-force-fail"];
+    const w448 = ["W4.48a-daemon-kill-mid-park", "W4.48b-park-absorption",
+      "W4.48b-move-during-hold", "W4.48c-compound-gate-degradation"];
     for (const id of [...w433, ...w448]) {
       const record = recordById(records, id);
       assert.match(record.spec_ref, /#W4\.(33|48)$/, `${id}: spec_ref must point at the W4.33/W4.48 spec section`);
@@ -224,21 +238,55 @@ describe("Tier-2 US-005 — section-B/G roster (moving targets & rugpull + compo
       "W4.33b must declare the first-class update_contained_install action");
     assert.equal(w433b.probe_sequence[0].actions[1].during_hold, true,
       "W4.33b update_contained_install must fire during the pause hold (during_hold: true)");
-    const w433d = recordById(records, "W4.33d-reroute-exhaustion-resume");
-    assert.equal(w433d.probe_sequence[0].actions[0].op, "resume", "W4.33d probe op must be resume");
-    assert.equal(w433d.probe_sequence[0].actions[0].when, "event:run.failed",
-      "W4.33d resume must arm on the run's permanent failure (reroute exhaustion)");
-    assert.equal(w433d.probe_sequence[0].actions[0].expect?.run_completes, true,
-      "W4.33d resume must expect the run to complete");
-    // W4.48b arms its pause on the real merge.target_moved event (the rugpull
-    // window) and is a characterization corridor.
-    const w448b = recordById(records, "W4.48b-pause-rugpull-window");
-    assert.equal(w448b.class, "characterization", "W4.48b is the one-of-two characterization corridor");
-    assert.equal(w448b.probe_sequence[0].actions[0].op, "pause", "W4.48b probe op must be pause");
-    assert.equal(w448b.probe_sequence[0].actions[0].when, "event:merge.target_moved",
-      "W4.48b pause must arm on target-moved detection (between detection and the relaunch decision)");
-    assert.ok(!w448b.oracles.includes("O16"),
-      "W4.48b must not declare O16 (its resume-completes leg cannot judge the {relaunch, paused-no-relaunch} branch)");
+    // W4.33d split (S49): the absorption cell pins reroute ABSORPTION (typed
+    // move-branch rearm chaos, NO probe); the resume-force-fail cell pins the
+    // resume VECTOR by CONSTRUCTING the failure with the CLI force-fail then
+    // resuming — no chaos race.
+    const w433dAbsorb = recordById(records, "W4.33d-reroute-absorption");
+    assert.equal(w433dAbsorb.probe_sequence, null,
+      "W4.33d-reroute-absorption: the absorption cell declares no probe sequence");
+    assert.equal(w433dAbsorb.chaos.type, "move-branch",
+      "W4.33d-reroute-absorption: the absorption cell keeps the typed move-branch chaos");
+    assert.equal(w433dAbsorb.chaos.ref, "refs/heads/seed/BUG-T4",
+      "W4.33d-reroute-absorption: the move ref must be the case's target ref (seed/BUG-T4)");
+    assert.equal(w433dAbsorb.chaos.rearm, true,
+      "W4.33d-reroute-absorption: per-attempt re-arm mode (each fresh finalize attempt observes a moved tip)");
+    const w433dResume = recordById(records, "W4.33d-resume-force-fail");
+    assert.equal(w433dResume.chaos.type ?? null, null,
+      "W4.33d-resume-force-fail: the constructed-state cell has no chaos (the failure is CLI-constructed)");
+    const opsD = w433dResume.probe_sequence[0].actions.map((action: any) => action.op);
+    assert.deepEqual(opsD, ["fail_force", "resume"],
+      "W4.33d-resume-force-fail probe ops must be fail_force -> resume");
+    assert.equal(w433dResume.probe_sequence[0].actions[0].when, "step:finalize_merge:running",
+      "W4.33d-resume-force-fail: the force-fail arms on the finalize step");
+    assert.equal(w433dResume.probe_sequence[0].actions[1].when, "event:run.force_failed",
+      "W4.33d-resume-force-fail: the resume arms on the constructed failure event (run.force_failed)");
+    assert.equal(w433dResume.probe_sequence[0].actions[1].expect?.run_completes, true,
+      "W4.33d-resume-force-fail resume must expect the run to complete");
+    // W4.48b split (S49): the park-absorption cell pins PARK ABSORPTION (typed
+    // move-branch rearm chaos, NO probe); the move-during-hold cell is the
+    // one-of-two characterization corridor with the moved-target state
+    // CONSTRUCTED during the pause hold (pause first, move during the hold,
+    // resume).
+    const w448bPark = recordById(records, "W4.48b-park-absorption");
+    assert.equal(w448bPark.probe_sequence, null,
+      "W4.48b-park-absorption: the absorption cell declares no probe sequence");
+    assert.equal(w448bPark.chaos.type, "move-branch",
+      "W4.48b-park-absorption: the absorption cell keeps the typed move-branch chaos");
+    assert.equal(w448bPark.chaos.ref, "refs/heads/seed/BUG-T2",
+      "W4.48b-park-absorption: the move ref must be the case's target ref (seed/BUG-T2)");
+    const w448bHold = recordById(records, "W4.48b-move-during-hold");
+    assert.equal(w448bHold.class, "characterization", "W4.48b-move-during-hold is the one-of-two characterization corridor");
+    const opsB2 = w448bHold.probe_sequence[0].actions.map((action: any) => action.op);
+    assert.deepEqual(opsB2, ["pause", "resume"], "W4.48b-move-during-hold probe ops must be pause -> resume");
+    assert.equal(w448bHold.probe_sequence[0].actions[0].when, "step:finalize_merge:running",
+      "W4.48b-move-during-hold pause arms on the deterministic finalize step marker (the hold)");
+    assert.ok(w448bHold.probe_sequence[0].actions[0].hold_seconds >= 600,
+      "W4.48b-move-during-hold: the hold must be long enough for the during-hold moves");
+    assert.equal(w448bHold.chaos.type, "move-branch",
+      "W4.48b-move-during-hold: the target move is the typed move-branch chaos (cadence keeps moving DURING the hold)");
+    assert.ok(!w448bHold.oracles.includes("O16"),
+      "W4.48b-move-during-hold must not declare O16 (its resume-completes leg cannot judge the {relaunch, paused-no-relaunch} branch)");
     // W4.48c is the compound: typed delete-tstx-row + drain barrier + slow-suite
     // sizing; W4.48a is the typed kill-daemon chaos block.
     const w448c = recordById(records, "W4.48c-compound-gate-degradation");
@@ -263,7 +311,8 @@ describe("Tier-2 US-005 — section-B/G roster (moving targets & rugpull + compo
       assert.equal(record.context?.test_cmd, canonical,
         `${record.id}: context.test_cmd must be the fixture's canonical TEST_CMD (${canonical}), got ${JSON.stringify(record.context?.test_cmd)}`);
     }
-    assert.equal(workflowCases, 11, "all 11 section-B/G cases are workflow-launching real cases");
+    assert.equal(workflowCases, 9,
+      "9 of the 13 section-B/G cases are workflow-launching REAL cases (S49: the W4.33d/W4.48b split cells are scripted-pi and do not launch a real harness)");
   });
 
   it("every bug-fix section-B/G case's seed exists in the fixture SEEDS.md catalog and its task names the seeded defect", () => {
@@ -278,12 +327,19 @@ describe("Tier-2 US-005 — section-B/G roster (moving targets & rugpull + compo
     }
   });
 
-  it("E3.D calibration holds for the section-B/G rows (floors never below family p50)", () => {
+  it("E3.D calibration holds for the REAL section-B/G rows (floors never below family p50); the S49 scripted split cells carry zero-token caps", () => {
     for (const record of readManifest()) {
       if (!SECTION_BG_IDS.includes(record.id)) continue;
-      assert.ok(record.caps.wall_min > 0 && record.caps.tokens > 0, `${record.id}: real case caps must be positive`);
       assert.ok(record.production_duration_floor_ms > 0,
         `${record.id}: must carry production_duration_floor_ms (E3.D calibration record)`);
+      if (record.harness === "scripted-pi") {
+        // S49 split cells: scripted + zero-token (bare --tier2), never a
+        // real-harness E3.D budget.
+        assert.equal(record.caps.tokens, 0, `${record.id}: the S49 split cell must be zero-token`);
+        assert.ok(record.caps.wall_min > 0, `${record.id}: scripted cell wall cap must be positive`);
+        continue;
+      }
+      assert.ok(record.caps.wall_min > 0 && record.caps.tokens > 0, `${record.id}: real case caps must be positive`);
       if (record.workflow === "bug-fix-merge-worktree") {
         assert.ok(record.caps.wall_min >= 35,
           `${record.id}: bfmw wall cap at/above the family p50 35-min floor (got ${record.caps.wall_min})`);
@@ -310,7 +366,7 @@ describe("Tier-2 US-005 — section-B/G roster (moving targets & rugpull + compo
     }
   });
 
-  it("task files exist for all 11 section-B/G cases under cases/tasks/tier2/ and describe the fixture's actual contents", () => {
+  it("task files exist for all 13 section-B/G cases under cases/tasks/tier2/ and describe the fixture's actual contents", () => {
     for (const record of readManifest()) {
       if (!SECTION_BG_IDS.includes(record.id)) continue;
       assert.equal(typeof record.task, "string", `${record.id}: task path required`);

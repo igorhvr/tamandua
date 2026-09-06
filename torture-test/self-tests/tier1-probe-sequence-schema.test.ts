@@ -119,8 +119,9 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
     assert.equal(action.additionalProperties, false, "probeAction must forbid unknown properties");
     assert.deepEqual(action.required, ["op", "when"], "probeAction must require op + when");
     assert.deepEqual(action.properties.op.enum, PROBE_OPS, "op enum must be exactly the eleven E3.C + S44a probe verbs");
-    // S18b: `when` is an anyOf — the string phase-marker form AND the awaited
-    // object-trigger form ({"status":...,"timeout_s":N} | {"event":...,"timeout_s":N}).
+    // S18b / S62: `when` is an anyOf — the string phase-marker form AND the
+    // awaited object-trigger form ({"status":...,"timeout_s":N} |
+    // {"event":...,"timeout_s":N} | {"daemon_log":...,"timeout_s":N}).
     const when = action.properties.when;
     assert.ok(Array.isArray(when.anyOf), "when must be an anyOf (string marker | awaited object trigger)");
     const stringArm = when.anyOf.find((arm: any) => arm.type === "string");
@@ -128,25 +129,31 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
     assert.ok(stringArm, "when must keep the string phase-marker form");
     assert.equal(stringArm.pattern, WHEN_PATTERN, "when string form must enforce the phase-marker format");
     assert.ok(objectArm, "when must add the awaited object-trigger form");
-    // The two alternatives (status vs event) are complete object forms inside
-    // an anyOf — the controller's bundled validator implements anyOf but NOT
-    // oneOf, and the per-arm additionalProperties:false rejects both-at-once
-    // while the per-arm required enforces timeout_s.
-    assert.ok(Array.isArray(objectArm.anyOf) && objectArm.anyOf.length === 2,
-      "when object form must carry exactly two complete alternatives (status | event)");
+    // The three alternatives (status vs event vs daemon_log) are complete
+    // object forms inside an anyOf — the controller's bundled validator
+    // implements anyOf but NOT oneOf, and the per-arm
+    // additionalProperties:false rejects two-at-once while the per-arm
+    // required enforces timeout_s.
+    assert.ok(Array.isArray(objectArm.anyOf) && objectArm.anyOf.length === 3,
+      "when object form must carry exactly three complete alternatives (status | event | daemon_log)");
     const statusArm = objectArm.anyOf.find((arm: any) => arm.properties?.status !== undefined);
     const eventArm = objectArm.anyOf.find((arm: any) => arm.properties?.event !== undefined);
-    assert.ok(statusArm && eventArm, "when object form must have a status arm and an event arm");
-    for (const arm of [statusArm, eventArm]) {
+    const daemonLogArm = objectArm.anyOf.find((arm: any) => arm.properties?.daemon_log !== undefined);
+    assert.ok(statusArm && eventArm && daemonLogArm,
+      "when object form must have a status arm, an event arm and a daemon_log arm");
+    for (const arm of [statusArm, eventArm, daemonLogArm]) {
       assert.equal(arm.type, "object", "each when object alternative must be typed object");
       assert.equal(arm.additionalProperties, false, "each when object alternative must forbid unknown properties");
-      assert.deepEqual(arm.required, [arm.properties.status !== undefined ? "status" : "event", "timeout_s"],
+      const key = arm.properties.status !== undefined ? "status" : arm.properties.event !== undefined ? "event" : "daemon_log";
+      assert.deepEqual(arm.required, [key, "timeout_s"],
         "each when object alternative must require its key + timeout_s");
       assert.equal(arm.properties.timeout_s.type, "number", "when object timeout_s must be typed number");
       assert.equal(arm.properties.timeout_s.exclusiveMinimum, 0, "when object timeout_s must be > 0");
     }
     assert.equal(statusArm.properties.status.type, "string", "when object status must be typed string");
     assert.equal(eventArm.properties.event.type, "string", "when object event must be typed string");
+    assert.equal(daemonLogArm.properties.daemon_log.type, "string", "when object daemon_log must be typed string");
+    assert.equal(daemonLogArm.properties.daemon_log.minLength, 1, "when object daemon_log must be a non-empty needle");
     assert.equal(action.properties.hold_seconds.type, "number", "hold_seconds must be typed number");
     assert.equal(action.properties.hold_seconds.exclusiveMinimum, 0, "hold_seconds must be > 0");
 
@@ -329,8 +336,8 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
     }, /probe_sequence/);
   });
 
-  it("accepts the awaited object when triggers (status and event) and rejects malformed object forms (S18b)", () => {
-    // Both object forms validate through the production --validate-only path.
+  it("accepts the awaited object when triggers (status, event and daemon_log) and rejects malformed object forms (S18b/S62)", () => {
+    // All three object forms validate through the production --validate-only path.
     const statusTrigger = buildCaseManifest({
       id: "T-WHEN-OBJECT-STATUS",
       probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", timeout_s: 120 } }] }],
@@ -351,13 +358,30 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
     } finally {
       fs.rmSync(path.dirname(eventTrigger), { recursive: true, force: true });
     }
+    const daemonLogTrigger = buildCaseManifest({
+      id: "T-WHEN-OBJECT-DAEMON-LOG",
+      probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { daemon_log: "Worker round classified as instant fail", timeout_s: 600 } }] }],
+    });
+    try {
+      const res = runValidate(daemonLogTrigger);
+      assert.equal(res.status, 0, `object daemon_log when must validate:\n${res.stdout}${res.stderr}`);
+    } finally {
+      fs.rmSync(path.dirname(daemonLogTrigger), { recursive: true, force: true });
+    }
     // Malformed object forms are REJECTED fail-closed: missing timeout_s,
-    // both status+event at once, unknown key, and non-positive timeout.
+    // two keys at once, empty daemon_log needle, unknown key, and
+    // non-positive timeout.
     expectRejected("object when missing timeout_s", {
       probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused" } }] }],
     }, /missing or invalid 'when' phase marker|does not match any allowed schema/);
     expectRejected("object when with both status and event", {
       probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", event: "run.process_cleanup", timeout_s: 120 } }] }],
+    }, /missing or invalid 'when' phase marker|does not match any allowed schema/);
+    expectRejected("object when mixing status and daemon_log", {
+      probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", daemon_log: "classified as instant fail", timeout_s: 120 } }] }],
+    }, /missing or invalid 'when' phase marker|does not match any allowed schema/);
+    expectRejected("object when with an empty daemon_log needle", {
+      probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { daemon_log: "", timeout_s: 120 } }] }],
     }, /missing or invalid 'when' phase marker|does not match any allowed schema/);
     expectRejected("object when with an unknown key", {
       probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", timeout_s: 120, bogus: 1 } }] }],

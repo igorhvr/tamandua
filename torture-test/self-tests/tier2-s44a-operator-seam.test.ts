@@ -168,6 +168,6 @@ describe("S44a — operator-seam controller actions (US-009)", () => {
   it("the existing tier2 manifest still validates with the extended schema + semantic layer", () => {
     const res = runValidate(path.join(ttRoot, "cases", "tier2.jsonl"));
     assert.equal(res.status, 0, `tier2 manifest must validate:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 });

@@ -4,7 +4,7 @@
 // Pins the section-I/J/K batch of cases/tier2.jsonl:
 //   * the 12 new rows exist (W4.40 x4, W4.41 x2, W4.42, W4.43, W4.44a/b,
 //     W4.46, W4.47) and tt-controller --manifest cases/tier2.jsonl
-//     --validate-only exits 0 (Validated 70 case(s)) — AC1;
+//     --validate-only exits 0 (Validated 72 case(s)) — AC1;
 //   * W4.40 has all FOUR stream arms (delayed-trailer / oversized-stdout /
 //     trailer-absent / malformed-trailer) and W4.41 has BOTH resolver arms
 //     (login-shell-tier / all-tiers-fail) + the zero-filesystem-mutation
@@ -19,7 +19,7 @@
 //     to prove the tier-3 win + all-tiers-fail refusal + zero-filesystem-
 //     mutation (the direct-execution pattern);
 //   * traceability rows + the section-I/J/K maps + exclusion enumerations +
-//     machinery-delta rows + token budgets exist; manifest summary shows 70.
+//     machinery-delta rows + token budgets exist; manifest summary shows 72.
 //
 // Confined to torture-test/ (writes only under gitignored var/). Zero tokens.
 import assert from "node:assert/strict";
@@ -126,7 +126,7 @@ describe("Tier-2 US-012 — sections I/J/K roster (hermes stream & resolver tort
     }
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("W4.40 has all four stream arms — zero-token scripted-hermes workflow rows with per-arm knob cells (AC2)", () => {
@@ -431,10 +431,10 @@ describe("Tier-2 US-012 — sections I/J/K roster (hermes stream & resolver tort
           `${id}: task must name its scenario cell (${CELL_DIRS[id]})`);
       }
     }
-    // No leftover extra files beyond the 70 authored.
+    // No leftover extra files beyond the 72 authored.
     const authored = fs.readdirSync(tasksDir).filter((name) => name.endsWith(".md")).sort();
     const expected = records.map((record) => path.basename(record.task)).sort();
-    assert.deepEqual(authored, expected, "cases/tasks/tier2/ must contain exactly the 70 authored task files");
+    assert.deepEqual(authored, expected, "cases/tasks/tier2/ must contain exactly the 72 authored task files");
   });
 
   it("the traceability report carries the section-I/J/K maps, exclusion enumerations, machinery deltas, and token budgets", () => {
@@ -448,8 +448,8 @@ describe("Tier-2 US-012 — sections I/J/K roster (hermes stream & resolver tort
     assert.match(trace, /## Token Budget Note \(section I\)/, "section-I token budget note");
     assert.match(trace, /## Token Budget Note \(section J\)/, "section-J token budget note");
     assert.match(trace, /## Token Budget Note \(section K\)/, "section-K token budget note");
-    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*/,
-      "manifest summary must show 70 cases");
+    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*/,
+      "manifest summary must show 72 cases");
     assert.match(trace, /| Wave 4 section I \(hermes stream & resolver torture\) \| 6 /,
       "manifest summary must show the 6 section-I rows");
     assert.match(trace, /| Wave 4 section J \(launch & control-plane hostility\) \| 4 /,

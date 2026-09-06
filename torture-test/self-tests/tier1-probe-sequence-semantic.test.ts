@@ -181,12 +181,13 @@ describe("E3.C US-005 — controller probe_sequence semantic validation (fail-cl
     );
   });
 
-  // S18b: the trigger vocabulary gains AWAITED object forms — a valid object
-  // `when` is a plain object with timeout_s > 0 and exactly ONE of status
-  // (nonempty string) / event (nonempty string). The semantic layer accepts
-  // them (defense-in-depth below the schema) and rejects malformed objects
-  // with the SAME distinct 'missing or invalid when' reason.
-  it("accepts the awaited object when forms (status and event) in --validate-only (S18b)", () => {
+  // S18b / S62: the trigger vocabulary gains AWAITED object forms — a valid
+  // object `when` is a plain object with timeout_s > 0 and exactly ONE of
+  // status (nonempty string) / event (nonempty string) / daemon_log (nonempty
+  // string needle). The semantic layer accepts them (defense-in-depth below
+  // the schema) and rejects malformed objects with the SAME distinct
+  // 'missing or invalid when' reason.
+  it("accepts the awaited object when forms (status, event and daemon_log) in --validate-only (S18b/S62)", () => {
     const builtStatus = buildCaseManifest("W3.18-pause-no-drain", {
       probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", timeout_s: 120 } }] }],
     });
@@ -205,9 +206,18 @@ describe("E3.C US-005 — controller probe_sequence semantic validation (fail-cl
     } finally {
       fs.rmSync(builtEvent.dir, { recursive: true, force: true });
     }
+    const builtLog = buildCaseManifest("W3.18-pause-no-drain", {
+      probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { daemon_log: "Worker round classified as instant fail", timeout_s: 600 } }] }],
+    });
+    try {
+      const res = runValidate(builtLog.manifest);
+      assert.equal(res.status, 0, `object daemon_log when must validate:\n${res.stdout}${res.stderr}`);
+    } finally {
+      fs.rmSync(builtLog.dir, { recursive: true, force: true });
+    }
   });
 
-  it("rejects an invalid object when with the distinct 'missing or invalid when' reason (S18b)", () => {
+  it("rejects an invalid object when with the distinct 'missing or invalid when' reason (S18b/S62)", () => {
     expectRejected(
       "object when missing timeout_s",
       "W3.18-pause-no-drain",
@@ -218,6 +228,18 @@ describe("E3.C US-005 — controller probe_sequence semantic validation (fail-cl
       "object when with both status and event",
       "W3.18-pause-no-drain",
       { probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", event: "run.process_cleanup", timeout_s: 120 } }] }] },
+      /case "W3\.18-pause-no-drain": .*action 1 \(op "resume"\): missing or invalid 'when' phase marker/,
+    );
+    expectRejected(
+      "object when mixing status and daemon_log",
+      "W3.18-pause-no-drain",
+      { probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", daemon_log: "classified as instant fail", timeout_s: 120 } }] }] },
+      /case "W3\.18-pause-no-drain": .*action 1 \(op "resume"\): missing or invalid 'when' phase marker/,
+    );
+    expectRejected(
+      "object when with an empty daemon_log needle",
+      "W3.18-pause-no-drain",
+      { probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { daemon_log: "", timeout_s: 120 } }] }] },
       /case "W3\.18-pause-no-drain": .*action 1 \(op "resume"\): missing or invalid 'when' phase marker/,
     );
     expectRejected(

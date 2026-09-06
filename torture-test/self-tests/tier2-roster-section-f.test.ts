@@ -3,7 +3,7 @@
 // Pins the section-F batch of cases/tier2.jsonl:
 //   * the 6 new rows exist (W4.26, W4.28, W4.30, W4.31, W4.45-gc-aggressive,
 //     W4.45-branch-delete) and tt-controller --manifest cases/tier2.jsonl
-//     --validate-only exits 0 (Validated 70 case(s) after US-012);
+//     --validate-only exits 0 (Validated 72 case(s) after US-012);
 //   * all 6 are real pi bfmw runs on tt-ts with the canonical TEST_CMD
 //     (npm test), E3.D bfmw floors+caps (wall >= 35 p50 floor, tokens 1M
 //     p95), and E2.2 requires (toolchains node, node_min 22);
@@ -24,7 +24,7 @@
 //     texts name the --expect-tip CAS and the never-a-silent-resurrect
 //     expectation;
 //   * traceability rows: section-F map + exclusion enumeration + machinery
-//     deltas + token budget; manifest summary showsTotal Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*.
+//     deltas + token budget; manifest summary shows Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*.
 //
 // Confined to torture-test/ (writes only under gitignored var/). Zero tokens.
 import assert from "node:assert/strict";
@@ -119,7 +119,7 @@ describe("Tier-2 US-010 — section-F roster (weird-git target repos)", () => {
     }
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("all 6 section-F cases are real pi bfmw runs on tt-ts with canonical TEST_CMD and E3.D floors+caps", () => {
@@ -374,8 +374,8 @@ describe("Tier-2 US-010 — section-F roster (weird-git target repos)", () => {
     assert.match(trace, /## Case ↔ Spec Reference Map — Wave 4 Section F/, "section-F reference map header");
     assert.match(trace, /## Excluded Scenarios — Complete Enumeration \(section F\)/, "section-F exclusion enumeration");
     assert.match(trace, /## Token Budget Note \(section F\)/, "section-F token budget note");
-    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*70\*\*/,
-      "manifest summary must show 70 cases");
+    assert.match(trace, /Total Tier-2 cases \(sections A \+ B \+ G \+ C1 \+ C2 \+ D \+ E \+ F \+ H \+ I \+ J \+ K \+ dsh lane \+ W5 storm\) \| \*\*72\*\*/,
+      "manifest summary must show 72 cases");
     assert.match(trace, /| Wave 4 section F \(weird-git target repos\) \| 6 /,
       "manifest summary must show the 6 section-F rows");
     for (const id of SECTION_F_IDS) {

@@ -2,7 +2,7 @@
 //
 // Pins the section-C1 batch of cases/tier2.jsonl:
 //   * the 6 new rows exist and tt-controller --manifest cases/tier2.jsonl
-//     --validate-only exits 0 (Validated 70 case(s) after US-012);
+//     --validate-only exits 0 (Validated 72 case(s) after US-012);
 //   * W4.09's pi + hermes rows carry the typed kill-harness chaos block
 //     (target harness_process, SIGKILL, armed at step:developer:running per
 //     US-003); the hermes row gates honestly on requires.capabilities
@@ -121,7 +121,7 @@ describe("Tier-2 US-006 — section-C1 roster (process & daemon violence)", () =
     }
     const res = run(controller, ["--manifest", manifestPath, "--validate-only"]);
     assert.equal(res.status, 0, `tt-controller --validate-only must exit 0:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
   });
 
   it("W4.09's pi and hermes rows carry the typed kill-harness chaos block (US-003 schema) and the hermes row gates on its presence", () => {

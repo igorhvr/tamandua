@@ -125,13 +125,17 @@ HEAVY_CAMPAIGN_TESTS=(
     # declared triggers with per-action evidence and the contained runs
     # recover — heavy/isolated like the tier1 scripted battery.
     'tier2-s44-operator-seam-corridors.test.ts'
-    # US-004 (S29): tier2-s29-premise-redesign-corridor drives the real
-    # controller + scripted daemon with pinned harness binaries to prove the
-    # REDESIGNED premise is genuinely reachable — the typed move-branch chaos
-    # makes event:run.failed (W4.33d reroute exhaustion) and
-    # event:merge.target_moved (W4.48b) fire, and the probe actions armed on
-    # them (resume / pause) execute with recorded probe evidence —
-    # heavy/isolated like the tier1 scripted battery.
+    # US-010 (S49): tier2-s29-premise-redesign-corridor now drives the S49
+    # SPLIT battery — the four W4.33d/W4.48b split cells
+    # (W4.33d-reroute-absorption, W4.33d-resume-force-fail,
+    # W4.48b-park-absorption, W4.48b-move-during-hold) execute their scripted
+    # corridors through the real controller + scripted daemon: the absorption
+    # cells absorb the typed move-branch fault (reroute/PARK — never
+    # run.failed), the resume-force-fail cell CONSTRUCTS the failure with the
+    # CLI force-fail and resumes, and the move-during-hold cell pauses then
+    # moves the target during the hold — heavy/isolated like the tier1
+    # scripted battery (the S29/S36 re-arm premise corridor it superseded is
+    # documented in cases/tier2-traceability.md §S49).
     'tier2-s29-premise-redesign-corridor.test.ts'
 )
 

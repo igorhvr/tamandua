@@ -1534,7 +1534,10 @@ fi
 echo ""
 echo "--- Test: graceful stop via tamandua CLI ---"
 
-if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'tamandua dashboard stop'; then
+# S55: the graceful stop invokes dashboard stop through the resolved
+# launcher (resolve_tt_cli — the worktree's own bin/tamandua by absolute
+# path, never a PATH lookup). The dashboard-stop CLI surface is unchanged.
+if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'dashboard stop'; then
   pass "cmd_stop runs tamandua dashboard stop for graceful shutdown"
 else
   fail "cmd_stop missing tamandua dashboard stop"

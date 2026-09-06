@@ -44,10 +44,10 @@ US-014).
 
 | Metric | Value |
 |--------|-------|
-| Total Tier-2 cases (sections A + B + G + C1 + C2 + D + E + F + H + I + J + K + dsh lane + W5 storm) | **70** |
+| Total Tier-2 cases (sections A + B + G + C1 + C2 + D + E + F + H + I + J + K + dsh lane + W5 storm) | **72** |
 | Wave 4 section A (merge-gate & evidence corridor) | 10 |
 | Wave 4 section B (moving targets & rugpull) | 4 (W4.06, W4.07, W4.08-no-relaunch, W4.08-control) |
-| Wave 4 section G (composition & resume) | 7 (W4.33a–d, W4.48a–c) |
+| Wave 4 section G (composition & resume) | 9 (W4.33a/b/c + the W4.33d S49 split pair, W4.48a/c + the W4.48b S49 split pair) |
 | Wave 4 section C1 (process & daemon violence) | 6 (W4.09-pi, W4.09-hermes, W4.10-kill-daemon, W4.10-restart-recovery, W4.27-shim-exit-matrix, W4.32-enospc) |
 | Wave 4 section C2 (daemon & launch violence) | 3 (W4.11-sigkill-launch-matrix, W4.12-port-squatter, W4.13-worktree-deletion) |
 | Wave 4 section D (contract & behavioral traps) | 10 (W4.14-verdict-trap, W4.15-story-flood, W4.16-scope-bait, W4.17-a, W4.17-b, W4.18-flaky-alternator, W4.38-hostile-task-scripted, W4.38-hostile-task-real, W4.39-a-union-honest, W4.39-b-union-dishonest) |
@@ -59,8 +59,8 @@ US-014).
 | Wave 4 section K (provider & auth faults) | 2 (W4.46-provider-error-rounds, W4.47-auth-expiry-copy) |
 | dsh lane (operator-directed alpha harness) | 4 (W4.dsh-do-now, W4.dsh-bfmw, W4.dsh-fdmw, W4.dsh-lifecycle) |
 | Wave 5 storm (capacity-scaled, two-round briefing) | 1 (W5.storm-capacity-scaled) |
-| Real (token-bearing) cases | 45 |
-| Scripted (zero-token) cases | 25 (W4.04c scripted-pi, W4.36 scripted-pi, W4.38-hostile-task-scripted scripted-pi, W4.39-a-union-honest scripted-pi, W4.27 local-command scenario, W4.11 local-command scenario, W4.12 local-command scenario, W4.19 local-command scenario, W4.20 local-command scenario, W4.34 local-command scenario, W4.21 local-command scenario, W4.22 local-command scenario, W4.23 local-command scenario, W4.24 local-command scenario, W4.40 × 4 scripted-hermes, W4.41 × 2 scripted-hermes, W4.42 local-command scenario, W4.43 local-command scenario, W4.44a local-command scenario, W4.44b local-command scenario, W4.46 scripted-pi) |
+| Real (token-bearing) cases | 43 |
+| Scripted (zero-token) cases | 29 (W4.04c scripted-pi, W4.36 scripted-pi, W4.38-hostile-task-scripted scripted-pi, W4.39-a-union-honest scripted-pi, W4.33d-reroute-absorption scripted-pi, W4.33d-resume-force-fail scripted-pi, W4.48b-park-absorption scripted-pi, W4.48b-move-during-hold scripted-pi (S49 split cells), W4.27 local-command scenario, W4.11 local-command scenario, W4.12 local-command scenario, W4.19 local-command scenario, W4.20 local-command scenario, W4.34 local-command scenario, W4.21 local-command scenario, W4.22 local-command scenario, W4.23 local-command scenario, W4.24 local-command scenario, W4.40 × 4 scripted-hermes, W4.41 × 2 scripted-hermes, W4.42 local-command scenario, W4.43 local-command scenario, W4.44a local-command scenario, W4.44b local-command scenario, W4.46 scripted-pi) |
 | Spec-estimated section-A scenarios (08 §A) | 10 (W4.01–W4.05 × 3 arms, W4.29, W4.36, W4.37) |
 | Section-A coverage | **10/10 — zero spec'd section-A scenarios excluded** |
 | Spec-estimated section-B scenarios (08 §B) | 3 (W4.06, W4.07, W4.08 × 2 variants) |
@@ -514,16 +514,19 @@ Every row carries `spec_ref` into `08-wave-4-fault-injection.md` §G.
 | Case ID | spec_ref | Fixture | Seed | Harness | Workflow | Mode | Injection | Expected (O10 unless noted) |
 |---------|----------|---------|------|---------|----------|------|-----------|------------------------------|
 | W4.33a-daemon-restart-resume | `#W4.33` | tt-ts | BUG-T3 | pi | bug-fix-merge-worktree | real | pause_drain at `step:fixer:running` (hold 600; S29 calibration US-002 — the bfmw coding step, agent `fixer`) → FIRST-CLASS `restart_contained_daemon` (`during_hold: true` — S44a/S44b wired action: daemon-control restart of the CONTAINED daemon concurrent with the hold) → resume | paused run continues cleanly after the daemon restart; pause state survives (DB-durable), O16 `run_completes`; EXCLUSIVE WINDOW (daemon-lifecycle) |
-| W4.33b-update-under-it-resume | `#W4.33` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | pause at `step:fixer:running` (hold 600; S29 calibration US-002) → FIRST-CLASS `update_contained_install` (`during_hold: true` — S44a/S44b wired action: contained `tamandua update --force` concurrent with the hold) → resume | defined YAML-version behavior surfaced not silent; resumed run completes with truthful annotation chain; O16 `no_rounds_during_hold` + `run_completes` |
+| W4.33b-update-under-it-resume | `#W4.33` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | pause at `step:fixer:running` (hold 600; S29 calibration US-002) → FIRST-CLASS `update_contained_install` (`during_hold: true` — S44a/S44b wired action: contained `tamandua update --force` concurrent with the hold; S45 two arms: executed when a contained install is on the PATH, EXPECTED escape-refusal PASS when the env resolves only the operator's live checkout) → resume | defined YAML-version behavior surfaced not silent (executed arm); escape refusal recorded + sequence continues (S45 refusal arm); resumed run completes with truthful annotation chain; O16 `no_rounds_during_hold` + `run_completes` |
 | W4.33c-deleted-worktree-refusal | `#W4.33` | tt-ts | BUG-T2 | pi | bug-fix-merge-worktree | real | operator deletes the run worktree out-of-band mid-run (W4.13 composition; no typed probe op) → operator `workflow resume` | diagnosable refusal, NEVER a silent fallback into the wrong directory (DC25 contamination fossil); `run_worktrees` reflects reality; no O16 (resume-refusal would trip the hardcoded resume-completes leg) |
-| W4.33d-reroute-exhaustion-resume | `#W4.33` | tt-ts | BUG-T4 | pi | bug-fix-merge-worktree | real | TYPED `move-branch` chaos (US-004) in per-attempt RE-ARM mode (US-007 S36: `rearm: true, rearm_hold_s: 3` — each fresh `step:finalize_merge:running` occurrence triggers the next move) exhausts finalize `max_reroutes: 8` → run permanently fails → operator removes the condition (chaos loop's run-terminal stand-down) → probe `resume` armed on `event:run.failed` | resume picks up from the failed step with context intact (AGENTS.md documented path); run completes; O16 `run_completes` |
+| W4.33d-reroute-absorption | `#W4.33` | tt-ts | BUG-T4 | scripted-pi | bug-fix-merge-worktree | scripted | TYPED `move-branch` chaos (US-004) in per-attempt RE-ARM mode (US-007 S36: `rearm: true, rearm_hold_s: 2`, 2 moves — each fresh `step:finalize_merge:running` occurrence triggers the next move) injects the colleague target-move that the reroute corridor **ABSORBS** (S49 split igorhvr item 6 — absorption-assertion arm; the former real reroute-exhaustion premise is retired: three real-campaign redesigns never fired it because the product absorbs the moves) | reroute ABSORBS the injected fault: `merge.target_moved` + ≥ 1 `step.rerouted` → clean single landing → `run.completed`; never `run.failed`, never a wedge, never a double landing on the absorbed move — RED on absorption regression; zero tokens |
 | W4.48a-daemon-kill-mid-park | `#W4.48` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | TYPED chaos `kill-daemon` SIGKILL at `step:finalize_merge:running` (park-event approximation — no product `merge.park*` event, see below) → FIRST-CLASS `restart_contained_daemon` armed on the SAME trigger (S44a/S44b wired action: daemon-control restart of the CONTAINED daemon) | PARK crash-safety: landing completes from the parked state OR park branch survives intact for manual landing; NEVER a lost diff / half-applied target; EXCLUSIVE WINDOW (daemon-lifecycle) |
-| W4.48b-pause-rugpull-window | `#W4.48` | tt-ts | BUG-T2 | pi | bug-fix-merge-worktree | real | target move during finalize (untyped) + probe `pause` armed on `event:merge.target_moved` (hold 600) → resume; characterization (one-of-two) | EXACTLY one of {relaunch, paused-no-relaunch}; NEVER a relaunch that starts paused-orphaned; NEVER double relaunch on resume; no O16 (resume-completes leg hardcodes the single-run corridor) |
+| W4.33d-resume-force-fail | `#W4.33` | tt-ts | BUG-T4 | scripted-pi | bug-fix-merge-worktree | scripted | probe `fail_force` at `step:finalize_merge:running` — the contained CLI `workflow fail --force` **CONSTRUCTS** the terminal failed state (no chaos race) → probe `resume` armed on `event:run.force_failed` (S49 split igorhvr item 6 — directly-constructed-state arm; the resume VECTOR the retired exhaustion premise could not fire) | resume after the CLI force-fail: the SAME run restarts from the interrupted finalize with context intact and completes (AGENTS.md documented path); O16 `run_completes`; zero tokens |
+| W4.48b-park-absorption | `#W4.48` | tt-ts | BUG-T2 | scripted-pi | bug-fix-merge-worktree | scripted | TYPED `move-branch` chaos (US-004) in per-attempt RE-ARM mode (US-007 S36: `rearm: true, rearm_hold_s: 2`, 2 moves) at `step:finalize_merge:running` — the moved landing is **ABSORBED** by the merger PARK machinery (S49 split igorhvr item 6 — absorption-assertion arm; the former real pause-rugpull premise is retired: the S37 observation shows the product parks the moved target and recovers cleanly) | PARK ABSORBS the injected fault: the moved-tip attempt parks (a `*-tamandua-parked-*` backup ref) → a single truthful re-attempt landing → `run.completed`; never a lost diff, never a double landing, never a paused-orphan replacement — RED on absorption regression; zero tokens |
+| W4.48b-move-during-hold | `#W4.48` | tt-ts | BUG-T2 | scripted-pi | bug-fix-merge-worktree | scripted | probe `pause` at `step:finalize_merge:running` (hold 600) FIRST, then the TYPED `move-branch` chaos cadence moves the target **DURING the hold** (the run is held; the external chaos loop keeps moving) → probe `resume` — the moved-target state is CONSTRUCTED, never raced (S49 split igorhvr item 6 — directly-constructed-state arm) | characterization one-of-two: EXACTLY one of {relaunch, paused-no-relaunch}; NEVER a relaunch that starts paused-orphaned; NEVER double relaunch on resume; no O16 (resume-completes leg hardcodes the single-run corridor); zero tokens |
 | W4.48c-compound-gate-degradation | `#W4.48` | tt-poly | POLY-BUG-T1 | pi | bug-fix-merge-worktree | real | W4.05's slow suite (`arm-slow` seam — delta) + colleague target commit (untyped) + TYPED `delete-tstx-row` at `step:finalize_merge:pending` under a 40-min drain hold | terminal + truthful: correct annotation chain (`landed_without_suite_evidence` if conceded; `MERGED_TREE != TESTED_TREE` fail-loud if moved); the three valves must NOT compose into a silent green; EXCLUSIVE WINDOW (drain-armed deletion corridor) |
 
-**Section G count:** 7 rows; all 2 spec'd section-G scenarios present
-(W4.33's four legs and W4.48's three arms are separate terminal rows). Zero
-silent trims.
+**Section G count:** 9 rows; all 2 spec'd section-G scenarios present
+(W4.33's four legs and W4.48's three arms are separate terminal rows; the
+S49 split makes W4.33d and W4.48b each a pair — an absorption-assertion cell
+plus a directly-constructed-state cell). Zero silent trims.
 
 ## Scripted W4 Cells Referenced from the Tier-0 Library (referenced, never duplicated)
 
@@ -574,7 +577,7 @@ mechanically complete and any future trim is recorded, never silent.
 
 | Scenario | Spec Section | Reason |
 |----------|-------------|--------|
-| *(none — section G fully covered)* | `08-wave-4-fault-injection.md` §G | All 2 section-G scenarios (W4.33, W4.48) are authored in `cases/tier2.jsonl`; W4.33's four resume legs (`W4.33a`–`W4.33d`) and W4.48's three composed-fault arms (`W4.48a`–`W4.48c`) are separate terminal rows so each corridor is a distinct outcome. |
+| *(none — section G fully covered)* | `08-wave-4-fault-injection.md` §G | All 2 section-G scenarios (W4.33, W4.48) are authored in `cases/tier2.jsonl`; W4.33's four resume legs (`W4.33a`–`W4.33d`) and W4.48's three composed-fault arms (`W4.48a`–`W4.48c`) are separate terminal rows so each corridor is a distinct outcome. The S49 split (igorhvr item 6) replaces the real W4.33d reroute-exhaustion and W4.48b pause-rugpull rows with SCRIPTED absorption-assertion + directly-constructed-state cells (`W4.33d-reroute-absorption`/`W4.33d-resume-force-fail`, `W4.48b-park-absorption`/`W4.48b-move-during-hold`) that execute in bare --tier2 — see the S49 section. |
 
 ## Case ↔ Spec Reference Map — Wave 4 Section C1 (process & daemon violence)
 
@@ -781,7 +784,7 @@ Every row carries `spec_ref` into `08-wave-4-fault-injection.md` §K.
 | Case ID | spec_ref | Fixture | Harness | Workflow | Mode | Injection | Expected |
 |---------|----------|---------|---------|----------|------|-----------|------------------------------|
 | W4.46-provider-error-rounds | `#W4.46` | tt-ts (BUG-T1) | scripted-pi | bug-fix-merge-worktree | scripted | cell `scenarios/w4.46/provider-error-rounds/` — scripted-pi behaviors emit on SUCCESSIVE rounds of the fixer step: 429 → 529 → mid-stream-drop → success (behavior ARRAY, one entry per invocation) | Each error round classified retryable and retried WITH BACKOFF (inter-attempt spacing visible in the step's event timestamps — never an instant hammer); step eventually completes; tokens attributed only for rounds that reported usage (total 0); NONE of the error rounds counts as an agent strike (PROVIDER_FAIL discipline, O11 — zero abandonment events) |
-| W4.47-auth-expiry-copy | `#W4.47` | tt-ts | pi | do-now | real | FIRST-CLASS `invalidate_credentials` armed on `now` (S44a/S44b wired action: replace the COPIED `$TT_HOME/.pi/agent/auth.json` with an invalid token — never the real `~/.pi`) → the do-now's first round fails with a diagnosable auth error → FIRST-CLASS `restore_credentials` armed on `event:step.running` (fires at the retried round's dispatch — the relaunch; byte-identical restore) → the retried round completes | Auth failure surfaces as a DIAGNOSABLE provider/auth error naming the harness (pi) — never a silent zero-token "completion", never a fallback to the REAL `~/.pi` (O15: the real credential file's atime/audit trail shows no access — an isolation-breach S0 otherwise); post-restore launch is clean |
+| W4.47-auth-expiry-copy | `#W4.47` | tt-ts | pi | do-now | real | FIRST-CLASS `invalidate_credentials` armed on `now` (S44a/S44b wired action: replace the COPIED `$TT_HOME/.pi/agent/auth.json` with an invalid token — never the real `~/.pi`) → the do-now's first round fails with a diagnosable auth error (an instant-fail loop — the round exits before claiming) → FIRST-CLASS `restore_credentials` armed on the run's first instant-fail classification in the contained daemon's log (S62 re-arm — the awaited trigger `{"daemon_log":"Worker round classified as instant fail","timeout_s":600}`; the old `event:step.running` arming can never fire when rounds exit before claiming) → the relaunch runs with valid credentials and completes (byte-identical restore) | Auth failure surfaces as a DIAGNOSABLE provider/auth error naming the harness (pi) — never a silent zero-token "completion", never a fallback to the REAL `~/.pi` (O15: the real credential file's atime/audit trail shows no access — an isolation-breach S0 otherwise); post-restore launch is clean |
 
 **Section K count:** 2 rows; both spec'd section-K scenarios present (W4.46,
 W4.47). Zero silent trims.
@@ -887,7 +890,7 @@ and the gap recorded here. Zero silent trims.
 | W4.06 / W4.07 / W4.08-no-relaunch / W4.08-control / W4.33d / W4.48b / W4.48c (colleague target moves) | `08-wave-4-fault-injection.md` §B W4.06/07/08 + §G W4.33/48 | The injections are tt-chaos `colleague-commit` (competing commits from a second-clone perspective) and `move-branch` (target ref movement). **US-004 (S29 premise redesign) exposes `move-branch` in the typed manifest chaos block** (`type: move-branch, target: origin_target_ref, ref, repeat, interval_s, wait_timeout_s`) so the controller actually executes the persistent colleague target-move (W4.33d/W4.48b now carry typed blocks; the machinery delta above for them is RESOLVED). `colleague-commit` remains an untyped operator action (forward-tip injection, identity+file config); W4.06/W4.07/W4.08/`W4.48c` carry `chaos: null` (or their typed block) + the injection contract in their task text. |
 | W4.33a / W4.48a (single-run daemon lifecycle) | `08-wave-4-fault-injection.md` §G W4.33/48 | The `restart_daemon` probe op is a daemon-level MULTI-RUN op by design (validateProbeSequence requires ≥2 run groups — W3.22 shape), so a single-run pause→restart→resume corridor cannot use it. **US-009 (S44a) wires the single-run daemon restart as the FIRST-CLASS `restart_contained_daemon` probe op** (daemon-control `<kind>` restart, containment-gated, per-action evidence, fail-closed categories) — W4.33a declares it `during_hold: true` (fires concurrently with the pause hold); W4.48a declares it armed on the chaos's own `step:finalize_merge:running` trigger. |
 | W4.33c-deleted-worktree-refusal | `08-wave-4-fault-injection.md` §G W4.33 | There is no typed probe/chaos op for deleting a run worktree out-of-band (W4.13's injection); the deletion + resume are OPERATOR actions in the task text. The case also deliberately declares NO O16: O16's resume leg hardcodes `O16_RESUME_RUN_NOT_COMPLETED` for any resume whose run does not complete, which would misjudge the expected refusal corridor. |
-| W4.33b-update-under-it-resume | `08-wave-4-fault-injection.md` §G W4.33 | `tamandua update --force` under a paused run is now the FIRST-CLASS `update_contained_install` probe op (US-009 S44a): the controller runs the update under the contained spawn env during the pause hold (`during_hold: true`), gated on containment before any spawn (state dir + resolved `tamandua` binary must be inside torture-test/var; an uncontained binary is refused `operator-action-escape-refused`/`uncontained-install-target`), recording the contained catalog stamp before/after as the observed effect. |
+| W4.33b-update-under-it-resume | `08-wave-4-fault-injection.md` §G W4.33 | `tamandua update --force` under a paused run is now the FIRST-CLASS `update_contained_install` probe op (US-009 S44a): the controller runs the update under the contained spawn env during the pause hold (`during_hold: true`), gated on containment before any spawn (state dir + resolved `tamandua` binary must be inside torture-test/var; an uncontained binary is refused `operator-action-escape-refused`/`uncontained-install-target`), recording the contained catalog stamp before/after as the observed effect. **S45 calibration:** the escape refusal is the cell's EXPECTED PASS outcome (real campaign envs resolve only the operator's live checkout — the refusal records on the action and the sequence continues); the executed arm (a contained install on the PATH) keeps the catalog-stamp-change observed effect. |
 | W4.48a-daemon-kill-mid-park | `08-wave-4-fault-injection.md` §G W4.48 | The spec's ideal trigger is the park event ("event-triggered on the park event"); the product emits NO `merge.park*` event (the park-branch creation and the checked-out-target landing run inside the finalize step's single merge-branch execution). The typed chaos block uses `step:finalize_merge:running` as the event-triggered approximation of the park→landing window; the FIRST-CLASS `restart_contained_daemon` probe op (US-009 S44a) is armed on the same trigger to restart the contained daemon after the SIGKILL. |
 | W4.48b-pause-rugpull-window | `08-wave-4-fault-injection.md` §G W4.48 | The pause probe arms on `event:merge.target_moved` (a real product event) while the run is still `running` — the CLI refuses to pause a non-running run, so a poll that observes the event only after the run transitioned to failed yields a refused pause (recorded as evidence; the corridor is re-armed). The case is CHARACTERIZATION (one-of-two outcome) and deliberately omits O16 because O16's resume-completes leg cannot judge the {relaunch, paused-no-relaunch} branch. |
 | W4.48c-compound-gate-degradation | `08-wave-4-fault-injection.md` §G W4.48 | Inherits W4.05's `arm-slow` seam delta (bin/tt-fixture-provision.mjs has no arm-slow) and the colleague-commit untyped delta; the drain hold is 2400s (40 min) so the ~35-min armed suite finishes under the drain and the `delete-tstx-row` fires reliably at `step:finalize_merge:pending`. |
@@ -922,7 +925,7 @@ and the gap recorded here. Zero silent trims.
 | W4.44a-double-tap | `08-wave-4-fault-injection.md` §J W4.44 | The double-tap contract is PINS-THE-ACTUAL-CONTRACT per the spec: the cell asserts BOTH observed product behaviors — worktree mode yields TWO DISTINCT RUNS with distinct managed worktrees (both-runs-one-worktree is the S1), and direct mode's second tap is REFUSED by the SAME shared-workdir admission gate as W4.42 (one-refusal contract). No new machinery. |
 | W4.44b-post-success-immunity | `08-wave-4-fault-injection.md` §J W4.44 | The spec's injector is tt-chaos `move-branch` (an untyped action, per the W4.03/04a delta pattern); the cell performs the identical ref move directly (`git branch -f main <colleague-commit>`) in its scratch fixture — the injection IS the move, the operator is the cell. The rugpull-detection window (15s) is the cell's observation window; zero replacement runs + zero rugpull events = the closed window (FI-Q3). |
 | W4.46-provider-error-rounds | `08-wave-4-fault-injection.md` §K W4.46 | (1) The spec's successive-round provider errors are expressed as a behavior ARRAY on the fixer (one entry per invocation: 429 → 529 → mid-stream-drop → success — `behaviorForInvocation` consumes one entry per work index). (2) OBSERVED MACHINERY (recorded, never silent): the current scheduler re-dispatches a worker_lost step IMMEDIATELY — the re-pend nudges the daemon, so the measured inter-attempt spacing is ~6ms (an instant hammer), NOT the spec's backoff. The cell RECORDS the measured spacing (`min_round_gap_ms` + `backoff_observed` in its summary) so the finding is measurable (when the product adds retry backoff, the recorded gap flips the case to the spec expectation), and asserts the corridor's core: the three error rounds were RETRIED (not abandoned) and the step eventually completed — PROVIDER_FAIL discipline (O11: zero abandonment events). The retry-with-backoff expectation stays in the task text per the spec. (3) The campaign runner's per-case behaviors wiring (US-015) supplies the array; the cell is proven end-to-end here. |
-| W4.47-auth-expiry-copy | `08-wave-4-fault-injection.md` §K W4.47 | (1) The copied-credential invalidation/restore (`$TT_HOME/.pi/agent/auth.json`) is now a FIRST-CLASS controller action — `invalidate_credentials` armed on `now` (fires as the run id resolves, before the first dispatch round) + `restore_credentials` armed on `event:step.running` (fires when the RETRIED round's dispatch sets the step running — the invalidated first round exits before claiming (a provider-error instant-fail), so the first `step.running` is the relaunch's — the machinery equivalent of the operator's "restore the copy, launch again"). Containment: the target must resolve strictly inside torture-test/var; a symlink/escaping target is refused `operator-action-escape-refused`; the restore is byte-identical. (2) O15 (production untouchedness) is the CAMPAIGN-LEVEL W0/W6 oracle (spec 03), NOT a per-case oracle — it is deliberately NOT declared in the manifest oracle list (tier1-oracle-hygiene fails closed on declared-but-missing oracles; the implemented per-case set is O1/O2/O3z/O4/O8/O9/O10/O11/O16); O15 is a REQUIRED backstop named in the task text (the real `~/.pi` auth.json's atime/audit trail must show no access during the invalidated window). |
+| W4.47-auth-expiry-copy | `08-wave-4-fault-injection.md` §K W4.47 | (1) The copied-credential invalidation/restore (`$TT_HOME/.pi/agent/auth.json`) is now a FIRST-CLASS controller action — `invalidate_credentials` armed on `now` (fires as the run id resolves, before the first dispatch round) + `restore_credentials` armed on the run's first instant-fail classification in the contained daemon's log (S62 re-arm — the awaited trigger `{"daemon_log":"Worker round classified as instant fail","timeout_s":600}`; the OLD `event:step.running` arming could NEVER fire: the invalidated first round exits before claiming (an instant-fail loop — sub-2s, zero output, no claim, no `step.running`), while the daemon logs every classification — the machinery equivalent of the operator's "restore the copy, launch again" right after the first failed round). Containment: the target must resolve strictly inside torture-test/var; a symlink/escaping target is refused `operator-action-escape-refused`; the restore is byte-identical. (3) S62 cap calibration: `caps.wall_min` 10 → 15 so the cell can observe EITHER the clean post-restore completion (~7–8 min) OR the product's legible instant-fail escalation (K=3 then 30/60/120s backoffs to the N=10 force-fail ≈ 12–13 min) without being cut off mid-escalation. (2) O15 (production untouchedness) is the CAMPAIGN-LEVEL W0/W6 oracle (spec 03), NOT a per-case oracle — it is deliberately NOT declared in the manifest oracle list (tier1-oracle-hygiene fails closed on declared-but-missing oracles; the implemented per-case set is O1/O2/O3z/O4/O8/O9/O10/O11/O16); O15 is a REQUIRED backstop named in the task text (the real `~/.pi` auth.json's atime/audit trail must show no access during the invalidated window). |
 | W4.dsh-* × 4 (dsh lane) | product README "DeepSeek Harness (dsh) Support (Alpha)" + `08-wave-4-fault-injection.md` (base rows W4.37/W4.02/W4.06/W4.33) | The dsh lane is an OPERATOR-DIRECTED, ALPHA harness lane (US-013): the spec 08 wave-4 roster is authored for the pi/hermes harnesses, and the dsh corridor is documented in the product README's dsh section, not in spec 08. Each dsh row is a FRESH id (`W4.dsh-*`) spec_ref'd to its base scenario + a dsh-lane note — the base corridor (KEY-line spoof / fail_missing refusal / rebase-loopback / resume-after-restart) is preserved, and the row additionally pins the dsh-specific contracts the base rows cannot exercise: `DSH_PERMISSION_MODE=danger-full-access` injection (step reporting works) and the profile-pin caveat (hard-pinned `cordis.patch.yml` sandbox/approval rows override the injection and break `tamandua step complete` — the operator checks `tamandua doctor`'s warn-only permission-mode probe before judging a wedged step). The dsh rows also inherit the base rows' machinery deltas (W4.dsh-fdmw's `colleague-commit` is untyped — `chaos: null` + task-text contract; W4.dsh-lifecycle's daemon restart rides the base W4.33a FIRST-CLASS `restart_contained_daemon` `during_hold` action — the single-run restart is a wired probe op since US-009, not an operator seam; W4.dsh-do-now's planted diagnostics file is reset-hook arming). Token accounting for dsh is best-effort (session-store read; unreadable -> 0 tokens with a warning) — an attribution gap is a finding to record, never a silent pass. The lane is a REPRESENTATIVE subset (one row per workflow family), not a full re-authoring of wave 4 on dsh — documented decision, never a silent trim. |
 | W5.storm-capacity-scaled | `09-wave-5-storm.md` (whole wave; capacity-scaled variant) | MACHINERY GAP (12-runner-automation): the storm's multi-run ORCHESTRATOR — launch stagger, the 15s simultaneity sampler, queue admission, Round B chaos dispatch, wedge-deadline enforcement — is CONTROLLER machinery beyond this roster-authoring scope. The row is a CONTRACT-PIN: its task file IS the full two-round briefing (Round A S1–S10 roster + 90s stagger + 44-timer queue math + S5/S9 STORM-SENTINEL guaranteed conflict + 15s simultaneity check + freeSlots admission snapshot; Round B B1–B5 roster + the full chaos schedule; success bands ≥6 of 8 merge-eligible, conflict-designated assessed separately, O2 union, O3z accounting, wedge deadline; results/w5 forensics) and the round-level checks are the orchestrator's acceptance criteria. `--include-real` launches the row's ANCHOR run (one real fdmw on tt-poly-lite at `seed/storm`). The Round B chaos schedule lives in the briefing as a dispatch contract, NOT as a typed manifest chaos block (`chaos: null` — the typed block applies to one run's launch; the storm's chaos spans a roster). The capacity-scaled scale-down (four simultaneous runs on tt-poly-lite: fdmw(pi, ts) / bfmw(hermes, python) / quarantine-mw(pi, ts → `broken-tests`) / do-now agitator, one colleague commit + one worker kill, timer cap recomputed) is a recorded manifest fact in the task text, never silent. The orchestrator (12-runner-automation P3) is a follow-up execution story — the explicit exclusion row above carries the same gap. |
 
@@ -1155,7 +1158,7 @@ single REAL row (auth expiry on the copied credentials) at the do-now unit:
 | Case | caps.tokens | caps.wall_min | Basis |
 |------|-------------|---------------|-------|
 | W4.46-provider-error-rounds | 0 | 15 | scripted-pi bfmw, zero tokens; wall = daemon start + one bfmw round with 3 provider-error retries (the retry/backoff spacing) ≈ 3–5 min |
-| W4.47-auth-expiry-copy | 200,000 | 10 | real pi do-now unit (W1.L1 tier1 cell); TWO launches — the invalidated launch spends ~0 (auth error before any model round) + the clean post-restore do-now ≈ the do-now unit; wall covers both launches + the restore choreography |
+| W4.47-auth-expiry-copy | 200,000 | 15 | real pi do-now unit (W1.L1 tier1 cell); TWO launches — the invalidated launch spends ~0 (auth error before any model round) + the clean post-restore do-now ≈ the do-now unit. S62 calibration: wall 15 covers BOTH observable corridors — the clean completion (~7–8 min) AND the product's legible instant-fail escalation horizon (~12–13 min: K=3 then 30/60/120s backoffs to the N=10 force-fail) with margin |
 
 Section K's real row carries `production_duration_floor_ms` at or above its
 honest corridor duration (W4.47 120000 — the two-launch do-now corridor;
@@ -2298,8 +2301,10 @@ judgment — the run finished, so 5m21s is an honest duration, not a truncation)
 **Decision: recalibrate.** `caps.wall_min` 5 → **10** for W4.37 (do-now
 family, tokens unchanged at 200,000 — observed spend was ~15–17k at the
 5-minute mark, no token pressure). 10 min = ~2× the observed-truncated
-minimum (5m18s), matching the W4.47 do-now tier (wall 10) and giving the
-honest path headroom while keeping the cell bounded. The US-002 grace fix
+minimum (5m18s), the do-now family headroom convention (W4.47 sits higher
+at wall 15 only because its S62 corridor must also cover the product's
+~12-min instant-fail escalation horizon — see the S62 section below) and
+giving the honest path headroom while keeping the cell bounded. The US-002 grace fix
 alone would NOT have sufficed: the grace window (30s default) protects only
 attempts that reach terminal within it, and the honest duration is
 demonstrably beyond 5m30s. The old 5-min cap was a runaway tripwire firing
@@ -2973,7 +2978,14 @@ cells could neither fire nor honestly fail — vacuous/stalled.
    `operator-action-escape-refused` / `uncontained-install-target` and NEVER
    executed — the operator's live checkout is never updated. Observed effect:
    the contained catalog stamp (`.catalog-version.json`) before/after.
-   Fail-closed category: `update-contained-install-failed`.
+   **S45 (W4.33b) calibration:** that escape refusal is the cell's EXPECTED
+   PASS-level outcome — a real campaign's contained env resolves only the
+   operator's live checkout (no contained install exists), so the refusal IS
+   the seam's containment guarantee: it is recorded on the action (`refusal`
+   field; argv stays null — nothing spawned, catalog stamp untouched) and the
+   probe sequence continues; it is never an infra failure. A genuine failure
+   (the update RAN and exited non-zero) keeps the fail-closed category
+   `update-contained-install-failed`.
 3. `invalidate_credentials` / `restore_credentials` — replace/restore the
    CONTAINED home's `.pi/agent/auth.json` (never the real `~/.pi`): the
    invalidate backs the original up beside it
@@ -3043,7 +3055,7 @@ acceptance).
 | W4.48a-daemon-kill-mid-park | `kill-daemon` SIGKILL @ `step:finalize_merge:running` | `restart_contained_daemon` | `step:finalize_merge:running` (same as the chaos) |
 | W4.33a-daemon-restart-resume | — | `pause_drain` (hold 600) → `restart_contained_daemon` `during_hold: true` → `resume` | restart fires CONCURRENTLY with the pause hold (the W4.33a "act during the hold" shape) |
 | W4.33b-update-under-it-resume | — | `pause` (hold 600) → `update_contained_install` `during_hold: true` → `resume` | update fires CONCURRENTLY with the pause hold |
-| W4.47-auth-expiry-copy | — | `invalidate_credentials` (`now` — fires as the run id resolves, before the first dispatch round) → `restore_credentials` (`event:step.running` — fires at the retried round's dispatch, the relaunch — the invalidated first round exits before claiming (provider-error instant-fail, no event)) | the invalidated launch round fails diagnosably; the restored retried round completes |
+| W4.47-auth-expiry-copy | — | `invalidate_credentials` (`now` — fires as the run id resolves, before the first dispatch round) → `restore_credentials` (the run's first instant-fail classification in the contained daemon's log — S62 re-arm: `{"daemon_log":"Worker round classified as instant fail","timeout_s":600}`; the OLD `event:step.running` arming can never fire because the invalidated first round exits before claiming (an instant-fail loop — no event, no `step.running`), while the daemon logs the classification) | the invalidated launch round fails diagnosably (instant-fail classified); the restored relaunch completes |
 
 **What changed vs the S44a machinery story (US-009):** US-009 built the four
 first-class probe ops (`restart_contained_daemon`, `update_contained_install`,
@@ -3074,14 +3086,17 @@ evidence record landing in the attempt evidence:
   `['tamandua','update','--force']` + the contained catalog stamp
   before/after) — and the resumed run completes with O16 judging the
   pause/resume lifecycle.
-- **W4.47 — invalidate/restore credential shape:** the corridor seeds the
-  contained home's `.pi/agent/auth.json`, drives the do-now with the
-  first-round provider-error behavior (the invalidated launch round fails
-  with a diagnosable provider/auth error), proves `invalidate_credentials`
-  fires at launch (target/backup paths + sha256 change) and
-  `restore_credentials` fires on `event:step.running` (byte-identical
-  restore), and the retried round completes — zero real `~/.pi` access (the
-  containment absolutes are unchanged from S44a).
+- **W4.47 — invalidate/restore credential shape (S62 re-arm):** the corridor
+  seeds the contained home's `.pi/agent/auth.json`, drives the do-now with a
+  first-round ZERO-OUTPUT sub-2s instant-fail behavior (the invalidated
+  launch round exits before claiming — the exact shape the OLD
+  `event:step.running` arming could never observe), proves
+  `invalidate_credentials` fires at launch (target/backup paths + sha256
+  change) and `restore_credentials` fires on the run's first instant-fail
+  classification in the contained daemon's log (the product daemon logs the
+  classification; byte-identical restore), and the retried round completes —
+  zero real `~/.pi` access (the containment absolutes are unchanged from
+  S44a).
 
 **Scripted corridors (zero tokens, contained-scripted daemons/homes):**
 `self-tests/tier2-s44-operator-seam-corridors.test.ts` (HEAVY — registered in
@@ -3109,3 +3124,114 @@ is now spawned ASYNC (event loop stays live): the chaos fires its SIGKILL
 during the restart's stop phase (the daemon is alive when SIGKILLed — chaos
 evidence records `fired`), the restart's start phase brings the daemon back,
 and the contained run recovers. Evidence record shape unchanged.
+
+## S49 W4.33d/W4.48b split — absorption-assertion + directly-constructed-state cells (US-010, 2026-09-04)
+
+**Decision (igorhvr triage-decisions-2026-09-01 item 6 — "Adopt the split").**
+The two real tier-2 cells `W4.33d-reroute-exhaustion-resume` and
+`W4.48b-pause-rugpull-window` were authored to force failure VECTORS through a
+race: W4.33d injected a persistent target move until `max_reroutes` exhausted
+so the probe could resume a permanently failed run; W4.48b raced a pause into
+the window between target-moved detection and the relaunch decision. Three
+real-campaign redesigns (S29 typed `move-branch` chaos, S36 per-attempt
+re-arm, mac campaign #1) never made either vector fire: **the product absorbs
+the injected faults gracefully** — reroute/PARK machinery reroutes the moved
+finalize, parks the landing, and the run completes (the S37 observation:
+`run.paused` on `merge.target_moved` → `run.resumed` → `merge.landed` with a
+`*-tamandua-parked-*` ref). Per the split, the two real rows are REPLACED by
+four SCRIPTED cells (bare --tier2 executable, zero tokens, deterministic) that
+pin BOTH the graceful absorption AND the failure vectors without a race:
+
+| Cell | Arm | Pins | Corridor |
+| --- | --- | --- | --- |
+| W4.33d-reroute-absorption | (a) absorption-assertion | reroute ABSORBS a colleague target-move — RED on absorption regression | typed `move-branch` rearm chaos (2 moves) at `step:finalize_merge:running`; scripted merger retry (old tip → `merge.target_moved` → `STATUS: retry` → one reroute) then done (current tip → land); run completes |
+| W4.33d-resume-force-fail | (b) directly-constructed-state | resume after permanent failure (AGENTS.md documented path) | probe `fail_force` at `step:finalize_merge:running` CONSTRUCTS the terminal `failed` state (`run.force_failed`, no chaos) → probe `resume` on `event:run.force_failed` → the SAME run restarts from the interrupted finalize and completes (O16 `run_completes`) |
+| W4.48b-park-absorption | (a) absorption-assertion | PARK ABSORBS a colleague target-move — RED on absorption regression | typed `move-branch` rearm chaos (2 moves) at `step:finalize_merge:running`; scripted merger retry parks the moved landing (the `*-tamandua-parked-*` backup ref) then done lands the re-attempt; run completes |
+| W4.48b-move-during-hold | (b) directly-constructed-state | pause/relaunch corridor (one-of-two characterization) | probe `pause` at `step:finalize_merge:running` (hold 600) FIRST; the typed `move-branch` cadence moves the target DURING the hold (the run is held; the external chaos loop keeps moving); probe `resume` → the moved-target state is constructed, never raced → EXACTLY one of {relaunch, paused-no-relaunch}; never paused-orphaned; never double relaunch |
+
+**Why the split is deterministic (no race).** (a) The absorption cells re-arm
+one move per FRESH `step:finalize_merge:running` occurrence (the proven S36
+re-arm premise) and spend the 2-move budget, so exactly the injected fault is
+absorbed and the target stabilizes before the landing attempt. (b) The
+constructed-state cells create the state with the CLI (`workflow fail
+--force`) or with the pause-hold ordering (pause first at a deterministic step
+marker, move while the run is held) — nothing depends on a chaos cadence
+landing inside a product-internal window.
+
+**Retired real premises (recorded, never silent).** The reroute-EXHAUSTION
+premise (`event:run.failed` after `max_reroutes` under persistent target
+pressure) and the pause-between-detection-and-relaunch race are retired from
+the real roster: three redesigns + mac campaign #1 proved they cannot fire in
+real runs because the product absorbs the faults. The absorption the redesigns
+exposed is now pinned as the resilience property (red on regression), and the
+failure vectors are exercised deterministically by the constructed-state cells
+above. Historical S29/S36/S37 dispositions earlier in this document describe
+the retired premises.
+
+**Cells/scripts (all inside torture-test/).** Roster rows in
+`cases/tier2.jsonl` (72 total), task docs in `cases/tasks/tier2/`
+(`W4.33d-reroute-absorption.md`, `W4.33d-resume-force-fail.md`,
+`W4.48b-park-absorption.md`, `W4.48b-move-during-hold.md`), scenario cells
+under `scenarios/w4.33d-reroute-absorption`, `scenarios/w4.33d-resume-force-fail`,
+`scenarios/w4.48b-park-absorption`, `scenarios/w4.48b-move-during-hold` (each
+with scenario.json + behaviors.json + run.sh + a contract-smoke runner; the
+materialized behaviors + manifest probe/chaos drive the corridor when the
+controller executes the cell in bare --tier2). `bin/tt-tier2-assets`
+validates the updated roster (72 cells). Zero-token scripted corridor proof:
+`self-tests/tier2-s29-premise-redesign-corridor.test.ts` (S49 arm, HEAVY —
+isolated like the tier1 scripted battery).
+
+## S62 W4.47 restore re-arm + wall-cap calibration (US-019, 2026-09-04)
+
+**Defect (mac campaign #1).** W4.47's `restore_credentials` was armed on
+`event:step.running`. Under the auth-invalidated launch the product emits NO
+`step.running` for rounds that exit before claiming — the contained pi rounds
+become an INSTANT-FAIL loop (sub-2s, zero output, no claim, no `step.worker_lost`), so the arming could never fire and the cell idled to its 10-min wall
+cap with the contained `$TT_HOME/.pi` copy still invalidated (the S61
+compensation now restores it at terminal-record time).
+
+**Fix (S62, all inside torture-test/).**
+
+1. **New awaited trigger arm — the daemon-log trigger.** The probe `when`
+   vocabulary gains `{"daemon_log":<needle>,"timeout_s":N}` (schema
+   `case.schema.json` + `bin/tt-controller` probeWhenValid /
+   probeObjectTriggerSatisfied): the trigger fires when the CONTAINED
+   daemon's product log (`<TAMANDUA_STATE_DIR>/tamandua.log`) gains a line
+   carrying BOTH the needle and the run's id (either spelling). The needle
+   exists under the instant-fail loop: the product daemon logs every "Worker
+   round classified as instant fail" classification for the run (the signal
+   `event:step.running` never provides). Reads are incremental (per-trigger
+   scan offsets, rotation fallback) and containment-gated (state dir must
+   resolve inside torture-test/var — never an operator log).
+2. **W4.47 manifest re-arm.** `restore_credentials` now arms on
+   `{"daemon_log":"Worker round classified as instant fail","timeout_s":600}`
+   — it fires right after the FIRST failed round, so the relaunch (the
+   machinery equivalent of the operator's "restore the copy, launch again")
+   runs with valid credentials. `expected_fast_failure: true` is kept (the
+   invalidated round fails fast by design). Task text +
+   `cases/tier2-traceability.md` updated.
+3. **Wall-cap calibration (10 → 15).** The cell must be able to observe
+   EITHER corridor inside its cap: the clean post-restore completion (~7–8
+   min) OR the product's legible instant-fail escalation — K=3 consecutive
+   instant-fails then the 30/60/120s (capped) relaunch backoffs to the N=10
+   force-fail (`run.instant_fail_loop` + precise force-fail reason) ≈ 12–13
+   min — with margin. Wall 10 cut that horizon off mid-escalation (the mac
+   shape); wall 15 covers it. Token cap unchanged (200k — the invalidated
+   rounds spend ~0).
+4. **Corridor re-shape (S44b).** The scripted W4.47 corridor's first round
+   is now a genuine ZERO-OUTPUT sub-2s instant-fail shape (the scripted
+   runtime's `die-before-claim` mode) so the real product daemon logs the
+   classification the trigger awaits — the corridor proves the restore fires
+   at the daemon-log trigger with byte-identical restore and the retried
+   round completes (previously the corridor's first round was a
+   provider-error shape that emits output and never classified instant-fail).
+   S61's compensation fixture (restore never fires → controller restores at
+   terminal) stays as the independent terminal-cleanup guarantee.
+
+**Pins.** Schema/semantic pins: `self-tests/tier1-probe-sequence-schema.test.ts`
+(three object-when alternatives) and `self-tests/tier1-probe-sequence-
+semantic.test.ts` (daemon_log acceptance + two-at-once/empty-needle
+rejections). Manifest/wiring pins: `self-tests/tier2-s44b-operator-seam-
+wiring.test.ts`. Execution proof: `self-tests/tier2-s44-operator-seam-
+corridors.test.ts` (HEAVY) + hermetic daemon-log fixtures in
+`bin/tt-controller.test.sh`.

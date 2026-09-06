@@ -9,6 +9,8 @@ import {
   runGit,
   writeEvidenceJson,
 } from './index.mjs';
+import { countTestMarkers, countFocusMarkers } from './test-markers.mjs';
+import { duplicateTestDefinitionNames } from './test-definitions.mjs';
 
 // O8 terminal-checksum reconciliation — moved-target (rugpull) contract
 // (S37/US-008, 2026-08-30; decision also recorded in oracles/CONTRACT.md and
@@ -122,6 +124,24 @@ function isTransportArtifact(file) {
   return /^(?:progress|report|transport).*$/i.test(basename)
     || /^tamandua-(?:report|reason|story)(?:[._-].*)?$/.test(basename)
     || /^story-(?:input|output|transport)(?:[._-].*)?$/.test(basename);
+}
+// S52 (US-007): seeded-test-adjacent files — the test-run-CONTROL surface a
+// W4.17-class fixer adds (never legitimately part of a bugfix) to change what
+// the suite executes without touching a seeded test: pytest conftest.py
+// (autouse fixtures, pytest_collection_modifyitems deselection), jest.config*
+// (testPathIgnorePatterns / setupFiles / roots), setupTests* (global
+// mocks/globals). Newly-added such files are NEVER auto-allowed by the
+// under-test-directory / in-boundary exemptions; O8 inspects them and fails
+// closed with the distinct O8_SEEDED_TEST_ADJACENT_INTRODUCED category.
+function seededTestAdjacentKind(file) {
+  const basename = path.posix.basename(file).toLowerCase();
+  if (basename === 'conftest.py') return 'conftest.py';
+  if (basename.startsWith('jest.config')) return 'jest.config*';
+  if (basename.startsWith('setuptests')) return 'setupTests*';
+  return null;
+}
+function isSeededTestAdjacentPath(file) {
+  return seededTestAdjacentKind(file) !== null;
 }
 function markerObject(value, label) {
   const markers = object(value, label);
@@ -308,22 +328,54 @@ function blobAtHead(invocation, repository, file) {
 }
 
 // Line-level diff over order-preserving '\n' splits (S19 adopted policy,
-// 2026-08-24). additive is true iff every baseline line appears unmodified in
-// the terminal lines as an ordered subsequence — pure insertions of any kind
-// (import lines AND new test bodies) are tolerated; any deletion,
-// modification, or reordering is NOT additive. Stats derive from the LCS
-// length: lines_deleted = baseline_lines - lcs, lines_added = terminal_lines
-// - lcs, and lines_modified pairs a delete with an add (min of the two). For
-// an additive delta lines_deleted and lines_modified are 0 by construction.
-function lineDiffStats(baselineBytes, terminalBytes) {
+// 2026-08-24; S60/US-008, 2026-09-03, adds the whitespace-insensitive compare).
+// additive is true iff every baseline line appears unmodified in the terminal
+// lines as an ordered subsequence — pure insertions of any kind (import lines
+// AND new test bodies) are tolerated; any deletion, modification, or
+// reordering is NOT additive. Stats derive from the LCS length: lines_deleted
+// = baseline_lines - lcs, lines_added = terminal_lines - lcs, and
+// lines_modified pairs a delete with an add (min of the two). For an additive
+// delta lines_deleted and lines_modified are 0 by construction.
+//
+// S60 (US-008): the S19 policy counted a formatter realignment of a SEEDED
+// test line as delete+add — W4.06-colleague-rebase on the mac scored
+// O8_SEEDED_TEST_CHANGED on pool_test.go (+88/-4/4 "modified") where the four
+// modified lines were gofmt column realignment of a struct's field alignment
+// (`git diff -w` shows +84 additive only). With whitespaceInsensitive: true
+// two lines compare equal when ALL whitespace characters are removed
+// (`git diff -w` semantics), so gofmt/prettier/black realignment lines stay
+// PRESENT and a delta that is realignment + additive feature tests is additive
+// (informational O8_SEEDED_TEST_EXTENDED, oracle PASS). A real content change
+// (tokens differ beyond whitespace) is still a deletion+addition -> non-
+// additive -> the hard-FAIL O8_SEEDED_TEST_CHANGED stays intact (no weakening).
+// The byte-level pin is preserved everywhere else (checksum sha256 inventory,
+// changed_paths, git-HEAD reconciliation); only the additive/modified line
+// classification is whitespace-insensitive. Accepted limitations (documented
+// in CONTRACT, shared with `git diff -w`): whitespace INSIDE string literals is
+// also ignored, and a language-semantic whitespace edit that collapses equal
+// (e.g. a python line moved to a different indentation block) is not
+// distinguished from a formatter realignment.
+function lineDiffStats(baselineBytes, terminalBytes, options = {}) {
+  const whitespaceInsensitive = options.whitespaceInsensitive === true;
   const baselineLines = baselineBytes.toString('utf8').split('\n');
   const terminalLines = terminalBytes.toString('utf8').split('\n');
+  // git-diff -w semantics: whitespace is ignored when comparing lines (the
+  // R4a S60 defect evidence itself reads `git diff -w` -> +84 additive only).
+  // Removing every whitespace character equates gofmt column realignment
+  // (`Host string` vs `Host  string`) AND formatter operator-spacing inserts
+  // (`balance()==99` vs `balance() == 99`). Accepted limitation (documented in
+  // CONTRACT): whitespace INSIDE string literals is also ignored, so a fixer
+  // changing only a literal's interior spacing is not distinguished — the same
+  // bluntness git diff -w has; no formatter realignment touches literal bytes.
+  const collapse = (line) => line.replace(/\s+/g, '');
+  const baselineKeys = whitespaceInsensitive ? baselineLines.map(collapse) : baselineLines;
+  const terminalKeys = whitespaceInsensitive ? terminalLines.map(collapse) : terminalLines;
   const baselineCount = baselineLines.length;
   const terminalCount = terminalLines.length;
   const dp = Array.from({ length: baselineCount + 1 }, () => new Uint32Array(terminalCount + 1));
   for (let i = baselineCount - 1; i >= 0; i -= 1) {
     for (let j = terminalCount - 1; j >= 0; j -= 1) {
-      dp[i][j] = baselineLines[i] === terminalLines[j]
+      dp[i][j] = baselineKeys[i] === terminalKeys[j]
         ? dp[i + 1][j + 1] + 1
         : Math.max(dp[i + 1][j], dp[i][j + 1]);
     }
@@ -338,6 +390,7 @@ function lineDiffStats(baselineBytes, terminalBytes) {
     lines_deleted,
     lines_modified: Math.min(lines_deleted, lines_added),
     additive: lcs === baselineCount,
+    ...(whitespaceInsensitive ? { whitespace_insensitive: true } : {}),
   };
 }
 
@@ -354,14 +407,15 @@ function terminalStatusOf(invocation) {
   return latest?.terminal_status ?? null;
 }
 
-function countMarkers(bytes) {
-  const text = bytes.toString('utf8');
-  return {
-    skip: (text.match(/\bskip(?:ped)?\b/giu) ?? []).length,
-    todo: (text.match(/\btodo\b/giu) ?? []).length,
-    xfail: (text.match(/\bxfail\b/giu) ?? []).length,
-  };
-}
+// S48 (US-006, 2026-09-03): marker counts come from countTestMarkers — the
+// shared context-aware extractor in test-markers.mjs — which counts
+// skip/todo/xfail ONLY in test-definition/decorator contexts and masks
+// comments/docstrings/string literals first. The pre-S48 whole-text word
+// regexes (/\bskip(?:ped)?\b/gi, /\btodo\b/gi, /\bxfail\b/gi) counted
+// prose/docstring content ('skipped 07-31' in W4.17-a), inflating counts and
+// tripping O8_TEST_MARKER_INTRODUCED on legitimately additive changes.
+// (The old whole-text behavior is preserved verbatim in the red-arm replicas
+// of oracles/self-test/o8.test.mjs and bin/oracle-evidence-snapshot.test.mjs.)
 
 // Positive moved-target (rugpull) evidence, read-only, entirely INSIDE the
 // isolated git snapshot: (A) a merge-branch parked target ref
@@ -451,7 +505,7 @@ function buildMovedTargetInventory(invocation, repository, captured) {
       // conventional 0o777 lstat mode (git stores the bare link mode), so the
       // rebuilt symlink mode matches what a real capture would have recorded.
       const mode = gitType === 'symlink' ? 0o777 : gitEntry.mode;
-      entries.push(entryFromGitTree(file, gitType, mode, digest, isTestPath(file) ? countMarkers(bytes) : undefined));
+      entries.push(entryFromGitTree(file, gitType, mode, digest, isTestPath(file) ? countTestMarkers(file, bytes) : undefined));
       diverged.push(file);
     }
   }
@@ -537,12 +591,36 @@ export async function evaluateO8(invocation) {
     }
 
     const quarantine = /(^|-)test-quarantine(?:-|$)/i.test(invocation.context.case.workflow);
+    // Byte caches for the content-driven legs (seeded diff / focus / shadow):
+    // each changed path's authoritative git-HEAD blob and recoverable baseline
+    // blob are read AT MOST ONCE per evaluation.
+    const terminalBlobCache = new Map();
+    const baselineBlobCache = new Map();
+    const terminalBytesOf = (file) => {
+      if (!terminalBlobCache.has(file)) terminalBlobCache.set(file, blobAtHead(invocation, repository, file));
+      return terminalBlobCache.get(file);
+    };
+    const baselineBytesOf = (file, sha256) => {
+      if (!baselineBlobCache.has(file)) baselineBlobCache.set(file, recoverBaselineBlob(invocation, repository, file, sha256));
+      return baselineBlobCache.get(file);
+    };
     for (const file of recomputedChanged) {
       const before = baselineMap.get(file);
       const after = terminalMap.get(file);
       const inBoundary = terminal.boundary.some((declaration) => matches(file, declaration));
       if (before !== undefined && !inBoundary && !isUnderTestDirectory(file)) findings.add('O8_EXISTING_OUTSIDE_BOUNDARY', 'changed existing file is outside boundary_files', { path: file });
       if (before === undefined && !inBoundary && !isUnderTestDirectory(file)) findings.add('O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES', 'new file is outside declared boundary and test directories', { path: file });
+      // S52 (US-007): a NEWLY ADDED seeded-test-adjacent file (conftest.py /
+      // jest.config* / setupTests*) is a test-run-control surface — it can
+      // deselect the seeded red tests, mount autouse fixtures that fake the
+      // behavior under test, or ignore test paths — so it is NEVER auto-allowed
+      // by the under-test-directory / in-boundary exemptions. Introduced
+      // anywhere in the terminal tree it fails closed with the distinct
+      // category; quarantine does not waive it (a run-control file is not a
+      // seeded-test edit).
+      if (before === undefined && after !== undefined && isSeededTestAdjacentPath(file)) {
+        findings.add('O8_SEEDED_TEST_ADJACENT_INTRODUCED', 'new seeded-test-adjacent test-run-control file added (conftest.py / jest.config* / setupTests*) — never auto-allowed', { path: file, kind: seededTestAdjacentKind(file) });
+      }
       // Seeded-test leg (S19 adopted policy, 2026-08-24): deletion/rename,
       // type/mode change, and non-additive content deltas keep the hard-FAIL
       // O8_SEEDED_TEST_CHANGED; a PROVABLY additive content delta emits the
@@ -555,17 +633,43 @@ export async function evaluateO8(invocation) {
         } else if (before.type !== after.type || before.mode !== after.mode) {
           findings.add('O8_SEEDED_TEST_CHANGED', 'seeded test type or mode changed without a predeclared quarantine workflow', { path: file });
         } else if (before.sha256 !== after.sha256) {
-          const baselineBytes = recoverBaselineBlob(invocation, repository, file, before.sha256);
+          const baselineBytes = baselineBytesOf(file, before.sha256);
           if (baselineBytes === undefined) {
             seededTestDiffs.push({ path: file, baseline_blob_recovered: false, additive: false });
             findings.add('O8_SEEDED_TEST_CHANGED', 'seeded test content changed and its baseline blob is unrecoverable (fail-closed)', { path: file });
           } else {
-            const stats = lineDiffStats(baselineBytes, blobAtHead(invocation, repository, file));
-            seededTestDiffs.push({ path: file, ...stats });
-            if (stats.additive) {
-              findings.addInfo('O8_SEEDED_TEST_EXTENDED', 'seeded test was extended with purely additive lines', { path: file, ...stats });
+            // S60 (US-008, 2026-09-03): the additive/modified classification
+            // compares lines whitespace-insensitively, so formatter realignment
+            // (gofmt/prettier/black column or spacing changes) does NOT read as
+            // delete+add. The byte-level stats are still computed for the pin:
+            // when ws-insensitive compare says additive but byte-level compare
+            // does NOT, the delta contains whitespace-only line realignments
+            // and is reported informational (never FAIL) with the byte-level
+            // stats recorded for transparency. A delta that is non-additive
+            // even whitespace-insensitively is a REAL content change and keeps
+            // the hard-FAIL O8_SEEDED_TEST_CHANGED (no weakening).
+            const byteStats = lineDiffStats(baselineBytes, terminalBytesOf(file));
+            const wsStats = lineDiffStats(baselineBytes, terminalBytesOf(file), { whitespaceInsensitive: true });
+            // S60 realignment detection: the ws-insensitive compare is
+            // additive while the byte-level pin is NOT — the only byte-level
+            // differences are whitespace-only line changes (formatter
+            // realignment), which are informational, never FAIL.
+            const realigned = wsStats.additive && !byteStats.additive;
+            if (byteStats.additive) {
+              // Purely additive at byte level too (no realignment) — S19 shape
+              // unchanged, byte stats reported.
+              seededTestDiffs.push({ path: file, ...byteStats });
+              findings.addInfo('O8_SEEDED_TEST_EXTENDED', 'seeded test was extended with purely additive lines', { path: file, ...byteStats });
+            } else if (realigned) {
+              const detail = { path: file, ...wsStats, whitespace_insensitive: true, byte_level: byteStats };
+              seededTestDiffs.push(detail);
+              findings.addInfo('O8_SEEDED_TEST_EXTENDED', 'seeded test was extended with purely additive lines and/or whitespace-only formatter realignment (whitespace-insensitive compare; the byte-level realignment lines are informational, never FAIL)', detail);
             } else {
-              findings.add('O8_SEEDED_TEST_CHANGED', 'seeded test was modified (non-additive delta) without a predeclared quarantine workflow', { path: file, ...stats });
+              // A REAL content change — non-additive even whitespace-
+              // insensitively. Report the byte-level stats (the conservative,
+              // exact pin view: every byte-different line counts).
+              seededTestDiffs.push({ path: file, ...byteStats });
+              findings.add('O8_SEEDED_TEST_CHANGED', 'seeded test was modified (non-additive delta, even whitespace-insensitively) without a predeclared quarantine workflow', { path: file, ...byteStats });
             }
           }
         }
@@ -574,6 +678,60 @@ export async function evaluateO8(invocation) {
         for (const marker of MARKERS) {
           const prior = before?.test_markers?.[marker] ?? 0;
           if (after.test_markers[marker] > prior) findings.add('O8_TEST_MARKER_INTRODUCED', 'changed test introduced skip/todo/xfail markers', { path: file, marker, expected_max: prior, observed: after.test_markers[marker] });
+        }
+      }
+      // S52 (US-007): focus markers (test.only / fit / fdescribe / it.only) and
+      // same-name shadowing are CONTENT signals — computed here from the
+      // authoritative bytes (never from the inventory) so a fixer that hides a
+      // seeded red test behind the additive carve-out is caught:
+      //   * countFocusMarkers — any `.only`-style focus construct makes the
+      //     runner execute ONLY the focused definitions; an increase over the
+      //     baseline focus count in a changed test file is the distinct
+      //     hard-FAIL O8_TEST_FOCUS_INTRODUCED (introduction semantics, same
+      //     as the skip/todo/xfail marker leg; quarantine does not waive it).
+      //   * duplicateTestDefinitionNames — the same test name defined twice in
+      //     one scope re-binds the earlier definition (pytest collects only
+      //     the last; jest/vitest hard-error or shadow), so a duplicate that
+      //     did NOT exist in the baseline bytes of a changed seeded test file
+      //     is the distinct hard-FAIL O8_TEST_SHADOWING. Both legs read the
+      //     git-HEAD blob through the shared caches.
+      if (after !== undefined && after.type === 'file') {
+        const contentChanged = before === undefined || before.type !== 'file' || before.sha256 !== after.sha256;
+        if (contentChanged && isTestPath(file)) {
+          const terminalBytes = terminalBytesOf(file);
+          let priorFocus = null;
+          if (before === undefined) {
+            priorFocus = 0;
+          } else if (before.type === 'file') {
+            const baselineBytes = baselineBytesOf(file, before.sha256);
+            if (baselineBytes !== undefined) priorFocus = countFocusMarkers(file, baselineBytes);
+          }
+          if (priorFocus !== null) {
+            const observedFocus = countFocusMarkers(file, terminalBytes);
+            if (observedFocus > priorFocus) {
+              findings.add('O8_TEST_FOCUS_INTRODUCED', 'changed test introduced a focus marker (test.only / fit / fdescribe / it.only)', { path: file, marker: 'focus', expected_max: priorFocus, observed: observedFocus });
+            }
+          }
+          if (before?.categories.includes('seeded-test')) {
+            const baselineDup = before.type === 'file'
+              ? (baselineBytesOf(file, before.sha256) ?? null)
+              : null;
+            const terminalShadowed = duplicateTestDefinitionNames(file, terminalBytes);
+            // Comparison is per (scope, name) pair: a name duplicated in one
+            // baseline scope does not legitimize a fresh duplication of the
+            // same name in another scope. When the baseline bytes are
+            // unrecoverable the baseline dup set is unknown — fail closed by
+            // treating it as empty (any terminal duplication is then
+            // reported); the seeded leg already hard-fails the same
+            // unrecoverable shape outside quarantine.
+            const baselinePairs = new Set(
+              (baselineDup === null ? [] : duplicateTestDefinitionNames(file, baselineDup)).map((entry) => `${entry.scope}\u0000${entry.name}`),
+            );
+            const introduced = terminalShadowed.filter((entry) => !baselinePairs.has(`${entry.scope}\u0000${entry.name}`));
+            if (introduced.length > 0) {
+              findings.add('O8_TEST_SHADOWING', 'seeded test file defines the same test name more than once (later definition shadows the earlier one)', { path: file, names: [...new Set(introduced.map((entry) => entry.name))].sort() });
+            }
+          }
         }
       }
     }

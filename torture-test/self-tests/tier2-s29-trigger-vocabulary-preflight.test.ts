@@ -133,7 +133,7 @@ describe("S29 (US-003) — fail-closed trigger-vocabulary preflight", () => {
   it("RED-ARM (AC4): an unknown event name (event:run.does_not_exist) fails closed immediately", () => {
     expectRejected(
       "unknown probe event",
-      "W4.33d-reroute-exhaustion-resume",
+      "W4.33d-resume-force-fail",
       {
         probe_sequence: [{
           run: 1,
@@ -185,7 +185,7 @@ describe("S29 (US-003) — fail-closed trigger-vocabulary preflight", () => {
   it("RED-ARM: object-form awaited triggers check the event/status vocabulary too", () => {
     expectRejected(
       "unknown object event",
-      "W4.33d-reroute-exhaustion-resume",
+      "W4.33d-resume-force-fail",
       {
         probe_sequence: [{
           run: 1,
@@ -196,7 +196,7 @@ describe("S29 (US-003) — fail-closed trigger-vocabulary preflight", () => {
     );
     expectRejected(
       "unknown object status",
-      "W4.33d-reroute-exhaustion-resume",
+      "W4.33d-resume-force-fail",
       {
         probe_sequence: [{
           run: 1,
@@ -307,25 +307,29 @@ describe("S29 (US-003) — fail-closed trigger-vocabulary preflight", () => {
     }
   });
 
-  it("GREEN-ARM (US-004): the premise-redesign cells carry the typed move-branch chaos injection and validate clean", () => {
+  it("GREEN-ARM (US-004 + S49): the absorption cells carry the typed move-branch rearm chaos injection; the constructed-state cells construct their state without a chaos race — and the manifest validates clean", () => {
     // US-004 (S29 premise redesign) wires the colleague target-move as a TYPED
     // move-branch chaos block the controller actually executes (previously
-    // chaos: null — the injection never ran, so event:run.failed /
-    // event:merge.target_moved never fired). The probe `when` triggers stay
-    // armed on the REAL premise events; the chaos block makes them reachable.
+    // chaos: null — the injection never ran, so the premise events never
+    // fired). S49 (igorhvr item 6) SPLITS the two real premise-redesign cells:
+    // the ABSORPTION cells (W4.33d-reroute-absorption, W4.48b-park-absorption)
+    // keep the typed rearm chaos and pin the graceful absorption; the
+    // DIRECTLY-CONSTRUCTED-STATE cells (W4.33d-resume-force-fail,
+    // W4.48b-move-during-hold) construct the failed / moved-target state
+    // without a race.
     const records = readRecords(TIER2);
-    for (const id of ["W4.33d-reroute-exhaustion-resume", "W4.48b-pause-rugpull-window"]) {
+    for (const id of ["W4.33d-reroute-absorption", "W4.48b-park-absorption"]) {
       const record = records.find((item) => item.id === id);
       assert.ok(record, `${id} must exist`);
       const chaos = record.chaos;
-      assert.ok(chaos && typeof chaos === "object", `${id}: the redesigned corridor must carry a chaos block`);
+      assert.ok(chaos && typeof chaos === "object", `${id}: the absorption cell must carry a chaos block`);
       assert.equal(chaos.type, "move-branch", `${id}: the typed injection must be move-branch`);
       assert.equal(chaos.target, "origin_target_ref", `${id}: move-branch targets the origin target ref`);
       assert.equal(chaos.operator, "tt-chaos", `${id}: the operator must be tt-chaos`);
       // The target ref is the branch the merger merges into: the SEEDED
       // branch for seeded tt-ts cells (seed/BUG-T4 for BUG-T4, seed/BUG-T2
       // for BUG-T2) — not main.
-      const expectedRef = id === "W4.33d-reroute-exhaustion-resume"
+      const expectedRef = id === "W4.33d-reroute-absorption"
         ? "refs/heads/seed/BUG-T4"
         : "refs/heads/seed/BUG-T2";
       assert.equal(chaos.ref, expectedRef, `${id}: the target ref must be ${expectedRef} (the merger's merge target)`);
@@ -337,9 +341,31 @@ describe("S29 (US-003) — fail-closed trigger-vocabulary preflight", () => {
         `${id}: the move interval must be declared`);
       assert.ok(Number.isSafeInteger(chaos.wait_timeout_s) && chaos.wait_timeout_s > 0,
         `${id}: the phase-marker wait bound must be declared (the trigger is minutes into the run)`);
+      assert.equal(chaos.rearm, true,
+        `${id}: the S36 per-attempt re-arm premise (each fresh finalize attempt observes a moved tip)`);
+      assert.ok(Number.isSafeInteger(chaos.rearm_hold_s) && chaos.rearm_hold_s > 0,
+        `${id}: the post-marker re-arm hold must be positive`);
       assert.notEqual(chaos.trigger, "step:developer:running",
         `${id}: the chaos trigger must not carry the wrong-vocabulary marker`);
+      assert.equal(record.probe_sequence, null,
+        `${id}: the absorption cell declares no probe sequence (the run completes through the reroute/PARK absorption)`);
     }
+    // Constructed-state cells: no chaos race — the failure / moved-target
+    // state is built by the probe sequence itself.
+    const w433dResume = records.find((item) => item.id === "W4.33d-resume-force-fail");
+    assert.ok(w433dResume, "W4.33d-resume-force-fail must exist");
+    assert.equal(w433dResume.chaos.type ?? null, null,
+      "W4.33d-resume-force-fail: no chaos — the CLI force-fail constructs the failed state");
+    assert.equal(w433dResume.probe_sequence[0].actions[0].op, "fail_force",
+      "W4.33d-resume-force-fail: fail_force constructs the terminal failed state");
+    assert.equal(w433dResume.probe_sequence[0].actions[1].op, "resume",
+      "W4.33d-resume-force-fail: resume re-activates the same run");
+    const w448bHold = records.find((item) => item.id === "W4.48b-move-during-hold");
+    assert.ok(w448bHold, "W4.48b-move-during-hold must exist");
+    assert.equal(w448bHold.probe_sequence[0].actions[0].op, "pause",
+      "W4.48b-move-during-hold: pause first (the deterministic hold)");
+    assert.equal(w448bHold.probe_sequence[0].actions[1].op, "resume",
+      "W4.48b-move-during-hold: resume after the hold");
     // The real manifest still validates clean under the preflight.
     const res = runValidate(TIER2);
     assert.equal(res.status, 0, `tier2 manifest must validate clean:\n${res.stdout}${res.stderr}`);
@@ -348,7 +374,7 @@ describe("S29 (US-003) — fail-closed trigger-vocabulary preflight", () => {
   it("GREEN-ARM (AC3): the real tier2.jsonl validates clean with no unknown-trigger errors", () => {
     const res = runValidate(TIER2);
     assert.equal(res.status, 0, `tier2 manifest must validate clean:\n${res.stdout}${res.stderr}`);
-    assert.match(res.stdout, /Validated 70 case\(s\)/);
+    assert.match(res.stdout, /Validated 72 case\(s\)/);
     assert.doesNotMatch(res.stdout + res.stderr, /unknown-(probe|chaos)-trigger/,
       "no unknown-trigger errors may remain in the calibrated manifest");
     assert.doesNotMatch(res.stdout + res.stderr, /unknown-workflow-spec/,
