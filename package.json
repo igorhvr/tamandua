@@ -11,7 +11,7 @@
     "tamandua-test": "dist/suite/shim.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && cp src/server/index.html dist/server/index.html && cp src/server/kanban.html dist/server/kanban.html && chmod +x dist/cli/cli.js && chmod +x dist/server/mcp-standalone.js && chmod +x dist/server/dashboard-standalone.js && chmod +x dist/suite/shim.js && node scripts/inject-version.js && rm -rf dist/www && cp -r www dist/www",
+    "build": "tsc -p tsconfig.json && cp src/server/index.html dist/server/index.html && cp src/server/kanban.html dist/server/kanban.html && chmod +x dist/cli/cli.js && chmod +x dist/server/mcp-standalone.js && chmod +x dist/server/dashboard-standalone.js && chmod +x dist/suite/shim.js && node scripts/inject-version.js && node scripts/build-native.mjs && rm -rf dist/www && cp -r www dist/www",
     "start": "node dist/cli/cli.js",
     "check-test-syntax": "tsx scripts/syntax-check-tests.ts",
     "test": "TAMANDUA_TEST_GUARD=1 TAMANDUA_PI_BINARY=/usr/bin/false TAMANDUA_DSH_BINARY=/usr/bin/false bash scripts/run-all-lanes.sh",

@@ -54,6 +54,9 @@ tamandua/
 │   │   ├── logs-tail-format.ts   # Shared logs-tail line formatting (CLI + dashboard API)
 │   │   ├── worktree-manager.ts   # Managed git worktree creation/removal for runs
 │   │   ├── run-harness.ts        # Harness (pi/hermes) invocation for runs
+│   │   ├── harness-adapter.ts    # Pi/Hermes/dsh adapter dispatch (findBinary/runRound)
+│   │   ├── harness-launch.ts     # Shared per-execution launch: fresh native signal domain + fallback
+│   │   ├── native-signal-backend.ts  # Native signal-isolation backend probe + launcher argv (pure)
 │   │   ├── rugpull.ts            # Relaunch-upon-rugpull handling
 │   │   ├── pi-stream-parser.ts   # pi --mode json output stream parsing
 │   │   ├── paths.ts              # Path resolution
@@ -78,6 +81,7 @@ tamandua/
 │       ├── logger.ts             # File logging
 │       ├── logger.test.ts        # Logger tests
 │       └── frontend-detect.ts    # Frontend file detection
+├── native/                       # Native signal-isolation assets (landlock-helper.c, seatbelt-signal.sb)
 ├── workflows/                    # Bundled workflow definitions (worktree variants symlink agent dirs)
 ├── agents/shared/                # Shared agent personas (setup, pr, verifier — symlinked into workflows)
 ├── skills/                       # Bundled skills

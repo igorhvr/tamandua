@@ -124,6 +124,26 @@ const TAMANDUA_EVENT_PROBE_PAYLOAD_FIELDS: TamanduaEvent = {
 void TAMANDUA_EVENT_PROBE_PAYLOAD_FIELDS;
 
 /**
+ * Compile-time pin of the KHYG US-002 per-execution isolation-mode payload
+ * fields on TamanduaEvent: run.harness_isolation carries harness/mode/
+ * reason (mode is the effective signal-isolation mode: 'landlock' |
+ * 'seatbelt' | 'unprotected-fallback'). If mode is dropped from
+ * TamanduaEvent, this assignment fails typecheck.
+ */
+const TAMANDUA_EVENT_ISOLATION_PAYLOAD_FIELDS: TamanduaEvent = {
+  ts: "static-pin",
+  event: "run.harness_isolation",
+  runId: "static-pin",
+  workflowId: "static-pin",
+  agentId: "static-pin",
+  roundId: "static-pin",
+  harness: "pi",
+  mode: "landlock",
+  reason: "static-pin",
+};
+void TAMANDUA_EVENT_ISOLATION_PAYLOAD_FIELDS;
+
+/**
  * The run-level alert vocabulary (RSPN). These are NON-terminal diagnostic
  * events emitted while a run is still active — they surface a pathology
  * (e.g. a worker instant-fail loop heading toward force-fail escalation)
@@ -134,17 +154,21 @@ const PINNED_RUN_ALERT_VOCABULARY = [
 ];
 
 /**
- * The launch-time harness probe diagnostic vocabulary (IFLB). These are
- * NON-terminal run-diagnostics emitted around the once-per-run probe that
- * precedes a run's first real dispatch: run.harness_probe_ok records a
- * passing probe (harness answered `<launcher> skill-path` with the expected
- * PATH) and run.harness_probe_failed records a failing one (the run is
- * force-failed immediately afterwards). Pinned alongside the lifecycle and
- * alert vocabularies.
+ * The launch-time harness probe / per-execution isolation diagnostic
+ * vocabulary (IFLB + KHYG US-002). These are NON-terminal run-diagnostics
+ * emitted around the once-per-run probe that precedes a run's first real
+ * dispatch — run.harness_probe_ok records a passing probe (harness answered
+ * `<launcher> skill-path` with the expected PATH), run.harness_probe_failed
+ * records a failing one (the run is force-failed immediately afterwards) —
+ * plus run.harness_isolation, emitted once per harness execution (work
+ * rounds AND the probe round) recording the effective signal-isolation mode
+ * ('landlock' | 'seatbelt' | 'unprotected-fallback') with reason on fallback.
+ * Pinned alongside the lifecycle and alert vocabularies.
  */
 const PINNED_RUN_DIAGNOSTIC_VOCABULARY = [
   "run.harness_probe_ok",
   "run.harness_probe_failed",
+  "run.harness_isolation",
 ];
 
 // ── Test suite ─────────────────────────────────────────────────────────
@@ -283,12 +307,12 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     }
   });
 
-  it("pins the harness-probe diagnostic vocabulary: {run.harness_probe_ok, run.harness_probe_failed} (IFLB)", () => {
+  it("pins the harness-probe diagnostic vocabulary: {run.harness_probe_ok, run.harness_probe_failed, run.harness_isolation} (IFLB + KHYG US-002)", () => {
     assert.ok(Array.isArray(RUN_DIAGNOSTIC_EVENTS), "RUN_DIAGNOSTIC_EVENTS must be exported");
     assert.deepEqual(
       [...RUN_DIAGNOSTIC_EVENTS].sort(),
       [...PINNED_RUN_DIAGNOSTIC_VOCABULARY].sort(),
-      "the run-diagnostic vocabulary changed — update this pin deliberately (IFLB)",
+      "the run-diagnostic vocabulary changed — update this pin deliberately (IFLB + KHYG US-002)",
     );
     assert.equal(RUN_DIAGNOSTIC_EVENTS.length, PINNED_RUN_DIAGNOSTIC_VOCABULARY.length, "diagnostic vocabulary must not contain duplicates");
     assert.ok(Object.isFrozen(RUN_DIAGNOSTIC_EVENTS), "diagnostic vocabulary must be frozen");
@@ -496,6 +520,64 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     assert.equal(failed.signal, null);
     assert.equal(failed.durationMs, 42);
     assert.equal(failed.stderrTail, "No API key found for the selected model");
+  });
+
+  it("run.harness_isolation event payloads persist the KHYG US-002 isolation-mode fields", () => {
+    const runId = "run-vocab-isolation-001";
+    seedRun(runId);
+
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.harness_isolation",
+      runId,
+      workflowId: "wf-vocab",
+      agentId: "dev",
+      roundId: "job-1",
+      harness: "dsh",
+      mode: "unprotected-fallback",
+      reason: "landlock-helper-not-built",
+      // The launch module (harness-launch.ts recordMode) always renders a
+      // human-visible detail line — logs-tail/dashboard display `detail`,
+      // so a fallback must spell out mode + reason there.
+      detail: "mode=unprotected-fallback reason=landlock-helper-not-built",
+    });
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.harness_isolation",
+      runId,
+      workflowId: "wf-vocab",
+      agentId: "dev",
+      roundId: "job-2",
+      harness: "pi",
+      mode: "landlock",
+      detail: "abi=8",
+    });
+
+    const events = getRunEvents(runId);
+    assert.equal(events.length, 2, "one isolation record per harness execution expected");
+    const [fallback, protected_] = events;
+
+    // fallback: mode + reason + run/execution identity + ts
+    assert.equal(fallback.event, "run.harness_isolation");
+    assert.equal(fallback.mode, "unprotected-fallback");
+    assert.equal(fallback.reason, "landlock-helper-not-built");
+    assert.equal(fallback.detail, "mode=unprotected-fallback reason=landlock-helper-not-built");
+    assert.equal(fallback.harness, "dsh");
+    assert.equal(fallback.runId, runId);
+    assert.equal(fallback.agentId, "dev");
+    assert.equal(fallback.roundId, "job-1");
+    const fbIdentity = requireIdentityFields(fallback);
+    assert.ok(fbIdentity.ts.length > 0, "the record must carry a UTC timestamp");
+
+    // protected: mode landlock + READY detail, no reason
+    assert.equal(protected_.event, "run.harness_isolation");
+    assert.equal(protected_.mode, "landlock");
+    assert.equal(protected_.detail, "abi=8");
+    assert.ok(!("reason" in protected_), "a protected record must not carry a fallback reason");
+    assert.equal(protected_.harness, "pi");
+    assert.equal(protected_.roundId, "job-2");
+    const protIdentity = requireIdentityFields(protected_);
+    assert.ok(protIdentity.ts.length > 0, "the record must carry a UTC timestamp");
   });
 
   it("run.started emitter (src/installer/run.ts) carries ts and runId (source pin)", () => {

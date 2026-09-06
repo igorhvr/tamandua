@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,6 +9,12 @@ import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { sanitizeStderrTail } from "./step-ops.js";
 import { resolveHermesBinary } from "./hermes-resolver.js";
 import { resolveDshBinary } from "./dsh-resolver.js";
+import {
+  launchHarnessExecution,
+  type HarnessLaunchMode,
+  type HarnessLaunchSeams,
+  type HarnessRoundIdentity,
+} from "./harness-launch.js";
 
 // ── Harness round result ───────────────────────────────────────────
 
@@ -47,6 +53,14 @@ export interface HarnessRoundResult {
    * classify instant-fail rounds (see src/installer/instant-fail.ts).
    */
   durationMs?: number;
+  /**
+   * KHYG US-002: the effective native signal-isolation mode of this
+   * launch ('landlock' | 'seatbelt' | 'unprotected-fallback'), as decided
+   * by the shared launch mechanism (src/installer/harness-launch.ts).
+   */
+  launchMode?: HarnessLaunchMode;
+  /** KHYG US-002: the fallback reason when launchMode === 'unprotected-fallback'. */
+  launchReason?: string;
 }
 
 // ── Run options shared across harnesses ────────────────────────────
@@ -73,6 +87,28 @@ export interface RunHarnessOptions {
    * same resolved binary — no re-resolution, no disagreement.
    */
   binaryPath?: string;
+  /**
+   * KHYG US-002: run/execution identity for the per-launch isolation-mode
+   * records (run.harness_isolation events + logs). Set by the scheduler
+   * for work rounds and the launch-time probe round; optional — records
+   * are logger-only when omitted.
+   */
+  execution?: HarnessRoundIdentity;
+  /**
+   * KHYG US-002: internal test-only launch seams passed through to the
+   * shared launch mechanism (backend probe overrides, forced fallback,
+   * readiness wall). Never a user-facing CLI knob.
+   */
+  launch?: HarnessLaunchSeams;
+  /**
+   * KHYG US-002: explicit cancellation signal — the scheduler aborts the
+   * dispatch round's controller on run teardown/pause/cancel. The launch
+   * mechanism vetoes release and any fresh fallback once it is aborted, so
+   * a canceled run never starts a harness even when the setup child's final
+   * signal is ambiguous. Optional; round cancels without a signal fall back
+   * to the group-signal heuristic.
+   */
+  signal?: AbortSignal;
 }
 
 // ── Adapter interface ──────────────────────────────────────────────
@@ -147,6 +183,105 @@ function safeKillPgid(pgid: number, signal: NodeJS.Signals): void {
   }
 }
 
+// ── Shared per-execution launch (KHYG US-002) ──────────────────────
+// All three adapters launch their harness through ONE shared mechanism
+// (harness-launch.ts): a FRESH native signal domain per launch (Linux
+// landlock helper / macOS sandbox-exec + Seatbelt), a private READY/release
+// handshake that releases the harness exactly once, and a single safe
+// fallback to an unprotected run when the backend is unavailable or setup
+// fails BEFORE release. This helper runs the mechanism, converts a launch
+// aborted during setup (e.g. cancellation) into an empty round result, and
+// hands the live child + effective mode back to the adapter, whose argv,
+// cwd, env, stdio, parsing, wall-limit and cancellation handling are
+// otherwise unchanged.
+
+interface LaunchedRoundProcess {
+  child: ChildProcess;
+  pid: number | undefined;
+  pgid: number;
+  mode: HarnessLaunchMode;
+  reason?: string;
+}
+
+async function launchRoundProcess(params: {
+  harness: string;
+  command: string[];
+  workdir?: string;
+  env: Record<string, string | undefined>;
+  onSpawn?: (handle: { pid: number; pgid: number }) => void;
+  execution?: HarnessRoundIdentity;
+  seams?: HarnessLaunchSeams;
+  signal?: AbortSignal;
+  startedAt: number;
+  /** Overall round wall budget in ms (startedAt + timeoutMs). */
+  timeoutMs: number;
+}): Promise<
+  | { status: "launched"; process: LaunchedRoundProcess }
+  | { status: "aborted"; result: HarnessRoundResult }
+> {
+  const outcome = await launchHarnessExecution({
+    harness: params.harness,
+    command: params.command,
+    cwd: params.workdir ?? process.cwd(),
+    env: params.env,
+    identity: params.execution,
+    seams: params.seams,
+    signal: params.signal,
+    // The whole launch (native setup + any fallback) runs INSIDE the
+    // adapter's overall wall budget: once it expires, no fresh harness
+    // work may begin.
+    wallDeadlineMs: params.startedAt + params.timeoutMs,
+    onSpawn: params.onSpawn
+      ? ({ pid, pgid }: { pid: number; pgid: number }) => {
+          try {
+            params.onSpawn!({ pid, pgid });
+          } catch (err) {
+            logger.warn(`${params.harness} onSpawn callback threw`, { error: String(err) });
+          }
+        }
+      : undefined,
+  });
+
+  if (outcome.status === "aborted") {
+    // The launch was cancelled/aborted during native setup: no harness ever
+    // started, no fallback ran. Resolve an empty round result carrying the
+    // setup-child exit/signal forensics — the same shape a signal-killed
+    // round produces, so the scheduler handles it through the normal path.
+    // A budget-exhausted abort reports the round's timedOut convention.
+    logger.warn(`${params.harness} launch aborted before harness start (native setup)`, {
+      pid: outcome.pid ?? null,
+      pgid: outcome.pgid,
+      reason: outcome.reason,
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
+      timedOut: outcome.timedOut === true,
+      durationMs: Date.now() - params.startedAt,
+    });
+    return {
+      status: "aborted",
+      result: {
+        output: "",
+        exitCode: outcome.exitCode ?? null,
+        signal: outcome.signal ?? undefined,
+        stderrTail: outcome.stderrTail,
+        timedOut: outcome.timedOut === true ? true : undefined,
+        durationMs: Date.now() - params.startedAt,
+      },
+    };
+  }
+
+  return {
+    status: "launched",
+    process: {
+      child: outcome.child,
+      pid: outcome.pid,
+      pgid: outcome.pgid,
+      mode: outcome.mode,
+      reason: outcome.reason,
+    },
+  };
+}
+
 // ── PiHarnessAdapter ───────────────────────────────────────────────
 
 class PiHarnessAdapter implements HarnessAdapter {
@@ -213,39 +348,41 @@ class PiHarnessAdapter implements HarnessAdapter {
       workdir: options?.workdir,
     });
 
-    // Spawn pi via a POSIX shell wrapper so the true harness PGID flows
-    // through to every tool subshell. With detached:true the shell becomes
-    // its own process group leader; exec preserves the pid so pgid == $$.
-    // The claim CLI prefers TAMANDUA_WORKER_PGID over self-detected PGID,
-    // which on macOS would otherwise pick up the transient tool-call subshell.
-    const child = spawn("/bin/sh", [
-      "-c",
-      `export TAMANDUA_WORKER_PGID="$$"; exec "$0" "$@"`,
-      piPath,
-      ...args,
-    ], {
-      cwd: options?.workdir ?? process.cwd(),
+    // Launch pi through the shared per-execution isolation mechanism: a
+    // FRESH native signal domain (Linux landlock helper / macOS seatbelt)
+    // self-restricts and then execs the /bin/sh PGID wrapper below, so the
+    // true harness PGID flows through to every tool subshell with pid/pgid
+    // identity preserved across exec exactly as before. The mechanism
+    // reports READY, waits for the parent's release, and only then starts
+    // the harness exactly once.
+    const launched = await launchRoundProcess({
+      harness: "pi",
+      command: [piPath, ...args],
+      workdir: options?.workdir,
       env: childEnv,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
+      onSpawn: options?.onSpawn,
+      execution: options?.execution,
+      seams: options?.launch,
+      signal: options?.signal,
+      startedAt,
+      timeoutMs,
     });
+    if (launched.status === "aborted") return launched.result;
 
-    const childPid = child.pid;
+    const child = launched.process.child;
+    const childPid = launched.process.pid;
     // On Linux, the spawned child becomes its own group leader (pgid === pid)
-    // when detached:true. Fall back to childPid if getpgid is unavailable.
-    const pgid = childPid ?? 0;
-
-    if (childPid && options?.onSpawn) {
-      try {
-        options.onSpawn({ pid: childPid, pgid });
-      } catch (err) {
-        logger.warn("pi onSpawn callback threw", { error: String(err) });
-      }
-    }
+    // when detached:true; the launch mechanism preserves that group across the
+    // native setup child -> /bin/sh -> harness exec chain.
+    const pgid = launched.process.pgid;
+    const launchMode = launched.process.mode;
+    const launchReason = launched.process.reason;
 
     logger.info("pi launched", {
       pid: childPid ?? null,
       pgid,
+      mode: launchMode,
+      ...(launchReason !== undefined ? { fallbackReason: launchReason } : {}),
       timeoutMs,
       workdir: options?.workdir,
     });
@@ -276,7 +413,10 @@ class PiHarnessAdapter implements HarnessAdapter {
     // The adapter resolves on ALL outcomes (success, non-zero exit, timeout)
     // so the scheduler can attribute tokens and populate worker_lost events
     // with real exit/signal/stderr forensics. Only fatal spawn errors
-    // (child.on("error")) still reject.
+    // (child.on("error")) still reject. The timer uses the REMAINING wall
+    // budget (native setup already consumed some of it): the overall round
+    // budget, including setup/fallback, stays as requested.
+    const remainingWallMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
     const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -297,7 +437,7 @@ class PiHarnessAdapter implements HarnessAdapter {
         // failure path can now populate worker_lost events with real forensics
         // instead of undefined.
         resolve({ code: null, signal: "SIGTERM" });
-      }, timeoutMs);
+      }, remainingWallMs);
 
       child.on("error", (err) => {
         if (settled) return;
@@ -396,6 +536,8 @@ class PiHarnessAdapter implements HarnessAdapter {
       stderrTail,
       timedOut: timedOut || undefined,
       durationMs,
+      launchMode,
+      ...(launchReason !== undefined ? { launchReason } : {}),
     };
   }
 }
@@ -464,38 +606,38 @@ class HermesHarnessAdapter implements HarnessAdapter {
       workdir: options?.workdir,
     });
 
-    // Spawn hermes via a POSIX shell wrapper so the true harness PGID flows
-    // through to every tool subshell. With detached:true the shell becomes
-    // its own process group leader; exec preserves the pid so pgid == $$.
-    // The claim CLI prefers TAMANDUA_WORKER_PGID over self-detected PGID,
-    // which on macOS would otherwise pick up the transient tool-call subshell.
-    const child = spawn("/bin/sh", [
-      "-c",
-      `export TAMANDUA_WORKER_PGID="$$"; exec "$0" "$@"`,
-      hermesPath,
-      ...args,
-    ], {
-      cwd: options?.workdir ?? process.cwd(),
+    // Launch hermes through the shared per-execution isolation mechanism: a
+    // FRESH native signal domain self-restricts and then execs the /bin/sh
+    // PGID wrapper below, so the true harness PGID flows through to every
+    // tool subshell with pid/pgid identity preserved across exec exactly as
+    // before. The mechanism reports READY, waits for the parent's release,
+    // and only then starts the harness exactly once.
+    const launched = await launchRoundProcess({
+      harness: "hermes",
+      command: [hermesPath, ...args],
+      workdir: options?.workdir,
       env: childEnv,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
+      onSpawn: options?.onSpawn,
+      execution: options?.execution,
+      seams: options?.launch,
+      signal: options?.signal,
+      startedAt,
+      timeoutMs,
     });
+    if (launched.status === "aborted") return launched.result;
 
-    const childPid = child.pid;
-    const pgid = childPid ?? 0;
-
-    if (childPid && options?.onSpawn) {
-      try {
-        options.onSpawn({ pid: childPid, pgid });
-      } catch (err) {
-        logger.warn("hermes onSpawn callback threw", { error: String(err) });
-      }
-    }
+    const child = launched.process.child;
+    const childPid = launched.process.pid;
+    const pgid = launched.process.pgid;
+    const launchMode = launched.process.mode;
+    const launchReason = launched.process.reason;
 
     logger.info("hermes launched", {
       harness: "hermes",
       pid: childPid ?? null,
       pgid,
+      mode: launchMode,
+      ...(launchReason !== undefined ? { fallbackReason: launchReason } : {}),
       timeoutMs,
       workdir: options?.workdir,
     });
@@ -615,6 +757,9 @@ class HermesHarnessAdapter implements HarnessAdapter {
     // (child.on("error")) still reject — those go to the scheduler's catch
     // block which can attempt stderr-based sessionRef extraction.
     let timeoutTimerFired = false;
+    // The timer uses the REMAINING wall budget (native setup already
+    // consumed part of it), keeping the overall round budget intact.
+    const remainingWallMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
     const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -634,7 +779,7 @@ class HermesHarnessAdapter implements HarnessAdapter {
         // Resolve with what we have — the stderr collector may already
         // contain the session_id trailer when the harness was killed.
         resolve({ code: null, signal: "SIGTERM" });
-      }, timeoutMs);
+      }, remainingWallMs);
 
       child.on("error", (err) => {
         if (settled) return;
@@ -794,6 +939,8 @@ class HermesHarnessAdapter implements HarnessAdapter {
       stderrTail,
       timedOut: timeoutTimerFired || undefined,
       durationMs,
+      launchMode,
+      ...(launchReason !== undefined ? { launchReason } : {}),
     };
   }
 }
@@ -881,38 +1028,38 @@ class DshHarnessAdapter implements HarnessAdapter {
       workdir: options?.workdir,
     });
 
-    // Spawn dsh via a POSIX shell wrapper so the true harness PGID flows
-    // through to every tool subshell. With detached:true the shell becomes
-    // its own process group leader; exec preserves the pid so pgid == $$.
-    // The claim CLI prefers TAMANDUA_WORKER_PGID over self-detected PGID,
-    // which on macOS would otherwise pick up the transient tool-call subshell.
-    const child = spawn("/bin/sh", [
-      "-c",
-      `export TAMANDUA_WORKER_PGID="$$"; exec "$0" "$@"`,
-      dshPath,
-      ...args,
-    ], {
-      cwd: options?.workdir ?? process.cwd(),
+    // Launch dsh through the shared per-execution isolation mechanism: a
+    // FRESH native signal domain self-restricts and then execs the /bin/sh
+    // PGID wrapper below, so the true harness PGID flows through to every
+    // tool subshell with pid/pgid identity preserved across exec exactly as
+    // before. The mechanism reports READY, waits for the parent's release,
+    // and only then starts the harness exactly once.
+    const launched = await launchRoundProcess({
+      harness: "dsh",
+      command: [dshPath, ...args],
+      workdir: options?.workdir,
       env: childEnv,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
+      onSpawn: options?.onSpawn,
+      execution: options?.execution,
+      seams: options?.launch,
+      signal: options?.signal,
+      startedAt,
+      timeoutMs,
     });
+    if (launched.status === "aborted") return launched.result;
 
-    const childPid = child.pid;
-    const pgid = childPid ?? 0;
-
-    if (childPid && options?.onSpawn) {
-      try {
-        options.onSpawn({ pid: childPid, pgid });
-      } catch (err) {
-        logger.warn("dsh onSpawn callback threw", { error: String(err) });
-      }
-    }
+    const child = launched.process.child;
+    const childPid = launched.process.pid;
+    const pgid = launched.process.pgid;
+    const launchMode = launched.process.mode;
+    const launchReason = launched.process.reason;
 
     logger.info("dsh launched", {
       harness: "dsh",
       pid: childPid ?? null,
       pgid,
+      mode: launchMode,
+      ...(launchReason !== undefined ? { fallbackReason: launchReason } : {}),
       timeoutMs,
       workdir: options?.workdir,
     });
@@ -1023,8 +1170,10 @@ class DshHarnessAdapter implements HarnessAdapter {
     // Wait for child exit, with timeout guard. The adapter resolves on ALL
     // outcomes (success, non-zero exit, timeout) so the scheduler can run
     // post-round processing. Only fatal spawn errors (child.on("error"))
-    // still reject.
+    // still reject. The timer uses the REMAINING wall budget (native setup
+    // already consumed part of it), keeping the overall round budget intact.
     let timeoutTimerFired = false;
+    const remainingWallMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
     const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -1045,7 +1194,7 @@ class DshHarnessAdapter implements HarnessAdapter {
         // failure path can populate worker_lost events with real forensics
         // instead of undefined.
         resolve({ code: null, signal: "SIGTERM" });
-      }, timeoutMs);
+      }, remainingWallMs);
 
       child.on("error", (err) => {
         if (settled) return;
@@ -1171,6 +1320,8 @@ class DshHarnessAdapter implements HarnessAdapter {
       stderrTail,
       timedOut: timedOut || undefined,
       durationMs,
+      launchMode,
+      ...(launchReason !== undefined ? { launchReason } : {}),
     };
   }
 }

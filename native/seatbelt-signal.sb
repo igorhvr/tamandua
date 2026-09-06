@@ -1,0 +1,1 @@
+(version 1) (allow default) (deny signal) (allow signal (target same-sandbox))

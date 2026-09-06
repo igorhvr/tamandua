@@ -137,6 +137,14 @@ export interface TamanduaEvent {
    * durationMs/stderrTail — the mechanical keyline-block fields).
    */
   harness?: string;
+  /**
+   * KHYG US-002: the effective native signal-isolation mode of one harness
+   * execution — 'landlock' | 'seatbelt' | 'unprotected-fallback'. Present on
+   * run.harness_isolation records along with the run/execution identity,
+   * `harness`, and (for fallback) `reason`; `detail` may carry the READY
+   * record's extra tokens (e.g. `abi=8`).
+   */
+  mode?: string;
   probeCmd?: string;
   expected?: string;
   observed?: string;
@@ -261,7 +269,8 @@ export const RUN_ALERT_EVENTS: readonly string[] = Object.freeze([
 ]);
 
 /**
- * Run-level launch-time harness probe diagnostic vocabulary (IFLB).
+ * Run-level launch-time harness probe / per-execution isolation diagnostic
+ * vocabulary (IFLB + KHYG US-002).
  *
  * `run.harness_probe_ok` fires when the probe round passes (the run's
  * harness answered the exact `<launcher> skill-path` command with the
@@ -272,12 +281,23 @@ export const RUN_ALERT_EVENTS: readonly string[] = Object.freeze([
  * keyline-block fields HARNESS / PROBE_CMD / EXPECTED / OBSERVED (≤400
  * chars) / EXIT_CODE / SIGNAL / DURATION_MS / STDERR_TAIL (≤2000 chars)
  * plus the full block in `reason`/`detail`; the run is force-failed
- * immediately afterwards (run.force_failed). Pinned by
+ * immediately afterwards (run.force_failed).
+ *
+ * `run.harness_isolation` (KHYG US-002) fires once per harness execution
+ * (work rounds AND the launch-time probe round) through the shared launch
+ * mechanism in src/installer/harness-launch.ts: it records the effective
+ * signal-isolation `mode` ('landlock' | 'seatbelt' | 'unprotected-fallback')
+ * with the run/execution identity and `harness`. When the backend was
+ * unavailable or setup failed before release and the execution fell back to
+ * an unprotected run, `mode` is 'unprotected-fallback' and `reason` names
+ * the exact fallback cause — the prominent durable warning operators see on
+ * the run event stream. Pinned by
  * src/installer/events-vocabulary.test.ts.
  */
 export const RUN_DIAGNOSTIC_EVENTS: readonly string[] = Object.freeze([
   "run.harness_probe_ok",
   "run.harness_probe_failed",
+  "run.harness_isolation",
 ]);
 
 export type EventCursorSource =

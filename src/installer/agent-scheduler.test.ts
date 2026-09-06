@@ -33,6 +33,7 @@ import {
 } from "../../dist/installer/agent-scheduler.js";
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
+import { getHarnessAdapter } from "../../dist/installer/harness-adapter.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import type { SetupAgentCronsOptions, NudgeResult, CronJobInfo } from "../../dist/installer/agent-scheduler.js";
 import type { WorkflowSpec } from "../../dist/installer/types.js";
@@ -2569,5 +2570,358 @@ process.exit(0);
       0,
       "no probe events may fire when the probe is disabled",
     );
+  });
+});
+
+// ── KHYG US-002: real registered-round teardown aborts a parked launch ──
+//
+// Coordinator-reproduced wiring gap (23:12/23:28 UTC): removeRunCrons and
+// shutdownAllCrons aborted a round's launch-cancellation controller ONLY
+// when the round had already published a child in inFlightChildren. A
+// registered dispatch round that is still awaiting binary resolution (no
+// child yet) therefore kept an un-aborted controller: after teardown the
+// round proceeded to launch the harness once. These tests drive the REAL
+// registered executeDispatchRound (job registered via createAgentCronJob),
+// park it at adapter.findBinary via a thin adapter-prototype override, run
+// REAL removeRunCrons / shutdownAllCrons, then release the round — and
+// assert zero harness executions, zero spawned handles and an aborted
+// signal observed at runRound.
+
+// ── KHYG US-002: real registered-round teardown cancels a parked launch ──
+//
+// Coordinator-reproduced wiring gap (23:12/23:28 UTC): removeRunCrons and
+// shutdownAllCrons aborted a round's launch-cancellation controller ONLY
+// when the round had already published a child in inFlightChildren. A
+// registered dispatch round that is still awaiting binary resolution (no
+// child yet) therefore kept an un-aborted controller: after teardown the
+// round proceeded to launch the harness once. These tests drive the REAL
+// registered executeDispatchRound (job registered via createAgentCronJob),
+// park it at adapter.findBinary via a thin adapter-prototype override, run
+// REAL removeRunCrons / shutdownAllCrons, then release the round — and
+// assert zero harness executions, zero spawned handles and an aborted
+// signal observed at runRound. The replacement case additionally pins the
+// identity-safe finally: an old round's cleanup must not erase a
+// replacement round's controller registered under the same job id.
+describe("KHYG US-002 real registered-round teardown cancels a parked dispatch launch", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-sched-cancel-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // These rounds must reach the WORK spawn (binary resolution) directly;
+    // the launch-time probe round would resolve the binary first.
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+    // Guard awareness (test-isolation-guard): this suite emits events and
+    // reads the run DB through the same isolated temp state dir it creates.
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-khyg-cancel"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    _resetInstantFailStreaks();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /** Seed a running run with one pending step and a counter harness. */
+  function seedCancellationRun(): { runId: string; workdir: string; counter: string; jobId: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'cancel task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    // The counter harness appends one 'x' per REAL harness execution.
+    const counter = path.join(tempHome, "target-starts");
+    const target = path.join(tempHome, "owned-harness");
+    fs.writeFileSync(target, `#!/bin/sh\nprintf 'x\\n' >> "${counter}"\nprintf 'NO_WORK_AVAILABLE\\n'\n`, {
+      mode: 0o755,
+    });
+    process.env.TAMANDUA_PI_BINARY = target;
+
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    return { runId, workdir, counter, jobId };
+  }
+
+  /**
+   * Drive a REAL registered dispatch round (or two overlapping rounds with
+   * the same job id, `replacement`), parking it at binary resolution
+   * (adapter.findBinary — no child published yet), then tear the run down
+   * with the REAL removeRunCrons or shutdownAllCrons and release the
+   * parked round(s). `forceFallback` routes the adapter's launch through
+   * the forced-unavailable fallback seam so a leaked post-teardown launch
+   * would run unprotected (and would be counted). Returns the observed
+   * signal-aborted state at each runRound entry, spawned onSpawn handles,
+   * and real harness executions.
+   */
+  async function runCancellationScenario(opts: {
+    action: "remove" | "shutdown";
+    forceFallback?: boolean;
+    replacement?: boolean;
+  }): Promise<{
+    signalsAtRun: Array<boolean | null>;
+    spawned: number;
+    executions: number;
+  }> {
+    const { runId, workdir, counter, jobId } = seedCancellationRun();
+    const agent = {
+      id: "test-agent",
+      model: "fake",
+      timeoutSeconds: 30,
+      workspace: { baseDir: "." },
+    };
+    const workflow = {
+      id: "test-wf",
+      agents: [agent],
+      steps: [{ id: "step-1", agent: "test-agent", input: "do work", expects: "STATUS" }],
+    };
+
+    // Register the dispatch round (jobMetadata entry) WITHOUT letting its
+    // stagger timer fire: 60s keeps the timer dormant for the test.
+    const registerRound = async (): Promise<string> => {
+      const created = await createAgentCronJob({
+        workflowId: "test-wf",
+        runId,
+        agent,
+        workflow,
+        workingDirectoryForHarness: workdir,
+        staggerOffsetMs: 60_000,
+      });
+      assert.ok(created.ok && created.id, `createAgentCronJob failed: ${created.error ?? "?"}`);
+      return created.id!;
+    };
+
+    // Park each real per-round adapter instance at its first findBinary
+    // (pi resolves once in the scheduler and again inside runRound; only
+    // the first per-instance call is held). Gates[0..1] cover round A and
+    // (replacement) round B.
+    const proto = Object.getPrototypeOf(getHarnessAdapter("pi")) as unknown as {
+      findBinary: (o?: { preferTokenSaver?: boolean }) => Promise<string>;
+      runRound: (prompt: string, options?: Record<string, unknown>) => Promise<unknown>;
+    };
+    const oldFind = proto.findBinary;
+    const oldRun = proto.runRound;
+    const signalsAtRun: Array<boolean | null> = [];
+    let spawned = 0;
+    const heldInstances = new WeakSet<object>();
+    const releaseGate: Array<() => void> = [];
+    const gates: Array<Promise<void>> = [];
+    const markParked: Array<() => void> = [];
+    const parked: Array<Promise<void>> = [];
+    for (let i = 0; i < 2; i++) {
+      gates.push(
+        new Promise<void>((resolve) => {
+          releaseGate[i] = resolve;
+        }),
+      );
+      parked.push(
+        new Promise<void>((resolve) => {
+          markParked[i] = resolve;
+        }),
+      );
+    }
+    let findIndex = 0;
+    proto.findBinary = async function (this: object) {
+      if (heldInstances.has(this)) return oldFind.call(this);
+      heldInstances.add(this);
+      const idx = findIndex++;
+      markParked[idx](); // announce: this round reached binary resolution
+      await gates[idx]; // park until the test tears the run down + releases
+      return oldFind.call(this);
+    };
+    proto.runRound = function (
+      this: object,
+      prompt: string,
+      options?: Record<string, unknown>,
+    ) {
+      signalsAtRun.push((options?.signal as AbortSignal | undefined)?.aborted ?? null);
+      const onSpawn = options?.onSpawn as ((h: { pid: number; pgid: number }) => void) | undefined;
+      const wrappedOptions: Record<string, unknown> = {
+        ...(options ?? {}),
+        onSpawn: (h: { pid: number; pgid: number }) => {
+          spawned++;
+          onSpawn?.(h);
+        },
+      };
+      if (opts.forceFallback) {
+        wrappedOptions.launch = {
+          ...((options?.launch as Record<string, unknown> | undefined) ?? {}),
+          forceFallbackReason: "owned scheduler diagnostic",
+        };
+      }
+      return oldRun.call(this, prompt, wrappedOptions);
+    };
+
+    const releaseAll = (): void => {
+      for (const r of releaseGate) r();
+    };
+    const jobFor = (id: string): CronJobInfo => ({
+      id,
+      workflowId: "test-wf",
+      runId,
+      agentId: "test-wf_test-agent",
+      harnessType: "pi",
+      workingDirectoryForHarness: workdir,
+      createdAt: new Date().toISOString(),
+    });
+
+    // Fire-and-forget rounds are captured so an early rejection (before the
+    // await below) is never an unhandled rejection; errors are re-thrown
+    // after the scenario completes.
+    const roundErrors: unknown[] = [];
+    const track = (p: Promise<void>): Promise<void> => {
+      p.catch((err: unknown) => {
+        roundErrors.push(err);
+      });
+      return p;
+    };
+    const throwIfRoundFailed = (): void => {
+      if (roundErrors.length > 0) {
+        throw roundErrors[0];
+      }
+    };
+
+    const withTimeout = async (p: Promise<void>, what: string): Promise<void> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<void>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), 10_000);
+      });
+      try {
+        await Promise.race([p, timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    try {
+      // Round A: register + park at binary resolution.
+      const idA = await registerRound();
+      const roundA = track(executeDispatchRound(jobFor(idA), agent, workflow));
+      await withTimeout(parked[0], "round A binary resolution");
+
+      if (opts.replacement) {
+        // Pause (teardown round A's bookkeeping while it is parked), then
+        // register a REPLACEMENT round under the SAME job id (pause/resume
+        // shape) and park it too.
+        await removeRunCrons(runId);
+        const idB = await registerRound();
+        const roundB = track(executeDispatchRound(jobFor(idB), agent, workflow));
+        await withTimeout(parked[1], "replacement round B binary resolution");
+        // Let the OLD round A finish first: its finally must delete only
+        // its OWN controller, not replacement round B's (identity-safe).
+        releaseGate[0]();
+        await roundA;
+        throwIfRoundFailed();
+        // Now the teardown under test: it must abort round B's controller.
+        if (opts.action === "remove") {
+          await removeRunCrons(runId);
+        } else {
+          shutdownAllCrons();
+        }
+        releaseGate[1]();
+        await roundB;
+        throwIfRoundFailed();
+      } else {
+        // Teardown the REAL run while round A is parked (no child yet).
+        if (opts.action === "remove") {
+          await removeRunCrons(runId);
+        } else {
+          shutdownAllCrons();
+        }
+        releaseGate[0]();
+        await roundA;
+        throwIfRoundFailed();
+      }
+
+      const executions = fs.existsSync(counter)
+        ? fs.readFileSync(counter, "utf8").split("\n").filter((l) => l.trim() === "x").length
+        : 0;
+      return { signalsAtRun, spawned, executions };
+    } finally {
+      releaseAll();
+      proto.findBinary = oldFind;
+      proto.runRound = oldRun;
+      await removeRunCrons(runId).catch(() => {});
+    }
+  }
+
+  it("removeRunCrons during a parked binary resolution aborts the round: zero executions, zero spawns, signal aborted", async () => {
+    const outcome = await runCancellationScenario({ action: "remove" });
+    assert.equal(outcome.signalsAtRun.length, 1, "exactly one round must reach runRound");
+    assert.equal(outcome.signalsAtRun[0], true, "the round's signal must be aborted at runRound entry");
+    assert.equal(outcome.spawned, 0, "no launcher child may be spawned after teardown");
+    assert.equal(outcome.executions, 0, "the harness must never execute after teardown");
+  });
+
+  it("shutdownAllCrons during a parked binary resolution aborts the round: zero executions, zero spawns, signal aborted", async () => {
+    const outcome = await runCancellationScenario({ action: "shutdown" });
+    assert.equal(outcome.signalsAtRun.length, 1, "exactly one round must reach runRound");
+    assert.equal(outcome.signalsAtRun[0], true, "the round's signal must be aborted at runRound entry");
+    assert.equal(outcome.spawned, 0, "no launcher child may be spawned after teardown");
+    assert.equal(outcome.executions, 0, "the harness must never execute after teardown");
+  });
+
+  it("a forced-fallback launch after removeRunCrons is vetoed: zero executions (no unprotected replay)", async () => {
+    const outcome = await runCancellationScenario({ action: "remove", forceFallback: true });
+    assert.equal(outcome.signalsAtRun.length, 1, "exactly one round must reach runRound");
+    assert.equal(outcome.signalsAtRun[0], true, "the round's signal must be aborted at runRound entry");
+    assert.equal(outcome.spawned, 0, "no fallback child may be spawned after teardown");
+    assert.equal(outcome.executions, 0, "a canceled round must never fall back to an unprotected run");
+  });
+
+  it("a forced-fallback launch after shutdownAllCrons is vetoed: zero executions (no unprotected replay)", async () => {
+    const outcome = await runCancellationScenario({ action: "shutdown", forceFallback: true });
+    assert.equal(outcome.signalsAtRun.length, 1, "exactly one round must reach runRound");
+    assert.equal(outcome.signalsAtRun[0], true, "the round's signal must be aborted at runRound entry");
+    assert.equal(outcome.spawned, 0, "no fallback child may be spawned after teardown");
+    assert.equal(outcome.executions, 0, "a canceled round must never fall back to an unprotected run");
+  });
+
+  it("replacement round under the same job id survives the old round's finally: teardown aborts it too (removeRunCrons)", async () => {
+    const outcome = await runCancellationScenario({ action: "remove", replacement: true });
+    assert.equal(outcome.signalsAtRun.length, 2, "both the old and the replacement round must reach runRound");
+    assert.deepEqual(
+      outcome.signalsAtRun,
+      [true, true],
+      "both rounds must observe an aborted signal (old round's finally must not erase the replacement's controller)",
+    );
+    assert.equal(outcome.spawned, 0, "no launcher child may be spawned after teardown");
+    assert.equal(outcome.executions, 0, "neither round may execute the harness after teardown");
+  });
+
+  it("replacement round under the same job id survives the old round's finally: teardown aborts it too (shutdownAllCrons)", async () => {
+    const outcome = await runCancellationScenario({ action: "shutdown", replacement: true });
+    assert.equal(outcome.signalsAtRun.length, 2, "both the old and the replacement round must reach runRound");
+    assert.deepEqual(
+      outcome.signalsAtRun,
+      [true, true],
+      "both rounds must observe an aborted signal (old round's finally must not erase the replacement's controller)",
+    );
+    assert.equal(outcome.spawned, 0, "no launcher child may be spawned after teardown");
+    assert.equal(outcome.executions, 0, "neither round may execute the harness after teardown");
   });
 });

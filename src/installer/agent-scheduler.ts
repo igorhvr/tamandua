@@ -191,6 +191,28 @@ interface InFlightChild {
 const inFlightChildren = new Map<string, InFlightChild>();
 
 /**
+ * KHYG US-002: per-dispatch-round cancellation controllers, keyed by job
+ * id. The dispatch round passes its controller's signal to the adapter's
+ * launch boundary (runRound options.signal → harness-launch.ts), and the
+ * teardown/cancel paths (removeRunCrons, shutdownAllCrons) abort it when
+ * they mark an in-flight child killed. Unlike `inFlightChildren` (cleared
+ * during teardown), this registry survives until the round's own finally
+ * so an explicit cancellation recorded mid-setup can veto release and any
+ * fresh fallback at the launch boundary — signalCode alone cannot tell a
+ * canceled run from the setup wall's own SIGKILL.
+ */
+const roundAbortControllers = new Map<string, AbortController>();
+
+/** Abort the dispatch round's launch-cancellation signal, if registered. */
+function abortDispatchRound(jobId: string): void {
+  try {
+    roundAbortControllers.get(jobId)?.abort();
+  } catch {
+    /* abort is idempotent — ignore */
+  }
+}
+
+/**
  * Pending post-grace process-cleanup sweep timers keyed by runId.
  * At most one timer per run: `removeRunCrons` schedules a one-shot
  * unref-ed timer at HARNESS_TEARDOWN_GRACE_MS + 2s after the last
@@ -1431,6 +1453,14 @@ export async function executeDispatchRound(
   // include run_number without a second DB trip.
   let runNumber: number | undefined;
 
+  // KHYG US-002: this round's explicit launch-cancellation signal. The
+  // teardown/cancel paths abort it (abortDispatchRound) when they kill the
+  // in-flight child; the launch boundary vetoes release/fallback once
+  // aborted. Registered for the whole round (probe + work) and cleared in
+  // the round's finally below — survives inFlightChildren map clearing.
+  const roundAbort = new AbortController();
+  roundAbortControllers.set(job.id, roundAbort);
+
   try {
     // ── Run-scoped status check ────────────────────────────────────
     // If this run is no longer 'running' (terminal/paused) tear down the
@@ -1674,6 +1704,7 @@ export async function executeDispatchRound(
           workdir: workingDirectoryForHarness,
           preferTokenSaver,
           wallMs: probeWallMs,
+          signal: roundAbort.signal,
           onSpawn: ({ pid, pgid }: { pid: number; pgid: number }) => {
             inFlightChildren.set(job.id, { pid, pgid, killed: false });
           },
@@ -1800,6 +1831,16 @@ export async function executeDispatchRound(
       onSpawn,
       preferTokenSaver,
       binaryPath,
+      // KHYG US-002: run/execution identity for the per-launch
+      // isolation-mode records (run.harness_isolation), and this round's
+      // explicit cancellation signal (aborted on teardown/cancel).
+      execution: {
+        runId: job.runId,
+        agentId: job.agentId,
+        workflowId: job.workflowId,
+        roundId: job.id,
+      },
+      signal: roundAbort.signal,
     });
     output = result.output;
 
@@ -2120,6 +2161,16 @@ export async function executeDispatchRound(
   } finally {
     inFlightJobs.delete(job.id);
     inFlightChildren.delete(job.id);
+    // KHYG US-002: the round's launch-cancellation signal lives for the
+    // whole round (teardown may abort it while inFlightChildren is being
+    // cleared); drop it only once the round itself is finished. The delete
+    // is identity-safe: after a pause/resume a replacement round may have
+    // registered a NEW controller under the same job id, and this old
+    // round's finally must not erase the replacement's cancellation
+    // controller. A map-entry identity check is sufficient.
+    if (roundAbortControllers.get(job.id) === roundAbort) {
+      roundAbortControllers.delete(job.id);
+    }
     // Resolve the round's completion signal AFTER the map entry is gone:
     // settleRunInFlightRounds wakes on `done`, then recomputes what is
     // still in flight and must not find this round anymore.
@@ -2218,9 +2269,11 @@ async function runLaunchTimeHarnessProbe(params: {
   workdir: string;
   preferTokenSaver: boolean;
   wallMs: number;
+  /** KHYG US-002: the round's launch-cancellation signal. */
+  signal: AbortSignal;
   onSpawn: (handle: { pid: number; pgid: number }) => void;
 }): Promise<LaunchTimeProbeOutcome> {
-  const { job, context, workdir, preferTokenSaver, wallMs, onSpawn } = params;
+  const { job, context, workdir, preferTokenSaver, wallMs, signal, onSpawn } = params;
   const harnessType = job.harnessType ?? "pi";
   const probeCmd = buildHarnessProbeCommand();
   const prompt = buildHarnessProbePrompt();
@@ -2305,6 +2358,17 @@ async function runLaunchTimeHarnessProbe(params: {
       onSpawn,
       preferTokenSaver,
       binaryPath,
+      // KHYG US-002: the launch-time probe round is a harness execution
+      // too — give it run/execution identity for the per-launch
+      // isolation-mode records (run.harness_isolation) plus this round's
+      // explicit cancellation signal.
+      execution: {
+        runId: job.runId,
+        agentId: job.agentId,
+        workflowId: job.workflowId,
+        roundId: job.id,
+      },
+      signal,
     });
   } catch (err) {
     return fail({
@@ -2707,6 +2771,13 @@ export async function removeRunCrons(
       activeTimers.delete(id);
     }
 
+    // KHYG US-002: record explicit cancellation intent for EVERY round
+    // torn down with this run, REGARDLESS of child presence — a registered
+    // round can be awaiting binary resolution with no published child yet,
+    // and its controller must still be aborted so a post-teardown launch
+    // can never release or fall back. The group signal below (when a live
+    // child exists) then terminates the process group exactly as before.
+    abortDispatchRound(id);
     const child = inFlightChildren.get(id);
     if (child && !child.killed) {
       child.killed = true;
@@ -2928,6 +2999,15 @@ export function shutdownAllCrons(): void {
     pendingStartTimers.delete(id);
     count++;
   }
+  // KHYG US-002: abort EVERY registered round controller before clearing
+  // the registry — a registered round can be awaiting binary resolution
+  // with no in-flight child yet, and its controller must still be aborted
+  // so a round that outlives shutdown can never release or fall back.
+  // Abort is idempotent, so controllers already aborted via the child
+  // loop below are unaffected.
+  for (const id of [...roundAbortControllers.keys()]) {
+    abortDispatchRound(id);
+  }
   for (const [id, child] of inFlightChildren) {
     if (!child.killed && child.pgid) {
       child.killed = true;
@@ -2950,6 +3030,10 @@ export function shutdownAllCrons(): void {
   inFlightJobs.clear();
   jobMetadata.clear();
   instantFailStreaks.clear();
+  // KHYG US-002: every round's cancellation controller was aborted above
+  // (or belongs to a round that already finished); a full scheduler
+  // shutdown leaves nothing in flight, so drop the registry too.
+  roundAbortControllers.clear();
   schedulerGeneration++;
   if (count > 0) {
     logger.info("Shut down all cron jobs", { count });

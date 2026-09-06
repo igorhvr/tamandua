@@ -580,6 +580,32 @@ You're installing agent teams that run code on your machine. We take that seriou
 - **Community contributions welcome** — Want to add a workflow? Submit a PR. All submissions go through careful security review before they ship.
 - **Transparent by default** — Every workflow is plain YAML and Markdown. You can read exactly what each agent will do before you install it.
 
+### Automatic per-execution signal isolation
+
+Every harness execution — each work round of pi, Hermes or dsh, **and** the
+launch-time harness probe — runs in its own fresh native signal-security
+domain, so a worker can signal its own execution's processes but not another
+execution, the scheduling daemon, or unrelated host processes. This is
+automatic, per execution, with no user-facing knobs:
+
+- **Linux:** Landlock `SIGNAL` scope (kernel ABI ≥ 6). The helper is built
+  locally during `npm run build` (working C compiler plus a
+  `linux/landlock.h` header defining `LANDLOCK_SCOPE_SIGNAL` at build
+  time); a kernel ABI alone does not supply the helper.
+- **macOS:** the system `sandbox-exec` command with a small Seatbelt
+  profile — opportunistic, since Apple has deprecated `sandbox-exec`.
+- **Fallback:** if the native backend is unavailable or setup fails before
+  any harness work starts, Tamandua warns prominently, durably records
+  `mode=unprotected-fallback` with the reason, run identity and UTC time,
+  and runs the harness normally. Tamandua never becomes unusable on older
+  or restricted systems.
+
+This is process-signal isolation, not a filesystem sandbox, and it is
+best-effort rather than a complete security boundary. See
+[docs/native-signal-isolation.md](docs/native-signal-isolation.md) for the
+full description, the honest Linux privilege/mount caveats, the macOS
+policy and deprecation status, and the stated limits.
+
 ---
 
 ## Troubleshooting
