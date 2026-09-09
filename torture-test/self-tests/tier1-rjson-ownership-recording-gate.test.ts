@@ -68,6 +68,15 @@
 // child_process import anywhere). Confined to torture-test/. Zero tokens.
 // The only host filesystem reads are the gate's own sanctioned reads of the
 // emission test source (and the typescript module load). No host writes.
+//
+// MACP3 US-004: this gate's ONLY '/proc' literal is the P6 escape-proof probe
+// expression — fs.readFileSync('/proc/self/cmdline') is evaluated in a hermetic
+// vm context whose fs binding is the recording VIRTUAL filesystem (empty vfs:
+// a read of a path with no virtual entry is recorded, then fs ENOENT is raised
+// BEFORE any real host operation). The P6 assertion below is exactly that a
+// live-pid/pidfile-style host path read never reaches the host; there is no
+// runtime procfs access of any kind anywhere in this gate. See the
+// tier0-procfs-portability-lint allowlist entry for this file.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";

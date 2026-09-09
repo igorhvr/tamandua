@@ -325,6 +325,12 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     requiredMarker: "MACP3 US-004",
     reason: "US-005: /proc references are linux-only documentation/assertion prose — the MACP4 US-005 daemon-scripted capability computation is a pure PATH scan (commandOnPath) that never touches the procfs mount; the structural pin asserts exactly that, and the both-platform proof is a simulated-Darwin run on a /proc-less, getent-less PATH seam.",
   },
+  "self-tests/tier1-rjson-ownership-recording-gate.test.ts": {
+    category: "us004-harness-guarded",
+    requiredMarker: "MACP3 US-004",
+    reason:
+      "MACP3 US-004: this recording-only ownership gate's ONLY '/proc' literal is the P6 escape-proof probe expression — fs.readFileSync('/proc/self/cmdline') is evaluated inside a hermetic vm context whose fs binding is the recording VIRTUAL filesystem (empty vfs: a read of a path with no virtual entry is recorded and raises fs ENOENT BEFORE any real host operation), and the gate asserts exactly that (P6 detail must match ENOENT) plus its prose; there is no runtime procfs access of any kind in the gate (zero real signals/spawns/waits/removals/live-pid reads — see the MACP3 US-004 header note).",
+  },
 
   // ── T2.1-owned (concurrent run owns daemon-control + tier2 scenario
   //    run files — no MACP3 markers required; out of scope for this branch,
