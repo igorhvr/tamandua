@@ -25,6 +25,21 @@
 //     cleanup signal revalidates the CURRENT identity against that captured
 //     evidence first — a changed/stale/foreign/unreadable/reused pid refuses
 //     the signal and preserves evidence (US-002 fixed ownership semantics).
+//   * Child teardown is ASYNC and bounded: the retained spawn handle
+//     (ChildProcess) keeps the direct child reaped by node and exposes its
+//     exit state, and stopOwnedChild waits for the TERM-exited child to be
+//     reaped by yielding to the event loop between bounded polls — a
+//     synchronous Atomics.wait/spawnSync wait would leave the child an
+//     unreaped zombie (kill -0 stays true, ps shows [bash] <defunct>) and the
+//     KILL-escalation revalidation would misclassify it as foreign, refusing
+//     the KILL and aborting the caller's finally mid-loop (observed: leaked
+//     owned children held their stderr pipes and stalled the runner for
+//     hours). The finallys therefore attempt EVERY independently owned child
+//     (and the fixture-recorder leftover cleanup) even when one cleanup
+//     refuses, aggregate the refusals, keep the fixture as refusal evidence
+//     (no rm), and surface them WITHOUT discarding the body's original
+//     assertion; a refused live pid is never signaled and its pipe is
+//     released so the run can never hang on it.
 //   * The fixture recorder is owned the same way (US-003): its launch
 //     identity (ps cmdline + birth start) is captured at start for the exact
 //     pid this invocation's `start` wrote to the fixture pidfile, with a
@@ -74,7 +89,7 @@
 // Zero tokens; confined to torture-test/. Passes twice consecutively
 // (idempotent — every run allocates a fresh fixture).
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -124,7 +139,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Synchronous bounded sleep (cleanup paths run outside async contexts). */
+/** Synchronous bounded sleep — retained ONLY for the recorder cleanup paths
+ *  (the fixture recorder is a detached process, never a direct child of this
+ *  node process, so blocking here cannot prevent node from reaping it). The
+ *  owned-CHILD cleanup path never uses it: a synchronous Atomics.wait poll
+ *  there would block the event loop and stop node from reaping a TERM-exited
+ *  direct child (see stopOwnedChild). */
 function sleepSync(ms: number): void {
   const sab = new SharedArrayBuffer(4);
   Atomics.wait(new Int32Array(sab), 0, 0, ms);
@@ -177,6 +197,13 @@ interface OwnedChild {
   pid: number;
   argv: string[]; // the exact exec argv (["bash","-c",PERSIST_SCRIPT, token, ...argvTail])
   stderr: string;
+  // The ChildProcess handle this invocation ACTUALLY spawned, retained so the
+  // direct child can never be GC'd mid-life and so teardown can observe the
+  // exit state node sets when it reaps the child (exitCode/signalCode become
+  // non-null once the 'exit' event has been processed on the event loop).
+  // undefined on evidence-only records that were never accepted (e.g. a
+  // rejected spawn attempt).
+  proc?: ChildProcess;
   // Launch identity evidence captured at spawn time for the handle this
   // invocation ACTUALLY created (ps cmdline + birth start, read right after
   // the child was first seen alive). Cleanup revalidates the CURRENT
@@ -260,8 +287,10 @@ async function spawnOwnedChild(token: string, cwd: string, argvTail: string[]): 
       const identity = readChildIdentity(pid);
       if (identity.alive && identity.cmdline !== "" && identity.start !== "" && identity.cmdline.includes(token)) {
         // Alive with THIS launch's token and a readable birth identity:
-        // capture the launch evidence on the exact handle we return.
-        return { pid, argv, stderr: err, launchCmdline: identity.cmdline, launchStart: identity.start };
+        // retain the ChildProcess handle (so node keeps and reaps this direct
+        // child and its exit state stays observable) and capture the launch
+        // evidence on the exact handle we return.
+        return { pid, argv, stderr: err, proc: child, launchCmdline: identity.cmdline, launchStart: identity.start };
       }
       // Not provably this launch (immediate exit before identity capture,
       // unreadable evidence, or the pid reused within the settle window).
@@ -287,17 +316,29 @@ async function spawnOwnedChild(token: string, cwd: string, argvTail: string[]): 
   );
 }
 
-/** Stop an owned child under EXACT invocation ownership. The ONE guarded
- *  decision (currentChildVerdict) revalidates the CURRENT identity against
- *  the launch evidence captured at spawn BEFORE EACH signal: SIGTERM first
- *  (the trap exits cleanly within ~1 s), then — if the child survives —
- *  identity is revalidated AGAIN before the SIGKILL escalation. A pid whose
+/** Stop an owned child under EXACT invocation ownership with asynchronous,
+ *  bounded teardown. The ONE guarded decision (currentChildVerdict)
+ *  revalidates the CURRENT identity against the launch evidence captured at
+ *  spawn BEFORE EACH signal: SIGTERM first (the trap exits cleanly within
+ *  ~1 s), then — if the child survives the TERM-exit window — identity is
+ *  revalidated AGAIN before the SIGKILL escalation. The TERM-exit and
+ *  KILL-collect windows are ASYNC (real `await sleep` between polls), never a
+ *  synchronous Atomics.wait/spawnSync loop: yielding to the event loop lets
+ *  node reap this direct child the moment it exits. A synchronous wait would
+ *  leave the TERM-exited child an unreaped ZOMBIE that stays kill -0 alive
+ *  with a defunct ps cmdline, so the pre-KILL revalidation would misclassify
+ *  it as "foreign" and refuse the KILL — aborting the caller's finally,
+ *  stranding the other owned children (their stderr pipes kept the runner
+ *  alive for hours) and hiding the real result. "Exited" (the retained
+ *  handle's exit state once node has reaped the child, or the pid gone from
+ *  the process table) is DISTINGUISHED from "still live": a zombie is never
+ *  treated as a live owned target and never authorizes a signal. A pid whose
  *  identity changed or was lost between TERM and KILL (process gone, PID
  *  possibly reused) never receives a KILL; unknown/changed/stale/foreign/
  *  unreadable evidence REFUSES the signal with rich context and the refusal
- *  propagates so evidence is preserved (the caller's finally stops before
- *  any removal). Its transient `sleep 1` grandchildren self-terminate. */
-function stopOwnedChild(owned: OwnedChild): void {
+ *  propagates so evidence is preserved. Its transient `sleep 1`
+ *  grandchildren self-terminate. */
+async function stopOwnedChild(owned: OwnedChild): Promise<void> {
   const beforeTerm = currentChildVerdict(owned);
   if (beforeTerm === "dead") return; // already gone — nothing to do
   if (beforeTerm !== "owned") refuseChildSignal(owned, "SIGTERM", beforeTerm);
@@ -306,8 +347,22 @@ function stopOwnedChild(owned: OwnedChild): void {
   } catch {
     /* already gone */
   }
-  for (let i = 0; i < 30 && pidAlive(owned.pid); i++) {
-    sleepSync(100);
+  // ── TERM-exit window (bounded, async) ──
+  // Wait for the TERM-exited child to be REAPED: node sets exitCode/signalCode
+  // on the retained handle once the 'exit' event has been processed, which
+  // happens only while the event loop runs (each `await sleep` below yields).
+  // A child that is merely a not-yet-reaped zombie must never be read as a
+  // live owned target — liveness alone is never proof of life here.
+  for (let i = 0; i < 30; i++) {
+    if (
+      owned.proc !== undefined &&
+      owned.proc !== null &&
+      (owned.proc.exitCode !== null || owned.proc.signalCode !== null)
+    ) {
+      return; // reaped clean TERM exit — no KILL
+    }
+    if (!pidAlive(owned.pid)) return; // gone from the process table — no KILL
+    await sleep(100);
   }
   const beforeKill = currentChildVerdict(owned);
   if (beforeKill === "dead") return; // TERM worked — clean exit, no KILL
@@ -316,6 +371,20 @@ function stopOwnedChild(owned: OwnedChild): void {
     process.kill(owned.pid, "SIGKILL");
   } catch {
     /* already gone */
+  }
+  // ── KILL-collect window (bounded, async) ──
+  // Wait for the SIGKILLed direct child to be reaped before returning so this
+  // function never leaves its own unreaped zombie behind.
+  for (let i = 0; i < 10; i++) {
+    if (
+      owned.proc !== undefined &&
+      owned.proc !== null &&
+      (owned.proc.exitCode !== null || owned.proc.signalCode !== null)
+    ) {
+      return;
+    }
+    if (!pidAlive(owned.pid)) return;
+    await sleep(100);
   }
 }
 
@@ -634,72 +703,129 @@ describe("RJSON US-002 — isolated emission-level recorder JSONL framing regres
     // Per-invocation launch token bound to this exact fresh fixture.
     const fxToken = launchToken(fixture.root);
     const children: OwnedChild[] = [];
+    // The body's first failure is retained so a cleanup refusal can be
+    // surfaced WITHOUT silently discarding the original assertion (see the
+    // finally below).
+    let bodyError: unknown;
     try {
-      // Multiline command text in the argv (child A), a multiline fixture
-      // path in the cwd (child B), and the daemon-db arm (child C).
-      const childACwd = path.join(fixture.varRoot, "childA");
-      fs.mkdirSync(childACwd, { recursive: true });
-      const childBDir = path.join(fixture.varRoot, "dirA\u000adirB");
-      fs.mkdirSync(childBDir, { recursive: true });
-      const childCCwd = path.join(fixture.varRoot, "home-scripted");
-      const childCDbDir = path.join(childCCwd, ".tamandua");
-      fs.mkdirSync(childCDbDir, { recursive: true });
-      const dbPath = path.join(childCDbDir, "tamandua.db");
-      const dbBody = "synthetic tamandua.db for the RJSON US-002 db-arm assertion";
-      fs.writeFileSync(dbPath, dbBody);
+      try {
+        // Multiline command text in the argv (child A), a multiline fixture
+        // path in the cwd (child B), and the daemon-db arm (child C).
+        const childACwd = path.join(fixture.varRoot, "childA");
+        fs.mkdirSync(childACwd, { recursive: true });
+        const childBDir = path.join(fixture.varRoot, "dirA\u000adirB");
+        fs.mkdirSync(childBDir, { recursive: true });
+        const childCCwd = path.join(fixture.varRoot, "home-scripted");
+        const childCDbDir = path.join(childCCwd, ".tamandua");
+        fs.mkdirSync(childCDbDir, { recursive: true });
+        const dbPath = path.join(childCDbDir, "tamandua.db");
+        const dbBody = "synthetic tamandua.db for the RJSON US-002 db-arm assertion";
+        fs.writeFileSync(dbPath, dbBody);
 
-      const a = await spawnOwnedChild(fxToken, childACwd, [
-        "rjson-argv0-A",
-        "line1\nline2\ttabbed torture-test/var in-scope marker",
-      ]);
-      children.push(a);
-      const b = await spawnOwnedChild(fxToken, childBDir, ["rjson-argv0-B", "plain-arg-B"]);
-      children.push(b);
-      const c = await spawnOwnedChild(fxToken, childCCwd, ["rjson-argv0-C", "daemon-child torture-test/var"]);
-      children.push(c);
+        const a = await spawnOwnedChild(fxToken, childACwd, [
+          "rjson-argv0-A",
+          "line1\nline2\ttabbed torture-test/var in-scope marker",
+        ]);
+        children.push(a);
+        const b = await spawnOwnedChild(fxToken, childBDir, ["rjson-argv0-B", "plain-arg-B"]);
+        children.push(b);
+        const c = await spawnOwnedChild(fxToken, childCCwd, ["rjson-argv0-C", "daemon-child torture-test/var"]);
+        children.push(c);
 
-      // Independent pgid cross-check BEFORE any child is stopped.
-      const pgids = new Map<number, string>();
-      for (const ch of children) {
-        const pgid = psPgid(ch.pid);
-        assert.ok(/^[0-9]+$/.test(pgid), `ps pgid for owned pid ${ch.pid} must be numeric, got ${JSON.stringify(pgid)}`);
-        pgids.set(ch.pid, pgid);
-      }
+        // Independent pgid cross-check BEFORE any child is stopped.
+        const pgids = new Map<number, string>();
+        for (const ch of children) {
+          const pgid = psPgid(ch.pid);
+          assert.ok(/^[0-9]+$/.test(pgid), `ps pgid for owned pid ${ch.pid} must be numeric, got ${JSON.stringify(pgid)}`);
+          pgids.set(ch.pid, pgid);
+        }
 
-      // A short settle lets every child's exec'd argv/cwd be fully visible.
-      await sleep(400);
+        // A short settle lets every child's exec'd argv/cwd be fully visible.
+        await sleep(400);
 
-      const out = collectSampleOnce(fixture.tool, fixture.root);
-      assert.equal(out.status, 0, `collect_sample exited ${out.status}; stderr: ${JSON.stringify(out.stderr)}`);
-      const entries = parseEveryLine("collect_sample", out.stdout);
+        const out = collectSampleOnce(fixture.tool, fixture.root);
+        assert.equal(out.status, 0, `collect_sample exited ${out.status}; stderr: ${JSON.stringify(out.stderr)}`);
+        const entries = parseEveryLine("collect_sample", out.stdout);
 
-      // Expected canonical cwd per child; child C additionally exercises the
-      // daemon-db arm (db fields only for a detected daemon under the
-      // fixture's home-scripted dir with a real tamandua.db present).
-      const expectations: Array<{ ch: OwnedChild; cwd: string; db?: { dbPath: string; dbSize: number; walSize: number } }> = [
-        { ch: a, cwd: fs.realpathSync(childACwd) },
-        { ch: b, cwd: fs.realpathSync(childBDir) },
-        {
-          ch: c,
-          cwd: fs.realpathSync(childCCwd),
-          db: {
-            dbPath: path.join(fs.realpathSync(fixture.varRoot), "home-scripted", ".tamandua", "tamandua.db"),
-            dbSize: fs.statSync(dbPath).size,
-            walSize: 0,
+        // Expected canonical cwd per child; child C additionally exercises the
+        // daemon-db arm (db fields only for a detected daemon under the
+        // fixture's home-scripted dir with a real tamandua.db present).
+        const expectations: Array<{ ch: OwnedChild; cwd: string; db?: { dbPath: string; dbSize: number; walSize: number } }> = [
+          { ch: a, cwd: fs.realpathSync(childACwd) },
+          { ch: b, cwd: fs.realpathSync(childBDir) },
+          {
+            ch: c,
+            cwd: fs.realpathSync(childCCwd),
+            db: {
+              dbPath: path.join(fs.realpathSync(fixture.varRoot), "home-scripted", ".tamandua", "tamandua.db"),
+              dbSize: fs.statSync(dbPath).size,
+              walSize: 0,
+            },
           },
-        },
-      ];
+        ];
 
-      for (const exp of expectations) {
-        const matches = entries.filter((e) => e.rec.pid === exp.ch.pid);
-        assert.equal(matches.length, 1, `expected exactly one record for owned pid ${exp.ch.pid}, got ${matches.length}`);
-        assertOwnedRecord(`owned child pid=${exp.ch.pid}`, matches[0], exp.ch, exp.cwd, {
-          pgid: pgids.get(exp.ch.pid),
-          ...(exp.db ? { db: exp.db } : {}),
-        });
+        for (const exp of expectations) {
+          const matches = entries.filter((e) => e.rec.pid === exp.ch.pid);
+          assert.equal(matches.length, 1, `expected exactly one record for owned pid ${exp.ch.pid}, got ${matches.length}`);
+          assertOwnedRecord(`owned child pid=${exp.ch.pid}`, matches[0], exp.ch, exp.cwd, {
+            pgid: pgids.get(exp.ch.pid),
+            ...(exp.db ? { db: exp.db } : {}),
+          });
+        }
+      } catch (err) {
+        bodyError = err;
+        throw err;
       }
     } finally {
-      for (const ch of children) stopOwnedChild(ch);
+      // Owned-child teardown: attempt EVERY independently owned child even
+      // when an earlier cleanup refuses — a refusal must never strand the
+      // other proven-owned children. See the refusal branch below.
+      const cleanupErrors: unknown[] = [];
+      for (const ch of children) {
+        try {
+          await stopOwnedChild(ch);
+        } catch (err) {
+          cleanupErrors.push(err);
+        }
+      }
+      if (cleanupErrors.length > 0) {
+        // A cleanup refusal/exception is NEVER silent and NEVER strands the
+        // other proven-owned children: every child/recorder was already
+        // attempted above. Release the stderr pipes AND unref the process
+        // handle of any child this finally could not stop (a refused live pid
+        // is never signaled). Destroying the pipe read end alone does not
+        // release node's ref'ed uv_process_t, so a still-live refused child
+        // that is OUR OWN direct child would otherwise keep this node --test
+        // process alive forever — unref() detaches the handle from the event
+        // loop (a no-op for the foreign/dead children that dominate), so once
+        // every other pending handle/work settles the runner can exit even in
+        // that refusal corner — an hours-long stall must never recur. Keep the
+        // fixture as refusal evidence (no rm), and surface the refusals —
+        // appended to the ORIGINAL body assertion when one exists, never
+        // replacing it.
+        for (const ch of children) {
+          try {
+            ch.proc?.stderr?.destroy?.();
+          } catch {
+            /* best effort */
+          }
+          try {
+            ch.proc?.unref?.();
+          } catch {
+            /* best effort */
+          }
+        }
+        const refusalDetail = cleanupErrors
+          .map((e) => String(e instanceof Error ? e.message : e))
+          .join("\n  - ");
+        if (bodyError instanceof Error) {
+          bodyError.message = `${bodyError.message}\n  [owned cleanup refused/raised — fixture NOT removed so the refusal evidence survives]\n  - ${refusalDetail}`;
+          throw bodyError;
+        }
+        assert.fail(
+          `owned cleanup refused or raised (${bodyError === undefined ? "test body completed cleanly" : `test body also failed: ${String(bodyError)}`}); fixture NOT removed so the refusal evidence survives:\n  - ${refusalDetail}`,
+        );
+      }
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
   });
@@ -713,113 +839,168 @@ describe("RJSON US-002 — isolated emission-level recorder JSONL framing regres
     // succeeded AND the launch identity was captured (a failed start leaves it
     // null — nothing is then provably owned, so cleanup never signals).
     let recorder: OwnedRecorder | null = null;
+    // The body's first failure is retained so a cleanup refusal can be
+    // surfaced WITHOUT silently discarding the original assertion (see the
+    // finally below).
+    let bodyError: unknown;
     try {
-      const childCwd = path.join(fixture.varRoot, "childF");
-      fs.mkdirSync(childCwd, { recursive: true });
-      const f = await spawnOwnedChild(fxToken, childCwd, [
-        "rjson-argv0-F",
-        "multi\nline cmd torture-test/var out-file marker",
-      ]);
-      children.push(f);
-      await sleep(300);
-      const pgid = psPgid(f.pid);
-      assert.ok(/^[0-9]+$/.test(pgid), `ps pgid for owned pid ${f.pid} must be numeric`);
+      try {
+        const childCwd = path.join(fixture.varRoot, "childF");
+        fs.mkdirSync(childCwd, { recursive: true });
+        const f = await spawnOwnedChild(fxToken, childCwd, [
+          "rjson-argv0-F",
+          "multi\nline cmd torture-test/var out-file marker",
+        ]);
+        children.push(f);
+        await sleep(300);
+        const pgid = psPgid(f.pid);
+        assert.ok(/^[0-9]+$/.test(pgid), `ps pgid for owned pid ${f.pid} must be numeric`);
 
-      // Start the fixture recorder at the minimum interval and let it run for
-      // a few real sample rounds. The fresh per-invocation launch token rides
-      // the start-subprocess env into the detached recorder (the recorder
-      // runtime ignores it — it is identity evidence for this invocation only).
-      const start = run(["bash", fixture.tool, "start", "--interval", "1"], {
-        cwd: fixture.root,
-        env: { ...process.env, RJSON_RECORDER_LAUNCH_TOKEN: fxToken },
-        timeoutMs: 20_000,
-      });
-      assert.equal(start.status, 0, `start failed (rc=${start.status}): ${start.stderr}`);
-      const pidfile = recorderPidfilePath(fixture.varRoot);
-      assert.ok(fs.existsSync(pidfile), `pidfile must exist at ${pidfile}`);
-      const recPid = fs.readFileSync(pidfile, "utf8").trim();
-      assert.match(recPid, /^[0-9]+$/, `pidfile must hold a numeric pid, got ${JSON.stringify(recPid)}`);
-      // Invocation-owned recorder handle: launch identity evidence (ps cmdline
-      // + birth start) captured at start for the EXACT pid this invocation's
-      // `start` wrote to the fixture pidfile, bound to this fixture+token —
-      // never a bare re-read of the mutable pidfile or a generic name match.
-      recorder = captureRecorderIdentity(fixture.varRoot, fxToken, Number(recPid));
+        // Start the fixture recorder at the minimum interval and let it run for
+        // a few real sample rounds. The fresh per-invocation launch token rides
+        // the start-subprocess env into the detached recorder (the recorder
+        // runtime ignores it — it is identity evidence for this invocation only).
+        const start = run(["bash", fixture.tool, "start", "--interval", "1"], {
+          cwd: fixture.root,
+          env: { ...process.env, RJSON_RECORDER_LAUNCH_TOKEN: fxToken },
+          timeoutMs: 20_000,
+        });
+        assert.equal(start.status, 0, `start failed (rc=${start.status}): ${start.stderr}`);
+        const pidfile = recorderPidfilePath(fixture.varRoot);
+        assert.ok(fs.existsSync(pidfile), `pidfile must exist at ${pidfile}`);
+        const recPid = fs.readFileSync(pidfile, "utf8").trim();
+        assert.match(recPid, /^[0-9]+$/, `pidfile must hold a numeric pid, got ${JSON.stringify(recPid)}`);
+        // Invocation-owned recorder handle: launch identity evidence (ps cmdline
+        // + birth start) captured at start for the EXACT pid this invocation's
+        // `start` wrote to the fixture pidfile, bound to this fixture+token —
+        // never a bare re-read of the mutable pidfile or a generic name match.
+        recorder = captureRecorderIdentity(fixture.varRoot, fxToken, Number(recPid));
 
-      // The statefile records the startedAt + output file (generate_output_filename).
-      const statefile = path.join(fixture.varRoot, "recorder", "current-state");
-      let samplesPath: string | null = null;
-      let payload = "";
-      let seenOwned = false;
-      for (let i = 0; i < 60 && !seenOwned; i++) {
-        await sleep(250);
-        if (fs.existsSync(statefile)) {
-          const m = fs.readFileSync(statefile, "utf8").match(/^file=(.+)$/m);
-          if (m) samplesPath = m[1].trim();
+        // The statefile records the startedAt + output file (generate_output_filename).
+        const statefile = path.join(fixture.varRoot, "recorder", "current-state");
+        let samplesPath: string | null = null;
+        let payload = "";
+        let seenOwned = false;
+        for (let i = 0; i < 60 && !seenOwned; i++) {
+          await sleep(250);
+          if (fs.existsSync(statefile)) {
+            const m = fs.readFileSync(statefile, "utf8").match(/^file=(.+)$/m);
+            if (m) samplesPath = m[1].trim();
+          }
+          if (samplesPath && fs.existsSync(samplesPath)) {
+            // Tolerant poll parse: the live file can be momentarily empty or
+            // hold a partial trailing line mid-append; only complete records
+            // count toward "seen". The strict every-record parse below runs
+            // after the recorder is stopped and the file is stable.
+            payload = fs.readFileSync(samplesPath, "utf8");
+            seenOwned = parseCompleteLines(payload).some((e) => e.rec.pid === f.pid);
+          }
         }
-        if (samplesPath && fs.existsSync(samplesPath)) {
-          // Tolerant poll parse: the live file can be momentarily empty or
-          // hold a partial trailing line mid-append; only complete records
-          // count toward "seen". The strict every-record parse below runs
-          // after the recorder is stopped and the file is stable.
-          payload = fs.readFileSync(samplesPath, "utf8");
-          seenOwned = parseCompleteLines(payload).some((e) => e.rec.pid === f.pid);
+        assert.ok(seenOwned, `the owned child pid ${f.pid} must appear in the samples file within ~15 s`);
+        assert.ok(samplesPath, "statefile must record the output file");
+        assert.ok(
+          /samples-\d{4}-\d{2}-\d{2}T\d{6}Z\.jsonl$/.test(samplesPath),
+          `output file must follow samples-<startedAt>.jsonl, got ${samplesPath}`,
+        );
+
+        // Evidence-based stop of the exact recorder pid BEFORE the strict
+        // every-record parse, so the samples file is stable (no mid-append
+        // partial line can race the read). The recorder's own `stop` subcommand
+        // signals the pidfile pid itself, so the CURRENT identity must still
+        // prove THIS invocation's recorder before it may run — the ONE guarded
+        // decision (assertRecorderStopProceeds); a stale/foreign pidfile or a
+        // changed/unreadable identity REFUSES with evidence preserved. The
+        // subcommand's internal stop semantics are the recorder's own
+        // (unchanged, out of scope).
+        assertRecorderStopProceeds(recorder, fixture.varRoot);
+        const stop = run(["bash", fixture.tool, "stop"], { cwd: fixture.root, timeoutMs: 30_000 });
+        assert.equal(stop.status, 0, `stop failed (rc=${stop.status}): ${stop.stderr}`);
+        assert.match(stop.stdout, /tt-recorder stopped/, `stop must report stopped. stdout: ${stop.stdout}`);
+        assert.ok(!pidAlive(Number(recPid)), `recorder pid ${recPid} must be dead after stop`);
+        assert.ok(!fs.existsSync(pidfile), "stop must remove the pidfile");
+
+        // Parse EVERY emitted record from the real output file: one physical
+        // line per record, every line parseable, and the owned child's records
+        // carry the exact expected fields with the multiline cmdline escaped.
+        payload = fs.readFileSync(samplesPath, "utf8");
+        // Every collect_sample record ends in '\n'; a stop that lands exactly
+        // mid-append can leave ONE unterminated trailing fragment, which is not
+        // a complete emitted record — drop that single fragment before the
+        // strict every-record parse (never drop a terminated line).
+        if (payload.length > 0 && !payload.endsWith("\n")) {
+          const nl = payload.lastIndexOf("\n");
+          payload = nl >= 0 ? payload.slice(0, nl + 1) : "";
         }
-      }
-      assert.ok(seenOwned, `the owned child pid ${f.pid} must appear in the samples file within ~15 s`);
-      assert.ok(samplesPath, "statefile must record the output file");
-      assert.ok(
-        /samples-\d{4}-\d{2}-\d{2}T\d{6}Z\.jsonl$/.test(samplesPath),
-        `output file must follow samples-<startedAt>.jsonl, got ${samplesPath}`,
-      );
-
-      // Evidence-based stop of the exact recorder pid BEFORE the strict
-      // every-record parse, so the samples file is stable (no mid-append
-      // partial line can race the read). The recorder's own `stop` subcommand
-      // signals the pidfile pid itself, so the CURRENT identity must still
-      // prove THIS invocation's recorder before it may run — the ONE guarded
-      // decision (assertRecorderStopProceeds); a stale/foreign pidfile or a
-      // changed/unreadable identity REFUSES with evidence preserved. The
-      // subcommand's internal stop semantics are the recorder's own
-      // (unchanged, out of scope).
-      assertRecorderStopProceeds(recorder, fixture.varRoot);
-      const stop = run(["bash", fixture.tool, "stop"], { cwd: fixture.root, timeoutMs: 30_000 });
-      assert.equal(stop.status, 0, `stop failed (rc=${stop.status}): ${stop.stderr}`);
-      assert.match(stop.stdout, /tt-recorder stopped/, `stop must report stopped. stdout: ${stop.stdout}`);
-      assert.ok(!pidAlive(Number(recPid)), `recorder pid ${recPid} must be dead after stop`);
-      assert.ok(!fs.existsSync(pidfile), "stop must remove the pidfile");
-
-      // Parse EVERY emitted record from the real output file: one physical
-      // line per record, every line parseable, and the owned child's records
-      // carry the exact expected fields with the multiline cmdline escaped.
-      payload = fs.readFileSync(samplesPath, "utf8");
-      // Every collect_sample record ends in '\n'; a stop that lands exactly
-      // mid-append can leave ONE unterminated trailing fragment, which is not
-      // a complete emitted record — drop that single fragment before the
-      // strict every-record parse (never drop a terminated line).
-      if (payload.length > 0 && !payload.endsWith("\n")) {
-        const nl = payload.lastIndexOf("\n");
-        payload = nl >= 0 ? payload.slice(0, nl + 1) : "";
-      }
-      const entries = parseEveryLine("samples file", payload);
-      const ownedEntries = entries.filter((e) => e.rec.pid === f.pid);
-      assert.ok(ownedEntries.length >= 1, `expected at least one record for owned pid ${f.pid}`);
-      const expectedCwd = fs.realpathSync(childCwd);
-      for (const entry of ownedEntries) {
-        assertOwnedRecord(`owned pid ${f.pid} in samples file`, entry, f, expectedCwd, { pgid });
+        const entries = parseEveryLine("samples file", payload);
+        const ownedEntries = entries.filter((e) => e.rec.pid === f.pid);
+        assert.ok(ownedEntries.length >= 1, `expected at least one record for owned pid ${f.pid}`);
+        const expectedCwd = fs.realpathSync(childCwd);
+        for (const entry of ownedEntries) {
+          assertOwnedRecord(`owned pid ${f.pid} in samples file`, entry, f, expectedCwd, { pgid });
+        }
+      } catch (err) {
+        bodyError = err;
+        throw err;
       }
     } finally {
-      for (const ch of children) stopOwnedChild(ch);
-      // Invocation-owned recorder cleanup (a stop that raced/failed above, or
-      // a failed start's leftover pidfile): the ONE guarded decision inside
-      // stopOwnedRecorder revalidates the CURRENT identity — pidfile content,
-      // liveness, ps cmdline + birth start vs the launch evidence captured at
-      // start — BEFORE EACH signal (TERM, then again before the KILL
-      // escalation). A stale/foreign/changed/unreadable pidfile or identity,
-      // or a recorder this invocation never captured (startup failure), never
-      // receives a signal; the refusal stops this block BEFORE the fixture rm
-      // so the refusal evidence survives.
-      stopOwnedRecorder(recorder, fixture.varRoot);
+      // Owned teardown: attempt EVERY independently owned child even when an
+      // earlier cleanup refuses, then the fixture-recorder leftover cleanup —
+      // a refusal must never strand the other proven-owned children OR skip
+      // the guarded recorder stop. See the refusal branch below.
+      const cleanupErrors: unknown[] = [];
+      for (const ch of children) {
+        try {
+          await stopOwnedChild(ch);
+        } catch (err) {
+          cleanupErrors.push(err);
+        }
+      }
+      try {
+        stopOwnedRecorder(recorder, fixture.varRoot);
+      } catch (err) {
+        cleanupErrors.push(err);
+      }
+      if (cleanupErrors.length > 0) {
+        // A cleanup refusal/exception is NEVER silent and NEVER strands the
+        // other proven-owned children: every child/recorder was already
+        // attempted above. Release the stderr pipes AND unref the process
+        // handle of any child this finally could not stop (a refused live pid
+        // is never signaled). Destroying the pipe read end alone does not
+        // release node's ref'ed uv_process_t, so a still-live refused child
+        // that is OUR OWN direct child would otherwise keep this node --test
+        // process alive forever — unref() detaches the handle from the event
+        // loop (a no-op for the foreign/dead children that dominate), so once
+        // every other pending handle/work settles the runner can exit even in
+        // that refusal corner — an hours-long stall must never recur. Keep the
+        // fixture as refusal evidence (no rm), and surface the refusals —
+        // appended to the ORIGINAL body assertion when one exists, never
+        // replacing it.
+        for (const ch of children) {
+          try {
+            ch.proc?.stderr?.destroy?.();
+          } catch {
+            /* best effort */
+          }
+          try {
+            ch.proc?.unref?.();
+          } catch {
+            /* best effort */
+          }
+        }
+        const refusalDetail = cleanupErrors
+          .map((e) => String(e instanceof Error ? e.message : e))
+          .join("\n  - ");
+        if (bodyError instanceof Error) {
+          bodyError.message = `${bodyError.message}\n  [owned cleanup refused/raised — fixture NOT removed so the refusal evidence survives]\n  - ${refusalDetail}`;
+          throw bodyError;
+        }
+        assert.fail(
+          `owned cleanup refused or raised (${bodyError === undefined ? "test body completed cleanly" : `test body also failed: ${String(bodyError)}`}); fixture NOT removed so the refusal evidence survives:\n  - ${refusalDetail}`,
+        );
+      }
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
   });
 });
+
+

@@ -97,11 +97,23 @@ function sha256(text: string): string {
 // re-pinned the source and the child-ownership functions; US-003 edits the
 // emission recorder helpers + call sites + the recorder-finally block, so the
 // source pin and the recorder-function/finally-block pins move to the NEW
-// code in this same story (the gate fails loudly on any later drift). The
-// child-ownership functions are byte-identical to US-002, so their pins stay.
-const SOURCE_SHA_PIN = "76fa7730355f2e61a661bb13b80eab78b37d88e8e16706fab66371be801d5b05";
-const STOP_FN_SHA_PIN = "ea04d35f8318e8e4252ac03996faaea5f867868c141aed453cd82c377d7bbe1c";
-const SPAWN_FN_SHA_PIN = "ecc73f4f8b06b9a9bde3a7bff0b8b00d32bab938524af21b302306a8d38d3ff6";
+// code in that story (the gate fails loudly on any later drift). The RJZX
+// async-teardown correction (beads tamandua-0j7.4.2.2.1) re-pins the source,
+// stopOwnedChild (now async bounded teardown that reaps TERM-exited direct
+// children), spawnOwnedChild (now retains the ChildProcess handle) and the
+// recorder-finally block (now aggregates cleanup errors so one refusal cannot
+// suppress the other cleanups or discard the body's original assertion). The
+// do-review refinement re-pins the source and the recorder-finally block once
+// more: the refusal branch of BOTH finallys now ALSO unrefs the retained
+// ChildProcess handle (destroying the stderr pipe alone does not release
+// node's ref'ed uv_process_t, so a still-live refused child that is our own
+// direct child would otherwise keep the runner alive) — the structural
+// assertions below are unchanged. The identity-decision helpers and the
+// recorder-ownership functions are byte-identical to US-002/US-003, so their
+// pins stay.
+const SOURCE_SHA_PIN = "e9af803432c4955ed665215eee94ac358cbf79fdef98208095b4c9705fc29133";
+const STOP_FN_SHA_PIN = "62a84fdd700c47a8d23158aee99ed401856faff56dddee5d997bfbb6442ddaa6";
+const SPAWN_FN_SHA_PIN = "6a1d89bfe4ffecf7a8ad38b1b7ae8a19d10d3993089fcd2e439c9ee7ec2956cf";
 const VERDICT_FN_SHA_PIN = "79367f8307a334a6a9d4bf34f62b9960b667c244e3335f5ea8ac6cfd59614192";
 const READ_FN_SHA_PIN = "e7f26e2eebced358e6bc7f7e1ffe05db3d820c5b6f23e33b917a52acab6985b8";
 const REFUSE_FN_SHA_PIN = "5a2ade199be4ff05ed502257468a91988aea69a642e221ac5f03d96bab76f021";
@@ -113,7 +125,7 @@ const REC_REFUSE_FN_SHA_PIN = "3b12fc864f7befc7eac420e35ed34c84e323a88a2979bd228
 const REC_PRE_CHECK_FN_SHA_PIN = "ccaa697c92f627b0afc7fae3f38868087c4105e0f2e83868686a8a98c66bdbc7";
 const REC_STOP_FN_SHA_PIN = "ac6f439354adf79f4fc506b149154c4e60408ee7cf5c97d638e726a5b09bb4ba";
 const REC_CAPTURE_FN_SHA_PIN = "16f174c1e2aa63458b62ac660ef35f7ce85a6dffa08f367179a0d83d21465643";
-const FINALLY_BLOCK_SHA_PIN = "39d0adc3f0e98f1aa025643f66346bdec27aca16abd50ed30ed07f8d7a237c73";
+const FINALLY_BLOCK_SHA_PIN = "6df93e07b168c651e47399e79a8de7b003f56f162b4ea8806cc6d321d6a91b98";
 
 const sourceSha256 = sha256(emissionText);
 
@@ -295,7 +307,18 @@ assert.equal(
 const finallyTryNode = finallyTryNodes[0] as ts.TryStatement;
 const finallyBlockSource = (finallyTryNode.finallyBlock as ts.Block).getText(ast);
 const finallyBlockSha256 = sha256(finallyBlockSource);
-assert.match(finallyBlockSource, /for \(const ch of children\) stopOwnedChild\(ch\)/, "recorder-finally must keep the guarded child loop");
+assert.match(finallyBlockSource, /for \(const ch of children\)/, "recorder-finally must keep the guarded per-child loop");
+assert.match(
+  finallyBlockSource,
+  /await stopOwnedChild\(ch\)/,
+  "recorder-finally must delegate each child stop to the ACTUAL async guarded stopOwnedChild",
+);
+assert.match(
+  finallyBlockSource,
+  /cleanupErrors\.push\(err\)/,
+  "recorder-finally must aggregate cleanup errors (one refusal must not suppress the other cleanups)",
+);
+assert.match(finallyBlockSource, /bodyError/, "recorder-finally must surface refusals without discarding the body's original assertion");
 assert.match(
   finallyBlockSource,
   /stopOwnedRecorder\(recorder, fixture\.varRoot\)/,
@@ -320,7 +343,7 @@ const recVerdictCompiled = compile(recVerdictFn.source);
 const recRefuseCompiled = compile(recRefuseFn.source);
 const recPreCheckCompiled = compile(recPreCheckFn.source);
 const recStopCompiled = compile(recStopFn.source);
-const finallyCompiled = compile(`function __actualRecorderFinally()${finallyBlockSource}`);
+const finallyCompiled = compile(`async function __actualRecorderFinally()${finallyBlockSource}`);
 for (const [label, js, expected] of [
   ["stopOwnedChild", stopCompiled, "function stopOwnedChild"],
   ["currentChildVerdict", verdictCompiled, "function currentChildVerdict"],
@@ -356,6 +379,7 @@ const ALLOWED_OPS = new Set([
   "psCommand",
   "psStart",
   "sleepSync",
+  "sleep",
   "signal",
   "spawn",
   "fs.existsSync",
@@ -374,7 +398,17 @@ interface ScenarioState {
   termKills: boolean; // simulate the child's trap: SIGTERM exits cleanly (true) or survives (false)
   vfs: Map<string, { exists: boolean; content?: string }>; // virtual filesystem
   reuseAfterTerm?: { cmdline: string; start: string }; // identity changed between TERM and KILL (pid reuse)
+  termExitAfterPolls?: number; // TERM keeps the pid kill -0 alive for this many further pidAlive polls (an unreaped-zombie window — node has not yet reaped the TERM-exited child), then it dies
   spawnPids?: Array<number | undefined>; // pids returned by successive spawn() calls (spawn scenarios)
+  // Retained-handle exit-state model (issue-three fidelity): the fake
+  // ChildProcess handle of an owned child plus the number of post-TERM sleep
+  // yields after which node "reaps" it — the recording sleep binding then
+  // sets proc.exitCode = 0 AND drops the pid from the alive table (the real
+  // node event loop waitpids the TERM-exited direct child during an `await
+  // sleep` yield, so the retained handle's exit state becomes observable).
+  // stopOwnedChild must return via the handle-exit short-circuit on the next
+  // iteration — before any further pidAlive poll.
+  reapHandle?: { pid: number; afterSleeps: number; proc: { exitCode: number | null; signalCode: number | null } };
 }
 
 interface RecordedOp {
@@ -391,8 +425,12 @@ function makeRecordingBindings(state: ScenarioState): {
   psStart: (pid: number) => string;
   sleepSync: (ms: number) => void;
   processKill: (pid: number, signal: string) => void;
-  spawn: (file: string, args: string[], opts: object) => { pid: number | undefined; stderr: object; kill: () => never };
-  sleep: () => Promise<void>;
+  spawn: (
+    file: string,
+    args: string[],
+    opts: object,
+  ) => { pid: number | undefined; stderr: object; exitCode: number | null; signalCode: number | null; kill: () => never };
+  sleep: (ms?: number) => Promise<void>;
   fsProxy: object;
   pathJoin: (...parts: string[]) => string;
 } {
@@ -403,9 +441,25 @@ function makeRecordingBindings(state: ScenarioState): {
   const ensureKnown = (pid: number, what: string): void => {
     if (!state.knownPids.has(pid)) escape(`${what} on unscripted pid ${pid} (not part of this scenario's process table)`);
   };
+  // Per-scenario "TERM-exited but not yet reaped" (zombie-window) liveness:
+  // when a TERM is delivered under termExitAfterPolls, the pid stays kill -0
+  // alive for that many further pidAlive polls — exactly the window in which
+  // a synchronous teardown would leave the real child an unreaped zombie —
+  // and then dies (node reaped it). The fixed ASYNC teardown must keep
+  // polling liveness (never reading the zombie's defunct identity) until the
+  // pid is truly gone and then stop WITHOUT a KILL and WITHOUT a refusal.
+  const termPending = new Map<number, number>();
 
   const pidAlive = (pid: number): boolean => {
     ensureKnown(pid, "pidAlive");
+    const pending = termPending.get(pid);
+    if (pending !== undefined) {
+      if (pending > 1) termPending.set(pid, pending - 1);
+      else {
+        termPending.delete(pid);
+        state.alive.delete(pid);
+      }
+    }
     const result = state.alive.has(pid);
     log.push({ op: "pidAlive", pid, result });
     return result;
@@ -439,8 +493,13 @@ function makeRecordingBindings(state: ScenarioState): {
       log.push({ op: "signal", pid, signal, delivered: false, reason: "ESRCH" });
       throw esrch;
     }
-    if (signal === "SIGTERM" && state.termKills) state.alive.delete(pid);
-    if (signal === "SIGTERM" && !state.termKills && state.reuseAfterTerm !== undefined) {
+    if (signal === "SIGTERM" && state.termExitAfterPolls !== undefined && state.termExitAfterPolls > 0) {
+      // The child traps out on TERM but stays kill -0 alive for the zombie
+      // window below before node reaps it.
+      termPending.set(pid, state.termExitAfterPolls);
+    } else if (signal === "SIGTERM" && state.termKills) {
+      state.alive.delete(pid);
+    } else if (signal === "SIGTERM" && !state.termKills && state.reuseAfterTerm !== undefined) {
       // The pid survives TERM but its identity changes before the KILL
       // revalidation (pid reuse between TERM and KILL).
       state.cmdline.set(pid, state.reuseAfterTerm.cmdline);
@@ -497,21 +556,51 @@ function makeRecordingBindings(state: ScenarioState): {
   const pathJoin = (...parts: string[]): string => parts.join("/");
   // spawn (spawnOwnedChild scenarios only): returns a scripted fake child.
   // Any raw child.kill on the fake is a regression (unguarded bypass) and
-  // raises before any real operation.
+  // raises before any real operation. The fake carries the retained-handle
+  // exit-state fields (exitCode/signalCode, matching the real ChildProcess
+  // subset stopOwnedChild reads) so a spawned handle can later model node
+  // having reaped the direct child.
   const spawnQueue: Array<number | undefined> = state.spawnPids ?? [];
-  const spawn = (file: string, args: string[], opts: object): { pid: number | undefined; stderr: object; kill: () => never } => {
+  const spawn = (
+    file: string,
+    args: string[],
+    opts: object,
+  ): { pid: number | undefined; stderr: object; exitCode: number | null; signalCode: number | null; kill: () => never } => {
     const pid = spawnQueue.shift();
     log.push({ op: "spawn", file, args, pid: pid === undefined ? null : pid });
     if (pid !== undefined) state.knownPids.add(pid);
     return {
       pid,
       stderr: { on: () => {} },
+      exitCode: null,
+      signalCode: null,
       kill: () => escape("raw child.kill in spawnOwnedChild (unguarded bypass)"),
     };
   };
-  // sleep is the module's async settle; the recording version resolves
-  // immediately (zero real wait) so spawn scenarios stay instant.
-  const sleep = async (): Promise<void> => {};
+  // sleep is the module's ASYNC settle — the fix's bounded teardown yields to
+  // the event loop through it (a real async sleep lets node reap a
+  // TERM-exited direct child; a synchronous Atomics.wait/spawnSync poll would
+  // not). The recording version records the yield and resolves immediately
+  // (zero real wait) so every scenario stays instant and deterministic. When
+  // a scenario models a retained handle (state.reapHandle), each post-TERM
+  // sleep doubles as an event-loop turn: after `afterSleeps` yields node has
+  // reaped the TERM-exited direct child (proc.exitCode set, pid gone) — the
+  // next teardown iteration must observe that exit state FIRST and return
+  // without a further liveness poll.
+  const sleep = async (ms?: number): Promise<void> => {
+    log.push({ op: "sleep", ms: ms === undefined ? 100 : ms });
+    const rh = state.reapHandle;
+    if (rh !== undefined && rh.proc.exitCode === null && rh.proc.signalCode === null) {
+      rh.afterSleeps -= 1;
+      if (rh.afterSleeps <= 0) {
+        // Node reaped the TERM-exited direct child during this event-loop
+        // yield: the retained handle exposes the exit state and the pid is
+        // gone from the process table.
+        rh.proc.exitCode = 0;
+        state.alive.delete(rh.pid);
+      }
+    }
+  };
   return { log, pidAlive, psCommand, psStart, sleepSync, processKill, spawn, sleep, fsProxy, pathJoin };
 }
 
@@ -523,6 +612,11 @@ interface ScenarioOwnedChild {
   stderr: string;
   launchCmdline: string;
   launchStart: string;
+  // Retained fake ChildProcess handle (subset of the REAL OwnedChild.proc the
+  // extracted code reads: exitCode/signalCode). undefined on evidence-only
+  // records that never held an accepted spawn handle, exactly like the real
+  // OwnedChild.proc being undefined for rejected spawn attempts.
+  proc?: { exitCode: number | null; signalCode: number | null } | null;
 }
 
 interface ScenarioOwnedRecorder {
@@ -562,6 +656,13 @@ interface ScenarioDefinition {
   recorder?: ScenarioOwnedRecorder | null; // for recorder scenarios (becomes __rec / recorder)
   children?: ScenarioOwnedChild[]; // for recorder-finally scenarios
   persistScript?: string; // PERSIST_SCRIPT global for spawn scenarios
+  // recorderFinally only: pre-set the test-scoped `bodyError` (the body's
+  // first failure) so the finally's "body ALREADY failed AND a cleanup
+  // refuses" branch runs — the refusal detail must be appended to the ORIGINAL
+  // assertion and the original error re-thrown (never discarded), with no
+  // fixture rm. A real Error (named AssertionError, like a node:assert body
+  // failure) is created in the vm realm so `instanceof Error` holds.
+  bodyErrorText?: string;
   expect: ScenarioExpect;
   meta?: Record<string, string>; // free-form documentation notes (path tags etc.)
 }
@@ -748,6 +849,31 @@ const SCENARIOS: ScenarioDefinition[] = [
     expect: { raisedName: null, delivered: [] },
   },
   {
+    id: "stop-exited-before-escalation-slow-reap",
+    target: "stopOwnedChild",
+    kind: "exited-before-escalation: a TERM-exited child that lingers kill-0-alive through an unreaped-zombie window then dies -> clean stop, NO KILL, NO refusal",
+    description:
+      "the child's trap exits it on SIGTERM, but reaping lags: the pid stays kill -0 alive for four further liveness polls (an unreaped-zombie window — exactly the state a SYNCHRONOUS Atomics.wait/spawnSync teardown would freeze in, because node cannot reap a direct child while its event loop is blocked). The fixed ASYNC teardown polls liveness across the window (yielding to the event loop between polls), observes the pid truly gone once node reaps it, and returns WITHOUT a KILL escalation and WITHOUT ever reading the zombie's defunct identity — so the pre-KILL 'foreign' misclassification (and its refusal) cannot occur, and no other owned child is stranded.",
+    state: { ...livePidState(700030), termKills: false, termExitAfterPolls: 4, vfs: new Map() },
+    owned: ownedChild(700030),
+    expect: { raisedName: null, delivered: ["SIGTERM"] },
+  },
+  {
+    id: "stop-exited-before-escalation-handle-reaped",
+    target: "stopOwnedChild",
+    kind: "exited-before-escalation via the RETAINED HANDLE exit state: node reaps the TERM-exited direct child during an event-loop yield -> proc.exitCode set -> the teardown's handle-exit short-circuit returns, NO KILL, NO refusal, NO further liveness poll",
+    description:
+      "the child's trap exits it on SIGTERM, but reaping lags: the pid stays kill -0 alive through a zombie window while node has not yet waitpid'ed it. The recording models the reap exactly as the real event loop performs it — during an `await sleep` yield, node reaps the TERM-exited direct child, sets exitCode on the RETAINED handle and the pid disappears. On the next teardown iteration the handle-exit short-circuit (proc.exitCode !== null) MUST fire FIRST and return WITHOUT a KILL, WITHOUT a refusal and WITHOUT a further pidAlive poll — a pidAlive(false) return would mean the teardown only works via the liveness fallback (the slow-reap scenario) and never via the PRIMARY real-world mechanism this scenario pins (the retained handle's exit state). A teardown without the handle-exit branch would poll the still-lingering zombie to the 30-iteration cap and KILL-escalate (delivered would then be SIGTERM + SIGKILL), so `delivered: [\"SIGTERM\"]` alone pins the branch.",
+    state: {
+      ...livePidState(700040),
+      termKills: false,
+      vfs: new Map(),
+      reapHandle: { pid: 700040, afterSleeps: 3, proc: { exitCode: null, signalCode: null } },
+    },
+    owned: ownedChild(700040),
+    expect: { raisedName: null, delivered: ["SIGTERM"] },
+  },
+  {
     id: "stop-sibling-fixture-prefix",
     target: "stopOwnedChild",
     kind: "exact path boundary: a sibling fixture path that merely PREFIX-matches never authorizes",
@@ -866,6 +992,89 @@ const SCENARIOS: ScenarioDefinition[] = [
     recorder: null,
     children: [ownedChild(800301)],
     expect: { raisedName: null, delivered: ["SIGTERM"], rmSyncCount: 1 },
+  },
+  {
+    id: "finally-refusal-does-not-suppress-other-cleanups",
+    target: "recorderFinally",
+    kind: "one child's REFUSED cleanup (foreign identity) does NOT suppress the other owned child's TERM nor the owned leftover recorder's guarded stop; the refusal is aggregated and the fixture is NOT removed (evidence preserved)",
+    description:
+      "the finally owns child X whose CURRENT identity is foreign (a different invocation on the shared host — its TERM is REFUSED with zero signals), child Y whose identity is fully owned (TERM'd and exited cleanly), and an owned leftover recorder (pidfile + identity revalidated, TERM'd and exited). The fixed finally attempts EVERY cleanup, aggregates child X's refusal, and only then fails loudly — the other proven-owned child and the recorder are still cleaned, and the fixture is NOT removed so the refusal evidence survives.",
+    state: {
+      knownPids: new Set([800401, 800402, 900071]),
+      alive: new Set([800401, 800402, 900071]),
+      cmdline: new Map([
+        [800401, otherInvocationCmdline("foreign-child")],
+        [800402, childCmdline("marker-tail")],
+        [900071, recorderCmdline()],
+      ]),
+      start: new Map([
+        [800401, OTHER_START_TS],
+        [800402, START_TS],
+        [900071, START_TS],
+      ]),
+      termKills: true,
+      vfs: new Map([[pidfilePath(currentFixture()), recorderPidfileEntry(currentFixture(), 900071)]]),
+    },
+    fixture: currentFixture(),
+    recorder: capturedRecorder(900071),
+    children: [
+      // X: launched owned-looking evidence, but the CURRENT pid is another
+      // invocation (foreign) — must be REFUSED with zero signals.
+      { pid: 800401, argv: childArgv(), stderr: "", launchCmdline: childCmdline("launched-originally"), launchStart: START_TS },
+      // Y: fully owned child — must still be TERM'd despite X's refusal.
+      ownedChild(800402),
+    ],
+    expect: {
+      raisedName: "AssertionError",
+      delivered: ["SIGTERM", "SIGTERM"],
+      rmSyncCount: 0,
+      messageIncludes: ["refusing to deliver SIGTERM"],
+    },
+    meta: { path: "finally", state: "one refusal does not suppress the other cleanups" },
+  },
+  {
+    id: "finally-body-failed-refusal-surfaces-original-assertion",
+    target: "recorderFinally",
+    kind: "body ALREADY failed AND a cleanup refuses: the refusal detail is APPENDED to the ORIGINAL body assertion (never discarded) and the original error is re-thrown; the other owned child AND the owned recorder are still cleaned; NO fixture rm",
+    description:
+      "the test body failed FIRST (bodyError pre-set to a representative AssertionError whose message carries the original assertion text), and the finally then finds child X's CURRENT identity foreign (its TERM is REFUSED with zero signals) while child Y and the leftover recorder remain fully owned. The fixed finally attempts EVERY cleanup, aggregates X's refusal, and — because bodyError is already an Error — appends the refusal detail to the ORIGINAL assertion message and re-throws the ORIGINAL error (the assert.fail fallback is never reached). This pins the branch the task demands: a cleanup refusal must never silently discard the original body assertion, the other proven-owned cleanups still run, and the fixture is NOT removed so the refusal evidence survives.",
+    state: {
+      knownPids: new Set([800501, 800502, 900081]),
+      alive: new Set([800501, 800502, 900081]),
+      cmdline: new Map([
+        [800501, otherInvocationCmdline("foreign-child")],
+        [800502, childCmdline("marker-tail")],
+        [900081, recorderCmdline()],
+      ]),
+      start: new Map([
+        [800501, OTHER_START_TS],
+        [800502, START_TS],
+        [900081, START_TS],
+      ]),
+      termKills: true,
+      vfs: new Map([[pidfilePath(currentFixture()), recorderPidfileEntry(currentFixture(), 900081)]]),
+    },
+    fixture: currentFixture(),
+    recorder: capturedRecorder(900081),
+    children: [
+      // X: launched owned-looking evidence, but the CURRENT pid is another
+      // invocation (foreign) — must be REFUSED with zero signals.
+      { pid: 800501, argv: childArgv(), stderr: "", launchCmdline: childCmdline("launched-originally"), launchStart: START_TS },
+      // Y: fully owned child — must still be TERM'd despite X's refusal.
+      ownedChild(800502),
+    ],
+    // The ORIGINAL body assertion that already failed before cleanup ran.
+    bodyErrorText: "original body assertion: owned pid 800502 record count mismatch (expected 1, got 0)",
+    expect: {
+      raisedName: "AssertionError",
+      delivered: ["SIGTERM", "SIGTERM"],
+      rmSyncCount: 0,
+      messageIncludes: [
+        "original body assertion: owned pid 800502 record count mismatch (expected 1, got 0)",
+        "refusing to deliver SIGTERM",
+      ],
+    },
+    meta: { path: "finally", state: "body already failed; refusal appended to the original assertion (never discarded)" },
   },
 
   // ── recorderStop: the ACTUAL guarded recorder stop (stopOwnedRecorder) ──
@@ -1443,16 +1652,42 @@ async function runScenario(def: ScenarioDefinition): Promise<ScenarioResult> {
     psCommand: bindings.psCommand,
     psStart: bindings.psStart,
     sleepSync: bindings.sleepSync,
+    sleep: bindings.sleep, // async settle — the fixed teardown yields through it
     process: { kill: bindings.processKill },
     fs: bindings.fsProxy,
     path: { join: bindings.pathJoin },
     children: def.children ?? [],
+    // The recorder-finally block reads the test-scoped `bodyError` (the
+    // body's first failure, retained so a cleanup refusal never discards the
+    // original assertion). Scenario runs with no live body leave it
+    // undefined, so a finally refusal surfaces through the block's own
+    // assert.fail (AssertionError), exactly like the real teardown does when
+    // the body completed cleanly. A scenario may pre-set it via
+    // def.bodyErrorText (below) to drive the body-ALREADY-failed branch.
+    bodyError: undefined,
   };
-  if (def.owned !== undefined) sandbox.__owned = def.owned;
+  if (def.owned !== undefined) {
+    // An owned child whose scenario models a retained handle (state.reapHandle)
+    // gets that fake handle attached as proc, so the extracted stopOwnedChild
+    // observes the same object the recording sleep binding mutates on reap.
+    sandbox.__owned =
+      def.state.reapHandle !== undefined ? { ...def.owned, proc: def.state.reapHandle.proc } : def.owned;
+  }
   if (def.fixture !== undefined) sandbox.fixture = def.fixture;
   if (def.recorder !== undefined) sandbox.recorder = def.recorder; // recorder-finally uses the test-scoped `recorder` var
   if (def.recorder !== undefined) sandbox.__rec = def.recorder; // recorderStop / recorderNormalStop targets
   vm.createContext(sandbox);
+  if (def.target === "recorderFinally" && def.bodyErrorText !== undefined) {
+    // Body-ALREADY-failed scenario: build the retained original body error as
+    // a REAL Error IN the vm realm (so the compiled finally's `bodyError
+    // instanceof Error` holds), named AssertionError to mirror a node:assert
+    // body failure, and expose it as the test-scoped `bodyError` the finally
+    // block reads.
+    sandbox.bodyError = vm.runInContext(
+      `(() => { const e = new Error(${JSON.stringify(def.bodyErrorText)}); e.name = "AssertionError"; return e; })()`,
+      sandbox,
+    );
+  }
 
   // The recorder guarded-decision chain, composed from the ACTUAL extracted
   // code: recorderPidfilePath + readRecorderPidfile (fixture pidfile),
@@ -1467,12 +1702,24 @@ async function runScenario(def: ScenarioDefinition): Promise<ScenarioResult> {
   const outcome: ScenarioOutcome = {};
   let spawned: ScenarioOwnedChild | null = null;
   if (def.target === "stopOwnedChild") {
-    const script = `${verdictCompiled}\n${readCompiled}\n${refuseCompiled}\n${stopCompiled}\nstopOwnedChild(__owned);`;
+    // stopOwnedChild is ASYNC (bounded teardown that yields to the event loop
+    // so a TERM-exited direct child is reaped). Run it through an async IIFE
+    // and await the promise so both clean returns and refusals surface.
+    const script =
+      `${verdictCompiled}\n${readCompiled}\n${refuseCompiled}\n${stopCompiled}\n` +
+      `(async () => { try { await stopOwnedChild(__owned); } ` +
+      `catch (e) { __stopRaised = { name: e.name, message: String(e.message) }; } })();`;
     try {
-      vm.runInContext(script, sandbox, { timeout: 2000 });
+      const promise = vm.runInContext(script, sandbox, { timeout: 2000 }) as Promise<unknown>;
+      await promise;
     } catch (err) {
       outcome.raisedName = (err as Error).name;
       outcome.raisedMessage = String((err as Error).message ?? err);
+    }
+    const raised = sandbox.__stopRaised as { name?: string; message?: string } | undefined;
+    if (raised !== undefined) {
+      outcome.raisedName = raised.name;
+      outcome.raisedMessage = raised.message;
     }
   } else if (def.target === "recorderStop") {
     // The ACTUAL guarded recorder stop (finally leftover + startup-error
@@ -1503,17 +1750,26 @@ async function runScenario(def: ScenarioDefinition): Promise<ScenarioResult> {
       outcome.raisedMessage = String((err as Error).message ?? err);
     }
   } else if (def.target === "recorderFinally") {
-    // recorder-finally: compose the ACTUAL guarded child stop
+    // recorder-finally: compose the ACTUAL guarded async child stop
     // (stopOwnedChild + its decision helpers, for the children loop), the
-    // ACTUAL guarded recorder stop chain, and the ACTUAL finally block.
+    // ACTUAL guarded recorder stop chain, and the ACTUAL finally block. The
+    // block is compiled into an ASYNC wrapper (it awaits stopOwnedChild), so
+    // await its completion.
     const script =
       `${verdictCompiled}\n${readCompiled}\n${refuseCompiled}\n${stopCompiled}\n${recorderStopChain}${finallyCompiled}\n` +
-      `__actualRecorderFinally();`;
+      `(async () => { try { await __actualRecorderFinally(); } ` +
+      `catch (e) { __finRaised = { name: e.name, message: String(e.message) }; } })();`;
     try {
-      vm.runInContext(script, sandbox, { timeout: 2000 });
+      const promise = vm.runInContext(script, sandbox, { timeout: 2000 }) as Promise<unknown>;
+      await promise;
     } catch (err) {
       outcome.raisedName = (err as Error).name;
       outcome.raisedMessage = String((err as Error).message ?? err);
+    }
+    const raised = sandbox.__finRaised as { name?: string; message?: string } | undefined;
+    if (raised !== undefined) {
+      outcome.raisedName = raised.name;
+      outcome.raisedMessage = raised.message;
     }
   } else {
     // spawnOwnedChild: async — the spawn/sleep/settle surface is recorded
@@ -1612,8 +1868,15 @@ function deriveDecision(def: ScenarioDefinition, facts: ScenarioFacts, outcome: 
   // stopOwnedChild; the recorder leftover cleanup routes through the ACTUAL
   // guarded stopOwnedRecorder (US-003 fixed semantics).
   const childSignals = facts.deliveredSignals.join(", ");
+  if (def.bodyErrorText !== undefined && outcome.raisedName === "AssertionError") {
+    // Body-ALREADY-failed scenario: the raised error IS the pre-set original
+    // body assertion (its message now carries the appended refusal detail) —
+    // the finally never discarded it and never reached the assert.fail
+    // fallback. No fixture rm keeps the refusal evidence.
+    return `recorder finally: the BODY had already failed (original assertion: ${JSON.stringify(def.bodyErrorText)}); the cleanup refusal(s) were appended to that ORIGINAL assertion and the original error re-thrown — never discarded — after every owned child/recorder cleanup was attempted (signals delivered first: ${childSignals || "none"}); NO fixture rm (refusal evidence preserved)${noteSuffix}`;
+  }
   if (outcome.raisedName === "AssertionError") {
-    return `recorder finally REFUSED (verdict "${facts.refusalVerdict}"): no signal to the fixture recorder and NO fixture rm (refusal evidence preserved)${noteSuffix}`;
+    return `recorder finally REFUSED (verdict "${facts.refusalVerdict}"): the refusal(s) were aggregated AFTER every owned child/recorder cleanup was attempted (signals delivered first: ${childSignals || "none"}); NO fixture rm (refusal evidence preserved)${noteSuffix}`;
   }
   if (facts.rmSyncCount === 1 && def.children !== undefined && def.children.length > 0) {
     return `finally child loop delegated to the ACTUAL guarded stopOwnedChild (child signaled: ${childSignals || "none"}, dead after TERM -> no KILL) then fixture rm recorded${noteSuffix}`;
@@ -1919,6 +2182,96 @@ describe("RJSON US-003 — recording-only ownership gate (fixed child- AND recor
       "alive-term-then-kill: the ops immediately before KILL must be a FRESH current-identity read (revalidation between TERM and KILL)",
     );
 
+    // ── AC1b: exited-before-escalation with a slow reap — the run-920 red.
+    // A TERM-exited child that lingers kill-0-alive through an unreaped-zombie
+    // window (node has not yet reaped it) must be observed as exited by the
+    // ASYNC teardown — NO KILL, NO refusal, and its defunct identity is never
+    // read (no ps read can misclassify it "foreign"). ──
+    const slowReap = scenarioResults.find((r) => r.definition.id === "stop-exited-before-escalation-slow-reap")!;
+    assert.equal(
+      slowReap.outcome.raisedName,
+      undefined,
+      "exited-before-escalation: a TERM-exited child that dies after a zombie window must stop cleanly (no refusal)",
+    );
+    assert.deepEqual(
+      slowReap.facts.deliveredSignals,
+      ["SIGTERM"],
+      "exited-before-escalation: only TERM (under the owned verdict) is delivered",
+    );
+    assert.equal(slowReap.facts.killDelivered, false, "exited-before-escalation: NO KILL once the child was observed exited");
+    assert.equal(slowReap.facts.psCommandReads, 1, "exited-before-escalation: cmdline read exactly once (before TERM) — the zombie window is never identity-read");
+    assert.equal(slowReap.facts.psStartReads, 1, "exited-before-escalation: birth start read exactly once (before TERM)");
+    const slowTermIdx = slowReap.log.findIndex((e) => e.op === "signal" && e.delivered === true);
+    const slowPost = slowReap.log.slice(slowTermIdx + 1);
+    for (const op of slowPost) {
+      assert.ok(
+        op.op === "pidAlive" || op.op === "sleep",
+        `exited-before-escalation: post-TERM op ${op.op} must be a liveness poll or an async sleep — never an identity read or a signal (a defunct zombie's identity must never be read)`,
+      );
+    }
+    assert.equal(
+      slowPost.filter((e) => e.op === "pidAlive").length,
+      4,
+      "exited-before-escalation: the zombie window spans exactly 4 liveness polls before the pid dies",
+    );
+    assert.ok(
+      slowPost.some((e) => e.op === "sleep"),
+      "exited-before-escalation: the teardown must yield to the event loop between polls (that is what lets node reap the child)",
+    );
+
+    // ── AC1c: exited-before-escalation via the RETAINED HANDLE exit state —
+    // the PRIMARY real-world mechanism. Node reaps the TERM-exited direct
+    // child during an `await sleep` event-loop yield and sets exitCode on the
+    // retained handle; the teardown's handle-exit short-circuit (checked
+    // before liveness each iteration) must return on the NEXT iteration —
+    // no KILL, no refusal, and NO further pidAlive poll (a pidAlive returning
+    // false would mean the return rode the liveness fallback, which the
+    // slow-reap scenario already covers). The recording models the reap as
+    // firing during the 3rd post-TERM sleep: proc.exitCode = 0 and the pid
+    // leaves the process table. If the handle-exit branch were missing, the
+    // teardown would keep polling the (still-lingering pre-reap) zombie to the
+    // 30-iteration cap and KILL-escalate, so `delivered: ["SIGTERM"]` pins
+    // the branch. ──
+    const handleReaped = scenarioResults.find((r) => r.definition.id === "stop-exited-before-escalation-handle-reaped")!;
+    assert.equal(
+      handleReaped.outcome.raisedName,
+      undefined,
+      "handle-reaped: a child reaped via its retained handle must stop cleanly (no refusal)",
+    );
+    assert.deepEqual(
+      handleReaped.facts.deliveredSignals,
+      ["SIGTERM"],
+      "handle-reaped: only TERM (under the owned verdict) is delivered — the handle-exit short-circuit must return BEFORE any KILL escalation",
+    );
+    assert.equal(handleReaped.facts.killDelivered, false, "handle-reaped: NO KILL once the retained handle exposes the reap");
+    const hrTermIdx = handleReaped.log.findIndex((e) => e.op === "signal" && e.delivered === true);
+    const hrPost = handleReaped.log.slice(hrTermIdx + 1);
+    for (const op of hrPost) {
+      assert.ok(
+        op.op === "pidAlive" || op.op === "sleep",
+        `handle-reaped: post-TERM op ${op.op} must be a liveness poll or an async sleep — never an identity read or a signal`,
+      );
+    }
+    assert.equal(
+      hrPost.filter((e) => e.op === "sleep").length,
+      3,
+      "handle-reaped: node reaps during the 3rd post-TERM sleep (the recording's modeled event-loop yield)",
+    );
+    assert.equal(
+      hrPost.filter((e) => e.op === "pidAlive").length,
+      3,
+      "handle-reaped: exactly 3 liveness polls before the reap — the 4th iteration must return at the HANDLE-EXIT check, not after a pidAlive poll",
+    );
+    assert.equal(
+      hrPost.filter((e) => e.op === "pidAlive" && e.result === false).length,
+      0,
+      "handle-reaped: NO pidAlive ever returns false — the wait ended on the retained handle's exit state (pid-gone liveness return is the slow-reap scenario's path, not this one)",
+    );
+    assert.ok(
+      handleReaped.log.every((e) => e.op !== "signal" || e.delivered === true),
+      "handle-reaped: zero undelivered signal attempts (no refusal, no KILL escalation)",
+    );
+
     // ── AC2: refusals — each refuses the signal and preserves evidence; the
     // gate issues no real signal in any refusal scenario (no undelivered
     // signal attempts either). ──
@@ -2127,6 +2480,98 @@ describe("RJSON US-003 — recording-only ownership gate (fixed child- AND recor
     assert.equal(finChild.outcome.raisedName, undefined, "finally-delegation: owned child stopped cleanly through the ACTUAL stopOwnedChild");
     assert.deepEqual(finChild.facts.deliveredSignals, ["SIGTERM"], "finally-delegation: child TERM'd under owned verdict");
     assert.equal(finChild.facts.rmSyncCount, 1, "finally-delegation: fixture rm recorded after child loop + no-pidfile recorder cleanup");
+
+    // ── AC5: one refusal never suppresses the other safe cleanups — the
+    // finally attempts EVERY independently owned child and the recorder even
+    // when an earlier cleanup refuses, aggregates the refusal, and only then
+    // fails loudly (fixture retained as refusal evidence). ──
+    const notSuppress = scenarioResults.find((r) => r.definition.id === "finally-refusal-does-not-suppress-other-cleanups")!;
+    assert.equal(
+      notSuppress.outcome.raisedName,
+      "AssertionError",
+      "refusal-not-suppressing: the aggregated refusal must fail loudly",
+    );
+    assert.deepEqual(
+      notSuppress.facts.deliveredSignals,
+      ["SIGTERM", "SIGTERM"],
+      "refusal-not-suppressing: the OTHER owned child AND the owned recorder are still TERM'd after the refusal",
+    );
+    assert.equal(
+      notSuppress.log.filter((e) => e.op === "signal" && e.pid === 800401).length,
+      0,
+      "refusal-not-suppressing: the foreign child (pid 800401) received ZERO signals",
+    );
+    assert.equal(
+      notSuppress.log.filter((e) => e.op === "signal" && e.pid === 800402 && e.signal === "SIGTERM").length,
+      1,
+      "refusal-not-suppressing: the owned child (pid 800402) was TERM'd exactly once",
+    );
+    assert.equal(
+      notSuppress.log.filter((e) => e.op === "signal" && e.pid === 900071 && e.signal === "SIGTERM").length,
+      1,
+      "refusal-not-suppressing: the owned recorder (pid 900071) was TERM'd exactly once",
+    );
+    assert.equal(
+      notSuppress.facts.rmSyncCount,
+      0,
+      "refusal-not-suppressing: NO fixture rm after a refusal (refusal evidence preserved)",
+    );
+    assert.ok(
+      (notSuppress.outcome.raisedMessage ?? "").includes("refusing to deliver SIGTERM"),
+      "refusal-not-suppressing: the raised message must carry the refusal detail",
+    );
+
+    // ── AC6: the body-ALREADY-failed branch — a cleanup refusal must NEVER
+    // silently discard the original body assertion. When bodyError is already
+    // an Error (the body failed before cleanup ran), the finally appends the
+    // aggregated refusal detail to the ORIGINAL assertion's message and
+    // re-throws the ORIGINAL error (the assert.fail fallback is never
+    // reached): the original failure survives verbatim (its text is the
+    // message PREFIX), the other owned child AND the owned recorder are still
+    // cleaned, and no fixture rm removes the refusal evidence. ──
+    const bodyFailed = scenarioResults.find((r) => r.definition.id === "finally-body-failed-refusal-surfaces-original-assertion")!;
+    assert.equal(
+      bodyFailed.outcome.raisedName,
+      "AssertionError",
+      "body-failed-refusal: the raised error is the ORIGINAL body assertion (AssertionError), not the finally's own assert.fail fallback",
+    );
+    assert.ok(
+      (bodyFailed.outcome.raisedMessage ?? "").startsWith(bodyFailed.definition.bodyErrorText!),
+      "body-failed-refusal: the ORIGINAL body assertion text must survive VERBATIM as the raised message prefix (the refusal detail is appended, never a replacement)",
+    );
+    assert.ok(
+      (bodyFailed.outcome.raisedMessage ?? "").includes("refusing to deliver SIGTERM"),
+      "body-failed-refusal: the appended refusal detail must name the refused signal",
+    );
+    assert.deepEqual(
+      bodyFailed.facts.deliveredSignals,
+      ["SIGTERM", "SIGTERM"],
+      "body-failed-refusal: the OTHER owned child AND the owned recorder are still TERM'd after the refusal even when the body already failed",
+    );
+    assert.equal(
+      bodyFailed.log.filter((e) => e.op === "signal" && e.pid === 800501).length,
+      0,
+      "body-failed-refusal: the foreign child (pid 800501) received ZERO signals",
+    );
+    assert.equal(
+      bodyFailed.log.filter((e) => e.op === "signal" && e.pid === 800502 && e.signal === "SIGTERM").length,
+      1,
+      "body-failed-refusal: the owned child (pid 800502) was TERM'd exactly once",
+    );
+    assert.equal(
+      bodyFailed.log.filter((e) => e.op === "signal" && e.pid === 900081 && e.signal === "SIGTERM").length,
+      1,
+      "body-failed-refusal: the owned recorder (pid 900081) was TERM'd exactly once",
+    );
+    assert.equal(
+      bodyFailed.facts.rmSyncCount,
+      0,
+      "body-failed-refusal: NO fixture rm (refusal evidence preserved)",
+    );
+    assert.ok(
+      (bodyFailed.outcome.raisedMessage ?? "").includes("[owned cleanup refused/raised — fixture NOT removed so the refusal evidence survives]"),
+      "body-failed-refusal: the raised message must carry the evidence-retention marker",
+    );
   });
 
   it("escape proof: hermetic sandbox and unscripted/unknown op requests raise before any real operation", () => {
