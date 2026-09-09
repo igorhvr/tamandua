@@ -11,10 +11,23 @@
 //   (b) The ordered-projection hash is deterministic for identical
 //       projections and changes when ANY ordered public field changes.
 //   (c) Captured / sanitized / synthetic / unknown labels stay distinct and
-//       honest across provenance scenarios.
+//       honest across provenance scenarios. Provenance is an EXPLICIT
+//       REQUIRED choice: an omitted/invalid provenance is refused (never
+//       silently invented as "captured"), and synthetic provenance retains
+//       the synthetic classification even when rows are sanitized.
 //   (d) Fail-closed on unknown origin, missing session, unsupported row
 //       shapes, truncated/incomplete input, unreadable input (caller-owned
 //       temp path) and ambiguous attribution — with useful diagnostics.
+//   (h) Complete-value redaction for credential assignment/header shapes
+//       (Authorization: Basic/Bearer, multi-token passwords, quoted values
+//       AND bare-then-quoted forms, mixed case) with unambiguous-delimiter
+//       preservation and normal content controls — never a partial-value
+//       leak. Quoted values are scanned conservatively: an escaped quote
+//       (backslash + quote) inside a quoted value is NOT a closing delimiter
+//       (so password="prefix\"secret tail" is one quoted unit), and a quote
+//       that never closes is bounded at the end of the line — the open value
+//       is fully removed rather than leaked or ignored. The importer does NOT
+//       promise arbitrary-secret detection; that limitation is explicit.
 //   (e) No reasoning/auth field ever appears in emitted projections: the
 //       extractable public-field vocabulary excludes them, denied names are
 //       refused, raw prompts/reasoning fields are never selected, and the
@@ -688,6 +701,213 @@ describe("CORE US-002 capture/sanitization importer", () => {
     assertNoSentinel(recordText(summary.record), "synthetic record");
   });
 
+  it("(c) provenance is an explicit required choice; synthetic classification survives sanitization", async () => {
+    const mod = await loadImporter();
+    // Synthetic rows carrying sentinels that the built-in detectors catch. Under
+    // provenance "synthetic" these rows MUST stay classified "synthetic" even
+    // though they are sanitized into derivatives — never relabelled
+    // "sanitized"/"captured", and never silently treated as real capture.
+    const syntheticRows = buildPiCorpus();
+    const synth = await captureCorpus({
+      origin: "pi",
+      rows: syntheticRows,
+      fields: PI_FIELDS,
+      provenance: "synthetic",
+      sentinels: DECLARED_SENTINELS,
+    });
+    const synthLabels = observationClassifications(synth.record);
+    assert.ok(synthLabels.length > 0);
+    for (const label of synthLabels) {
+      assert.equal(label, "synthetic", "synthetic provenance must label every observation synthetic, even sanitized rows");
+    }
+    assert.ok(
+      synth.record.transformations.some((t: any) => t.step === "adapt.declare_synthetic"),
+      "synthetic adaptation must be declared",
+    );
+    assert.ok(synth.redactions.length > 0, "synthetic corpus was sanitized (redaction evidence retained)");
+    assert.equal(synth.validation.ok, true, JSON.stringify(synth.validation));
+    assertNoSentinel(recordText(synth.record), "synthetic record");
+
+    // A caller deliberately simulating the captured path declares "captured":
+    // the adaptation transform is ABSENT and rows are labelled captured/sanitized
+    // (the record records the caller's assertion, never a verified real origin).
+    const captured = await captureCorpus({
+      origin: "pi",
+      rows: syntheticRows,
+      fields: PI_FIELDS,
+      provenance: "captured",
+      sentinels: DECLARED_SENTINELS,
+    });
+    assert.equal(
+      captured.record.transformations.some((t: any) => t.step === "adapt.declare_synthetic"),
+      false,
+      "captured provenance must not declare a synthetic adaptation",
+    );
+    assert.ok(
+      !observationClassifications(captured.record).includes("synthetic"),
+      "captured provenance rows must never be labelled synthetic",
+    );
+    assert.ok(
+      observationClassifications(captured.record).includes("sanitized"),
+      "captured provenance rows with sentinels are sanitized derivatives",
+    );
+    assert.equal(captured.validation.ok, true, JSON.stringify(captured.validation));
+  });
+
+  it("auth/credential assignment and header values are redacted completely (no partial-value leak)", async () => {
+    const mod = await loadImporter();
+    const sanitizeOut = (text: string): { out: string; reasons: string[] } => {
+      const rows = [
+        {
+          type: "message",
+          timestamp: "2026-08-27T06:24:46.059Z",
+          message: {
+            role: "tool",
+            content: [
+              { type: "toolResult", toolCallId: "call_synth_redact_0001", exitCode: 0, content: [{ type: "text", text }] },
+            ],
+          },
+        },
+      ];
+      const projection = mod.parsePublicProjection({ origin: "pi", input: rows, session: SESSION_ID, publicFieldOrder: [...PI_FIELDS] });
+      const { sanitized, redactions } = mod.sanitizeProjection(projection, { sentinels: [] });
+      return { out: sanitized.rows[0].public.output ?? "", reasons: redactions.map((r: any) => r.reason) };
+    };
+
+    // Reported defect 1: "Authorization: Basic <base64>" leaked the base64 payload
+    // because only the first scheme token ("Basic") was redacted.
+    const basic = sanitizeOut("Authorization: Basic dXNlcjpwYXNz");
+    assert.equal(basic.out, "Authorization: [REDACTED:authorization-header]");
+    assert.equal(basic.out.includes("dXNlcjpwYXNz"), false, "base64 credentials must not leak");
+    assert.ok(basic.reasons.includes("authorization-header"), `expected authorization-header redaction, got ${basic.reasons}`);
+
+    // Reported defect 2: "login password: my secret passphrase 789 done" left
+    // "secret passphrase 789 done" after redacting only "my".
+    const pass = sanitizeOut("login password: my secret passphrase 789 done");
+    assert.equal(pass.out, "login password: [REDACTED:auth-assignment]");
+    assert.equal(pass.out.includes("secret passphrase"), false, "multi-token password must not leak");
+    assert.ok(pass.reasons.includes("auth-assignment"));
+
+    // Quoted multi-token value redacted as a unit; trailing clear content kept.
+    const quoted = sanitizeOut('password="my secret passphrase" next=ok');
+    assert.equal(quoted.out, 'password=[REDACTED:auth-assignment] next=ok');
+
+    // Bare-then-quoted shape (regression): a quote appearing partway through a
+    // value is NOT a delimiter — the rest of the credential field is consumed
+    // and redacted, never partially kept. This is the exact partial-value leak
+    // class the task asked to close (quoted forms; "do not treat only the first
+    // auth scheme token as the secret").
+    const bareThenQuoted = sanitizeOut('password=pw "the secret" rest');
+    assert.equal(bareThenQuoted.out, 'password=[REDACTED:auth-assignment]');
+    assert.equal(bareThenQuoted.out.includes('"the secret"'), false, 'bare-then-quoted password must not partially leak the quoted remainder');
+    assert.ok(bareThenQuoted.reasons.includes('auth-assignment'));
+
+    // Authorization header with a quoted base64 payload (regression): the base64
+    // of the original reported defect must not leak when the scheme is followed
+    // by a quoted token.
+    const quotedAuth = sanitizeOut('Authorization: Basic "dXNlcjpwYXNz"');
+    assert.equal(quotedAuth.out, 'Authorization: [REDACTED:authorization-header]');
+    assert.equal(quotedAuth.out.includes('dXNlcjpwYXNz'), false, 'quoted base64 credentials must not leak');
+    assert.ok(quotedAuth.reasons.includes('authorization-header'), `expected authorization-header redaction, got ${quotedAuth.reasons}`);
+
+    // Mixed case folded.
+    assert.equal(sanitizeOut("PASSWORD=supersecret").out, "PASSWORD=[REDACTED:auth-assignment]");
+    assert.equal(sanitizeOut("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9").out, "Authorization: [REDACTED:authorization-header]");
+
+    // Bearer credential inside a header is fully redacted (not just the scheme).
+    assert.equal(sanitizeOut("Authorization: Bearer tok123").out.includes("tok123"), false);
+
+    // Negative controls: adjacent clear fields preserved at an unambiguous delimiter.
+    assert.equal(
+      sanitizeOut("password=my secret phrase, username=alice").out,
+      "password=[REDACTED:auth-assignment], username=alice",
+    );
+    assert.equal(
+      sanitizeOut("api_key=abc; token=def; username=bob").out,
+      "api_key=[REDACTED:auth-assignment]; token=[REDACTED:auth-assignment]; username=bob",
+    );
+
+    // Newline is an unambiguous boundary: the next line is not swallowed.
+    assert.equal(sanitizeOut("password=secret\nnext=foo").out, "password=[REDACTED:auth-assignment]\nnext=foo");
+
+    // Normal-content controls: content that is NOT a credential assignment passes through.
+    assert.equal(sanitizeOut("the token lives on the server").out, "the token lives on the server");
+    assert.equal(sanitizeOut("the api endpoint is https://example.com").out, "the api endpoint is https://example.com");
+  });
+
+  it("escaped-quote and incomplete (unterminated) quoted credential values are fully redacted (no partial/ignored leak)", async () => {
+    const mod = await loadImporter();
+    const sanitizeOut = (text: string): { out: string; reasons: string[] } => {
+      const rows = [
+        {
+          type: "message",
+          timestamp: "2026-08-27T06:24:46.059Z",
+          message: {
+            role: "tool",
+            content: [
+              { type: "toolResult", toolCallId: "call_synth_redact_0002", exitCode: 0, content: [{ type: "text", text }] },
+            ],
+          },
+        },
+      ];
+      const projection = mod.parsePublicProjection({ origin: "pi", input: rows, session: SESSION_ID, publicFieldOrder: [...PI_FIELDS] });
+      const { sanitized, redactions } = mod.sanitizeProjection(projection, { sentinels: [] });
+      return { out: sanitized.rows[0].public.output ?? "", reasons: redactions.map((r: any) => r.reason) };
+    };
+
+    // Escaped DOUBLE quote inside a quoted password: the escaped quote is NOT a
+    // closing delimiter, so the whole quoted unit is consumed — never the
+    // secret tail left visible after a premature close.
+    const escDouble = sanitizeOut(String.raw`password="prefix\"SYNTHETIC_SECRET_TAIL rest"; status=ok`);
+    assert.equal(escDouble.out, "password=[REDACTED:auth-assignment]; status=ok");
+    assert.equal(escDouble.out.includes("SYNTHETIC_SECRET_TAIL"), false, "escaped double quote must not leak the secret tail");
+    assert.ok(escDouble.reasons.includes("auth-assignment"));
+
+    // Escaped SINGLE quote inside a quoted password.
+    const escSingle = sanitizeOut(String.raw`password='prefix\'SYNTHETIC_SECRET_TAIL rest'; status=ok`);
+    assert.equal(escSingle.out, "password=[REDACTED:auth-assignment]; status=ok");
+    assert.equal(escSingle.out.includes("SYNTHETIC_SECRET_TAIL"), false, "escaped single quote must not leak the secret tail");
+    assert.ok(escSingle.reasons.includes("auth-assignment"));
+
+    // Incomplete (unterminated) quoted password: no closing quote — redact
+    // through the conservative line bound instead of leaking or ignoring.
+    const unterminated = sanitizeOut("password=\"SYNTHETIC_SECRET_TAIL rest");
+    assert.equal(unterminated.out, "password=[REDACTED:auth-assignment]");
+    assert.equal(unterminated.out.includes("SYNTHETIC_SECRET_TAIL"), false, "unterminated quoted password must be fully redacted");
+    assert.ok(unterminated.reasons.includes("auth-assignment"));
+
+    // The same boundary rules hold across the other recognized value families
+    // (token=, secret=, api_key=): an escaped quote is not a delimiter and an
+    // unclosed quote is bounded conservatively.
+    const tokenEsc = sanitizeOut(String.raw`token="a\"SYNTHETIC_SECRET_TAIL b"; x=1`);
+    assert.equal(tokenEsc.out, "token=[REDACTED:auth-assignment]; x=1");
+    assert.equal(tokenEsc.out.includes("SYNTHETIC_SECRET_TAIL"), false, "escaped double quote in token= must not leak");
+    const secretEsc = sanitizeOut(String.raw`secret='s\'SYNTHETIC_SECRET_TAIL t'; y=2`);
+    assert.equal(secretEsc.out, "secret=[REDACTED:auth-assignment]; y=2");
+    assert.equal(secretEsc.out.includes("SYNTHETIC_SECRET_TAIL"), false, "escaped single quote in secret= must not leak");
+    const apiKeyUnterm = sanitizeOut('api_key="SYNTHETIC_SECRET_TAIL rest');
+    assert.equal(apiKeyUnterm.out, "api_key=[REDACTED:auth-assignment]", "unterminated api_key= must be fully redacted through the line bound");
+    assert.equal(apiKeyUnterm.out.includes("SYNTHETIC_SECRET_TAIL"), false, "unterminated api_key= must not leak the secret tail");
+    assert.ok(apiKeyUnterm.reasons.includes("auth-assignment"));
+
+    // authorization-header: an escaped quote inside a quoted value and an
+    // unterminated quoted value are both fully redacted.
+    const headerEsc = sanitizeOut(String.raw`Authorization: "dXNlcjpwYXNz\"tail" rest`);
+    assert.equal(headerEsc.out.startsWith("Authorization: [REDACTED:authorization-header]"), true);
+    assert.equal(headerEsc.out.includes("dXNlcjpwYXNz"), false, "escaped quote in a quoted authorization header must not leak");
+    assert.ok(headerEsc.reasons.includes("authorization-header"));
+    const headerUnterm = sanitizeOut('Authorization: "dXNlcjpwYXNz');
+    assert.equal(headerUnterm.out, "Authorization: [REDACTED:authorization-header]");
+    assert.equal(headerUnterm.out.includes("dXNlcjpwYXNz"), false, "unterminated quoted authorization header must be fully redacted");
+
+    // Normal-content controls: content that is NOT a recognized credential
+    // assignment passes through untouched, and a properly-closed quote is an
+    // honest delimiter preserving the neighbor field.
+    assert.equal(sanitizeOut("the password lives on the server").out, "the password lives on the server");
+    assert.equal(sanitizeOut('password="my secret passphrase" next=ok').out, "password=[REDACTED:auth-assignment] next=ok");
+    assert.equal(sanitizeOut('password="ab" more').out, "password=[REDACTED:auth-assignment] more");
+  });
+
   it("(c) a clean corpus stays all-captured with zero redactions and identical raw/sanitized hashes", async () => {
     const summary = await captureCorpus({ origin: "dsh", rows: buildCleanDshCorpus(), fields: DSH_FIELDS, sentinels: [] });
     const labels = observationClassifications(summary.record);
@@ -881,8 +1101,26 @@ describe("CORE US-002 capture/sanitization importer", () => {
       /provenance must be one of/,
     );
     assert.throws(() => mod.captureRecording({ ...base }), /runId argument is required/);
+    // provenance is an EXPLICIT REQUIRED choice: an omitted provenance is
+    // refused (never silently invented as "captured"), and the refusal is
+    // issued before any unknown/report validation so a caller must own the
+    // origin decision first.
     assert.throws(
-      () => mod.captureRecording({ ...base, runId: RUN_ID, unknown: [{ fact: "x", reason: "invented" }] }),
+      () => mod.captureRecording({ ...base, runId: RUN_ID }),
+      /provenance argument is required/,
+    );
+    assert.throws(
+      () => mod.captureRecording({ ...base, runId: RUN_ID, provenance: undefined }),
+      /provenance argument is required/,
+    );
+    assert.throws(
+      () =>
+        mod.captureRecording({
+          ...base,
+          runId: RUN_ID,
+          provenance: "captured",
+          unknown: [{ fact: "x", reason: "invented" }],
+        }),
       /unknown\[0\]\.reason must be one of/,
     );
     assert.throws(

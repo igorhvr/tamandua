@@ -46,11 +46,40 @@
 //     become explicit unknown entries with a US-001 closed-set reason, and
 //     synthetic stand-in input is declared synthetic end-to-end. Sanitized
 //     rows are labeled "sanitized", untouched rows "captured".
+//   * Provenance is an EXPLICIT REQUIRED choice on captureRecording
+//     (captured | synthetic) with a clear missing-value refusal: the
+//     importer NEVER infers whether a caller's rows are truthful or
+//     synthetic, and an omitted provenance is refused rather than being
+//     silently invented as "captured". "captured" is the CALLER'S ASSERTION
+//     that the rows are captured public output — the record records that
+//     assertion, it cannot verify it (nor does it label the record as a
+//     simulation); "synthetic" is a declared synthetic adaptation standing
+//     in for unretained data. A synthetic corpus must declare "synthetic"
+//     and retain that classification even when its rows are sanitized into
+//     derivatives.
 //   * Fails closed with a useful diagnostic (never a partial or unlabeled
-//     record) on: unknown origin, unsupported row shape, missing input or
-//     session argument, unreadable/truncated/incomplete input and ambiguous
-//     attribution (row-declared session identity conflicting with the
-//     explicit session argument).
+//     record) on: unknown origin, unsupported row shape, missing input,
+//     session or provenance argument, unreadable/truncated/incomplete input
+//     and ambiguous attribution (row-declared session identity conflicting
+//     with the explicit session argument).
+//
+// Sanitization limits (honest, finite scanner): this is NOT a promise to
+// sanitize arbitrary secrets forever. The built-in shapes cover the
+// documented credential/header/token/reasoning families and DECLARED literal
+// sentinels; a value whose boundaries are ambiguous is conservatively
+// removed (the credential field's remainder is dropped and the loss is
+// documented in redaction evidence / transformation metadata), never
+// partially kept. For the quoted credential/header forms, the value extent
+// is computed by a bounded scanner (findCredentialValueEnd): an escaped
+// quote inside a quoted value is NOT a closing delimiter (so a value like
+// password="prefix\"secret tail" is taken as one quoted unit), and a quote
+// that never closes is conservatively bounded at the end of the line — the
+// open value is fully removed rather than leaked or left partially visible.
+// The scanner makes no promise about arbitrary secrets OUTSIDE a recognized
+// credential value; a properly-closed quote (or an unambiguous delimiter) is
+// an honest boundary and the text after it is a separate neighbor field. The
+// explicit-public-fields/sentinels contract remains the authoritative
+// sanitization boundary for anything outside the finite shape set.
 //
 // Snapshot semantics (honest boundary): the projection is derived from ONE
 // read of ONE explicit input. Its hash is therefore a single-read snapshot —
@@ -151,10 +180,16 @@ const UNKNOWN_REASONS = Object.freeze([
 
 // Built-in generic credential-shape detectors. Applied (in list order) to
 // every string leaf of the captured public values AFTER the caller-declared
-// literal sentinels. Each entry is {reason, re, prefixGroups} where
-// prefixGroups is the number of leading capture groups to keep verbatim
-// before inserting the redaction marker (so e.g. "password=" stays visible
-// while the secret value is replaced).
+// literal sentinels. Each entry is EITHER a regex detector of the shape
+// {reason, re, prefixGroups} (prefixGroups is the number of leading capture
+// groups to keep verbatim before inserting the redaction marker, so e.g.
+// "password=" stays visible while the secret value is replaced) OR a
+// conservative value-extent detector of the shape {reason, prefixRe, scanner}
+// whose prefixRe matches the key+separator and whose value extent is computed
+// by the bounded scanner scanCredentialValues (scanner: "credential-value",
+// used by the authorization-header and auth-assignment entries so an escaped
+// inner quote and an unclosed quote are bounded conservatively instead of
+// being decided by a fragile regex alternation).
 const BUILTIN_PATTERNS = Object.freeze([
   {
     reason: "private-key-block",
@@ -165,6 +200,26 @@ const BUILTIN_PATTERNS = Object.freeze([
     reason: "hidden-reasoning",
     re: /<reasoning>[\s\S]*?<\/reasoning>/g,
     prefixGroups: 0,
+  },
+  {
+    reason: "authorization-header",
+    // A dedicated, conservative authorization-header handler. An
+    // "Authorization:" header carries a scheme ("Basic", "Bearer", ...)
+    // AND the whole credential value after it; both are the secret value. We
+    // redact the ENTIRE value (never just the first scheme token) so e.g.
+    // "Authorization: Basic dXNlcjpwYXNz" cannot leak the base64 payload. The
+    // "Authorization:" label stays visible; the value (including inner
+    // spaces and quoted forms) is replaced. The value extent is computed by
+    // the bounded scanner (findCredentialValueEnd) so a quote is handled
+    // conservatively: a value that starts bare and then contains a quote is
+    // consumed through the inner quote to the next unambiguous delimiter or
+    // end of the line; a value that STARTS with a quote is consumed as a
+    // quoted unit where an escaped quote is NOT a closing delimiter, and a
+    // quote that never closes bounds the value at the end of the line — a
+    // quoted credential is never partially kept, and an unclosed one is
+    // conservatively removed (see module-header limitation).
+    prefixRe: /\bAuthorization\b[ \t]*:[ \t]*/gi,
+    scanner: "credential-value",
   },
   {
     reason: "credential-token",
@@ -180,10 +235,24 @@ const BUILTIN_PATTERNS = Object.freeze([
   },
   {
     reason: "auth-assignment",
-    // name=value / name: value assignment for known credential keys; the
-    // value (and only the value) is replaced.
-    re: /\b(password|passwd|token|secret|api[_-]?key|authorization|access_token|auth_token)\b(\s*[:=]\s*)[^\s,;"'`[\]]+/gi,
-    prefixGroups: 2,
+    // name=value / name: value assignment for known credential keys. The
+    // value is replaced with the COMPLETE value (never just the first
+    // whitespace-delimited token, and never just the first auth scheme
+    // token): a bare value runs to the next unambiguous delimiter (comma,
+    // semicolon, newline, closing bracket/brace/paren) or end of line, so
+    // multi-token passwords ("password: my secret passphrase 789 done") and
+    // token values are fully redacted. The value extent is computed by the
+    // bounded scanner (findCredentialValueEnd): a value that starts bare and
+    // then contains a quote ("password=pw \"the secret\" rest") is consumed
+    // through the inner quote to the next unambiguous delimiter or end of
+    // line, so the quoted remainder is never partially kept; a value that
+    // STARTS with a quote is consumed as a quoted unit where an escaped
+    // quote is NOT a closing delimiter, and a quote that never closes is
+    // bounded conservatively at the end of the line — a quoted credential is
+    // never partially kept and an unclosed one is conservatively removed
+    // (see module-header limitation).
+    prefixRe: /\b(password|passwd|token|secret|api[_-]?key|authorization|access_token|auth_token)\b[ \t]*[:=][ \t]*/gi,
+    scanner: "credential-value",
   },
 ]);
 
@@ -306,6 +375,17 @@ function assertReports(reports) {
     }
     return { callId: r.callId, note: r.note };
   });
+}
+
+function assertProvenance(provenance) {
+  if (provenance === undefined || provenance === null) {
+    throw fail(
+      "provenance argument is required: explicitly declare \"captured\" (the caller asserts the rows are captured public output) or \"synthetic\" (a declared synthetic adaptation); origin cannot be inferred, so an omitted provenance is refused",
+    );
+  }
+  if (!PROVENANCES.includes(provenance)) {
+    throw fail(`provenance must be one of ${PROVENANCES.join("|")}, got ${JSON.stringify(provenance)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +925,105 @@ export function parsePublicProjection({ origin, input, session, publicFieldOrder
 // Sanitization
 // ---------------------------------------------------------------------------
 
+// Conservative credential-value extent scanner, used by the two quoted-form
+// credential detectors (authorization-header / auth-assignment). A plain
+// regex cannot tell an escaped inner quote from a closing delimiter, and
+// cannot decide how far an unclosed quote should be redacted, without
+// becoming a fragile layered alternation. This bounded scanner implements
+// the module's finite contract:
+//
+//   * A value that STARTS with a quote ("", '', `) is consumed as a quoted
+//     unit. A backslash-quote (escaped quote) INSIDE that unit is NOT a
+//     closing delimiter — it is part of the value. The unit ends only at an
+//     UNESCAPED matching quote.
+//   * A quote that never closes (end of string before a matching quote) is
+//     conservatively bounded at the end of the line: the whole open value is
+//     redacted, never leaked and never left partially visible.
+//   * A value that does NOT start with a quote (bare value) runs to the next
+//     unambiguous delimiter (comma, semicolon, bracket, brace, paren,
+//     newline) or end of the line; quotes it contains are value characters.
+//   * A value that starts with a delimiter/whitespace has no identifiable
+//     value to redact (e.g. "password=" with no value) and is left as-is.
+//
+// Returns the exclusive end index of the value, or null when there is no
+// value to redact. This is deliberately conservative and finite: it is NOT a
+// promise to detect arbitrary secrets inside a value — it only ever redacts
+// the value extent of a RECOGNIZED credential assignment/header.
+function findCredentialValueEnd(text, start) {
+  const first = text[start];
+  if (first === '"' || first === "'" || first === "`") {
+    const quote = first;
+    let i = start + 1;
+    while (i < text.length) {
+      const ch = text[i];
+      if (ch === "\\") {
+        i += 2; // skip the escaped character (backslash + following char)
+        continue;
+      }
+      if (ch === quote) {
+        return i + 1; // unescaped closing quote; the value ends after it
+      }
+      if (ch === "\n" || ch === "\r") {
+        return i; // unterminated quote: conservative line bound
+      }
+      i += 1;
+    }
+    return text.length; // unterminated quote to end of string
+  }
+  if (first === undefined || /[ \t,;"'`\[\]{}()\r\n]/.test(first)) {
+    return null; // no value to redact (delimiter/whitespace/value absent)
+  }
+  let i = start;
+  while (i < text.length) {
+    const ch = text[i];
+    if (
+      ch === "," ||
+      ch === ";" ||
+      ch === "[" ||
+      ch === "]" ||
+      ch === "{" ||
+      ch === "}" ||
+      ch === "(" ||
+      ch === ")" ||
+      ch === "\n" ||
+      ch === "\r"
+    ) {
+      break;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+// Apply one credential-value detector (authorization-header / auth-assignment)
+// to `text`: find every recognized prefix (key + separator), compute its value
+// extent with the conservative scanner, and replace [prefixStart, valueEnd)
+// with the kept prefix + the redaction marker. Returns {out, count} where
+// `count` is the number of redactions applied (for redaction-evidence
+// bookkeeping).
+function scanCredentialValues(text, prefixRe, marker) {
+  const re = new RegExp(prefixRe.source, prefixRe.flags);
+  re.lastIndex = 0;
+  let out = "";
+  let lastEnd = 0;
+  let count = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const prefixStart = m.index;
+    const prefixEnd = m.index + m[0].length;
+    if (prefixStart < lastEnd) continue; // prefix inside an already-redacted value
+    const valueEnd = findCredentialValueEnd(text, prefixEnd);
+    if (valueEnd === null) continue; // no value to redact — keep the prefix as-is
+    out += text.slice(lastEnd, prefixStart);
+    out += text.slice(prefixStart, prefixEnd); // keep key/separator prefix
+    out += marker;
+    lastEnd = valueEnd;
+    count += 1;
+  }
+  out += text.slice(lastEnd);
+  return { out, count };
+}
+
 function scanText(text, sentinels, hits) {
   let out = text;
   // 1) Caller-declared literal sentinels (deterministic, exact substring).
@@ -856,16 +1035,24 @@ function scanText(text, sentinels, hits) {
   }
   // 2) Built-in generic credential-shape detectors.
   for (const pattern of BUILTIN_PATTERNS) {
-    const re = new RegExp(pattern.re.source, pattern.re.flags);
-    re.lastIndex = 0;
     const marker = redactMarker(pattern.reason);
-    out = out.replace(re, (...args) => {
-      hits.push({ reason: pattern.reason, replacedWith: marker });
-      // args[0] is the full match; the first `prefixGroups` capture groups
-      // (args[1..prefixGroups]) are the verbatim prefix to keep.
-      const kept = args.slice(1, 1 + pattern.prefixGroups).join("");
-      return kept + marker;
-    });
+    if (pattern.re) {
+      const re = new RegExp(pattern.re.source, pattern.re.flags);
+      re.lastIndex = 0;
+      out = out.replace(re, (...args) => {
+        hits.push({ reason: pattern.reason, replacedWith: marker });
+        // args[0] is the full match; the first `prefixGroups` capture groups
+        // (args[1..prefixGroups]) are the verbatim prefix to keep.
+        const kept = args.slice(1, 1 + pattern.prefixGroups).join("");
+        return kept + marker;
+      });
+    } else if (pattern.scanner === "credential-value") {
+      const applied = scanCredentialValues(out, pattern.prefixRe, marker);
+      out = applied.out;
+      for (let i = 0; i < applied.count; i += 1) {
+        hits.push({ reason: pattern.reason, replacedWith: marker });
+      }
+    }
   }
   return out;
 }
@@ -1008,9 +1195,14 @@ const PROVENANCES = Object.freeze(["captured", "synthetic"]);
  *   publicFieldOrder explicit ordered extractable public fields
  *   runId            the record's single run identity (non-empty string)
  *   caseId?          optional case identity for sourceIdentity
- *   provenance?      "captured" (default: rows are imported as captured
- *                    public output) | "synthetic" (rows are a declared
- *                    synthetic adaptation standing in for unretained data)
+ *   provenance       REQUIRED explicit choice: "captured" (the caller
+ *                    ASSERTS the rows are captured public output; the record
+ *                    records that assertion, it cannot verify a real origin
+ *                    and does not label the record as a simulation) |
+ *                    "synthetic" (rows are a declared synthetic adaptation
+ *                    standing in for unretained data). Omitted/invalid
+ *                    provenance is refused — the importer never infers
+ *                    {"captured"} for you.
  *   sentinels?       literal private sentinels to scrub (in addition to the
  *                    built-in generic credential shapes)
  *   unknown?         [{fact, reason}] explicit unknown facts (reason in the
@@ -1043,7 +1235,7 @@ export function captureRecording({
   publicFieldOrder,
   runId,
   caseId,
-  provenance = "captured",
+  provenance,
   sentinels,
   unknown,
   reports,
@@ -1057,9 +1249,7 @@ export function captureRecording({
   if (caseId !== undefined && (typeof caseId !== "string" || caseId.length === 0)) {
     throw fail("caseId must be a non-empty string when present");
   }
-  if (!PROVENANCES.includes(provenance)) {
-    throw fail(`provenance must be one of ${PROVENANCES.join("|")}, got ${JSON.stringify(provenance)}`);
-  }
+  assertProvenance(provenance);
   const sentinelList = assertSentinels(sentinels);
   const unknownEntries = assertUnknownEntries(unknown);
   const reportEntries = assertReports(reports);
