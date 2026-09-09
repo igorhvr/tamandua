@@ -1,5 +1,9 @@
 // SOGI US-002 — the ONE designated recording-only cleanup-identity regression
 // gate (SOGI designated gate). Beads tamandua-6sy.5.1 preflight, US-002.
+// Extended by SGBD 9.1.2 (bounded unreleased-child teardown): the extracted
+// stop_unreleased_command cases additionally observe the explicit pre-release
+// ABORT-marker publish (never the release marker) that makes an unreleased
+// child self-exit without any signal when identity is unreadable/changed.
 //
 // What this gate is:
 //   * A single, focused, RECORDING-ONLY regression file auto-discovered by
@@ -20,7 +24,14 @@
 //     write can occur from inside the extracted functions: every dangerous
 //     name resolves to a recorder, the extracted text is statically guarded
 //     for direct-operation tokens, and the interpreters run under a PATH that
-//     contains no executables.
+//     contains no executables. The ONLY real filesystem write is the SGBD
+//     9.1.2 abort-marker publish, confined to a per-case os.tmpdir fixture
+//     path wired in as COMMAND_ABORT_FILE (empty in cases that do not assert
+//     the marker).
+//   * MACP3 US-004: the only '/proc' text in this file is the
+//     static-escape-guard regex literal and its prose (asserting the
+//     extracted decision code performs no procfs access) — there is no
+//     runtime procfs access of any kind in this recording gate.
 //   * Each run retains fresh evidence (command line, source/function sha256,
 //     per-case real exits and outcomes, recorded output) under a fresh
 //     torture-test/var/review-logs/<fresh-id>/ directory. Evidence is never
@@ -193,6 +204,12 @@ interface GateCase {
   pgPolicy: keyof typeof PG;
   expected: string[]; // exact ordered recorded op lines
   cleanedClaimExpected: boolean; // true only when a KILL escalation is recorded
+  // SGBD 9.1.2: real temp paths wired into the recording prelude so the
+  // ACTUAL committed stop_unreleased_command's abort-marker publish is
+  // observable. Empty = no marker configured (the publish is skipped).
+  abortFile?: string;
+  releaseFile?: string;
+  abortMarkerExpected?: boolean; // true when the abort marker must be created
 }
 
 // Every case is a pure recording run of the ACTUAL committed functions. Pids
@@ -411,6 +428,84 @@ const CASES: GateCase[] = [
     expected: ["RECORDED_WAIT 424243"],
     cleanedClaimExpected: false,
   },
+  {
+    id: "unreleased_unknown_publishes_abort",
+    functionUnderTest: "stop_unreleased_command",
+    description:
+      "SGBD 9.1.2: unreleased branch with UNKNOWN identity -> no TERM/group signal of " +
+      "any kind (SOGI refusal preserved) BUT the explicit pre-release ABORT marker is " +
+      "published (never the release marker) so the unreleased leader+anchor self-exit " +
+      "and the wait is bounded instead of hanging forever.",
+    groupProven: "0",
+    leaderPid: "424242",
+    starttime: "owned-start",
+    anchorPid: "",
+    anchorStarttime: "",
+    pstPolicy: "unreadable",
+    pgPolicy: "returns_leader",
+    expected: ["RECORDED_WAIT 424243"],
+    cleanedClaimExpected: false,
+    abortFile: "ABORT_TMP_PATH",
+    abortMarkerExpected: true,
+  },
+  {
+    id: "unreleased_changed_publishes_abort",
+    functionUnderTest: "stop_unreleased_command",
+    description:
+      "SGBD 9.1.2: unreleased branch with CHANGED identity (readable but != recorded " +
+      "start) -> no TERM (pid-reuse control) and the abort marker is published.",
+    groupProven: "0",
+    leaderPid: "424242",
+    starttime: "owned-start",
+    anchorPid: "",
+    anchorStarttime: "",
+    pstPolicy: "readable_changed",
+    pgPolicy: "returns_leader",
+    expected: ["RECORDED_WAIT 424243"],
+    cleanedClaimExpected: false,
+    abortFile: "ABORT_TMP_PATH",
+    abortMarkerExpected: true,
+  },
+  {
+    id: "unreleased_proven_term_publishes_abort_too",
+    functionUnderTest: "stop_unreleased_command",
+    description:
+      "SGBD 9.1.2: unreleased branch under PROVEN identity -> the authorized TERM fires " +
+      "as before (leader pid unknown, so the target falls back to the direct child) AND " +
+      "the abort marker is still published (it also tears the disowned anchor down " +
+      "promptly in the non-group-TERM arm); the release marker is never touched.",
+    groupProven: "0",
+    leaderPid: "",
+    starttime: "owned-start",
+    anchorPid: "",
+    anchorStarttime: "",
+    pstPolicy: "readable_match",
+    pgPolicy: "returns_other",
+    expected: ["RECORDED_KILL -TERM 424243", "RECORDED_WAIT 424243"],
+    cleanedClaimExpected: false,
+    abortFile: "ABORT_TMP_PATH",
+    abortMarkerExpected: true,
+  },
+  {
+    id: "unreleased_released_never_publishes_abort",
+    functionUnderTest: "stop_unreleased_command",
+    description:
+      "SGBD 9.1.2 refusal: when the release marker ALREADY exists (the scenario was " +
+      "released), the abort marker must NOT be published — abort is a pre-release " +
+      "control only and must never race a released scenario command.",
+    groupProven: "0",
+    leaderPid: "",
+    starttime: "owned-start",
+    anchorPid: "",
+    anchorStarttime: "",
+    pstPolicy: "readable_match",
+    pgPolicy: "returns_other",
+    expected: ["RECORDED_KILL -TERM 424243", "RECORDED_WAIT 424243"],
+    cleanedClaimExpected: false,
+    abortFile: "ABORT_TMP_PATH",
+    releaseFile: "RELEASE_TMP_PATH",
+    abortMarkerExpected: false,
+  },
 ];
 
 interface CaseResult {
@@ -422,6 +517,7 @@ interface CaseResult {
   stderr: string;
   meets: boolean;
   cleanedClaimRecorded: boolean; // derived: a -KILL escalation was recorded
+  abortMarkerCreated: boolean; // derived: the configured abort marker exists after the run
 }
 
 // ── case runner ──────────────────────────────────────────────────────────
@@ -430,6 +526,12 @@ function runCase(gateCase: GateCase, extractedFns: string): CaseResult {
   const emptyBin = path.join(fixtureRoot, "emptybin");
   fs.mkdirSync(emptyBin);
   try {
+    // SGBD 9.1.2: real temp marker paths wired into the prelude so the ACTUAL
+    // committed stop_unreleased_command's abort-marker publish is observable
+    // (and so the extracted function's references are defined under set -u).
+    const abortPath = gateCase.abortFile ? path.join(fixtureRoot, "abort.marker") : "";
+    const releasePath = gateCase.releaseFile ? path.join(fixtureRoot, "release.marker") : "";
+    if (releasePath !== "") fs.writeFileSync(releasePath, "released\n");
     const prelude = [
       "set -u",
       "_signal_after_term=0",
@@ -441,6 +543,8 @@ function runCase(gateCase: GateCase, extractedFns: string): CaseResult {
       gateCase.anchorStarttime === ""
         ? "COMMAND_ANCHOR_STARTTIME="
         : `COMMAND_ANCHOR_STARTTIME=${gateCase.anchorStarttime}`,
+      `COMMAND_ABORT_FILE=${abortPath}`,
+      `COMMAND_RELEASE_FILE=${releasePath}`,
       `process_starttime() {\n  ${PST[gateCase.pstPolicy]}\n}`,
       `process_group() {\n  ${PG[gateCase.pgPolicy]}\n}`,
       KILL_REC,
@@ -473,6 +577,7 @@ function runCase(gateCase: GateCase, extractedFns: string): CaseResult {
     const recorded = stdout.trim() === "" ? [] : stdout.trim().split("\n").filter((l) => l !== "");
     const recordedKill = recorded.filter((l) => l.startsWith("RECORDED_KILL"));
     const cleanedClaimRecorded = recordedKill.some((l) => l.includes("-KILL"));
+    const abortMarkerCreated = abortPath !== "" && fs.existsSync(abortPath);
     const meets =
       status === 0 &&
       JSON.stringify(recorded) === JSON.stringify(gateCase.expected) &&
@@ -487,6 +592,7 @@ function runCase(gateCase: GateCase, extractedFns: string): CaseResult {
       stderr,
       meets,
       cleanedClaimRecorded,
+      abortMarkerCreated,
     };
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
@@ -558,9 +664,11 @@ function writeEvidence(): void {
         meets_expectation: r.meets,
         cleaned_claim_recorded: r.cleanedClaimRecorded,
         cleaned_claim_expected: c.cleanedClaimExpected,
+        abort_marker_created: r.abortMarkerCreated,
+        abort_marker_expected: c.abortMarkerExpected ?? null,
         real_signals: 0,
         real_process_queries: 0,
-        real_filesystem_operations_in_function: 0,
+        real_filesystem_operations_in_function: r.abortMarkerCreated ? 1 : 0,
       }),
     );
   }
@@ -673,9 +781,34 @@ describe("SOGI US-002 cleanup-identity recording gate", () => {
         c.cleanedClaimExpected,
         `${c.id}: cleaned-survivor claim must be recorded exactly when a KILL escalation fires`,
       );
+      if (c.abortMarkerExpected !== undefined) {
+        assert.equal(
+          r.abortMarkerCreated,
+          c.abortMarkerExpected,
+          `${c.id}: the abort-marker publish must match expectation (created=${r.abortMarkerCreated}, expected=${c.abortMarkerExpected})`,
+        );
+      }
       assert.ok(r.meets, `${c.id}: case did not meet expectations`);
     });
   }
+
+  it("publishes the pre-release abort marker exactly when no release exists (SGBD 9.1.2)", () => {
+    for (const r of results) {
+      const c = r.gateCase;
+      if (c.functionUnderTest !== "stop_unreleased_command") continue;
+      if (c.abortMarkerExpected === undefined) continue;
+      if (c.abortMarkerExpected) {
+        assert.ok(
+          !r.recorded.some((l) => l.startsWith("RECORDED_KILL") && l.includes("-KILL")),
+          `${c.id}: the abort-marker publish must never accompany a KILL escalation`,
+        );
+        assert.ok(
+          !r.recorded.some((l) => l.includes("RECORDED_KILL") && l.includes("-TERM") && l.includes("-424242")),
+          `${c.id}: an abort-marker publish under UNKNOWN/CHANGED identity must record no group TERM`,
+        );
+      }
+    }
+  });
 
   it("keeps every required refusal/loss case free of a cleaned claim and any KILL escalation", () => {
     for (const r of results) {

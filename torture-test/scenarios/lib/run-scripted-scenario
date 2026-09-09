@@ -136,6 +136,7 @@ COMMAND_STARTTIME=""
 COMMAND_GROUP_PROVEN=0
 COMMAND_READY_FILE=""
 COMMAND_RELEASE_FILE=""
+COMMAND_ABORT_FILE=""
 COMMAND_ANCHOR_PID=""
 COMMAND_ANCHOR_STARTTIME=""
 COMMAND_ANCHOR_PID_FILE=""
@@ -275,11 +276,31 @@ daemon_control() {
 stop_unreleased_command() {
   [ -n "$COMMAND_PID" ] || return 0
   local current group leader_pid="${COMMAND_LEADER_PID:-$COMMAND_PID}"
+  # SGBD 9.1.2: an unreleased child must never hang the harness (the Mac
+  # native-sandbox ps-denial case: identity unreadable -> the signal arm below
+  # correctly refuses, and the OLD code then waited on a wrapper whose leader
+  # looped forever for a release marker that could never come). Publish the
+  # explicit pre-release ABORT marker FIRST — never the release marker, whose
+  # creation would RUN the scenario command. The unreleased session leader
+  # and its disowned in-group anchor both watch the abort marker and exit on
+  # their own without ever running scenario code, so the wait below is
+  # bounded; the leader's self-expiration cap
+  # (TT_SCENARIO_UNRELEASED_TIMEOUT_S) bounds it even when the marker cannot
+  # be written or observed. The marker is transient state under the
+  # invocation dir and is removed with it at cleanup. Skipped when no marker
+  # path is configured (recording self-tests run the extracted function).
+  if [ -n "$COMMAND_ABORT_FILE" ] && [ ! -e "$COMMAND_RELEASE_FILE" ]; then
+    : >"$COMMAND_ABORT_FILE" 2>/dev/null || true
+  fi
   current="$(process_starttime "$leader_pid" 2>/dev/null || true)"
-  # COMMAND_PID is our direct, unreaped child and scenario code has not been
-  # released, so an unavailable start time is still safe: on linux the /proc
-  # read yields the exact starttime, and on a /proc-less Darwin host the
-  # portable ps arm yields the same 1-second lstart identity (MACP4 US-003).
+  # SOGI: EVERY signal still requires current readable identity evidence
+  # authorizing that exact target. COMMAND_PID is our direct, unreaped child
+  # and scenario code has not been released, so an unavailable start time is
+  # still safe: on linux the /proc read yields the exact starttime, and on a
+  # /proc-less Darwin host the portable ps arm yields the same 1-second
+  # lstart identity (MACP4 US-003). When identity is unreadable or changed NO
+  # signal fires — the abort marker + self-expiration cap above terminate the
+  # unreleased child without any signal.
   if [ -n "$current" ] && { [ -z "$COMMAND_STARTTIME" ] || [ "$current" = "$COMMAND_STARTTIME" ]; }; then
     group="$(process_group "$leader_pid" 2>/dev/null || true)"
     if [ "$group" = "$leader_pid" ]; then
@@ -288,6 +309,11 @@ stop_unreleased_command() {
       kill -TERM "$leader_pid" 2>/dev/null || true
     fi
   fi
+  # Bounded by construction: an authorized TERM kills the unreleased leader
+  # immediately; otherwise the abort marker (published above) makes the
+  # leader exit within one poll tick, with its own expiration cap as the
+  # backstop. The wrapper relays the leader's exit, so this wait always
+  # returns within the cap instead of hanging forever.
   wait "$COMMAND_PID" 2>/dev/null || true
   COMMAND_PID=""
 }
@@ -352,6 +378,11 @@ COUNTER_DIR="$INVOCATION_DIR/work-count"
 BEHAVIORS_FILE="$INVOCATION_DIR/behaviors.json"
 COMMAND_READY_FILE="$INVOCATION_DIR/command-group-ready"
 COMMAND_RELEASE_FILE="$INVOCATION_DIR/command-group-release"
+# Explicit pre-release ABORT marker (SGBD 9.1.2): distinct from the release
+# marker — creating the RELEASE marker would execute the scenario command, so
+# a failed pre-release proof must NEVER touch it. The unreleased session
+# leader and its in-group anchor watch this marker and exit on their own.
+COMMAND_ABORT_FILE="$INVOCATION_DIR/command-group-abort"
 COMMAND_LEADER_PID_FILE="$INVOCATION_DIR/command-group-leader-pid"
 COMMAND_ANCHOR_PID_FILE="$INVOCATION_DIR/command-group-anchor-pid"
 mkdir -p "$COUNTER_DIR"
@@ -487,17 +518,50 @@ printf '%s\n' "$DAEMON_STATUS" | grep -q 'STATUS: RUNNING' \
       release_file=$2
       command_path=$3
       anchor_pid_file=$4
+      abort_file=$5
       : >"$ready_file"
       # SOGI: spawn the disowned in-group identity anchor (double-fork — the
       # intermediate subshell exits at once, so the scenario command never
       # sees the anchor as a child and a bare wait cannot block on it). The
       # anchor publishes its pid, waits boundedly for this release file, then
-      # holds the dedicated group until the cleanup group KILL reaps it.
-      ( "$BASH_BIN" "$TT_SCENARIO_ANCHOR" "$anchor_pid_file" "$release_file" & ) &
-      while [ ! -f "$release_file" ]; do sleep 0.01; done
+      # holds the dedicated group until the cleanup group KILL reaps it. The
+      # anchor also watches the abort marker so an aborted pre-release cell
+      # never leaves it holding inherited pipe handles.
+      ( "$BASH_BIN" "$TT_SCENARIO_ANCHOR" "$anchor_pid_file" "$release_file" "$abort_file" & ) &
+      # SGBD 9.1.2 — BOUNDED pre-release wait (the historical loop waited for
+      # the release marker forever; when the parent could not prove identity
+      # — e.g. Mac native-sandbox ps denial — the marker could never come and
+      # the wrapper/harness waited for hours). The leader now waits for the
+      # RELEASE marker, an explicit ABORT marker, or its own self-expiration
+      # cap (TT_SCENARIO_UNRELEASED_TIMEOUT_S seconds, default 20), whichever
+      # comes first. Only the release marker may lead to scenario execution;
+      # abort and expiry exit WITHOUT running scenario code, so the harness
+      # reaps a bounded, actionable failure instead of hanging.
+      _unreleased_timeout_s="${TT_SCENARIO_UNRELEASED_TIMEOUT_S:-20}"
+      case "$_unreleased_timeout_s" in
+        ""|*[!0-9]*) _unreleased_timeout_s=20 ;;
+      esac
+      _unreleased_attempts=$(( _unreleased_timeout_s * 100 ))
+      _unreleased_attempt=0
+      while [ ! -e "$release_file" ] && [ ! -e "$abort_file" ] \
+            && [ "$_unreleased_attempt" -lt "$_unreleased_attempts" ]; do
+        sleep 0.01
+        _unreleased_attempt=$(( _unreleased_attempt + 1 ))
+      done
+      if [ -e "$abort_file" ]; then
+        printf "run-scripted-scenario: unreleased scenario command aborted by the harness (abort marker present); scenario code was NOT run\n" >&2
+        exit 125
+      fi
+      if [ ! -e "$release_file" ]; then
+        # SGBD 9.1.2 review hardening (c): stderr is the only actionable
+        # surface this exit leaves behind — tell the operator the cell never
+        # executed anything and may safely be re-run.
+        printf "run-scripted-scenario: unreleased scenario command pre-release wait expired after %s s without release or abort; scenario code was NOT run and the harness invocation may be re-run\n" "$_unreleased_timeout_s" >&2
+        exit 124
+      fi
       export TT_SCENARIO_COMMAND_GROUP_PROVEN=1
       exec "$command_path"
-    ' scripted-scenario-command "$COMMAND_READY_FILE" "$COMMAND_RELEASE_FILE" "$COMMAND_PATH" "$COMMAND_ANCHOR_PID_FILE"
+    ' scripted-scenario-command "$COMMAND_READY_FILE" "$COMMAND_RELEASE_FILE" "$COMMAND_PATH" "$COMMAND_ANCHOR_PID_FILE" "$COMMAND_ABORT_FILE"
 ) &
 COMMAND_PID=$!
 # The direct child is now the node wrapper; the REAL session/group leader
@@ -516,16 +580,48 @@ done
   fail "could not determine the scenario command leader pid before release"
 }
 COMMAND_STARTTIME="$(process_starttime "$COMMAND_LEADER_PID" 2>/dev/null || true)"
+# SGBD 9.1.2 review hardening (a): PERSISTENT identity-unreadability tripwire.
+# The 500-iteration cap below bounds this proof loop, but under persistent
+# unreadability (the Mac native-sandbox ps-denial case: /bin/ps EPERM, so on a
+# host without a procfs identity source both process_starttime and
+# process_group return EMPTY) every iteration is a futile identity spawn and
+# the bare loop can burn ~20 s+ before stop_unreleased_command may publish the
+# abort marker — and on a slower host the leader's own self-expiration cap
+# could even fire first. Detect the denial signature (readiness published,
+# then identity STILL unreadable after a bounded wall-clock grace) and hand
+# the teardown to stop_unreleased_command EARLY, a few seconds instead of
+# ~20. The grace clock starts only once the leader publishes its ready file,
+# so a SLOW start (leader alive but not yet identity-readable) is never
+# aborted early: readiness is the leader's own signal that it is up and
+# waiting, and a live leader's identity is readable whenever the identity
+# tooling is not being denied. This path never signals anything — it only
+# breaks to the exact same stop_unreleased_command teardown the
+# loop-exhaustion path uses (abort marker -> the unreleased leader self-exits
+# without ever running scenario code).
+_ready_first_seen_s=""
+_unreadable_grace_s=5
 for _attempt in $(seq 1 500); do
   if [ -z "$COMMAND_STARTTIME" ]; then
     COMMAND_STARTTIME="$(process_starttime "$COMMAND_LEADER_PID" 2>/dev/null || true)"
   fi
   if [ -f "$COMMAND_READY_FILE" ]; then
+    if [ -z "$_ready_first_seen_s" ]; then
+      _ready_first_seen_s="$(date +%s 2>/dev/null || true)"
+    fi
     COMMAND_GROUP="$(process_group "$COMMAND_LEADER_PID" 2>/dev/null || true)"
     if [ -n "$COMMAND_STARTTIME" ] && [ "$COMMAND_GROUP" = "$COMMAND_LEADER_PID" ]; then
       COMMAND_GROUP_PROVEN=1
       break
     fi
+  fi
+  # (a) Trip once readiness has been up for the grace with identity STILL
+  # unreadable (empty starttime — the ps-denial signature; the group read is
+  # empty with it). A readable identity proves the group immediately and
+  # never reaches the trip; a changed identity (readable but not the leader's
+  # group) still polls conservatively to the loop cap, exactly as before.
+  if [ -n "$_ready_first_seen_s" ] && [ -z "$COMMAND_STARTTIME" ] \
+     && [ "$(date +%s 2>/dev/null || true)" -ge "$(( _ready_first_seen_s + _unreadable_grace_s ))" ]; then
+    break
   fi
   kill -0 "$COMMAND_PID" 2>/dev/null || break
   sleep 0.01

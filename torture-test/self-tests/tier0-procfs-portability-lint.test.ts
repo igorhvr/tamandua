@@ -222,6 +222,11 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     requiredMarker: "MACP3 US-003",
     reason: "US-003: /proc process-introspection hits carry a MACP3 US-003 linux-only marker; real Darwin branches (early empty return on non-linux) where a read would hard-fail.",
   },
+  "self-tests/tier0-scenario-unreleased-bounds.test.ts": {
+    category: "us003-runtime-guarded",
+    requiredMarker: "MACP3 US-003",
+    reason: "SGBD 9.1.2 + SGBD-OWN correction: the ONLY runtime /proc access is a MACP3 US-003-marked READ-ONLY /proc/<pid>/cmdline leak observation (observeFixtureHolders) that never signals and reports an explicitly unsupported observation (supported:false) on a /proc-less host — a substring match is never ownership and no observed pid is ever signalled; all remaining '/proc' text is linux-only prose about the ps-denial fixture (the /proc identity arm is neutralized ONLY in a harness COPY — the committed harness keeps its guarded /proc reads) and the structural pins asserting exactly that.",
+  },
   "self-tests/tier1-kill-ancestry-hygiene.test.ts": {
     category: "us003-runtime-guarded",
     requiredMarker: "MACP3 US-003",
@@ -309,6 +314,11 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     category: "us004-harness-guarded",
     requiredMarker: "MACP3 US-004",
     reason: "US-004: /proc references are linux-only documentation/assertion prose (the MACP4 US-003 Darwin portability pins for the harness's process_starttime/process_group are simulated via the portable ps arms and the failing session-leader-binary seam); no runtime procfs access in this harness test.",
+  },
+  "self-tests/tier0-sogi-cleanup-identity-gate.test.ts": {
+    category: "us004-harness-guarded",
+    requiredMarker: "MACP3 US-004",
+    reason: "MACP3 US-004: this recording-only gate's only '/proc' text is the static-escape-guard regex literal and its prose (asserting the extracted decision code performs no procfs access) plus the MACP3 US-004 header note; there is no runtime procfs access of any kind in the gate.",
   },
   "self-tests/tier1-host-profile-daemon-scripted.test.ts": {
     category: "us004-harness-guarded",
