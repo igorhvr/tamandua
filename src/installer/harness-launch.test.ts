@@ -20,9 +20,11 @@
  *  - Mode records (run.harness_isolation) for protected and fallback
  *    launches with run/execution identity + UTC.
  *  - Adapter-level integration for pi/hermes/dsh AND a probe-shaped round
- *    against the REAL native backend when one is available (honest
- *    capability skip otherwise) — asserting exactly one execution and
- *    preserved PGID identity (TAMANDUA_WORKER_PGID === pid === pgid).
+ *    against the REAL native backend once the REAL helper proves it can
+ *    establish its domain on THIS host (an honest capability skip on a known
+ *    ABI-floor refusal; an unexpected probe failure stays RED) — asserting
+ *    exactly one execution and preserved PGID identity
+ *    (TAMANDUA_WORKER_PGID === pid === pgid).
  *
  * Spawns child processes → registered in tests/serial-files.txt.
  */
@@ -30,8 +32,8 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { createTempHome } from "../../tests/helpers/test-env.ts";
-import type { ChildProcess } from "node:child_process";
+import { cleanChildEnv, createTempHome } from "../../tests/helpers/test-env.ts";
+import { spawn, type ChildProcess } from "node:child_process";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
@@ -40,7 +42,12 @@ import {
   HARNESS_ISOLATION_EVENT,
   type HarnessLaunchOutcome,
 } from "../../dist/installer/harness-launch.js";
-import { probeBackend } from "../../dist/installer/native-signal-backend.js";
+import {
+  HELPER_EXIT_SETUP_FAILURE,
+  LANDLOCK_CONTROL_FD,
+  LANDLOCK_MIN_ABI,
+  probeBackend,
+} from "../../dist/installer/native-signal-backend.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 import { formatLogsTailLine } from "../../dist/installer/logs-tail-format.js";
 import { getHarnessAdapter } from "../../dist/installer/harness-adapter.js";
@@ -128,7 +135,8 @@ function makeCounterHarness(
  * A fixture "landlock helper" standing in for dist/native/landlock-helper.
  * Installed as `<dir>/landlock-helper` so probeBackend({ platform: 'linux',
  * artifactDir: dir }) selects the landlock backend. Behaviors:
- *  - "good": READY mode=landlock, wait for GO, then exec the harness argv.
+ *  - "good": READY mode=landlock, wait for the release, then exec the
+ *    harness argv.
  *  - "exit-125": exits 125 before any READY (settled pre-release setup failure).
  *  - "partial-frame": writes a truncated READY frame then exits 125.
  *  - "hang": never reports readiness (sleeps) — setup wall must settle it.
@@ -138,6 +146,16 @@ function makeCounterHarness(
  *    without waiting (peer reset around the release boundary).
  * Every behavior appends one `x` to helperCounterFile when provided so
  * tests can count how many times a launcher instance was spawned.
+ *
+ * The fd-3 release wait defaults to the RUNTIME line protocol (a "GO" line —
+ * harness-launch.ts releases with "GO\n" and the launch-mechanism tests below
+ * exercise exactly that handshake). Pass releaseProtocol "byte" to mirror the
+ * REAL C helper instead (native/landlock-helper.c read(1)): ANY single byte
+ * releases the helper and EOF before a release byte is a setup failure. Only
+ * the probeRealLandlockDomain fixture cases use "byte", so those synthetic
+ * helpers simulate the real helper's one-byte release semantics (including
+ * the residual-unread-payload behavior on a multi-byte release) rather than
+ * the runtime's line handshake.
  */
 function makeFakeHelper(
   dir: string,
@@ -149,9 +167,22 @@ function makeFakeHelper(
     | "ready-then-exit-125"
     | "ready-then-close",
   helperCounterFile?: string,
+  releaseProtocol: "line" | "byte" = "line",
 ): string {
   const p = path.join(dir, "landlock-helper");
   const count = helperCounterFile ? `printf 'x\\n' >> "${helperCounterFile}"\n` : "";
+  // Release wait on fd 3. "line" (default) matches the runtime handshake
+  // ("GO\n" written by harness-launch.ts; the shell fixtures line-read it).
+  // "byte" emulates the REAL C helper's read(1): consume exactly one byte
+  // with dd (bs=1 count=1) and treat an empty read as EOF-before-release
+  // (setup failure). The release byte is the fixed non-newline "G", so a
+  // non-empty capture is the EOF discriminator.
+  const releaseWait =
+    releaseProtocol === "byte"
+      ? `__rel="$(dd bs=1 count=1 2>/dev/null <&3)" || exit 125\n` +
+        `[ -n "$__rel" ] || exit 125\n`
+      : `IFS= read -r __rel <&3 || exit 125\n` +
+        `[ "$__rel" = "GO" ] || exit 125\n`;
   let body: string;
   switch (behavior) {
     case "good":
@@ -159,8 +190,7 @@ function makeFakeHelper(
         `[ "$1" = "--control-fd" ] && [ "$3" = "--" ] || exit 124\n` +
         `shift 3\n` +
         `printf 'READY mode=landlock abi=8 pid=%s\\n' "$$" >&3 || exit 125\n` +
-        `IFS= read -r __rel <&3 || exit 125\n` +
-        `[ "$__rel" = "GO" ] || exit 125\n` +
+        releaseWait +
         `exec 3>&-\n` +
         `exec "$@"\n`;
       break;
@@ -176,8 +206,7 @@ function makeFakeHelper(
     case "ready-then-exit-125":
       body =
         `printf 'READY mode=landlock abi=8 pid=%s\\n' "$$" >&3 || exit 125\n` +
-        `IFS= read -r __rel <&3 || exit 125\n` +
-        `[ "$__rel" = "GO" ] || exit 125\n` +
+        releaseWait +
         `exit 125\n`;
       break;
     case "ready-then-close":
@@ -242,6 +271,214 @@ function launchFixture(opts: {
       forceFallbackReason: opts.forceFallbackReason,
     },
   });
+}
+
+// ── Real landlock host-capability gate ─────────────────────────────
+// probeBackend() only proves the compiled helper ARTIFACT exists — never
+// that this kernel lets it establish its SIGNAL-scope domain. The strict
+// protected-mode adapter cases below must therefore watch the REAL helper
+// apply its domain to a short-lived owned child with a private control
+// channel and a harmless target (/usr/bin/true) BEFORE they may assume
+// mode=landlock. This mirrors the detectCapability pattern in
+// landlock-helper.test.ts and never confines the test parent.
+//
+// Classification contract (known-unavailability vs genuine failure):
+//  - READY + release + controlled /usr/bin/true exit 0 -> "supported".
+//  - exit 125 pre-READY with stage=abi-below-minimum (the helper's own ABI
+//    gate diagnostic: SIGNAL scope below the floor or unavailable at boot)
+//    -> "known-unsupported": the protected real-backend cases skip.
+//  - anything else — spawn/protocol failures, signal deaths, malformed or
+//    missing READY, a post-READY target failure, a READY below the ABI
+//    floor, or a control-channel error during the handshake — THROWS: a
+//    genuine regression that must stay RED. There is no blanket
+//    catch-and-skip.
+
+const CAPABILITY_READY_RE = /^READY mode=landlock abi=(\d+) pid=(\d+)$/;
+/** Watchdog: never let a misbehaving probe child strand a process. */
+const CAPABILITY_WATCHDOG_MS = 25_000;
+/** How long the probe waits for the helper's READY record before giving up. */
+const CAPABILITY_READY_TIMEOUT_MS = 15_000;
+
+type LandlockHostCapability =
+  | { state: "supported"; realAbi: number }
+  | { state: "known-unsupported"; reason: string };
+
+/**
+ * Verify that the REAL landlock helper can establish its domain on THIS
+ * host: spawn it as a short-lived owned child (detached group, private
+ * bidirectional control channel on fd 3) pointed at the harmless /usr/bin/true
+ * target, require a valid READY, release exactly once with a single byte
+ * (the helper's read(1) contract), and require the controlled target to
+ * exit 0. The test parent is never confined.
+ *
+ * Returns "supported" (with the READY abi) when the domain works, or
+ * "known-unsupported" when the helper itself refuses with its documented ABI
+ * diagnostic (exit 125 + stage=abi-below-minimum before READY). ANY other
+ * outcome — spawn/protocol failure, signal death, a malformed or missing
+ * READY frame, a post-READY target failure, a READY below the SIGNAL-scope
+ * ABI floor, or a control-channel error during the handshake — throws so
+ * callers fail RED instead of silently skipping.
+ */
+async function probeRealLandlockDomain(helperPath: string): Promise<LandlockHostCapability> {
+  const child = spawn(
+    helperPath,
+    ["--control-fd", String(LANDLOCK_CONTROL_FD), "--", "/usr/bin/true"],
+    {
+      env: cleanChildEnv({}),
+      stdio: ["pipe", "pipe", "pipe", "pipe"], // fd 3 = private control channel
+      detached: true,
+    },
+  );
+  const control = child.stdio[LANDLOCK_CONTROL_FD] as
+    | (NodeJS.ReadWriteStream & { destroy?: () => void })
+    | undefined;
+
+  let stdoutBuf = "";
+  let stderrBuf = "";
+  let controlBuf = "";
+  child.stdout?.on("data", (d: Buffer) => (stdoutBuf += d.toString("utf8")));
+  child.stderr?.on("data", (d: Buffer) => (stderrBuf += d.toString("utf8")));
+  control?.on("data", (d: Buffer) => (controlBuf += d.toString("utf8")));
+
+  // A control-channel error (e.g. EPIPE on the release write racing the
+  // child's exit) must never surface as an uncaught 'error' and crash the
+  // whole runner: record it here, settle readiness early below, and treat a
+  // control error on an otherwise-"supported" outcome as unexpected (RED).
+  let controlError: Error | undefined;
+  control?.on("error", (err: Error) => {
+    controlError = err;
+  });
+
+  // Settles with the child's exit info on close; a spawn-level failure
+  // settles via error so the probe never hangs on a child that never started.
+  let resolveExit!: (r: { code: number | null; signal: NodeJS.Signals | null }) => void;
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve) => (resolveExit = resolve),
+  );
+  child.on("close", (code, signal) => {
+    resolveExit({ code, signal: (signal ?? null) as NodeJS.Signals | null });
+    try {
+      control?.destroy?.();
+    } catch {
+      /* best effort */
+    }
+  });
+  child.on("error", () => resolveExit({ code: null, signal: null }));
+
+  const watchdog = setTimeout(() => {
+    // Never signal a historical PID: only a STILL-LIVE owned child may be
+    // group-SIGKILLed. A child that already settled resolves exited below.
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* best effort */
+        }
+      }
+    }
+  }, CAPABILITY_WATCHDOG_MS);
+  watchdog.unref();
+  void exited.finally(() => clearTimeout(watchdog));
+
+  // Resolve with the parsed READY record, or null when the child exits (or
+  // errors) before reporting readiness, or when the readiness bound elapses.
+  const ready = new Promise<{ abi: number; pid: number; line: string } | null>(
+    (resolve) => {
+      const timer = setTimeout(() => resolve(null), CAPABILITY_READY_TIMEOUT_MS);
+      const finish = (v: { abi: number; pid: number; line: string } | null): void => {
+        clearTimeout(timer);
+        resolve(v);
+      };
+      const check = (): void => {
+        const nl = controlBuf.indexOf("\n");
+        if (nl >= 0) {
+          const line = controlBuf.slice(0, nl).trim();
+          const m = CAPABILITY_READY_RE.exec(line);
+          if (m) {
+            finish({ abi: Number(m[1]), pid: Number(m[2]), line });
+            return;
+          }
+        }
+        if (child.exitCode !== null || child.signalCode !== null) finish(null);
+      };
+      control?.on("data", check);
+      // A pre-READY control-channel error means no READY can ever arrive on
+      // this channel: fail readiness fast instead of waiting out the bound.
+      control?.on("error", () => finish(null));
+      child.on("close", check);
+      child.on("error", () => finish(null));
+      check();
+    },
+  );
+
+  const readyRec = await ready;
+  if (readyRec !== null) {
+    // Release exactly once with a SINGLE byte and no trailing payload — the
+    // real helper's contract (native/landlock-helper.c read(1)): it consumes
+    // one byte, closes the control channel and execs the target. Bytes left
+    // unread in the channel when the peer closes trip the parent control
+    // stream (read ECONNRESET), and the gate below must keep such an anomaly
+    // RED — so the probe itself must never create that residual. The former
+    // "GO\n" release did: real ABI-8 hosts reported READY and a clean
+    // /usr/bin/true exit 0 yet still failed the gate with ECONNRESET from the
+    // unread "O\n". Write exactly one byte ("G") so no payload remains.
+    control?.write("G"); // exactly one release byte -> helper execs /usr/bin/true
+  } else if (child.exitCode === null && child.signalCode === null) {
+    // The helper never reported READY and is still live: kill its group
+    // rather than let it strand. An already-settled child is never signalled.
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+    } catch {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+  const close = await exited;
+
+  if (readyRec === null) {
+    // Known unavailability is ONLY the helper's own ABI diagnostic: exit 125
+    // pre-READY with stage=abi-below-minimum. Everything else is a genuine
+    // regression and must stay RED, never a blanket catch-and-skip.
+    if (
+      close.code === HELPER_EXIT_SETUP_FAILURE &&
+      /stage=abi-below-minimum/.test(stderrBuf)
+    ) {
+      const detail = stderrBuf.trim().split("\n").filter(Boolean).slice(-2).join(" ").slice(0, 300);
+      return {
+        state: "known-unsupported",
+        reason: `landlock ABI below ${LANDLOCK_MIN_ABI} / SIGNAL scope unavailable on this kernel (${detail})`,
+      };
+    }
+    throw new Error(
+      `landlock host-capability probe failed unexpectedly: code=${close.code} signal=${close.signal} stderr=${JSON.stringify(stderrBuf.slice(-400))}`,
+    );
+  }
+  if (close.code !== 0) {
+    throw new Error(
+      `landlock host-capability probe: READY domain (abi=${readyRec.abi}) established but the controlled /usr/bin/true target failed: code=${close.code} signal=${close.signal} stderr=${JSON.stringify(stderrBuf.slice(-400))}`,
+    );
+  }
+  if (readyRec.abi < LANDLOCK_MIN_ABI) {
+    // The real helper cannot reach READY below the SIGNAL-scope floor; a
+    // READY under it is a helper/protocol anomaly — never "supported".
+    throw new Error(
+      `landlock host-capability probe: helper reported READY with abi=${readyRec.abi} below the SIGNAL-scope floor ${LANDLOCK_MIN_ABI} (protocol anomaly)`,
+    );
+  }
+  if (controlError !== undefined) {
+    // A control-channel error on an otherwise-"supported" outcome means the
+    // release / controlled execution was never confirmed — never green.
+    throw new Error(
+      `landlock host-capability probe: control channel error during the READY/release handshake: ${controlError.message} (code=${close.code} signal=${close.signal})`,
+    );
+  }
+  return { state: "supported", realAbi: readyRec.abi };
 }
 
 // ── Shared launch mechanism: fixture-backed (host-independent) ─────
@@ -902,15 +1139,60 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
 
 describe("adapter launches through the shared mechanism (real backend)", () => {
   // Host capability gate: these tests exercise the REAL native backend.
-  // On the rollout hosts the backend exists and the tests MUST execute; on
-  // hosts without one they skip with an honest capability reason.
+  // probeBackend() proves only that the compiled helper ARTIFACT exists.
+  // Before the strict protected-mode cases may assume mode=landlock, the
+  // REAL helper must prove it can establish its domain on THIS host (see
+  // probeRealLandlockDomain): a known ABI-floor refusal skips those cases
+  // with an informative reason, an unexpected probe failure FAILS them (RED),
+  // and hosts without a backend skip as before. The Mac seatbelt branch is
+  // not Linux-gated and keeps its full protected coverage.
   const realBackend = probeBackend();
   const protectedKind =
     realBackend.kind === "landlock" || realBackend.kind === "seatbelt" ? realBackend.kind : null;
 
+  // Shared real-helper domain probe, cached: the real helper is spawned at
+  // most once per suite and every strict protected-mode case awaits the same
+  // outcome. An unexpected probe failure rejects the shared promise, which
+  // FAILS each awaiting strict case (RED) — never a silent skip.
+  let landlockCapabilityPromise: Promise<LandlockHostCapability> | null = null;
+  function realLandlockCapability(): Promise<LandlockHostCapability> {
+    if (realBackend.kind !== "landlock") {
+      return Promise.reject(
+        new Error("real landlock capability requested without a landlock backend"),
+      );
+    }
+    if (landlockCapabilityPromise === null) {
+      landlockCapabilityPromise = probeRealLandlockDomain(realBackend.helperPath);
+      // Keep the shared probe from ever surfacing as an unhandled rejection;
+      // each strict case awaits it and re-raises on unexpected failure.
+      void landlockCapabilityPromise.catch(() => undefined);
+    }
+    return landlockCapabilityPromise;
+  }
+
+  /**
+   * Decide whether a STRICT protected-mode real-backend case may run on this
+   * host. Returns a skip reason when it cannot (t.skip with an informative
+   * capability reason) or null when the case must execute with its full
+   * protected-mode assertions. An unexpected probe failure rejects here — the
+   * calling test fails RED instead of skipping.
+   */
+  async function protectedModeSkipReason(): Promise<string | null> {
+    if (realBackend.kind === "seatbelt") return null; // real protected Mac branch: run
+    if (realBackend.kind !== "landlock") {
+      return `no native backend on this host (${realBackend.kind}: ${realBackend.kind === "unavailable" ? realBackend.reason : ""})`;
+    }
+    const cap = await realLandlockCapability();
+    if (cap.state === "known-unsupported") {
+      return `real landlock helper cannot establish its SIGNAL-scope domain on this host: ${cap.reason}`;
+    }
+    return null; // supported — strict protected-mode assertions run
+  }
+
   it("pi runRound executes exactly once with launchMode reporting the real backend", async (t) => {
-    if (!protectedKind) {
-      t.skip(`no native backend on this host (${realBackend.kind}: ${realBackend.kind === "unavailable" ? realBackend.reason : ""})`);
+    const skip = await protectedModeSkipReason();
+    if (skip !== null) {
+      t.skip(skip);
       return;
     }
     const root = tamanduaTempDir("tamandua-launch-adapter-pi-");
@@ -952,8 +1234,9 @@ describe("adapter launches through the shared mechanism (real backend)", () => {
   });
 
   it("pi runRound: harness exiting 125 after release is a normal failure — no fallback", async (t) => {
-    if (!protectedKind) {
-      t.skip(`no native backend on this host (${realBackend.kind})`);
+    const skip = await protectedModeSkipReason();
+    if (skip !== null) {
+      t.skip(skip);
       return;
     }
     const root = tamanduaTempDir("tamandua-launch-adapter-pi125-");
@@ -987,8 +1270,9 @@ describe("adapter launches through the shared mechanism (real backend)", () => {
   });
 
   it("hermes runRound executes exactly once through the shared mechanism", async (t) => {
-    if (!protectedKind) {
-      t.skip(`no native backend on this host (${realBackend.kind})`);
+    const skip = await protectedModeSkipReason();
+    if (skip !== null) {
+      t.skip(skip);
       return;
     }
     const root = tamanduaTempDir("tamandua-launch-adapter-hermes-");
@@ -1012,8 +1296,9 @@ describe("adapter launches through the shared mechanism (real backend)", () => {
   });
 
   it("dsh runRound executes exactly once through the shared mechanism", async (t) => {
-    if (!protectedKind) {
-      t.skip(`no native backend on this host (${realBackend.kind})`);
+    const skip = await protectedModeSkipReason();
+    if (skip !== null) {
+      t.skip(skip);
       return;
     }
     const root = tamanduaTempDir("tamandua-launch-adapter-dsh-");
@@ -1037,8 +1322,9 @@ describe("adapter launches through the shared mechanism (real backend)", () => {
   });
 
   it("a launch-time-probe-shaped round executes exactly once per launch", async (t) => {
-    if (!protectedKind) {
-      t.skip(`no native backend on this host (${realBackend.kind})`);
+    const skip = await protectedModeSkipReason();
+    if (skip !== null) {
+      t.skip(skip);
       return;
     }
     const root = tamanduaTempDir("tamandua-launch-adapter-probe-");
@@ -1231,6 +1517,119 @@ describe("adapter launches through the shared mechanism (real backend)", () => {
         if (saved === undefined) delete process.env.TAMANDUA_PI_BINARY;
         else process.env.TAMANDUA_PI_BINARY = saved;
       }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Real landlock host-capability gate: fixture-backed coverage ────
+// Synthetic (provider-free) classification coverage for the gate the strict
+// protected-mode cases use. Each fixture stands in for the real helper
+// binary and is exercised through the SAME probeRealLandlockDomain the suite
+// gate runs, covering supported / known-unsupported / unexpected-failure.
+
+describe("real landlock host-capability gate (fixture helpers)", () => {
+  // The "good" / "ready-then-exit-125" fixtures below stand in for the REAL
+  // helper binary, so they use the byte release protocol (read exactly one
+  // byte, like native/landlock-helper.c read(1)) — NOT the runtime's "GO"
+  // line protocol. Only these fixtures wait for a release, which is why only
+  // they select "byte".
+  it("reports supported when the helper establishes its domain and the controlled target exits 0", async () => {
+    const root = tamanduaTempDir("tamandua-cap-supported-");
+    try {
+      const helper = makeFakeHelper(root, "good", undefined, "byte"); // real-helper one-byte release
+      const cap = await probeRealLandlockDomain(helper);
+      assert.equal(cap.state, "supported");
+      if (cap.state === "supported") {
+        assert.equal(cap.realAbi, 8, "READY abi is parsed from the control frame");
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports known-unsupported for the helper's own ABI-floor diagnostic (exit 125 + stage=abi-below-minimum)", async () => {
+    const root = tamanduaTempDir("tamandua-cap-abi-");
+    try {
+      const helper = path.join(root, "landlock-helper");
+      // Mimic the real helper's pre-READY ABI gate diagnostic verbatim.
+      writeExecutable(
+        helper,
+        `#!/bin/sh\n` +
+          `printf 'tamandua-landlock-helper: pre-exec setup failure stage=abi-below-minimum detail=landlock kernel ABI 4 below required minimum 6 (SYS_landlock_create_ruleset returned 4) errno=0 (none)\\n' >&2\n` +
+          `exit 125\n`,
+      );
+      const cap = await probeRealLandlockDomain(helper);
+      assert.equal(cap.state, "known-unsupported");
+      if (cap.state === "known-unsupported") {
+        assert.match(cap.reason, /below required minimum|SIGNAL scope unavailable/);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("throws (never skips) when the helper exits pre-READY without the known ABI-floor diagnostic", async () => {
+    const root = tamanduaTempDir("tamandua-cap-exit125-");
+    try {
+      const helper = makeFakeHelper(root, "exit-125");
+      await assert.rejects(
+        () => probeRealLandlockDomain(helper),
+        /probe failed unexpectedly/,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("throws when only a malformed READY frame arrives (never treated as a domain)", async () => {
+    const root = tamanduaTempDir("tamandua-cap-partial-");
+    try {
+      const helper = makeFakeHelper(root, "partial-frame");
+      await assert.rejects(
+        () => probeRealLandlockDomain(helper),
+        /probe failed unexpectedly/,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("throws when the domain is established but the controlled target then fails", async () => {
+    const root = tamanduaTempDir("tamandua-cap-targetfail-");
+    try {
+      const helper = makeFakeHelper(root, "ready-then-exit-125", undefined, "byte"); // real-helper one-byte release
+      await assert.rejects(
+        () => probeRealLandlockDomain(helper),
+        /controlled .* target failed/,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("throws when the helper reports READY below the SIGNAL-scope ABI floor (protocol anomaly)", async () => {
+    const root = tamanduaTempDir("tamandua-cap-lowabi-");
+    try {
+      const helper = path.join(root, "landlock-helper");
+      // Reports READY with abi=3 (below the floor) then waits for the real
+      // helper's one-byte release (byte protocol, not the runtime "GO" line).
+      writeExecutable(
+        helper,
+        `#!/bin/sh\n` +
+          `[ "$1" = "--control-fd" ] && [ "$3" = "--" ] || exit 124\n` +
+          `shift 3\n` +
+          `printf 'READY mode=landlock abi=3 pid=%s\\n' "$$" >&3 || exit 125\n` +
+          `__rel="$(dd bs=1 count=1 2>/dev/null <&3)" || exit 125\n` +
+          `[ -n "$__rel" ] || exit 125\n` +
+          `exec 3>&-\n` +
+          `exec "$@"\n`,
+      );
+      await assert.rejects(
+        () => probeRealLandlockDomain(helper),
+        /below the SIGNAL-scope floor/,
+      );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

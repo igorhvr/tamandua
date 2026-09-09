@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
+import net from "node:net";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 
@@ -1351,12 +1352,38 @@ describe("relaunchRunAfterRugpull", () => {
       no_hurry_save_tokens_mode: "false",
     }, "failed");
 
-    // Port 1 is unroutable (repo convention). Never DELETE the var to
-    // simulate unreachability — the fallback default port may host a real
-    // production daemon (observed 2026-07-05: this test registered its
-    // relaunch against the live control plane the moment it came up).
+    // The controlled premise is an UNAVAILABLE control-plane service, not an
+    // unroutable port. Bind a real, owned TCP blocker on 127.0.0.1:0 (an
+    // OS-assigned port) and keep it listening for the whole relaunch attempt.
+    // Every accepted socket is destroyed immediately, so the blocker never
+    // answers a healthy HTTP 200, never impersonates a Tamandua control
+    // plane, and never accumulates hanging connections. Because the port is
+    // genuinely occupied, the real daemon the relaunch path auto-starts
+    // fails to bind it (EADDRINUSE) and exits instead of surviving as a live
+    // control plane — the failure mode of the old fixed-port-1 fixture for
+    // root, where a detached daemon would bind port 1, admit the run, and
+    // outlive the test (VBASE-RUG). Never DELETE the var to simulate
+    // unreachability — the fallback default port may host a real production
+    // daemon (observed 2026-07-05: this test registered its relaunch against
+    // the live control plane the moment it came up).
+    const blocker = net.createServer((socket) => {
+      socket.destroy();
+    });
+    const blockedPort = await new Promise<number>((resolve, reject) => {
+      blocker.once("error", reject);
+      blocker.listen({ host: "127.0.0.1", port: 0 }, () => {
+        const addr = blocker.address();
+        assert.ok(addr && typeof addr !== "string");
+        resolve(addr.port);
+      });
+    });
+    assert.ok(
+      Number.isInteger(blockedPort) && blockedPort > 0 && blockedPort < 65536,
+      `blocker must hold an OS-assigned port, got ${blockedPort}`,
+    );
+
     const savedPort = process.env.TAMANDUA_CONTROL_PORT;
-    process.env.TAMANDUA_CONTROL_PORT = "1";
+    process.env.TAMANDUA_CONTROL_PORT = String(blockedPort);
     try {
       const result = await relaunchRunAfterRugpull(runId);
       assert.equal(result.relaunched, true, "unreachable control plane must not fail the relaunch");
@@ -1375,6 +1402,12 @@ describe("relaunchRunAfterRugpull", () => {
       } else {
         process.env.TAMANDUA_CONTROL_PORT = savedPort;
       }
+      // Release the blocked port explicitly even on assertion/error paths.
+      // Relying only on expected process death is insufficient: an owned
+      // Node listener would keep this test process's event loop alive.
+      await new Promise<void>((resolve, reject) => {
+        blocker.close((err) => (err ? reject(err) : resolve()));
+      });
     }
   });
 

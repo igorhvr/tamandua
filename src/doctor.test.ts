@@ -1169,7 +1169,7 @@ describe("ENVIRONMENT dsh checks (US-009)", () => {
       `Message should carry the alpha label, got: ${check.message}`);
   });
 
-  it("session-store probe warns when the sessions dir is not readable", async () => {
+  it("session-store probe warns when the sessions dir is not readable", (t) => {
     const sessionsDir = path.join(dshHomeDir!, "sessions");
     fs.mkdirSync(sessionsDir, { recursive: true });
     const check = checkDshSessionStore({
@@ -1181,9 +1181,35 @@ describe("ENVIRONMENT dsh checks (US-009)", () => {
     assert.ok(check.message.includes("token accounting available"),
       `Message should mention token accounting, got: ${check.message}`);
 
-    // Now make it unreadable.
-    fs.chmodSync(sessionsDir, 0o000);
+    // Simulate an unreadable sessions dir deterministically: a real chmod000
+    // cannot deny this owned fixture when tests run as root with
+    // CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH, so instead mock fs.accessSync to
+    // raise EACCES ONLY for the exact owned sessions fixture when the product
+    // probes read access. Every other path delegates to the real fs.
+    const realAccessSync = fs.accessSync;
+    let deniedPath: fs.PathLike | undefined;
+    let deniedMode: number | undefined;
+    t.mock.method(fs, "accessSync", (p: fs.PathLike, mode?: number) => {
+      if (p === sessionsDir && mode === fs.constants.R_OK) {
+        deniedPath = p;
+        deniedMode = mode;
+        // Synthetic denial: like a genuine EACCES it carries err.code (the
+        // property the product inspects); unlike a real one it has no
+        // err.syscall/err.path — fine unless checkDshSessionStore reads those.
+        const err = new Error(`EACCES: permission denied, access '${String(sessionsDir)}'`);
+        (err as NodeJS.ErrnoException).code = "EACCES";
+        throw err;
+      }
+      // Unrelated paths keep the real permission semantics.
+      return realAccessSync.call(fs, p, mode);
+    });
+
     try {
+      // Non-vacuity: an unrelated owned readable fixture still succeeds while
+      // the narrow mock is active (delegated to the real fs.accessSync).
+      assert.doesNotThrow(() => fs.accessSync(dshHomeDir!, fs.constants.R_OK),
+        "unrelated readable fixture should still pass while the narrow mock is active");
+
       const unreadable = checkDshSessionStore({
         dshHome: dshHomeDir!,
         zstdSupport: { ok: true },
@@ -1194,8 +1220,18 @@ describe("ENVIRONMENT dsh checks (US-009)", () => {
         `Message should mention 'not readable', got: ${unreadable.message}`);
       assert.ok(unreadable.message.includes("0 tokens"),
         `Message should warn dsh runs will report 0 tokens, got: ${unreadable.message}`);
+      // Prove the product really probed the owned fixture for read access and
+      // hit the injected denial (the warn above is not vacuous).
+      assert.strictEqual(deniedPath, sessionsDir,
+        "product should have fs.accessSync'd the exact sessions dir");
+      assert.strictEqual(deniedMode, fs.constants.R_OK,
+        "product should have probed the sessions dir with R_OK");
     } finally {
-      fs.chmodSync(sessionsDir, 0o700);
+      // Restore even when an assertion throws, so later tests cannot inherit
+      // the injected denial.
+      t.mock.restoreAll();
+      assert.doesNotThrow(() => fs.accessSync(sessionsDir, fs.constants.R_OK),
+        "real fs.accessSync should be restored (fixture readable again) after the test");
     }
   });
 
