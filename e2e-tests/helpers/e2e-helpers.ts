@@ -15,10 +15,12 @@ import { spawnSync, spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
 import { baseEnv } from "./smoke-helpers.ts";
 import { openE2eDatabase } from "./e2e-database.mjs";
+import { sumBillableTokens } from "../../dist/installer/token-usage-policy.js";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -164,6 +166,262 @@ export function auditRunTokens(tamanduaDir: string, runId: string): RunTokenAudi
   }
 
   return { workTokens, systemTokens, tokenUpdateEvents, terminalTokensSpent };
+}
+
+// ── Harness session-store reconciliation (tamandua-6sy.52) ─────────
+//
+// The real canary asserts that `runs.tokens_spent` equals the harness's OWN
+// session-store total under the shared policy (input + output + cache_write;
+// cache_read excluded), tolerance 0. These helpers read the store directly:
+// pi's per-session JSONL and hermes' state.db. Reconciliation is scoped to
+// the round's working directory (and, when given, a start timestamp) so a
+// developer's unrelated live sessions are never counted.
+
+export interface HarnessStoreAudit {
+  /** Number of harness sessions matched for the round's workdir. */
+  sessions: number;
+  /** Total under the shared policy (cache_read excluded). */
+  policyTotal: number;
+  /** Cache-inclusive total, kept for diagnostics only. */
+  cacheInclusiveTotal: number;
+  /** Number of assistant messages/usages summed. */
+  usageCount: number;
+}
+
+function finiteNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/** True when two cwd spellings name the same directory (symlink-tolerant). */
+function sameWorkdir(a: string, b: string): boolean {
+  if (path.resolve(a) === path.resolve(b)) return true;
+  try {
+    return fs.realpathSync(a) === fs.realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+interface PiSessionFileAudit {
+  policyTotal: number;
+  cacheInclusiveTotal: number;
+  usageCount: number;
+}
+
+/** Sum assistant-message usage from one pi session JSONL under the shared policy. */
+function auditPiSessionFile(filePath: string): PiSessionFileAudit {
+  const text = fs.readFileSync(filePath, "utf-8");
+  let policyTotal = 0;
+  let cacheInclusiveTotal = 0;
+  let usageCount = 0;
+
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue; // best-effort: a partially-written trailing line is ignored
+    }
+    if (record.type !== "message") continue;
+    const message = record.message as Record<string, unknown> | undefined;
+    if (!message || message.role !== "assistant") continue;
+    const usage = message.usage as Record<string, unknown> | undefined;
+    if (!usage || typeof usage !== "object") continue;
+
+    policyTotal += sumBillableTokens({
+      input: usage.input,
+      output: usage.output,
+      cacheWrite: usage.cacheWrite,
+    });
+    const aggregate = finiteNumber(usage.totalTokens);
+    cacheInclusiveTotal +=
+      aggregate > 0
+        ? aggregate
+        : finiteNumber(usage.input) +
+          finiteNumber(usage.output) +
+          finiteNumber(usage.cacheRead) +
+          finiteNumber(usage.cacheWrite);
+    usageCount++;
+  }
+
+  return { policyTotal, cacheInclusiveTotal, usageCount };
+}
+
+/**
+ * Audit pi's own session store for one workdir.
+ *
+ * Scans `$HOME/.pi/agent/sessions/**` for `*.jsonl` files whose session
+ * header (`type: "session"`) records `cwd === workdir` (symlink-tolerant).
+ * When `sinceMs` is given, only sessions started at/after that timestamp
+ * (with 5 s clock slack) are counted.
+ */
+export function auditPiSessionStore(opts: {
+  homeDir: string;
+  workdir: string;
+  sinceMs?: number;
+}): HarnessStoreAudit {
+  const sessionsRoot = path.join(opts.homeDir, ".pi", "agent", "sessions");
+  const result: HarnessStoreAudit = {
+    sessions: 0,
+    policyTotal: 0,
+    cacheInclusiveTotal: 0,
+    usageCount: 0,
+  };
+
+  let dirs: fs.Dirent[];
+  try {
+    dirs = fs.readdirSync(sessionsRoot, { withFileTypes: true });
+  } catch {
+    return result; // pi never wrote a session (or the store is elsewhere)
+  }
+
+  for (const dir of dirs) {
+    if (!dir.isDirectory()) continue;
+    const dirPath = path.join(sessionsRoot, dir.name);
+    let files: string[];
+    try {
+      files = fs.readdirSync(dirPath).filter((name) => name.endsWith(".jsonl"));
+    } catch {
+      continue;
+    }
+
+    for (const file of files) {
+      const filePath = path.join(dirPath, file);
+      try {
+        const firstLine = fs.readFileSync(filePath, "utf-8").split("\n", 1)[0]?.trim();
+        if (!firstLine) continue;
+        const header = JSON.parse(firstLine) as Record<string, unknown>;
+        if (header.type !== "session") continue;
+        if (typeof header.cwd !== "string" || !sameWorkdir(header.cwd, opts.workdir)) continue;
+
+        if (typeof opts.sinceMs === "number") {
+          const startedMs = typeof header.timestamp === "string" ? Date.parse(header.timestamp) : NaN;
+          if (Number.isFinite(startedMs) && startedMs < opts.sinceMs - 5_000) continue;
+        }
+
+        const audit = auditPiSessionFile(filePath);
+        result.sessions++;
+        result.policyTotal += audit.policyTotal;
+        result.cacheInclusiveTotal += audit.cacheInclusiveTotal;
+        result.usageCount += audit.usageCount;
+      } catch {
+        // unreadable/partial session file — skip
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Audit hermes' own state.db for one workdir, summing sessions whose cwd
+ * matches and (when given) that started at/after `sinceMs`. Returns an empty
+ * audit when the DB/columns/rows are unavailable — callers decide whether to
+ * skip or fail reconciliation.
+ */
+export function auditHermesSessionStore(opts: {
+  homeDir: string;
+  workdir: string;
+  sinceMs?: number;
+}): HarnessStoreAudit {
+  const result: HarnessStoreAudit = {
+    sessions: 0,
+    policyTotal: 0,
+    cacheInclusiveTotal: 0,
+    usageCount: 0,
+  };
+  const dbPath = path.join(opts.homeDir, ".hermes", "state.db");
+  if (!fs.existsSync(dbPath)) return result;
+
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db
+      .prepare(
+        "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, started_at, cwd FROM sessions",
+      )
+      .all() as Array<Record<string, unknown>>;
+
+    for (const row of rows) {
+      if (typeof row.cwd !== "string" || !sameWorkdir(row.cwd, opts.workdir)) continue;
+      if (typeof opts.sinceMs === "number") {
+        const startedMs = finiteNumber(row.started_at) * 1_000;
+        if (startedMs > 0 && startedMs < opts.sinceMs - 5_000) continue;
+      }
+      result.sessions++;
+      result.policyTotal += sumBillableTokens({
+        input: row.input_tokens,
+        output: row.output_tokens,
+        cacheWrite: row.cache_write_tokens,
+      });
+      result.cacheInclusiveTotal +=
+        finiteNumber(row.input_tokens) +
+        finiteNumber(row.output_tokens) +
+        finiteNumber(row.cache_read_tokens) +
+        finiteNumber(row.cache_write_tokens);
+      result.usageCount++;
+    }
+  } catch {
+    // state.db missing/read-only failure/schema change — leave empty
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore
+    }
+  }
+
+  return result;
+}
+
+export interface HarnessReconciliation {
+  /** DB-attributed tokens (runs.tokens_spent). */
+  workTokens: number;
+  /** Session-store audit under the shared policy. */
+  store: HarnessStoreAudit;
+  /** True when runs.tokens_spent === store.policyTotal with >=1 session. */
+  reconciled: boolean;
+}
+
+/**
+ * Poll until `runs.tokens_spent` equals the harness session store total under
+ * the shared policy, or `timeoutMs` elapses. Returns the last observed values
+ * either way; callers assert tolerance 0 on `reconciled`.
+ */
+export async function waitForHarnessStoreReconciliation(opts: {
+  tamanduaDir: string;
+  runId: string;
+  auditStore: () => HarnessStoreAudit;
+  timeoutMs?: number;
+}): Promise<HarnessReconciliation> {
+  const timeoutMs = opts.timeoutMs ?? 120_000;
+  const startedAt = Date.now();
+  let workTokens = auditRunTokens(opts.tamanduaDir, opts.runId).workTokens;
+  let store = opts.auditStore();
+  // Require the equality to hold across two consecutive polls: the probe
+  // round can make runs.tokens_spent transiently equal a one-session store
+  // while the work round's usage is still settling.
+  let consecutiveMatches = 0;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (store.sessions > 0 && workTokens === store.policyTotal) {
+      consecutiveMatches++;
+      if (consecutiveMatches >= 2) break;
+    } else {
+      consecutiveMatches = 0;
+    }
+    await sleep(1_000);
+    workTokens = auditRunTokens(opts.tamanduaDir, opts.runId).workTokens;
+    store = opts.auditStore();
+  }
+
+  return {
+    workTokens,
+    store,
+    reconciled: store.sessions > 0 && workTokens === store.policyTotal,
+  };
 }
 
 /**

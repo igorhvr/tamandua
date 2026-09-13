@@ -47,6 +47,8 @@ import {
   pollForRunCompletionWithNudge,
   isSuccessfulRunTerminalStatus,
   waitForRunWorkTokens,
+  auditPiSessionStore,
+  waitForHarnessStoreReconciliation,
   collectRunDiagnostics,
 } from "./helpers/e2e-helpers.ts";
 
@@ -76,6 +78,11 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
 
         await releasePortReservations(env);
         daemon = await startIsolatedDaemon(env.homeDir, env.controlPort);
+
+        // Session-store reconciliation scopes to sessions started at/after
+        // this timestamp, so the symlinked real ~/.pi's older sessions are
+        // never counted.
+        const runStartedMs = Date.now();
 
         const runIdPrefix = await spawnWorkflowRun(
           ["workflow", "run", "do-now", CANARY_TASK, "--working-directory-for-harness", workdir],
@@ -119,6 +126,38 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
           typeof audit.terminalTokensSpent,
           "number",
           "terminal run event should carry tokensSpent",
+        );
+
+        // ── Session-store reconciliation (tamandua-6sy.52, tolerance 0) ──
+        // The defect fixed here was summing only the LAST assistant message
+        // (and including cache reads). Assert the DB total equals pi's OWN
+        // session store for this round under the shared policy
+        // (input + output + cache_write; cache_read excluded).
+        const reconciliation = await waitForHarnessStoreReconciliation({
+          tamanduaDir: env.tamanduaDir,
+          runId,
+          auditStore: () =>
+            auditPiSessionStore({
+              homeDir: env.homeDir,
+              workdir,
+              sinceMs: runStartedMs,
+            }),
+        });
+        assert.ok(
+          reconciliation.store.sessions > 0,
+          `pi session store should contain this run's session(s) for ${workdir} ` +
+            `(matched ${reconciliation.store.sessions})\n` +
+            collectRunDiagnostics(env.tamanduaDir, runId),
+        );
+        assert.equal(
+          reconciliation.workTokens,
+          reconciliation.store.policyTotal,
+          `runs.tokens_spent (${reconciliation.workTokens}) must equal pi's session-store ` +
+            `total under the shared policy (input+output+cache_write, cache_read excluded) = ` +
+            `${reconciliation.store.policyTotal}; cache-inclusive store total was ` +
+            `${reconciliation.store.cacheInclusiveTotal} over ${reconciliation.store.sessions} ` +
+            `session(s) / ${reconciliation.store.usageCount} usage record(s)\n` +
+            collectRunDiagnostics(env.tamanduaDir, runId),
         );
 
         // ── Real-model motor baseline (see MOTOR-CONTRACT.md N1/N2):
