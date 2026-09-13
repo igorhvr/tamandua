@@ -163,9 +163,9 @@ describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
         // ── Session-store reconciliation (tamandua-6sy.52, tolerance 0) ──
         // hermes' own state.db is the source of truth. Assert the DB total
         // equals the sum over this run's sessions under the shared policy.
-        // Best-effort: hermes versions/schemas without cwd/started_at leave
-        // the audit empty, in which case we report a diagnostic instead of
-        // failing a run whose token accounting is already covered above.
+        // The live schema exposes cwd + started_at (verified against
+        // /root/.hermes/state.db), so this is a HARD assert symmetric with
+        // the pi canary — not a best-effort skip.
         const reconciliation = await waitForHarnessStoreReconciliation({
           tamanduaDir: env.tamanduaDir,
           runId,
@@ -176,22 +176,21 @@ describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
               sinceMs: runStartedMs,
             }),
         });
-        if (reconciliation.store.sessions > 0) {
-          assert.equal(
-            reconciliation.workTokens,
-            reconciliation.store.policyTotal,
-            `runs.tokens_spent (${reconciliation.workTokens}) must equal hermes' state.db ` +
-              `total under the shared policy (input+output+cache_write, cache_read excluded) = ` +
-              `${reconciliation.store.policyTotal}; cache-inclusive total was ` +
-              `${reconciliation.store.cacheInclusiveTotal} over ${reconciliation.store.sessions} session(s)\n` +
-              collectRunDiagnostics(env.tamanduaDir, runId),
-          );
-        } else {
-          t.diagnostic(
-            `hermes state.db reconciliation skipped: no session rows matched ${workdir} ` +
-              `(runs.tokens_spent=${reconciliation.workTokens})`,
-          );
-        }
+        assert.ok(
+          reconciliation.store.sessions > 0,
+          `hermes state.db should contain this run's session(s) for ${workdir} ` +
+            `(matched ${reconciliation.store.sessions}; runs.tokens_spent=${reconciliation.workTokens})\n` +
+            collectRunDiagnostics(env.tamanduaDir, runId),
+        );
+        assert.equal(
+          reconciliation.workTokens,
+          reconciliation.store.policyTotal,
+          `runs.tokens_spent (${reconciliation.workTokens}) must equal hermes' state.db ` +
+            `total under the shared policy (input+output+cache_write, cache_read excluded) = ` +
+            `${reconciliation.store.policyTotal}; cache-inclusive total was ` +
+            `${reconciliation.store.cacheInclusiveTotal} over ${reconciliation.store.sessions} session(s)\n` +
+            collectRunDiagnostics(env.tamanduaDir, runId),
+        );
 
         console.log(
           `[hermes-canary baseline] do-now: workTokens=${audit.workTokens} ` +
