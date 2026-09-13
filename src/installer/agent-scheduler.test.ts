@@ -2423,10 +2423,14 @@ process.exit(done.status ?? 0);
 
     const forceFailures = events.filter((e) => e.event === "run.force_failed");
     assert.equal(forceFailures.length, 1, "the run must be force-failed through the sanctioned path");
+    // F3: the scheduler teardown may append a closing run.tokens.final after
+    // the terminal event, so run.force_failed must be the run's final
+    // lifecycle event (ignoring an optional trailing token finalization).
+    const lifecycleEvents = events.filter((e) => e.event !== "run.tokens.final");
     assert.equal(
-      events[events.length - 1].event,
+      lifecycleEvents[lifecycleEvents.length - 1].event,
       "run.force_failed",
-      "run.force_failed must be the run's final event",
+      "run.force_failed must be the run's final lifecycle event",
     );
 
     // Zero steps started: the step was never claimed (no step.running, no

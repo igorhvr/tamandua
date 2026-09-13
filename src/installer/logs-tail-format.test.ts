@@ -75,6 +75,11 @@ describe("formatLogsTailLabel", () => {
     assert.equal(formatLogsTailLabel(evt), "Token spend updated (post-terminal)");
   });
 
+  it("displays a distinct label for run.tokens.final (F3)", () => {
+    const evt = makeEvent("run.tokens.final", { tokenDelta: 137, tokensSpent: 137 });
+    assert.equal(formatLogsTailLabel(evt), "Token spend finalized");
+  });
+
   it("displays 'Step rerouted' for step.rerouted events (WAVE-B.1)", () => {
     const evt = makeEvent("step.rerouted");
     assert.equal(formatLogsTailLabel(evt), "Step rerouted");
@@ -126,6 +131,35 @@ describe("formatLogsTailLine", () => {
     const line = formatLogsTailLine(evt);
     assert.ok(line.includes("Token spend updated (post-terminal)"), `Expected post-terminal label in: ${line}`);
     assert.ok(line.includes("[tokens: Δ +137, total 137]"), `Expected token spend detail in: ${line}`);
+  });
+
+  it("renders the finalization label and closing totals for run.tokens.final (F3)", () => {
+    const evt = makeEvent("run.tokens.final", {
+      runId: "abcd1234",
+      tokenDelta: 137,
+      tokensSpent: 137,
+    });
+    const line = formatLogsTailLine(evt);
+    assert.ok(line.includes("Token spend finalized"), `Expected finalization label in: ${line}`);
+    assert.ok(line.includes("[tokens: Δ +137, total 137]"), `Expected closing token spend in: ${line}`);
+  });
+
+  it("annotates a terminal event's token total as an as-of-completion snapshot (F3)", () => {
+    const completed = formatLogsTailLine(makeEvent("run.completed", { runId: "abcd1234", tokensSpent: 80 }));
+    assert.ok(
+      completed.includes("[tokens: total 80 as of completion]"),
+      `Expected snapshot caveat on run.completed in: ${completed}`,
+    );
+    const failed = formatLogsTailLine(makeEvent("run.failed", { runId: "abcd1234", tokensSpent: 70 }));
+    assert.ok(
+      failed.includes("[tokens: total 70 as of completion]"),
+      `Expected snapshot caveat on run.failed in: ${failed}`,
+    );
+    // A canceled run settles its attribution before run.canceled (TATR
+    // US-006), so its total is already authoritative and keeps the plain label.
+    const canceled = formatLogsTailLine(makeEvent("run.canceled", { runId: "abcd1234", tokensSpent: 60 }));
+    assert.ok(canceled.includes("[tokens: total 60]"), `Expected plain canceled total in: ${canceled}`);
+    assert.ok(!canceled.includes("as of completion"), `Canceled total must not be marked a snapshot: ${canceled}`);
   });
 
   it("renders the plain step.rerouted label in the full line (WAVE-B.1)", () => {

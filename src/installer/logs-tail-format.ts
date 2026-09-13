@@ -8,6 +8,7 @@ const EVENT_LABELS: Record<string, string> = {
   "run.nudged": "Run nudged",
   "run.deleted": "Run deleted",
   "run.tokens.updated": "Token spend updated",
+  "run.tokens.final": "Token spend finalized",
   "system.tokens.updated": "System token spend updated",
   "step.pending": "Step pending",
   "step.running": "Claimed step",
@@ -64,7 +65,15 @@ function formatTokenSpend(evt: TamanduaEvent): string {
   }
   if (hasTotal) {
     const total = evt.tokensSpent as number;
-    parts.push(`total ${Math.trunc(total)}`);
+    // F3: run.completed/run.failed carry the run total AS OF the terminal
+    // event; the harness's final round usage lands after it and is closing
+    // by run.tokens.final. Never present the terminal snapshot as the final
+    // total — labeled readers must defer to run.tokens.final or the runs row.
+    if (evt.event === "run.completed" || evt.event === "run.failed") {
+      parts.push(`total ${Math.trunc(total)} as of completion`);
+    } else {
+      parts.push(`total ${Math.trunc(total)}`);
+    }
   }
 
   return ` [tokens: ${parts.join(", ")}]`;

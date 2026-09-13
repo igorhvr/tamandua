@@ -97,6 +97,13 @@ describe("token spend event formatting", () => {
         runId,
         tokensSpent: 80,
       });
+      appendEvent(globalFile, {
+        ts: new Date().toISOString(),
+        event: "run.tokens.final",
+        runId,
+        tokenDelta: 40,
+        tokensSpent: 120,
+      });
 
       const result = await runCliOnce(["logs", "20"], {
         TAMANDUA_STATE_DIR: env.stateDir,
@@ -107,7 +114,11 @@ describe("token spend event formatting", () => {
       assert.equal(result.stderr.includes("Error:"), false);
       assert.match(result.stdout, /Token spend updated/);
       assert.match(result.stdout, /\[tokens: Δ \+80, total 80\]/);
-      assert.match(result.stdout, /Run completed.*\[tokens: total 80\]/);
+      // F3: the terminal event's total is an as-of-completion snapshot.
+      assert.match(result.stdout, /Run completed.*\[tokens: total 80 as of completion\]/);
+      // F3: run.tokens.final carries the authoritative closing figure.
+      assert.match(result.stdout, /Token spend finalized/);
+      assert.match(result.stdout, /\[tokens: Δ \+40, total 120\]/);
     } finally {
       fs.rmSync(env.root, { recursive: true, force: true });
     }
@@ -152,7 +163,17 @@ describe("token spend event formatting", () => {
         tokensSpent: 125,
       });
       await waitForContains(proc.getStdout, "Run completed");
-      await waitForContains(proc.getStdout, "[tokens: total 125]");
+      await waitForContains(proc.getStdout, "[tokens: total 125 as of completion]");
+
+      appendEvent(runFile, {
+        ts: new Date().toISOString(),
+        event: "run.tokens.final",
+        runId,
+        tokenDelta: 10,
+        tokensSpent: 135,
+      });
+      await waitForContains(proc.getStdout, "Token spend finalized");
+      await waitForContains(proc.getStdout, "[tokens: Δ +10, total 135]");
 
       const code = await stopWithSigint(proc.child);
       assert.equal(code, 0);

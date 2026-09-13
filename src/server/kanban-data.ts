@@ -100,7 +100,7 @@ export interface KanbanCardDetail {
     lastEvent: string;
     durationMs: number;
   };
-  /** Token spend from run.tokens.updated events (total and per-delta). */
+  /** Token spend from the run.tokens.updated / run.tokens.final events (total and per-delta). */
   tokens?: {
     total: number;
     deltas: number[];
@@ -250,7 +250,11 @@ function aggregateTokens(events: TamanduaEvent[]): NonNullable<KanbanCardDetail[
   const deltas: number[] = [];
   let lastTotal = 0;
   for (const e of events) {
-    if (e.event === "run.tokens.updated") {
+    // F3: run.tokens.final is the authoritative closing figure; it follows
+    // the last run.tokens.updated, so the latest matching total wins and the
+    // card-detail total closes on the final figure. Its tokenDelta (the last
+    // settled round's usage) is included when present.
+    if (e.event === "run.tokens.updated" || e.event === "run.tokens.final") {
       if (typeof e.tokenDelta === "number") deltas.push(e.tokenDelta);
       if (typeof e.tokensSpent === "number") lastTotal = e.tokensSpent;
     }

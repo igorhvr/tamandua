@@ -37,6 +37,8 @@ describe("dashboard run token spend surfaces", () => {
     const result = runNodeScript(
       `
           import { once } from "node:events";
+          import fs from "node:fs";
+          import path from "node:path";
           import { getDb } from "./dist/db.js";
           import { createDashboardServer } from "./dist/server/dashboard.js";
 
@@ -48,12 +50,22 @@ describe("dashboard run token spend surfaces", () => {
           db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
 
           db.prepare(
-            "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 7, 'wf-dashboard', 'Token visibility', 'running', '{}', 144, ?, ?)"
+            "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 7, 'wf-dashboard', 'Token visibility', 'completed', '{}', 144, ?, ?)"
           ).run(runId, now, now);
 
           db.prepare(
             "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES ('step_token_api_001', ?, 'implement', 'dev', 1, 'input', 'expects', 'done', ?, ?)"
           ).run(runId, now, now);
+
+          // The terminal event's tokensSpent is an as-of-completion snapshot
+          // that under-reports the final round; the API must still source the
+          // displayed spend from the runs row (144), not this snapshot (1).
+          const eventsDir = path.join(process.env.HOME, ".tamandua", "events");
+          fs.mkdirSync(eventsDir, { recursive: true });
+          fs.appendFileSync(
+            path.join(eventsDir, runId + ".jsonl"),
+            JSON.stringify({ ts: now, event: "run.completed", runId, tokensSpent: 1 }) + "\\n",
+          );
 
           const server = createDashboardServer(0);
           if (!server.listening) {
@@ -79,12 +91,15 @@ describe("dashboard run token spend surfaces", () => {
               Object.prototype.hasOwnProperty.call(row, "tokens_spent")
             );
 
+            const terminalEvent = (detailBody?.events || []).find((e) => e.event === "run.completed");
+
             console.log(JSON.stringify({
               listStatus: listRes.status,
               detailStatus: detailRes.status,
               hasTokensOnEveryRun,
               listTokens: runRow?.tokens_spent ?? null,
               detailTokens: detailBody?.run?.tokens_spent ?? null,
+              terminalEventTokens: terminalEvent?.tokensSpent ?? null,
             }));
           } finally {
             await new Promise((resolve) => server.close(() => resolve()));
@@ -96,6 +111,9 @@ describe("dashboard run token spend surfaces", () => {
     assert.equal(result.listStatus, 200);
     assert.equal(result.detailStatus, 200);
     assert.equal(result.hasTokensOnEveryRun, true);
+    // The row total (144) must win over the run.completed snapshot (1) in
+    // both the run list and the run detail payloads.
+    assert.equal(result.terminalEventTokens, 1);
     assert.equal(result.listTokens, 144);
     assert.equal(result.detailTokens, 144);
   });

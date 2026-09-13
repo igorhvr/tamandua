@@ -482,6 +482,27 @@ describe("kanban-data: buildKanbanCardDetail", () => {
     assert.deepEqual(detail.tokens.deltas, [1500, 800, 200]);
   });
 
+  it("closes the card-detail total on a run.tokens.final event (F3)", () => {
+    const db = seedDb();
+    insertRun(db, "r5f", "completed", 2500);
+    insertStep(db, "r5f", "plan", "planner", 0, "done", {
+      input_template: "Plan it",
+    });
+
+    const events: TamanduaEvent[] = [
+      makeEvent("2025-01-05T10:01:00Z", "run.tokens.updated", { runId: "r5f", stepId: "plan", tokenDelta: 1500, tokensSpent: 1500 }),
+      // The closing figure (and the last settled round's delta) arrives on
+      // run.tokens.final, after the terminal event's as-of-completion snapshot.
+      makeEvent("2025-01-05T10:02:00Z", "run.tokens.final", { runId: "r5f", stepId: "plan", tokenDelta: 1000, tokensSpent: 2500 }),
+    ];
+
+    const detail = buildKanbanCardDetail(db, "r5f", "plan", events);
+    assert.ok(detail);
+    assert.ok(detail.tokens);
+    assert.equal(detail.tokens.total, 2500, "run.tokens.final total must win");
+    assert.deepEqual(detail.tokens.deltas, [1500, 1000], "run.tokens.final tokenDelta must be included");
+  });
+
   it("returns undefined tokens when no token events exist", () => {
     const db = seedDb();
     insertRun(db, "r6", "running");
