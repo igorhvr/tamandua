@@ -188,6 +188,33 @@ function readRunEvents(tamanduaDir: string, runId: string): Array<Record<string,
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+/**
+ * Poll the on-disk run event stream until an event with `eventName` appears.
+ *
+ * The closing `run.tokens.final` (F3) is emitted from scheduler teardown
+ * AFTER the terminal event and after the final round's usage has been
+ * attributed (or the teardown grace expires), so reading the stream
+ * immediately after `waitForRun` would race it. Teardown grants the
+ * production HARNESS_TEARDOWN_GRACE_MS (10 s) window before emitting the
+ * no-in-flight closing figure, so allow comfortably more than that. Returns
+ * undefined if the event never lands within `timeoutMs`.
+ */
+async function waitForRunEvent(
+  tamanduaDir: string,
+  runId: string,
+  eventName: string,
+  timeoutMs = 45_000,
+): Promise<Record<string, unknown> | undefined> {
+  const startedAt = Date.now();
+  let match: Record<string, unknown> | undefined;
+  while (Date.now() - startedAt < timeoutMs) {
+    match = readRunEvents(tamanduaDir, runId).find((event) => event.event === eventName);
+    if (match) return match;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return match;
+}
+
 // ── Scripted behaviors: bug-fix-merge-worktree happy path ───────────
 
 const BRANCH = "bugfix-scripted-add";
@@ -1171,6 +1198,131 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           `final round's usage (555 tokens, emitted AFTER step complete) should be ` +
             `attributed to the run — got ${tokens}. If this is 0, completion teardown ` +
             `killed the harness before it flushed usage.\n${diagnostics(ctx)}`,
+        );
+
+        // F3: the terminal run.completed is emitted at step-complete time, so
+        // its tokensSpent is a snapshot; the closing run.tokens.final emitted
+        // from scheduler teardown is the authoritative figure.
+        const finalEvent = await waitForRunEvent(ctx.env.tamanduaDir, runId, "run.tokens.final");
+        assert.ok(
+          finalEvent,
+          `run.tokens.final should be emitted after the run completes and the ` +
+            `final round's usage lands\n${diagnostics(ctx)}`,
+        );
+
+        const events = readRunEvents(ctx.env.tamanduaDir, runId);
+        const completedIndex = events.findIndex((event) => event.event === "run.completed");
+        const finalIndex = events.findIndex((event) => event.event === "run.tokens.final");
+        assert.notEqual(completedIndex, -1, "run.completed must be present");
+        assert.ok(
+          finalIndex > completedIndex,
+          `run.tokens.final must follow run.completed (completed@${completedIndex}, final@${finalIndex})`,
+        );
+
+        const completedEvent = events[completedIndex];
+        const row = dbRow<{ tokens_spent: number }>(
+          ctx.env.tamanduaDir,
+          "SELECT tokens_spent FROM runs WHERE id = ?",
+          runId,
+        );
+        assert.equal(
+          Number(finalEvent.tokensSpent),
+          row.tokens_spent,
+          "run.tokens.final.tokensSpent must equal the runs row total",
+        );
+        assert.ok(
+          Number(finalEvent.tokensSpent) >= Number(completedEvent.tokensSpent ?? 0),
+          `run.tokens.final.tokensSpent (${String(finalEvent.tokensSpent)}) must be >= ` +
+            `run.completed.tokensSpent (${String(completedEvent.tokensSpent)})`,
+        );
+        assert.equal(
+          finalEvent.tokenDelta,
+          555,
+          "run.tokens.final.tokenDelta must cover the last round's usage",
+        );
+        assert.equal(
+          events.filter((event) => event.event === "run.tokens.final").length,
+          1,
+          "exactly one run.tokens.final must be emitted per run",
+        );
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "do-now: no final-round usage — run.tokens.final carries the row total and no tokenDelta",
+    { timeout: 120_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        // Same report-BEFORE-usage ordering, but this round spends zero
+        // tokens: no post-terminal run.tokens.updated lands, so the closing
+        // event must carry the runs row total with no fabricated delta.
+        ctx = await startScriptedEnvironment("do-now", {
+          agents: {
+            doer: {
+              reportBeforeEmit: true,
+              tokens: 0,
+              output: "STATUS: done\nREPORT: zero-token round reported before usage flush",
+            },
+          },
+        });
+        const workdir = path.join(ctx.env.root, "do-now-workdir");
+        fs.mkdirSync(workdir, { recursive: true });
+
+        const runIdPrefix = await spawnWorkflowRun(
+          [
+            "workflow",
+            "run",
+            "do-now",
+            "Report the current date",
+            "--working-directory-for-harness",
+            workdir,
+          ],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+        );
+        const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+
+        const status = await waitForRun(ctx, runId, 90_000);
+        assert.ok(
+          status === "completed" || status === "done",
+          `run should complete, got "${status}"\n${diagnostics(ctx)}`,
+        );
+
+        const finalEvent = await waitForRunEvent(ctx.env.tamanduaDir, runId, "run.tokens.final");
+        assert.ok(
+          finalEvent,
+          `run.tokens.final should be emitted even when no usage landed\n${diagnostics(ctx)}`,
+        );
+
+        const events = readRunEvents(ctx.env.tamanduaDir, runId);
+        assert.equal(
+          events.filter((event) => event.event === "run.tokens.updated").length,
+          0,
+          "a zero-token round must not attribute any usage",
+        );
+
+        const row = dbRow<{ tokens_spent: number }>(
+          ctx.env.tamanduaDir,
+          "SELECT tokens_spent FROM runs WHERE id = ?",
+          runId,
+        );
+        assert.equal(
+          Number(finalEvent.tokensSpent),
+          row.tokens_spent,
+          "run.tokens.final.tokensSpent must equal the runs row total",
+        );
+        assert.equal(
+          finalEvent.tokenDelta,
+          undefined,
+          "no tokenDelta may be fabricated when no usage landed",
+        );
+        assert.equal(
+          events.filter((event) => event.event === "run.tokens.final").length,
+          1,
+          "exactly one run.tokens.final must be emitted per run",
         );
       } finally {
         await teardown(ctx);
