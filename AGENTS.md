@@ -233,7 +233,10 @@ followed by a top-level command listing.
   the WLST5.1 failure mode: adding a guarded ALTER without bumping leaves
   existing DBs (user_version === the old version) early-returning in
   `migrate()` and skipping the ALTER, so any SQL touching the new column
-  crashes with "no such column".
+  crashes with "no such column". The bump applies to DDL changes inside
+  `applySchema()`, and `migrate()` now serializes cold-start migration across
+  processes (`BEGIN IMMEDIATE` + bounded retry, re-reading `user_version`
+  under the lock) so concurrent first-opens cannot race the guarded ALTERs.
 - Migration coverage belongs in `src/db.test.ts` MIGV tests: build a legacy DB
   with raw pre-bump DDL + `PRAGMA user_version = SCHEMA_VERSION - 1` in a temp
   HOME, open it through `getDb()` in a subprocess (import from `dist/db.js`,
