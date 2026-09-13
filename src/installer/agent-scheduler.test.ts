@@ -33,6 +33,7 @@ import {
 } from "../../dist/installer/agent-scheduler.js";
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
+import { emitRunTerminalEvent } from "../../dist/installer/step-ops.js";
 import { getHarnessAdapter } from "../../dist/installer/harness-adapter.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import type { SetupAgentCronsOptions, NudgeResult, CronJobInfo } from "../../dist/installer/agent-scheduler.js";
@@ -2923,5 +2924,252 @@ describe("KHYG US-002 real registered-round teardown cancels a parked dispatch l
     );
     assert.equal(outcome.spawned, 0, "no launcher child may be spawned after teardown");
     assert.equal(outcome.executions, 0, "neither round may execute the harness after teardown");
+  });
+});
+
+// ── F3: run.tokens.final closing token total (US-002) ───────────────
+// step-ops emits run.completed/run.failed with tokensSpent read at that
+// instant, but the harness that reported the final step emits its
+// message_end usage AFTER the step-complete tool call. The scheduler keeps
+// that round alive for the teardown grace window so the usage lands as a
+// post-terminal run.tokens.updated; run.tokens.final is then the
+// authoritative closing figure, emitted exactly once per terminal run
+// without delaying or reordering the terminal event.
+
+describe("run.tokens.final closing token total (F3)", () => {
+  let tempHome: string;
+  let stateDir: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-tokens-final-");
+    stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-tokens-final"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /** Seed a run + pending step and return the matching dispatch job id. */
+  function seedRun(
+    status: string,
+    tokensSpent = 0,
+  ): { runId: string; jobId: string; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'test-workflow', 'tokens final task', ?, ?, ?, ?, ?)",
+    ).run(runId, status, JSON.stringify({ working_directory_for_harness: workdir }), tokensSpent, now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-workflow_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    const jobId = `tamandua-test-workflow-${runId}-test-agent`;
+    return { runId, jobId, workdir };
+  }
+
+  /**
+   * Fake pi reproducing the real timeline: claims the pending step and
+   * writes the in-flight marker, sleeps 300ms (so the test can mark the run
+   * terminal and tear down first), then emits a pi-shaped message_end with
+   * usage.totalTokens = 137 followed by STATUS: done — exactly the
+   * report-BEFORE-usage ordering that under-reports the terminal event.
+   */
+  function writeFakePi(): string {
+    const fakePi = path.join(tempHome, "pi-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+fs.writeFileSync(process.env.TAMANDUA_ROUND_MARKER, "inflight");
+await new Promise((resolve) => setTimeout(resolve, 300));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "STATUS: done", usage: { totalTokens: 137 } } }));
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    return fakePi;
+  }
+
+  async function waitForMarker(markerPath: string, timeoutMs = 5000): Promise<void> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (fs.existsSync(markerPath)) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("round never reached in-flight state (marker not written)");
+  }
+
+  async function waitForFinalEvent(runId: string, timeoutMs = 5000): Promise<void> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (getRunEvents(runId).some((e) => e.event === "run.tokens.final")) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("run.tokens.final was never emitted");
+  }
+
+  function startRound(runId: string, jobId: string, workdir: string): Promise<void> {
+    return executeDispatchRound(
+      { id: jobId, workflowId: "test-workflow", runId, agentId: "test-workflow_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+  }
+
+  it("emits run.tokens.final after the terminal event with the full row total and last delta", async () => {
+    const { runId, jobId, workdir } = seedRun("running");
+    const marker = path.join(tempHome, "round-final-usage.marker");
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+    process.env.TAMANDUA_PI_BINARY = writeFakePi();
+
+    // Register the run's dispatch job exactly as admission does, so
+    // removeRunCrons has real bookkeeping to tear down (and therefore
+    // schedules the closing final).
+    await setupAgentCrons(makeWorkflow(), runId, { workingDirectoryForHarness: workdir });
+
+    const round = startRound(runId, jobId, workdir);
+    await waitForMarker(marker);
+
+    // The run reaches completed and the terminal event is emitted BEFORE
+    // this round's usage parses — the exact under-report defect.
+    getDb()
+      .prepare("UPDATE runs SET status = 'completed', updated_at = datetime('now') WHERE id = ?")
+      .run(runId);
+    emitRunTerminalEvent({ event: "run.completed", runId, workflowId: "test-workflow" });
+
+    // Teardown with the production grace: waits for the in-flight round's
+    // attribution to settle before emitting the closing figure.
+    await removeRunCrons(runId, { graceMs: 2000 });
+    await round;
+    await waitForFinalEvent(runId);
+
+    const events = getRunEvents(runId);
+    const names = events.map((e) => e.event);
+    const completedIdx = names.indexOf("run.completed");
+    const updatedIdx = names.indexOf("run.tokens.updated");
+    const finalIdx = names.lastIndexOf("run.tokens.final");
+
+    assert.notEqual(completedIdx, -1, "the terminal run.completed must be present");
+    assert.notEqual(updatedIdx, -1, "the post-terminal usage flush must be present");
+    assert.notEqual(finalIdx, -1, "run.tokens.final must be emitted");
+    assert.ok(finalIdx > completedIdx, "run.tokens.final must follow the terminal event");
+    assert.ok(finalIdx > updatedIdx, "run.tokens.final must follow the post-terminal flush");
+
+    const finalEvent = events[finalIdx];
+    assert.equal(finalEvent.tokensSpent, 137, "run.tokens.final must carry the full row total");
+    assert.equal(finalEvent.tokenDelta, 137, "run.tokens.final must carry the last settled round's delta");
+    assert.equal(finalEvent.workflowId, "test-workflow");
+
+    const row = getDb().prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(runId) as { tokens_spent: number };
+    assert.equal(finalEvent.tokensSpent, row.tokens_spent, "the closing figure must equal the runs row");
+
+    assert.equal(
+      events.filter((e) => e.event === "run.tokens.final").length,
+      1,
+      "exactly one run.tokens.final must be emitted",
+    );
+  });
+
+  it("emits run.tokens.final with the row total and no tokenDelta when the grace expires with no usage", async () => {
+    const { runId, workdir } = seedRun("completed", 500);
+    await setupAgentCrons(makeWorkflow(), runId, { workingDirectoryForHarness: workdir });
+
+    await removeRunCrons(runId, { graceMs: 25 });
+    await waitForFinalEvent(runId);
+
+    const finals = getRunEvents(runId).filter((e) => e.event === "run.tokens.final");
+    assert.equal(finals.length, 1, "exactly one run.tokens.final must be emitted");
+    assert.equal(finals[0].tokensSpent, 500, "the row total must be emitted");
+    assert.equal(finals[0].tokenDelta, undefined, "no tokenDelta may be fabricated when no usage landed");
+  });
+
+  it("emits at most one run.tokens.final across repeated teardown and settle calls", async () => {
+    const { runId, workdir } = seedRun("failed", 77);
+    await setupAgentCrons(makeWorkflow(), runId, { workingDirectoryForHarness: workdir });
+
+    await removeRunCrons(runId, { graceMs: 25 });
+    await removeRunCrons(runId, { graceMs: 25 });
+    await settleRunInFlightRounds(runId, { graceMs: 25 });
+    await waitForFinalEvent(runId);
+
+    // A late repeated teardown after the closing event must not add another.
+    await removeRunCrons(runId, { graceMs: 25 });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const finals = getRunEvents(runId).filter((e) => e.event === "run.tokens.final");
+    assert.equal(finals.length, 1, "at most one run.tokens.final may exist per run");
+  });
+
+  it("does not emit run.tokens.final for a canceled run", async () => {
+    const { runId, workdir } = seedRun("canceled", 999);
+    await setupAgentCrons(makeWorkflow(), runId, { workingDirectoryForHarness: workdir });
+
+    await removeRunCrons(runId, { graceMs: 25 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(
+      getRunEvents(runId).filter((e) => e.event === "run.tokens.final").length,
+      0,
+      "canceled runs settle before run.canceled and must get no final",
+    );
+  });
+
+  it("does not emit run.tokens.final on a post-terminal attribution without a grace teardown", async () => {
+    const { runId, jobId, workdir } = seedRun("running");
+    const marker = path.join(tempHome, "round-no-teardown.marker");
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+    process.env.TAMANDUA_PI_BINARY = writeFakePi();
+
+    const round = startRound(runId, jobId, workdir);
+    await waitForMarker(marker);
+
+    // Flip terminal mid-round and let the round's post-terminal attribution
+    // land WITHOUT any removeRunCrons grace teardown (cancel-race shape).
+    getDb()
+      .prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?")
+      .run(runId);
+    await round;
+
+    const events = getRunEvents(runId);
+    assert.equal(
+      events.filter((e) => e.event === "run.tokens.updated" && e.postTerminal === true).length,
+      1,
+      "the post-terminal flush must land",
+    );
+    assert.equal(
+      events.filter((e) => e.event === "run.tokens.final").length,
+      0,
+      "a post-terminal attribution without a grace teardown must not finalize",
+    );
   });
 });

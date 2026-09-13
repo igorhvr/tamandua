@@ -149,6 +149,35 @@ interface RoundCompletionSignal {
 }
 const roundCompletionSignals = new Map<string, RoundCompletionSignal>();
 
+/**
+ * F3: per-run delta of the most recently attributed worker round.
+ *
+ * Updated by `attributeWorkRoundTokenUsage` after a successful DB
+ * increment; read by the once-per-run `run.tokens.final` emitter at run
+ * teardown so the closing event can carry the last settled round's delta
+ * (omitted entirely when no usage ever landed — never fabricated).
+ */
+const lastRoundTokenDeltas = new Map<string, number>();
+
+/**
+ * F3: run ids whose closing `run.tokens.final` has already been
+ * scheduled. The entry is added before any timer/wait is armed so
+ * repeated `removeRunCrons`/settle calls for the same run can never
+ * schedule (or emit) a second final event.
+ */
+const finalizedTokenRuns = new Set<string>();
+
+/**
+ * F3: run ids with an in-progress `run.tokens.final` wait/timer. Cleared
+ * per run once the closing event settles, and wholesale by
+ * `shutdownAllCrons` (which also cancels the timers) so a late callback
+ * cannot emit after the scheduler has shut down.
+ */
+const activeTokenFinalizations = new Set<string>();
+
+/** F3: pending `run.tokens.final` grace timers, keyed by runId. */
+const tokenFinalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 // ── Nudge types ─────────────────────────────────────────────────────
 
 export interface NudgeJobDetail {
@@ -1112,6 +1141,11 @@ async function attributeWorkRoundTokenUsage(
       });
       return;
     }
+
+    // F3: remember the last settled round's delta for this run so the
+    // closing run.tokens.final emitted at teardown can carry it (omitted
+    // when no usage ever landed).
+    lastRoundTokenDeltas.set(runId, metadata.tokenUsage);
 
     // TATR US-007: explicit post-terminal flush identity. A round's token
     // attribution can land after the run already reached a terminal DB
@@ -2728,6 +2762,119 @@ function scheduleSweepTimer(runId: string): void {
 }
 
 /**
+ * F3: emit the run's closing `run.tokens.final` event.
+ *
+ * Reads the run row at emit time: `tokensSpent` is the authoritative
+ * accumulated total and `workflowId` names the run. `tokenDelta` is
+ * included only when the run has a settled worker-round attribution (the
+ * last settled round's delta); it is never fabricated. No-ops when the row
+ * is gone, the run is not terminal completed/failed, or the finalization
+ * was cancelled by a scheduler shutdown.
+ */
+async function finalizeRunTokenSpend(runId: string): Promise<void> {
+  if (!activeTokenFinalizations.has(runId)) return;
+  try {
+    const { getDb } = await import("../db.js");
+    const db = getDb();
+    const row = db
+      .prepare("SELECT workflow_id, tokens_spent, status FROM runs WHERE id = ?")
+      .get(runId) as { workflow_id: string; tokens_spent: number; status: string } | undefined;
+    if (!row) return;
+    // Canceled runs settle their attribution before run.canceled (TATR
+    // US-006), so run.canceled is already authoritative and gets no final.
+    if (row.status !== "completed" && row.status !== "failed") return;
+
+    const delta = lastRoundTokenDeltas.get(runId);
+    const evt: TamanduaEvent = {
+      ts: new Date().toISOString(),
+      event: "run.tokens.final",
+      runId,
+      workflowId: row.workflow_id,
+      tokensSpent: row.tokens_spent,
+    };
+    if (delta !== undefined) evt.tokenDelta = delta;
+    emitEvent(evt);
+    lastRoundTokenDeltas.delete(runId);
+
+    logger.debug("Emitted run.tokens.final", {
+      runId,
+      workflowId: row.workflow_id,
+      tokensSpent: row.tokens_spent,
+      tokenDelta: delta ?? null,
+    });
+  } catch (err) {
+    logger.warn("run.tokens.final emit failed", { runId, error: String(err) });
+  } finally {
+    activeTokenFinalizations.delete(runId);
+    tokenFinalTimers.delete(runId);
+  }
+}
+
+/**
+ * F3: schedule the once-per-run closing `run.tokens.final` event.
+ *
+ * step-ops emits the terminal run.completed/run.failed at the instant the
+ * run reaches a terminal status, but the harness that reported the final
+ * step emits its message_end usage AFTER the tool call that ran
+ * `step complete`. The scheduler keeps that round alive for the teardown
+ * grace window so the usage can land as a post-terminal
+ * run.tokens.updated; this helper closes the gap without delaying or
+ * reordering the terminal event. Once the last in-flight round's
+ * attribution has settled (or the grace window expires with no usage), it
+ * emits run.tokens.final carrying the runs row total and, when usage
+ * landed, the last round's delta.
+ *
+ * Exactly once per run: the runId is recorded in `finalizedTokenRuns`
+ * before any timer/wait is armed, so repeated removeRunCrons/settle calls
+ * cannot schedule a second final.
+ *
+ * @param graceMs injectable teardown grace (HARNESS_TEARDOWN_GRACE_MS in
+ *   production; tens of milliseconds in tests).
+ */
+function scheduleRunTokenFinalization(runId: string, graceMs: number): void {
+  if (finalizedTokenRuns.has(runId)) return;
+  finalizedTokenRuns.add(runId);
+  activeTokenFinalizations.add(runId);
+
+  const signals = inFlightJobIdsForRun(runId)
+    .map((jobId) => roundCompletionSignals.get(jobId)?.done)
+    .filter((done): done is Promise<void> => done !== undefined);
+
+  if (signals.length > 0) {
+    // Wait for the in-flight round(s) to settle — the round's `finally`
+    // resolves the signal AFTER attributeWorkRoundTokenUsage — bounded by
+    // the teardown grace; whichever comes first, emit the closing figure.
+    // Exactly one finalize call: the race settles once.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, graceMs);
+      timer.unref();
+    });
+    if (timer) tokenFinalTimers.set(runId, timer);
+    void Promise.race([
+      Promise.all(signals).then(() => undefined),
+      timeout,
+    ]).then(() => {
+      const pending = tokenFinalTimers.get(runId);
+      if (pending) {
+        clearTimeout(pending);
+        tokenFinalTimers.delete(runId);
+      }
+      return finalizeRunTokenSpend(runId);
+    });
+    return;
+  }
+
+  // Nothing in flight: give any late usage the grace window, then emit the
+  // closing figure (with the last settled delta when one exists).
+  const timer = setTimeout(() => {
+    void finalizeRunTokenSpend(runId);
+  }, graceMs);
+  timer.unref();
+  tokenFinalTimers.set(runId, timer);
+}
+
+/**
  * Remove all dispatch jobs for a given runId. Terminates any in-flight
  * pi process group for the run as well (after `options.graceMs`, if set).
  */
@@ -2819,6 +2966,30 @@ export async function removeRunCrons(
   const epochStale = epoch !== undefined && epoch !== schedulerGeneration;
   if (removed.length > 0 && !epochStale) {
     scheduleSweepTimer(runId);
+  }
+
+  // ── F3: closing run.tokens.final ────────────────────────────────
+  // A run that reached completed/failed on its own keeps its final
+  // harness round alive for the grace window so the round's message_end
+  // usage can land after the terminal event. Emit the authoritative
+  // closing total once that attribution settles (or the grace expires).
+  // Canceled runs are excluded: the cancel path settles in-flight
+  // attribution before run.canceled (TATR US-006), so run.canceled is
+  // already authoritative. graceMs=0 (user-directed teardown) never
+  // finalizes. The epoch guard mirrors the sweep-timer guard so a stale
+  // round cannot finalize after shutdownAllCrons.
+  if (removed.length > 0 && !epochStale && graceMs > 0) {
+    try {
+      const { getDb } = await import("../db.js");
+      const row = getDb()
+        .prepare("SELECT status FROM runs WHERE id = ?")
+        .get(runId) as { status: string } | undefined;
+      if (row && (row.status === "completed" || row.status === "failed")) {
+        scheduleRunTokenFinalization(runId, graceMs);
+      }
+    } catch (err) {
+      logger.warn("run.tokens.final scheduling check failed", { runId, error: String(err) });
+    }
   }
 }
 
@@ -3001,6 +3172,15 @@ export function shutdownAllCrons(): void {
     clearTimeout(timer);
     pendingSweepTimers.delete(runId);
   }
+  // F3: cancel pending run.tokens.final timers and mark their runs as no
+  // longer active so a late race callback cannot emit after shutdown.
+  // `finalizedTokenRuns` is intentionally left intact: a shut-down scheduler
+  // must not re-finalize a run it already closed.
+  for (const [runId, timer] of tokenFinalTimers) {
+    clearTimeout(timer);
+    tokenFinalTimers.delete(runId);
+  }
+  activeTokenFinalizations.clear();
   // Unblock any settleRunInFlightRounds waiters and drop the round
   // completion signals: after a full scheduler shutdown nothing is in
   // flight, so every waiter reports fully settled.
