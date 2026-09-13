@@ -39,7 +39,9 @@ function createTempHome() {
  * file, then emits a pi-shaped tool_execution_end (run/step ids for
  * attribution) + message_end whose components sum to 4242 under the shared
  * policy (input 121 + output 25 + cache_write 4096; the 4096 cache_read is
- * excluded) and exits 0.
+ * excluded). `totalTokens` is the cache-INCLUSIVE pi aggregate
+ * (121 + 25 + 4096 cache_read + 4096 cache_write = 8338), so the fixture
+ * mirrors a real pi usage object and would catch accidental reliance on it.
  */
 function createJournalingFakePi(rootDir: string, runId: string, stepId: string): {
   binPath: string;
@@ -67,7 +69,7 @@ function createJournalingFakePi(rootDir: string, runId: string, stepId: string):
         output: 25,
         cacheRead: 4096,
         cacheWrite: 4096,
-        totalTokens: 4242,
+        totalTokens: 8338,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
       stopReason: "stop",
