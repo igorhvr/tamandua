@@ -3,6 +3,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { logger } from "../lib/logger.js";
+import { sumBillableTokens } from "./token-usage-policy.js";
 
 const REQUIRED_COLUMNS = [
   "input_tokens",
@@ -149,11 +150,13 @@ export async function lookupHermesSessionTokens(
         | undefined;
 
       if (row) {
-        const total =
-          Math.max(0, row.input_tokens ?? 0) +
-          Math.max(0, row.output_tokens ?? 0) +
-          Math.max(0, row.cache_write_tokens ?? 0);
-        return Math.round(total);
+        // Shared harness policy (token-usage-policy.ts): input + output +
+        // cache_write, cache_read excluded. Kept in lockstep with pi and dsh.
+        return sumBillableTokens({
+          input: row.input_tokens,
+          output: row.output_tokens,
+          cacheWrite: row.cache_write_tokens,
+        });
       }
 
       lastReason = `hermes session ${sessionRef} not found in state.db`;

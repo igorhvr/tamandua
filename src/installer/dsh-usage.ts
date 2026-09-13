@@ -37,6 +37,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import zlib from "node:zlib";
 import { logger } from "../lib/logger.js";
+import { sumBillableTokens } from "./token-usage-policy.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -502,18 +503,12 @@ export function sumUsageChunks(text: string): number | null {
     const usage = ((chunk as { usage?: unknown }).usage ?? chunk) as DshUsageNumbers;
     if (typeof usage !== "object" || usage === null) continue;
 
-    const input = toNonNegative(usage.inputTokens);
-    const output = toNonNegative(usage.outputTokens);
-    total += input + output;
+    // Shared harness policy (token-usage-policy.ts): input + output
+    // (dsh's inputTokens is already uncached), cache_read excluded. dsh
+    // exposes no cache_write component, so none is passed.
+    total += sumBillableTokens({ input: usage.inputTokens, output: usage.outputTokens });
     found = true;
   }
 
   return found ? Math.round(total) : null;
-}
-
-/** Non-negative finite number, or 0 for anything else. */
-function toNonNegative(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? Math.max(0, value)
-    : 0;
 }

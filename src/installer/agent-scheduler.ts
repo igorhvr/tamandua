@@ -35,6 +35,7 @@ import {
 } from "./harness-probe.js";
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
 import { lookupDshSessionTokens } from "./dsh-usage.js";
+import { sumBillableTokens } from "./token-usage-policy.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // Run-Scoped Deterministic Dispatch
@@ -677,24 +678,34 @@ function firstNumeric(record: Record<string, unknown>, keys: string[]): number |
   return null;
 }
 
+/**
+ * Per-call token total for one pi `message.usage` object.
+ *
+ * Applies the shared harness policy (`sumBillableTokens`): input + output +
+ * cache_write, cache_read EXCLUDED (matching hermes and dsh). pi's own
+ * `totalTokens` is cache-inclusive, so it is NOT used when the component
+ * fields are present.
+ *
+ * Fallback: when a usage object carries ONLY an aggregate total (no
+ * component fields at all), return that total for the call rather than
+ * fabricating zero. Such a total is cache-inclusive for pi, but nothing
+ * finer is available for that call.
+ */
 export function extractTokenUsage(usageLike: unknown): number | null {
   const usage = asRecord(usageLike);
   if (!usage) return null;
 
+  const input = firstNumeric(usage, ["input", "inputTokens", "input_tokens", "prompt_tokens"]);
+  const output = firstNumeric(usage, ["output", "outputTokens", "output_tokens", "completion_tokens"]);
+  const cacheWrite = firstNumeric(usage, ["cacheWrite", "cache_write", "cache_write_tokens"]);
+
+  // cacheRead is intentionally not read here: the shared policy excludes it.
+  if (input !== null || output !== null || cacheWrite !== null) {
+    return sumBillableTokens({ input, output, cacheWrite });
+  }
+
   const directTotal = firstNumeric(usage, ["totalTokens", "total_tokens", "total"]);
-  if (directTotal !== null) return normalizeTokenUsage(directTotal);
-
-  const parts: Array<number | null> = [
-    firstNumeric(usage, ["input", "inputTokens", "input_tokens", "prompt_tokens"]),
-    firstNumeric(usage, ["output", "outputTokens", "output_tokens", "completion_tokens"]),
-    firstNumeric(usage, ["cacheRead", "cache_read", "cache_read_tokens"]),
-    firstNumeric(usage, ["cacheWrite", "cache_write", "cache_write_tokens"]),
-  ];
-
-  if (!parts.some((value) => value !== null)) return null;
-
-  const total = parts.reduce<number>((sum, value) => sum + (value ?? 0), 0);
-  return normalizeTokenUsage(total);
+  return directTotal !== null ? normalizeTokenUsage(directTotal) : null;
 }
 
 function collectTextFragments(value: unknown, sink: string[], depth = 0): void {
@@ -799,8 +810,14 @@ export function parseWorkRoundMetadata(output: string): WorkRoundMetadata {
         const assistantText = extractAssistantText(message).trim();
         if (assistantText.length > 0) assistantOutput = assistantText;
 
+        // pi reports usage PER API CALL, so a tool-using round emits one
+        // assistant message_end per call. SUM every assistant message's
+        // per-call usage (shared policy: input + output + cache_write,
+        // cache_read excluded) — never the last value alone.
         const extractedUsage = extractTokenUsage(message.usage);
-        if (extractedUsage !== null) tokenUsage = extractedUsage;
+        if (extractedUsage !== null) {
+          tokenUsage = (tokenUsage ?? 0) + extractedUsage;
+        }
       }
     }
 
