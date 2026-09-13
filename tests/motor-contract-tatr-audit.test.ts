@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const contractPath = resolve(__dirname, "MOTOR-CONTRACT.md");
+const agentsPath = resolve(__dirname, "..", "AGENTS.md");
 
 function readContract(): string {
   return readFileSync(contractPath, "utf-8");
@@ -19,10 +20,13 @@ function readContract(): string {
 
 describe("MOTOR-CONTRACT.md TATR contract audit (US-012)", () => {
   let content: string;
+  let agents: string;
 
   before(() => {
     assert.ok(readFileSync(contractPath, "utf-8").length > 0);
     content = readContract();
+    assert.ok(readFileSync(agentsPath, "utf-8").length > 0);
+    agents = readFileSync(agentsPath, "utf-8");
   });
 
   it("no longer claims the TATR token-attribution race is out of scope", () => {
@@ -135,6 +139,79 @@ describe("MOTOR-CONTRACT.md TATR contract audit (US-012)", () => {
       content,
       /`parentRunId`/,
       "must document the parentRunId field on run.started"
+    );
+  });
+
+  it("documents the run.tokens.final closing contract (DB-TOKENS F3)", () => {
+    // C15's final-round caveat must name the closing event that supersedes
+    // the terminal event's as-of-completion snapshot, and pin its
+    // once-per-run / optional-tokenDelta / no-delay semantics so the
+    // documentation cannot be silently removed.
+    assert.match(
+      content,
+      /run\.tokens\.final/,
+      "C15 must document the run.tokens.final closing event"
+    );
+    assert.match(
+      content,
+      /as of completion/,
+      "C15 must state the terminal tokensSpent total is as of completion"
+    );
+    assert.match(
+      content,
+      /authoritative closing\s+figure/,
+      "C15 must name run.tokens.final the authoritative closing figure"
+    );
+    assert.match(
+      content,
+      /without delaying or reordering the\s+terminal event/,
+      "C15 must state run.tokens.final does not delay or reorder the terminal event"
+    );
+    assert.match(
+      content,
+      /exactly once per\s+run/,
+      "C15 must document run.tokens.final once-per-run semantics"
+    );
+    assert.match(
+      content,
+      /the field is omitted, never fabricated/,
+      "C15 must document that an absent tokenDelta is omitted, never fabricated"
+    );
+    assert.match(
+      content,
+      /gets \*\*no\*\* `run\.tokens\.final`/,
+      "C15 must document that canceled runs get no run.tokens.final"
+    );
+  });
+
+  it("documents the run.tokens.final contract in AGENTS.md", () => {
+    // The Agent Scheduler token-attribution items must carry the same
+    // reader contract: terminal tokensSpent is a snapshot, run.tokens.final
+    // is the authoritative closing figure, and canceled runs are exempt.
+    assert.match(
+      agents,
+      /run\.tokens\.final/,
+      "AGENTS.md Agent Scheduler items must document run.tokens.final"
+    );
+    assert.match(
+      agents,
+      /as of completion/,
+      "AGENTS.md must state the terminal tokensSpent total is as of completion"
+    );
+    assert.match(
+      agents,
+      /authoritative closing figure/,
+      "AGENTS.md must name run.tokens.final the authoritative closing figure"
+    );
+    assert.match(
+      agents,
+      /Canceled runs get no `run\.tokens\.final`/,
+      "AGENTS.md must state canceled runs get no run.tokens.final"
+    );
+    assert.match(
+      agents,
+      /settle-before-terminal already makes `run\.canceled` authoritative/,
+      "AGENTS.md must explain why canceled runs need no run.tokens.final"
     );
   });
 });

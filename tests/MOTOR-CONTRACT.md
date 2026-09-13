@@ -708,21 +708,38 @@ a human can clean them up. Remedy text: `Manual cleanup: kill <pid>`.
   dispatch job id) so consumers can trace a delta to the exact worker
   round that spent it.
 - **C15** Terminal run events (`run.completed`/`run.failed`/`run.canceled`)
-  carry `tokensSpent`. Caveat (inherent to the event ordering): for
-  `run.completed`/`run.failed` the FINAL round's usage is parsed only
-  after the harness exits, i.e. after the terminal event fired — so the
-  event's `tokensSpent` can under-report by the final round (a single-step
-  run reports 0). `run.canceled` does NOT have this gap anymore: the
-  cancel path settles in-flight token attribution BEFORE emitting the
-  terminal event (TATR US-006 — see the run.canceled audit section above),
-  so `run.canceled` is the final event of the run with no trailing
-  `run.tokens.updated` in the common path, and its `tokensSpent` includes
-  the settled in-flight delta. In exceptional cases a round may outlive
-  the settle grace window and flush after the terminal event; that late
-  flush is a post-terminal `run.tokens.updated` (consumers may subscribe
-  to it — it never re-opens a terminal run). **Post-terminal flush
-  identity (TATR US-007):** any `run.tokens.updated` attributed when the
-  run's DB status is already terminal (`completed`/`failed`/`canceled`)
+  carry `tokensSpent`. For `run.completed`/`run.failed` that figure is the
+  total **as of completion** — a snapshot, not necessarily the closing
+  total. Caveat (inherent to the event ordering): the FINAL round's usage
+  is parsed only after the harness exits, i.e. after the terminal event
+  fired — so the event's `tokensSpent` can under-report by the final round
+  (a single-step run reports 0). **The final-round gap is closed by
+  `run.tokens.final` (DB-TOKENS F3), without delaying or reordering the
+  terminal event.** Once per completed/failed run, after the last in-flight
+  round's attribution settles — or when the teardown grace expires with no
+  usage — the scheduler teardown emits `run.tokens.final` carrying `runId`,
+  `workflowId`, `tokensSpent` (the `runs.tokens_spent` row read at emit
+  time) and, only when usage landed, the last settled round's `tokenDelta`
+  (the field is omitted, never fabricated as 0, when no usage landed). It
+  is emitted after `run.completed`/`run.failed` (and after any
+  post-terminal `run.tokens.updated` that lands first) and exactly once per
+  run: a module-level finalized-run set short-circuits repeated
+  teardown/settle calls for the same run, and the teardown grace is
+  injectable for tests. `run.tokens.final` is the authoritative closing
+  figure; readers that display a run's spend use the `runs.tokens_spent`
+  row or the latest `run.tokens.*` event, never the terminal event's
+  snapshot. `run.canceled` does NOT have this gap: the cancel path settles
+  in-flight token attribution BEFORE emitting the terminal event (TATR
+  US-006 — see the run.canceled audit section above), so `run.canceled` is
+  the final event of the run with no trailing `run.tokens.updated` in the
+  common path, its `tokensSpent` includes the settled in-flight delta, and
+  — because settle-before-terminal already makes it authoritative — a
+  canceled run gets **no** `run.tokens.final`. In exceptional cases a round
+  may outlive the settle grace window and flush after the terminal event;
+  that late flush is a post-terminal `run.tokens.updated` (consumers may
+  subscribe to it — it never re-opens a terminal run). **Post-terminal
+  flush identity (TATR US-007):** any `run.tokens.updated` attributed when
+  the run's DB status is already terminal (`completed`/`failed`/`canceled`)
   carries `postTerminal: true` plus `terminalStatus: <status>`; consumers
   that stop reading at the terminal event can therefore subscribe to
   post-terminal token events instead of missing the delta. Non-terminal
