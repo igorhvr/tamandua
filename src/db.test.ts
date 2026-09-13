@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, realpathSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
@@ -43,6 +43,78 @@ describe("PRAGMA synchronous", () => {
     const db = getDb();
     const row = db.prepare("PRAGMA synchronous").get() as { synchronous: number };
     assert.equal(row.synchronous, 1, "synchronous should be 1 (NORMAL)");
+  });
+});
+describe("cross-process migration serialization", () => {
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  function envFor(homeDir: string, dbPath: string): NodeJS.ProcessEnv {
+    return {
+      HOME: homeDir,
+      TAMANDUA_DB_PATH: dbPath,
+      TAMANDUA_TEST_GUARD: "1",
+      PATH: process.env.PATH ?? "",
+    };
+  }
+
+  // Regression: without cross-process serialization, two cold-start
+  // initializers both read the pre-migration `PRAGMA user_version` and both
+  // ran the guarded ALTER TABLEs; the loser aborted with
+  // "duplicate column name: <col>" — the same failure the fast-e2e gate
+  // surfaced as `Workflow run failed (exit 1)`. Concurrent first-openers must
+  // converge: the loser re-reads the version under the write lock and skips
+  // the DDL instead of racing it.
+  it("serializes concurrent first-open migrations instead of racing ALTER TABLEs", async () => {
+    const CONCURRENCY = 8;
+    const ITERATIONS = 6;
+    const childScript = [
+      `import { getDb } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "try {",
+      "  const db = getDb();",
+      '  const v = db.prepare("PRAGMA user_version").get();',
+      '  process.stdout.write("OK:" + JSON.stringify(v));',
+      "} catch (err) {",
+      '  process.stderr.write(String(err && err.message ? err.message : err));',
+      "  process.exit(3);",
+      "}",
+    ].join("\n");
+
+    const failures: string[] = [];
+    for (let i = 0; i < ITERATIONS; i++) {
+      const th = createTempHome(`tamandua-db-migrate-race-${i}-`);
+      const dbPath = path.join(th.root, "tamandua.db");
+      const results = await Promise.all(
+        Array.from({ length: CONCURRENCY }, () =>
+          new Promise<{ code: number | null; out: string; err: string }>((resolve) => {
+            const p = spawn(process.execPath, ["--input-type=module", "-e", childScript], {
+              cwd: distDir(),
+              env: envFor(th.homeDir, dbPath),
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            let out = "";
+            let err = "";
+            p.stdout?.on("data", (d: Buffer) => (out += d.toString("utf-8")));
+            p.stderr?.on("data", (d: Buffer) => (err += d.toString("utf-8")));
+            p.on("error", (e) => resolve({ code: -1, out, err: `${err}${e.message}` }));
+            p.on("close", (code) => resolve({ code, out, err }));
+          }),
+        ),
+      );
+      for (const [j, r] of results.entries()) {
+        if (r.code !== 0) {
+          failures.push(`iter ${i} child ${j}: rc=${r.code} stderr=${r.err.trim()}`);
+        } else if (!r.out.includes(`"user_version":${SCHEMA_VERSION}`) && !r.out.includes(`"user_version": ${SCHEMA_VERSION}`)) {
+          failures.push(`iter ${i} child ${j}: unexpected user_version output ${r.out.trim()}`);
+        }
+      }
+    }
+    assert.deepEqual(
+      failures,
+      [],
+      `concurrent getDb() must serialize the migration:\n${failures.join("\n")}`,
+    );
   });
 });
 

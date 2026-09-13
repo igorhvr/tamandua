@@ -89,12 +89,76 @@ export function getDb(): DatabaseSync {
   return _db;
 }
 
+// SQLite lock detection + bounded synchronous backoff. Main predates the
+// US-011 WAL-init fix that introduced these on the integration branch; the
+// migration lock below depends on them. Atomics.wait is the only blocking
+// backoff primitive available to synchronous getDb() callers.
+function isDatabaseLockedError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /database is locked|SQLITE_BUSY/i.test(message);
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Bounded retry budget for the cross-process migration lock. The write lock
+// itself waits under the SQLite busy handler (busy_timeout is set in getDb);
+// this budget only bounds a pathological holder so getDb() cannot block
+// forever.
+const MIGRATION_LOCK_RETRY_MS = 20;
+const MIGRATION_LOCK_TIMEOUT_MS = 15_000;
+
+function acquireMigrationLock(db: DatabaseSync): void {
+  const deadline = Date.now() + MIGRATION_LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      return;
+    } catch (err) {
+      if (!isDatabaseLockedError(err) || Date.now() >= deadline) {
+        throw err;
+      }
+      sleepSync(MIGRATION_LOCK_RETRY_MS);
+    }
+  }
+}
+
 function migrate(db: DatabaseSync): void {
-  const currentVersion = db.prepare("PRAGMA user_version").get() as { user_version: number };
-  if (currentVersion.user_version === SCHEMA_VERSION) {
+  // Fast path: the common case is an already-migrated database.
+  const observed = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  if (observed.user_version === SCHEMA_VERSION) {
     return;
   }
 
+  // Serialize the full migration across processes. Two cold-start
+  // initializers (the daemon and a `tamandua workflow run` CLI) can both
+  // observe the pre-migration user_version above; without a write lock both
+  // execute the guarded ALTER TABLEs and the loser aborts with
+  // "duplicate column name: <col>" (the load-dependent e2e gate flake).
+  // After acquiring the lock the version is re-read, so the loser sees the
+  // winner's committed migration and skips the DDL instead of racing it.
+  acquireMigrationLock(db);
+  try {
+    const currentVersion = db.prepare("PRAGMA user_version").get() as { user_version: number };
+    if (currentVersion.user_version !== SCHEMA_VERSION) {
+      applySchema(db);
+      _migrateFullRuns++;
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // SQLite may have already rolled the transaction back on a fatal error.
+    }
+    throw err;
+  }
+}
+
+// Runs the full DDL upgrade. Callers MUST hold the migration write lock
+// (acquireMigrationLock) and commit the enclosing transaction.
+function applySchema(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS runs (
       id TEXT PRIMARY KEY,
@@ -487,7 +551,6 @@ function migrate(db: DatabaseSync): void {
   );
 
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-  _migrateFullRuns++;
 }
 
 export function closeDb(): void {
