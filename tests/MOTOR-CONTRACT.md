@@ -690,10 +690,11 @@ a human can clean them up. Remedy text: `Manual cleanup: kill <pid>`.
   `input + output + cache_write`, cache_read EXCLUDED (the single definition
   lives in `src/installer/token-usage-policy.ts` and is used by pi, hermes
   and dsh). A pi usage object with no component fields falls back to
-  `totalTokens` for that call (never zero). **Dispatch-run attribution is
-  authoritative (TATR US-008):** the delta is ALWAYS attributed to the dispatch
-  job's own runId — the run the round was spawned for and therefore the run
-  that actually spent the tokens. Run/step IDs parsed from tool outputs
+  `totalTokens` for that call (never zero).
+  **Dispatch-run attribution is authoritative (TATR US-008):** the delta is
+  ALWAYS attributed to the dispatch job's own runId — the run the round was
+  spawned for and therefore the run that actually spent the tokens. Run/step
+  IDs parsed from tool outputs
   (`metadata_run_id` / step lookup) are advisory only and never redirect
   attribution; when such an id names a different (sibling/nested) run, a
   warning with reason `cross_run_metadata_hijack` is logged (naming both
