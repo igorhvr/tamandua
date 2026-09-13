@@ -77,14 +77,21 @@ export function getDb(): DatabaseSync {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   _db = new DatabaseSync(dbPath);
   _dbPath = dbPath;
-  _db.exec("PRAGMA journal_mode=WAL");
-  _db.exec("PRAGMA synchronous = NORMAL");
-  _db.exec("PRAGMA foreign_keys=ON");
   // Concurrent writers (daemon dispatch rounds, CLI step complete/fail,
   // migrations at process start) briefly contend for the WAL write lock;
   // without a busy timeout that surfaces as an immediate
-  // "database is locked" error instead of a short wait.
+  // "database is locked" error instead of a short wait. Set it BEFORE any
+  // lock-taking statement so ordinary contention waits.
   _db.exec("PRAGMA busy_timeout = 5000");
+  // The WAL switch is special: `PRAGMA journal_mode=WAL` must take an
+  // exclusive lock and, unlike reads/writes, is NOT covered by the SQLite
+  // busy handler. Two processes racing to initialize the same fresh database
+  // (daemon + `tamandua workflow run` CLI) would otherwise have one abort
+  // instantly with "database is locked" — the load-dependent e2e gate flake.
+  // Retry the switch until the other initializer finishes.
+  enableWalMode(_db);
+  _db.exec("PRAGMA synchronous = NORMAL");
+  _db.exec("PRAGMA foreign_keys=ON");
   migrate(_db);
   return _db;
 }
@@ -100,6 +107,29 @@ function isDatabaseLockedError(err: unknown): boolean {
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// WAL-mode initialization retry budget. The WAL switch ignores the SQLite
+// busy handler, so a bounded synchronous retry is the only way to converge
+// two concurrent first-time initializers without a "database is locked"
+// abort. The timeout bounds how long getDb() can block when the lock is held
+// by a genuinely long-running writer.
+const WAL_INIT_RETRY_MS = 20;
+const WAL_INIT_TIMEOUT_MS = 10_000;
+
+function enableWalMode(db: DatabaseSync): void {
+  const deadline = Date.now() + WAL_INIT_TIMEOUT_MS;
+  for (;;) {
+    try {
+      db.exec("PRAGMA journal_mode=WAL");
+      return;
+    } catch (err) {
+      if (!isDatabaseLockedError(err) || Date.now() >= deadline) {
+        throw err;
+      }
+      sleepSync(WAL_INIT_RETRY_MS);
+    }
+  }
 }
 
 // Bounded retry budget for the cross-process migration lock. The write lock

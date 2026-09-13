@@ -45,6 +45,121 @@ describe("PRAGMA synchronous", () => {
     assert.equal(row.synchronous, 1, "synchronous should be 1 (NORMAL)");
   });
 });
+describe("WAL initialization under a concurrent first-time initializer", () => {
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  function envFor(homeDir: string, dbPath: string): NodeJS.ProcessEnv {
+    return {
+      HOME: homeDir,
+      TAMANDUA_DB_PATH: dbPath,
+      TAMANDUA_TEST_GUARD: "1",
+      PATH: process.env.PATH ?? "",
+    };
+  }
+
+  before(() => {
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  // Regression: `PRAGMA journal_mode=WAL` is NOT covered by the SQLite busy
+  // handler, so a daemon and a CLI racing to initialize the same fresh
+  // database made the loser throw "database is locked" immediately (the
+  // load-dependent e2e gate flake). getDb() must retry the WAL switch until
+  // the other initializer releases its lock, then succeed.
+  it("retries the WAL switch instead of failing fast on a concurrent initializer", async () => {
+    const th = createTempHome("tamandua-db-wal-race-");
+    const dbPath = path.join(th.root, "tamandua.db");
+
+    // Locker: creates a fresh ROLLBACK-journal database, takes a write lock
+    // (BEGIN IMMEDIATE), announces LOCKED, holds for ~800ms, then releases.
+    const lockScript = [
+      'import { DatabaseSync } from "node:sqlite";',
+      'const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);',
+      'db.exec("CREATE TABLE seed (x INTEGER)");',
+      'db.exec("BEGIN IMMEDIATE");',
+      'db.prepare("INSERT INTO seed VALUES (1)").run();',
+      'console.log("LOCKED");',
+      'setTimeout(() => { try { db.exec("ROLLBACK"); } catch {} db.close(); process.exit(0); }, 800);',
+      'setTimeout(() => process.exit(0), 5000);',
+    ].join("\n");
+
+    const locker = spawn(process.execPath, ["--input-type=module", "-e", lockScript], {
+      env: envFor(th.homeDir, dbPath),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    try {
+      // Wait until the locker genuinely holds the write lock.
+      await new Promise<void>((resolve, reject) => {
+        let out = "";
+        const onData = (chunk: Buffer) => {
+          out += chunk.toString("utf-8");
+          if (out.includes("LOCKED")) resolve();
+        };
+        locker.stdout?.on("data", onData);
+        locker.on("error", reject);
+        locker.on("close", (code) => {
+          if (!out.includes("LOCKED")) {
+            reject(new Error(`locker exited (${code}) before acquiring the lock:\n${out}`));
+          }
+        });
+      });
+
+      // Runner: getDb() races the held lock. Without the retry it throws
+      // "database is locked" immediately and exits non-zero; with it, it
+      // waits for the release and reaches WAL.
+      const runnerScript = [
+        `import { getDb } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+        "const db = getDb();",
+        'console.log(JSON.stringify(db.prepare("PRAGMA journal_mode").get()));',
+      ].join("\n");
+
+      const result = execFileSync(
+        process.execPath,
+        ["--input-type=module", "-e", runnerScript],
+        {
+          cwd: distDir(),
+          env: envFor(th.homeDir, dbPath),
+          encoding: "utf-8",
+        },
+      ).trim();
+
+      assert.match(
+        result,
+        /"journal_mode"\s*:\s*"wal"/i,
+        `getDb() should recover from a concurrent WAL initializer, got: ${result}`,
+      );
+    } finally {
+      if (locker.exitCode === null && locker.pid) {
+        locker.kill("SIGKILL");
+      }
+      await new Promise<void>((resolve) => {
+        if (locker.exitCode !== null) resolve();
+        else locker.once("close", () => resolve());
+      });
+    }
+  });
+});
+
 describe("cross-process migration serialization", () => {
   function distDir(): string {
     return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
