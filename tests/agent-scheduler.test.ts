@@ -62,7 +62,13 @@ ${scriptContent}
   return scriptPath;
 }
 
-/** Write a canned message_end JSON string for an assistant reply. */
+/**
+ * Write a canned message_end JSON string for an assistant reply.
+ *
+ * The component fields are chosen so the shared token policy (input + output
+ * + cache_write, cache_read excluded) sums to `totalTokens`, keeping the
+ * caller's expected value meaningful under the policy.
+ */
 function cannedMessageEndLine(text: string, totalTokens: number): string {
   return JSON.stringify({
     type: "message_end",
@@ -70,7 +76,7 @@ function cannedMessageEndLine(text: string, totalTokens: number): string {
       role: "assistant",
       content: [{ type: "text", text }],
       usage: {
-        input: 100,
+        input: Math.max(0, totalTokens - 50),
         output: 50,
         cacheRead: 0,
         cacheWrite: 0,
@@ -364,7 +370,7 @@ describe("maxBuffer cleanup verification", () => {
 // ── Integration: extractTokenUsage from kept events ───────────────
 
 describe("extractTokenUsage from streaming output", () => {
-  it("extractTokenUsage works with full usage object", () => {
+  it("extractTokenUsage applies the shared policy and excludes cacheRead", () => {
     const usage = {
       input: 121,
       output: 25,
@@ -379,7 +385,8 @@ describe("extractTokenUsage from streaming output", () => {
         total: 0.000089233,
       },
     };
-    assert.equal(extractTokenUsage(usage), 4242);
+    assert.equal(extractTokenUsage(usage), 146);
+    assert.notEqual(extractTokenUsage(usage), 4242);
   });
 
   it("extractTokenUsage sums components when totalTokens is missing", () => {
@@ -388,6 +395,10 @@ describe("extractTokenUsage from streaming output", () => {
       output: 50,
     };
     assert.equal(extractTokenUsage(usage), 150);
+  });
+
+  it("extractTokenUsage falls back to totalTokens when no components are present", () => {
+    assert.equal(extractTokenUsage({ totalTokens: 4242 }), 4242);
   });
 
   it("extractTokenUsage returns null for empty object", () => {

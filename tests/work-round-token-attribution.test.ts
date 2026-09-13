@@ -43,8 +43,10 @@ function createFakePi(rootDir: string, opts: { toolEventText?: string; totalToke
         provider: "fake",
         model: "fake-pi",
         usage: {
-          input: 10,
-          output: 5,
+          // Components chosen so the shared policy (input + output +
+          // cache_write, cache_read excluded) equals opts.totalTokens.
+          input: Math.max(0, opts.totalTokens - 4),
+          output: 4,
           cacheRead: 0,
           cacheWrite: 0,
           totalTokens: opts.totalTokens,

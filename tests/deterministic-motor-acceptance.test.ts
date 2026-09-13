@@ -37,7 +37,9 @@ function createTempHome() {
 /**
  * Fake pi executable that appends one line per invocation to a journal
  * file, then emits a pi-shaped tool_execution_end (run/step ids for
- * attribution) + message_end (usage.totalTokens = 4242) and exits 0.
+ * attribution) + message_end whose components sum to 4242 under the shared
+ * policy (input 121 + output 25 + cache_write 4096; the 4096 cache_read is
+ * excluded) and exits 0.
  */
 function createJournalingFakePi(rootDir: string, runId: string, stepId: string): {
   binPath: string;
@@ -64,7 +66,7 @@ function createJournalingFakePi(rootDir: string, runId: string, stepId: string):
         input: 121,
         output: 25,
         cacheRead: 4096,
-        cacheWrite: 0,
+        cacheWrite: 4096,
         totalTokens: 4242,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },

@@ -167,6 +167,7 @@ tests/stories-json-validation.test.ts
 tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
 tests/token-log-formatting.test.ts
+tests/token-usage-policy.test.ts
 tests/update-command.test.ts
 tests/update-protocol.test.ts
 tests/work-round-persona-prompt.test.ts

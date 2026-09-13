@@ -215,7 +215,9 @@ describe("hermes token attribution", () => {
             provider: "fake",
             model: "fake",
             usage: {
-              input: 10,
+              // Components sum to 42 under the shared policy
+              // (input + output; cache_read excluded).
+              input: 37,
               output: 5,
               cacheRead: 0,
               cacheWrite: 0,
