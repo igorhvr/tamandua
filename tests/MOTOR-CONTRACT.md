@@ -689,8 +689,11 @@ a human can clean them up. Remedy text: `Manual cleanup: kill <pid>`.
   sums every assistant call's usage under ONE shared harness policy —
   `input + output + cache_write`, cache_read EXCLUDED (the single definition
   lives in `src/installer/token-usage-policy.ts` and is used by pi, hermes
-  and dsh). A pi usage object with no component fields falls back to
-  `totalTokens` for that call (never zero).
+  and dsh). The same module owns the per-call field aliasing and the
+  fallback to `totalTokens` for a usage object with no component fields
+  (`extractPerCallTokenTotal`), and the real-canary tolerance-0
+  session-store reconciliation calls that SAME extractor — the parser and
+  the audit cannot drift (never fabricate zero).
   **Dispatch-run attribution is authoritative (TATR US-008):** the delta is
   ALWAYS attributed to the dispatch job's own runId — the run the round was
   spawned for and therefore the run that actually spent the tokens. Run/step

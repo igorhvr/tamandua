@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
 import { baseEnv } from "./smoke-helpers.ts";
 import { openE2eDatabase } from "./e2e-database.mjs";
-import { sumBillableTokens } from "../../dist/installer/token-usage-policy.js";
+import { extractPerCallTokenTotal, sumBillableTokens } from "../../dist/installer/token-usage-policy.js";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -229,11 +229,13 @@ function auditPiSessionFile(filePath: string): PiSessionFileAudit {
     const usage = message.usage as Record<string, unknown> | undefined;
     if (!usage || typeof usage !== "object") continue;
 
-    policyTotal += sumBillableTokens({
-      input: usage.input,
-      output: usage.output,
-      cacheWrite: usage.cacheWrite,
-    });
+    // Same shared extractor the pi round parser uses (field aliasing +
+    // aggregate-only totalTokens fallback), so a tolerance-0 reconciliation
+    // can never disagree with attribution because of parsing differences.
+    const perCall = extractPerCallTokenTotal(usage);
+    if (perCall === null) continue;
+    policyTotal += perCall;
+
     const aggregate = finiteNumber(usage.totalTokens);
     cacheInclusiveTotal +=
       aggregate > 0

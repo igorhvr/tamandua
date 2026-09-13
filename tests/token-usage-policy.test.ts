@@ -16,10 +16,14 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, describe, it } from "node:test";
 
-import { sumBillableTokens } from "../dist/installer/token-usage-policy.js";
+import {
+  extractPerCallTokenTotal,
+  sumBillableTokens,
+} from "../dist/installer/token-usage-policy.js";
 import { extractTokenUsage } from "../dist/installer/agent-scheduler.js";
 import { sumUsageChunks } from "../dist/installer/dsh-usage.js";
 import { lookupHermesSessionTokens } from "../dist/installer/hermes-usage.js";
+import { auditPiSessionStore } from "../e2e-tests/helpers/e2e-helpers.ts";
 import { createTempHome } from "./helpers/test-env.ts";
 
 // Isolate the logger's state dir (hermes-usage logs warnings through lib/logger).
@@ -143,5 +147,104 @@ describe("shared harness token policy", () => {
   it("pi falls back to totalTokens only when no component fields are present", () => {
     assert.equal(extractTokenUsage({ totalTokens: 4_242 }), 4_242);
     assert.equal(extractTokenUsage({ input: 0, output: 0, cacheRead: 500, totalTokens: 500 }), 0);
+  });
+});
+
+/** Write one pi session JSONL: a session header plus assistant message lines. */
+function writePiSessionFile(
+  homeDir: string,
+  workdir: string,
+  usages: Array<Record<string, unknown>>,
+): void {
+  const sessionDir = path.join(
+    homeDir,
+    ".pi",
+    "agent",
+    "sessions",
+    "2026-09-13T00-00-00-000Z_test-session",
+  );
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const lines = [
+    JSON.stringify({ type: "session", cwd: workdir, timestamp: "2026-09-13T00:00:00.000Z" }),
+    ...usages.map((usage) =>
+      JSON.stringify({ type: "message", message: { role: "assistant", content: [], usage } }),
+    ),
+  ];
+  fs.writeFileSync(path.join(sessionDir, "session.jsonl"), lines.join("\n") + "\n");
+}
+
+describe("shared usage-object extractor (parser + session-store audit)", () => {
+  it("resolves camelCase/snake_case aliases and the totalTokens fallback", () => {
+    assert.equal(
+      extractPerCallTokenTotal({
+        input: 100,
+        output: 50,
+        cacheRead: 9_999,
+        cacheWrite: 25,
+        totalTokens: 10_174,
+      }),
+      175,
+    );
+    assert.equal(
+      extractPerCallTokenTotal({
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_tokens: 9_999,
+        cache_write_tokens: 25,
+      }),
+      175,
+    );
+    assert.equal(extractPerCallTokenTotal({ prompt_tokens: 100, completion_tokens: 50 }), 150);
+    assert.equal(extractPerCallTokenTotal({ totalTokens: 4_242 }), 4_242);
+    assert.equal(extractPerCallTokenTotal({ total_tokens: "4242" }), 4_242);
+    assert.equal(extractPerCallTokenTotal({ cacheRead: 9_999 }), null);
+    assert.equal(extractPerCallTokenTotal({}), null);
+    assert.equal(extractPerCallTokenTotal(null), null);
+  });
+
+  it("auditPiSessionStore applies the same extractor: aggregate-only session reconciles", () => {
+    const homeDir = makeTempDir("tamandua-token-policy-pi-audit-");
+    try {
+      const workdir = path.join(homeDir, "workdir");
+      fs.mkdirSync(workdir, { recursive: true });
+      writePiSessionFile(homeDir, workdir, [
+        { totalTokens: 4_242 }, // aggregate-only: no component fields
+        {
+          input_tokens: 100,
+          output_tokens: 50,
+          cache_write_tokens: 25,
+          cache_read_tokens: 9_999,
+        },
+      ]);
+
+      const audit = auditPiSessionStore({ homeDir, workdir });
+      assert.equal(audit.sessions, 1);
+      assert.equal(audit.usageCount, 2);
+      // 4242 + (100 + 50 + 25); the old helper read only camelCase and
+      // never applied the totalTokens fallback, so it returned 175.
+      assert.equal(audit.policyTotal, 4_242 + 175);
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("auditPiSessionStore sums every assistant message, not just the last", () => {
+    const homeDir = makeTempDir("tamandua-token-policy-pi-sum-");
+    try {
+      const workdir = path.join(homeDir, "workdir");
+      fs.mkdirSync(workdir, { recursive: true });
+      writePiSessionFile(homeDir, workdir, [
+        { input: 1_000, output: 10, cacheRead: 5_000, cacheWrite: 0 },
+        { input: 2_000, output: 20, cacheRead: 5_000, cacheWrite: 0 },
+        { input: 3_000, output: 30, cacheRead: 5_000, cacheWrite: 0 },
+      ]);
+
+      const audit = auditPiSessionStore({ homeDir, workdir });
+      assert.equal(audit.policyTotal, 6_060);
+      assert.notEqual(audit.policyTotal, 3_030); // NOT the last call alone
+      assert.equal(audit.cacheInclusiveTotal, 21_060);
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
   });
 });

@@ -35,7 +35,7 @@ import {
 } from "./harness-probe.js";
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
 import { lookupDshSessionTokens } from "./dsh-usage.js";
-import { sumBillableTokens } from "./token-usage-policy.js";
+import { extractPerCallTokenTotal } from "./token-usage-policy.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // Run-Scoped Deterministic Dispatch
@@ -657,55 +657,20 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function parseNumeric(value: unknown): number | null {
-  if (typeof value === "number") return Number.isFinite(value) ? value : null;
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function normalizeTokenUsage(value: number): number {
-  return Math.max(0, Math.round(value));
-}
-
-function firstNumeric(record: Record<string, unknown>, keys: string[]): number | null {
-  for (const key of keys) {
-    const parsed = parseNumeric(record[key]);
-    if (parsed !== null) return parsed;
-  }
-  return null;
-}
-
 /**
  * Per-call token total for one pi `message.usage` object.
  *
- * Applies the shared harness policy (`sumBillableTokens`): input + output +
- * cache_write, cache_read EXCLUDED (matching hermes and dsh). pi's own
- * `totalTokens` is cache-inclusive, so it is NOT used when the component
- * fields are present.
- *
- * Fallback: when a usage object carries ONLY an aggregate total (no
- * component fields at all), return that total for the call rather than
- * fabricating zero. Such a total is cache-inclusive for pi, but nothing
- * finer is available for that call.
+ * Historical name for the shared extractor (`extractPerCallTokenTotal` in
+ * `token-usage-policy.ts`): field aliasing and the aggregate-only
+ * `totalTokens` fallback live THERE so the pi round parser and the
+ * real-canary session-store audit cannot drift. Applies the shared harness
+ * policy — input + output + cache_write, cache_read EXCLUDED (matching
+ * hermes and dsh); pi's cache-inclusive `totalTokens` is ignored whenever a
+ * component field is present, and used only as a last-resort per-call
+ * fallback (never a fabricated zero).
  */
 export function extractTokenUsage(usageLike: unknown): number | null {
-  const usage = asRecord(usageLike);
-  if (!usage) return null;
-
-  const input = firstNumeric(usage, ["input", "inputTokens", "input_tokens", "prompt_tokens"]);
-  const output = firstNumeric(usage, ["output", "outputTokens", "output_tokens", "completion_tokens"]);
-  const cacheWrite = firstNumeric(usage, ["cacheWrite", "cache_write", "cache_write_tokens"]);
-
-  // cacheRead is intentionally not read here: the shared policy excludes it.
-  if (input !== null || output !== null || cacheWrite !== null) {
-    return sumBillableTokens({ input, output, cacheWrite });
-  }
-
-  const directTotal = firstNumeric(usage, ["totalTokens", "total_tokens", "total"]);
-  return directTotal !== null ? normalizeTokenUsage(directTotal) : null;
+  return extractPerCallTokenTotal(usageLike);
 }
 
 function collectTextFragments(value: unknown, sink: string[], depth = 0): void {
