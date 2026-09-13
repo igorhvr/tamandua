@@ -15,7 +15,6 @@ import { spawnSync, spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
 import { baseEnv } from "./smoke-helpers.ts";
@@ -335,9 +334,9 @@ export function auditHermesSessionStore(opts: {
   const dbPath = path.join(opts.homeDir, ".hermes", "state.db");
   if (!fs.existsSync(dbPath)) return result;
 
-  let db: DatabaseSync | null = null;
+  let db: ReturnType<typeof openE2eDatabase> | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    db = openE2eDatabase(dbPath, { readOnly: true });
     const rows = db
       .prepare(
         "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, started_at, cwd FROM sessions",
