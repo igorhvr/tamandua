@@ -640,14 +640,16 @@ interface WorkRoundOutputSummary extends BoundedPreviewMetadata {
  */
 export function classifyWorkRoundOutcome(output: string): WorkRoundOutcome {
   if (output.length === 0) return "empty_output";
-  // Markers are recognized ONLY at the START of the assistant's own final
-  // text (leading whitespace allowed), never embedded mid-line and never
-  // inside a tool_execution payload. A STATUS/NO_WORK marker echoed back in
-  // a tool result, a cat'ed file, or a command echo is NOT the agent's
-  // report (PRAW requirement 2) and must never drive completion.
-  if (/^\s*NO_WORK_AVAILABLE\b/.test(output)) return "no_work";
-  if (/^\s*STATUS:\s*(fail|failed|error)\b/i.test(output)) return "work_failed";
-  if (/^\s*STATUS:\s*done\b/i.test(output)) return "work_done";
+  // Markers are recognized ONLY at the START of a line in the assistant's own
+  // final text (leading whitespace allowed), never embedded mid-line and never
+  // inside a tool_execution payload. The `m` (multiline) flag makes `^` match
+  // at every line start — the anchor required by PRAW requirement 2
+  // (`^\s*STATUS:\s*(done|fail|failed|error)\b`, multiline). A STATUS/NO_WORK
+  // marker echoed back in a tool result, a cat'ed file, or a command echo is
+  // NOT the agent's report and must never drive completion.
+  if (/^\s*NO_WORK_AVAILABLE\b/m.test(output)) return "no_work";
+  if (/^\s*STATUS:\s*(fail|failed|error)\b/im.test(output)) return "work_failed";
+  if (/^\s*STATUS:\s*done\b/im.test(output)) return "work_done";
   return "other_output";
 }
 

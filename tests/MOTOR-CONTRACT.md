@@ -62,10 +62,11 @@ token overhead on real runs (see the historical baselines at the bottom).
     from tool data and per-call token usage is still summed, so token
     attribution and cross-run hijack detection are unaffected.
   - `STATUS: done`, `STATUS: fail|failed|error` and `NO_WORK_AVAILABLE` are
-    recognized ONLY at the start of the assistant's own final text (leading
-    whitespace allowed) — not on a later line, not embedded mid-line, and
-    never inside a `tool_execution` payload. Text-mode (non-JSON) rounds keep
-    their existing behavior (their normalized text is the round output).
+    recognized ONLY at the start of a line of the assistant's own final text
+    (the `^` anchor applied with the multiline flag, leading whitespace
+    allowed) — never embedded mid-line and never inside a `tool_execution`
+    payload. Text-mode (non-JSON) rounds keep their existing behavior (their
+    normalized text is the round output).
   - Outcome routing: `work_done` → `autoCompleteStepIfRunning`;
     `other_output` / `empty_output` → `recoverOrphanedStepsForAgent`;
     `no_work` → benign no-op. An `empty_output` round is not an instant fail

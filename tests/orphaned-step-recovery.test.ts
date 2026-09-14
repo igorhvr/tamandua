@@ -441,24 +441,30 @@ describe("other_output recovery (clean pi exit without STATUS)", () => {
     );
   });
 
-  // ── PRAW US-001: markers are anchored at line start ─────────────
+  // ── PRAW US-001: markers are anchored at line start (multiline) ─
   it("classifyWorkRoundOutcome: STATUS/NO_WORK markers are recognized only at line start", () => {
-    // A STATUS line embedded mid-line (e.g. inside tool-result prose) is not
-    // the agent's report.
+    // A STATUS line at the start of ANY line of the assistant's own text is
+    // the agent's report (PRAW requirement 2 anchors `^` with the multiline
+    // flag). Only markers embedded mid-line are ignored.
     assert.equal(
       classifyWorkRoundOutcome("ran the task\nSTATUS: done"),
-      "other_output",
-      "STATUS not at line start must be other_output",
+      "work_done",
+      "STATUS at the start of line 2 must be work_done (multiline anchor)",
     );
     assert.equal(
       classifyWorkRoundOutcome("tool says STATUS: done"),
       "other_output",
-      "STATUS embedded in tool-result text must be other_output",
+      "STATUS embedded mid-line must be other_output",
     );
     assert.equal(
       classifyWorkRoundOutcome("prefix NO_WORK_AVAILABLE"),
       "other_output",
-      "NO_WORK_AVAILABLE not at line start must be other_output",
+      "NO_WORK_AVAILABLE embedded mid-line must be other_output",
+    );
+    assert.equal(
+      classifyWorkRoundOutcome("some preamble\nprefix STATUS: done"),
+      "other_output",
+      "STATUS after a non-whitespace prefix on its line must be other_output",
     );
 
     // Line-start markers (with optional leading whitespace) still classify.
