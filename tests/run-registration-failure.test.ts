@@ -132,9 +132,13 @@ test("Registration failure preserves body.error in scheduling_error", () => {
 
   insertRunAsCreated(db, runId, "feature-dev", "fix bug");
 
+  // WORKDIR-QUEUE: use a genuinely fatal validation class here. A busy harness
+  // workdir is NO LONGER a terminal failure — it is a retriable 'waiting'
+  // admission (pinned by Test 1c below).
+  const fatalReason = "Run run-abc harness workdir does not exist: /nope";
   db.prepare(
     "UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
-  ).run("workdir already occupied by another active run", runId);
+  ).run(fatalReason, runId);
 
   const run = db.prepare("SELECT status, scheduling_status, scheduling_error FROM runs WHERE id = ?").get(runId) as {
     status: string; scheduling_status: string | null; scheduling_error: string | null;
@@ -143,9 +147,49 @@ test("Registration failure preserves body.error in scheduling_error", () => {
   assert(run.status === "failed", "Run status is 'failed'");
   assert(run.scheduling_status === null, "scheduling_status is NULL");
   assert(
-    run.scheduling_error === "workdir already occupied by another active run",
+    run.scheduling_error === fatalReason,
     "scheduling_error contains the daemon error message",
   );
+});
+
+// ── Test 1c: WORKDIR-QUEUE — a busy harness workdir is retriable, not fatal ──
+
+test("Busy harness workdir records a retriable 'waiting' state, never a terminal failure", () => {
+  const db = createTestDb();
+  const runId = crypto.randomUUID();
+  const holderRunId = "run-holder-1";
+  const workdir = "/repo/harness-workdir";
+
+  insertRunAsCreated(db, runId, "feature-dev", "fix bug");
+
+  // This is exactly the row admitOrQueueRun() writes on a busy workdir: the
+  // run stays registered ('running'), scheduling_status becomes 'waiting', and
+  // the reason names the holding run and the directory. It never takes the
+  // terminal failed path.
+  const waitReason = `waiting for harness workdir held by run ${holderRunId}: ${workdir}`;
+  db.prepare(
+    "UPDATE runs SET scheduling_status = 'waiting', scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
+  ).run(waitReason, runId);
+
+  const run = db.prepare("SELECT status, scheduling_status, scheduling_error FROM runs WHERE id = ?").get(runId) as {
+    status: string; scheduling_status: string | null; scheduling_error: string | null;
+  };
+  assert(run.status === "running", "Busy workdir keeps the run registered (status='running')");
+  assert(run.status !== "failed", "Busy workdir must not mark the run terminal failed");
+  assert(run.scheduling_status === "waiting", "Busy workdir is a retriable 'waiting' scheduling state");
+  assert(
+    run.scheduling_error === waitReason,
+    "waiting reason names the holding run and the directory",
+  );
+
+  // The reconciler re-admits 'waiting' runs on a later tick.
+  const reconcilerRow = db.prepare(
+    `SELECT id FROM runs
+     WHERE status IN ('running')
+       AND (scheduling_status IS NULL OR scheduling_status IN ('pending_register', 'active', 'error', 'waiting'))
+       AND id = ?`,
+  ).get(runId) as { id: string } | undefined;
+  assert(reconcilerRow !== undefined, "Reconciler includes 'waiting' runs for re-admission");
 });
 
 // ── Test 2: Reconciler query excludes terminal failed runs ──────────
@@ -387,16 +431,19 @@ test("Resume registration failure preserves body.error in scheduling_error", () 
     "UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = datetime('now') WHERE id = ?",
   ).run(resumeNow, runId);
 
-  // Registration fails with a specific daemon error
+  // Registration fails with a specific daemon error. WORKDIR-QUEUE: use a
+  // genuinely fatal validation class — a busy harness workdir is now a
+  // retriable 'waiting' admission, not a terminal failure.
+  const fatalReason = "Cannot resume run: Run run-abc harness workdir does not exist: /nope";
   db.prepare(
     "UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
-  ).run("workdir already occupied by another active run", runId);
+  ).run(fatalReason, runId);
 
   // Emit event
   const eventTs = now();
   db.prepare(
     "INSERT INTO events (ts, event, run_id, workflow_id, detail) VALUES (?, 'run.failed', ?, ?, ?)",
-  ).run(eventTs, runId, workflowId, "Resume registration failed: workdir already occupied by another active run");
+  ).run(eventTs, runId, workflowId, "Resume registration failed: Run run-abc harness workdir does not exist: /nope");
 
   const run = db.prepare("SELECT status, scheduling_status, scheduling_error FROM runs WHERE id = ?").get(runId) as {
     status: string; scheduling_status: string | null; scheduling_error: string | null;
@@ -404,7 +451,7 @@ test("Resume registration failure preserves body.error in scheduling_error", () 
   assert(run.status === "failed", "Resumed run with body.error: status is 'failed'");
   assert(run.scheduling_status === null, "Resumed run with body.error: scheduling_status is NULL");
   assert(
-    run.scheduling_error === "workdir already occupied by another active run",
+    run.scheduling_error === fatalReason,
     "Resumed run preserves the daemon body.error message",
   );
 });

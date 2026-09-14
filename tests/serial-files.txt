@@ -172,6 +172,7 @@ tests/update-command.test.ts
 tests/update-protocol.test.ts
 tests/work-round-persona-prompt.test.ts
 tests/work-round-token-attribution.test.ts
+tests/workdir-queue-admission.test.ts
 tests/workflow-contract.test.ts
 tests/workflow-fail.test.ts
 tests/workflow-graph-simulation.test.ts
