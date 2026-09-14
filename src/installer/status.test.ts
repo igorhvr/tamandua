@@ -1387,6 +1387,84 @@ describe("RSPN instant-fail loop surfacing", () => {
   });
 });
 
+// ── WORKDIR-QUEUE US-004: scheduling state surfacing ─────────────────
+// A run queued behind a busy harness workdir keeps status 'running' with
+// scheduling_status='waiting' and scheduling_error naming the holder + dir.
+// getWorkflowStatus() and listRuns() must both expose the state and the
+// reason so operator surfaces can tell "waiting" from "dead".
+
+describe("WORKDIR-QUEUE US-004 scheduling state surfacing", () => {
+  const WAIT_TEXT = "waiting for harness workdir held by run run-holder01: /tmp/held-dir";
+
+  function seedWaitingRun(env: { tamanduaDir: string }, runId: string): string {
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        worker_lost_count INTEGER NOT NULL DEFAULT 0,
+        ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+        instant_fail_count INTEGER NOT NULL DEFAULT 0,
+        scheduling_status TEXT,
+        scheduling_error TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, scheduling_status, scheduling_error) VALUES (?, 'feature-dev', 'queued behind holder', 'running', '{}', 'waiting', ?)",
+    ).run(runId, WAIT_TEXT);
+    db.close();
+    return dbPath;
+  }
+
+  it("getWorkflowStatus returns schedulingError for a waiting run", async () => {
+    const env = createTempEnv();
+    const runId = "wa171111-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const dbPath = seedWaitingRun(env, runId);
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus } = await import("../../dist/installer/status.js");
+      const detail = getWorkflowStatus(runId);
+      assert.equal(detail.status, "running");
+      assert.equal(detail.schedulingStatus, "waiting");
+      assert.equal(detail.schedulingError, WAIT_TEXT);
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("listRuns exposes schedulingStatus and schedulingError", async () => {
+    const env = createTempEnv();
+    const runId = "wa172222-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const dbPath = seedWaitingRun(env, runId);
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { listRuns } = await import("../../dist/installer/status.js");
+      const run = listRuns().find((r) => r.id === runId);
+      assert.ok(run, "waiting run should be listed");
+      assert.equal(run!.status, "running");
+      assert.equal(run!.schedulingStatus, "waiting");
+      assert.equal(run!.schedulingError, WAIT_TEXT);
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+});
+
 // ── Late fire-and-forget continuations (sticky isolation env) ─────────
 // stopWorkflow's teardown + webhook continuations (scheduleRunCronTeardown
 // → teardownWorkflowCronsIfIdle, emitEvent → fireWebhook) resolve DB / log /

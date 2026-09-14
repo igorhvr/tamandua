@@ -401,6 +401,41 @@ describe("tamandua workflow status --json", () => {
     assert.match(stepLines[3], /\(pr\)/);
   });
 
+  // WORKDIR-QUEUE US-004: a run queued behind a busy harness workdir carries
+  // scheduling_status='waiting' + a scheduling_error naming the holder and
+  // directory. Non-JSON `workflow status` must print that explanation.
+  it("without --json prints the waiting scheduling explanation", async () => {
+    const { homeDir, tamanduaDir } = createTempHome("tamandua-status-waiting-human-");
+    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    const db = getDb();
+    const runId = seedDb(dbPath, db);
+    const waitText = "waiting for harness workdir held by run run-holder01: /tmp/held-dir";
+    db.prepare("UPDATE runs SET scheduling_status = 'waiting', scheduling_error = ? WHERE id = ?").run(waitText, runId);
+
+    const { stdout, stderr } = await runCli(["workflow", "status", runId], homeDir, tamanduaDir, dbPath);
+    assert.equal(cleanStderr(stderr), "", `unexpected stderr: ${cleanStderr(stderr)}`);
+    assert.match(stdout, /^Status: running/m);
+    assert.match(stdout, /waiting for harness workdir held by run run-holder01: \/tmp\/held-dir/);
+  });
+
+  // WORKDIR-QUEUE US-004: --json exposes both the state and the reason.
+  it("--json includes schedulingStatus and schedulingError for a waiting run", async () => {
+    const { homeDir, tamanduaDir } = createTempHome("tamandua-status-waiting-json-");
+    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    const db = getDb();
+    const runId = seedDb(dbPath, db);
+    const waitText = "waiting for harness workdir held by run run-holder01: /tmp/held-dir";
+    db.prepare("UPDATE runs SET scheduling_status = 'waiting', scheduling_error = ? WHERE id = ?").run(waitText, runId);
+
+    const { stdout, stderr } = await runCli(["workflow", "status", runId, "--json"], homeDir, tamanduaDir, dbPath);
+    assert.equal(cleanStderr(stderr), "", `unexpected stderr: ${cleanStderr(stderr)}`);
+    const parsed = JSON.parse(stdout);
+    assert.equal(parsed.schedulingStatus, "waiting");
+    assert.equal(parsed.schedulingError, waitText);
+  });
+
   // AC 7: With --json, stdout contains exactly one JSON object and nothing else
   it("--json stdout purity: exactly one JSON object", async () => {
     const { homeDir, tamanduaDir } = createTempHome("tamandua-status-purity-");

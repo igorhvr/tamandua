@@ -18,6 +18,15 @@ export interface RunInfo {
   createdAt: string;
   updatedAt: string;
   stepSummary?: string;
+  /** Daemon-side scheduling state (pending_register | active | queued |
+   *  waiting | paused | draining_pause | error | NULL). A run queued behind
+   *  a busy harness workdir keeps status 'running' with schedulingStatus
+   *  'waiting'. */
+  schedulingStatus?: string | null;
+  /** Human-readable scheduling reason (e.g. the workdir-busy wait text
+   *  "waiting for harness workdir held by run <id>: <dir>"). Null unless a
+   *  schedulingStatus set it. */
+  schedulingError?: string | null;
   tokensSpent: number;
   workerLostCount: number;
   /** Rounds the motor itself killed at the worker time ceiling (step.ceiling_expiry). */
@@ -38,9 +47,15 @@ export interface RunDetail extends RunInfo {
   steps: StepInfo[];
   stories?: StoryInfo[];
   /** Daemon-side scheduling state (pending_register | active | queued |
-   *  paused | draining_pause | error | NULL). A run mid-drain keeps
-   *  status 'running' with schedulingStatus 'draining_pause'. */
+   *  waiting | paused | draining_pause | error | NULL). A run mid-drain keeps
+   *  status 'running' with schedulingStatus 'draining_pause'; a run queued
+   *  behind a busy harness workdir keeps status 'running' with
+   *  schedulingStatus 'waiting'. */
   schedulingStatus?: string | null;
+  /** Human-readable scheduling reason paired with schedulingStatus (e.g.
+   *  "waiting for harness workdir held by run <id>: <dir>"). Null unless a
+   *  schedulingStatus set it. */
+  schedulingError?: string | null;
   /** Harness selected for the run, resolved from context harness_type (default "pi"). */
   harnessType: HarnessType;
   workspace_mode?: string;
@@ -97,7 +112,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   // Try exact id match first (original)
   let row = db
     .prepare(
-      "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?",
+      "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?",
     )
     .get(query) as unknown as (RunRow & { run_number: number | null }) | undefined;
 
@@ -105,7 +120,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row && useOriginal) {
     row = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?",
       )
       .get(stripped) as unknown as (RunRow & { run_number: number | null }) | undefined;
   }
@@ -114,7 +129,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let prefixRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id LIKE ?",
       )
       .all(`${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
@@ -122,7 +137,7 @@ export function getWorkflowStatus(query: string): RunDetail {
     if (prefixRows.length === 0 && useOriginal) {
       prefixRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id LIKE ?",
         )
         .all(`${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -143,7 +158,7 @@ export function getWorkflowStatus(query: string): RunDetail {
       const num = Number(nMatch[1]);
       row = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE run_number = ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE run_number = ?",
         )
         .get(num) as unknown as (RunRow & { run_number: number | null }) | undefined;
       if (!row) {
@@ -156,14 +171,14 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let taskRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE task LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE task LIKE ?",
       )
       .all(`%${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
     if (taskRows.length === 0 && useOriginal) {
       taskRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE task LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE task LIKE ?",
         )
         .all(`%${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -192,7 +207,7 @@ export function listRuns(limit = 50): RunInfo[] {
   const db = getDb();
   const rows = db
     .prepare(
-      "SELECT id, run_number, workflow_id, task, status, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs ORDER BY created_at DESC LIMIT ?",
+      "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs ORDER BY created_at DESC LIMIT ?",
     )
     .all(limit) as unknown as (RunRow & { run_number: number | null })[];
 
@@ -208,6 +223,8 @@ export function listRuns(limit = 50): RunInfo[] {
       createdAt: r.created_at,
       updatedAt: r.updated_at,
       stepSummary,
+      schedulingStatus: r.scheduling_status ?? null,
+      schedulingError: r.scheduling_error ?? null,
       tokensSpent: r.tokens_spent,
       workerLostCount: r.worker_lost_count,
       ceilingExpiryCount: r.ceiling_expiry_count,
@@ -535,6 +552,7 @@ interface RunRow {
   task: string;
   status: string;
   scheduling_status: string | null;
+  scheduling_error: string | null;
   context: string;
   created_at: string;
   updated_at: string;
@@ -724,6 +742,7 @@ function buildRunDetail(
     task: row.task,
     status: row.status,
     schedulingStatus: row.scheduling_status ?? null,
+    schedulingError: row.scheduling_error ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     stepSummary,

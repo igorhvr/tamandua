@@ -885,6 +885,10 @@ export async function handleWorkflow(
         // PAUS US-004: surface the daemon-side scheduling state (e.g.
         // draining_pause) machine-readably when it is set.
         if (result.schedulingStatus) jsonOutput.schedulingStatus = result.schedulingStatus;
+        // WORKDIR-QUEUE US-004: expose the scheduling reason (e.g. the
+        // workdir-busy wait text) so JSON consumers can tell waiting from
+        // dead without reconstructing it.
+        if (result.schedulingError) jsonOutput.schedulingError = result.schedulingError;
         if (jsonStories) jsonOutput.stories = jsonStories;
         if (result.redLedgerLanding) jsonOutput.redLedgerLanding = result.redLedgerLanding;
         if (result.workspace_mode === "worktree") {
@@ -896,6 +900,13 @@ export async function handleWorkflow(
         return true;
       }
       console.log(`Run: ${prefixRunId(result.id)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}`);
+      // WORKDIR-QUEUE US-004: a run queued behind a busy harness workdir keeps
+      // status 'running' with schedulingStatus 'waiting'. Print the stored
+      // scheduling reason verbatim (e.g. "waiting for harness workdir held by
+      // run <id>: <dir>") so the operator can tell waiting from dead.
+      if (result.schedulingStatus === "waiting" && result.schedulingError) {
+        console.log(`Scheduling: ${result.schedulingError}`);
+      }
       if (result.harnessType !== "pi") {
         const harnessLabel = result.harnessType === "dsh" ? "dsh (alpha)" : result.harnessType;
         console.log(`Harness: ${harnessLabel}`);

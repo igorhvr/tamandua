@@ -2270,6 +2270,53 @@ describe("formatRunsSummary", () => {
     assert.match(result, /\(1 failed runs not shown\)/);
   });
 
+  it("surfaces the waiting scheduling reason for a workdir-queued run (WORKDIR-QUEUE)", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const now = new Date().toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        {
+          id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+          workflowId: "feature-dev",
+          task: "Queued behind holder",
+          status: "running",
+          createdAt: now,
+          updatedAt: now,
+          tokensSpent: 100,
+          schedulingStatus: "waiting",
+          schedulingError: "waiting for harness workdir held by run run-holder01: /tmp/held-dir",
+        },
+      ],
+      isDaemonRunning: () => true,
+    });
+    // The stored scheduling_error is rendered verbatim so an operator can tell
+    // "waiting" from "dead".
+    assert.match(result, /waiting for harness workdir held by run run-holder01: \/tmp\/held-dir/);
+    // A waiting run is not annotated as stale while the daemon is healthy.
+    assert.doesNotMatch(result, /stale/);
+  });
+
+  it("does not print a waiting marker for a non-waiting scheduling status", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const now = new Date().toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        {
+          id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee",
+          workflowId: "feature-dev",
+          task: "Draining run",
+          status: "running",
+          createdAt: now,
+          updatedAt: now,
+          tokensSpent: 100,
+          schedulingStatus: "draining_pause",
+        },
+      ],
+      isDaemonRunning: () => true,
+    });
+    assert.doesNotMatch(result, /WAITING:/);
+  });
+
   it("defaults to real listRuns when no override provided (accepts any output)", async () => {
     // This test hits the REAL listRuns → getDb(); point HOME / STATE_DIR /
     // DB_PATH at a temp dir so the DB read lands in temp state instead of

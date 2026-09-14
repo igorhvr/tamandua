@@ -363,8 +363,17 @@ export function formatRunsSummary(opts?: {
         r.instantFailCount >= getInstantFailBackoffThreshold()
           ? `  INSTANT-FAIL LOOP (${r.instantFailCount} consecutive)`
           : "";
+      // WORKDIR-QUEUE US-004: a run queued behind a busy harness workdir keeps
+      // status 'running' with schedulingStatus 'waiting'. Render the stored
+      // scheduling_error verbatim (e.g. "waiting for harness workdir held by
+      // run <id>: <dir>") so an operator can tell "waiting" from "dead". This
+      // is a distinct annotation from the stale/dead marker above.
+      const waitingMarker =
+        r.schedulingStatus === "waiting" && r.schedulingError
+          ? `  WAITING: ${r.schedulingError}`
+          : "";
       lines.push(
-        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}${redLedgerMarker}${instantFailMarker}`,
+        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}${redLedgerMarker}${instantFailMarker}${waitingMarker}`,
       );
     }
   }

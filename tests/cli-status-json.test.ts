@@ -315,6 +315,24 @@ describe("tamandua status --json", () => {
     assert.match(stdout, /Running Processes/);
   });
 
+  // WORKDIR-QUEUE US-004: a run queued behind a busy harness workdir must be
+  // visible as WAITING (with the holder run id and directory) in the human
+  // run summary, so an operator can tell "waiting" from "dead".
+  it("without --json surfaces a waiting scheduling reason in the run summary", async () => {
+    const { homeDir, tamanduaDir } = createTempHome("tamandua-status-waiting-human-");
+    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    seedDb(dbPath);
+    const waitText = "waiting for harness workdir held by run run-holder01: /tmp/held-dir";
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE runs SET scheduling_status = 'waiting', scheduling_error = ? WHERE status = 'running'").run(waitText);
+    db.close();
+
+    const { stdout, stderr } = await runCli(["status"], homeDir, tamanduaDir);
+    assert.equal(cleanStderr(stderr), "", `unexpected stderr: ${cleanStderr(stderr)}`);
+    assert.match(stdout, /Workflow Runs/);
+    assert.match(stdout, /waiting for harness workdir held by run run-holder01: \/tmp\/held-dir/);
+  });
+
   // AC 7: With --json, stdout contains exactly one JSON object and nothing else
   it("--json stdout purity: exactly one JSON object", async () => {
     const { homeDir, tamanduaDir } = createTempHome("tamandua-status-purity-");
