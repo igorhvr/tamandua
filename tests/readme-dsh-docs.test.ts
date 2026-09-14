@@ -53,6 +53,25 @@ describe("README dsh harness documentation", () => {
     );
   });
 
+  it("documents the dsh v3 session contract and dsh >= 0.1.5 requirement", () => {
+    assert.ok(
+      readmeContent.includes("session.v3.jsonl.zstd"),
+      "README must name the supported dsh >= 0.1.5 session artifact session.v3.jsonl.zstd"
+    );
+    assert.ok(
+      readmeContent.includes("dsh >= 0.1.5"),
+      "README must state the dsh >= 0.1.5 requirement"
+    );
+    assert.ok(
+      readmeContent.match(/upgrade dsh/i),
+      "README must give the upgrade-dsh remedy for older session layouts"
+    );
+    assert.ok(
+      readmeContent.includes("session.v2.jsonl.zstd"),
+      "README must name the unsupported dsh 0.1.3 layout session.v2.jsonl.zstd"
+    );
+  });
+
   it("documents no per-run model selection", () => {
     assert.ok(
       readmeContent.match(/no per-run model\s*selection/i),

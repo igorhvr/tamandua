@@ -123,8 +123,12 @@ describe("SKILL.md dsh (DeepSeek Harness) documentation", () => {
 
   it("documents where dsh token usage comes from", () => {
     assert.ok(
+      dshSection.includes("session.v3.jsonl.zstd"),
+      "SKILL.md dsh section must document that tokens are read from the v3 session.v3.jsonl.zstd"
+    );
+    assert.ok(
       dshSection.includes("session.jsonl.zstd"),
-      "SKILL.md dsh section must document that tokens are read from session.jsonl.zstd"
+      "SKILL.md dsh section must name the unsupported legacy layout session.jsonl.zstd"
     );
     assert.ok(
       dshSection.includes("best-effort") || dshSection.includes("falls back"),
@@ -133,6 +137,17 @@ describe("SKILL.md dsh (DeepSeek Harness) documentation", () => {
     assert.ok(
       dshSection.includes("cache reads excluded"),
       "SKILL.md dsh section must document that cache reads are excluded from the total"
+    );
+  });
+
+  it("documents the dsh >= 0.1.5 requirement and upgrade-dsh remedy", () => {
+    assert.ok(
+      dshSection.includes("dsh >= 0.1.5"),
+      "SKILL.md dsh section must state the dsh >= 0.1.5 requirement"
+    );
+    assert.ok(
+      dshSection.match(/upgrade dsh/i),
+      "SKILL.md dsh section must give the upgrade-dsh remedy for older session layouts"
     );
   });
 

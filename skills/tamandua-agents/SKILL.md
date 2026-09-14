@@ -712,7 +712,10 @@ in the same run.
 Tamandua resolves the dsh binary through a **three-tier chain**. The
 binary is validated at scheduling time — if no dsh binary is found or
 the resolved binary is not executable, the run fails at startup with a
-clear actionable error.
+clear actionable error. Native token accounting additionally expects
+**dsh >= 0.1.5** (session format v3): an older dsh still runs, but each round
+records 0 tokens with a warning naming the unsupported session file and the
+remedy `upgrade dsh` (see Token Accounting below).
 
 **Tier 1 — Explicit environment variable:**
 
@@ -765,14 +768,21 @@ dsh-related operation is resolving and running an existing binary.
 
 dsh never prints token usage. Tamandua records each round's spawn time and,
 after the round, reads the session log under
-`$DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.jsonl.zstd`
-(`$DSH_HOME` defaults to `~/.dsh`) and sums the recorded usage chunks (input
-+ output tokens, cache reads excluded). This is best-effort — any failure
-(no zstd support, a missing or unreadable session store) falls back to 0
-tokens with a warning. `tamandua doctor` includes a dsh session-store probe
-that warns when the sessions directory is unreadable or zstd decompression is
-unavailable, and a permission-mode probe that warns when a profile layer pins
-sandbox/approval rows that override the injected permission mode.
+`$DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd`
+(`$DSH_HOME` defaults to `~/.dsh`) and sums the recorded usage once per
+request from the top-level `data.usage` of the v3 records (input + output
+tokens, cache reads excluded). This requires **dsh >= 0.1.5** (session format
+v3); older layouts (`session.jsonl.zstd` from dsh 0.1.0 and
+`session.v2.jsonl.zstd` from dsh 0.1.3) are unsupported — Tamandua logs one
+warning naming the found file and records 0 tokens, and the remedy is to
+**upgrade dsh** to >= 0.1.5. The v3 `session.v3.jsonl.zstd` is a concatenated
+zstd frame container and every frame is decoded, so usage in later frames is
+not missed. This is best-effort — any failure (no zstd support, a missing or
+unreadable session store) falls back to 0 tokens with a warning. `tamandua
+doctor` includes a dsh session-store probe that warns when the sessions
+directory is unreadable or zstd decompression is unavailable, and a
+permission-mode probe that warns when a profile layer pins sandbox/approval
+rows that override the injected permission mode.
 
 ## Services & maintenance
 
