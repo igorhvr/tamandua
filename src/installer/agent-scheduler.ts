@@ -983,7 +983,7 @@ export async function autoCompleteStepIfRunning(
       : row.run_id;
 
   try {
-    const result = completeStep(stepId, metadata.assistantOutput);
+    const result = completeStep(stepId, metadata.assistantOutput, { rejectPausedRun: true });
     logger.info("Auto-complete via claim_job_id completed step", {
       ...context,
       stepId,

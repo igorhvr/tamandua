@@ -1973,5 +1973,202 @@ describe("US-004 JCAC: auto-complete via claim_job_id", () => {
       }
     });
 });
+
+// ══════════════════════════════════════════════════════════════════════
+// US-003 (PRAW): scheduler auto-completion refuses paused/draining runs
+// ══════════════════════════════════════════════════════════════════════
+// Requirement 3. The scheduler's OUTPUT-derived auto-completion must not
+// land on a run whose status is 'paused' or whose scheduling_status is
+// 'draining_pause', exactly as it already refuses failed/canceled runs.
+// The agent-issued CLI `tamandua step complete` path (completeStep without
+// the scheduler-only option) stays unconditional — a pause drain lets
+// in-flight agent work finish and report. This is the run-49 weakness:
+// pause_requested -> paused -> step.done + run.completed although the
+// agent produced no final answer.
+
+describe("US-003 PRAW: auto-complete refuses paused/draining runs", () => {
+  const logPath = path.join(tamanduaDir, "tamandua.log");
+
+  function logLen(): number {
+    try { return fs.statSync(logPath).size; } catch { return 0; }
+  }
+
+  function logDelta(from: number): string {
+    try { return fs.readFileSync(logPath, "utf-8").slice(from); } catch { return ""; }
+  }
+
+  function seedRunAndStep(opts: {
+    runStatus: string;
+    schedulingStatus: string | null;
+    stepStatus: string;
+    jobId: string;
+  }): { runId: string; stepUuid: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const now = ts();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, scheduling_status, context, created_at, updated_at) VALUES (?, 'test-wf', 'praw paused guard', ?, ?, '{}', ?, ?)"
+    ).run(runId, opts.runStatus, opts.schedulingStatus, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+       VALUES (?, ?, 'dev-step', 'test_praw-guard', 0, '', 'STATUS: done', ?, 0, 2, 'single', ?, 12345, ?, ?, ?)`
+    ).run(stepUuid, runId, opts.stepStatus, opts.jobId, now, now, now);
+    return { runId, stepUuid };
+  }
+
+  const doneMetadata: PollingRoundMetadata = {
+    assistantOutput: "STATUS: done\nCHANGES: implemented\nTESTS: pass\n",
+    tokenUsage: null,
+    runId: null,
+    stepId: null,
+    jsonMetadataDetected: false,
+  };
+
+  it("AC1: does not auto-complete a running step on a paused run", async () => {
+    const db = getDb();
+    const jobId = "job-praw-paused";
+    const { runId, stepUuid } = seedRunAndStep({
+      runStatus: "paused",
+      schedulingStatus: "paused",
+      stepStatus: "running",
+      jobId,
+    });
+    const before = logLen();
+
+    try {
+      await autoCompleteStepIfRunning(
+        { jobId, runId, agentId: "test_praw-guard", role: "developer", timeoutSeconds: 1800, workdir: "/tmp", model: "default" },
+        doneMetadata,
+      );
+
+      const step = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepUuid) as { status: string; output: string | null };
+      assert.equal(step.status, "running", "paused run must not auto-complete the step");
+      assert.equal(step.output, null, "no output must be written for a refused completion");
+      const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+      assert.equal(run.status, "paused", "run must stay paused");
+
+      const delta = logDelta(before);
+      const refusal = delta.split("\n").find((l) => l.includes("Scheduler auto-complete refused"));
+      assert.ok(refusal, `expected an INFO refusal log; delta:\n${delta}`);
+      assert.match(refusal!, /INFO/, "refusal must be logged at INFO");
+      assert.ok(refusal!.includes(runId), "refusal log must name runId");
+      assert.ok(refusal!.includes(stepUuid), "refusal log must name stepId");
+      assert.ok(refusal!.includes('"runStatus":"paused"'), "refusal log must name the paused run status");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  it("AC2: does not auto-complete on a draining_pause run (status running)", async () => {
+    const db = getDb();
+    const jobId = "job-praw-draining";
+    const { runId, stepUuid } = seedRunAndStep({
+      runStatus: "running",
+      schedulingStatus: "draining_pause",
+      stepStatus: "running",
+      jobId,
+    });
+    const before = logLen();
+
+    try {
+      await autoCompleteStepIfRunning(
+        { jobId, runId, agentId: "test_praw-guard", role: "developer", timeoutSeconds: 1800, workdir: "/tmp", model: "default" },
+        doneMetadata,
+      );
+
+      const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepUuid) as { status: string };
+      assert.equal(step.status, "running", "draining_pause run must not auto-complete the step");
+      const run = db.prepare("SELECT status, scheduling_status FROM runs WHERE id = ?").get(runId) as { status: string; scheduling_status: string | null };
+      assert.equal(run.status, "running", "run status must stay running");
+      assert.equal(run.scheduling_status, "draining_pause", "drain must stay pending");
+
+      const delta = logDelta(before);
+      const refusal = delta.split("\n").find((l) => l.includes("Scheduler auto-complete refused"));
+      assert.ok(refusal, `expected an INFO refusal log; delta:\n${delta}`);
+      assert.match(refusal!, /INFO/, "refusal must be logged at INFO");
+      assert.ok(refusal!.includes(runId), "refusal log must name runId");
+      assert.ok(refusal!.includes(stepUuid), "refusal log must name stepId");
+      assert.ok(refusal!.includes('"schedulingStatus":"draining_pause"'), "refusal log must name the draining_pause reason");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  it("AC4: canceled run stays blocked (regression)", async () => {
+    const db = getDb();
+    const jobId = "job-praw-canceled";
+    const { runId, stepUuid } = seedRunAndStep({
+      runStatus: "canceled",
+      schedulingStatus: null,
+      stepStatus: "running",
+      jobId,
+    });
+
+    try {
+      await autoCompleteStepIfRunning(
+        { jobId, runId, agentId: "test_praw-guard", role: "developer", timeoutSeconds: 1800, workdir: "/tmp", model: "default" },
+        doneMetadata,
+      );
+
+      const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepUuid) as { status: string };
+      assert.equal(step.status, "running", "canceled run must not auto-complete the step");
+      const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+      assert.equal(run.status, "canceled", "run status must stay canceled");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  it("AC4: failed run stays blocked (regression)", async () => {
+    const db = getDb();
+    const jobId = "job-praw-failed-run";
+    const { runId, stepUuid } = seedRunAndStep({
+      runStatus: "failed",
+      schedulingStatus: null,
+      stepStatus: "running",
+      jobId,
+    });
+
+    try {
+      await autoCompleteStepIfRunning(
+        { jobId, runId, agentId: "test_praw-guard", role: "developer", timeoutSeconds: 1800, workdir: "/tmp", model: "default" },
+        doneMetadata,
+      );
+
+      const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepUuid) as { status: string };
+      assert.equal(step.status, "running", "failed run must not auto-complete the step");
+      const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+      assert.equal(run.status, "failed", "run status must stay failed");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  it("AC5: CLI completeStep (no scheduler option) still completes on a draining_pause run", () => {
+    const db = getDb();
+    const { runId, stepUuid } = seedRunAndStep({
+      runStatus: "running",
+      schedulingStatus: "draining_pause",
+      stepStatus: "running",
+      jobId: "job-praw-cli",
+    });
+
+    try {
+      const result = completeStep(stepUuid, "STATUS: done\nCHANGES: finished in-flight work\n");
+      assert.notEqual(result.status, "blocked", `CLI completion must not be blocked, got ${result.status}`);
+      const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepUuid) as { status: string };
+      assert.equal(step.status, "done", "CLI completion must land during a drain");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+});
 });
 });

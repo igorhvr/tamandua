@@ -3254,11 +3254,29 @@ export function finalizeDrainingPause(runId: string): void {
 // ══════════════════════════════════════════════════════════════════════
 
 /**
+ * Options for {@link completeStep}.
+ *
+ * `rejectPausedRun` is the scheduler's output-derived auto-completion guard
+ * (PRAW US-003): when set, a run whose status is `paused` or whose
+ * `scheduling_status` is `draining_pause` refuses the completion exactly as a
+ * failed/canceled run does. It is opt-in so the agent-issued CLI
+ * `tamandua step complete` path is untouched — a pause drain lets in-flight
+ * work finish and report normally.
+ */
+export interface CompleteStepOptions {
+  rejectPausedRun?: boolean;
+}
+
+/**
  * Complete a step: validate expects, save output, merge context, advance pipeline.
  */
-export function completeStep(stepId: string, output: string): { status: string; detail?: string } {
+export function completeStep(
+  stepId: string,
+  output: string,
+  opts?: CompleteStepOptions,
+): { status: string; detail?: string } {
   stepId = stripIdPrefix(stepId);
-  const result = completeStepInternal(stepId, output);
+  const result = completeStepInternal(stepId, output, opts);
 
   // Write story plan to progress log after successful completion.
   // Hoisted out of completeStepInternal so that no file I/O executes
@@ -3281,7 +3299,11 @@ export function completeStep(stepId: string, output: string): { status: string; 
   return result;
 }
 
-function completeStepInternal(stepId: string, output: string): { status: string; detail?: string } {
+function completeStepInternal(
+  stepId: string,
+  output: string,
+  opts?: CompleteStepOptions,
+): { status: string; detail?: string } {
   const db = getDb();
 
   const body = (): { status: string; detail?: string } => {
@@ -3306,9 +3328,35 @@ function completeStepInternal(stepId: string, output: string): { status: string;
 
   // Guard: don't process completions for failed runs
   const runId = step.run_id;
-  const runCheck = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string } | undefined;
+  const runCheck = db
+    .prepare("SELECT status, scheduling_status FROM runs WHERE id = ?")
+    .get(runId) as { status: string; scheduling_status: string | null } | undefined;
   if (runCheck?.status === "failed" || runCheck?.status === "canceled") {
     return { status: "blocked" };
+  }
+
+  // Guard: scheduler output-derived auto-completion must not land on a paused
+  // or draining_pause run (PRAW US-003). A pause must protect an in-flight
+  // step from the output fallback exactly as a failed/canceled run does. This
+  // is opt-in (rejectPausedRun), so the agent-issued CLI `tamandua step
+  // complete` path is unaffected: pause semantics drain the run by letting
+  // in-flight agent work finish and report. An unconditional guard here would
+  // break that drain contract.
+  if (
+    opts?.rejectPausedRun
+    && (runCheck?.status === "paused" || runCheck?.scheduling_status === "draining_pause")
+  ) {
+    logger.info("Scheduler auto-complete refused: run is paused or draining", {
+      runId,
+      stepId,
+      stepSlug: step.step_id,
+      runStatus: runCheck?.status,
+      schedulingStatus: runCheck?.scheduling_status ?? null,
+    });
+    return {
+      status: "blocked",
+      detail: `run is ${runCheck?.status}${runCheck?.scheduling_status ? ` (scheduling_status=${runCheck.scheduling_status})` : ""} — scheduler auto-complete refused`,
+    };
   }
 
   // Guard: duplicate completion. Delivery is at-least-once (agent CLI
