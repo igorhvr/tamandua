@@ -78,9 +78,9 @@ Selector syntax:
   (no arg)      Show the last 50 events globally
 
 Options:
-  --tail <N>    Follow events in real-time (like logs-tail), starting with
-                the last N events. With a run-id, follows that run's events.
-                Without a run-id, follows global events.
+  --tail <N>    Print the last N events and exit (bounded). With a run-id,
+                shows the last N events for that run. Without a run-id,
+                shows the last N global events.
 
 If a run-id prefix matches no run in the database but has an events file on
 disk (events can be written before the run row is committed), the logs output
@@ -91,8 +91,8 @@ Examples:
   tamandua logs 20                # Show last 20 global events
   tamandua logs abc123            # Show events for run starting with abc123
   tamandua logs #3                # Show events for run #3
-  tamandua logs --tail 30         # Follow global events, starting with last 30
-  tamandua logs abc123 --tail 20  # Follow run abc123 events, starting with last 20`;
+  tamandua logs --tail 30         # Show last 30 global events
+  tamandua logs abc123 --tail 20  # Show last 20 events for run abc123`;
 }
 
 export function getLogsTailHelp(): string {
@@ -160,20 +160,22 @@ export async function handleLogs(group: string, args: string[]): Promise<boolean
 
     const selector = parseLogsSelector(positionalArgs.length > 0 ? positionalArgs[0] : undefined);
 
-    // --tail mode: follow events in real-time (same behavior as logs-tail)
+    // --tail mode: bounded read — print the last N events and exit (never follow).
     if (tailLimit !== undefined) {
       if (selector.kind === "global-recent" || selector.kind === "global-limit") {
-        await streamEventSource({ kind: "global" }, tailLimit);
+        printEvents(getRecentEvents(tailLimit));
         return true;
       }
 
       if (selector.kind === "run-number") {
         const runId = lookupRunIdByNumber(selector.runNumber);
-        if (!runId) {
-          console.log(`No run #${selector.runNumber}.`);
+        if (runId) {
+          const events = getRunEvents(runId, tailLimit);
+          events.length === 0 ? console.log(`No events for run #${selector.runNumber}.`) : printEvents(events);
           return true;
         }
-        await streamEventSource({ kind: "run", runId }, tailLimit);
+        const fallbackEvents = getRunEvents(selector.raw, tailLimit);
+        fallbackEvents.length === 0 ? console.log(`No run #${selector.runNumber}.`) : printEvents(fallbackEvents);
         return true;
       }
 
@@ -184,7 +186,8 @@ export async function handleLogs(group: string, args: string[]): Promise<boolean
         console.log(err instanceof Error ? err.message : `No run found matching "${selector.runId}".`);
         return true;
       }
-      await streamEventSource({ kind: "run", runId }, tailLimit);
+      const events = getRunEvents(runId, tailLimit);
+      events.length === 0 ? console.log(`No events for run "${selector.runId}".`) : printEvents(events);
       return true;
     }
 
