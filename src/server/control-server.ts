@@ -197,6 +197,54 @@ export function isTerminal(status: string): boolean {
   return status === "completed" || status === "failed" || status === "canceled";
 }
 
+/**
+ * Warn-throttle state for the "harness workdir busy" retriable admission
+ * condition. Maps runId -> epoch ms of the last WARN emitted for that run.
+ * The condition is NOT an error: a run whose harness working directory is
+ * already held by a live scheduled run waits until the holder releases it.
+ * We warn once on the first refusal and then at most once per interval
+ * (default 60s) while the wait persists.
+ */
+const workdirWaitWarnState = new Map<string, number>();
+
+/** Default cadence for repeated workdir-wait WARN lines. */
+export const DEFAULT_WORKDIR_WAIT_WARN_INTERVAL_MS = 60_000;
+
+function getWorkdirWaitWarnIntervalMs(): number {
+  const raw = process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS;
+  if (!raw) return DEFAULT_WORKDIR_WAIT_WARN_INTERVAL_MS;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_WORKDIR_WAIT_WARN_INTERVAL_MS;
+  return n;
+}
+
+/**
+ * @internal — test hook: clear the workdir-wait warn-throttle state so a
+ * refusal after a reset is treated as a first refusal.
+ */
+export function _resetWorkdirWaitWarnState(): void {
+  workdirWaitWarnState.clear();
+}
+
+/** @internal — test hook: the current warn-throttle map size. */
+export function _workdirWaitWarnStateSize(): number {
+  return workdirWaitWarnState.size;
+}
+
+/**
+ * Decide whether to emit the workdir-wait WARN for `runId` now: first
+ * refusal always logs; subsequent refusals log at most once per interval.
+ * Records the emission timestamp when it returns true.
+ */
+function shouldWarnWorkdirWait(runId: string, nowMs: number = Date.now()): boolean {
+  const last = workdirWaitWarnState.get(runId);
+  if (last !== undefined && nowMs - last < getWorkdirWaitWarnIntervalMs()) {
+    return false;
+  }
+  workdirWaitWarnState.set(runId, nowMs);
+  return true;
+}
+
 function requiredTimersForRun(runId: string): number {
   const row = getDb()
     .prepare("SELECT COUNT(DISTINCT agent_id) AS cnt FROM steps WHERE run_id = ?")
@@ -226,8 +274,36 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
     run.id,
   );
   if (duplicateRunId && process.env.TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR !== "1") {
-    throw new Error(
-      `Run ${run.id} harness workdir is already scheduled for run ${duplicateRunId}: ${harness.workingDirectoryForHarness}`,
+    // Retriable admission condition, not a validation failure: a live
+    // scheduled run already holds this harness working directory. Keep the
+    // run status 'running' and record a 'waiting' scheduling state so the
+    // reconciler admits it once the holder releases the directory. Never
+    // 'error' — the wait is expected behavior, not a failure.
+    const reason = `waiting for harness workdir held by run ${duplicateRunId}: ${harness.workingDirectoryForHarness}`;
+    getDb()
+      .prepare(
+        `UPDATE runs
+         SET scheduling_status = 'waiting',
+             scheduling_error = ?,
+             scheduling_requested_at = COALESCE(scheduling_requested_at, ?),
+             updated_at = datetime('now')
+         WHERE id = ?`,
+      )
+      .run(reason, new Date().toISOString(), run.id);
+    if (shouldWarnWorkdirWait(run.id)) {
+      logger.warn("control-server: register-run waiting for harness workdir", {
+        runId: run.id,
+        heldByRunId: duplicateRunId,
+        workingDirectoryForHarness: harness.workingDirectoryForHarness,
+      });
+    }
+    return ok(
+      {
+        state: "waiting",
+        heldByRunId: duplicateRunId,
+        workingDirectoryForHarness: harness.workingDirectoryForHarness,
+      },
+      202,
     );
   }
 
@@ -238,6 +314,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
         "UPDATE runs SET scheduling_status = 'active', scheduling_error = NULL, updated_at = datetime('now') WHERE id = ?",
       )
       .run(run.id);
+    workdirWaitWarnState.delete(run.id);
     return ok({ state: "active", requiredTimers, maxActiveTimers });
   }
 
@@ -309,6 +386,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
     )
     .run(run.id);
 
+  workdirWaitWarnState.delete(run.id);
   logger.info("control-server: register-run admitted", { runId: run.id, requiredTimers });
   return ok({ state: "active", requiredTimers, maxActiveTimers }, 202);
 }
