@@ -55,7 +55,7 @@ function headerLine(id: string, createdAt: number): string {
   return (
     JSON.stringify({
       type: "session",
-      version: 1,
+      version: 3,
       id,
       createdAt,
       delegationDepth: 0,
@@ -63,6 +63,10 @@ function headerLine(id: string, createdAt: number): string {
   );
 }
 
+/**
+ * A dsh >= 0.1.5 (format v3) `assistant/message` record carrying usage as
+ * a TOP-LEVEL `data.usage` object.
+ */
 function usageLine(opts: {
   input: number;
   output: number;
@@ -71,21 +75,19 @@ function usageLine(opts: {
 }): string {
   return (
     JSON.stringify({
-      type: "assistant/chunk",
+      type: "assistant/message",
       seq: opts.seq ?? 0,
       time: 1_700_000_000_000,
       data: {
-        turn: 0,
-        step: 0,
-        chunk: {
-          type: "usage",
-          usage: {
-            inputTokens: opts.input,
-            outputTokens: opts.output,
-            ...(opts.cacheRead !== undefined
-              ? { cacheReadTokens: opts.cacheRead }
-              : {}),
-          },
+        turn: 1,
+        step: 1,
+        message: { role: "assistant", content: [] },
+        usage: {
+          inputTokens: opts.input,
+          outputTokens: opts.output,
+          ...(opts.cacheRead !== undefined
+            ? { cacheReadTokens: opts.cacheRead }
+            : {}),
         },
       },
     }) + "\n"

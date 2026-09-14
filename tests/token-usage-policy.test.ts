@@ -69,7 +69,7 @@ function seedHermesDb(hermesHome: string, sessionId: string, tokens: Components)
   }
 }
 
-/** A dsh session JSONL line carrying one assistant usage chunk. */
+/** A dsh >= 0.1.5 (format v3) session JSONL line carrying one request's usage. */
 function dshUsageLine(usage: {
   inputTokens: number;
   outputTokens: number;
@@ -77,10 +77,15 @@ function dshUsageLine(usage: {
 }): string {
   return (
     JSON.stringify({
-      type: "assistant/chunk",
+      type: "assistant/message",
       seq: 0,
       time: 1_700_000_000_000,
-      data: { turn: 0, step: 0, chunk: { type: "usage", usage } },
+      data: {
+        turn: 1,
+        step: 1,
+        message: { role: "assistant", content: [] },
+        usage,
+      },
     }) + "\n"
   );
 }

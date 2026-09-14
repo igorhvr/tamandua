@@ -2,15 +2,28 @@
  * dsh (DeepSeek Harness) token usage reader — session-file strategy.
  *
  * dsh never prints token usage to stdout. Usage is recorded only in the
- * session log at:
+ * session log. This reader targets dsh >= 0.1.5 (session format v3),
+ * whose `assistant/message` (and `compaction/summary`) records carry a
+ * TOP-LEVEL `data.usage` object
+ * ({inputTokens, outputTokens, totalTokens, cacheReadTokens,
+ * reasoningTokens}); the older `assistant/chunk` usage events do not
+ * exist in v3. The module reads that file after a dsh round and applies
+ * the shared harness token policy (token-usage-policy.ts):
  *
- *   $DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.jsonl.zstd
+ *   billable = inputTokens + outputTokens
  *
- * as `assistant/chunk` events whose `chunk.type === "usage"`
- * ({inputTokens, outputTokens, cacheReadTokens, ...}). This module reads
- * that file after a dsh round and returns input + output tokens,
- * excluding cache reads (matching the hermes convention of excluding
- * cache reads).
+ * `inputTokens` is already UNCACHED in dsh (observed arithmetic:
+ * totalTokens = inputTokens + cacheReadTokens + outputTokens), so
+ * `cacheReadTokens` is EXCLUDED and the policy's cache-write component
+ * is always 0 (dsh exposes no cache-write field). `reasoningTokens` is
+ * already included inside `outputTokens` (fixture: outputTokens 13,
+ * reasoningTokens 11, totalTokens 7235 = input 7222 + output 13), so it
+ * is never added separately.
+ *
+ * Each request's usage is counted exactly once: the v3 `assistant/message`
+ * record repeats the same usage object inside its embedded
+ * `data.stream[<i>].chunk.usage` entry, so the parser deliberately reads
+ * only the top-level `data.usage` and never recurses into `data.stream[]`.
  *
  * cwd escaping (`projectKey`) is replicated exactly from dsh's session
  * persistence source
@@ -43,7 +56,7 @@ import { sumBillableTokens } from "./token-usage-policy.js";
 
 /** Result of a successful session-file token lookup. */
 export interface DshSessionUsage {
-  /** inputTokens + outputTokens across usage chunks (cacheReadTokens excluded). */
+  /** inputTokens + outputTokens across v3 usage records (cacheReadTokens excluded). */
   totalTokens: number;
   /** The session directory name (e.g. `session-<uuid>`) the usage was read from. */
   sessionRef: string;
@@ -134,7 +147,8 @@ export function dshSessionProjectDir(dshHome: string, workdir: string): string {
  * directory when the session starts, so older sessions from other
  * processes are excluded), pick the newest, decompress its
  * `session.jsonl.zstd`, and sum `inputTokens + outputTokens` over every
- * `assistant/chunk` usage record (`cacheReadTokens` excluded).
+ * v3 record carrying a top-level `data.usage` object (`cacheReadTokens`
+ * excluded).
  *
  * `sessionRef` is the winning session directory name. Best-effort
  * throughout: any failure (missing dir, no candidates, corrupt log, no
@@ -462,17 +476,25 @@ interface DshUsageNumbers {
 }
 
 /**
- * Sum input+output tokens across all `assistant/chunk` records whose
- * `chunk.type === "usage"` in a session log. cacheReadTokens (and any
- * other usage field) is excluded, matching the hermes convention.
+ * Sum input+output tokens across every session-format-v3 (dsh >= 0.1.5)
+ * record that carries a TOP-LEVEL `data.usage` object — observed carriers
+ * are `assistant/message` and `compaction/summary`; a generic scan also
+ * covers any title-generation LLM result that records usage.
  *
- * dsh serializes the usage numbers under `chunk.usage` (TokenUsage);
- * flat fields directly on the chunk are also tolerated for forward
- * compatibility with fixture variants. Non-numeric/negative values
- * count as 0. Lines that fail to parse are skipped (best effort).
+ * The shared harness policy is applied per record via
+ * `sumBillableTokens({ input: usage.inputTokens, output: usage.outputTokens })`:
+ * dsh's `inputTokens` is already uncached, `cacheReadTokens` is excluded,
+ * and `reasoningTokens` is already inside `outputTokens`, so neither is
+ * read. Each record's usage is counted exactly once — the parser never
+ * recurses into `data.stream[]`, where the `assistant/message` record
+ * embeds a duplicate copy of the same usage object (counting both would
+ * double-count the request).
+ *
+ * Lines that fail to parse are skipped (best effort); non-numeric or
+ * negative components count as 0.
  *
  * @returns the rounded total, or `null` when the log contained no
- *          recognizable usage chunk at all.
+ *          recognizable top-level usage object at all.
  */
 export function sumUsageChunks(text: string): number | null {
   let total = 0;
@@ -488,25 +510,28 @@ export function sumUsageChunks(text: string): number | null {
     } catch {
       continue; // best-effort per line
     }
-    if (typeof record !== "object" || record === null) continue;
-
-    if ((record as { type?: unknown }).type !== "assistant/chunk") continue;
+    if (typeof record !== "object" || record === null || Array.isArray(record)) {
+      continue;
+    }
 
     const data = (record as { data?: unknown }).data;
-    if (typeof data !== "object" || data === null) continue;
+    if (typeof data !== "object" || data === null || Array.isArray(data)) continue;
 
-    const chunk = (data as { chunk?: unknown }).chunk;
-    if (typeof chunk !== "object" || chunk === null) continue;
-    if ((chunk as { type?: unknown }).type !== "usage") continue;
-
-    // dsh TokenUsage travels under chunk.usage; tolerate flat fields too.
-    const usage = ((chunk as { usage?: unknown }).usage ?? chunk) as DshUsageNumbers;
-    if (typeof usage !== "object" || usage === null) continue;
+    // v3 usage is a TOP-LEVEL data.usage object. Do NOT recurse into
+    // data.stream[]: the same usage is embedded there a second time.
+    const usage = (data as { usage?: unknown }).usage;
+    if (typeof usage !== "object" || usage === null || Array.isArray(usage)) {
+      continue;
+    }
 
     // Shared harness policy (token-usage-policy.ts): input + output
     // (dsh's inputTokens is already uncached), cache_read excluded. dsh
     // exposes no cache_write component, so none is passed.
-    total += sumBillableTokens({ input: usage.inputTokens, output: usage.outputTokens });
+    const numbers = usage as DshUsageNumbers;
+    total += sumBillableTokens({
+      input: numbers.inputTokens,
+      output: numbers.outputTokens,
+    });
     found = true;
   }
 

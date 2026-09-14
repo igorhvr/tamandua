@@ -38,7 +38,7 @@ function headerLine(id: string, createdAt: number): string {
   return (
     JSON.stringify({
       type: "session",
-      version: 1,
+      version: 3,
       id,
       createdAt,
       delegationDepth: 0,
@@ -46,6 +46,10 @@ function headerLine(id: string, createdAt: number): string {
   );
 }
 
+/**
+ * A dsh >= 0.1.5 (format v3) `assistant/message` record carrying the
+ * request's usage as a TOP-LEVEL `data.usage` object.
+ */
 function usageLine(opts: {
   input: number;
   output: number;
@@ -55,21 +59,19 @@ function usageLine(opts: {
 }): string {
   return (
     JSON.stringify({
-      type: "assistant/chunk",
+      type: "assistant/message",
       seq: opts.seq ?? 0,
       time: opts.time ?? 1_700_000_000_000,
       data: {
-        turn: 0,
-        step: 0,
-        chunk: {
-          type: "usage",
-          usage: {
-            inputTokens: opts.input,
-            outputTokens: opts.output,
-            ...(opts.cacheRead !== undefined
-              ? { cacheReadTokens: opts.cacheRead }
-              : {}),
-          },
+        turn: 1,
+        step: 1,
+        message: { role: "assistant", content: [] },
+        usage: {
+          inputTokens: opts.input,
+          outputTokens: opts.output,
+          ...(opts.cacheRead !== undefined
+            ? { cacheReadTokens: opts.cacheRead }
+            : {}),
         },
       },
     }) + "\n"
@@ -197,7 +199,7 @@ describe("resolveDshHome", () => {
 // ── sumUsageChunks: pure parsing ───────────────────────────────────
 
 describe("sumUsageChunks", () => {
-  it("sums input+output across multiple usage chunks and excludes cache reads", () => {
+  it("sums input+output across multiple v3 usage records and excludes cache reads", () => {
     const text =
       headerLine("session-a", 1) +
       usageLine({ input: 100, output: 50, cacheRead: 9_000, seq: 1 }) +
@@ -206,18 +208,83 @@ describe("sumUsageChunks", () => {
     assert.equal(sumUsageChunks(text), 100 + 50 + 25 + 75 + 7 + 3);
   });
 
-  it("tolerates flat usage fields directly on the chunk", () => {
+  it("tolerates a record whose usage is embedded twice (stream duplicate counted once)", () => {
+    const usage = { inputTokens: 100, outputTokens: 50, cacheReadTokens: 9_999 };
     const line = JSON.stringify({
-      type: "assistant/chunk",
+      type: "assistant/message",
       seq: 0,
       time: 1,
       data: {
-        turn: 0,
-        step: 0,
-        chunk: { type: "usage", inputTokens: 10, outputTokens: 20, cacheReadTokens: 99 },
+        turn: 1,
+        step: 1,
+        message: { role: "assistant", content: [] },
+        usage,
+        // v3 repeats the same usage object inside the embedded stream —
+        // recursing into it would double-count this request.
+        stream: [{ type: "chunk", chunk: { type: "usage", usage } }],
       },
     });
-    assert.equal(sumUsageChunks(line + "\n"), 30);
+    assert.equal(sumUsageChunks(line + "\n"), 150);
+  });
+
+  it("returns 150 for a bare v3 assistant/message record (cache read excluded)", () => {
+    const line = JSON.stringify({
+      type: "assistant/message",
+      data: {
+        turn: 1,
+        step: 1,
+        message: { role: "assistant", content: [] },
+        usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 9_999 },
+      },
+    });
+    assert.equal(sumUsageChunks(line + "\n"), 150);
+  });
+
+  it("counts a top-level data.usage on a compaction/summary record", () => {
+    const line = JSON.stringify({
+      type: "compaction/summary",
+      data: {
+        compactionId: "c1",
+        summary: [],
+        provider: "deepseek-official",
+        model: "deepseek-flash",
+        usage: { inputTokens: 11, outputTokens: 4, cacheReadTokens: 7 },
+      },
+    });
+    assert.equal(sumUsageChunks(line + "\n"), 15);
+  });
+
+  it("does not count usage nested only under data.stream[].chunk.usage", () => {
+    const line = JSON.stringify({
+      type: "assistant/message",
+      data: {
+        turn: 1,
+        step: 1,
+        message: { role: "assistant", content: [] },
+        stream: [
+          {
+            type: "chunk",
+            chunk: {
+              type: "usage",
+              usage: { inputTokens: 100, outputTokens: 50 },
+            },
+          },
+        ],
+      },
+    });
+    assert.equal(sumUsageChunks(line + "\n"), null);
+  });
+
+  it("does not count the removed legacy assistant/chunk usage record", () => {
+    const line = JSON.stringify({
+      type: "assistant/chunk",
+      data: {
+        turn: 0,
+        step: 0,
+        chunk: { type: "usage", usage: { inputTokens: 10, outputTokens: 20 } },
+      },
+    });
+    assert.equal(sumUsageChunks(line + "\n"), null);
   });
 
   it("treats non-numeric and negative values as 0", () => {
@@ -244,7 +311,7 @@ describe("sumUsageChunks", () => {
 // ── lookupDshSessionTokens ─────────────────────────────────────────
 
 describe("lookupDshSessionTokens", () => {
-  it("sums input+output across multiple usage chunks via the binary zstd tier", async () => {
+  it("sums input+output across multiple v3 usage records via the binary zstd tier", async () => {
     const dshHome = path.join(tmpRoot!, "dsh-home");
     const workdir = path.join(tmpRoot!, "worktree", "repo");
     const sessionName = "session-11111111-2222-4333-8444-555555555555";
