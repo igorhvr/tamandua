@@ -20,6 +20,17 @@
  * reasoningTokens 11, totalTokens 7235 = input 7222 + output 13), so it
  * is never added separately.
  *
+ * ONLY the v3 artifact layout is supported: `session.v3.jsonl.zstd`
+ * (concatenated zstd frames), with a same-version plain-JSONL fallback
+ * `session.v3.jsonl` for compression-off persistence. When the `.zstd`
+ * form exists it wins; the plain form is read as UTF-8 text and zstd is
+ * never invoked. Session directories that hold only an older layout
+ * (`session.jsonl.zstd`/`session.jsonl` from dsh 0.1.0, or
+ * `session.v2.jsonl.zstd`/`session.v2.jsonl` from dsh 0.1.3) are
+ * unsupported: the lookup logs ONE warning naming the found file, states
+ * the required dsh version `>= 0.1.5`, gives the remedy `upgrade dsh`,
+ * and returns `null` — never a fabricated `{ totalTokens: 0 }`.
+ *
  * Each request's usage is counted exactly once: the v3 `assistant/message`
  * record repeats the same usage object inside its embedded
  * `data.stream[<i>].chunk.usage` entry, so the parser deliberately reads
@@ -32,7 +43,8 @@
  * UTF-16 units stay literal; every other unit becomes `~XXXX`; the
  * result is wrapped in `--…--` and bounded at 251 chars.
  *
- * The session.jsonl.zstd artifact is a concatenated zstd frame container
+ * The `session.v3.jsonl.zstd` artifact is a concatenated zstd frame
+ * container
  * (one frame for the header + first batch, one frame per durable append),
  * so decompression scans frames structurally and decodes each frame
  * separately. node:zlib `zstdDecompressSync` exists on Node >= 23.8;
@@ -136,6 +148,37 @@ export function dshSessionProjectDir(dshHome: string, workdir: string): string {
   return path.join(dshHome, "sessions", projectKey(workdir));
 }
 
+// ── Supported artifact layout (dsh >= 0.1.5 / session format v3) ───
+
+/**
+ * Compressed v3 session log — the only supported persisted artifact when
+ * dsh compression is on. dsh 0.1.5 writes this alongside a
+ * `session.lock`.
+ */
+export const DSH_V3_LOG_COMPRESSED = "session.v3.jsonl.zstd";
+
+/**
+ * Plain v3 session log written by dsh when compression is disabled. Read
+ * as UTF-8 text directly (zstd is never invoked for this form).
+ */
+export const DSH_V3_LOG_PLAIN = "session.v3.jsonl";
+
+/**
+ * Older (unsupported) session-log filenames, in probe order: dsh 0.1.0
+ * wrote `session.jsonl[.zstd]`; dsh 0.1.3 wrote `session.v2.jsonl[.zstd]`.
+ * A session directory holding only one of these triggers the
+ * "upgrade dsh" warning instead of a silent 0-token reading.
+ */
+export const DSH_LEGACY_LOGS = [
+  "session.jsonl.zstd",
+  "session.jsonl",
+  "session.v2.jsonl.zstd",
+  "session.v2.jsonl",
+] as const;
+
+/** The minimum dsh version whose session layout this reader understands. */
+export const DSH_MIN_SUPPORTED_VERSION = ">= 0.1.5";
+
 // ── Token lookup ───────────────────────────────────────────────────
 
 /**
@@ -145,15 +188,23 @@ export function dshSessionProjectDir(dshHome: string, workdir: string): string {
  * Strategy: scan `$DSH_HOME/sessions/<escaped-cwd-of-workdir>/` for
  * session directories whose mtime is >= the spawn time (dsh creates the
  * directory when the session starts, so older sessions from other
- * processes are excluded), pick the newest, decompress its
- * `session.jsonl.zstd`, and sum `inputTokens + outputTokens` over every
- * v3 record carrying a top-level `data.usage` object (`cacheReadTokens`
- * excluded).
+ * processes are excluded), and pick the newest one holding a v3 log
+ * (`session.v3.jsonl.zstd`, preferring it over the plain
+ * `session.v3.jsonl`). Decompress/read that log and sum
+ * `inputTokens + outputTokens` over every v3 record carrying a top-level
+ * `data.usage` object (`cacheReadTokens` excluded).
+ *
+ * Only the v3 layout is supported. When no candidate holds a v3 log but
+ * one holds an older layout (`session.jsonl.zstd`/`session.jsonl` or
+ * `session.v2.jsonl.zstd`/`session.v2.jsonl`), the lookup logs ONE
+ * warning naming the found file, requiring dsh `>= 0.1.5` and telling
+ * the operator to `upgrade dsh`, then returns `null` — never a
+ * fabricated zero.
  *
  * `sessionRef` is the winning session directory name. Best-effort
- * throughout: any failure (missing dir, no candidates, corrupt log, no
- * zstd support, no usage chunks) returns `null` with ONE warning — the
- * caller falls back to 0 tokens.
+ * throughout: any failure (missing dir, no candidates, unsupported
+ * layout, corrupt log, no zstd support, no usage chunks) returns `null`
+ * with ONE warning — the caller falls back to 0 tokens.
  *
  * @returns total tokens + sessionRef, or `null` when unavailable.
  */
@@ -195,27 +246,93 @@ export async function lookupDshSessionTokens(
     interface Candidate {
       name: string;
       logPath: string;
+      compressed: boolean;
       mtimeMs: number;
     }
 
-    const candidates: Candidate[] = [];
+    interface LegacyCandidate extends Candidate {
+      logFile: string;
+    }
+
+    // A candidate is a session dir holding a v3 log (supported). Its
+    // `compressed` flag records whether the `.zstd` form was chosen, so
+    // the plain form can be read without ever touching zstd.
+    const v3Candidates: Candidate[] = [];
+    // A candidate holding only an older layout — never read, only warned
+    // about.
+    const legacyCandidates: LegacyCandidate[] = [];
+
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      const logPath = path.join(sessionsDir, entry.name, "session.jsonl.zstd");
+      const sessionDir = path.join(sessionsDir, entry.name);
       try {
-        if (!fs.existsSync(logPath)) continue;
-        const mtimeMs = fs.statSync(path.join(sessionsDir, entry.name)).mtimeMs;
-        candidates.push({ name: entry.name, logPath, mtimeMs });
+        const mtimeMs = fs.statSync(sessionDir).mtimeMs;
+        const compressedPath = path.join(sessionDir, DSH_V3_LOG_COMPRESSED);
+        if (fs.existsSync(compressedPath)) {
+          v3Candidates.push({
+            name: entry.name,
+            logPath: compressedPath,
+            compressed: true,
+            mtimeMs,
+          });
+          continue;
+        }
+        const plainPath = path.join(sessionDir, DSH_V3_LOG_PLAIN);
+        if (fs.existsSync(plainPath)) {
+          v3Candidates.push({
+            name: entry.name,
+            logPath: plainPath,
+            compressed: false,
+            mtimeMs,
+          });
+          continue;
+        }
+        const legacyFile = DSH_LEGACY_LOGS.find((file) =>
+          fs.existsSync(path.join(sessionDir, file)),
+        );
+        if (legacyFile !== undefined) {
+          legacyCandidates.push({
+            name: entry.name,
+            logPath: path.join(sessionDir, legacyFile),
+            compressed: true,
+            logFile: legacyFile,
+            mtimeMs,
+          });
+        }
       } catch {
         // unreadable/vanished entry — skip
       }
     }
 
-    const eligible = candidates
+    const eligibleV3 = v3Candidates
       .filter((c) => c.mtimeMs >= spawnedAtMs)
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-    if (eligible.length === 0) {
+    if (eligibleV3.length === 0) {
+      // No supported session since spawn. If an older-layout session
+      // exists (an under-versioned dsh wrote it), say so LOUDLY and
+      // name the file — the alternative is a silent 0-token run.
+      const eligibleLegacy = legacyCandidates
+        .filter((c) => c.mtimeMs >= spawnedAtMs)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      if (eligibleLegacy.length > 0) {
+        const found = eligibleLegacy[0];
+        logger.warn(
+          `dsh session token lookup failed: unsupported session layout ` +
+            `(found ${found.logFile}); dsh ${DSH_MIN_SUPPORTED_VERSION} is required ` +
+            `(expected ${DSH_V3_LOG_COMPRESSED}) — upgrade dsh`,
+          {
+            sessionsDir,
+            workdir,
+            foundFile: found.logFile,
+            requiredDshVersion: DSH_MIN_SUPPORTED_VERSION,
+            remedy: "upgrade dsh",
+          },
+        );
+        return null;
+      }
+
       logger.warn("dsh session token lookup failed: no session created since spawn", {
         sessionsDir,
         workdir,
@@ -224,17 +341,19 @@ export async function lookupDshSessionTokens(
       return null;
     }
 
-    // Newest session since spawn time wins.
-    const session = eligible[0];
+    // Newest supported (v3) session since spawn time wins.
+    const session = eligibleV3[0];
 
-    // ── Decompress + parse ─────────────────────────────────────
-    const text = await decompressSessionLog(
-      session.logPath,
-      options.zstdStrategy ?? "auto",
-      options.env,
-    );
+    // ── Read (decompress only when needed) + parse ─────────────
+    const text = session.compressed
+      ? await decompressSessionLog(
+          session.logPath,
+          options.zstdStrategy ?? "auto",
+          options.env,
+        )
+      : readPlainSessionLog(session.logPath);
     if (text === null) {
-      // decompressSessionLog already warned.
+      // The reader already warned.
       return null;
     }
 
@@ -369,6 +488,23 @@ function scanZstdFrames(buffer: Buffer): ZstdFrameRange[] {
   }
 
   return frames;
+}
+
+/**
+ * Read a plain (uncompressed) `session.v3.jsonl` directly as UTF-8 text.
+ * Used for the compression-off persistence form: zstd is never invoked
+ * for this layout. Returns null after one warning on any read failure.
+ */
+function readPlainSessionLog(logPath: string): string | null {
+  try {
+    return fs.readFileSync(logPath, "utf8");
+  } catch (err) {
+    logger.warn("dsh session token lookup failed to read session log", {
+      logPath,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }
 
 /**

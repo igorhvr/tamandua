@@ -12,7 +12,7 @@
  *   an error, never a retry, never blocks the round
  *
  * All mocks are `#!/bin/sh` fakes that write a synthetic
- * `$DSH_HOME/sessions/<escaped-workdir>/session-<uuid>/session.jsonl.zstd`
+ * `$DSH_HOME/sessions/<escaped-workdir>/session-<uuid>/session.v3.jsonl.zstd`
  * — zero tokens, never a real harness or model.
  *
  * The scheduler lookup runs the "auto" zstd strategy (node:zlib zstd on
@@ -248,7 +248,7 @@ describe("executeDispatchRound dsh token accounting", () => {
   function writeSessionFixture(workdir: string, sessionName: string): string {
     const sessionDir = path.join(dshSessionProjectDir(dshHome, workdir), sessionName);
     fs.mkdirSync(sessionDir, { recursive: true });
-    const logPath = path.join(sessionDir, "session.jsonl.zstd");
+    const logPath = path.join(sessionDir, "session.v3.jsonl.zstd");
     fs.writeFileSync(logPath, fixtureBytes());
     return sessionDir;
   }
@@ -270,7 +270,7 @@ describe("executeDispatchRound dsh token accounting", () => {
     makeMockBinary(
       dshPath,
       `mkdir -p "${sessionDir}"
-cp "${path.join(tempHome, "fixture.zstd")}" "${path.join(sessionDir, "session.jsonl.zstd")}"
+cp "${path.join(tempHome, "fixture.zstd")}" "${path.join(sessionDir, "session.v3.jsonl.zstd")}"
 echo "${stdoutText}"
 ${extraBehavior}`,
     );

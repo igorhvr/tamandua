@@ -84,11 +84,13 @@ function writeSessionDir(opts: {
   workdir: string;
   sessionName: string;
   content: Buffer | string;
+  /** Session-log filename; defaults to the supported v3 compressed form. */
+  fileName?: string;
 }): string {
   const sessionsDir = dshSessionProjectDir(opts.dshHome, opts.workdir);
   const sessionDir = path.join(sessionsDir, opts.sessionName);
   fs.mkdirSync(sessionDir, { recursive: true });
-  const logPath = path.join(sessionDir, "session.jsonl.zstd");
+  const logPath = path.join(sessionDir, opts.fileName ?? "session.v3.jsonl.zstd");
   fs.writeFileSync(logPath, opts.content);
   return logPath;
 }
@@ -485,6 +487,197 @@ describe("lookupDshSessionTokens", () => {
     assert.ok(result !== null);
     assert.equal(result.totalTokens, 46);
     assert.equal(result.sessionRef, fresh);
+  });
+
+  // ── v3-only layout probing (dsh >= 0.1.5) ──────────────────────
+
+  it("returns null and warns once for a v1-only session.jsonl.zstd layout", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName: "session-v1",
+      fileName: "session.jsonl.zstd",
+      // Deliberately not a valid zstd stream: the unsupported layout must
+      // be rejected before any read, so its bytes never matter.
+      content: headerLine("s", 1) + usageLine({ input: 999, output: 9, seq: 1 }),
+    });
+
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: 0,
+      workdir,
+      env: envWith(dshHome),
+    });
+
+    assert.equal(result, null, "an unsupported v1 layout must never yield a total");
+    const log = readTamanduaLog();
+    assert.match(log, /found session\.jsonl\.zstd/, "warning must name the found file");
+    assert.match(log, /dsh >= 0\.1\.5/, "warning must state the required dsh version");
+    assert.match(log, /upgrade dsh/, "warning must give the upgrade-dsh remedy");
+    assert.equal(
+      log.split("\n").filter((l) => l.includes("unsupported session layout")).length,
+      1,
+      "the unsupported-layout warning must be emitted exactly once",
+    );
+  });
+
+  it("returns null and warns once for a v2-only session.v2.jsonl.zstd layout", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName: "session-v2",
+      fileName: "session.v2.jsonl.zstd",
+      content: "not a zstd stream and never read",
+    });
+
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: 0,
+      workdir,
+      env: envWith(dshHome),
+    });
+
+    assert.equal(result, null);
+    const log = readTamanduaLog();
+    assert.match(log, /found session\.v2\.jsonl\.zstd/);
+    assert.match(log, /upgrade dsh/);
+    assert.match(log, /dsh >= 0\.1\.5/);
+    assert.equal(
+      log.split("\n").filter((l) => l.includes("unsupported session layout")).length,
+      1,
+    );
+  });
+
+  it("returns null and warns for a plain (uncompressed) v1 session.jsonl layout", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName: "session-v1-plain",
+      fileName: "session.jsonl",
+      content: "legacy plain log — never read",
+    });
+
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: 0,
+      workdir,
+      env: envWith(dshHome),
+    });
+
+    assert.equal(result, null);
+    const log = readTamanduaLog();
+    assert.match(log, /found session\.jsonl(?!\.zstd)/);
+    assert.match(log, /upgrade dsh/);
+  });
+
+  it("reads a plain session.v3.jsonl directly without invoking zstd", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const sessionName = "session-plain-v3";
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName,
+      fileName: "session.v3.jsonl",
+      content: headerLine(sessionName, 1) + usageLine({ input: 7, output: 3, seq: 1 }),
+    });
+
+    // The "none" tier would warn and return null if the reader touched
+    // zstd; a parsed total proves the plain log skipped zstd entirely.
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: 0,
+      workdir,
+      env: envWith(dshHome),
+      zstdStrategy: "none",
+    });
+
+    assert.ok(result !== null);
+    assert.equal(result.totalTokens, 10);
+    assert.equal(result.sessionRef, sessionName);
+    assert.doesNotMatch(readTamanduaLog(), /no zstd support available/);
+  });
+
+  it("prefers the .zstd v3 log over the plain v3 log when both exist", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const sessionName = "session-both-v3";
+    const sessionDir = path.join(dshSessionProjectDir(dshHome, workdir), sessionName);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    // Plain form would total 2; the fake `zstd -dc` (cat) exposes the
+    // compressed form's bytes, which total 150 — so the observed value
+    // identifies which file won.
+    fs.writeFileSync(
+      path.join(sessionDir, "session.v3.jsonl"),
+      headerLine(sessionName, 1) + usageLine({ input: 1, output: 1, seq: 1 }),
+    );
+    fs.writeFileSync(
+      path.join(sessionDir, "session.v3.jsonl.zstd"),
+      headerLine(sessionName, 1) + usageLine({ input: 100, output: 50, seq: 1 }),
+    );
+
+    const binDir = makeFakeZstdBin(tmpRoot!);
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: 0,
+      workdir,
+      env: envWithFakeZstd(dshHome, binDir),
+      zstdStrategy: "binary",
+    });
+
+    assert.ok(result !== null);
+    assert.equal(result.totalTokens, 150, "the .zstd form must win over the plain form");
+    assert.equal(result.sessionRef, sessionName);
+  });
+
+  it("prefers a v3 session over a newer older-layout sibling", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const spawnMs = 1_700_000_000_000;
+
+    // The older-layout sibling is NEWER on disk but unsupported: it must
+    // be ignored (and not warned about) because a v3 session exists.
+    const legacy = "session-older-layout";
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName: legacy,
+      fileName: "session.jsonl.zstd",
+      content: "legacy bytes — never read",
+    });
+    const v3 = "session-v3-wins";
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName: v3,
+      fileName: "session.v3.jsonl",
+      content: headerLine(v3, 1) + usageLine({ input: 42, output: 8, seq: 1 }),
+    });
+
+    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
+    fs.utimesSync(
+      path.join(sessionsDir, legacy),
+      new Date(spawnMs + 9_000),
+      new Date(spawnMs + 9_000),
+    );
+    fs.utimesSync(
+      path.join(sessionsDir, v3),
+      new Date(spawnMs + 1_000),
+      new Date(spawnMs + 1_000),
+    );
+
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: spawnMs,
+      workdir,
+      env: envWith(dshHome),
+      zstdStrategy: "none",
+    });
+
+    assert.ok(result !== null);
+    assert.equal(result.sessionRef, v3);
+    assert.equal(result.totalTokens, 50);
+    assert.doesNotMatch(readTamanduaLog(), /unsupported session layout/);
   });
 
   it("returns null when the log has no usage chunks", async () => {
