@@ -6,6 +6,8 @@
 
 import { setTimeout as delay } from "node:timers/promises";
 
+import { getDb } from "../../db.js";
+import { HARNESS_TEARDOWN_GRACE_MS } from "../../installer/agent-scheduler.js";
 import {
   getRecentEvents,
   getRunEvents,
@@ -30,7 +32,47 @@ function getLogsTailPollIntervalMs(): number {
   return Math.max(10, raw);
 }
 
-async function streamEventSource(source: EventCursorSource, initialLimit: number): Promise<void> {
+/** Run statuses that let a run-scoped follow exit on its own. */
+const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "canceled"]);
+
+/**
+ * Bounded extra padding beyond the teardown grace so the closing
+ * `run.tokens.final` event (emitted by the scheduler at the
+ * HARNESS_TEARDOWN_GRACE_MS boundary) is flushed before the stream closes.
+ * Mirrors the sweep timer's `HARNESS_TEARDOWN_GRACE_MS + 2s` padding.
+ */
+const RUN_TOKEN_FINAL_BUFFER_MS = 2_000;
+
+/**
+ * How long a run-scoped follow keeps polling after it first observes the
+ * run reach a terminal status, so trailing post-terminal events (the final
+ * round's `run.tokens.updated` and the closing `run.tokens.final`) are
+ * flushed before the stream closes. Defaults to the teardown grace plus a
+ * bounded buffer; tests may shrink it via TAMANDUA_LOGS_TAIL_GRACE_MS.
+ */
+function getRunFollowGraceMs(): number {
+  const raw = parseInt(process.env.TAMANDUA_LOGS_TAIL_GRACE_MS ?? "", 10);
+  if (!Number.isNaN(raw)) return Math.max(0, raw);
+  return HARNESS_TEARDOWN_GRACE_MS + RUN_TOKEN_FINAL_BUFFER_MS;
+}
+
+/** Read a run's current status by exact id. Undefined when the row is gone. */
+function readRunStatus(runId: string): string | undefined {
+  try {
+    const row = getDb()
+      .prepare("SELECT status FROM runs WHERE id = ?")
+      .get(runId) as { status: string } | undefined;
+    return row?.status;
+  } catch {
+    return undefined;
+  }
+}
+
+async function streamEventSource(
+  source: EventCursorSource,
+  initialLimit: number,
+  observeRunId?: string,
+): Promise<void> {
   const initial = readEventsFromCursor(source, 0);
   const firstBatch = initial.events.slice(-Math.max(1, initialLimit));
   if (firstBatch.length === 0) console.log("No events yet.");
@@ -44,6 +86,21 @@ async function streamEventSource(source: EventCursorSource, initialLimit: number
 
   process.on("SIGINT", onSigint);
   try {
+    // A run that is already terminal when following starts prints its
+    // initial window plus the closing line and exits without polling.
+    if (observeRunId !== undefined) {
+      const startStatus = readRunStatus(observeRunId);
+      if (startStatus !== undefined && TERMINAL_RUN_STATUSES.has(startStatus)) {
+        console.log(`run ${observeRunId} ${startStatus}; stream closed`);
+        return;
+      }
+    }
+
+    // When the run first reaches a terminal status, keep polling for the
+    // teardown grace (plus a bounded buffer for the run.tokens.final event)
+    // so trailing post-terminal events are flushed, then close.
+    let terminalDetectedAt: number | undefined;
+
     while (!abort.signal.aborted) {
       try {
         await delay(pollIntervalMs, undefined, { signal: abort.signal });
@@ -57,6 +114,18 @@ async function streamEventSource(source: EventCursorSource, initialLimit: number
       cursor = next.nextOffset;
       generation = next.generation;
       if (next.events.length > 0) printEvents(next.events);
+
+      if (observeRunId !== undefined) {
+        const status = readRunStatus(observeRunId);
+        if (status !== undefined && TERMINAL_RUN_STATUSES.has(status)) {
+          if (terminalDetectedAt === undefined) {
+            terminalDetectedAt = Date.now();
+          } else if (Date.now() - terminalDetectedAt >= getRunFollowGraceMs()) {
+            console.log(`run ${observeRunId} ${status}; stream closed`);
+            return;
+          }
+        }
+      }
     }
   } finally {
     process.removeListener("SIGINT", onSigint);
@@ -236,7 +305,7 @@ export async function handleLogs(group: string, args: string[]): Promise<boolean
         console.log(`No run #${selector.runNumber}.`);
         return true;
       }
-      await streamEventSource({ kind: "run", runId }, 50);
+      await streamEventSource({ kind: "run", runId }, 50, runId);
       return true;
     }
 
@@ -262,7 +331,7 @@ export async function handleLogs(group: string, args: string[]): Promise<boolean
       console.log(message);
       return true;
     }
-    await streamEventSource({ kind: "run", runId: logsTailRunId }, 50);
+    await streamEventSource({ kind: "run", runId: logsTailRunId }, 50, logsTailRunId);
     return true;
   }
 

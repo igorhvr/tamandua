@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
@@ -218,5 +218,263 @@ describe("tamandua logs --tail N bounded (never follows)", () => {
     } finally {
       rmSync(th.root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("tamandua logs-tail follow auto-exit (terminal run)", () => {
+  const wrapperPath = path.resolve("bin/tamandua");
+
+  function makeEvent(runId: string, detail: string, event = "step.pending") {
+    return { ts: new Date().toISOString(), event, runId, detail };
+  }
+
+  function appendEvent(filePath: string, event: unknown): void {
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    appendFileSync(filePath, `${JSON.stringify(event)}\n`, "utf-8");
+  }
+
+  function setupFollowDb(stateDir: string, runId: string, runNumber: number, status = "running") {
+    mkdirSync(stateDir, { recursive: true });
+    const db = new DatabaseSync(path.join(stateDir, "tamandua.db"));
+    db.exec("PRAGMA journal_mode=WAL");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        run_number INTEGER,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        notify_url TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+      VALUES (?, ?, 'logs-tail-test', 'test run', ?, '{}', ?, ?)
+    `).run(runId, runNumber, status, now, now);
+    return db;
+  }
+
+  function spawnFollow(stateDir: string, homeDir: string, args: string[], env: Record<string, string> = {}) {
+    return spawn("/bin/sh", [wrapperPath, ...args], {
+      env: cleanChildEnv({
+        HOME: homeDir,
+        TAMANDUA_STATE_DIR: stateDir,
+        TAMANDUA_LOGS_TAIL_POLL_MS: "20",
+        TAMANDUA_LOGS_TAIL_GRACE_MS: "300",
+        ...env,
+      }),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  }
+
+  function waitForExit(child: ChildProcess, timeoutMs = 10000) {
+    return new Promise<{ code: number | null; signal: string | null; stdout: string; stderr: string }>(
+      (resolve, reject) => {
+        let stdout = "";
+        let stderr = "";
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          child.kill("SIGKILL");
+          reject(new Error(`follow process did not exit within ${timeoutMs}ms`));
+        }, timeoutMs);
+        child.stdout?.on("data", (d) => { stdout += String(d); });
+        child.stderr?.on("data", (d) => { stderr += String(d); });
+        child.on("error", (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.on("close", (code, signal) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ code, signal, stdout, stderr });
+        });
+      },
+    );
+  }
+
+  function sleep(ms: number) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // Resolves once `needle` appears in the child's stdout, so a test can flip
+  // the run status only after the follow has already printed its initial
+  // window (and thus passed the "already terminal at start" check).
+  function waitForOutput(child: ChildProcess, needle: string, timeoutMs = 10000) {
+    return new Promise<void>((resolve, reject) => {
+      let buf = "";
+      const onData = (d: Buffer) => {
+        buf += String(d);
+        if (buf.includes(needle)) {
+          cleanup();
+          resolve();
+        }
+      };
+      const onErr = (err: Error) => {
+        cleanup();
+        reject(err);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`did not see "${needle}" in stdout within ${timeoutMs}ms: ${buf}`));
+      }, timeoutMs);
+      function cleanup() {
+        clearTimeout(timer);
+        child.stdout?.off("data", onData);
+        child.off("error", onErr);
+      }
+      child.stdout?.on("data", onData);
+      child.on("error", onErr);
+    });
+  }
+
+  it("exits 0 with closing line and flushes trailing events when run flips to completed", async () => {
+    const th = createTempHome("tamandua-logs-follow-completed-");
+    const runId = "run-follow-completed-1234";
+    const runFile = path.join(th.tamanduaDir, "events", `${runId}.jsonl`);
+    appendEvent(runFile, makeEvent(runId, "initial-1"));
+    appendEvent(runFile, makeEvent(runId, "initial-2"));
+    const db = setupFollowDb(th.tamanduaDir, runId, 1, "running");
+    const child = spawnFollow(th.tamanduaDir, th.homeDir, ["logs-tail", runId]);
+    const exitPromise = waitForExit(child, 8000);
+    try {
+      await waitForOutput(child, "(initial-1)");
+
+      // Now that the follow is past the initial window, flip status and write
+      // post-terminal trailing events during the grace window.
+      db.prepare("UPDATE runs SET status = 'completed', updated_at = datetime('now') WHERE id = ?").run(runId);
+      await sleep(30);
+      appendEvent(runFile, makeEvent(runId, "trailing-tokens", "run.tokens.updated"));
+      appendEvent(runFile, makeEvent(runId, "trailing-final", "run.tokens.final"));
+
+      const result = await exitPromise;
+
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      assert.match(result.stdout, /initial-1/);
+      assert.match(result.stdout, /initial-2/);
+      assert.match(result.stdout, /trailing-tokens/);
+      assert.match(result.stdout, /trailing-final/);
+      assert.match(result.stdout, new RegExp(`${runId} completed; stream closed`));
+      const closingIdx = result.stdout.indexOf(`${runId} completed; stream closed`);
+      const trailingIdx = result.stdout.indexOf("(trailing-final)");
+      assert.ok(trailingIdx >= 0 && closingIdx > trailingIdx, "closing line must follow trailing events");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      db.close();
+      rmSync(th.root, { recursive: true, force: true });
+    }
+  });
+
+  for (const status of ["failed", "canceled"]) {
+    it(`exits 0 with closing line when run flips to ${status}`, async () => {
+      const th = createTempHome(`tamandua-logs-follow-${status}-`);
+      const runId = `run-follow-${status}-1234`;
+      const runFile = path.join(th.tamanduaDir, "events", `${runId}.jsonl`);
+      appendEvent(runFile, makeEvent(runId, "initial-1"));
+      const db = setupFollowDb(th.tamanduaDir, runId, 1, "running");
+      const child = spawnFollow(th.tamanduaDir, th.homeDir, ["logs-tail", runId]);
+      const exitPromise = waitForExit(child, 8000);
+      try {
+        await waitForOutput(child, "(initial-1)");
+        db.prepare("UPDATE runs SET status = ?, updated_at = datetime('now') WHERE id = ?").run(status, runId);
+
+        const result = await exitPromise;
+
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        assert.match(result.stdout, /initial-1/);
+        assert.match(result.stdout, new RegExp(`${runId} ${status}; stream closed`));
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        db.close();
+        rmSync(th.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("follow on an already-terminal run prints last N events plus closing line and exits", async () => {
+    const th = createTempHome("tamandua-logs-follow-terminal-at-start-");
+    const runId = "run-follow-terminal-start-1234";
+    const runFile = path.join(th.tamanduaDir, "events", `${runId}.jsonl`);
+    for (let i = 1; i <= 8; i++) appendEvent(runFile, makeEvent(runId, `t-${i}`));
+    const db = setupFollowDb(th.tamanduaDir, runId, 1, "completed");
+    const child = spawnFollow(th.tamanduaDir, th.homeDir, ["logs-tail", runId]);
+    try {
+      const result = await waitForExit(child, 5000);
+
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      assert.match(result.stdout, /\(t-8\)/);
+      assert.match(result.stdout, /\(t-1\)/);
+      assert.match(result.stdout, new RegExp(`${runId} completed; stream closed`));
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      db.close();
+      rmSync(th.root, { recursive: true, force: true });
+    }
+  });
+
+  it("global follow keeps streaming until SIGINT (never auto-exits)", async () => {
+    const th = createTempHome("tamandua-logs-follow-global-");
+    const globalFile = path.join(th.tamanduaDir, "events", "all.jsonl");
+    appendEvent(globalFile, makeEvent("run-g", "g-1"));
+    const child = spawnFollow(th.tamanduaDir, th.homeDir, ["logs-tail"]);
+    const exitPromise = waitForExit(child, 5000);
+    try {
+      await waitForOutput(child, "(g-1)");
+
+      // Several polls plus a full grace window elapse; a global follow must
+      // still be alive because there is no run status to observe.
+      await sleep(500);
+      assert.equal(child.exitCode, null, "global follow must not auto-exit");
+
+      child.kill("SIGINT");
+      const result = await exitPromise;
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      assert.match(result.stdout, /\(g-1\)/);
+      assert.doesNotMatch(result.stdout, /stream closed/);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      rmSync(th.root, { recursive: true, force: true });
+    }
+  });
+
+  it("#N selector auto-exits when the resolved run reaches a terminal status", async () => {
+    const th = createTempHome("tamandua-logs-follow-number-");
+    const runId = "run-follow-number-1234";
+    const runFile = path.join(th.tamanduaDir, "events", `${runId}.jsonl`);
+    appendEvent(runFile, makeEvent(runId, "n-1"));
+    const db = setupFollowDb(th.tamanduaDir, runId, 3, "running");
+    const child = spawnFollow(th.tamanduaDir, th.homeDir, ["logs-tail", "#3"]);
+    const exitPromise = waitForExit(child, 8000);
+    try {
+      await waitForOutput(child, "(n-1)");
+      db.prepare("UPDATE runs SET status = 'completed', updated_at = datetime('now') WHERE id = ?").run(runId);
+
+      const result = await exitPromise;
+
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      assert.match(result.stdout, /n-1/);
+      assert.match(result.stdout, new RegExp(`${runId} completed; stream closed`));
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      db.close();
+      rmSync(th.root, { recursive: true, force: true });
+    }
+  });
+
+  it("grace derives from HARNESS_TEARDOWN_GRACE_MS (no hardcoded 10000 literal)", () => {
+    const source = readFileSync(join(process.cwd(), "src/cli/commands/logs.ts"), "utf8");
+    assert.match(source, /HARNESS_TEARDOWN_GRACE_MS/);
+    assert.match(source, /from "\.\.\/\.\.\/installer\/agent-scheduler\.js"/);
+    assert.doesNotMatch(source, /\b10000\b/);
+    assert.doesNotMatch(source, /\b10_000\b/);
   });
 });
