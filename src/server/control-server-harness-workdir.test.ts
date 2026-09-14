@@ -11,8 +11,10 @@ import { DatabaseSync } from "node:sqlite";
 import {
   createControlServer,
   _resetWorkdirWaitWarnState,
+  _reconcileOnce,
+  _admitQueuedRunsOnce,
 } from "../../dist/server/control-server.js";
-import { shutdownAllCrons } from "../../dist/installer/agent-scheduler.js";
+import { shutdownAllCrons, removeRunCrons } from "../../dist/installer/agent-scheduler.js";
 import { getDb } from "../../dist/db.js";
 
 interface JsonResponse {
@@ -26,12 +28,14 @@ let originalStateDir: string | undefined;
 let originalDbPath: string | undefined;
 let originalAllowSharedHarnessWorkdir: string | undefined;
 let originalWarnInterval: string | undefined;
+let originalMaxActiveTimers: string | undefined;
 
 beforeEach(() => {
   originalStateDir = process.env.TAMANDUA_STATE_DIR;
   originalDbPath = process.env.TAMANDUA_DB_PATH;
   originalAllowSharedHarnessWorkdir = process.env.TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR;
   originalWarnInterval = process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS;
+  originalMaxActiveTimers = process.env.TAMANDUA_MAX_ACTIVE_TIMERS;
   _resetWorkdirWaitWarnState();
 });
 
@@ -48,6 +52,8 @@ afterEach(async () => {
   else process.env.TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR = originalAllowSharedHarnessWorkdir;
   if (originalWarnInterval === undefined) delete process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS;
   else process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS = originalWarnInterval;
+  if (originalMaxActiveTimers === undefined) delete process.env.TAMANDUA_MAX_ACTIVE_TIMERS;
+  else process.env.TAMANDUA_MAX_ACTIVE_TIMERS = originalMaxActiveTimers;
   _resetWorkdirWaitWarnState();
 });
 
@@ -450,6 +456,192 @@ describe("control-server busy harness workdir waits (US-001)", () => {
       assert.equal(response.status, 422, JSON.stringify(response.body));
       assert.match(String(response.body.error), /branch mismatch/);
       assert.equal(readRunRow(dbPath, runId).scheduling_status, "error");
+    } finally {
+      await close(server);
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// US-002: the reconciler and the queued-run drain admit 'waiting' runs once
+// the holder releases the harness workdir.
+// ══════════════════════════════════════════════════════════════════════
+
+const ADMIT_AFTER_WAIT_MARKER = "control-server: register-run admitted after workdir wait";
+
+function seedSchedulingRun(
+  dbPath: string,
+  runId: string,
+  context: Record<string, unknown>,
+  schedulingStatus: string,
+  schedulingRequestedAt: string | null,
+): void {
+  const db = new DatabaseSync(dbPath);
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO runs
+       (id, workflow_id, task, status, context, tokens_spent, scheduling_status, scheduling_requested_at, created_at, updated_at)
+     VALUES (?, 'wf-harness', 'harness test', 'running', ?, 0, ?, ?, ?, ?)`,
+  ).run(runId, JSON.stringify(context), schedulingStatus, schedulingRequestedAt, now, now);
+  db.prepare(
+    `INSERT INTO steps
+       (id, run_id, step_id, agent_id, step_index, input_template, expects, status, type, created_at, updated_at)
+     VALUES (?, ?, 'do_work', 'wf-harness_worker', 0, 'test', 'STATUS', 'pending', 'single', ?, ?)`,
+  ).run(crypto.randomUUID(), runId, now, now);
+  db.close();
+}
+
+function setRunStatus(dbPath: string, runId: string, status: string): void {
+  const db = new DatabaseSync(dbPath);
+  db.prepare("UPDATE runs SET status = ?, updated_at = datetime('now') WHERE id = ?").run(status, runId);
+  db.close();
+}
+
+function countLogLines(stateDir: string, level: string, marker: string): number {
+  return readLog(stateDir)
+    .split("\n")
+    .filter((line) => line.includes(level) && line.includes(marker)).length;
+}
+
+describe("control-server reconcile admits waiting runs (US-002)", () => {
+  it("_reconcileOnce admits a previously-waiting run after the holder releases the workdir", async () => {
+    const { root, stateDir, dbPath } = setupState();
+    const shared = path.join(root, "shared-workdir");
+    fs.mkdirSync(shared, { recursive: true });
+
+    const runA = crypto.randomUUID();
+    const runB = crypto.randomUUID();
+    seedRun(dbPath, runA, "running", { working_directory_for_harness: shared });
+    seedRun(dbPath, runB, "running", { working_directory_for_harness: shared });
+    _resetWorkdirWaitWarnState();
+
+    const server = createControlServer({ secret: SECRET, listen: false });
+    const port = await listen(server);
+    try {
+      const registerA = await jsonRequest(port, "POST", "/control/register-run", { runId: runA });
+      assert.equal(registerA.body.state, "active", JSON.stringify(registerA.body));
+      const registerB = await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
+      assert.equal(registerB.body.state, "waiting", JSON.stringify(registerB.body));
+      assert.equal(readRunRow(dbPath, runB).scheduling_status, "waiting");
+
+      // Holder A finishes: drop its scheduled jobs and mark it terminal so the
+      // reconciler no longer re-admits it. Then drive exactly ONE reconcile
+      // pass via the deterministic seam (no 30s timer wait).
+      await removeRunCrons(runA);
+      setRunStatus(dbPath, runA, "completed");
+
+      await _reconcileOnce();
+
+      const rowB = readRunRow(dbPath, runB);
+      assert.equal(
+        rowB.scheduling_status,
+        "active",
+        `waiting run should be admitted, got ${JSON.stringify(rowB)}`,
+      );
+      assert.equal(rowB.scheduling_error, null);
+      assert.equal(rowB.status, "running");
+
+      assert.equal(
+        countLogLines(stateDir, "INFO", ADMIT_AFTER_WAIT_MARKER),
+        1,
+        `expected one admission-after-wait INFO line:\n${readLog(stateDir)}`,
+      );
+      const infoLine = readLog(stateDir)
+        .split("\n")
+        .find((line) => line.includes(ADMIT_AFTER_WAIT_MARKER));
+      assert.ok(infoLine && infoLine.includes(runB), "INFO line must name the admitted run");
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("_admitQueuedRunsOnce continues past a still-waiting run and admits the next queued run", async () => {
+    const { root, dbPath } = setupState();
+    const shared = path.join(root, "shared-workdir");
+    const other = path.join(root, "other-workdir");
+    fs.mkdirSync(shared, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+
+    const runA = crypto.randomUUID();
+    const runB = crypto.randomUUID();
+    const runC = crypto.randomUUID();
+    seedRun(dbPath, runA, "running", { working_directory_for_harness: shared });
+    seedRun(dbPath, runB, "running", { working_directory_for_harness: shared });
+    // runC is a plain capacity-queued run on its own directory; give it a
+    // later request time so the waiting run B is considered first.
+    seedSchedulingRun(
+      dbPath,
+      runC,
+      { working_directory_for_harness: other },
+      "queued",
+      new Date(Date.now() + 60_000).toISOString(),
+    );
+
+    const server = createControlServer({ secret: SECRET, listen: false });
+    const port = await listen(server);
+    try {
+      await jsonRequest(port, "POST", "/control/register-run", { runId: runA });
+      const registerB = await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
+      assert.equal(registerB.body.state, "waiting", JSON.stringify(registerB.body));
+
+      // Order B (waiting) ahead of C (queued) in the FIFO drain.
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE runs SET scheduling_requested_at = ? WHERE id = ?").run(
+        new Date(Date.now() - 60_000).toISOString(),
+        runB,
+      );
+      db.close();
+
+      await _admitQueuedRunsOnce();
+
+      // B is still held by A, so it stays waiting — and that waiting outcome
+      // must NOT stop the drain, so C is admitted.
+      assert.equal(readRunRow(dbPath, runB).scheduling_status, "waiting");
+      assert.equal(readRunRow(dbPath, runC).scheduling_status, "active");
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("_admitQueuedRunsOnce still stops at a capacity-queued run (FIFO order preserved)", async () => {
+    process.env.TAMANDUA_MAX_ACTIVE_TIMERS = "1";
+    const { root, dbPath } = setupState();
+    const dirA = path.join(root, "dir-a");
+    const dirB = path.join(root, "dir-b");
+    const dirC = path.join(root, "dir-c");
+    for (const d of [dirA, dirB, dirC]) fs.mkdirSync(d, { recursive: true });
+
+    const runA = crypto.randomUUID();
+    const runB = crypto.randomUUID();
+    const runC = crypto.randomUUID();
+    seedRun(dbPath, runA, "running", { working_directory_for_harness: dirA });
+    seedSchedulingRun(
+      dbPath,
+      runB,
+      { working_directory_for_harness: dirB },
+      "queued",
+      new Date(Date.now() - 60_000).toISOString(),
+    );
+    seedSchedulingRun(
+      dbPath,
+      runC,
+      { working_directory_for_harness: dirC },
+      "queued",
+      new Date().toISOString(),
+    );
+
+    const server = createControlServer({ secret: SECRET, listen: false });
+    const port = await listen(server);
+    try {
+      const registerA = await jsonRequest(port, "POST", "/control/register-run", { runId: runA });
+      assert.equal(registerA.body.state, "active", JSON.stringify(registerA.body));
+
+      await _admitQueuedRunsOnce();
+
+      // The single timer slot is taken by A, so B returns 'queued' and the
+      // drain must break — C stays queued rather than jumping the FIFO line.
+      assert.equal(readRunRow(dbPath, runB).scheduling_status, "queued");
+      assert.equal(readRunRow(dbPath, runC).scheduling_status, "queued");
     } finally {
       await close(server);
     }

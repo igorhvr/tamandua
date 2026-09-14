@@ -252,6 +252,23 @@ function requiredTimersForRun(runId: string): number {
   return row?.cnt ?? 0;
 }
 
+/**
+ * Shared post-admission bookkeeping: clear the workdir-wait warn throttle for
+ * the run and, when the run had been parked in the retriable 'waiting' state,
+ * emit one INFO line announcing the admission-after-wait. The INFO line is the
+ * operator's signal that a queued run drained (distinct from the WARN emitted
+ * while it waited).
+ */
+function markActiveAfterAdmission(runId: string, requiredTimers: number, wasWaiting: boolean): void {
+  workdirWaitWarnState.delete(runId);
+  if (wasWaiting) {
+    logger.info("control-server: register-run admitted after workdir wait", {
+      runId,
+      requiredTimers,
+    });
+  }
+}
+
 async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
   const requiredTimers = requiredTimersForRun(run.id);
   const maxActiveTimers = getMaxActiveTimers();
@@ -307,6 +324,8 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
     );
   }
 
+  const wasWaiting = run.scheduling_status === "waiting";
+
   const existingForRun = _scheduledJobCountForRun(run.id);
   if (requiredTimers > 0 && existingForRun >= requiredTimers) {
     getDb()
@@ -314,7 +333,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
         "UPDATE runs SET scheduling_status = 'active', scheduling_error = NULL, updated_at = datetime('now') WHERE id = ?",
       )
       .run(run.id);
-    workdirWaitWarnState.delete(run.id);
+    markActiveAfterAdmission(run.id, requiredTimers, wasWaiting);
     return ok({ state: "active", requiredTimers, maxActiveTimers });
   }
 
@@ -386,7 +405,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
     )
     .run(run.id);
 
-  workdirWaitWarnState.delete(run.id);
+  markActiveAfterAdmission(run.id, requiredTimers, wasWaiting);
   logger.info("control-server: register-run admitted", { runId: run.id, requiredTimers });
   return ok({ state: "active", requiredTimers, maxActiveTimers }, 202);
 }
@@ -397,7 +416,7 @@ async function admitQueuedRuns(): Promise<void> {
     .prepare(
       `SELECT id, workflow_id, status, scheduling_status, context, created_at
        FROM runs
-       WHERE status = 'running' AND scheduling_status = 'queued'
+       WHERE status = 'running' AND scheduling_status IN ('queued', 'waiting')
        ORDER BY scheduling_requested_at ASC, created_at ASC`,
     )
     .all() as unknown as RunRow[];
@@ -411,8 +430,17 @@ async function admitQueuedRuns(): Promise<void> {
       return null;
     });
     if (!result) continue;
+    // A run still waiting on a busy harness workdir must not stop the drain:
+    // its holder will release the directory later. A capacity 'queued' result
+    // still breaks so FIFO ordering across the queued lane is preserved.
+    if (result.body.state === "waiting") continue;
     if (result.body.state === "queued") break;
   }
+}
+
+/** @internal — deterministic one-pass queue-drain seam for tests. */
+export async function _admitQueuedRunsOnce(): Promise<void> {
+  await admitQueuedRuns();
 }
 
 // ── TSTX suite endpoints ──────────────────────────────────────────────
@@ -1587,6 +1615,123 @@ export async function _admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
   return admitOrQueueRun(run);
 }
 
+/**
+ * One full reconcile pass: stale-phantom recovery, dead-worker recovery,
+ * re-admission of pending/error/waiting runs, cleanup of jobs for runs that
+ * are no longer active, TSTX ledger pruning, then a queued-run drain.
+ *
+ * Keeping this as a standalone function (rather than inline in the timer
+ * callback) lets `_reconcileOnce()` drive exactly one pass in tests without
+ * waiting the 30s RECONCILER_INTERVAL_MS.
+ */
+async function reconcileOnce(): Promise<void> {
+  try {
+    const db = getDb();
+
+    // ── Stale launch-phantom sweep (LNCZ) ────────────────────────
+    // Recover legacy/crash-left runs only after a conservative 30-minute
+    // grace period and only while both launch artifacts remain absent.
+    try {
+      const { recoverStaleLaunchPhantoms } = await import("../installer/run-recovery.js");
+      const sweep = recoverStaleLaunchPhantoms();
+      if (sweep.recovered > 0) {
+        logger.info("control-server: recovered stale launch phantom runs", {
+          recovered: sweep.recovered,
+          runIds: sweep.runIds,
+        });
+      }
+    } catch (err) {
+      logger.warn("control-server: stale launch phantom sweep failed", { error: String(err) });
+    }
+
+    // ── Dead-worker sweep (MOTOR-CONTRACT.md C18) ────────────────
+    // A previous daemon may have died (crash, reboot, kill) with work
+    // rounds in flight, leaving steps 'running' under dead workers.
+    // Requeue them now instead of waiting out the age-based stale
+    // threshold (up to 45 minutes). First tick runs ~1s after startup.
+    let deadWorkerRunIds: string[] = [];
+    try {
+      const { recoverStepsWithDeadWorkers } = await import("../installer/step-ops.js");
+      const sweep = recoverStepsWithDeadWorkers();
+      if (sweep.recovered > 0 || sweep.failed > 0) {
+        deadWorkerRunIds = sweep.runIds;
+        logger.info("control-server: recovered steps claimed by dead workers", {
+          recovered: sweep.recovered,
+          failed: sweep.failed,
+          skipped: sweep.skipped,
+          runIds: sweep.runIds,
+        });
+      }
+    } catch (err) {
+      logger.warn("control-server: dead-worker sweep failed", { error: String(err) });
+    }
+
+    const desired = db
+      .prepare(
+        `SELECT id, workflow_id, status, scheduling_status, context, created_at
+         FROM runs
+         WHERE status IN ('running')
+           AND (scheduling_status IS NULL OR scheduling_status IN ('pending_register', 'active', 'error', 'waiting'))
+         ORDER BY scheduling_requested_at ASC, created_at ASC`,
+      )
+      .all() as unknown as RunRow[];
+
+    const { _hasRunScheduled, removeRunCrons, getRunTeardownGraceMs } = await import(
+      "../installer/agent-scheduler.js"
+    );
+
+    for (const run of desired) {
+      if (run.scheduling_status === "active" && _hasRunScheduled(run.id)) continue;
+      // Re-admit pending/error/waiting/missing runs. A run still blocked by a
+      // busy harness workdir simply records 'waiting' again and is retried on
+      // the next pass.
+      await handleRegisterRun(run.id).catch(() => {});
+    }
+
+    // Dispatch requeued steps immediately — their runs' jobs exist now
+    // that admission ran above.
+    if (deadWorkerRunIds.length > 0) {
+      const { nudgeScheduledRuns } = await import("../installer/agent-scheduler.js");
+      await nudgeScheduledRuns(deadWorkerRunIds).catch(() => {});
+    }
+
+    // Clean up jobs for runs that are no longer active.
+    const { _scheduledRunIds } = await import("../installer/agent-scheduler.js");
+    const scheduledIds = _scheduledRunIds();
+    for (const runId of scheduledIds) {
+      const row = db
+        .prepare("SELECT status FROM runs WHERE id = ?")
+        .get(runId) as { status: string } | undefined;
+      if (!row || row.status !== "running") {
+        await removeRunCrons(runId, {
+          graceMs: getRunTeardownGraceMs(row?.status),
+        });
+      }
+    }
+
+    // ── TSTX ledger retention pruning ──
+    // Remove suite_results rows older than LEDGER_RETENTION (14d).
+    try {
+      const { pruneOldSuiteResults } = await import("../db.js");
+      const pruned = pruneOldSuiteResults();
+      if (pruned > 0) {
+        logger.info("control-server: pruned old suite_results rows", { pruned });
+      }
+    } catch (err) {
+      logger.warn("control-server: suite_results pruning failed", { error: String(err) });
+    }
+
+    await admitQueuedRuns();
+  } catch (err) {
+    logger.warn("control-server: reconciler tick failed", { error: String(err) });
+  }
+}
+
+/** @internal — deterministic one-pass reconciler seam for tests. */
+export async function _reconcileOnce(): Promise<void> {
+  await reconcileOnce();
+}
+
 export function startReconciler(): { stop: () => void } {
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
@@ -1594,102 +1739,7 @@ export function startReconciler(): { stop: () => void } {
   async function tick(): Promise<void> {
     if (stopped) return;
     try {
-      const db = getDb();
-
-      // ── Stale launch-phantom sweep (LNCZ) ────────────────────────
-      // Recover legacy/crash-left runs only after a conservative 30-minute
-      // grace period and only while both launch artifacts remain absent.
-      try {
-        const { recoverStaleLaunchPhantoms } = await import("../installer/run-recovery.js");
-        const sweep = recoverStaleLaunchPhantoms();
-        if (sweep.recovered > 0) {
-          logger.info("control-server: recovered stale launch phantom runs", {
-            recovered: sweep.recovered,
-            runIds: sweep.runIds,
-          });
-        }
-      } catch (err) {
-        logger.warn("control-server: stale launch phantom sweep failed", { error: String(err) });
-      }
-
-      // ── Dead-worker sweep (MOTOR-CONTRACT.md C18) ────────────────
-      // A previous daemon may have died (crash, reboot, kill) with work
-      // rounds in flight, leaving steps 'running' under dead workers.
-      // Requeue them now instead of waiting out the age-based stale
-      // threshold (up to 45 minutes). First tick runs ~1s after startup.
-      let deadWorkerRunIds: string[] = [];
-      try {
-        const { recoverStepsWithDeadWorkers } = await import("../installer/step-ops.js");
-        const sweep = recoverStepsWithDeadWorkers();
-        if (sweep.recovered > 0 || sweep.failed > 0) {
-          deadWorkerRunIds = sweep.runIds;
-          logger.info("control-server: recovered steps claimed by dead workers", {
-            recovered: sweep.recovered,
-            failed: sweep.failed,
-            skipped: sweep.skipped,
-            runIds: sweep.runIds,
-          });
-        }
-      } catch (err) {
-        logger.warn("control-server: dead-worker sweep failed", { error: String(err) });
-      }
-
-      const desired = db
-        .prepare(
-          `SELECT id, workflow_id, status, scheduling_status, context, created_at
-           FROM runs
-           WHERE status IN ('running')
-             AND (scheduling_status IS NULL OR scheduling_status IN ('pending_register', 'active', 'error'))
-           ORDER BY scheduling_requested_at ASC, created_at ASC`,
-        )
-        .all() as unknown as RunRow[];
-
-      const { _hasRunScheduled, removeRunCrons, getRunTeardownGraceMs } = await import(
-        "../installer/agent-scheduler.js"
-      );
-
-      for (const run of desired) {
-        if (run.scheduling_status === "active" && _hasRunScheduled(run.id)) continue;
-        // Re-admit pending/error/missing runs.
-        await handleRegisterRun(run.id).catch(() => {});
-      }
-
-      // Dispatch requeued steps immediately — their runs' jobs exist now
-      // that admission ran above.
-      if (deadWorkerRunIds.length > 0) {
-        const { nudgeScheduledRuns } = await import("../installer/agent-scheduler.js");
-        await nudgeScheduledRuns(deadWorkerRunIds).catch(() => {});
-      }
-
-      // Clean up jobs for runs that are no longer active.
-      const { _scheduledRunIds } = await import("../installer/agent-scheduler.js");
-      const scheduledIds = _scheduledRunIds();
-      for (const runId of scheduledIds) {
-        const row = db
-          .prepare("SELECT status FROM runs WHERE id = ?")
-          .get(runId) as { status: string } | undefined;
-        if (!row || row.status !== "running") {
-          await removeRunCrons(runId, {
-            graceMs: getRunTeardownGraceMs(row?.status),
-          });
-        }
-      }
-
-      // ── TSTX ledger retention pruning ──
-      // Remove suite_results rows older than LEDGER_RETENTION (14d).
-      try {
-        const { pruneOldSuiteResults } = await import("../db.js");
-        const pruned = pruneOldSuiteResults();
-        if (pruned > 0) {
-          logger.info("control-server: pruned old suite_results rows", { pruned });
-        }
-      } catch (err) {
-        logger.warn("control-server: suite_results pruning failed", { error: String(err) });
-      }
-
-      await admitQueuedRuns();
-    } catch (err) {
-      logger.warn("control-server: reconciler tick failed", { error: String(err) });
+      await reconcileOnce();
     } finally {
       if (!stopped) {
         timer = setTimeout(() => void tick(), RECONCILER_INTERVAL_MS);
