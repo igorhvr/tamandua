@@ -16,7 +16,7 @@
  * Shares types with scripted-agent.ts so all factories use the same
  * ScriptedAgentConfig shape. The dsh factory also sets:
  *   TAMANDUA_PI_BINARY=/usr/bin/false  (accidental pi spawns fail loudly)
- *   DSH_HOME=<temp dsh home>  (fake session.jsonl.zstd logs live here)
+ *   DSH_HOME=<temp dsh home>  (fake session.v3.jsonl.zstd logs live here)
  */
 
 import fs from "node:fs";

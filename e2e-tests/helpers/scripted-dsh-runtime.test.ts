@@ -7,10 +7,11 @@
  *   1. stdout is EXACTLY the final assistant text plus a newline — plain
  *      text, no JSON, no session trailer
  *   2. stderr is EMPTY on success; exit code 0
- *   3. a valid session.jsonl.zstd is written under
- *      $DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/ with usage chunks
- *      (input + output tokens, cacheReadTokens excluded) so the scheduler's
- *      session-file token lookup (dsh-usage.ts) can attribute tokens
+ *   3. a valid session.v3.jsonl.zstd is written under
+ *      $DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/ with a v3
+ *      assistant/message data.usage object (input + output tokens,
+ *      cacheReadTokens excluded) so the scheduler's session-file token
+ *      lookup (dsh-usage.ts) can attribute tokens
  *   4. All chaos modes (work, hang, die-before-claim, die-after-claim,
  *      no-status, garbage)
  *
@@ -229,7 +230,7 @@ function listSessionDirs(dirs: TestDirs): string[] {
 
 function readSessionLogText(dirs: TestDirs, sessionName: string): string {
   const projectDir = dshSessionProjectDir(dirs.dshHome, dirs.workdir);
-  const logPath = path.join(projectDir, sessionName, "session.jsonl.zstd");
+  const logPath = path.join(projectDir, sessionName, "session.v3.jsonl.zstd");
   return decompressZstd(fs.readFileSync(logPath));
 }
 
@@ -322,7 +323,7 @@ describe("scripted-dsh-runtime", () => {
   // ── Session file tests (token attribution) ────────────────────────
 
   describe("session file", () => {
-    it("writes a valid session.jsonl.zstd with usage chunks under the escaped-cwd dir", () => {
+    it("writes a valid session.v3.jsonl.zstd with a data.usage record under the escaped-cwd dir", () => {
       const dirs = makeTempDirs();
       try {
         createMockCli(dirs.tmp);
@@ -343,39 +344,38 @@ describe("scripted-dsh-runtime", () => {
         const text = readSessionLogText(dirs, sessionDirs[0]);
         const lines = text.split("\n").filter(Boolean);
 
-        // First line: session header
+        // First line: session header (format v3)
         const header = JSON.parse(lines[0]);
         assert.equal(header.type, "session");
+        assert.equal(header.version, 3, "session header must declare format v3");
         assert.equal(header.id, sessionDirs[0].replace(/^session-/, ""));
 
-        // Usage chunks: input on the first, output on the second, cache
-        // reads sprinkled on both (must be excluded by the reader).
-        const usageLines = lines
+        // One v3 assistant/message record with TOP-LEVEL data.usage
+        // (input + output, plus a non-zero cacheReadTokens that must be
+        // excluded by the reader).
+        const usageRecords = lines
           .slice(1)
           .map((l) => JSON.parse(l) as {
             type: string;
             data: {
-              chunk: {
-                type: string;
-                usage: {
-                  inputTokens: number;
-                  outputTokens: number;
-                  cacheReadTokens: number;
-                };
+              usage: {
+                inputTokens: number;
+                outputTokens: number;
+                cacheReadTokens: number;
               };
             };
           });
-        assert.equal(usageLines.length, 2, "should have 2 usage chunks");
-        for (const line of usageLines) {
-          assert.equal(line.type, "assistant/chunk");
-          assert.equal(line.data.chunk.type, "usage");
-        }
-        const inputTotal = usageLines.reduce((s, l) => s + l.data.chunk.usage.inputTokens, 0);
-        const outputTotal = usageLines.reduce((s, l) => s + l.data.chunk.usage.outputTokens, 0);
-        assert.equal(inputTotal, 100, `input should total 100 (111 - 11), got ${inputTotal}`);
-        assert.equal(outputTotal, 11, `output should total 11, got ${outputTotal}`);
-        const cacheReadTotal = usageLines.reduce((s, l) => s + l.data.chunk.usage.cacheReadTokens, 0);
-        assert.equal(cacheReadTotal, 8, `cache reads should total 8, got ${cacheReadTotal}`);
+        assert.equal(usageRecords.length, 1, "should have 1 v3 usage record");
+        const record = usageRecords[0];
+        assert.equal(record.type, "assistant/message");
+        assert.equal(typeof record.data.usage, "object", "usage must be at the top level of data");
+        const inputTotal = record.data.usage.inputTokens;
+        const outputTotal = record.data.usage.outputTokens;
+        assert.equal(inputTotal, 100, `input should be 100 (111 - 11), got ${inputTotal}`);
+        assert.equal(outputTotal, 11, `output should be 11, got ${outputTotal}`);
+        const cacheReadTotal = record.data.usage.cacheReadTokens;
+        assert.ok(cacheReadTotal > 0, `cache reads should be non-zero, got ${cacheReadTotal}`);
+        assert.equal(cacheReadTotal, 8, `cache reads should be 8, got ${cacheReadTotal}`);
       } finally {
         cleanup(dirs.tmp);
       }
@@ -684,18 +684,15 @@ describe("scripted-dsh-runtime", () => {
           const record = JSON.parse(line) as {
             type: string;
             data?: {
-              chunk?: {
-                type?: string;
-                usage?: { inputTokens?: number; outputTokens?: number };
-              };
+              usage?: { inputTokens?: number; outputTokens?: number };
             };
           };
-          if (record.data?.chunk?.usage) {
-            inputTotal += record.data.chunk.usage.inputTokens ?? 0;
-            outputTotal += record.data.chunk.usage.outputTokens ?? 0;
+          if (record.data?.usage) {
+            inputTotal += record.data.usage.inputTokens ?? 0;
+            outputTotal += record.data.usage.outputTokens ?? 0;
           }
         }
-        assert.equal(inputTotal + outputTotal, 237, `usage chunks should total 237, got ${inputTotal + outputTotal}`);
+        assert.equal(inputTotal + outputTotal, 237, `v3 data.usage should total 237, got ${inputTotal + outputTotal}`);
       } finally {
         cleanup(dirs.tmp);
       }

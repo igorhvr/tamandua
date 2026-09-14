@@ -10,12 +10,13 @@
  *   - stderr: EMPTY on success (`dsh: <code>: <message>` only on failure)
  *   - exit code: 0 on completion, non-zero on failure
  *   - usage: never printed — recorded in the session log at
- *     $DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.jsonl.zstd
+ *     $DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd
  *
  * Token attribution: after each work round this runtime writes a fake
- * session.jsonl.zstd (a real zstd-compressed session log) under the temp
- * $DSH_HOME so the scheduler's session-file lookup (dsh-usage.ts →
- * lookupDshSessionTokens) can attribute per-round tokens end to end.
+ * session.v3.jsonl.zstd (a real zstd-compressed dsh >= 0.1.5 session log)
+ * under the temp $DSH_HOME so the scheduler's session-file lookup
+ * (dsh-usage.ts → lookupDshSessionTokens) can attribute per-round tokens
+ * end to end.
  *
  * Work protocol (shared with scripted-agent-runtime.mjs and
  * scripted-hermes-runtime.mjs):
@@ -26,7 +27,7 @@
  *      edits / shell commands in the harness workdir, then report via
  *      `step complete` / `step fail`
  *   4. Write the fake session log to $DSH_HOME/sessions/<escaped-cwd>/
- *      session-<uuid>/session.jsonl.zstd with configurable token counts
+ *      session-<uuid>/session.v3.jsonl.zstd with configurable token counts
  *
  * Behaviors come from a JSON file (TAMANDUA_SCRIPTED_BEHAVIORS), keyed by the
  * short agent id. Same format as the pi/hermes runtimes.
@@ -96,13 +97,13 @@ function emitOutput(text) {
   if (!text.endsWith("\n")) process.stdout.write("\n");
 }
 
-// ── Fake session.jsonl.zstd for token accounting ────────────────────
+// ── Fake session.v3.jsonl.zstd for token accounting ─────────────────
 //
 // The scheduler calls lookupDshSessionTokens(spawnedAtMs, workdir) after
 // each round. That function scans $DSH_HOME/sessions/<escaped-cwd>/ for
 // session dirs created since the round started and decompresses the
-// newest session.jsonl.zstd. We must write the file BEFORE exiting so it
-// is available (the dsh adapter waits for the child to exit before the
+// newest session.v3.jsonl.zstd. We must write the file BEFORE exiting so
+// it is available (the dsh adapter waits for the child to exit before the
 // lookup runs).
 
 /**
@@ -159,14 +160,18 @@ function compressZstd(buffer) {
 
 /**
  * Write the fake session log under
- * $DSH_HOME/sessions/<escaped-cwd>/session-<sessionId>/session.jsonl.zstd
- * with usage chunks totaling the given token count. The log is a real
- * zstd-compressed session.jsonl: a `session` header line followed by two
- * `assistant/chunk` usage records (input on the first, output on the
- * second, cacheReadTokens sprinkled on both so cache-read exclusion is
- * exercised end to end). Never throws — silently degrades on any failure
- * so the token-degradation scenario (no/write-protected DSH_HOME) is
- * supported.
+ * $DSH_HOME/sessions/<escaped-cwd>/session-<sessionId>/session.v3.jsonl.zstd
+ * with usage totaling the given token count.
+ *
+ * The log is a real zstd-compressed dsh >= 0.1.5 (format v3) session.jsonl:
+ * a `session` header line followed by one `assistant/message` record whose
+ * TOP-LEVEL `data.usage` object carries inputTokens + outputTokens (=
+ * tokens) plus a non-zero cacheReadTokens so cache-read exclusion is
+ * exercised end to end. `totalTokens` mirrors dsh's observed arithmetic
+ * (input + cacheRead + output). There is no `assistant/chunk` record in v3.
+ *
+ * Never throws — silently degrades on any failure so the token-degradation
+ * scenario (no/write-protected DSH_HOME) is supported.
  */
 function writeSessionLog(sessionId, tokens) {
   try {
@@ -183,38 +188,37 @@ function writeSessionLog(sessionId, tokens) {
     // MUST be excluded by the reader.
     const inputTokens = Math.max(0, tokens - 11);
     const outputTokens = tokens > 0 ? Math.min(tokens, 11) : 0;
+    const cacheReadTokens = 8;
 
     const header = JSON.stringify({
       type: "session",
-      version: 1,
+      version: 3,
       id: sessionId,
       createdAt: Date.now(),
       delegationDepth: 0,
     });
     const now = Date.now();
-    const chunk = (seq, input, output, cacheRead) =>
-      JSON.stringify({
-        type: "assistant/chunk",
-        seq,
-        time: now,
-        data: {
-          turn: 0,
-          step: seq,
-          chunk: {
-            type: "usage",
-            usage: {
-              inputTokens: input,
-              outputTokens: output,
-              cacheReadTokens: cacheRead,
-            },
-          },
+    // v3 usage lives at the TOP LEVEL of the record's `data` object; the
+    // reader (sumUsageChunks) reads only that copy and never recurses into
+    // `data.stream[]`, where dsh embeds a duplicate usage object.
+    const message = JSON.stringify({
+      type: "assistant/message",
+      seq: 0,
+      time: now,
+      data: {
+        turn: 0,
+        step: 0,
+        message: { role: "assistant", content: "scripted-dsh" },
+        usage: {
+          inputTokens,
+          outputTokens,
+          totalTokens: inputTokens + outputTokens + cacheReadTokens,
+          cacheReadTokens,
+          reasoningTokens: 0,
         },
-      });
-    const lines = [
-      header,
-      chunk(0, inputTokens, 0, 5),
-      chunk(1, 0, outputTokens, 3),
-    ].join("\n") + "\n";
+      },
+    });
+    const lines = [header, message].join("\n") + "\n";
 
     const sessionDir = path.join(
       dshHome,
@@ -224,7 +228,7 @@ function writeSessionLog(sessionId, tokens) {
     );
     fs.mkdirSync(sessionDir, { recursive: true });
     fs.writeFileSync(
-      path.join(sessionDir, "session.jsonl.zstd"),
+      path.join(sessionDir, "session.v3.jsonl.zstd"),
       compressZstd(Buffer.from(lines, "utf-8")),
     );
 

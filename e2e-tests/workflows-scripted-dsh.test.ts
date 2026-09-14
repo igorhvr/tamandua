@@ -11,9 +11,11 @@
  * TAMANDUA_DSH_BINARY is pointed at a scripted dsh (see
  * helpers/scripted-dsh.ts) that executes the real work protocol
  * deterministically, emitting plain-text output with NO session trailer
- * and writing a fake session.jsonl.zstd under the temp $DSH_HOME for
+ * and writing a fake session.v3.jsonl.zstd under the temp $DSH_HOME for
  * token attribution (dsh prints no usage — the scheduler reads usage
- * from the session files via the escaped-cwd scan).
+ * from the session files via the escaped-cwd scan; the v3 format is a
+ * `session` header plus `assistant/message` records carrying a top-level
+ * `data.usage`).
  *
  * Runs advance at nudge speed via the daemon control plane.
  *
@@ -87,7 +89,7 @@ function decompressZstd(buffer: Buffer): string {
   return r.stdout.toString("utf-8");
 }
 
-/** Collect every session.jsonl.zstd under a dsh home's sessions tree. */
+/** Collect every session.v3.jsonl.zstd under a dsh home's sessions tree. */
 function collectSessionLogs(dshHome: string): string[] {
   const sessionsRoot = path.join(dshHome, "sessions");
   if (!fs.existsSync(sessionsRoot)) return [];
@@ -97,7 +99,7 @@ function collectSessionLogs(dshHome: string): string[] {
     const projectDir = path.join(sessionsRoot, projectEntry.name);
     for (const sessionEntry of fs.readdirSync(projectDir, { withFileTypes: true })) {
       if (!sessionEntry.isDirectory()) continue;
-      const logPath = path.join(projectDir, sessionEntry.name, "session.jsonl.zstd");
+      const logPath = path.join(projectDir, sessionEntry.name, "session.v3.jsonl.zstd");
       if (fs.existsSync(logPath)) logs.push(logPath);
     }
   }
@@ -606,9 +608,10 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
         );
 
         // ── Token accounting: session-file usage attributed to the run ──
-        // Each work round writes a fake session.jsonl.zstd under the temp
-        // DSH_HOME; the scheduler attributes the newest session per round
-        // via the escaped-cwd scan (cacheReadTokens excluded).
+        // Each work round writes a fake session.v3.jsonl.zstd under the
+        // temp DSH_HOME; the scheduler attributes the newest session per
+        // round via the escaped-cwd scan (top-level data.usage, cache
+        // reads excluded).
         const dshHome = ctx.scripted.env.DSH_HOME;
         const sessionLogs = collectSessionLogs(dshHome);
         assert.equal(
