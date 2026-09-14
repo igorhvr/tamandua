@@ -971,7 +971,10 @@ async function handleRegisterRun(runId: string): Promise<JsonResponse> {
       /* best-effort */
     }
     logger.error("control-server: register-run failed", { runId, error: message });
-    return unprocessable(`Failed to register run: ${message}`);
+    // US-003: return the RAW validation message. The caller (run.ts) adds the
+    // single "Failed to register run with daemon: " prefix, so wrapping it
+    // here too produced a doubled prefix.
+    return unprocessable(message);
   }
 }
 

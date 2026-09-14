@@ -429,6 +429,14 @@ describe("control-server busy harness workdir waits (US-001)", () => {
     try {
       const response = await jsonRequest(port, "POST", "/control/register-run", { runId });
       assert.equal(response.status, 422, JSON.stringify(response.body));
+      // US-003: the control plane returns the RAW validation message — the CLI
+      // caller adds the single "Failed to register run with daemon: " prefix.
+      // The old "Failed to register run: " wrapper here produced a doubled prefix.
+      assert.equal(
+        String(response.body.error).startsWith("Failed to register run:"),
+        false,
+        `the control plane must not add its own register prefix: ${String(response.body.error)}`,
+      );
       const row = readRunRow(dbPath, runId);
       assert.equal(row.scheduling_status, "error");
       assert.notEqual(row.scheduling_status, "waiting");

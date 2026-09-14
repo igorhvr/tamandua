@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import crypto from "node:crypto";
+import http from "node:http";
 import {
   cleanChildEnv,
   reservePortHandles,
@@ -126,6 +128,48 @@ async function runCliToExit(args: string[], env: Record<string, string>): Promis
     child.on("error", reject);
     child.on("close", (code) => resolve({ stdout, stderr, code }));
   });
+}
+
+/**
+ * US-003: a minimal stand-in for the daemon control plane. It answers the
+ * liveness probe (/control/health) so runWorkflow never spawns a real daemon,
+ * and replies to register-run with a canned response. Everything else (e.g.
+ * /control/nudge) gets a benign 200.
+ */
+async function startFakeControlPlane(response: {
+  status: number;
+  body: Record<string, unknown>;
+}): Promise<{ port: number; close: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    req.on("data", () => {});
+    req.on("end", () => {
+      if (req.method === "GET" && req.url === "/control/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/control/register-run") {
+        res.writeHead(response.status, { "content-type": "application/json" });
+        res.end(JSON.stringify(response.body));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    port: address.port,
+    close: async () => {
+      server.closeAllConnections?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
 }
 
 describe("CLI workflow run working-directory-for-harness", () => {
@@ -340,6 +384,139 @@ describe("CLI workflow run working-directory-for-harness", () => {
         "should not print successful run output for invalid workflow",
       );
     } finally {
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try {
+        fs.rmSync(env.root, { recursive: true, force: true });
+      } catch {
+        /* cleanup */
+      }
+    }
+  });
+
+  // US-003: a busy harness workdir is a retriable admission condition, so the
+  // synchronous CLI path must exit 0 with a queued-behind explanation (not the
+  // old fatal 422), and --wait must still enter the wait loop for the new run.
+  it("prints queued-behind and exits 0 when the harness workdir is held", async () => {
+    const env = await createTempEnv();
+    const holderRunId = crypto.randomUUID();
+    const harnessDir = path.join(env.root, "held-workdir");
+    fs.mkdirSync(harnessDir, { recursive: true });
+    const fake = await startFakeControlPlane({
+      status: 202,
+      body: {
+        state: "waiting",
+        heldByRunId: holderRunId,
+        workingDirectoryForHarness: path.resolve(harnessDir),
+      },
+    });
+
+    try {
+      const workflowId = "cli-run-queued";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Queued run",
+          "--working-directory-for-harness",
+          harnessDir,
+        ],
+        { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+
+      assert.equal(
+        result.code,
+        0,
+        `expected exit code 0 (queued, not refused), got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.match(
+        result.stdout,
+        new RegExp(`Queued behind run ${holderRunId}`),
+        `stdout must name the holder run id:\n${result.stdout}`,
+      );
+      assert.ok(
+        result.stdout.includes(path.resolve(harnessDir)),
+        `stdout must name the held harness workdir:\n${result.stdout}`,
+      );
+      assert.ok(
+        !result.stdout.includes("Status: running"),
+        `the generic status line must not be printed for a queued-behind run:\n${result.stdout}`,
+      );
+      assert.ok(
+        !result.stderr.includes("Failed to register run"),
+        `stderr must not report a registration failure:\n${result.stderr}`,
+      );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try {
+        fs.rmSync(env.root, { recursive: true, force: true });
+      } catch {
+        /* cleanup */
+      }
+    }
+  });
+
+  it("still enters the wait loop with --wait when the run is queued behind a holder", async () => {
+    const env = await createTempEnv();
+    const holderRunId = crypto.randomUUID();
+    const harnessDir = path.join(env.root, "held-workdir-wait");
+    fs.mkdirSync(harnessDir, { recursive: true });
+    const fake = await startFakeControlPlane({
+      status: 202,
+      body: {
+        state: "waiting",
+        heldByRunId: holderRunId,
+        workingDirectoryForHarness: path.resolve(harnessDir),
+      },
+    });
+
+    try {
+      const workflowId = "cli-run-queued-wait";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      // --timeout 1s bounds the wait: the run stays non-terminal (the fake
+      // control plane never admits it), so the loop must time out with exit 2
+      // while having entered the wait loop for the newly created run.
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Queued wait run",
+          "--working-directory-for-harness",
+          harnessDir,
+          "--wait",
+          "--timeout",
+          "1s",
+        ],
+        { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+
+      assert.equal(
+        result.code,
+        2,
+        `expected wait-timeout exit code 2, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.match(
+        result.stdout,
+        new RegExp(`Queued behind run ${holderRunId}`),
+        `stdout must still explain the queue position:\n${result.stdout}`,
+      );
+      assert.match(
+        result.stderr,
+        /\[wait /,
+        `--wait must enter the wait loop (heartbeat on stderr):\n${result.stderr}`,
+      );
+      assert.match(result.stdout, /running/, "wait output must describe the queued run");
+    } finally {
+      try { await fake.close(); } catch {}
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
       await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
       try {

@@ -59,6 +59,19 @@ export interface RunWorkflowResult {
   workingDirectoryForHarness: string;
   /** Set when the run row was created but the daemon control plane didn't become reachable in time. */
   daemonWarning?: string;
+  /**
+   * US-003: set when the daemon admitted the run as 'waiting' because another
+   * live run already holds the harness working directory. "Workdir busy" is a
+   * retriable admission condition, NOT a launch failure: the run stays
+   * registered (status 'running') and the reconciler admits it once the holder
+   * releases the directory. Carries the holding run's id.
+   */
+  queuedBehindRunId?: string;
+  /**
+   * US-003: the daemon admission state that queuedBehindRunId corresponds to
+   * ('waiting' for a busy harness workdir). Undefined for an ordinary launch.
+   */
+  schedulingState?: string;
   /** Warnings collected during run creation (e.g. base capture failures degrading rugpull detection). */
   captureWarnings?: string[];
 }
@@ -504,6 +517,11 @@ export async function runWorkflow(
   // admit it. Capture probe timeouts as warnings; genuine registration
   // failures (non-2xx, daemon rejected the run) remain fatal.
   let daemonWarning: string | undefined;
+  // US-003: set when the daemon parks the run as 'waiting' behind another
+  // live run that holds the harness working directory. This is a success
+  // outcome (2xx), never a launch failure.
+  let queuedBehindRunId: string | undefined;
+  let schedulingState: string | undefined;
 
   try {
     await ensureDaemonControlAvailable();
@@ -538,6 +556,21 @@ export async function runWorkflow(
       throw new Error(`Failed to register run with daemon: ${message}`);
     }
 
+    // US-003: a 2xx `waiting` admission means the harness working directory is
+    // held by another live run. Treat it as success (the run row stays
+    // 'running' with scheduling_status='waiting'); surface the holder and the
+    // admission state so the CLI can explain the queue position. The
+    // reconciler admits the run when the holder releases the directory.
+    if (registration.body.state === "waiting") {
+      schedulingState = "waiting";
+      if (
+        typeof registration.body.heldByRunId === "string" &&
+        registration.body.heldByRunId.length > 0
+      ) {
+        queuedBehindRunId = registration.body.heldByRunId;
+      }
+    }
+
     // Kick the first dispatch immediately — the first step is already
     // 'pending', so without a nudge the run would idle until the fallback
     // dispatch sweep. Fire-and-forget: the sweep is the safety net.
@@ -557,6 +590,8 @@ export async function runWorkflow(
     stepCount: workflow.steps.length,
     workingDirectoryForHarness,
     daemonWarning,
+    queuedBehindRunId,
+    schedulingState,
     captureWarnings: warnings.length > 0 ? warnings : undefined,
   };
 }

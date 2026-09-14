@@ -1127,6 +1127,143 @@ describe("runWorkflow", () => {
     });
   });
 
+  // US-003: "harness workdir busy" is a retriable admission condition. The
+  // synchronous register path must treat the daemon's 202 {state:'waiting'}
+  // answer as success and surface the holder; genuine non-2xx registration
+  // failures stay fatal (with exactly one "Failed to register run" prefix).
+  describe("US-003: sync register path treats waiting admission as success", () => {
+    async function startFakeControlPlane(response: {
+      status: number;
+      body: Record<string, unknown>;
+    }): Promise<{ port: number; close: () => Promise<void> }> {
+      const server = http.createServer((req, res) => {
+        // Drain the request body before replying so the client socket can close.
+        req.on("data", () => {});
+        req.on("end", () => {
+          if (req.method === "GET" && req.url === "/control/health") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+          if (req.method === "POST" && req.url === "/control/register-run") {
+            res.writeHead(response.status, { "content-type": "application/json" });
+            res.end(JSON.stringify(response.body));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      return {
+        port: address.port,
+        close: async () => {
+          server.closeAllConnections?.();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    it("surfaces queuedBehindRunId and keeps the run running on a 202 waiting", async () => {
+      const workflowId = "test-us003-waiting";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const harnessDir = path.join(tempHome, "us003-held-workdir");
+      initGitRepo(harnessDir);
+      const holderRunId = crypto.randomUUID();
+
+      const fake = await startFakeControlPlane({
+        status: 202,
+        body: {
+          state: "waiting",
+          heldByRunId: holderRunId,
+          workingDirectoryForHarness: path.resolve(harnessDir),
+        },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        const result = await runWorkflow({
+          workflowId,
+          taskTitle: "US-003 busy workdir is queued, not refused",
+          workingDirectoryForHarness: harnessDir,
+        });
+
+        assert.equal(result.status, "running", "a waiting admission must not fail the run");
+        assert.equal(result.queuedBehindRunId, holderRunId);
+        assert.equal(result.schedulingState, "waiting");
+        assert.equal(result.daemonWarning, undefined);
+
+        const { getDb } = await import("../../dist/db.js");
+        const row = getDb()
+          .prepare("SELECT status, scheduling_status FROM runs WHERE id = ?")
+          .get(result.runId) as { status: string; scheduling_status: string | null };
+        assert.equal(row.status, "running", "run must not be marked failed");
+        assert.notEqual(row.status, "failed");
+        assert.notEqual(row.scheduling_status, "error");
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+    });
+
+    it("still fails the run on a genuine non-2xx registration error with a single prefix", async () => {
+      const workflowId = "test-us003-fatal";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const harnessDir = path.join(tempHome, "us003-fatal-workdir");
+      initGitRepo(harnessDir);
+
+      const fake = await startFakeControlPlane({
+        status: 422,
+        body: { error: "working-directory-for-harness does not exist: /nope" },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        await assert.rejects(
+          runWorkflow({
+            workflowId,
+            taskTitle: "US-003 genuine failure stays fatal",
+            workingDirectoryForHarness: harnessDir,
+          }),
+          (err: unknown) => {
+            const message = (err as Error).message;
+            assert.equal(
+              message,
+              "Failed to register run with daemon: working-directory-for-harness does not exist: /nope",
+              "the raw validation message must be wrapped exactly once",
+            );
+            const prefixes = message.match(/Failed to register run/g) ?? [];
+            assert.equal(prefixes.length, 1, `expected a single prefix, got: ${message}`);
+            return true;
+          },
+        );
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const row = getDb()
+        .prepare("SELECT status FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1")
+        .get(workflowId) as { status: string } | undefined;
+      assert.ok(row, "the run row should have been created before the fatal registration error");
+      assert.equal(row!.status, "failed", "genuine registration failures still fail the run");
+    });
+  });
+
   describe("BSHA - capture failure events and warnings", () => {
     it("emits run.base_capture_failed event when git capture fails in non-git directory", async () => {
       const workflowId = "test-bsha-capture-event";

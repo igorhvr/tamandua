@@ -806,6 +806,17 @@ export async function handleWorkflow(
       }
       console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nRun created (pending admission); the reconciler will admit it when the control plane responds.`);
       console.log(`Check: tamandua workflow status run-${result.runId.slice(0, 8)}${dashboardLine}`);
+    } else if (result.queuedBehindRunId) {
+      // US-003: the harness working directory is held by another live run, so
+      // registration returned a retriable 'waiting' admission (not a failure).
+      // The run is registered and the reconciler admits it once the holder
+      // releases the directory — exit 0 and explain the queue position.
+      console.log(
+        `Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\n` +
+        `Queued behind run ${result.queuedBehindRunId}: harness workdir ${result.workingDirectoryForHarness} is held by that run. ` +
+        `It will be admitted automatically when the holder releases it.`,
+      );
+      console.log(`Check: tamandua workflow status run-${result.runId.slice(0, 8)}`);
     } else {
       console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nStatus: ${result.status}\nHarness CWD: ${result.workingDirectoryForHarness}`);
     }
