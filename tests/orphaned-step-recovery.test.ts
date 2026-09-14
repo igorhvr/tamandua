@@ -441,6 +441,33 @@ describe("other_output recovery (clean pi exit without STATUS)", () => {
     );
   });
 
+  // ── PRAW US-001: markers are anchored at line start ─────────────
+  it("classifyWorkRoundOutcome: STATUS/NO_WORK markers are recognized only at line start", () => {
+    // A STATUS line embedded mid-line (e.g. inside tool-result prose) is not
+    // the agent's report.
+    assert.equal(
+      classifyWorkRoundOutcome("ran the task\nSTATUS: done"),
+      "other_output",
+      "STATUS not at line start must be other_output",
+    );
+    assert.equal(
+      classifyWorkRoundOutcome("tool says STATUS: done"),
+      "other_output",
+      "STATUS embedded in tool-result text must be other_output",
+    );
+    assert.equal(
+      classifyWorkRoundOutcome("prefix NO_WORK_AVAILABLE"),
+      "other_output",
+      "NO_WORK_AVAILABLE not at line start must be other_output",
+    );
+
+    // Line-start markers (with optional leading whitespace) still classify.
+    assert.equal(classifyWorkRoundOutcome("STATUS: done"), "work_done");
+    assert.equal(classifyWorkRoundOutcome("  STATUS: done\nCHANGES: x"), "work_done");
+    assert.equal(classifyWorkRoundOutcome("STATUS: failed\nREASON: x"), "work_failed");
+    assert.equal(classifyWorkRoundOutcome("  NO_WORK_AVAILABLE"), "no_work");
+  });
+
   // ── AC 4: other_output with no running step is a no-op ─────────
   it("recoverOrphanedStepsForAgent is a no-op when no running steps exist", () => {
     const result = recoverOrphanedStepsForAgent("agent_with_no_claims_xyz", crypto.randomUUID());

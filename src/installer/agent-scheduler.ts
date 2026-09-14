@@ -640,9 +640,14 @@ interface WorkRoundOutputSummary extends BoundedPreviewMetadata {
  */
 export function classifyWorkRoundOutcome(output: string): WorkRoundOutcome {
   if (output.length === 0) return "empty_output";
-  if (/\bNO_WORK_AVAILABLE\b/.test(output)) return "no_work";
-  if (/STATUS:\s*(fail|failed|error)/i.test(output)) return "work_failed";
-  if (/STATUS:\s*done/i.test(output)) return "work_done";
+  // Markers are recognized ONLY at the START of the assistant's own final
+  // text (leading whitespace allowed), never embedded mid-line and never
+  // inside a tool_execution payload. A STATUS/NO_WORK marker echoed back in
+  // a tool result, a cat'ed file, or a command echo is NOT the agent's
+  // report (PRAW requirement 2) and must never drive completion.
+  if (/^\s*NO_WORK_AVAILABLE\b/.test(output)) return "no_work";
+  if (/^\s*STATUS:\s*(fail|failed|error)\b/i.test(output)) return "work_failed";
+  if (/^\s*STATUS:\s*done\b/i.test(output)) return "work_done";
   return "other_output";
 }
 
@@ -820,10 +825,14 @@ export function parseWorkRoundMetadata(output: string): WorkRoundMetadata {
     }
   }
 
-  if (!assistantOutput) {
-    assistantOutput = normalized;
-  }
-
+  // PRAW requirement 1: a JSON round with no assistant text yields
+  // assistantOutput "" — NOT the raw JSONL transcript. The transcript is
+  // full of tool payloads that may echo the task instructions (including a
+  // literal "STATUS: done"), so treating it as the round's output let a
+  // tool result masquerade as the agent's report. There is no fallback:
+  // an empty assistant text classifies as empty_output. Identifier hints
+  // are still harvested from tool data below (token attribution and
+  // cross-run hijack detection depend on them).
   const hintsFromToolData = extractIdentifierHints(toolTextFragments.join("\n"));
   const fallbackHints = extractIdentifierHints(`${assistantOutput}\n${normalized}`);
 
@@ -1862,7 +1871,11 @@ export async function executeDispatchRound(
 
     // ── Post-round processing ──────────────────────────────────────
     const metadata = parseWorkRoundMetadata(output);
-    const outputSummary = summarizeWorkRoundOutput(metadata.assistantOutput || output);
+    // PRAW requirement 1/2: classify the assistant's OWN text only. Text-mode
+    // rounds already carry their normalized text in `assistantOutput`; a JSON
+    // round with no assistant text is empty_output and must NOT fall back to
+    // the raw JSONL transcript (tool payloads can contain a literal STATUS).
+    const outputSummary = summarizeWorkRoundOutput(metadata.assistantOutput);
 
     logger.info("Work round complete", {
       ...context,

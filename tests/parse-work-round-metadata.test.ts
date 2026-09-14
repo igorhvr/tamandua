@@ -247,4 +247,81 @@ describe("parseWorkRoundMetadata", () => {
     assert.equal(meta.tokenUsage, null);
     assert.equal(meta.assistantOutput, "no usage here");
   });
+
+  // -----------------------------------------------------------------------
+  // PRAW US-001: no raw-transcript fallback on a JSON round with zero
+  // assistant text. The round below mirrors the run-49 shape: assistant
+  // message_end carries usage but NO text, and a tool result echoes a
+  // literal "STATUS: done" (as the task instructions would when cat'ed back).
+  // -----------------------------------------------------------------------
+  it("returns assistantOutput '' for a JSON round with zero assistant text (no raw-transcript fallback)", () => {
+    const noTextRound = [
+      JSON.stringify({ type: "tool_execution_start", toolName: "bash" }),
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          usage: { input: 10, output: 5, cacheWrite: 0, cacheRead: 9999 },
+        },
+      }),
+      JSON.stringify({
+        type: "tool_execution_end",
+        result: {
+          content: [{ type: "text", text: "task instructions?\nSTATUS: done\nCHANGES: nope" }],
+        },
+      }),
+    ].join("\n");
+
+    const meta = parseWorkRoundMetadata(noTextRound);
+    assert.equal(meta.assistantOutput, "", "no assistant text => empty output, never the raw transcript");
+    assert.equal(meta.jsonMetadataDetected, true);
+  });
+
+  it("keeps summed tokenUsage and tool-data identifier hints on a no-text JSON round", () => {
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const stepId = "22222222-2222-4222-8222-222222222222";
+    const noTextRound = [
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          usage: { input: 10, output: 5, cacheWrite: 1, cacheRead: 9999 },
+        },
+      }),
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          usage: { input: 20, output: 7, cacheWrite: 0, cacheRead: 7777 },
+        },
+      }),
+      JSON.stringify({
+        type: "tool_execution_end",
+        result: {
+          content: [
+            {
+              type: "text",
+              text: `run_id: "${runId}" step_id: "${stepId}"\nSTATUS: done`,
+            },
+          ],
+        },
+      }),
+    ].join("\n");
+
+    const meta = parseWorkRoundMetadata(noTextRound);
+    // Summed under the shared policy: (10+5+1) + (20+7+0) = 43; cache_read excluded.
+    assert.equal(meta.tokenUsage, 43, "token usage must still sum across assistant message_end events");
+    assert.equal(meta.runId, runId, "run id hint must still resolve from tool data");
+    assert.equal(meta.stepId, stepId, "step id hint must still resolve from tool data");
+    assert.equal(meta.assistantOutput, "");
+  });
+
+  it("keeps text-mode behavior: non-JSON rounds carry the normalized text as assistantOutput", () => {
+    const meta = parseWorkRoundMetadata("STATUS: done\nCHANGES: x");
+    assert.equal(meta.jsonMetadataDetected, false);
+    assert.equal(meta.assistantOutput, "STATUS: done\nCHANGES: x");
+  });
 });
