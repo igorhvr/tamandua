@@ -203,7 +203,7 @@ function getUsageText(): string {
     "tamandua step fail <step-id> <error>  Fail step with retry logic. Ids: step-<uuid> or bare.",
     "tamandua step stories <run-id> [--json]        List stories for a run. Ids: run-<uuid> or bare.",
     "tamandua step release <run-id> [step-id] [--force]  Release stuck step back to pending. Ids: run-<uuid>, step-<uuid>.",
-    "", "tamandua logs [<lines>|<run-id>|#<run-number>] Show recent activity",
+    "", "tamandua logs [<lines>|<run-id>|#<run-number>] [--tail <N>] [--follow|-f]  Show recent activity or follow",
     "tamandua logs-tail [<lines>|<run-id>|#<run-number>] Follow recent activity",
     "", "tamandua version                      Show installed version",
     "tamandua skill-path                  Print path to the bundled tamandua-agents skill",

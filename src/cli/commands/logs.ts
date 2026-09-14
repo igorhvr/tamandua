@@ -17,7 +17,7 @@ import {
 } from "../../installer/events.js";
 import { formatLogsTailLines } from "../../installer/logs-tail-format.js";
 import { getWorkflowStatus } from "../../installer/status.js";
-import { lookupRunIdByNumber, parseLogsSelector } from "../logs-selector.js";
+import { lookupRunIdByNumber, parseLogsSelector, type LogsSelector } from "../logs-selector.js";
 
 function printEvents(events: TamanduaEvent[]): void {
   if (events.length === 0) { console.log("No events yet."); return; }
@@ -132,10 +132,59 @@ async function streamEventSource(
   }
 }
 
+/**
+ * Follow a selector's events in real-time — the shared core behind both
+ * `tamandua logs-tail` and `tamandua logs --follow` / `-f`.
+ *
+ * `initialLimit` (when provided) sets the initial window; when omitted the
+ * selector's own default applies (the numeric limit for global selectors,
+ * 50 for run selectors — matching logs-tail's behavior).
+ */
+async function followSelector(selector: LogsSelector, initialLimit?: number): Promise<void> {
+  if (selector.kind === "global-recent" || selector.kind === "global-limit") {
+    await streamEventSource({ kind: "global" }, initialLimit ?? selector.limit);
+    return;
+  }
+
+  if (selector.kind === "run-number") {
+    const runId = lookupRunIdByNumber(selector.runNumber);
+    if (!runId) {
+      console.log(`No run #${selector.runNumber}.`);
+      return;
+    }
+    await streamEventSource({ kind: "run", runId }, initialLimit ?? 50, runId);
+    return;
+  }
+
+  let runId: string;
+  try {
+    runId = getWorkflowStatus(selector.runId).id;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : `No run found matching "${selector.runId}".`;
+    // The DB row may lag behind the events file in early bootstrap (events
+    // can be written before the run row is committed). If the literal runId
+    // already has an events file on disk, tail it; otherwise fall through
+    // to the not-found message so unknown prefixes don't hang forever.
+    if (message.startsWith("No run found matching")) {
+      const { getEventsPath } = await import("../../installer/events.js");
+      const fsMod = await import("node:fs");
+      const pathMod = await import("node:path");
+      const eventsFile = pathMod.join(getEventsPath(), `${selector.runId}.jsonl`);
+      if (fsMod.existsSync(eventsFile)) {
+        await streamEventSource({ kind: "run", runId: selector.runId }, initialLimit ?? 50);
+        return;
+      }
+    }
+    console.log(message);
+    return;
+  }
+  await streamEventSource({ kind: "run", runId }, initialLimit ?? 50, runId);
+}
+
 export function getLogsHelp(): string {
   return `tamandua logs — Show recent activity events
 
-Usage: tamandua logs [<selector>] [--tail <N>]
+Usage: tamandua logs [<selector>] [--tail <N>] [--follow | -f]
 
 Shows the most recent Tamandua activity events (runs, steps, agent activity).
 The optional selector determines which events to show.
@@ -150,6 +199,10 @@ Options:
   --tail <N>    Print the last N events and exit (bounded). With a run-id,
                 shows the last N events for that run. Without a run-id,
                 shows the last N global events.
+  --follow, -f  Follow events in real-time (like logs-tail). This BLOCKS —
+                it streams until Ctrl-C or until the followed run ends.
+                Combine with --tail <N> to set the initial window; without
+                it, the window defaults to 50.
 
 If a run-id prefix matches no run in the database but has an events file on
 disk (events can be written before the run row is committed), the logs output
@@ -161,7 +214,9 @@ Examples:
   tamandua logs abc123            # Show events for run starting with abc123
   tamandua logs #3                # Show events for run #3
   tamandua logs --tail 30         # Show last 30 global events
-  tamandua logs abc123 --tail 20  # Show last 20 events for run abc123`;
+  tamandua logs abc123 --tail 20  # Show last 20 events for run abc123
+  tamandua logs --follow          # Follow global events (blocks until Ctrl-C)
+  tamandua logs abc123 --follow   # Follow run abc123 (auto-exits when done)`;
 }
 
 export function getLogsTailHelp(): string {
@@ -170,7 +225,9 @@ export function getLogsTailHelp(): string {
 Usage: tamandua logs-tail [<selector>]
 
 Follows Tamandua activity events in real-time, polling for new events and
-printing them as they arrive. Press Ctrl-C (SIGINT) to stop following.
+printing them as they arrive. This BLOCKS: it streams until Ctrl-C (SIGINT)
+or until the followed run ends (a run selector auto-exits once the run
+reaches a terminal status).
 
 The selector uses the same syntax as tamandua logs:
   <run-id>      Follow events for a specific run (prefix match supported)
@@ -191,13 +248,17 @@ Examples:
 /** Handle logs and logs-tail commands. Returns false for unrelated command groups. */
 export async function handleLogs(group: string, args: string[]): Promise<boolean> {
   if (group === "logs") {
-    // Pre-process args: extract --tail, reject unknown flags, detect "tail" literal.
+    // Pre-process args: extract --tail and --follow/-f, reject unknown flags,
+    // detect "tail" literal.
     let tailLimit: number | undefined;
+    let follow = false;
     const positionalArgs: string[] = [];
 
     for (let i = 1; i < args.length; i++) {
       const arg = args[i];
-      if (arg === "--tail") {
+      if (arg === "--follow" || arg === "-f") {
+        follow = true;
+      } else if (arg === "--tail") {
         if (i + 1 < args.length && /^\d+$/.test(args[i + 1])) {
           tailLimit = parseInt(args[i + 1], 10);
           i++; // consume the number
@@ -228,6 +289,13 @@ export async function handleLogs(group: string, args: string[]): Promise<boolean
     }
 
     const selector = parseLogsSelector(positionalArgs.length > 0 ? positionalArgs[0] : undefined);
+
+    // --follow / -f: blocking follow (alias of logs-tail). --tail N sets the
+    // initial window; without --tail the selector's default window applies.
+    if (follow) {
+      await followSelector(selector, tailLimit);
+      return true;
+    }
 
     // --tail mode: bounded read — print the last N events and exit (never follow).
     if (tailLimit !== undefined) {
@@ -293,45 +361,7 @@ export async function handleLogs(group: string, args: string[]): Promise<boolean
 
   if (group === "logs-tail") {
     const selector = parseLogsSelector(args[1]);
-
-    if (selector.kind === "global-recent" || selector.kind === "global-limit") {
-      await streamEventSource({ kind: "global" }, selector.limit);
-      return true;
-    }
-
-    if (selector.kind === "run-number") {
-      const runId = lookupRunIdByNumber(selector.runNumber);
-      if (!runId) {
-        console.log(`No run #${selector.runNumber}.`);
-        return true;
-      }
-      await streamEventSource({ kind: "run", runId }, 50, runId);
-      return true;
-    }
-
-    let logsTailRunId: string;
-    try {
-      logsTailRunId = getWorkflowStatus(selector.runId).id;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : `No run found matching "${selector.runId}".`;
-      // The DB row may lag behind the events file in early bootstrap (events
-      // can be written before the run row is committed). If the literal runId
-      // already has an events file on disk, tail it; otherwise fall through
-      // to the not-found message so unknown prefixes don't hang forever.
-      if (message.startsWith("No run found matching")) {
-        const { getEventsPath } = await import("../../installer/events.js");
-        const fsMod = await import("node:fs");
-        const pathMod = await import("node:path");
-        const eventsFile = pathMod.join(getEventsPath(), `${selector.runId}.jsonl`);
-        if (fsMod.existsSync(eventsFile)) {
-          await streamEventSource({ kind: "run", runId: selector.runId }, 50);
-          return true;
-        }
-      }
-      console.log(message);
-      return true;
-    }
-    await streamEventSource({ kind: "run", runId: logsTailRunId }, 50, logsTailRunId);
+    await followSelector(selector);
     return true;
   }
 
