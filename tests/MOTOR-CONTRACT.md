@@ -48,6 +48,40 @@ token overhead on real runs (see the historical baselines at the bottom).
 - **C3** Agent output is classified by exact STATUS markers
   (`STATUS: done`, `STATUS: failed`/`error`). Output matching the step's
   `expects` completes it; anything else takes a failure/retry path.
+
+  **Work-round classification (PRAW):** separately from `expects`, the
+  scheduler classifies each dispatch round's *assistant* text
+  (`classifyWorkRoundOutcome`, via `parseWorkRoundMetadata` /
+  `summarizeWorkRoundOutput` in `src/installer/agent-scheduler.ts`). The
+  contract is anchored and assistant-text-only:
+  - A JSON round with no assistant text yields `assistantOutput: ""` and
+    outcome `empty_output` — there is **no raw-transcript fallback**. The raw
+    JSONL transcript (tool payloads, cat'ed files, `step complete --output`
+    echoes) is never the round's output, even when a `tool_execution` result
+    carries a literal `STATUS: done`. Identifier hints are still harvested
+    from tool data and per-call token usage is still summed, so token
+    attribution and cross-run hijack detection are unaffected.
+  - `STATUS: done`, `STATUS: fail|failed|error` and `NO_WORK_AVAILABLE` are
+    recognized ONLY at the start of the assistant's own final text (leading
+    whitespace allowed) — not on a later line, not embedded mid-line, and
+    never inside a `tool_execution` payload. Text-mode (non-JSON) rounds keep
+    their existing behavior (their normalized text is the round output).
+  - Outcome routing: `work_done` → `autoCompleteStepIfRunning`;
+    `other_output` / `empty_output` → `recoverOrphanedStepsForAgent`;
+    `no_work` → benign no-op. An `empty_output` round is not an instant fail
+    (RSPN/C9 requires sub-threshold wall time AND zero output AND a nonzero
+    exit/signal).
+  - **Paused/draining auto-completion:** the scheduler's output-derived
+    auto-completion (`autoCompleteStepIfRunning` → `completeStep` with
+    `{ rejectPausedRun: true }`) refuses a run whose `status` is `paused` or
+    whose `scheduling_status` is `draining_pause`, exactly as it already
+    refuses `failed`/`canceled`, and logs at INFO. The guard is opt-in, so
+    the agent-issued CLI `tamandua step complete` path still completes
+    in-flight work during a drain (pause lets in-flight work finish). Pinned
+    by `tests/parse-work-round-metadata.test.ts`,
+    `tests/orphaned-step-recovery.test.ts`,
+    `tests/work-round-token-attribution.test.ts` and
+    `src/installer/instant-fail.test.ts`.
 - **C4** `KEY: value` lines in step output are captured into run context and
   resolve `{{placeholders}}` in later step inputs (e.g. `{{branch}}`,
   `{{original_branch}}` seeding for worktrees).

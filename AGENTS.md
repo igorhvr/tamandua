@@ -187,6 +187,34 @@ other register-run failure remains fatal: missing/relative/nonexistent harness
 workdir, branch mismatch, unsupported harness, and malformed input still throw,
 are marked `scheduling_status = 'error'`, and return **422** — they never enter
 `waiting`.
+**Round-outcome classification (PRAW).** Each dispatch round's *assistant*
+text is classified by `classifyWorkRoundOutcome` (via
+`parseWorkRoundMetadata` → `summarizeWorkRoundOutput`), and there is **no
+raw-transcript fallback**:
+
+- A JSON round (`pi --mode json`, hermes, dsh) with no assistant text yields
+  `assistantOutput: ""` and outcome `empty_output` — the raw JSONL transcript
+  is NEVER used as the round's output. A `tool_execution` result that echoes
+  the task instructions, a cat'ed file, or the agent's own
+  `tamandua step complete --output` text must not masquerade as the agent's
+  report (the run-49 defect). Identifier hints (run/step ids) are still
+  harvested from tool data and token usage is still summed, so token
+  attribution and cross-run hijack detection are unaffected.
+- `STATUS: done` / `STATUS: fail|failed|error` and `NO_WORK_AVAILABLE` are
+  recognized ONLY at the start of the assistant's own final text (leading
+  whitespace allowed) — not on a later line, not embedded mid-line, and never
+  inside a `tool_execution` payload. Text-mode (non-JSON) rounds keep their
+  existing behavior: their normalized text is the round output.
+- Outcome routing: `work_done` → `autoCompleteStepIfRunning`; `other_output`
+  / `empty_output` → `recoverOrphanedStepsForAgent`; `no_work` → benign no-op.
+
+**Paused auto-completion (PRAW).** Scheduler output-derived auto-completion
+(`autoCompleteStepIfRunning` → `completeStep(..., { rejectPausedRun: true })`)
+refuses a run whose `status` is `paused` OR whose `scheduling_status` is
+`draining_pause`, exactly as it already refuses `failed`/`canceled`, and logs
+at INFO with the runId/stepId and run/scheduling status. The guard is opt-in:
+the agent-issued CLI `tamandua step complete` path passes no such option, so a
+pause drain still lets in-flight agent work finish and report normally.
 
 ### Step Lifecycle
 
