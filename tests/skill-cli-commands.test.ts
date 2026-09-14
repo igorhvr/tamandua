@@ -600,6 +600,23 @@ describe("SKILL.md logs commands documented", () => {
   });
 });
 
+describe("SKILL.md logs bounded vs blocking follow", () => {
+  it("states logs-tail and --follow BLOCK and must not run from a tool call without a timeout", () => {
+    assert.match(skillContent, /logs-tail[^]*--follow[^]*BLOCK/i);
+    assert.match(skillContent, /must not be run from a tool call without a timeout/i);
+  });
+
+  it("lists the bounded forms logs <run-id>, logs <run-id> --tail N, and workflow status", () => {
+    assert.ok(skillContent.includes("tamandua logs <run-id>"));
+    assert.ok(skillContent.includes("tamandua logs <run-id> --tail"));
+    assert.ok(skillContent.includes("tamandua workflow status <run-id>"));
+  });
+
+  it("does not present logs --tail N as a blocking follow", () => {
+    assert.doesNotMatch(skillContent, /tail a specific run with initial limit/i);
+  });
+});
+
 describe("SKILL.md output format accuracy", () => {
   it("completion contract specifies STATUS, CHANGES, TESTS", () => {
     assert.ok(skillContent.includes("STATUS:"), "SKILL.md must mention STATUS: output field");

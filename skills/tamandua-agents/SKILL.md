@@ -342,30 +342,46 @@ to cancel and delete a running or paused run in one step.
 
 ### Inspect activity with logs and logs-tail
 
-Use logs to inspect recent run activity or follow events as they happen.
+Use `tamandua logs` to inspect recent activity (bounded — it prints and exits)
+or `tamandua logs-tail` / `tamandua logs --follow` to follow events as they
+happen (blocking — see below).
 
 The selector can be:
 - A number — shows that many most recent entries globally
 - A run ID prefix — shows entries for that run
 - `#<run-number>` — shows entries for the Nth run
 
+**Bounded forms (print and exit — safe from a tool call):**
+
 ```bash
-# Show recent entries
 tamandua logs                        # default: last 20 entries
-tamandua logs --tail 50              # last 50 entries (flag form)
+tamandua logs --tail 50              # last 50 entries (flag form, bounded)
 tamandua logs 50                     # last 50 entries (numeric selector)
 tamandua logs <run-id>               # entries for a specific run
-tamandua logs <run-id> --tail 20     # tail a specific run with initial limit
+tamandua logs <run-id> --tail 20     # last 20 entries for a specific run
 tamandua logs #3                     # entries for run number 3
-
-# Follow activity as new events arrive
-tamandua logs-tail                   # tail recent activity (live)
-tamandua logs-tail 50                # tail, starting with last 50 entries
-tamandua logs-tail <run-id>          # tail events for a specific run
-tamandua logs-tail #3                # tail events for run number 3
+tamandua workflow status <run-id>    # one-shot run status (bounded)
 ```
 
-Example: after starting a workflow, follow its progress:
+**Blocking follow (streams until Ctrl-C or until the followed run ends):**
+
+`tamandua logs-tail` and `tamandua logs --follow` / `-f` BLOCK: they stream
+events until Ctrl-C (SIGINT) or until the followed run reaches a terminal
+status. They must not be run from a tool call without a timeout — they will
+hang until the round times out.
+
+```bash
+tamandua logs-tail                   # tail recent activity (live, blocks)
+tamandua logs-tail 50                # tail, starting with last 50 entries
+tamandua logs-tail <run-id>          # tail a run; auto-exits when the run ends
+tamandua logs-tail #3                # tail events for run number 3
+tamandua logs --follow               # alias of logs-tail (blocks)
+tamandua logs <run-id> --follow      # follow a run; auto-exits when the run ends
+tamandua logs --follow --tail 20     # follow, starting with the last 20 entries
+```
+
+Example: after starting a workflow, follow its progress (interactive only —
+this blocks):
 
 ```bash
 tamandua workflow run feature-dev "Add login page"

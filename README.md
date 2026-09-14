@@ -664,8 +664,8 @@ If something isn't working as expected, start with the built-in diagnostic:
 | `tamandua daemon start\|stop\|restart\|status` | Manage the daemon (control plane + scheduling motor) |
 | `tamandua mcp start\|stop\|restart\|status [--port N]` | Manage the standalone MCP server |
 | `tamandua control-plane start\|stop\|restart\|status [--port N]` | Alias for daemon commands (control plane is hosted by daemon) |
-| `tamandua logs [<lines>|<run-id>|#<run-number>] [--tail <N>]` | View recent log entries. `--tail N` shows last N entries (flag equivalent of numeric selector). |
-| `tamandua logs-tail [<lines>|<run-id>|#<run-number>]` | Follow recent activity as new events arrive |
+| `tamandua logs [<lines>\|<run-id>\|#<run-number>] [--tail <N>] [--follow \| -f]` | View recent log entries and exit (bounded). `--tail N` shows the last N entries; `--follow`/`-f` instead blocks and follows like `logs-tail`. |
+| `tamandua logs-tail [<lines>\|<run-id>\|#<run-number>]` | Follow recent activity as new events arrive — blocks until Ctrl-C or until the followed run ends |
 | `tamandua nudge` | Trigger an immediate dispatch round for all running runs |
 
 When you start the management dashboard (`tamandua dashboard`), Tamandua automatically starts the remote MCP server too.
