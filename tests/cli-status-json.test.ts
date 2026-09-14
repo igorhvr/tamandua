@@ -322,7 +322,7 @@ describe("tamandua status --json", () => {
     const { homeDir, tamanduaDir } = createTempHome("tamandua-status-waiting-human-");
     const dbPath = path.join(tamanduaDir, "tamandua.db");
     seedDb(dbPath);
-    const waitText = "waiting for harness workdir held by run run-holder01: /tmp/held-dir";
+    const waitText = "waiting for harness workdir held by run run-holder01: /srv/held-dir";
     const db = new DatabaseSync(dbPath);
     db.prepare("UPDATE runs SET scheduling_status = 'waiting', scheduling_error = ? WHERE status = 'running'").run(waitText);
     db.close();
@@ -330,7 +330,7 @@ describe("tamandua status --json", () => {
     const { stdout, stderr } = await runCli(["status"], homeDir, tamanduaDir);
     assert.equal(cleanStderr(stderr), "", `unexpected stderr: ${cleanStderr(stderr)}`);
     assert.match(stdout, /Workflow Runs/);
-    assert.match(stdout, /waiting for harness workdir held by run run-holder01: \/tmp\/held-dir/);
+    assert.match(stdout, /waiting for harness workdir held by run run-holder01: \/srv\/held-dir/);
   });
 
   // AC 7: With --json, stdout contains exactly one JSON object and nothing else

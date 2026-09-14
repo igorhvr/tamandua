@@ -2284,14 +2284,14 @@ describe("formatRunsSummary", () => {
           updatedAt: now,
           tokensSpent: 100,
           schedulingStatus: "waiting",
-          schedulingError: "waiting for harness workdir held by run run-holder01: /tmp/held-dir",
+          schedulingError: "waiting for harness workdir held by run run-holder01: /srv/held-dir",
         },
       ],
       isDaemonRunning: () => true,
     });
     // The stored scheduling_error is rendered verbatim so an operator can tell
     // "waiting" from "dead".
-    assert.match(result, /waiting for harness workdir held by run run-holder01: \/tmp\/held-dir/);
+    assert.match(result, /waiting for harness workdir held by run run-holder01: \/srv\/held-dir/);
     // A waiting run is not annotated as stale while the daemon is healthy.
     assert.doesNotMatch(result, /stale/);
   });
