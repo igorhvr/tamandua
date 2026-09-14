@@ -346,7 +346,7 @@ export async function lookupDshSessionTokens(
 
     // ── Read (decompress only when needed) + parse ─────────────
     const text = session.compressed
-      ? await decompressSessionLog(
+      ? await decompressDshSessionLog(
           session.logPath,
           options.zstdStrategy ?? "auto",
           options.env,
@@ -508,10 +508,18 @@ function readPlainSessionLog(logPath: string): string | null {
 }
 
 /**
- * Decompress the session log via the selected strategy. Returns the
- * plaintext JSONL, or null after one warning on any failure.
+ * Decompress the (concatenated-frame) v3 session log via the selected
+ * strategy and return its plaintext JSONL, or null after one warning on
+ * any failure.
+ *
+ * Exported so tests can assert multi-frame decoding directly against a
+ * real dsh >= 0.1.5 session container. The `node` tier scans the
+ * container structurally and decodes EACH frame separately — whole-buffer
+ * `zstdDecompressSync` would return only the first frame. The `binary`
+ * tier spawns `zstd -dc`, which handles concatenated frames natively.
+ * `lookupDshSessionTokens` behavior is unchanged by this export.
  */
-async function decompressSessionLog(
+export async function decompressDshSessionLog(
   logPath: string,
   strategy: DshZstdStrategy,
   env?: NodeJS.ProcessEnv,

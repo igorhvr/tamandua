@@ -1,20 +1,28 @@
 /**
  * Unit tests for dsh-usage.ts — lookupDshSessionTokens.
  *
- * All fixtures are synthetic session logs (no real dsh, no model calls,
+ * Most fixtures are synthetic session logs (no real dsh, no model calls,
  * zero tokens). zstd fixture compression is feature-gated on node:zlib
  * `zstdCompressSync` (Node >= 23.8); the binary-strategy tests exercise
  * the same parsing through a fake `zstd` shell script so the reader's
  * core logic is covered on every supported Node.
  *
- * This file spawns `zstd` via the module's binary fallback, so it is
- * classified in the serial test lane (tests/serial-files.txt).
+ * The "dsh v3 real multi-frame fixture" suite additionally stages the
+ * coordinator-verified dsh 0.1.5 container (copied byte-for-byte into
+ * tests/fixtures/dsh-v3/) and — on this host — exercises the genuine
+ * `zstd -dc` binary.
+ *
+ * This file spawns `zstd` (fake shell shim and, for the real-fixture
+ * binary-tier test, the real binary), so it is classified in the serial
+ * test lane (tests/serial-files.txt).
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
   lookupDshSessionTokens,
@@ -22,7 +30,71 @@ import {
   resolveDshHome,
   dshSessionProjectDir,
   sumUsageChunks,
+  decompressDshSessionLog,
 } from "../../dist/installer/dsh-usage.js";
+
+// ── Real dsh 0.1.5 (v3) ground-truth fixture ───────────────────────
+//
+// Copied byte-for-byte from the coordinator-verified fixture:
+//   /root/matchlock-work/dsh-v3-fixture/session-store/
+//     session-281fad5b-1fb8-4872-8434-1a29c5fcd8f2/session.v3.jsonl.zstd
+// It is a CONCATENATED zstd-frame container; node:zlib
+// `zstdDecompressSync` applied to the WHOLE buffer yields only the first
+// frame (1 record), while `zstd -dc` yields all 18 records. The reader
+// must therefore scan + decode frame by frame.
+const FIXTURE_DIR = path.resolve(
+  import.meta.dirname ?? __dirname,
+  "..",
+  "..",
+  "tests",
+  "fixtures",
+  "dsh-v3",
+);
+const FIXTURE_ZSTD = path.join(FIXTURE_DIR, "session.v3.jsonl.zstd");
+const FIXTURE_LOCK = path.join(FIXTURE_DIR, "session.lock");
+const FIXTURE_SHA256 =
+  "fe33b4d5081277b083ce6b9563b1f3eaad864c3eff18035ee046f1b42f6361f8";
+const FIXTURE_SESSION_NAME = "session-281fad5b-1fb8-4872-8434-1a29c5fcd8f2";
+// Hand computation from `zstd -dc <fixture>`: the single usage carrier is
+// the `assistant/message` record at seq 15 with
+//   inputTokens 7222 + outputTokens 13 = 7235
+// cacheReadTokens 0 and reasoningTokens 11 are EXCLUDED (shared policy),
+// and the duplicate `data.stream[].chunk.usage` copy is not counted.
+const FIXTURE_TOTAL_TOKENS = 7235;
+
+/** Is a real `zstd` CLI on PATH? (v1.4.8 at /usr/bin/zstd on this host.) */
+function detectZstdBinary(): boolean {
+  try {
+    execFileSync("zstd", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const haveZstdBinary = detectZstdBinary();
+
+/**
+ * Stage the real fixture as a v3 session directory under a temp
+ * `$DSH_HOME` (`sessions/<escaped-workdir>/session-<uuid>`), preserving
+ * the file bytes. `mutate` may rewrite the log bytes (e.g. truncation).
+ */
+function stageFixtureSession(opts: {
+  dshHome: string;
+  workdir: string;
+  sessionName?: string;
+  mutate?: (bytes: Buffer) => Buffer;
+}): { sessionDir: string; logPath: string } {
+  const sessionName = opts.sessionName ?? FIXTURE_SESSION_NAME;
+  const sessionsDir = dshSessionProjectDir(opts.dshHome, opts.workdir);
+  const sessionDir = path.join(sessionsDir, sessionName);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const bytes = fs.readFileSync(FIXTURE_ZSTD);
+  const logPath = path.join(sessionDir, "session.v3.jsonl.zstd");
+  fs.writeFileSync(logPath, opts.mutate ? opts.mutate(bytes) : bytes);
+  fs.copyFileSync(FIXTURE_LOCK, path.join(sessionDir, "session.lock"));
+  return { sessionDir, logPath };
+}
 
 // ── Feature gate: node:zlib zstd (Node >= 23.8) ────────────────────
 
@@ -787,6 +859,140 @@ describe("lookupDshSessionTokens", () => {
       assert.ok(result !== null);
       assert.equal(result.totalTokens, 11);
       assert.equal(result.sessionRef, sessionName);
+    },
+  );
+});
+
+// ── Real dsh 0.1.5 (v3) multi-frame fixture ────────────────────────
+
+describe("dsh v3 real multi-frame fixture", () => {
+  it("ships the coordinator-verified fixture bytes (sha256)", () => {
+    assert.ok(fs.existsSync(FIXTURE_ZSTD), `fixture missing: ${FIXTURE_ZSTD}`);
+    const sha = createHash("sha256").update(fs.readFileSync(FIXTURE_ZSTD)).digest("hex");
+    assert.equal(sha, FIXTURE_SHA256);
+    assert.ok(fs.existsSync(FIXTURE_LOCK), `fixture lock missing: ${FIXTURE_LOCK}`);
+  });
+
+  it(
+    "decodes every frame of the concatenated container (18 records, not just the first)",
+    { skip: !haveNodeZstd },
+    () => {
+      const buffer = fs.readFileSync(FIXTURE_ZSTD);
+
+      // Guard against regression to whole-buffer decoding: node:zlib
+      // applied to the whole concatenated buffer returns ONLY the first
+      // frame — one record. This is the defect the frame scan fixes.
+      const firstFrameOnly = zlib.zstdDecompressSync(buffer).toString("utf8");
+      const naiveRecords = firstFrameOnly.split("\n").filter((l) => l.trim().length > 0);
+      assert.equal(
+        naiveRecords.length,
+        1,
+        "whole-buffer zstdDecompressSync is expected to yield only the first frame",
+      );
+
+      return decompressDshSessionLog(FIXTURE_ZSTD, "node").then((text) => {
+        assert.ok(text !== null, "node zstd tier must decode the real fixture");
+        const records = text!
+          .split("\n")
+          .filter((l) => l.trim().length > 0);
+        assert.equal(records.length, 18, "all 18 frames/records must be decoded");
+        // Every decoded record must be valid JSON (proves frames were not
+        // concatenated mid-record).
+        for (const record of records) {
+          assert.doesNotThrow(() => JSON.parse(record));
+        }
+      });
+    },
+  );
+
+  it(
+    "looks up exactly 7235 tokens from the real fixture via the node tier",
+    { skip: !haveNodeZstd },
+    async () => {
+      const dshHome = path.join(tmpRoot!, "dsh-home");
+      const workdir = path.join(tmpRoot!, "worktree", "repo");
+      stageFixtureSession({ dshHome, workdir });
+
+      const result = await lookupDshSessionTokens({
+        spawnedAtMs: 0,
+        workdir,
+        env: envWith(dshHome),
+        zstdStrategy: "node",
+      });
+
+      assert.ok(result !== null, "the real v3 fixture must yield a total");
+      // Hand computation: input 7222 + output 13 = 7235. cacheReadTokens
+      // (0) and reasoningTokens (11) are excluded by the shared policy,
+      // and the duplicate data.stream[].chunk.usage copy is not counted.
+      assert.equal(result.totalTokens, FIXTURE_TOTAL_TOKENS);
+      assert.equal(result.sessionRef, FIXTURE_SESSION_NAME);
+
+      // The "auto" tier must ALSO decode every frame on a Node that has
+      // zlib zstd (it selects the frame-scanning node path) — not just
+      // the first frame.
+      const autoResult = await lookupDshSessionTokens({
+        spawnedAtMs: 0,
+        workdir,
+        env: envWith(dshHome),
+      });
+      assert.ok(autoResult !== null, "the auto tier must decode the real fixture");
+      assert.equal(autoResult.totalTokens, FIXTURE_TOTAL_TOKENS);
+    },
+  );
+
+  it(
+    "looks up exactly 7235 tokens from the real fixture via the binary zstd tier",
+    { skip: !haveZstdBinary },
+    async () => {
+      const dshHome = path.join(tmpRoot!, "dsh-home");
+      const workdir = path.join(tmpRoot!, "worktree", "repo");
+      stageFixtureSession({ dshHome, workdir });
+
+      const result = await lookupDshSessionTokens({
+        spawnedAtMs: 0,
+        workdir,
+        // Real PATH so the genuine `zstd -dc` (v1.4.8) is spawned.
+        env: envWith(dshHome),
+        zstdStrategy: "binary",
+      });
+
+      assert.ok(result !== null, "the real v3 fixture must yield a total");
+      assert.equal(result.totalTokens, FIXTURE_TOTAL_TOKENS);
+      assert.equal(result.sessionRef, FIXTURE_SESSION_NAME);
+    },
+  );
+
+  it(
+    "returns null (never a partial total) for a truncated fixture, without throwing",
+    { skip: !haveNodeZstd },
+    async () => {
+      const dshHome = path.join(tmpRoot!, "dsh-home");
+      const workdir = path.join(tmpRoot!, "worktree", "repo");
+      // Cut bytes off the tail so the final zstd frame is incomplete.
+      stageFixtureSession({
+        dshHome,
+        workdir,
+        mutate: (bytes) => bytes.subarray(0, bytes.length - 5),
+      });
+
+      const result = await lookupDshSessionTokens({
+        spawnedAtMs: 0,
+        workdir,
+        env: envWith(dshHome),
+        zstdStrategy: "node",
+      });
+
+      assert.equal(result, null, "a truncated container must not fabricate a total");
+      assert.match(readTamanduaLog(), /failed to decompress session log/);
+
+      // Direct entry point must also degrade to null instead of throwing.
+      const truncatedPath = stageFixtureSession({
+        dshHome: path.join(tmpRoot!, "dsh-home-2"),
+        workdir,
+        mutate: (bytes) => bytes.subarray(0, bytes.length - 5),
+      }).logPath;
+      const text = await decompressDshSessionLog(truncatedPath, "node");
+      assert.equal(text, null);
     },
   );
 });
