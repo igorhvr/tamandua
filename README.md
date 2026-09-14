@@ -319,6 +319,8 @@ flowchart LR
     DB --> MCP["Remote MCP :3338<br/>14 tools"]
 ```
 
+**Busy harness workdirs queue, they don't refuse.** The control plane admits at most one direct (non-worktree) run per harness working directory. A second `workflow run` aimed at a directory a live run already holds is not refused: it is registered in a `waiting` state naming the holder, and `workflow run` exits **0** with a queued-behind explanation. `tamandua status` shows `WAITING: waiting for harness workdir held by run <id>: <dir>` so an operator can tell a waiting run from a dead one, and the daemon's reconciler admits the run automatically once the holder releases the directory. The `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1` escape hatch still admits immediately; every other registration validation failure stays fatal.
+
 The motor's invariants are pinned by an engineering contract with acceptance tests and real-model baselines: [tests/MOTOR-CONTRACT.md](tests/MOTOR-CONTRACT.md).
 
 ### Minimal by design

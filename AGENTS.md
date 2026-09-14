@@ -133,6 +133,61 @@ tokens (MOTOR-CONTRACT.md N1/N2). Per-(runId, agentId) in-memory
 
    tripwire: nothing writes to it anymore; tests assert it stays 0.
 
+### Control plane / run registration (busy harness workdir queueing)
+
+The daemon control plane (`src/server/control-server.ts`) admits at most one
+**direct (non-worktree) run** per harness working directory. Admission runs
+through `admitOrQueueRun()`, reached from the synchronous `POST
+/control/register-run` path and from the reconciler's periodic pass.
+
+A second direct run pointed at a directory that a live scheduled run already
+holds is **queued, not refused**. `_runIdForScheduledHarnessWorkdir()`
+(realpath comparison against the daemon's in-memory job metadata) names the
+holder, and `admitOrQueueRun()` keeps `runs.status = 'running'` while setting:
+
+- `scheduling_status = 'waiting'`
+- `scheduling_error = 'waiting for harness workdir held by run <holderId>: <dir>'`
+- `scheduling_requested_at = COALESCE(scheduling_requested_at, <now ISO>)`
+
+and returns HTTP **202** `{ state: 'waiting', heldByRunId, workingDirectoryForHarness }`.
+Both the synchronous CLI register path and the deferred launch-probe path get
+this same 202/`waiting` outcome — timing no longer selects between "queued" and
+"permanently failed".
+
+Release and admission: `reconcileOnce()` re-selects
+`scheduling_status IN ('pending_register', 'active', 'error', 'waiting')` on
+each 30s tick, and `admitQueuedRuns()` (run on terminate) selects
+`scheduling_status IN ('queued', 'waiting')`. Once the holder's scheduled jobs
+are gone, admission sets `scheduling_status = 'active'`, clears
+`scheduling_error`, and the run dispatches normally.
+
+Logging — this condition is never ERROR, and the register-run error is never
+double-prefixed (the control plane returns the raw message; `run.ts` adds the
+single outer `Failed to register run with daemon: ` prefix):
+
+- first refusal, then at most once per 60s
+  (`TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS` override) while the wait persists:
+  WARN `control-server: register-run waiting for harness workdir`
+  `{runId, heldByRunId, workingDirectoryForHarness}`.
+- admission of a previously-waiting run: INFO
+  `control-server: register-run admitted after workdir wait`
+  `{runId, requiredTimers}`.
+
+Operator surfaces: `workflow run` exits **0** and prints
+`Queued behind run <holder>: harness workdir <dir> is held by that run. It will
+be admitted automatically when the holder releases it.` (`--wait` still waits);
+`tamandua status` run summaries append
+`  WAITING: waiting for harness workdir held by run <id>: <dir>` and `workflow
+status` prints `Scheduling: <reason>` (also in `--json`), so a waiting run is
+distinguishable from a dead one.
+
+`TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1` still bypasses the queue and admits
+immediately; the one-live-run-per-workdir rule itself is **not** lifted. Every
+other register-run failure remains fatal: missing/relative/nonexistent harness
+workdir, branch mismatch, unsupported harness, and malformed input still throw,
+are marked `scheduling_status = 'error'`, and return **422** — they never enter
+`waiting`.
+
 ### Step Lifecycle
 
 ```
