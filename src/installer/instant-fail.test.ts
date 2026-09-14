@@ -30,6 +30,11 @@ import {
   DEFAULT_INSTANT_FAIL_ESCALATION_THRESHOLD,
   DEFAULT_INSTANT_FAIL_BACKOFF_BASE_MS,
 } from "../../dist/installer/instant-fail.js";
+// Cross-module guard (PRAW US-004): the outcome classifier's `empty_output`
+// label must never be wired into the instant-fail detector. Importing the
+// pure classifier (not the spawning dispatch path) keeps this test in the
+// parallel lane — see tests/serial-classification-guard.test.ts.
+import { classifyWorkRoundOutcome } from "../../dist/installer/agent-scheduler.js";
 
 // Local structural stand-in for HarnessRoundResult — deliberately NOT
 // imported from harness-adapter (which imports node:child_process and
@@ -238,6 +243,94 @@ describe("instant-fail classification boundaries (RSPN)", () => {
     process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "-3";
     assert.equal(getInstantFailWallThresholdMs(), DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS);
     assert.equal(getInstantFailBackoffThreshold(), DEFAULT_INSTANT_FAIL_BACKOFF_THRESHOLD);
+  });
+});
+
+describe("empty_output rounds cannot feed the instant-fail detector (PRAW US-004)", () => {
+  // The RSPN instant-fail classifier is deliberately CONSERVATIVE: it needs
+  // sub-threshold wall time AND zero TRIMMED output AND (nonzero exit code OR
+  // signal death). An `empty_output` work round (a JSON round with no
+  // assistant text) is a clean, exit-0 round, so it is structurally excluded
+  // on two independent signals. These tests pin the boundary so a future
+  // regression cannot wire `classifyWorkRoundOutcome(...) === "empty_output"`
+  // into `isInstantFailRound` and start force-failing legitimate no-text
+  // rounds (the run-49 shape).
+  afterEach(() => {
+    restoreEnv();
+  });
+
+  it("does NOT classify a long zero-output exit-0 round (the empty_output shape)", () => {
+    const threshold = getInstantFailWallThresholdMs();
+    assert.equal(
+      isInstantFailRound({
+        wallMs: threshold + 1_000,
+        result: roundResult({ output: "", exitCode: 0 }),
+      }),
+      false,
+      "a long, clean (exit 0), no-output round is empty_output — never an instant fail",
+    );
+  });
+
+  it("does NOT classify a round whose wall time sits exactly on the threshold", () => {
+    // `isInstantFailRound` excludes `wallMs >= threshold`; pin the >= boundary
+    // so an off-by-one loosening cannot let a long empty_output round through.
+    assert.equal(
+      isInstantFailRound({
+        wallMs: getInstantFailWallThresholdMs(),
+        result: roundResult({ output: "", exitCode: 0 }),
+      }),
+      false,
+      "wallMs === threshold must NOT classify (slow-round guard is inclusive)",
+    );
+  });
+
+  it("does NOT classify a short zero-output exit-0 round", () => {
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 100,
+        result: roundResult({ output: "", exitCode: 0 }),
+      }),
+      false,
+      "a fast exit-0 round is a legitimate no-op, not an instant fail",
+    );
+  });
+
+  it("still classifies the sub-threshold zero-output nonzero-exit round (unchanged positive)", () => {
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 100,
+        result: roundResult({ output: "", exitCode: 1 }),
+      }),
+      true,
+      "the existing RSPN positive case must remain unchanged",
+    );
+  });
+
+  it("documents that empty_output is independent of isInstantFailRound", () => {
+    // The outcome label and the instant-fail verdict are computed from
+    // different signals. A long exit-0 no-text round is empty_output AND is
+    // not an instant fail, so the label can never be the trigger.
+    assert.equal(classifyWorkRoundOutcome(""), "empty_output");
+    assert.equal(
+      isInstantFailRound({
+        wallMs: getInstantFailWallThresholdMs() + 5_000,
+        result: roundResult({ output: "", exitCode: 0 }),
+      }),
+      false,
+    );
+
+    // The converse wiring is also impossible: a sub-threshold exit-1 no-output
+    // round is empty_output too, yet the detector's `true` comes from the
+    // nonzero exit code, not from the outcome label.
+    assert.equal(classifyWorkRoundOutcome(""), "empty_output");
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 100,
+        result: roundResult({ output: "", exitCode: 1 }),
+      }),
+      true,
+      "the detector keys on exit/signal/wall time — never on the outcome label",
+    );
   });
 });
 
