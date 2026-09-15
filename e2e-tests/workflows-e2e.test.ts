@@ -77,6 +77,7 @@ import {
   collectRunDiagnostics,
 } from "./helpers/e2e-helpers.ts";
 import type { ChildProcess } from "node:child_process";
+import { stripComments, assertsBuggyAddValue } from "../dist/lib/comment-blind.js";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
 
@@ -108,82 +109,10 @@ function assertRepoClean(repoDir: string, context: string): void {
 }
 
 /**
- * stripComments removes line comments (double-slash) and block comments
- * (slash-star to star-slash) from source code, while preserving those
- * character sequences inside string literals.
- *
- * This allows assertions on source content (e.g. checking for exec()
- * calls) without being tripped by comment mentions like
- * "// FIX: use fs.readFile() instead of shell exec()".
+ * NOTE: `stripComments` now lives in the shared `src/lib/comment-blind.ts`
+ * module (imported above) so the real e2e suites and the fast-tier unit
+ * tests use one implementation.
  */
-function stripComments(source: string): string {
-  const result: string[] = [];
-  let i = 0;
-
-  while (i < source.length) {
-    // ── Check for the start of a string literal ─────────────────
-    const quote = source[i];
-    if (quote === "'" || quote === '"' || quote === "`") {
-      result.push(quote);
-      i++;
-      // Consume until matching closing quote (handling escapes)
-      while (i < source.length) {
-        const ch = source[i];
-        if (ch === "\\") {
-          result.push(ch);
-          i++;
-          if (i < source.length) {
-            result.push(source[i]);
-            i++;
-          }
-        } else if (ch === quote) {
-          result.push(ch);
-          i++;
-          break;
-        } else {
-          result.push(ch);
-          i++;
-        }
-      }
-      continue;
-    }
-
-    // ── Check for // line comment ──────────────────────────────
-    if (source[i] === "/" && i + 1 < source.length && source[i + 1] === "/") {
-      // Skip to end of line
-      while (i < source.length && source[i] !== "\n") {
-        i++;
-      }
-      continue;
-    }
-
-    // ── Check for /* block comment ─────────────────────────────
-    if (source[i] === "/" && i + 1 < source.length && source[i + 1] === "*") {
-      i += 2; // skip /*
-      let depth = 1;
-      // Scan for matching */, handling nested /* (increment depth)
-      // and unclosed comments (strip to end of source)
-      while (i < source.length && depth > 0) {
-        if (source[i] === "/" && i + 1 < source.length && source[i + 1] === "*") {
-          i += 2;
-          depth++;
-        } else if (source[i] === "*" && i + 1 < source.length && source[i + 1] === "/") {
-          i += 2;
-          depth--;
-        } else {
-          i++;
-        }
-      }
-      continue;
-    }
-
-    // ── Regular code character ─────────────────────────────────
-    result.push(source[i]);
-    i++;
-  }
-
-  return result.join("");
-}
 
 // ── Shared state across both sequential tests ────────────────────────────
 let env: Awaited<ReturnType<typeof createTempHome>>;
@@ -378,7 +307,7 @@ describe(
             );
             // Should NOT still assert add(5, 3) === 2
             assert.ok(
-              !testContent.match(/add\(5,\s*3\).*2/) && !testContent.includes("expects subtraction"),
+              !assertsBuggyAddValue(testContent),
               `math.test.ts should no longer assert the buggy value 2. Content:\n${testContent.substring(0, 500)}`,
             );
           }
@@ -531,7 +460,7 @@ describe(
             );
             // Should NOT still assert add(5, 3) === 2
             assert.ok(
-              !testContent.match(/add\(5,\s*3\).*2/) && !testContent.includes("expects subtraction"),
+              !assertsBuggyAddValue(testContent),
               `math.test.ts should no longer assert the buggy value 2. Content:\n${testContent.substring(0, 500)}`,
             );
           }
