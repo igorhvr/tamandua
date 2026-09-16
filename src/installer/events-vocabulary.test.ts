@@ -160,9 +160,11 @@ const PINNED_RUN_ALERT_VOCABULARY = [
  * dispatch — run.harness_probe_ok records a passing probe (harness answered
  * `<launcher> skill-path` with the expected PATH), run.harness_probe_failed
  * records a failing one (the run is force-failed immediately afterwards) —
- * plus run.harness_isolation, emitted once per harness execution (work
- * rounds AND the probe round) recording the effective signal-isolation mode
- * ('landlock' | 'seatbelt' | 'unprotected-fallback') with reason on fallback.
+ * plus run.harness_isolation, which records the effective signal-isolation
+ * mode ('landlock' | 'seatbelt' | 'unprotected-fallback') with reason on
+ * fallback. Protected records fire once per harness execution (work rounds
+ * AND the probe round); the unprotected-fallback record is deduped to once
+ * per run per daemon start (WNOI) so a long run does not flood the stream.
  * Pinned alongside the lifecycle and alert vocabularies.
  */
 const PINNED_RUN_DIAGNOSTIC_VOCABULARY = [

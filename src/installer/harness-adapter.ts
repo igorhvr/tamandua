@@ -7,6 +7,7 @@ import { logger } from "../lib/logger.js";
 import { formatPiCommandPreview, findPromptArgvIndices, formatCommandPreview } from "./pi-command-preview.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { sanitizeStderrTail } from "./step-ops.js";
+import { classifyHarnessStderr } from "./harness-stderr.js";
 import { resolveHermesBinary } from "./hermes-resolver.js";
 import { resolveDshBinary } from "./dsh-resolver.js";
 import {
@@ -492,12 +493,22 @@ class PiHarnessAdapter implements HarnessAdapter {
     const stderrMeta = buildStreamLogMetadata(stderrOut);
 
     if (stderrMeta.preview) {
-      logger.warn("pi stderr", {
-        pid: childPid ?? null,
-        stderrBytes: stderrMeta.bytes,
-        stderrPreview: stderrMeta.preview,
-        stderrTruncated: stderrMeta.truncated,
-      });
+      const stderrClass = classifyHarnessStderr("pi", stderrOut);
+      if (stderrClass.benign) {
+        logger.debug("pi stderr (benign)", {
+          pid: childPid ?? null,
+          stderrBytes: stderrMeta.bytes,
+          stderrPreview: stderrMeta.preview,
+          stderrTruncated: stderrMeta.truncated,
+        });
+      } else {
+        logger.warn("pi stderr", {
+          pid: childPid ?? null,
+          stderrBytes: stderrMeta.bytes,
+          stderrPreview: stderrMeta.preview,
+          stderrTruncated: stderrMeta.truncated,
+        });
+      }
     }
 
     // Reconstruct filtered stdout from parsed events for backwards compatibility.
@@ -842,13 +853,24 @@ class HermesHarnessAdapter implements HarnessAdapter {
     const stderrMeta = buildStreamLogMetadata(stderrOut);
 
     if (stderrMeta.preview) {
-      logger.warn("hermes stderr", {
-        harness: "hermes",
-        pid: childPid ?? null,
-        stderrBytes: stderrMeta.bytes,
-        stderrPreview: stderrMeta.preview,
-        stderrTruncated: stderrMeta.truncated,
-      });
+      const stderrClass = classifyHarnessStderr("hermes", stderrOut);
+      if (stderrClass.benign) {
+        logger.debug("hermes stderr (benign)", {
+          harness: "hermes",
+          pid: childPid ?? null,
+          stderrBytes: stderrMeta.bytes,
+          stderrPreview: stderrMeta.preview,
+          stderrTruncated: stderrMeta.truncated,
+        });
+      } else {
+        logger.warn("hermes stderr", {
+          harness: "hermes",
+          pid: childPid ?? null,
+          stderrBytes: stderrMeta.bytes,
+          stderrPreview: stderrMeta.preview,
+          stderrTruncated: stderrMeta.truncated,
+        });
+      }
     }
 
     // Extract session_id trailer. Real hermes prints the session identifier
@@ -1264,13 +1286,24 @@ class DshHarnessAdapter implements HarnessAdapter {
     const stderrMeta = buildStreamLogMetadata(stderrOut);
 
     if (stderrMeta.preview) {
-      logger.warn("dsh stderr", {
-        harness: "dsh",
-        pid: childPid ?? null,
-        stderrBytes: stderrMeta.bytes,
-        stderrPreview: stderrMeta.preview,
-        stderrTruncated: stderrMeta.truncated,
-      });
+      const stderrClass = classifyHarnessStderr("dsh", stderrOut);
+      if (stderrClass.benign) {
+        logger.debug("dsh stderr (benign)", {
+          harness: "dsh",
+          pid: childPid ?? null,
+          stderrBytes: stderrMeta.bytes,
+          stderrPreview: stderrMeta.preview,
+          stderrTruncated: stderrMeta.truncated,
+        });
+      } else {
+        logger.warn("dsh stderr", {
+          harness: "dsh",
+          pid: childPid ?? null,
+          stderrBytes: stderrMeta.bytes,
+          stderrPreview: stderrMeta.preview,
+          stderrTruncated: stderrMeta.truncated,
+        });
+      }
     }
 
     // stdout passes through VERBATIM: dsh prints exactly the last assistant

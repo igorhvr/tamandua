@@ -6,7 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
 
-import { runWorkflow } from "../../dist/installer/run.js";
+import { runWorkflow, isGitRepositoryForHarness } from "../../dist/installer/run.js";
 import { getPidFile, getPortFile, stopDaemon, stopDaemonFamily } from "../../dist/server/daemonctl.js";
 import {
   reservePortHandles,
@@ -1265,70 +1265,69 @@ describe("runWorkflow", () => {
   });
 
   describe("BSHA - capture failure events and warnings", () => {
-    it("emits run.base_capture_failed event when git capture fails in non-git directory", async () => {
+    it("isGitRepositoryForHarness distinguishes git repos from plain directories (BCAP)", () => {
+      const repoDir = tamanduaTempDir("tamandua-bcap-git-");
+      const plainDir = tamanduaTempDir("tamandua-bcap-plain-");
+      try {
+        initGitRepo(repoDir);
+        assert.equal(isGitRepositoryForHarness(repoDir), true,
+          "a real git work tree must be classified as applicable");
+        assert.equal(isGitRepositoryForHarness(plainDir), false,
+          "a plain directory must be classified as not-a-git-repository");
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+        fs.rmSync(plainDir, { recursive: true, force: true });
+      }
+    });
+
+    it("emits exactly one run.base_capture_skipped event for a non-git directory", async () => {
       const workflowId = "test-bsha-capture-event";
       writeMinimalWorkflow(tempHome, workflowId, "direct");
       const nonGitDir = tamanduaTempDir("tamandua-bsha-non-git-");
 
-      let result: Awaited<ReturnType<typeof runWorkflow>>;
       try {
-        result = await runWorkflow({
+        await runWorkflow({
           workflowId,
           taskTitle: "Test BSHA capture failure events",
           workingDirectoryForHarness: nonGitDir,
         });
       } catch {
         // Daemon registration may fail after persisting the run; assertions below only need persisted state.
-        // Re-fetch result by querying the run.
-        const { getDb } = await import("../../dist/db.js");
-        const db = getDb();
-        const rows = db.prepare(
-          "SELECT id FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
-        ).all(workflowId) as { id: string }[];
-        assert.ok(rows.length > 0, "run record should exist even when daemon registration fails");
-        const runId = rows[0].id;
-
-        // Verify events were emitted
-        const events = getRunEvents(runId);
-        const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
-
-        // Should have two capture_failed events: original_branch and base_branch_sha
-        assert.equal(captureEvents.length, 2,
-          `Expected 2 capture_failed events, got ${captureEvents.length}`);
-
-        const originalBranchEvent = captureEvents.find((e) => e.detail?.startsWith("original_branch:"));
-        const baseBranchShaEvent = captureEvents.find((e) => e.detail?.startsWith("base_branch_sha:"));
-
-        assert.ok(originalBranchEvent, "Should have original_branch capture_failed event");
-        assert.ok(baseBranchShaEvent, "Should have base_branch_sha capture_failed event");
-
-        // Verify event detail includes probe name, git command
-        assert.ok(originalBranchEvent!.detail?.includes("original_branch:"),
-          `original_branch event detail should include probe name: ${originalBranchEvent!.detail}`);
-        assert.ok(originalBranchEvent!.detail?.includes("git rev-parse --abbrev-ref HEAD"),
-          `original_branch event detail should include git command: ${originalBranchEvent!.detail}`);
-        assert.ok(baseBranchShaEvent!.detail?.includes("base_branch_sha:"),
-          `base_branch_sha event detail should include probe name: ${baseBranchShaEvent!.detail}`);
-        assert.ok(baseBranchShaEvent!.detail?.includes("git rev-parse HEAD"),
-          `base_branch_sha event detail should include git command: ${baseBranchShaEvent!.detail}`);
-
-        // Verify the event includes stderr (non-git dir should produce "not a git repository" stderr)
-        assert.ok(
-          originalBranchEvent!.detail!.includes("not a git repository") ||
-            originalBranchEvent!.detail!.includes("fatal:"),
-          `original_branch event detail should include git stderr: ${originalBranchEvent!.detail}`,
-        );
-      } finally {
-        fs.rmSync(nonGitDir, { recursive: true, force: true });
       }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT id FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { id: string }[];
+      assert.ok(rows.length > 0, "run record should exist even when daemon registration fails");
+      const runId = rows[0].id;
+
+      const events = getRunEvents(runId);
+      const skippedEvents = events.filter((e) => e.event === "run.base_capture_skipped");
+      const failedEvents = events.filter((e) => e.event === "run.base_capture_failed");
+
+      // A non-git directory is not-applicable, not a failure: one skipped
+      // event and zero error-class capture events.
+      assert.equal(failedEvents.length, 0,
+        `Expected 0 base_capture_failed events for a non-git dir, got ${failedEvents.length}`);
+      assert.equal(skippedEvents.length, 1,
+        `Expected exactly 1 base_capture_skipped event, got ${skippedEvents.length}`);
+      assert.equal(skippedEvents[0].reason, "not_a_git_repository",
+        `Expected reason not_a_git_repository, got ${skippedEvents[0].reason}`);
+      assert.equal(skippedEvents[0].runId, runId, "skipped event runId should match");
+      assert.match(skippedEvents[0].detail ?? "", /not a git repository/,
+        `skipped event detail should be human-readable: ${skippedEvents[0].detail}`);
+
+      fs.rmSync(nonGitDir, { recursive: true, force: true });
     });
 
-    it("returns captureWarnings with warning messages when captures fail", async () => {
+    it("returns no captureWarnings and classifies a non-git directory as skipped", async () => {
       const workflowId = "test-bsha-capture-warnings";
       writeMinimalWorkflow(tempHome, workflowId, "direct");
       const nonGitDir = tamanduaTempDir("tamandua-bsha-warn-");
 
-      let result: Awaited<ReturnType<typeof runWorkflow>>;
+      let result: Awaited<ReturnType<typeof runWorkflow>> | undefined;
       try {
         result = await runWorkflow({
           workflowId,
@@ -1337,31 +1336,39 @@ describe("runWorkflow", () => {
         });
       } catch {
         // Daemon may fail to start — the run row is still there. Query it.
-        const { getDb } = await import("../../dist/db.js");
-        const db = getDb();
-        const rows = db.prepare(
-          "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
-        ).all(workflowId) as { id: string; context: string }[];
-        assert.ok(rows.length > 0, "run record should exist");
-
-        // Verify empty-string fallback behavior is preserved
-        const ctx = JSON.parse(rows[0].context);
-        assert.equal(ctx.original_branch, "",
-          "original_branch should fall back to empty string on git failure");
-        assert.equal(ctx.base_branch_sha, "",
-          "base_branch_sha should fall back to empty string on git failure");
-
-        // Verify warnings were collected
-        const events = getRunEvents(rows[0].id);
-        const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
-        assert.equal(captureEvents.length, 2,
-          `Expected 2 capture_failed events, got ${captureEvents.length}`);
-      } finally {
-        fs.rmSync(nonGitDir, { recursive: true, force: true });
       }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { id: string; context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+
+      // Verify empty-string fallback behavior is preserved
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.original_branch, "",
+        "original_branch should fall back to empty string on git failure");
+      assert.equal(ctx.base_branch_sha, "",
+        "base_branch_sha should fall back to empty string on git failure");
+
+      // Not-applicable is not a degraded capture: no rugpull-degradation
+      // warning, no base_capture_failed event.
+      if (result) {
+        assert.equal(result.captureWarnings, undefined,
+          "non-git classification must not produce captureWarnings");
+      }
+
+      const events = getRunEvents(rows[0].id);
+      assert.equal(events.filter((e) => e.event === "run.base_capture_failed").length, 0,
+        "non-git classification must emit zero base_capture_failed events");
+      assert.equal(events.filter((e) => e.event === "run.base_capture_skipped").length, 1,
+        "non-git classification must emit exactly one base_capture_skipped event");
+
+      fs.rmSync(nonGitDir, { recursive: true, force: true });
     });
 
-    it("preserves empty-string fallback and emits events for original_branch failure", async () => {
+    it("preserves empty-string fallback and emits one skipped event for a non-git dir", async () => {
       const workflowId = "test-bsha-original-fallback";
       writeMinimalWorkflow(tempHome, workflowId, "direct");
       const nonGitDir = tamanduaTempDir("tamandua-bsha-orig-");
@@ -1388,18 +1395,61 @@ describe("runWorkflow", () => {
       assert.equal(ctx.original_branch, "", "original_branch should be empty string");
       assert.equal(ctx.base_branch_sha, "", "base_branch_sha should be empty string");
 
-      // Verify events were emitted
+      // Verify classification: one skipped event, zero failed events
       const events = getRunEvents(rows[0].id);
-      const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
-      assert.equal(captureEvents.length, 2,
-        `Expected 2 capture_failed events, got ${captureEvents.length}`);
-
-      // Both events should have the runId
-      for (const evt of captureEvents) {
-        assert.equal(evt.runId, rows[0].id, "capture_failed event runId should match");
-      }
+      assert.equal(events.filter((e) => e.event === "run.base_capture_failed").length, 0,
+        "non-git classification must emit zero base_capture_failed events");
+      const skipped = events.filter((e) => e.event === "run.base_capture_skipped");
+      assert.equal(skipped.length, 1,
+        `Expected exactly 1 base_capture_skipped event, got ${skipped.length}`);
+      assert.equal(skipped[0].reason, "not_a_git_repository");
+      assert.equal(skipped[0].runId, rows[0].id, "capture_skipped event runId should match");
 
       fs.rmSync(nonGitDir, { recursive: true, force: true });
+    });
+
+    it("classifies an explicit non-git fixture directory as skipped (BCAP)", async () => {
+      const workflowId = "test-bsha-non-git-fixture";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      // Explicit fixture dir: a plain directory holding ordinary files and no
+      // .git entry anywhere in its ancestry (tamanduaTempDir lives under the
+      // OS temp root), proving base capture is not-applicable rather than
+      // failing twice.
+      const fixtureDir = tamanduaTempDir("tamandua-bsha-fixture-");
+      fs.writeFileSync(path.join(fixtureDir, "notes.txt"), "not a repository\n", "utf-8");
+      fs.mkdirSync(path.join(fixtureDir, "src"));
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test explicit non-git fixture dir",
+          workingDirectoryForHarness: fixtureDir,
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { id: string; context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+
+      const events = getRunEvents(rows[0].id);
+      const skipped = events.filter((e) => e.event === "run.base_capture_skipped");
+      assert.equal(skipped.length, 1,
+        `Expected exactly 1 base_capture_skipped event, got ${skipped.length}`);
+      assert.equal(skipped[0].reason, "not_a_git_repository");
+      assert.equal(skipped[0].runId, rows[0].id, "skipped event runId should match");
+      assert.equal(events.filter((e) => e.event === "run.base_capture_failed").length, 0,
+        "non-git fixture must emit zero base_capture_failed events");
+
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.original_branch, "", "original_branch should be empty string");
+      assert.equal(ctx.base_branch_sha, "", "base_branch_sha should be empty string");
+
+      fs.rmSync(fixtureDir, { recursive: true, force: true });
     });
 
     it("does not emit capture failure events when git succeeds in a real repo", async () => {
@@ -1437,6 +1487,11 @@ describe("runWorkflow", () => {
         const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
         assert.equal(captureEvents.length, 0,
           `Expected 0 capture_failed events on success, got ${captureEvents.length}`);
+
+        // A real repo is applicable: no skipped classification either.
+        const skippedEvents = events.filter((e) => e.event === "run.base_capture_skipped");
+        assert.equal(skippedEvents.length, 0,
+          `Expected 0 capture_skipped events on success, got ${skippedEvents.length}`);
       } finally {
         fs.rmSync(repoDir, { recursive: true, force: true });
       }

@@ -17,6 +17,8 @@
  *   - Nudge-based polling (fast, no 15s dispatch interval wait)
  *
  * Run via:  ./run-all-scripted-e2e-tests
+ *           ./run-all-e2e-tests (combined fast certification alias, which now
+ *           includes this concurrent stress scenario)
  */
 
 import { describe, it } from "node:test";

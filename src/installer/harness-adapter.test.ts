@@ -2277,6 +2277,198 @@ echo "done"
   });
 });
 
+// ── WNOI: benign-vs-genuine harness stderr logging ─────────────────
+//
+// The adapters route assembled stderr through classifyHarnessStderr so
+// known-benign harness noise (dsh `reasoning:` blocks, hermes
+// `session_id:` trailer) logs at debug instead of WARN, while any genuine
+// line keeps the WARN '<harness> stderr' diagnostic.
+
+describe("harness stderr classification (WNOI)", () => {
+  function isolatedLogPath(): string {
+    return path.join(process.env.TAMANDUA_STATE_DIR ?? "", "tamandua.log");
+  }
+
+  function readIsolatedLog(): string {
+    const logPath = isolatedLogPath();
+    return fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf-8") : "";
+  }
+
+  /** True when some log line is a WARN with message '<harness> stderr'. */
+  function hasWarnStderr(logContent: string, harness: string): boolean {
+    return logContent
+      .split("\n")
+      .some((line) => /\] WARN\s/.test(line) && line.includes(`${harness} stderr`));
+  }
+
+  it("dsh: benign-only reasoning stderr writes no WARN and logs at debug", async () => {
+    const adapter = getHarnessAdapter("dsh");
+    const { root: tmpDir } = createTempHome("tamandua-test-dsh-benign-stderr-");
+    const fakeDsh = path.join(tmpDir, "dsh");
+    fs.writeFileSync(
+      fakeDsh,
+      `#!/bin/sh
+echo "reasoning: evaluating the task" >&2
+echo "  body of the reasoning trace" >&2
+echo "STATUS: done"
+`,
+      { mode: 0o755 },
+    );
+
+    const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    const savedDebug = process.env.TAMANDUA_DEBUG;
+    process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+    process.env.TAMANDUA_DEBUG = "1";
+    try {
+      const result = await adapter.runRound("prompt", { timeout: 5, workdir: tmpDir });
+      assert.equal(result.exitCode, 0);
+
+      const logContent = readIsolatedLog();
+      assert.equal(
+        hasWarnStderr(logContent, "dsh"),
+        false,
+        `benign dsh stderr must NOT produce a WARN "dsh stderr" line.\n${logContent}`,
+      );
+      assert.ok(
+        logContent.includes("dsh stderr (benign)"),
+        "benign dsh stderr must be logged at debug",
+      );
+    } finally {
+      if (originalDshBinary === undefined) delete process.env.TAMANDUA_DSH_BINARY;
+      else process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+      if (savedDebug === undefined) delete process.env.TAMANDUA_DEBUG;
+      else process.env.TAMANDUA_DEBUG = savedDebug;
+    }
+  });
+
+  it("dsh: genuine stderr still writes the WARN 'dsh stderr' line", async () => {
+    const adapter = getHarnessAdapter("dsh");
+    const { root: tmpDir } = createTempHome("tamandua-test-dsh-genuine-stderr-");
+    const fakeDsh = path.join(tmpDir, "dsh");
+    fs.writeFileSync(
+      fakeDsh,
+      `#!/bin/sh
+echo "reasoning: evaluating the task" >&2
+echo "dsh: E_CREDENTIALS: DEEPSEEK_API_KEY is not set" >&2
+echo "STATUS: done"
+`,
+      { mode: 0o755 },
+    );
+
+    const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+    try {
+      const result = await adapter.runRound("prompt", { timeout: 5, workdir: tmpDir });
+      assert.equal(result.exitCode, 0);
+
+      const logContent = readIsolatedLog();
+      assert.ok(
+        hasWarnStderr(logContent, "dsh"),
+        `genuine dsh stderr must produce a WARN "dsh stderr" line.\n${logContent}`,
+      );
+    } finally {
+      if (originalDshBinary === undefined) delete process.env.TAMANDUA_DSH_BINARY;
+      else process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+    }
+  });
+
+  it("hermes: benign-only session_id stderr writes no WARN and logs at debug", async () => {
+    const adapter = getHarnessAdapter("hermes");
+    const { root: tmpDir } = createTempHome("tamandua-test-hermes-benign-stderr-");
+    const fakeHermes = path.join(tmpDir, "hermes");
+    fs.writeFileSync(
+      fakeHermes,
+      `#!/bin/sh
+echo "STATUS: done"
+echo "session_id: 20260518_103004_cdae11" >&2
+`,
+      { mode: 0o755 },
+    );
+
+    const originalHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    const savedDebug = process.env.TAMANDUA_DEBUG;
+    process.env.TAMANDUA_HERMES_BINARY = fakeHermes;
+    process.env.TAMANDUA_DEBUG = "1";
+    try {
+      const result = await adapter.runRound("prompt", { timeout: 5 });
+      assert.equal(result.sessionRef, "20260518_103004_cdae11");
+
+      const logContent = readIsolatedLog();
+      assert.equal(
+        hasWarnStderr(logContent, "hermes"),
+        false,
+        `benign hermes stderr must NOT produce a WARN "hermes stderr" line.\n${logContent}`,
+      );
+      assert.ok(
+        logContent.includes("hermes stderr (benign)"),
+        "benign hermes stderr must be logged at debug",
+      );
+    } finally {
+      if (originalHermesBinary === undefined) delete process.env.TAMANDUA_HERMES_BINARY;
+      else process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
+      if (savedDebug === undefined) delete process.env.TAMANDUA_DEBUG;
+      else process.env.TAMANDUA_DEBUG = savedDebug;
+    }
+  });
+
+  it("hermes: genuine stderr still writes the WARN 'hermes stderr' line", async () => {
+    const adapter = getHarnessAdapter("hermes");
+    const { root: tmpDir } = createTempHome("tamandua-test-hermes-genuine-stderr-");
+    const fakeHermes = path.join(tmpDir, "hermes");
+    fs.writeFileSync(
+      fakeHermes,
+      `#!/bin/sh
+echo "STATUS: done"
+echo "session_id: 20260518_103004_cdae11" >&2
+echo "Traceback (most recent call last):" >&2
+`,
+      { mode: 0o755 },
+    );
+
+    const originalHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    process.env.TAMANDUA_HERMES_BINARY = fakeHermes;
+    try {
+      const result = await adapter.runRound("prompt", { timeout: 5 });
+      assert.equal(result.sessionRef, "20260518_103004_cdae11");
+
+      const logContent = readIsolatedLog();
+      assert.ok(
+        hasWarnStderr(logContent, "hermes"),
+        `genuine hermes stderr must produce a WARN "hermes stderr" line.\n${logContent}`,
+      );
+    } finally {
+      if (originalHermesBinary === undefined) delete process.env.TAMANDUA_HERMES_BINARY;
+      else process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
+    }
+  });
+
+  it("pi: genuine stderr still writes the WARN 'pi stderr' line", async () => {
+    const adapter = getHarnessAdapter("pi");
+    const { root: tmpDir } = createTempHome("tamandua-test-pi-genuine-stderr-");
+    const fakePi = path.join(tmpDir, "pi");
+    fs.writeFileSync(
+      fakePi,
+      "#!/bin/sh\necho 'unexpected pi failure' >&2\n",
+      { mode: 0o755 },
+    );
+
+    const originalPiBinary = process.env.TAMANDUA_PI_BINARY;
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    try {
+      await adapter.runRound("prompt", { timeout: 5, workdir: tmpDir });
+
+      const logContent = readIsolatedLog();
+      assert.ok(
+        hasWarnStderr(logContent, "pi"),
+        `genuine pi stderr must produce a WARN "pi stderr" line.\n${logContent}`,
+      );
+    } finally {
+      if (originalPiBinary === undefined) delete process.env.TAMANDUA_PI_BINARY;
+      else process.env.TAMANDUA_PI_BINARY = originalPiBinary;
+    }
+  });
+});
+
 // ── Type-level checks that the implement types work ────────────────
 
 describe("HarnessRoundResult shape", () => {

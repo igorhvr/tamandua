@@ -49,6 +49,10 @@ import type {
   ScriptedAgent,
   ScriptedAgentConfig,
 } from "./helpers/scripted-agent.ts";
+import {
+  ROOT_DAC_SKIP_REASON,
+  shouldSkipDacFixtureTest,
+} from "../src/lib/dac-guard.ts";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
@@ -746,7 +750,11 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
   it(
     "do-now: token degradation (empty HERMES_HOME with no state.db) — run completes, tokens_spent = 0, no crash",
     { timeout: 120_000 },
-    async () => {
+    async (t) => {
+      if (shouldSkipDacFixtureTest()) {
+        t.skip(ROOT_DAC_SKIP_REASON);
+        return;
+      }
       let ctx: ScriptedHermesRunContext | undefined;
       try {
         // Create the scripted hermes normally (this creates HERMES_HOME dir

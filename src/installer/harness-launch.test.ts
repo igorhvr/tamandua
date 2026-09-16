@@ -39,6 +39,7 @@ import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import {
   launchHarnessExecution,
+  __resetFallbackDedupForTests,
   HARNESS_ISOLATION_EVENT,
   type HarnessLaunchOutcome,
 } from "../../dist/installer/harness-launch.js";
@@ -72,6 +73,9 @@ beforeEach(() => {
   process.env.TAMANDUA_DB_PATH = path.join(env.tamanduaDir, "tamandua.db");
   assertStatePathIsolation(process.env.TAMANDUA_STATE_DIR, "harness-launch test state");
   assertStatePathIsolation(process.env.TAMANDUA_DB_PATH, "harness-launch test database");
+  // The per-run fallback dedup is process-scoped module state; reset it so no
+  // test's runIds leak into another test's WARN/event counts.
+  __resetFallbackDedupForTests();
 });
 
 afterEach(() => {
@@ -244,6 +248,15 @@ function isolationRecords(runId: string): Array<Record<string, unknown>> {
   return getRunEvents(runId).filter(
     (e) => e.event === HARNESS_ISOLATION_EVENT,
   ) as unknown as Array<Record<string, unknown>>;
+}
+
+/**
+ * Path to the isolated state log (TAMANDUA_STATE_DIR is set per test in
+ * beforeEach). Reading the file directly avoids importing logger, which the
+ * test-isolation guard forbids here. Mirrors signal-isolation-compat.test.ts.
+ */
+function isolationLogPath(): string {
+  return path.join(process.env.TAMANDUA_STATE_DIR!, "tamandua.log");
 }
 
 function launchFixture(opts: {
@@ -1079,6 +1092,132 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
       );
       assert.match(rendered, /unprotected/, `rendered fallback record must say 'unprotected': ${rendered}`);
       assert.match(String(records[0].detail ?? ""), /reason=forced-by-test/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("N >= 3 fallback launches under one runId emit exactly one isolation record and one WARN", async () => {
+    const root = tamanduaTempDir("tamandua-launch-dedup-");
+    const savedDebug = process.env.TAMANDUA_DEBUG;
+    process.env.TAMANDUA_DEBUG = "1"; // make debug-level later-round logs observable
+    try {
+      const counter = path.join(root, "harness-executions");
+      const harness = makeCounterHarness(root, counter);
+      for (let i = 0; i < 3; i++) {
+        const outcome = await launchFixture({
+          fixtureDir: root,
+          behavior: "good",
+          command: [harness],
+          forceFallbackReason: "forced-by-test",
+          runId: "run-launch-dedup-1",
+        });
+        assert.equal(outcome.status, "launched");
+        if (outcome.status !== "launched") return;
+        assert.equal(outcome.mode, "unprotected-fallback");
+        const done = await runChildToCompletion(outcome.child);
+        assert.equal(done.code, 0);
+      }
+      assert.equal(
+        readCounter(counter),
+        3,
+        "every fallback round must still EXECUTE the harness (dedup is logging only)",
+      );
+
+      // exactly ONE run.harness_isolation record for the run...
+      const records = isolationRecords("run-launch-dedup-1");
+      assert.equal(records.length, 1, "exactly one fallback event for the run");
+      assert.equal(records[0].mode, "unprotected-fallback");
+      assert.equal(records[0].runId, "run-launch-dedup-1");
+
+      // ...and exactly ONE WARN line; later rounds are debug-only.
+      const logLines = fs.readFileSync(isolationLogPath(), "utf8").split("\n");
+      const warnLines = logLines.filter(
+        (l) => l.includes("WARN") && l.includes("harness signal isolation unavailable"),
+      );
+      assert.equal(warnLines.length, 1, "exactly one fallback WARN for the run");
+      const debugLines = logLines.filter(
+        (l) => l.includes("DEBUG") && l.includes("already recorded for this run"),
+      );
+      assert.equal(debugLines.length, 2, "the 2 later fallback rounds log at debug");
+    } finally {
+      if (savedDebug === undefined) delete process.env.TAMANDUA_DEBUG;
+      else process.env.TAMANDUA_DEBUG = savedDebug;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("two distinct runIds each get their own single unprotected-fallback record (not global-once)", async () => {
+    const root = tamanduaTempDir("tamandua-launch-dedup-two-");
+    try {
+      const counter = path.join(root, "harness-executions");
+      const harness = makeCounterHarness(root, counter);
+      for (const runId of ["run-launch-dedup-a", "run-launch-dedup-b"]) {
+        for (let i = 0; i < 2; i++) {
+          const outcome = await launchFixture({
+            fixtureDir: root,
+            behavior: "good",
+            command: [harness],
+            forceFallbackReason: "forced-by-test",
+            runId,
+          });
+          assert.equal(outcome.status, "launched");
+          if (outcome.status !== "launched") return;
+          assert.equal(outcome.mode, "unprotected-fallback");
+          const done = await runChildToCompletion(outcome.child);
+          assert.equal(done.code, 0);
+        }
+      }
+      assert.equal(readCounter(counter), 4, "every fallback round still executes the harness");
+
+      const a = isolationRecords("run-launch-dedup-a");
+      const b = isolationRecords("run-launch-dedup-b");
+      assert.equal(a.length, 1, "run A has its own single fallback event");
+      assert.equal(b.length, 1, "run B has its own single fallback event");
+      assert.equal(a[0].runId, "run-launch-dedup-a");
+      assert.equal(b[0].runId, "run-launch-dedup-b");
+
+      const warnLines = fs
+        .readFileSync(isolationLogPath(), "utf8")
+        .split("\n")
+        .filter((l) => l.includes("WARN") && l.includes("harness signal isolation unavailable"));
+      assert.equal(warnLines.length, 2, "each run gets exactly one fallback WARN");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("protected landlock executions still emit one isolation record PER execution (dedup never applies)", async () => {
+    const root = tamanduaTempDir("tamandua-launch-protected-multi-");
+    try {
+      const counter = path.join(root, "harness-executions");
+      const helperCount = path.join(root, "helper-starts");
+      const harness = makeCounterHarness(root, counter);
+      for (let i = 0; i < 3; i++) {
+        const outcome = await launchFixture({
+          fixtureDir: root,
+          behavior: "good",
+          helperCounterFile: helperCount,
+          command: [harness],
+          runId: "run-launch-protected-multi-1",
+        });
+        assert.equal(outcome.status, "launched");
+        if (outcome.status !== "launched") return;
+        assert.equal(outcome.mode, "landlock");
+        const done = await runChildToCompletion(outcome.child);
+        assert.equal(done.code, 0);
+      }
+      const records = isolationRecords("run-launch-protected-multi-1");
+      assert.equal(records.length, 3, "protected records are one-per-execution, undeduped");
+      assert.deepEqual(
+        records.map((r) => r.mode),
+        ["landlock", "landlock", "landlock"],
+      );
+      const warnLines = fs
+        .readFileSync(isolationLogPath(), "utf8")
+        .split("\n")
+        .filter((l) => l.includes("WARN") && l.includes("harness signal isolation unavailable"));
+      assert.equal(warnLines.length, 0, "protected launches never warn");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

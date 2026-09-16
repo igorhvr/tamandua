@@ -6,9 +6,13 @@
 #   1. Smoke / state-machine test — manually advances workflow steps using
 #      step claim/step complete with canned outputs. No agents, models, or
 #      schedulers. (~10-15 seconds)
-#   2. Scripted-agent full-pipeline test — REAL daemon + scheduler + worktree
+#   2. Scripted-agent full-pipeline tests — REAL daemon + scheduler + worktree
 #      + merge pipeline driven by a deterministic scripted agent standing in
-#      for pi (TAMANDUA_PI_BINARY). No models, ZERO tokens. (~30-60 seconds)
+#      for pi (TAMANDUA_PI_BINARY). No models, ZERO tokens. This tier now also
+#      includes the concurrent-runs stress scenario
+#      (e2e-tests/workflows-stress-concurrent.test.ts: 8 simultaneous
+#      bug-fix-merge-worktree pipelines), so the combined wall-clock time is
+#      higher than the plain scripted tier. (~1-3 minutes)
 #
 # For the SLOW REAL end-to-end test that runs actual agent invocations:
 #   ./run-all-real-e2e-tests
@@ -27,5 +31,5 @@ cd "$(dirname "$0")"
 LOG="${TAMANDUA_E2E_TEST_LOG:-e2e-test-output.log}"
 
 npm run build
-node --test e2e-tests/workflows-smoke.test.ts e2e-tests/workflows-scripted.test.ts e2e-tests/workflows-scripted-hermes.test.ts e2e-tests/workflows-scripted-dsh.test.ts e2e-tests/workflows-harness-probe.test.ts e2e-tests/workflows-instant-fail-loop.test.ts e2e-tests/autoresearch-scripted.test.ts e2e-tests/fixture-health.test.ts e2e-tests/workflows-verify-each-nonadjacent.test.ts e2e-tests/workflows-verifier-verdict-retry.test.ts e2e-tests/workflows-drain-verify-pause.test.ts 2>&1 | tee "$LOG"
+node --test e2e-tests/workflows-smoke.test.ts e2e-tests/workflows-scripted.test.ts e2e-tests/workflows-scripted-hermes.test.ts e2e-tests/workflows-scripted-dsh.test.ts e2e-tests/workflows-harness-probe.test.ts e2e-tests/workflows-instant-fail-loop.test.ts e2e-tests/autoresearch-scripted.test.ts e2e-tests/fixture-health.test.ts e2e-tests/workflows-verify-each-nonadjacent.test.ts e2e-tests/workflows-verifier-verdict-retry.test.ts e2e-tests/workflows-drain-verify-pause.test.ts e2e-tests/workflows-stress-concurrent.test.ts 2>&1 | tee "$LOG"
 exit "${PIPESTATUS[1]}"

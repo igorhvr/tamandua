@@ -592,12 +592,15 @@ distinction is critical:
 | Test | Script | What it does | Duration |
 |------|--------|--------------|----------|
 | **Smoke (state-machine)** | `./run-all-smoke-e2e-tests` | Exercises workflow state machine, pipeline wiring, and step lifecycle using manual `step claim` / `step complete` with canned outputs. No real agents, models, or schedulers. | ~10–15 seconds |
-| **Scripted (full pipeline, fake pi)** | `./run-all-scripted-e2e-tests` | Runs the REAL daemon → scheduler → harness spawn → step-ops → worktree/merge pipeline, with `TAMANDUA_PI_BINARY` pointed at a deterministic scripted agent (`e2e-tests/helpers/scripted-agent.ts`) that executes the claim/complete work protocol, including chaos scenarios (lost steps, crashed agents). No models, ZERO tokens. Primary regression net for motor changes — see `tests/MOTOR-CONTRACT.md`. | ~30–60 seconds |
+| **Scripted (full pipeline, fake pi)** | `./run-all-scripted-e2e-tests` | Runs the REAL daemon → scheduler → harness spawn → step-ops → worktree/merge pipeline, with `TAMANDUA_PI_BINARY` pointed at a deterministic scripted agent (`e2e-tests/helpers/scripted-agent.ts`) that executes the claim/complete work protocol, including chaos scenarios (lost steps, crashed agents) and the concurrent-runs stress scenario (`e2e-tests/workflows-stress-concurrent.test.ts`: 8 simultaneous `bug-fix-merge-worktree` pipelines). No models, ZERO tokens. Primary regression net for motor changes — see `tests/MOTOR-CONTRACT.md`. | ~1–3 minutes (the concurrent stress test dominates) |
 | **Real canary (single run)** | `./run-real-e2e-canary` | ONE do-now run with a trivial task through the real daemon → scheduler → pi pipeline, with token-accounting audits. **Spends a small amount of real tokens.** Use at motor-change milestones before the full real suite. | ~2–10 minutes |
 | **Real (full pipeline)** | `./run-all-real-e2e-tests` | Launches actual Tamandua workflows that run through the full daemon → scheduler → pi agent pipeline. Uses real model invocations, real worktree creation, real git merges. | 30+ minutes per workflow |
 
 `./run-all-e2e-tests` is the convenience alias — it runs the **smoke and
-scripted tests** (fast, no tokens). It does NOT run the real e2e test.
+scripted tests** (fast, no tokens), including the concurrent-runs stress
+scenario (`e2e-tests/workflows-stress-concurrent.test.ts`), which raises the
+expected wall-clock time above the plain scripted tier. It does NOT run the
+real e2e test.
 
 #### Real End-to-End Test — Cost and Duration
 

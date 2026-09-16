@@ -21,6 +21,10 @@ import path from "node:path";
 import os from "node:os";
 import { openE2eDatabase } from "./e2e-database.mjs";
 import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
+import {
+  ROOT_DAC_SKIP_REASON,
+  shouldSkipDacFixtureTest,
+} from "../../src/lib/dac-guard.ts";
 
 const runtimePath = path.resolve(
   process.cwd(),
@@ -458,7 +462,11 @@ describe("scripted-hermes-runtime", () => {
       }
     });
 
-    it("degradation: non-writeable HERMES_HOME — still produces valid output", () => {
+    it("degradation: non-writeable HERMES_HOME — still produces valid output", (t) => {
+      if (shouldSkipDacFixtureTest()) {
+        t.skip(ROOT_DAC_SKIP_REASON);
+        return;
+      }
       const dirs = makeTempDirs();
       try {
         createMockCli(dirs.tmp);

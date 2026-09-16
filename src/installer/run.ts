@@ -116,6 +116,27 @@ function failPersistedRunLaunch(params: {
 }
 
 /**
+ * BCAP (US-001): is the harness working directory inside a git work tree?
+ *
+ * Base capture is only applicable to git repositories. A non-git working
+ * directory (e.g. a just-do-it dispatcher dir or any plain directory) must be
+ * classified ONCE as "not applicable" instead of letting each rev-parse probe
+ * fail and emit its own error-class event/warning.
+ */
+export function isGitRepositoryForHarness(workingDirectory: string): boolean {
+  try {
+    const out = execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd: workingDirectory,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    return out === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Start a new workflow run.
  *
  * 1. Loads the workflow spec
@@ -155,6 +176,10 @@ export async function runWorkflow(
   const warnings: string[] = [];
 
   let workingDirectoryForHarness: string;
+  // BCAP (US-001): whether the resolved harness working directory is a git
+  // repository (computed once in direct mode). False for worktree mode; the
+  // worktree-mode capture path uses worktree_origin_sha and is unaffected.
+  let harnessDirIsGitRepo = false;
 
   // Seed the run context with the task description so step input templates can
   // reference {{task}} from the very first step. Without this, the planner step
@@ -209,68 +234,92 @@ export async function runWorkflow(
     seededContext[RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY] =
       workingDirectoryForHarness;
 
-    // Capture original branch for rugpull detection in direct mode — records
-    // the base branch name at run creation so downstream detection can compare
-    // its current tip against the recorded base_branch_sha instead of depending
-    // on whatever HEAD happens to be after a final-merge failure.
-    try {
-      const branchName = execFileSync(
-        "git",
-        ["rev-parse", "--abbrev-ref", "HEAD"],
-        {
-          cwd: workingDirectoryForHarness,
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      ).trim();
-      // HEAD is not a branch name (detached HEAD), so fall back to empty.
-      seededContext.original_branch =
-        branchName !== "HEAD" ? branchName : "";
-    } catch (err) {
-      const stderr = (err as { stderr?: Buffer }).stderr?.toString("utf-8")?.trim() ?? "";
+    // BCAP (US-001): determine git-repository applicability ONCE for the
+    // resolved harness working directory. A non-git directory is a
+    // "not applicable" case for base capture: classify it with a single
+    // skipped event instead of letting each rev-parse probe fail and emit
+    // separate error-class events/warnings.
+    harnessDirIsGitRepo = isGitRepositoryForHarness(workingDirectoryForHarness);
+
+    if (!harnessDirIsGitRepo) {
+      // Not a git repository — base capture does not apply. Emit EXACTLY ONE
+      // skipped event (never run.base_capture_failed) and leave the captured
+      // values empty without any rugpull-degradation warning.
+      seededContext.original_branch = "";
+      seededContext.base_branch_sha = "";
+      seededContext.tested_tree = "";
       emitEvent({
         ts: new Date().toISOString(),
-        event: "run.base_capture_failed",
+        event: "run.base_capture_skipped",
         runId,
         workflowId,
-        detail: `original_branch: git rev-parse --abbrev-ref HEAD — ${stderr || "git command failed"}`,
+        reason: "not_a_git_repository",
+        detail: `Base capture skipped: ${workingDirectoryForHarness} is not a git repository (reason: not_a_git_repository)`,
       });
-      warnings.push(
-        `Unable to capture original branch at launch — rugpull detection degraded for this run (git error: ${stderr || "unknown"})`,
-      );
-      seededContext.original_branch = "";
-    }
-
-    // Store base branch SHA for rugpull detection in direct mode.
-    try {
-      seededContext.base_branch_sha = execFileSync(
-        "git",
-        ["rev-parse", "HEAD"],
-        { cwd: workingDirectoryForHarness, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-      ).trim();
-    } catch {
-      seededContext.base_branch_sha = "";
-    }
-
-    // Store tree hash of the base commit for self-merge detection — resolved at
-    // run creation time so rugpull detection can compare the current tip's tree
-    // against the tree that was tested (prevents relaunch when own merge landed).
-    if (seededContext.base_branch_sha) {
+    } else {
+      // Capture original branch for rugpull detection in direct mode — records
+      // the base branch name at run creation so downstream detection can compare
+      // its current tip against the recorded base_branch_sha instead of depending
+      // on whatever HEAD happens to be after a final-merge failure.
       try {
-        seededContext.tested_tree = execFileSync(
+        const branchName = execFileSync(
           "git",
-          ["rev-parse", `${seededContext.base_branch_sha}^{tree}`],
+          ["rev-parse", "--abbrev-ref", "HEAD"],
           {
             cwd: workingDirectoryForHarness,
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
           },
         ).trim();
+        // HEAD is not a branch name (detached HEAD), so fall back to empty.
+        seededContext.original_branch =
+          branchName !== "HEAD" ? branchName : "";
+      } catch (err) {
+        const stderr = (err as { stderr?: Buffer }).stderr?.toString("utf-8")?.trim() ?? "";
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "run.base_capture_failed",
+          runId,
+          workflowId,
+          detail: `original_branch: git rev-parse --abbrev-ref HEAD — ${stderr || "git command failed"}`,
+        });
+        warnings.push(
+          `Unable to capture original branch at launch — rugpull detection degraded for this run (git error: ${stderr || "unknown"})`,
+        );
+        seededContext.original_branch = "";
+      }
+
+      // Store base branch SHA for rugpull detection in direct mode.
+      try {
+        seededContext.base_branch_sha = execFileSync(
+          "git",
+          ["rev-parse", "HEAD"],
+          { cwd: workingDirectoryForHarness, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+        ).trim();
       } catch {
+        seededContext.base_branch_sha = "";
+      }
+
+      // Store tree hash of the base commit for self-merge detection — resolved at
+      // run creation time so rugpull detection can compare the current tip's tree
+      // against the tree that was tested (prevents relaunch when own merge landed).
+      if (seededContext.base_branch_sha) {
+        try {
+          seededContext.tested_tree = execFileSync(
+            "git",
+            ["rev-parse", `${seededContext.base_branch_sha}^{tree}`],
+            {
+              cwd: workingDirectoryForHarness,
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+            },
+          ).trim();
+        } catch {
+          seededContext.tested_tree = "";
+        }
+      } else {
         seededContext.tested_tree = "";
       }
-    } else {
-      seededContext.tested_tree = "";
     }
 
     let workingDirectoryStats;
@@ -427,7 +476,7 @@ export async function runWorkflow(
   // so downstream detection can compare against current tip after failure.
   if (workspaceMode === "worktree") {
     seededContext.base_branch_sha = seededContext.worktree_origin_sha;
-  } else {
+  } else if (harnessDirIsGitRepo) {
     try {
       seededContext.base_branch_sha = execFileSync(
         "git",
@@ -449,6 +498,9 @@ export async function runWorkflow(
       seededContext.base_branch_sha = "";
     }
   }
+  // BCAP (US-001): a non-git harness working directory was already classified
+  // with a single run.base_capture_skipped event above; base_branch_sha stays
+  // empty with no further events or warnings.
 
   // Insert step records for each workflow step
   const insertStep = db.prepare(

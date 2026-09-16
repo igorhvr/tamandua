@@ -214,6 +214,62 @@ describe("e2e test infrastructure", () => {
     );
   });
 
+  it("both combined and scripted runners include the concurrent stress test", () => {
+    const combined = fs.readFileSync(
+      path.join(repoRoot, "run-all-e2e-tests"),
+      "utf-8",
+    );
+    const scripted = fs.readFileSync(
+      path.join(repoRoot, "run-all-scripted-e2e-tests"),
+      "utf-8",
+    );
+    assert.ok(
+      combined.includes("e2e-tests/workflows-stress-concurrent.test.ts"),
+      "run-all-e2e-tests should run e2e-tests/workflows-stress-concurrent.test.ts",
+    );
+    assert.ok(
+      scripted.includes("e2e-tests/workflows-stress-concurrent.test.ts"),
+      "run-all-scripted-e2e-tests should still run e2e-tests/workflows-stress-concurrent.test.ts",
+    );
+  });
+
+  it("both e2e runner scripts keep a single serial-safe node --test invocation", () => {
+    for (const scriptName of [
+      "run-all-e2e-tests",
+      "run-all-scripted-e2e-tests",
+    ]) {
+      const content = fs.readFileSync(path.join(repoRoot, scriptName), "utf-8");
+      const testInvocations = content
+        .split("\n")
+        .filter((line) => /^\s*node\s+--test\b/.test(line));
+      assert.equal(
+        testInvocations.length,
+        1,
+        `${scriptName} should have exactly one node --test invocation`,
+      );
+      assert.ok(
+        !testInvocations[0].includes("--test-concurrency"),
+        `${scriptName} should not add a test-concurrency flag (stress test must stay serial-safe)`,
+      );
+    }
+  });
+
+  it("concurrent stress test documents both e2e runner entry points", () => {
+    const content = fs.readFileSync(
+      path.join(repoRoot, "e2e-tests", "workflows-stress-concurrent.test.ts"),
+      "utf-8",
+    );
+    assert.ok(
+      content.includes("Run via:") &&
+        content.includes("./run-all-e2e-tests"),
+      "workflows-stress-concurrent.test.ts should name ./run-all-e2e-tests in its Run via header",
+    );
+    assert.ok(
+      content.includes("./run-all-scripted-e2e-tests"),
+      "workflows-stress-concurrent.test.ts should keep naming ./run-all-scripted-e2e-tests",
+    );
+  });
+
   it("run-all-smoke-e2e-tests exists and is executable", () => {
     const scriptPath = path.join(repoRoot, "run-all-smoke-e2e-tests");
     assert.ok(

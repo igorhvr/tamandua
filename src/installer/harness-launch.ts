@@ -206,12 +206,37 @@ export type HarnessLaunchOutcome = HarnessLaunchLaunched | HarnessLaunchAborted;
 // ── Mode records (durable + visible) ───────────────────────────────
 
 /**
+ * Run ids whose unprotected-fallback warning + run.harness_isolation record
+ * have ALREADY been written in THIS process. The unprotected-fallback state
+ * is a property of the host/run, not of each round: on a host with no usable
+ * native backend, every round would otherwise emit the same WARN + event
+ * hundreds of times (958 in one observed run). The set is process-scoped, so
+ * it naturally resets on each daemon start — the first fallback round after a
+ * daemon start records the warning/event, later rounds log at debug.
+ */
+const fallbackRecordedRunIds = new Set<string>();
+
+/**
+ * Test-only hook: clear the per-run fallback dedup state so unit tests can
+ * isolate module state. Product code never calls this.
+ */
+export function __resetFallbackDedupForTests(): void {
+  fallbackRecordedRunIds.clear();
+}
+
+/**
  * Record the launch's effective isolation mode. Always logged; additionally
  * emitted as a run.harness_isolation event when run identity is available
  * (the scheduler always supplies it). Fallback warnings are logged at warn
  * level and carried on the event with reason — visible on the run event
- * stream (dashboard/kanban) and durable in the log + events files. Never
- * dumps prompts or secrets.
+ * stream (dashboard/kanban) and durable in the log + events files.
+ *
+ * Per-run fallback dedup (WNOI): the FIRST unprotected-fallback execution for
+ * a runId in this process logs the WARN and emits the run.harness_isolation
+ * event; every LATER fallback execution for that runId logs the same fields
+ * at debug and emits NO event. Protected modes ('landlock'/'seatbelt') are
+ * unchanged: one info record + event per execution. Never dumps prompts or
+ * secrets.
  */
 function recordMode(
   opts: HarnessLaunchOptions,
@@ -239,10 +264,23 @@ function recordMode(
     ...(identity?.runId !== undefined ? { runId: identity.runId } : {}),
   };
   if (mode === "unprotected-fallback") {
+    // Dedup ONLY when we have a runId to key on; a runless fallback keeps
+    // today's always-warn behavior (it has no run stream to record on).
+    const fallbackRunId = identity?.runId;
+    if (fallbackRunId !== undefined && fallbackRecordedRunIds.has(fallbackRunId)) {
+      // Already warned/recorded for this run in this process: keep the
+      // fields observable at debug and do NOT emit another event.
+      logger.debug(
+        "harness signal isolation unavailable (already recorded for this run; running unprotected)",
+        fields,
+      );
+      return;
+    }
     logger.warn(
       "harness signal isolation unavailable — running this execution unprotected (mode=unprotected-fallback)",
       fields,
     );
+    if (fallbackRunId !== undefined) fallbackRecordedRunIds.add(fallbackRunId);
   } else {
     logger.info("harness execution isolation mode", fields);
   }

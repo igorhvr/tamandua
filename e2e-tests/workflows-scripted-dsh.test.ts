@@ -59,6 +59,10 @@ import type {
 import {
   sumUsageChunks,
 } from "../dist/installer/dsh-usage.js";
+import {
+  ROOT_DAC_SKIP_REASON,
+  shouldSkipDacFixtureTest,
+} from "../src/lib/dac-guard.ts";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
@@ -805,7 +809,11 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
   it(
     "do-now: token degradation (read-only DSH_HOME) — run completes, tokens_spent = 0, no crash",
     { timeout: 120_000 },
-    async () => {
+    async (t) => {
+      if (shouldSkipDacFixtureTest()) {
+        t.skip(ROOT_DAC_SKIP_REASON);
+        return;
+      }
       let ctx: ScriptedDshRunContext | undefined;
       try {
         // Create the scripted dsh normally (this creates the DSH_HOME dir

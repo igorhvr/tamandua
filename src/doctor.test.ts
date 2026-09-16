@@ -35,6 +35,10 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { getBuildVersion } from "../dist/lib/version.js";
 import { bindIdentitySocket } from "../dist/server/daemon-identity.js";
+import {
+  ROOT_DAC_SKIP_REASON,
+  shouldSkipDacFixtureTest,
+} from "../dist/lib/dac-guard.js";
 
 // ── Test-isolation DB setup ────────────────────────────────────
 
@@ -1173,6 +1177,10 @@ describe("ENVIRONMENT dsh checks (US-009)", () => {
   });
 
   it("session-store probe warns when the sessions dir is not readable", (t) => {
+    if (shouldSkipDacFixtureTest()) {
+      t.skip(ROOT_DAC_SKIP_REASON);
+      return;
+    }
     const sessionsDir = path.join(dshHomeDir!, "sessions");
     fs.mkdirSync(sessionsDir, { recursive: true });
     const check = checkDshSessionStore({

@@ -284,15 +284,20 @@ export const RUN_ALERT_EVENTS: readonly string[] = Object.freeze([
  * plus the full block in `reason`/`detail`; the run is force-failed
  * immediately afterwards (run.force_failed).
  *
- * `run.harness_isolation` (KHYG US-002) fires once per harness execution
- * (work rounds AND the launch-time probe round) through the shared launch
- * mechanism in src/installer/harness-launch.ts: it records the effective
+ * `run.harness_isolation` (KHYG US-002) records the effective
  * signal-isolation `mode` ('landlock' | 'seatbelt' | 'unprotected-fallback')
- * with the run/execution identity and `harness`. When the backend was
- * unavailable or setup failed before release and the execution fell back to
- * an unprotected run, `mode` is 'unprotected-fallback' and `reason` names
- * the exact fallback cause — the prominent durable warning operators see on
- * the run event stream. Pinned by
+ * with the run/execution identity and `harness`, for harness executions
+ * (work rounds AND the launch-time probe round) through the shared launch
+ * mechanism in src/installer/harness-launch.ts. Protected records (landlock /
+ * seatbelt) fire once per harness execution. When the backend was unavailable
+ * or setup failed before release and the execution fell back to an
+ * unprotected run, `mode` is 'unprotected-fallback' and `reason` names the
+ * exact fallback cause — the prominent durable warning operators see on the
+ * run event stream. Because the fallback condition is a run/host property,
+ * the unprotected-fallback record is written ONCE PER RUN PER DAEMON START
+ * (on the first fallback execution): later fallback rounds in the same run
+ * are logged at debug and emit no further event, so a run with many rounds
+ * does not flood the stream with duplicates. Pinned by
  * src/installer/events-vocabulary.test.ts.
  */
 export const RUN_DIAGNOSTIC_EVENTS: readonly string[] = Object.freeze([

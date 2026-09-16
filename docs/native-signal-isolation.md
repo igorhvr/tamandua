@@ -68,6 +68,14 @@ backend is unavailable, Tamandua still runs your workflow — protection is
 best-effort and must never make Tamandua unusable on older or restricted
 systems.
 
+Because no-backend is a property of the host (not of each round), the
+unprotected-fallback warning and its `run.harness_isolation` record are
+written **once per run per daemon start** — on the first fallback execution.
+Later fallback rounds in the same run log the same fields at debug level and
+emit no further event, so a long run does not produce hundreds of duplicate
+warnings. Protected (`landlock`/`seatbelt`) records are unaffected: they are
+still emitted once per harness execution.
+
 ## Limits
 
 Best effort is **not** a complete security boundary:

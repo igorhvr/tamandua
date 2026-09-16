@@ -3468,7 +3468,7 @@ describe("BSHA CLI capture warnings", () => {
     );
   }
 
-  it("prints capture warnings to stderr when git probes fail at launch", () => {
+  it("does not print capture warnings for a non-git working directory (BCAP)", () => {
     const th = createTempHome("tamandua-cli-bsha-");
     const homeDir = th.homeDir;
     const stateDir = th.tamanduaDir;
@@ -3515,18 +3515,32 @@ describe("BSHA CLI capture warnings", () => {
     } catch { /* no pid file */ }
 
     try {
-      // Launch should succeed (exit code 0) even with capture failures
+      // Launch should succeed (exit code 0) even though base capture is not applicable
       assert.equal(result.status, 0,
         `Expected exit code 0, got ${result.status}. stderr: ${result.stderr}`);
 
-      // stderr should contain capture warnings for both original_branch and base_branch_sha
+      // BCAP: a non-git working directory is classified as not-applicable, so no
+      // rugpull-degradation warnings are printed to stderr.
       const stderr = result.stderr ?? "";
-      assert.match(stderr, /Unable to capture original branch at launch/,
-        `Expected original_branch warning in stderr. Got: ${stderr}`);
-      assert.match(stderr, /Unable to capture base branch SHA at launch/,
-        `Expected base_branch_sha warning in stderr. Got: ${stderr}`);
-      assert.match(stderr, /rugpull detection degraded/,
-        `Expected rugpull degradation notice in stderr. Got: ${stderr}`);
+      assert.doesNotMatch(stderr, /Unable to capture original branch at launch/,
+        `Expected no original_branch warning for a non-git dir. Got: ${stderr}`);
+      assert.doesNotMatch(stderr, /Unable to capture base branch SHA at launch/,
+        `Expected no base_branch_sha warning for a non-git dir. Got: ${stderr}`);
+      assert.doesNotMatch(stderr, /rugpull detection degraded/,
+        `Expected no rugpull degradation notice for a non-git dir. Got: ${stderr}`);
+
+      // The run event stream still records the single not-applicable classification.
+      const eventsFile = path.join(stateDir, "events", "all.jsonl");
+      const events = fs.readFileSync(eventsFile, "utf-8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { event?: string; reason?: string });
+      const skipped = events.filter((e) => e.event === "run.base_capture_skipped");
+      assert.equal(skipped.length, 1,
+        `Expected exactly one run.base_capture_skipped event, got ${skipped.length}`);
+      assert.equal(skipped[0].reason, "not_a_git_repository");
+      assert.equal(events.filter((e) => e.event === "run.base_capture_failed").length, 0,
+        "non-git working directory must emit zero run.base_capture_failed events");
     } finally {
       fs.rmSync(th.root, { recursive: true, force: true });
     }
