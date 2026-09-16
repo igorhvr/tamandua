@@ -2,10 +2,85 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, existsSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
-import { terminateOwnedProcessGroup, reapStaleOrphans } from "./dead-owner-teardown.ts";
+import { terminateOwnedProcessGroup, reapStaleOrphans, decideOwnershipByIdentity } from "./dead-owner-teardown.ts";
 import { getProcessStartIdentity } from "../../src/lib/process-start-identity.ts";
+import { getPgid, getProcessState } from "../../dist/lib/proc-info.js";
+
+// ── Pure ABA identity-gate decision (v2 matcher) ──────────────────────
+//
+// These tests need no real process and no `ps`, so they run (and are
+// meaningful) even inside a seatbelt-isolated worker round where /bin/ps is
+// EPERM. They pin the rule that ONLY a well-formed v2 'same' comparison
+// proves ownership and that BOTH a v2 mismatch and an unknown/legacy
+// persisted value refuse — the latter never by silent string comparison.
+describe("decideOwnershipByIdentity — v2 matcher, legacy refusal", () => {
+  it("proves ownership only for a well-formed v2 match", () => {
+    const decision = decideOwnershipByIdentity("v2:4242:1700000000000", "v2:4242:1700000000000");
+    assert.equal(decision.proven, true);
+    assert.equal(decision.verdict, "same");
+    assert.match(decision.reason, /v2 identity match/);
+  });
+
+  it("proves ownership for a v2 match within the documented tolerance", () => {
+    const decision = decideOwnershipByIdentity("v2:4242:1700000000000", "v2:4242:1700000000400");
+    assert.equal(decision.proven, true);
+    assert.equal(decision.verdict, "same");
+  });
+
+  it("refuses a v2 mismatch beyond tolerance (PID reuse) with a mismatch reason", () => {
+    const decision = decideOwnershipByIdentity("v2:4242:1700000000000", "v2:4242:1900000000000");
+    assert.equal(decision.proven, false);
+    assert.equal(decision.verdict, "different");
+    assert.match(decision.reason, /mismatch/);
+    assert.match(decision.reason, /PID reuse/);
+  });
+
+  it("refuses a v2 pid mismatch as a mismatch", () => {
+    const decision = decideOwnershipByIdentity("v2:4242:1700000000000", "v2:4243:1700000000000");
+    assert.equal(decision.proven, false);
+    assert.equal(decision.verdict, "different");
+  });
+
+  it("refuses a persisted legacy ps: value with an unknown-format reason", () => {
+    const decision = decideOwnershipByIdentity(
+      "ps:Sun Sep  6 00:26:59 2026",
+      "v2:4242:1700000000000",
+    );
+    assert.equal(decision.proven, false);
+    assert.equal(decision.verdict, "unknown");
+    assert.match(decision.reason, /unknown\/legacy identity format/);
+    assert.match(decision.reason, /never proven/);
+  });
+
+  it("refuses a persisted legacy proc: value with an unknown-format reason", () => {
+    const decision = decideOwnershipByIdentity("proc:442043503", "v2:4242:1700000000000");
+    assert.equal(decision.proven, false);
+    assert.equal(decision.verdict, "unknown");
+    assert.match(decision.reason, /legacy ps:\/proc:/);
+  });
+
+  it("refuses a non-comparable v2u: value", () => {
+    const decision = decideOwnershipByIdentity("v2u:4242", "v2u:4242");
+    assert.equal(decision.proven, false);
+    assert.equal(decision.verdict, "unknown");
+  });
+
+  it("refuses malformed, empty and missing values", () => {
+    for (const [expected, current] of [
+      ["v2:4242:not-a-number", "v2:4242:1700000000000"],
+      ["", "v2:4242:1700000000000"],
+      [undefined, "v2:4242:1700000000000"],
+      ["v2:4242:1700000000000", null],
+      [null, null],
+    ] as Array<[string | null | undefined, string | null | undefined]>) {
+      const decision = decideOwnershipByIdentity(expected, current);
+      assert.equal(decision.proven, false, `expected=${String(expected)} current=${String(current)}`);
+      assert.equal(decision.verdict, "unknown");
+    }
+  });
+});
 
 describe("terminateOwnedProcessGroup", { concurrency: 1 }, () => {
   const tempDir = mkdtempSync(join(tmpdir(), "dead-owner-teardown-test-"));
@@ -19,12 +94,16 @@ describe("terminateOwnedProcessGroup", { concurrency: 1 }, () => {
    * Spawn a detached shell loop with a unique ownership marker, write its
    * pgid to a file, and return the pgid and marker.
    *
-   * The script does:
-   *   echo <pgid> > <pgidFile>
-   *   while :; do sleep 0.1; done
+   * The script just runs the loop; the group id is written by the test from
+   * the SPAWN HANDLE after `detached: true` made `child.pid` the leader of a
+   * new process group.
    *
-   * The ownership marker is baked into the script's args so it appears in
-   * `ps eww` output and our helper can validate ownership.
+   * Why not `$$` from the script: on Linux `/bin/sh` (dash) forks a nested
+   * shell to run `/bin/sh -c <script>`, so the script's `$$` is that nested
+   * shell's pid — a group MEMBER, not the group id. Recording it makes
+   * `terminateOwnedProcessGroup`'s ownership scan look for a process group
+   * that does not exist, so ownership is never proven and teardown silently
+   * no-ops. `child.pid` is the kernel's true group id for every member.
    */
   function spawnDetachedSuite(
     pgidFile: string,
@@ -32,13 +111,11 @@ describe("terminateOwnedProcessGroup", { concurrency: 1 }, () => {
   ): { pgid: number; child: ChildProcess } {
     const script = join(tempDir, `suite-${marker}.sh`);
     // The marker is embedded in the script path and passed as a literal
-    // argument so `ps eww` can see it. Using a unique marker dir suffices.
+    // argument so the process table can see it. Using a unique marker dir
+    // suffices.
     writeFileSync(
       script,
       `#!/bin/sh
-pgid=$(ps -o pgid= -p $$ | tr -d ' ')
-echo "$pgid" > "${pgidFile}"
-echo $$ > "${pgidFile}.pid"
 while :; do sleep 0.1; done
 `,
       { mode: 0o755 },
@@ -51,18 +128,66 @@ while :; do sleep 0.1; done
     });
     child.unref();
     ownedChildren.push(child);
-    return { pgid: child.pid!, child };
+    // Record the TRUE process-group id from the spawn handle — see the
+    // function doc for why the script's `$$` is wrong on Linux.
+    const pgid = child.pid!;
+    writeFileSync(pgidFile, String(pgid));
+    writeFileSync(`${pgidFile}.pid`, String(pgid));
+    return { pgid, child };
   }
 
   /**
-   * Poll until the pgid file exists and contains a valid positive integer.
+   * Spawn a detached suite whose recorded pgid file deliberately holds the
+   * NESTED shell's pid (`$$`), NOT the process-group leader.
+   *
+   * On Linux `/bin/sh` (dash) forks a nested shell to run
+   * `/bin/sh -c <script>`, so the script's `$$` is a group MEMBER pid while
+   * `child.pid` (with `detached: true`) is the group leader. Recording the
+   * member pid used to make `terminateOwnedProcessGroup`'s ownership scan
+   * look for a process group that does not exist, so ownership was never
+   * proven and teardown silently no-oped. This helper pins the kernel
+   * `getPgid()` resolution that makes the member pid work again.
+   */
+  function spawnDetachedNestedShellSuite(
+    pgidFile: string,
+    marker: string,
+  ): { leaderPgid: number; memberPid: number; child: ChildProcess } {
+    const script = join(tempDir, `nested-${marker}.sh`);
+    const memberFile = `${pgidFile}.member`;
+    // The marker is embedded in the script path, so it is visible in the
+    // group members' command lines (the ownership-scan evidence).
+    writeFileSync(
+      script,
+      `#!/bin/sh
+echo $$ > ${memberFile}
+while :; do sleep 0.1; done
+`,
+      { mode: 0o755 },
+    );
+
+    const child = spawn("/bin/sh", ["-c", script], {
+      detached: true,
+      stdio: "ignore",
+      env: { PATH: process.env.PATH },
+    });
+    child.unref();
+    ownedChildren.push(child);
+    const leaderPgid = child.pid!;
+    const memberPid = readIntegerFileWhenReady(memberFile);
+    // Record the MEMBER pid ON PURPOSE (the regression scenario).
+    writeFileSync(pgidFile, String(memberPid));
+    return { leaderPgid, memberPid, child };
+  }
+
+  /**
+   * Poll until the file exists and contains a valid positive integer.
    * Throws after deadlineMs.
    */
-  function readPgidWhenReady(pgidFile: string, deadlineMs = 5000): number {
+  function readIntegerFileWhenReady(file: string, deadlineMs = 5000): number {
     const deadline = Date.now() + deadlineMs;
     while (Date.now() < deadline) {
-      if (existsSync(pgidFile)) {
-        const raw = readFileSync(pgidFile, "utf-8").trim();
+      if (existsSync(file)) {
+        const raw = readFileSync(file, "utf-8").trim();
         if (/^[1-9][0-9]*$/.test(raw)) {
           return Number(raw);
         }
@@ -71,29 +196,29 @@ while :; do sleep 0.1; done
       const end = Date.now() + 50;
       while (Date.now() < end) { /* spin */ }
     }
-    throw new Error(`pgidFile ${pgidFile} was not written within ${deadlineMs}ms`);
+    throw new Error(`${file} was not written within ${deadlineMs}ms`);
+  }
+
+  /**
+   * Poll until the pgid file exists and contains a valid positive integer.
+   * Throws after deadlineMs.
+   */
+  function readPgidWhenReady(pgidFile: string, deadlineMs = 5000): number {
+    return readIntegerFileWhenReady(pgidFile, deadlineMs);
   }
 
   /**
    * Check if a pid references a live (non-zombie) process.
    *
-   * Uses `ps -p <pid> -o state=` which correctly reports Z (zombie)
-   * and X (dead) states on all platforms, avoiding the signal-0 trap
-   * (process.kill(pid, 0) succeeds for zombies).
+   * Uses the kernel process state (procfs on Linux, the sandbox-safe native
+   * helper on macOS), which correctly reports Z (zombie) and X (dead) states
+   * on all platforms, avoiding the signal-0 trap (process.kill(pid, 0)
+   * succeeds for zombies).
    */
   function isAlive(pid: number): boolean {
-    try {
-      const result = execSync(`ps -p ${pid} -o state= 2>/dev/null`, {
-        encoding: "utf-8",
-        timeout: 5000,
-        stdio: ["ignore", "pipe", "pipe"],
-      }).trim();
-      if (result.length === 0) return false;
-      const state = result[0];
-      return state !== "Z" && state !== "X";
-    } catch {
-      return false;
-    }
+    const state = getProcessState(pid);
+    if (state === null) return false;
+    return state !== "Z" && state !== "X";
   }
 
   function spinWait(ms: number): void {
@@ -151,6 +276,51 @@ while :; do sleep 0.1; done
   });
 
   // ── Ownership validation ──
+
+  it("records a pgidFile whose value the kernel resolves to the suite's process group", () => {
+    const marker = uniqueMarker();
+    const pgidFile = join(tempDir, `pgid-source-${marker}.pid`);
+    const { pgid } = spawnDetachedSuite(pgidFile, marker);
+    const recorded = readPgidWhenReady(pgidFile);
+
+    assert.equal(recorded, pgid, "recorded value must be the spawn-handle group leader");
+    assert.equal(
+      getPgid(recorded),
+      recorded,
+      "kernel getPgid must confirm the recorded value names the live process group",
+    );
+
+    // The pid file must carry the same leader pid (the ABA identity pid).
+    const pidFromFile = Number(readFileSync(`${pgidFile}.pid`, "utf-8").trim());
+    assert.equal(pidFromFile, pgid);
+
+    try { process.kill(-pgid, "SIGKILL"); } catch { /* */ }
+  });
+
+  it("resolves a recorded group-member pid to the kernel process group and tears the group down", () => {
+    const marker = uniqueMarker();
+    const pgidFile = join(tempDir, `nested-member-${marker}.pid`);
+    const { leaderPgid, memberPid } = spawnDetachedNestedShellSuite(pgidFile, marker);
+
+    assert.ok(isAlive(leaderPgid), "suite leader should be alive before teardown");
+    assert.ok(isAlive(memberPid), "nested shell member should be alive before teardown");
+
+    // The recorded value is a group MEMBER pid, not the group id — exactly the
+    // Linux `/bin/sh -c <script>` (dash) `$$` case. The kernel must map it back
+    // to the process group before the ownership scan runs.
+    const recorded = readPgidWhenReady(pgidFile);
+    assert.equal(recorded, memberPid, "pgidFile must hold the nested-shell member pid");
+    assert.equal(
+      getPgid(memberPid),
+      leaderPgid,
+      "kernel getPgid must resolve the member pid to the suite's process group",
+    );
+
+    terminateOwnedProcessGroup({ pgidFile, ownershipMarker: marker, graceMs: 500 });
+
+    assert.ok(!isAlive(leaderPgid), "whole group must be torn down from a recorded member pid");
+    assert.ok(!isAlive(memberPid), "nested shell member must be torn down");
+  });
 
   it("does NOT signal a process whose args lack the ownership marker", () => {
     const marker = uniqueMarker();
@@ -294,11 +464,12 @@ while :; do sleep 0.1; done
     readPgidWhenReady(pgidFile);
     assert.ok(isAlive(pgid), "suite should be alive before teardown");
 
-    // Provide a deliberately WRONG startTime
+    // Provide a well-formed v2 value for the SAME pid whose start epoch is
+    // far beyond the documented tolerance — a stale/earlier incarnation.
     terminateOwnedProcessGroup({
       pgidFile,
       pid: pgid,
-      startTime: "deliberately-wrong-identity",
+      startTime: `v2:${pgid}:1`,
       ownershipMarker: marker,
       graceMs: 500,
     });

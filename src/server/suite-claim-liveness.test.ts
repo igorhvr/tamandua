@@ -9,7 +9,10 @@ import {
   type SuiteOwnerLiveness,
 } from "../../dist/server/control-server.js";
 import { CLAIM_TIMEOUT_MS } from "../../dist/suite/config.js";
-import { getProcessStartIdentity } from "../../dist/lib/process-start-identity.js";
+import {
+  PROCESS_START_IDENTITY_TOLERANCE_MS,
+  getProcessStartIdentity,
+} from "../../dist/lib/process-start-identity.js";
 
 interface JsonResponse {
   status: number;
@@ -23,18 +26,26 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
   const probedPids: number[] = [];
   const probedIdentities: Array<{ pid: number; startTime?: string }> = [];
   const events: Array<Parameters<NonNullable<ControlServerOptions["emitSuiteClaimEvent"]>>[0]> = [];
+  // Freshly read (actual) identities keyed by pid; a pid absent from the map
+  // yields an unreadable actual identity unless deadPids/indeterminatePids
+  // forces the signal-0 outcome.
+  const actualIdentities = new Map<number, string>();
   const secret = "suite-claim-liveness-secret";
   const server = createControlServer({
     listen: false,
     secret,
     now: () => now,
+    // Delegate to the REAL format-aware matcher so the HTTP reclaim path is
+    // exercised end to end: scripted signal-0 outcomes drive ESRCH/EPERM and
+    // actualIdentities supplies what a fresh identity read would return.
     probeSuiteOwnerPid: (pid, startTime): SuiteOwnerLiveness => {
       probedPids.push(pid);
       probedIdentities.push({ pid, startTime });
-      if (pid === 801 && startTime === "original-start") return "dead";
-      if (deadPids.has(pid)) return "dead";
-      if (indeterminatePids.has(pid)) return "indeterminate";
-      return "alive";
+      return probeSuiteOwnerPid(pid, () => {
+        if (deadPids.has(pid)) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+        if (indeterminatePids.has(pid)) throw Object.assign(new Error("denied"), { code: "EPERM" });
+        return true;
+      }, startTime, (targetPid) => actualIdentities.get(targetPid));
     },
     emitSuiteClaimEvent: (event) => events.push(event),
   });
@@ -108,9 +119,53 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
   });
 
   it("classifies a reused PID with a different process start time as dead", () => {
-    assert.equal(probeSuiteOwnerPid(4, () => true, "original-start", () => "replacement-start"), "dead");
-    assert.equal(probeSuiteOwnerPid(4, () => true, "original-start", () => "original-start"), "alive");
-    assert.equal(probeSuiteOwnerPid(4, () => true, "original-start", () => undefined), "indeterminate");
+    const tolerance = PROCESS_START_IDENTITY_TOLERANCE_MS;
+    const expected = "v2:4:1000000";
+    // identical well-formed v2 values -> same pid, same start -> alive
+    assert.equal(probeSuiteOwnerPid(4, () => true, expected, () => "v2:4:1000000"), "alive");
+    // same pid within the documented tolerance -> alive
+    assert.equal(
+      probeSuiteOwnerPid(4, () => true, expected, () => `v2:4:${1000000 + tolerance}`),
+      "alive",
+    );
+    // same pid beyond tolerance -> different process -> dead
+    assert.equal(
+      probeSuiteOwnerPid(4, () => true, expected, () => `v2:4:${1000000 + tolerance + 1}`),
+      "dead",
+    );
+    // pid mismatch is a different process -> dead
+    assert.equal(probeSuiteOwnerPid(4, () => true, expected, () => "v2:5:1000000"), "dead");
+    // absent actual identity -> indeterminate
+    assert.equal(probeSuiteOwnerPid(4, () => true, expected, () => undefined), "indeterminate");
+    assert.equal(probeSuiteOwnerPid(4, () => true, expected, () => null), "indeterminate");
+    // no recorded start time cannot prove reuse; a live signal-0 is enough
+    assert.equal(probeSuiteOwnerPid(4, () => true, undefined, () => "v2:4:1000000"), "alive");
+  });
+
+  it("never classifies legacy, fallback, malformed, or empty identities as dead", () => {
+    const legacyExpected = "ps:Sun Sep  6 00:26:59 2026";
+    const legacyActual = "ps:Sat Sep  5 21:26:59 2026";
+    const v2 = "v2:4:1000000";
+    const cases: Array<[string, string, string]> = [
+      ["legacy expected", legacyExpected, v2],
+      ["legacy actual", v2, legacyActual],
+      ["legacy on both sides", legacyExpected, legacyActual],
+      ["legacy proc: expected", "proc:12345", v2],
+      ["legacy proc: actual", v2, "proc:12345"],
+      ["v2u fallback expected", "v2u:4", v2],
+      ["v2u fallback actual", v2, "v2u:4"],
+      ["malformed expected", "v2:4:not-a-number", v2],
+      ["malformed actual", v2, "v2:4:not-a-number"],
+      ["empty expected", "", v2],
+      ["empty actual", v2, ""],
+    ];
+    for (const [label, expected, actual] of cases) {
+      assert.equal(
+        probeSuiteOwnerPid(4, () => true, expected, () => actual),
+        "indeterminate",
+        `${label} must be unknown, never dead`,
+      );
+    }
   });
 
   it("reads a stable start identity for the current process", () => {
@@ -141,14 +196,63 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
   });
 
   it("forwards process start identity and reclaims a PID-reused owner", async () => {
-    const original = { ...key("pid-reuse", "pid-reuse-owner", 801), owner_start_time: "original-start" };
+    // PID 801 was reused: the recorded v2 identity differs from the fresh read
+    // well beyond the documented tolerance, so the owner is provably dead.
+    actualIdentities.set(801, "v2:801:9000000");
+    const original = { ...key("pid-reuse", "pid-reuse-owner", 801), owner_start_time: "v2:801:5000000" };
     assert.equal((await request(original)).body.action, "run");
     assert.equal((await request(key("pid-reuse", "pid-reuse-waiter", 802))).body.action, "run");
-    assert.ok(probedIdentities.some(({ pid, startTime }) => pid === 801 && startTime === "original-start"));
+    assert.ok(probedIdentities.some(({ pid, startTime }) => pid === 801 && startTime === "v2:801:5000000"));
     const reclaim = events.find((event) => event.event === "suite.claim_dead_owner_reclaimed"
       && event.originRepo === "/repo/pid-reuse");
     assert.equal(reclaim?.ownerPid, 801);
     assert.equal(reclaim?.reclaimerPid, 802);
+  });
+
+  it("matches owner identity by format over HTTP and never reclaims unknowns", async () => {
+    const tolerance = PROCESS_START_IDENTITY_TOLERANCE_MS;
+    const legacy = "ps:Sun Sep  6 00:26:59 2026";
+    const cases: Array<{
+      suffix: string;
+      pid: number;
+      expected?: string;
+      actual?: string;
+      action: "run" | "wait";
+    }> = [
+      { suffix: "same-v2", pid: 901, expected: "v2:901:7000000", actual: "v2:901:7000000", action: "wait" },
+      {
+        suffix: "within-tol",
+        pid: 902,
+        expected: "v2:902:7000000",
+        actual: `v2:902:${7000000 + tolerance}`,
+        action: "wait",
+      },
+      {
+        suffix: "beyond-tol",
+        pid: 903,
+        expected: "v2:903:7000000",
+        actual: `v2:903:${7000000 + tolerance + 1}`,
+        action: "run",
+      },
+      { suffix: "pid-mismatch", pid: 904, expected: "v2:904:7000000", actual: "v2:905:7000000", action: "run" },
+      { suffix: "legacy-expected", pid: 906, expected: legacy, actual: "v2:906:7000000", action: "wait" },
+      { suffix: "legacy-actual", pid: 907, expected: "v2:907:7000000", actual: legacy, action: "wait" },
+      { suffix: "fallback-expected", pid: 908, expected: "v2u:908", actual: "v2:908:7000000", action: "wait" },
+      { suffix: "malformed-identity", pid: 909, expected: "v2:909:not-a-number", actual: "v2:909:7000000", action: "wait" },
+    ];
+    for (const testCase of cases) {
+      if (testCase.actual !== undefined) actualIdentities.set(testCase.pid, testCase.actual);
+      const owner = {
+        ...key(testCase.suffix, `${testCase.suffix}-owner`, testCase.pid),
+        ...(testCase.expected === undefined ? {} : { owner_start_time: testCase.expected }),
+      };
+      assert.equal((await request(owner)).body.action, "run", `${testCase.suffix}: owner is granted`);
+      const waiter = await request(key(testCase.suffix, `${testCase.suffix}-waiter`, testCase.pid + 50));
+      assert.equal(waiter.body.action, testCase.action, `${testCase.suffix}: waiter action`);
+      const reclaimed = events.some((event) => event.event === "suite.claim_dead_owner_reclaimed"
+        && event.originRepo === `/repo/${testCase.suffix}`);
+      assert.equal(reclaimed, testCase.action === "run", `${testCase.suffix}: reclaim only when provably dead`);
+    }
   });
 
   it("retains live, indeterminate, and legacy owners below the ceiling", async () => {

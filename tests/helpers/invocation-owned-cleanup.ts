@@ -23,11 +23,14 @@
  *   reports).
  * - Process identity is re-verified immediately before EACH signal. When the
  *   invocation recorded (pid, getProcessStartIdentity(pid)) at spawn or
- *   PID-file-read time, the recorded identity must still match; a mismatch
- *   (PID reuse / stale identity) or an unavailable identity is a refusal.
- *   When nothing was recorded, the decision-time identity snapshot is
- *   compared again at signal time so reuse inside the decision→signal window
- *   is still caught.
+ *   PID-file-read time, the recorded and current values are compared with
+ *   compareProcessStartIdentities() (the versioned v2 matcher), never with
+ *   string equality. A `'different'` verdict (PID reuse / stale identity), an
+ *   `'unknown'` verdict (a persisted legacy ps:/proc: value, a non-comparable
+ *   v2u: value, or a malformed/empty value) and an unavailable current
+ *   identity are all refusals. When nothing was recorded, the decision-time
+ *   identity snapshot is re-verified at signal time through the same matcher
+ *   so reuse inside the decision→signal window is still caught.
  * - Unavailable evidence is a REFUSAL, never cleanup: an unreadable or
  *   inaccessible observation yields a distinct outcome and no signal.
  *
@@ -41,8 +44,11 @@
 
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import { getEnvironText } from "../../src/lib/proc-info.ts";
-import { getProcessStartIdentity } from "../../src/lib/process-start-identity.ts";
+import { getEnvironText } from "../../dist/lib/proc-info.js";
+import {
+  compareProcessStartIdentities,
+  getProcessStartIdentity,
+} from "../../src/lib/process-start-identity.ts";
 import { ownedTempRoots } from "./test-env.ts";
 
 /**
@@ -69,6 +75,7 @@ export type SkipReason =
   | "unreadable-evidence" // evidence could not be read → refusal
   | "not-owned" // readable evidence points outside every owned root
   | "identity-unavailable" // recorded identity exists but current identity is unreadable
+  | "identity-unknown-format" // recorded/current identity is legacy ps:/proc:, v2u:, malformed or empty → never comparable
   | "identity-mismatch" // recorded identity differs from current (PID reuse / stale identity)
   | "exited-before-signal" // recheck: process exited before the signal
   | "evidence-changed-before-signal" // recheck: evidence no longer proves ownership
@@ -173,10 +180,11 @@ export function hasOwnedEvidence(
  * process identity immediately before EACH signal.
  *
  * Refusals (never signalled): unreadable evidence, readable evidence outside
- * every owned root, recorded-identity mismatch (PID reuse / stale identity)
- * and unavailable identity when one was recorded. Between decision and
- * signal the evidence and identity are re-observed: a process that exited or
- * whose evidence/identity changed is skipped, never signalled on stale
+ * every owned root, a recorded identity that is legacy/unknown-format
+ * (identity-unknown-format), a recorded-identity mismatch (PID reuse / stale
+ * identity) and unavailable identity when one was recorded. Between decision
+ * and signal the evidence and identity are re-observed: a process that exited
+ * or whose evidence/identity changed is skipped, never signalled on stale
  * proof.
  */
 export function cleanupInvocationOwnedSurvivors(
@@ -205,6 +213,10 @@ export function cleanupInvocationOwnedSurvivors(
     }
 
     // ── Identity gate. ──
+    // Recorded-vs-current uses the versioned v2 matcher, never string
+    // equality: a persisted legacy ps:/proc: value (or a v2u:/malformed one)
+    // is 'unknown' and must refuse, so an upgrade can never signal a process
+    // it cannot prove it owns.
     const recorded = recordedIdentityOf(pid);
     let decisionIdentity: string | null;
     if (recorded !== null) {
@@ -213,11 +225,18 @@ export function cleanupInvocationOwnedSurvivors(
         dispositions.push({ pid, outcome: "skipped", reason: "identity-unavailable" });
         continue;
       }
-      if (current !== recorded) {
+      const verdict = compareProcessStartIdentities(recorded, current);
+      if (verdict === "unknown") {
+        dispositions.push({ pid, outcome: "skipped", reason: "identity-unknown-format" });
+        continue;
+      }
+      if (verdict === "different") {
         dispositions.push({ pid, outcome: "skipped", reason: "identity-mismatch" });
         continue;
       }
-      decisionIdentity = recorded;
+      // 'same': both sides are well-formed v2 — keep the freshly read value
+      // as the recheck baseline.
+      decisionIdentity = current;
     } else {
       // No spawn-time record for this pid: snapshot the identity now so the
       // pre-signal recheck can detect PID reuse inside the decision→signal
@@ -242,7 +261,7 @@ export function cleanupInvocationOwnedSurvivors(
     const recheckIdentity = bindings.identityOf(pid);
     if (
       decisionIdentity !== null &&
-      (recheckIdentity === null || recheckIdentity !== decisionIdentity)
+      compareProcessStartIdentities(decisionIdentity, recheckIdentity) !== "same"
     ) {
       dispositions.push({ pid, outcome: "skipped", reason: "identity-changed-before-signal" });
       continue;
@@ -324,9 +343,9 @@ export function sigkillSurvivor(pid: number): void {
  *
  * pids may be strings (pgrep output) or numbers; non-positive/non-integer
  * entries are ignored. Unavailable evidence, prefix neighbors, other
- * invocations and stale identities are refused; only survivors whose current
- * evidence points exactly inside an owned root are signalled (after an
- * immediate evidence+identity recheck).
+ * invocations, legacy/unknown identity formats and stale identities are
+ * refused; only survivors whose current evidence points exactly inside an
+ * owned root are signalled (after an immediate evidence+identity recheck).
  */
 export function sweepInvocationOwnedLeakedSurvivors(
   pids: Iterable<number | string>,

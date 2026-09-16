@@ -10,6 +10,7 @@ import {
   getProcessCwd,
   hasProcfs,
   listPids,
+  listProcessDetails,
 } from "../lib/proc-info.js";
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -148,9 +149,10 @@ export function getProcPids(): number[] {
 
 /**
  * One observation per visible process. On Linux this walks procfs per pid.
- * On macOS per-pid reads would spawn two subprocesses per process, so the
- * whole table is captured with ONE `ps -axwwo` call (argv) and ONE
- * `lsof -d cwd` call (cwd) instead; environ stays null there (unreadable).
+ * On macOS per-pid reads would spawn one subprocess per process, so the whole
+ * command-line table is captured with ONE sandbox-safe `listProcessDetails()`
+ * call (the native sysctl helper, or ps where the helper is absent) and ONE
+ * `lsof -d cwd` call; environ stays null there (unreadable).
  */
 export function collectProcessSnapshot(): ProcessSnapshotEntry[] {
   if (hasProcfs()) {
@@ -164,19 +166,11 @@ export function collectProcessSnapshot(): ProcessSnapshotEntry[] {
 
   const cmdlineByPid = new Map<number, string>();
   try {
-    const r = spawnSync("ps", ["-axwwo", "pid=,command="], {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      maxBuffer: 64 * 1024 * 1024,
-    });
-    if (r.status === 0 && typeof r.stdout === "string") {
-      for (const line of r.stdout.split("\n")) {
-        const m = line.match(/^\s*(\d+)\s+(.*)$/);
-        if (m) cmdlineByPid.set(Number(m[1]), m[2]);
-      }
+    for (const detail of listProcessDetails()) {
+      cmdlineByPid.set(detail.pid, detail.cmdline);
     }
   } catch {
-    // ps unavailable — snapshot stays empty for cmdline.
+    // process metadata unavailable — snapshot stays empty for cmdline.
   }
 
   const cwdByPid = new Map<number, string>();

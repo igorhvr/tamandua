@@ -61,6 +61,22 @@ describe("captureProcessIdentity", () => {
     assert.strictEqual(coercionFlag, false);
   });
 
+  it("captures a TZ-independent identity (in-process TZ flip)", () => {
+    if (process.platform !== "linux" && process.platform !== "darwin") return;
+    const savedTz = process.env.TZ;
+    try {
+      process.env.TZ = "UTC";
+      const utc = captureProcessIdentity(process.pid);
+      process.env.TZ = "America/Los_Angeles";
+      const local = captureProcessIdentity(process.pid);
+      assert.equal(utc, local, "the same live pid must yield the same identity in any TZ");
+      assert.equal(validateProcessIdentity(utc), utc);
+    } finally {
+      if (savedTz === undefined) delete process.env.TZ;
+      else process.env.TZ = savedTz;
+    }
+  });
+
   it("surfaces hermetic Linux failures and passes through validateProcessIdentity", () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
     const originalReadFileSync = fs.readFileSync;

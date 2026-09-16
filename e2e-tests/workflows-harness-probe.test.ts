@@ -264,7 +264,16 @@ describe("launch-time harness probe e2e (IFLB US-006)", () => {
           env: baseEnv(ctx.env.homeDir, ctx.env.controlPort),
           encoding: "utf-8",
         });
-        const text = `${statusOut.stdout}\n${statusOut.stderr}`;
+        // The CLI's update banner is environment-dependent: the daemon's
+        // startup version check compares the checkout HEAD against
+        // origin/main, which diverges on any feature branch/worktree. It is
+        // unrelated to the operator surface under test, so drop it before
+        // asserting the keyline block is the last output.
+        const statusStderr = statusOut.stderr
+          .split(/\r?\n/)
+          .filter((line) => !line.includes("A new version of tamandua is available!"))
+          .join("\n");
+        const text = `${statusOut.stdout}\n${statusStderr}`;
         assert.match(text, /FAILURE_CLASS: harness_unavailable/, "workflow status must surface the keyline block");
         assert.match(text, /\nHARNESS: pi\n/, "workflow status must surface HARNESS: pi");
         assert.match(text, /STDERR_TAIL:/, "workflow status must surface the last STDERR_TAIL key");

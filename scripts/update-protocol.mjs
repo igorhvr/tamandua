@@ -33,6 +33,55 @@ const VALID_MODES = Object.freeze(["legacy", "current"]);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// Kernel-derived identity (sandbox-safe): inside the macOS Seatbelt signal
+// profile /bin/ps is EPERM (setuid). The compiled native helpers read the same
+// kernel data via sysctl, so identity capture and ancestry walks prefer them
+// and fall back to ps only when the helpers were not built.
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** Resolve a compiled native helper (env override, packaged dist, then cwd). */
+function resolveNativeHelper(basename, envName) {
+  const override = process.env[envName];
+  if (typeof override === "string" && override.trim() !== "") return override.trim();
+  const candidates = [
+    path.resolve(SCRIPT_DIR, "..", "dist", "native", basename),
+    path.resolve(process.cwd(), "dist", "native", basename),
+  ];
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+/**
+ * Format a kernel start time (epoch seconds + microseconds) as a deterministic
+ * UTC `Lstart` string (`Www Mmm [d]d HH:MM:SS YYYY`).
+ *
+ * The serialized mac identity keeps its historical `{ "lstart": ... }` shape so
+ * existing validators and persisted rows stay comparable, but the text is now
+ * derived from RAW KERNEL NUMERICS in UTC instead of `ps -o lstart=` — which
+ * ps(1) formats in the CALLER's local timezone, making the same live pid look
+ * different to a parent and a child with different TZ values (the TZPI defect).
+ */
+function formatUtcLstart(sec, usec) {
+  const d = new Date(sec * 1000 + Math.floor(usec / 1000));
+  if (!Number.isFinite(d.getTime())) throw new Error("Cannot capture process identity");
+  const day = String(d.getUTCDate()).padStart(2, " ");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+  return `${DAY_NAMES[d.getUTCDay()]} ${MONTH_NAMES[d.getUTCMonth()]} ${day} ${hh}:${mm}:${ss} ${d.getUTCFullYear()}`;
+}
+
 function validateMode(name) {
   if (typeof name !== "string" || !VALID_MODES.includes(name)) {
     throw new Error("Invalid mode");
@@ -220,6 +269,30 @@ function captureLinuxIdentity(pid) {
 }
 
 function captureMacIdentity(pid) {
+  // Prefer the compiled sysctl helper: it works inside the macOS Seatbelt
+  // signal sandbox where ps(1) is EPERM, and it yields the raw kernel start
+  // time (TZ-independent) rather than ps's localized `lstart` text.
+  const helper = resolveNativeHelper("proc-starttime", "TAMANDUA_PROC_STARTTIME_HELPER");
+  if (helper !== null) {
+    let start;
+    try {
+      start = spawnSync(helper, [String(pid)], {
+        encoding: "utf-8",
+        timeout: 5000,
+        maxBuffer: 4096,
+      });
+    } catch {
+      start = null;
+    }
+    if (start && !start.error && start.status === 0 && typeof start.stdout === "string") {
+      const m = /^(\d+)\.(\d{1,6})$/.exec(start.stdout.trim());
+      if (m) {
+        return JSON.stringify({ lstart: formatUtcLstart(Number(m[1]), Number(m[2])) });
+      }
+    }
+  }
+
+  // Legacy fallback for hosts where the helper was not built.
   // Use argument-vector process API — never interpolated shell commands
   let result;
   try {
@@ -286,6 +359,21 @@ function getParentPid(pid) {
   }
 
   if (process.platform === "darwin") {
+    // Prefer the compiled sysctl helper (works inside the macOS Seatbelt
+    // signal sandbox where /bin/ps is EPERM); ps stays the last-resort
+    // fallback when the helper was not built.
+    const helper = resolveNativeHelper("proc-info", "TAMANDUA_PROC_INFO_HELPER");
+    if (helper !== null) {
+      const native = spawnSync(helper, ["pid", String(pid)], {
+        encoding: "utf-8",
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+      });
+      if (!native.error && native.status === 0 && typeof native.stdout === "string") {
+        const fields = native.stdout.trim().split("\t");
+        if (fields.length >= 2) return parseInt(fields[1], 10) || null;
+      }
+    }
     const result = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], {
       encoding: "utf-8",
       timeout: 5000,

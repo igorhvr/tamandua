@@ -25,7 +25,10 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { logger } from "../lib/logger.js";
 import { SQL_NOW_ISO } from "../lib/instant.js";
-import { getProcessStartIdentity } from "../lib/process-start-identity.js";
+import {
+  compareProcessStartIdentities,
+  getProcessStartIdentity,
+} from "../lib/process-start-identity.js";
 import { getBuildVersion } from "../lib/version.js";
 import { assertPortIsolation, assertStatePathIsolation, testGuardActive } from "../lib/test-guard.js";
 import { getDb } from "../db.js";
@@ -521,6 +524,23 @@ function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClai
 
 export type SuiteOwnerLiveness = "alive" | "dead" | "indeterminate";
 
+/**
+ * Probe a suite claim's recorded owner PID and start identity.
+ *
+ * The start identity is compared with `compareProcessStartIdentities`, never
+ * with string equality, so the result is format-aware:
+ *   - `same`   → `alive` (two well-formed v2 values, same pid, |Δstart| within
+ *                the documented tolerance),
+ *   - `different` → `dead` (same pid but beyond tolerance, or a pid mismatch),
+ *   - `unknown` → `indeterminate` (legacy `ps:`/`proc:`, the `v2u:` fallback,
+ *                malformed/empty values, or no value at all).
+ *
+ * Legacy and malformed identities are therefore NEVER treated as dead: a
+ * mismatch we cannot prove is not a licence to reclaim a live owner. A
+ * null/undefined *actual* identity (process absent or unreadable) is likewise
+ * `indeterminate`. Only an ESRCH from the signal-0 probe is `dead` without an
+ * identity comparison.
+ */
 export function probeSuiteOwnerPid(
   pid: number,
   signalZero: (targetPid: number, signal: 0) => unknown = (targetPid, signal) => process.kill(targetPid, signal),
@@ -535,7 +555,14 @@ export function probeSuiteOwnerPid(
   if (expectedStartTime === undefined) return "alive";
   const actualStartTime = readStartTime(pid);
   if (actualStartTime == null) return "indeterminate";
-  return actualStartTime === expectedStartTime ? "alive" : "dead";
+  switch (compareProcessStartIdentities(expectedStartTime, actualStartTime)) {
+    case "same":
+      return "alive";
+    case "different":
+      return "dead";
+    default:
+      return "indeterminate";
+  }
 }
 
 interface SuiteClaimRuntime {

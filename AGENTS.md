@@ -390,6 +390,28 @@ npm run build && npm test
 
 Tests use Node's built-in `node:test` and `node:assert`.
 
+### Sandbox-safe process metadata (MPSX)
+
+Inside the macOS Seatbelt signal profile used for per-execution isolation,
+`/bin/ps` (setuid) is EPERM, so every ps-based process probe degrades to
+nothing in a sandboxed worker round. `native/proc-info.c` (compiled by
+`scripts/build-native.mjs` to `dist/native/proc-info`, like `proc-starttime`)
+exposes the needed metadata through `sysctl(2)`:
+
+```
+proc-info list | pid <pid> | dump      # pid/ppid/pgid/state/start/cmdline, TAB-separated
+```
+
+`src/lib/proc-info.ts` prefers it for `listPids`/`getPgid`/`getCmdline`/
+`getProcessState`/`getElapsedSeconds` and the bulk `listProcessDetails()`,
+falling back to ps only when the helper was not built; procfs stays the
+primary Linux source. `scripts/update-protocol.mjs` also derives its mac
+process identity from the `proc-starttime` helper (formatted as a
+deterministic UTC `Lstart` string via `formatUtcLstart`) and its parent chain
+from `proc-info pid <pid>`, so identity capture and ancestry validation work
+in-sandbox and no longer vary with the caller's `TZ`. New spawn-capable test
+files must be registered in `tests/serial-files.txt`.
+
 ### Two-lane test suite (PRLL)
 
 `npm test` delegates to `scripts/run-all-lanes.sh`, which runs the suite in

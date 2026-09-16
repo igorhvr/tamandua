@@ -65,6 +65,7 @@ src/installer/step-ops-stories.test.ts
 src/installer/step-ops-verifier-verdict.test.ts
 src/installer/step-ops-verify-each-eligibility.test.ts
 src/installer/worktree-manager.test.ts
+src/lib/proc-info.test.ts
 src/lib/process-start-identity.test.ts
 src/lib/version-check.test.ts
 src/server/control-client.test.ts

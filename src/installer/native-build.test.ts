@@ -15,6 +15,10 @@
  *    and refreshes the artifact + stamp area;
  *  - unsupported platforms are an explicit unavailable backend, never a
  *    broken build;
+ *  - the darwin proc-starttime helper (TZPI US-001) is compiled + stamped on
+ *    a darwin host, obtained only via sysctl KERN_PROC_PID (never ps(1)),
+ *    TZ-independent, and its build failures never write the
+ *    signal-backend .unavailable.json marker;
  *  - no downloaded binaries / native-addon dependencies are introduced
  *    (the script only compiles the repo's own C source with cc/gcc).
  *
@@ -30,7 +34,7 @@
  * Spawn-capable (subprocess + compiler): listed in tests/serial-files.txt.
  */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it, type TestContext } from "node:test";
@@ -367,7 +371,7 @@ describe("native build integration (US-001)", () => {
     assert.ok(fs.existsSync(path.join(run.outDir, "seatbelt-signal.sb")));
   });
 
-  it("stamps the seatbelt profile on darwin without compiling anything", { timeout: 120000 }, () => {
+  it("stamps the seatbelt profile on darwin and does not build the landlock helper", { timeout: 120000 }, () => {
     const run = runBuild({ TAMANDUA_BUILD_NATIVE_FORCE_PLATFORM: "darwin" });
     assert.equal(run.status, 0, `stderr: ${run.stderr}`);
     assert.match(run.stdout, /"backend":"seatbelt"/);
@@ -378,6 +382,288 @@ describe("native build integration (US-001)", () => {
     assert.equal(stamp.compiled, false);
     assert.ok(!fs.existsSync(path.join(run.outDir, "landlock-helper")));
     assertNoUnavailableMarker(run.outDir);
+  });
+
+  // ------------------------------------------------------------------
+  // TZPI US-001: darwin proc-starttime native helper (sysctl KERN_PROC_PID)
+  // ------------------------------------------------------------------
+
+  // A darwin-forced build only ever compiles the sysctl helper on a real
+  // darwin host; on any other host the compiler cannot consume the
+  // Darwin-only headers, which must be a graceful exit 0. Build once and
+  // reuse for the behavior tests below.
+  let darwinForcedBuild: BuildRun | null = null;
+  function buildDarwinProcStarttimeOnce(): BuildRun {
+    if (darwinForcedBuild === null) {
+      darwinForcedBuild = runBuild({ TAMANDUA_BUILD_NATIVE_FORCE_PLATFORM: "darwin" });
+    }
+    return darwinForcedBuild;
+  }
+
+  it("proc-starttime source obtains the start time only via sysctl KERN_PROC_PID (never ps)", () => {
+    const sourcePath = path.join(REPO_ROOT, "native", "proc-starttime.c");
+    assert.ok(fs.existsSync(sourcePath), "native/proc-starttime.c must exist");
+    const src = fs.readFileSync(sourcePath, "utf8");
+    // The only permitted kernel source.
+    assert.match(src, /KERN_PROC_PID/);
+    assert.match(src, /p_starttime/);
+    assert.match(src, /sysctl\s*\(/);
+    // Strip C comments so documentation that NAMES ps(1)/bin/ps as the
+    // rejected approach is not mistaken for a code invocation; then assert
+    // the executable code never shells out to ps or any other binary.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    assert.ok(!code.includes("/bin/ps"), "proc-starttime code must not reference /bin/ps");
+    assert.ok(!/\bps\b/.test(code), "proc-starttime code must not invoke ps");
+    assert.ok(
+      !/\b(popen|system|fork|execlp|execvp|execve|posix_spawn)\s*\(/.test(code),
+      "proc-starttime must not use an external-binary API",
+    );
+  });
+
+  it("forced darwin build produces an executable, stamped proc-starttime helper", { timeout: 120000 }, () => {
+    const run = buildDarwinProcStarttimeOnce();
+    assert.equal(run.status, 0, `build-native must exit 0; stderr: ${run.stderr}`);
+
+    const helper = path.join(run.outDir, "proc-starttime");
+    const stampPath = path.join(run.outDir, "proc-starttime.stamp.json");
+
+    if (process.platform !== "darwin") {
+      // Forcing the darwin platform on a non-darwin host cannot compile the
+      // sysctl source. Contract: graceful exit 0, NO helper/stamp, and
+      // critically NO .unavailable.json (that marker governs the signal
+      // backend, not process identity).
+      assert.ok(!fs.existsSync(helper), "no proc-starttime helper on a non-darwin host");
+      assert.ok(!fs.existsSync(stampPath), "no proc-starttime stamp on a non-darwin host");
+      assertNoUnavailableMarker(run.outDir);
+      assert.match(run.stdout, /"artifact":"proc-starttime"/);
+      return;
+    }
+
+    assert.ok(fs.existsSync(helper), "proc-starttime artifact must be produced on darwin");
+    assert.ok((fs.statSync(helper).mode & 0o111) !== 0, "proc-starttime must be executable");
+    const stamp = readJson(stampPath);
+    assert.ok(stamp, "a proc-starttime stamp file must be written next to the artifact");
+    assert.equal(stamp.artifact, "proc-starttime");
+    assert.equal(stamp.backend, "darwin-sysctl");
+    assert.equal(stamp.platform, "darwin");
+    assert.equal(stamp.source, "native/proc-starttime.c");
+    assert.ok(["cc", "gcc"].includes(String(stamp.toolchain)), `stamp toolchain: ${String(stamp.toolchain)}`);
+    assert.equal(typeof stamp.sourceSha256, "string");
+    assert.ok(String(stamp.sourceSha256).length >= 40);
+    assertNoUnavailableMarker(run.outDir);
+    assert.match(run.stdout, /"backend":"darwin-sysctl"/);
+  });
+
+  it("darwin proc-starttime reports kernel start times for live pids", { timeout: 120000 }, (t) => {
+    if (process.platform !== "darwin") {
+      return t.skip("honest capability skip: the sysctl proc-starttime helper requires a darwin host");
+    }
+    const run = buildDarwinProcStarttimeOnce();
+    assert.equal(run.status, 0, `stderr: ${run.stderr}`);
+    const helper = path.join(run.outDir, "proc-starttime");
+    assert.ok(fs.existsSync(helper));
+
+    // This test process is definitely live.
+    const self = spawnSync(helper, [String(process.pid)], { encoding: "utf8" });
+    assert.equal(self.status, 0, `helper must exit 0 for a live pid; stderr: ${self.stderr}`);
+    assert.match(self.stdout.trim(), /^\d+\.\d{6}$/, `expected '<sec>.<usec>'; got: ${self.stdout}`);
+    const selfStart = Number(self.stdout.trim().split(".")[0]);
+    assert.ok(selfStart > 0, "a live process must have a non-zero start epoch");
+
+    // A second, distinct live process must yield its own start time.
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      stdio: "ignore",
+      env: cleanChildEnv({}),
+    });
+    try {
+      const childResult = spawnSync(helper, [String(child.pid)], { encoding: "utf8" });
+      assert.equal(childResult.status, 0, `helper must exit 0 for a live child; stderr: ${childResult.stderr}`);
+      assert.match(childResult.stdout.trim(), /^\d+\.\d{6}$/);
+      assert.notEqual(
+        childResult.stdout.trim(),
+        self.stdout.trim(),
+        "two distinct live processes must have distinct raw start times",
+      );
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("darwin proc-starttime output is byte-identical across caller TZ", { timeout: 120000 }, (t) => {
+    if (process.platform !== "darwin") {
+      return t.skip("honest capability skip: the sysctl proc-starttime helper requires a darwin host");
+    }
+    const run = buildDarwinProcStarttimeOnce();
+    assert.equal(run.status, 0, `stderr: ${run.stderr}`);
+    const helper = path.join(run.outDir, "proc-starttime");
+
+    const underUtc = spawnSync(helper, [String(process.pid)], {
+      encoding: "utf8",
+      env: cleanChildEnv({ TZ: "UTC" }),
+    });
+    const underLocal = spawnSync(helper, [String(process.pid)], {
+      encoding: "utf8",
+      env: cleanChildEnv({ TZ: "America/Los_Angeles" }),
+    });
+    assert.equal(underUtc.status, 0, `stderr: ${underUtc.stderr}`);
+    assert.equal(underLocal.status, 0, `stderr: ${underLocal.stderr}`);
+    assert.equal(underUtc.stdout, underLocal.stdout, "raw kernel start time must not depend on caller TZ");
+  });
+
+  it("darwin proc-starttime rejects bad usage and missing processes with documented codes", { timeout: 120000 }, (t) => {
+    if (process.platform !== "darwin") {
+      return t.skip("honest capability skip: the sysctl proc-starttime helper requires a darwin host");
+    }
+    const run = buildDarwinProcStarttimeOnce();
+    assert.equal(run.status, 0, `stderr: ${run.stderr}`);
+    const helper = path.join(run.outDir, "proc-starttime");
+
+    // Usage error (missing / extra argv) -> 64, one diagnostic line.
+    const noArg = spawnSync(helper, [], { encoding: "utf8" });
+    assert.equal(noArg.status, 64, `missing pid must exit 64; got ${noArg.status}`);
+    assert.ok(noArg.stderr.trim().length > 0, "a usage error must print a diagnostic");
+
+    const extraArg = spawnSync(helper, [String(process.pid), "extra"], { encoding: "utf8" });
+    assert.equal(extraArg.status, 64, `extra argv must exit 64; got ${extraArg.status}`);
+
+    // Malformed / non-positive pid -> 64 (never treated as a lookup).
+    for (const badPid of ["abc", "0", "-1", "1.5", "12abc", ""]) {
+      const bad = spawnSync(helper, [badPid], { encoding: "utf8" });
+      assert.equal(bad.status, 64, `pid ${JSON.stringify(badPid)} must exit 64; got ${bad.status} (stderr: ${bad.stderr})`);
+      assert.ok(bad.stderr.trim().length > 0, `pid ${JSON.stringify(badPid)} must print a diagnostic`);
+    }
+
+    // Lookup failure for a pid that is not running -> 1.
+    const missing = spawnSync(helper, ["999999"], { encoding: "utf8" });
+    assert.equal(missing.status, 1, `a nonexistent pid must exit 1; got ${missing.status} (stderr: ${missing.stderr})`);
+    assert.ok(missing.stderr.trim().length > 0, "a lookup failure must print a diagnostic");
+  });
+
+  it("darwin proc-starttime failure never writes .unavailable.json and clears stale artifacts", { timeout: 120000 }, () => {
+    // Pre-seed a STALE helper + stamp, then force the darwin identity build to
+    // fail by removing every compiler from PATH. Node itself runs from an
+    // absolute execPath, so only cc/gcc resolution is affected.
+    const outDir = tamanduaTempDir("tamandua-nb-procstale-");
+    const staleHelper = path.join(outDir, "proc-starttime");
+    fs.writeFileSync(staleHelper, "#!/bin/sh\necho stale\n", { mode: 0o755 });
+    fs.writeFileSync(
+      path.join(outDir, "proc-starttime.stamp.json"),
+      JSON.stringify({ artifact: "proc-starttime", stale: true }),
+    );
+    const emptyPath = tamanduaTempDir("tamandua-nb-proc-nopath-");
+
+    const run = runBuild(
+      { PATH: emptyPath, TAMANDUA_BUILD_NATIVE_FORCE_PLATFORM: "darwin" },
+      outDir,
+    );
+    assert.equal(run.status, 0, `build must still exit 0; stderr: ${run.stderr}`);
+
+    assert.ok(!fs.existsSync(staleHelper), "the stale proc-starttime artifact must be cleared");
+    assert.ok(
+      !fs.existsSync(path.join(outDir, "proc-starttime.stamp.json")),
+      "the stale proc-starttime stamp must be cleared",
+    );
+    // The identity failure must NOT masquerade as a signal-backend outage.
+    assertNoUnavailableMarker(outDir);
+    assert.match(run.stdout, /"reason":"missing-compiler"/);
+    assert.match(run.stdout, /"artifact":"proc-starttime"/);
+    // The seatbelt profile asset is independent of the identity helper and
+    // must still be packaged.
+    assert.ok(fs.existsSync(path.join(outDir, "seatbelt-signal.sb")));
+  });
+
+  // ------------------------------------------------------------------
+  // MPSX follow-on: darwin proc-info native helper (sysctl process table)
+  // ------------------------------------------------------------------
+
+  it("proc-info source reads process metadata only via sysctl (never ps)", () => {
+    const sourcePath = path.join(REPO_ROOT, "native", "proc-info.c");
+    assert.ok(fs.existsSync(sourcePath), "native/proc-info.c must exist");
+    const src = fs.readFileSync(sourcePath, "utf8");
+    assert.match(src, /KERN_PROC_ALL/);
+    assert.match(src, /KERN_PROC_PID/);
+    assert.match(src, /KERN_PROCARGS2/);
+    assert.match(src, /sysctl\s*\(/);
+    // Strip C comments so documentation that NAMES ps(1) as the rejected
+    // approach is not mistaken for a code invocation; then assert the
+    // executable code never shells out to ps or any other binary.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    assert.ok(!code.includes("/bin/ps"), "proc-info code must not reference /bin/ps");
+    assert.ok(!/\bps\b/.test(code), "proc-info code must not invoke ps");
+    assert.ok(
+      !/\b(popen|system|fork|execlp|execvp|execve|posix_spawn)\s*\(/.test(code),
+      "proc-info must not use an external-binary API",
+    );
+  });
+
+  it("forced darwin build produces an executable, stamped proc-info helper", { timeout: 120000 }, () => {
+    const run = buildDarwinProcStarttimeOnce();
+    assert.equal(run.status, 0, `build-native must exit 0; stderr: ${run.stderr}`);
+
+    const helper = path.join(run.outDir, "proc-info");
+    const stampPath = path.join(run.outDir, "proc-info.stamp.json");
+
+    if (process.platform !== "darwin") {
+      // Forcing darwin on a non-darwin host cannot compile the sysctl source.
+      // Contract: graceful exit 0, NO helper/stamp, and NO .unavailable.json.
+      assert.ok(!fs.existsSync(helper), "no proc-info helper on a non-darwin host");
+      assert.ok(!fs.existsSync(stampPath), "no proc-info stamp on a non-darwin host");
+      assertNoUnavailableMarker(run.outDir);
+      assert.match(run.stdout, /"artifact":"proc-info"/);
+      return;
+    }
+
+    assert.ok(fs.existsSync(helper), "proc-info artifact must be produced on darwin");
+    assert.ok((fs.statSync(helper).mode & 0o111) !== 0, "proc-info must be executable");
+    const stamp = readJson(stampPath);
+    assert.ok(stamp, "a proc-info stamp file must be written next to the artifact");
+    assert.equal(stamp.artifact, "proc-info");
+    assert.equal(stamp.backend, "darwin-sysctl");
+    assert.equal(stamp.platform, "darwin");
+    assert.equal(stamp.source, "native/proc-info.c");
+    assert.ok(["cc", "gcc"].includes(String(stamp.toolchain)), `stamp toolchain: ${String(stamp.toolchain)}`);
+    assert.equal(typeof stamp.sourceSha256, "string");
+    assert.ok(String(stamp.sourceSha256).length >= 40);
+    assertNoUnavailableMarker(run.outDir);
+    assert.match(run.stdout, /"artifact":"proc-info"/);
+  });
+
+  it("darwin proc-info reports the kernel process table without ps", { timeout: 120000 }, (t) => {
+    if (process.platform !== "darwin") {
+      return t.skip("honest capability skip: the sysctl proc-info helper requires a darwin host");
+    }
+    const run = buildDarwinProcStarttimeOnce();
+    assert.equal(run.status, 0, `stderr: ${run.stderr}`);
+    const helper = path.join(run.outDir, "proc-info");
+    assert.ok(fs.existsSync(helper));
+
+    // list: contains this process.
+    const listed = spawnSync(helper, ["list"], { encoding: "utf8" });
+    assert.equal(listed.status, 0, `list must exit 0; stderr: ${listed.stderr}`);
+    const listedPids = listed.stdout.split("\n").map((l) => Number(l.trim())).filter((n) => n > 0);
+    assert.ok(listedPids.includes(process.pid), "list must include the current pid");
+
+    // pid: one TAB-separated record with a positive pgid and an argv.
+    const self = spawnSync(helper, ["pid", String(process.pid)], { encoding: "utf8" });
+    assert.equal(self.status, 0, `pid must exit 0; stderr: ${self.stderr}`);
+    const fields = self.stdout.trim().split("\t");
+    assert.equal(fields.length, 7, `expected 7 TAB fields; got: ${self.stdout}`);
+    assert.equal(Number(fields[0]), process.pid);
+    assert.ok(Number(fields[2]) > 0, "pgid must be positive");
+    assert.ok(fields[6].includes("node"), "the current cmdline must contain node");
+
+    // dump: every record is a complete, single-line row.
+    const dump = spawnSync(helper, ["dump"], { encoding: "utf8" });
+    assert.equal(dump.status, 0, `dump must exit 0; stderr: ${dump.stderr}`);
+    const rows = dump.stdout.split("\n").filter((l) => l.length > 0);
+    assert.ok(rows.length > 0, "dump must emit at least one record");
+    for (const row of rows) {
+      assert.ok(row.split("\t").length >= 7, `malformed dump row: ${row}`);
+    }
+
+    // Lookup failure for a pid that is not running -> 1.
+    const missing = spawnSync(helper, ["pid", "999999"], { encoding: "utf8" });
+    assert.equal(missing.status, 1, `a nonexistent pid must exit 1; got ${missing.status}`);
   });
 
   it("no-op guard: only the repo's own C source is compiled (no downloads/addons)", () => {

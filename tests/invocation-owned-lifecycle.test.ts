@@ -24,9 +24,11 @@
  *     root registries are genuinely disjoint, exactly like concurrent test
  *     invocations.
  *  2. Refusal proof on real processes: unavailable ownership evidence refuses
- *     with nothing killed (refusal is not claimed cleanup), and a stale /
+ *     with nothing killed (refusal is not claimed cleanup), a stale /
  *     PID-reuse recorded identity refuses even when current evidence proves
- *     ownership. A matching recorded identity still signals.
+ *     ownership, and a persisted legacy ps:/proc: recorded identity refuses as
+ *     identity-unknown-format (never string-compared). A matching recorded
+ *     identity still signals.
  *  3. Failing-path proof: a simulated mid-test assertion failure leaves no
  *     owned survivor behind — owned cleanup still runs on failing paths.
  *
@@ -647,10 +649,10 @@ describe("invocation-owned lifecycle regression (US-003)", { concurrency: 1 }, (
         ownedRoots: ownedTempRoots(),
         observe: realOwnershipObserver(),
         identityOf: getProcessStartIdentity,
-        // Simulate a pid-file record from an EARLIER incarnation: the
-        // recorded identity differs from the live process's current identity
-        // (PID reuse / stale record) → refusal, never a signal.
-        recordedIdentityOf: () => "proc:stale-earlier-incarnation",
+        // Simulate a pid-file record from an EARLIER incarnation: a well-formed
+        // v2 value for the SAME pid but a start epoch far outside the
+        // documented tolerance (PID reuse) → refusal, never a signal.
+        recordedIdentityOf: () => `v2:${svc.pid}:1`,
         signal: sigkillSurvivor,
       });
       assert.deepEqual(dispositions, [
@@ -666,6 +668,46 @@ describe("invocation-owned lifecycle regression (US-003)", { concurrency: 1 }, (
       const cleanupDispositions = sweepInvocationOwnedLeakedSurvivors([svc.pid]);
       assert.deepEqual(cleanupDispositions, [{ pid: svc.pid, outcome: "signalled" }]);
       await waitForPidGone(svc.pid, "stale-identity survivor");
+      removeTestTempDirWithDiagnostics(svc.root);
+      assert.equal(fs.existsSync(svc.root), false, "owned root removed after real cleanup");
+    } finally {
+      await cleanupOwnedService(svc);
+    }
+  });
+
+  it("refuses a persisted legacy recorded identity (unknown format) and never signals", async () => {
+    const svc = await spawnOwnedService("legacyid");
+    try {
+      // Upgrade path: an older build persisted a TZ-dependent ps lstart text
+      // (or a boot-relative proc: tick count). The live process is a valid v2
+      // incarnation, but the recorded value is not comparable: the matcher
+      // must return 'unknown' → identity-unknown-format, NEVER
+      // identity-mismatch and NEVER a signal.
+      const dispositions = cleanupInvocationOwnedSurvivors([svc.pid], {
+        ownedRoots: ownedTempRoots(),
+        observe: realOwnershipObserver(),
+        identityOf: getProcessStartIdentity,
+        recordedIdentityOf: () => "ps:Sun Sep  6 00:26:59 2026",
+        signal: sigkillSurvivor,
+      });
+      assert.deepEqual(dispositions, [
+        { pid: svc.pid, outcome: "skipped", reason: "identity-unknown-format" },
+      ]);
+
+      // Nothing was killed...
+      assert.ok(pidAlive(svc.pid), "legacy-identity survivor must not be signalled");
+      await assertServiceHealthy(svc.port, svc.token, svc.pid, "legacy-identity survivor");
+      assert.equal(
+        getProcessStartIdentity(svc.pid),
+        svc.identity,
+        "identity unchanged after legacy-format refusal (no signal, no PID reuse)",
+      );
+
+      // ...and the invocation still owns it: the real sweep (no record →
+      // decision-time identity snapshot) cleans it.
+      const cleanupDispositions = sweepInvocationOwnedLeakedSurvivors([svc.pid]);
+      assert.deepEqual(cleanupDispositions, [{ pid: svc.pid, outcome: "signalled" }]);
+      await waitForPidGone(svc.pid, "legacy-identity survivor");
       removeTestTempDirWithDiagnostics(svc.root);
       assert.equal(fs.existsSync(svc.root), false, "owned root removed after real cleanup");
     } finally {

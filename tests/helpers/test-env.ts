@@ -162,6 +162,13 @@ const BASE_ENV_KEYS = [
   // MCP/dashboard, scripts) inherit the invocation's timezone instead of
   // silently defaulting to UTC or the host zone. No zone value is forced
   // here — ambient TZ is preserved only when the invoker set one.
+  //
+  // NOTE (TZPI): process-start identity is now TZ-INDEPENDENT. The canonical
+  // identity is `v2:<pid>:<startEpochMs>`, derived from raw kernel numerics
+  // (linux procfs btime+starttime; darwin sysctl KERN_PROC_PID), never from
+  // localized `ps` text, so a child's identity is byte-equal regardless of
+  // TZ. TZ remains in BASE_ENV_KEYS only for general child-env fidelity
+  // (localized timestamps in logs/output), not for identity correctness.
   "TZ",
   "SSH_AUTH_SOCK",
   "GIT_SSH_COMMAND",

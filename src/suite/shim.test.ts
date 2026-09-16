@@ -47,6 +47,7 @@ import { DatabaseSync } from "node:sqlite";
 import { cleanChildEnv, createTempHome, reservePortHandles } from "../../tests/helpers/test-env.ts";
 import { terminateOwnedProcessGroup, reapStaleOrphans } from "../../tests/helpers/dead-owner-teardown.ts";
 import { getProcessStartIdentity } from "../lib/process-start-identity.ts";
+import { getPgid } from "../../dist/lib/proc-info.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SHIM_PATH = path.resolve(__dirname, "..", "..", "dist", "suite", "shim.js");
@@ -920,7 +921,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       const script = join(fixture.repoDir, "dead-owner-suite.sh");
       writeFileSync(
         script,
-        `#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' > "${suitePidFile}"\necho $$ > "${suitePidFile}.pid"\necho 'DEAD OWNER SUITE STARTED'\nwhile :; do sleep 1; done\n`,
+        `#!/bin/sh\npgid=$$\necho "$pgid" > "${suitePidFile}"\necho $$ > "${suitePidFile}.pid"\necho 'DEAD OWNER SUITE STARTED'\nwhile :; do sleep 1; done\n`,
       );
       chmodSync(script, 0o755);
       const runId = "r-dead-owner";
@@ -975,6 +976,12 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
             suitePid = Number(pidStr);
             if (Number.isSafeInteger(suitePid) && suitePid > 0) {
               startTime = getProcessStartIdentity(suitePid) ?? undefined;
+              // The suite script records its own `$$`, which on Linux is the
+              // pid of the nested shell dash forks to run the script — a
+              // group MEMBER, not the process-group id. Resolve the kernel
+              // group of that pid and persist it as the teardown pgid, while
+              // keeping `suitePid` as the ABA identity pid.
+              writeFileSync(suitePidFile, String(getPgid(suitePid) ?? suitePid));
             }
           } catch {
             // PID file read failed — teardown falls back to marker-only ownership

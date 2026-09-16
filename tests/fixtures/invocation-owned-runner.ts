@@ -36,7 +36,10 @@ import { cleanChildEnv, createTempHome } from "../helpers/test-env.ts";
 import {
   sweepInvocationOwnedLeakedSurvivors,
 } from "../helpers/invocation-owned-cleanup.ts";
-import { getProcessStartIdentity } from "../../src/lib/process-start-identity.ts";
+import {
+  compareProcessStartIdentities,
+  getProcessStartIdentity,
+} from "../../src/lib/process-start-identity.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LABEL = "neighborB";
@@ -126,8 +129,10 @@ async function main(): Promise<void> {
       // Sweep refused (e.g. evidence raced with an exit). This process
       // spawned and recorded the exact child, so an exact recorded-identity
       // kill is the sanctioned fallback — never a pattern/broad kill.
+      // The v2 matcher is used (never string equality) so a legacy/unknown
+      // identity can only refuse.
       const current = getProcessStartIdentity(servicePid);
-      if (current !== null && current === serviceIdentity) {
+      if (compareProcessStartIdentities(serviceIdentity, current) === "same") {
         try {
           process.kill(servicePid, "SIGKILL");
         } catch {

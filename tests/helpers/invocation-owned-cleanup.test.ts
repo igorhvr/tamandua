@@ -18,6 +18,8 @@
  *  - unrelated B (same prefix, different root), prefix-neighbor and
  *    similar-prefix strings are refused (exact path boundaries only);
  *  - stale/PID-reuse identity and unavailable identity are refused;
+ *  - a persisted legacy (`ps:`/`proc:`) or non-comparable (`v2u:`) recorded
+ *    identity is refused as `identity-unknown-format`, never string-compared;
  *  - unreadable evidence is refused (never an empty proof);
  *  - evidence and identity are re-verified immediately before each signal,
  *    and evidence/identity mutated between decision and signal (including
@@ -276,8 +278,8 @@ describe("cleanupInvocationOwnedSurvivors — linux /proc-environ semantics", ()
       [pidB, `PATH=/usr/bin\0HOME=${HOME_B}\0LANG=C.UTF-8\0`],
     ]);
     const identities = stableIdentities([
-      [pidA, "proc:100"],
-      [pidB, "proc:200"],
+      [pidA, "v2:200001:1000000"],
+      [pidB, "v2:200002:2000000"],
     ]);
 
     const dispositions = cleanupInvocationOwnedSurvivors([pidA, pidB], {
@@ -306,7 +308,7 @@ describe("cleanupInvocationOwnedSurvivors — linux /proc-environ semantics", ()
     const signalled: number[] = [];
     const pid = 200003;
     const environs = new Map<number, string>([[pid, "PATH=/usr/bin\0LANG=C\0"]]);
-    const identities = stableIdentities([[pid, "proc:300"]]);
+    const identities = stableIdentities([[pid, "v2:200003:3000000"]]);
 
     const dispositions = cleanupInvocationOwnedSurvivors([pid], {
       ownedRoots: [ROOT_A],
@@ -338,8 +340,8 @@ describe("cleanupInvocationOwnedSurvivors — darwin lsof semantics", () => {
     const lsofA = ["p300001", "f1", "n/usr/lib/dyld", `n${ROOT_A}/home/.tamandua/mcp.log`].join("\n");
     const lsofB = ["p300002", "f1", "n/usr/lib/dyld", `n${ROOT_B}/home/.tamandua/mcp.log`].join("\n");
     const identities = stableIdentities([
-      [pidA, "proc:100"],
-      [pidB, "proc:200"],
+      [pidA, "v2:300001:1000000"],
+      [pidB, "v2:300002:2000000"],
     ]);
 
     const dispositions = cleanupInvocationOwnedSurvivors([pidA, pidB], {
@@ -366,7 +368,7 @@ describe("cleanupInvocationOwnedSurvivors — darwin lsof semantics", () => {
     const signalled: number[] = [];
     const pid = 300003;
     const lsof = ["p300003", "f1", "n/usr/lib/dyld", "n/var/log/system.log"].join("\n");
-    const identities = stableIdentities([[pid, "proc:300"]]);
+    const identities = stableIdentities([[pid, "v2:300003:3000000"]]);
 
     const dispositions = cleanupInvocationOwnedSurvivors([pid], {
       ownedRoots: [ROOT_A],
@@ -408,7 +410,7 @@ describe("cleanupInvocationOwnedSurvivors — refusals", () => {
   }
 
   it("refuses unreadable evidence (never an empty proof)", () => {
-    const { dispositions, signalled } = sweepSingle({ kind: "unreadable" }, "proc:100");
+    const { dispositions, signalled } = sweepSingle({ kind: "unreadable" }, "v2:400001:1000000");
     assert.deepEqual(signalled, []);
     assert.deepEqual(dispositionFor(dispositions, 400001), {
       pid: 400001,
@@ -418,7 +420,7 @@ describe("cleanupInvocationOwnedSurvivors — refusals", () => {
   });
 
   it("refuses a process that is already gone", () => {
-    const { dispositions, signalled } = sweepSingle({ kind: "gone" }, "proc:100");
+    const { dispositions, signalled } = sweepSingle({ kind: "gone" }, "v2:400001:1000000");
     assert.deepEqual(signalled, []);
     assert.deepEqual(dispositionFor(dispositions, 400001), {
       pid: 400001,
@@ -428,12 +430,13 @@ describe("cleanupInvocationOwnedSurvivors — refusals", () => {
   });
 
   it("refuses stale / PID-reuse identity (recorded identity no longer matches)", () => {
-    // Recorded at spawn/PID-file-read time: proc:100. Current identity:
-    // proc:200 — the PID was recycled, so no signal.
+    // Recorded at spawn/PID-file-read time: v2:400001:1000000. Current
+    // identity: v2:400001:9000000 — the same pid was recycled into a new
+    // incarnation beyond the documented tolerance, so no signal.
     const { dispositions, signalled } = sweepSingle(
       { kind: "ok", paths: [HOME_A] },
-      "proc:200",
-      "proc:100",
+      "v2:400001:9000000",
+      "v2:400001:1000000",
     );
     assert.deepEqual(signalled, []);
     assert.deepEqual(dispositionFor(dispositions, 400001), {
@@ -447,7 +450,7 @@ describe("cleanupInvocationOwnedSurvivors — refusals", () => {
     const { dispositions, signalled } = sweepSingle(
       { kind: "ok", paths: [HOME_A] },
       null,
-      "proc:100",
+      "v2:400001:1000000",
     );
     assert.deepEqual(signalled, []);
     assert.deepEqual(dispositionFor(dispositions, 400001), {
@@ -460,8 +463,8 @@ describe("cleanupInvocationOwnedSurvivors — refusals", () => {
   it("accepts an owned survivor when the recorded identity matches", () => {
     const { dispositions, signalled } = sweepSingle(
       { kind: "ok", paths: [HOME_A] },
-      "proc:100",
-      "proc:100",
+      "v2:400001:1000000",
+      "v2:400001:1000000",
     );
     assert.deepEqual(signalled, [400001]);
     assert.deepEqual(dispositionFor(dispositions, 400001), {
@@ -470,12 +473,74 @@ describe("cleanupInvocationOwnedSurvivors — refusals", () => {
     });
   });
 
+  it("refuses a persisted legacy ps: recorded identity (unknown format, never signalled)", () => {
+    // Upgrade path: an older build recorded a TZ-dependent ps lstart string.
+    // The current process is a valid v2 incarnation, but the recorded value is
+    // not comparable — it must be classified 'unknown', NOT 'different' and
+    // NOT string-compared, so nothing is signalled.
+    const { dispositions, signalled } = sweepSingle(
+      { kind: "ok", paths: [HOME_A] },
+      "v2:400001:1000000",
+      "ps:Sun Sep  6 00:26:59 2026",
+    );
+    assert.deepEqual(signalled, [], "legacy ps: recorded identity must never be signalled");
+    assert.deepEqual(dispositionFor(dispositions, 400001), {
+      pid: 400001,
+      outcome: "skipped",
+      reason: "identity-unknown-format",
+    });
+  });
+
+  it("refuses a persisted legacy proc: recorded identity (unknown format, never signalled)", () => {
+    const { dispositions, signalled } = sweepSingle(
+      { kind: "ok", paths: [HOME_A] },
+      "v2:400001:1000000",
+      "proc:442043503",
+    );
+    assert.deepEqual(signalled, [], "legacy proc: recorded identity must never be signalled");
+    assert.deepEqual(dispositionFor(dispositions, 400001), {
+      pid: 400001,
+      outcome: "skipped",
+      reason: "identity-unknown-format",
+    });
+  });
+
+  it("refuses a legacy-format CURRENT identity even when the record is v2", () => {
+    // The reverse direction: a v2 record compared against a legacy/unreadable
+    // current value can never prove ownership.
+    const { dispositions, signalled } = sweepSingle(
+      { kind: "ok", paths: [HOME_A] },
+      "ps:Sat Sep  5 21:26:59 2026",
+      "v2:400001:1000000",
+    );
+    assert.deepEqual(signalled, []);
+    assert.deepEqual(dispositionFor(dispositions, 400001), {
+      pid: 400001,
+      outcome: "skipped",
+      reason: "identity-unknown-format",
+    });
+  });
+
+  it("refuses a non-comparable v2u: recorded identity (unknown format)", () => {
+    const { dispositions, signalled } = sweepSingle(
+      { kind: "ok", paths: [HOME_A] },
+      "v2:400001:1000000",
+      "v2u:400001",
+    );
+    assert.deepEqual(signalled, []);
+    assert.deepEqual(dispositionFor(dispositions, 400001), {
+      pid: 400001,
+      outcome: "skipped",
+      reason: "identity-unknown-format",
+    });
+  });
+
   it("ignores invalid pids (never signalled, never journaled)", () => {
     const journal: JournalEvent[] = [];
     const signalled: number[] = [];
     const pid = 400002;
     const observe = recordingObserver(new Map([[pid, [{ kind: "ok", paths: [HOME_A] }]]]), journal);
-    const identity = recordingIdentity(stableIdentities([[pid, "proc:100"]]), journal);
+    const identity = recordingIdentity(stableIdentities([[pid, "v2:400002:1000000"]]), journal);
 
     const dispositions = cleanupInvocationOwnedSurvivors([0, -5, 1.5, NaN, pid], {
       ownedRoots: [ROOT_A],
@@ -510,7 +575,7 @@ describe("cleanupInvocationOwnedSurvivors — refusals", () => {
       const dispositions = cleanupInvocationOwnedSurvivors([pid], {
         ownedRoots: [ROOT_A],
         observe: recordingObserver(new Map([[pid, [{ kind: "ok", paths }]]]), journal),
-        identityOf: recordingIdentity(stableIdentities([[pid, "proc:100"]]), journal),
+        identityOf: recordingIdentity(stableIdentities([[pid, "v2:400003:1000000"]]), journal),
         signal: recordingSignal(journal, signalled),
       });
 
@@ -544,7 +609,7 @@ describe("cleanupInvocationOwnedSurvivors — recheck before each signal", () =>
     const dispositions = cleanupInvocationOwnedSurvivors([pid], {
       ownedRoots: [ROOT_A],
       observe: recordingObserver(new Map([[pid, [{ kind: "ok", paths: [HOME_A] }]]]), journal),
-      identityOf: recordingIdentity(stableIdentities([[pid, "proc:100"]]), journal),
+      identityOf: recordingIdentity(stableIdentities([[pid, "v2:500001:1000000"]]), journal),
       signal: recordingSignal(journal, signalled),
     });
 
@@ -572,7 +637,7 @@ describe("cleanupInvocationOwnedSurvivors — recheck before each signal", () =>
         new Map([[pid, [{ kind: "ok", paths: [HOME_A] }, { kind: "ok", paths: [HOME_B] }]]]),
         journal,
       ),
-      identityOf: recordingIdentity(stableIdentities([[pid, "proc:100"]]), journal),
+      identityOf: recordingIdentity(stableIdentities([[pid, "v2:500002:1000000"]]), journal),
       signal: recordingSignal(journal, signalled),
     });
 
@@ -599,7 +664,7 @@ describe("cleanupInvocationOwnedSurvivors — recheck before each signal", () =>
         new Map([[pid, [{ kind: "ok", paths: [HOME_A] }, { kind: "unreadable" }]]]),
         journal,
       ),
-      identityOf: recordingIdentity(stableIdentities([[pid, "proc:100"]]), journal),
+      identityOf: recordingIdentity(stableIdentities([[pid, "v2:500003:1000000"]]), journal),
       signal: recordingSignal(journal, signalled),
     });
 
@@ -622,7 +687,7 @@ describe("cleanupInvocationOwnedSurvivors — recheck before each signal", () =>
         new Map([[pid, [{ kind: "ok", paths: [HOME_A] }, { kind: "gone" }]]]),
         journal,
       ),
-      identityOf: recordingIdentity(stableIdentities([[pid, "proc:100"]]), journal),
+      identityOf: recordingIdentity(stableIdentities([[pid, "v2:500004:1000000"]]), journal),
       signal: recordingSignal(journal, signalled),
     });
 
@@ -642,7 +707,10 @@ describe("cleanupInvocationOwnedSurvivors — recheck before each signal", () =>
     const dispositions = cleanupInvocationOwnedSurvivors([pid], {
       ownedRoots: [ROOT_A],
       observe: recordingObserver(new Map([[pid, [{ kind: "ok", paths: [HOME_A] }]]]), journal),
-      identityOf: recordingIdentity(new Map([[pid, ["proc:100", "proc:200"]]]), journal),
+      identityOf: recordingIdentity(
+        new Map([[pid, ["v2:500005:1000000", "v2:500005:9000000"]]]),
+        journal,
+      ),
       signal: recordingSignal(journal, signalled),
     });
 
@@ -674,7 +742,7 @@ describe("cleanupInvocationOwnedSurvivors — recheck before each signal", () =>
         journal,
       ),
       identityOf: recordingIdentity(
-        stableIdentities([[pidA, "proc:100"], [pidB, "proc:200"]]),
+        stableIdentities([[pidA, "v2:500101:1000000"], [pidB, "v2:500102:2000000"]]),
         journal,
       ),
       signal: recordingSignal(journal, signalled),
