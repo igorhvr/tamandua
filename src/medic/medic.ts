@@ -5,6 +5,7 @@
  * and takes corrective action where safe. Logs all findings to the medic_checks table.
  */
 import { getDb } from "../db.js";
+import { SQL_NOW_ISO } from "../lib/instant.js";
 import { emitEvent } from "../installer/events.js";
 import { teardownWorkflowCronsIfIdle } from "../installer/agent-scheduler.js";
 import crypto from "node:crypto";
@@ -97,10 +98,10 @@ async function remediate(finding: MedicFinding): Promise<boolean> {
       if (!run || run.status !== "running") return false;
 
       db.prepare(
-        "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
+        `UPDATE runs SET status = 'failed', updated_at = ${SQL_NOW_ISO} WHERE id = ?`
       ).run(finding.runId);
       db.prepare(
-        "UPDATE steps SET status = 'failed', output = 'Medic: run marked as dead', updated_at = datetime('now') WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')"
+        `UPDATE steps SET status = 'failed', output = 'Medic: run marked as dead', updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')`
       ).run(finding.runId);
       emitEvent({
         ts: new Date().toISOString(),

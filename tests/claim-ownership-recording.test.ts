@@ -30,6 +30,9 @@ describe("claim-ownership-recording", () => {
 const TEST_AGENT = "test_claim-ownership-agent";
 const TEST_LOOP_AGENT = "test_claim-ownership-loop-agent";
 
+/** Canonical stored instant shape (TIME-STORAGE): ISO-8601 UTC, ms, Z. */
+const ISO_MS_Z = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/;
+
 function ts(): string {
   return new Date().toISOString();
 }
@@ -40,13 +43,14 @@ interface StepRow {
   claim_pid: number | null;
   claim_pgid: number | null;
   claim_updated_at: string | null;
+  updated_at: string;
   status: string;
 }
 
 function queryStep(stepId: string): StepRow {
   const db = getDb();
   const row = db.prepare(
-    "SELECT id, claim_job_id, claim_pid, claim_pgid, claim_updated_at, status FROM steps WHERE id = ?"
+    "SELECT id, claim_job_id, claim_pid, claim_pgid, claim_updated_at, updated_at, status FROM steps WHERE id = ?"
   ).get(stepId) as StepRow | undefined;
   if (!row) throw new Error(`Step not found: ${stepId}`);
   return row;
@@ -143,6 +147,8 @@ describe("claimStep ownership recording", () => {
     assert.equal(step.claim_pid, 12345);
     assert.equal(step.claim_pgid, null, "pgid should be null when not provided");
     assert.ok(step.claim_updated_at, "claim_updated_at should be set");
+    assert.match(step.updated_at, ISO_MS_Z, "claim must stamp updated_at as ISO-Z");
+    assert.match(step.claim_updated_at, ISO_MS_Z, "claim must stamp claim_updated_at as ISO-Z");
   });
 
   // ── Test 2: Ownership recording on loop-step story claim ──────────────
@@ -162,6 +168,8 @@ describe("claimStep ownership recording", () => {
     assert.equal(step.claim_pid, 99999);
     assert.equal(step.claim_pgid, null);
     assert.ok(step.claim_updated_at, "claim_updated_at should be set on loop claim");
+    assert.match(step.updated_at, ISO_MS_Z, "loop claim must stamp updated_at as ISO-Z");
+    assert.match(step.claim_updated_at, ISO_MS_Z, "loop claim must stamp claim_updated_at as ISO-Z");
   });
 
   // ── Test 3: Backward compat — no WorkerOwnership leaves columns NULL ──
@@ -175,6 +183,7 @@ describe("claimStep ownership recording", () => {
     assert.equal(step.claim_pid, null);
     assert.equal(step.claim_pgid, null);
     assert.equal(step.claim_updated_at, null);
+    assert.match(step.updated_at, ISO_MS_Z, "claim without ownership must still stamp updated_at as ISO-Z");
   });
 
   // ── Test 4: pgid is recorded when provided ────────────────────────────
@@ -195,6 +204,8 @@ describe("claimStep ownership recording", () => {
     assert.equal(step.claim_pid, 42);
     assert.equal(step.claim_pgid, 99);
     assert.ok(step.claim_updated_at, "claim_updated_at should be set");
+    assert.match(step.updated_at, ISO_MS_Z, "claim must stamp updated_at as ISO-Z");
+    assert.match(step.claim_updated_at, ISO_MS_Z, "claim must stamp claim_updated_at as ISO-Z");
   });
 
   // ── Test 5: Called without WorkerOwnership (2-arg form) still works ──

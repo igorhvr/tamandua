@@ -14,6 +14,7 @@ import {
   buildKanbanCardDetail,
   laneAgentSuffix,
   normaliseStatus,
+  parseEventIsoMs,
 } from "../../dist/server/kanban-data.js";
 import { createDashboardServer, invalidateRunsCache } from "../../dist/server/dashboard.js";
 import { getDb } from "../../dist/db.js";
@@ -164,6 +165,43 @@ describe("kanban-data: laneAgentSuffix", () => {
   });
 });
 
+describe("kanban-data: parseEventIsoMs shared reader semantics (US-007)", () => {
+  it("treats a legacy naive UTC value as UTC, never host-local", () => {
+    const expected = Date.UTC(2026, 8, 15, 22, 0, 0);
+    assert.equal(parseEventIsoMs("2026-09-15 22:00:00"), expected);
+    assert.equal(parseEventIsoMs("2026-09-15T22:00:00"), expected);
+    assert.equal(parseEventIsoMs("2026-09-15 22:00:00.123"), Date.UTC(2026, 8, 15, 22, 0, 0, 123));
+  });
+
+  it("accepts ISO-Z unchanged (with and without milliseconds)", () => {
+    assert.equal(parseEventIsoMs("2026-09-15T22:00:00Z"), Date.UTC(2026, 8, 15, 22, 0, 0));
+    assert.equal(
+      parseEventIsoMs("2026-09-15T22:00:00.123Z"),
+      Date.UTC(2026, 8, 15, 22, 0, 0, 123),
+    );
+  });
+
+  it("honors a real +03:00 offset instead of appending Z (the old bug)", () => {
+    // The legacy implementation appended 'Z' to any non-Z input, turning this
+    // into an invalid string and silently returning 0.
+    assert.equal(
+      parseEventIsoMs("2026-09-15T22:00:00+03:00"),
+      Date.UTC(2026, 8, 15, 19, 0, 0),
+    );
+    assert.equal(
+      parseEventIsoMs("2026-09-15T22:00:00-03:00"),
+      Date.UTC(2026, 8, 16, 1, 0, 0),
+    );
+  });
+
+  it("returns undefined for missing/unparseable input instead of 0", () => {
+    assert.equal(parseEventIsoMs(undefined), undefined);
+    assert.equal(parseEventIsoMs(""), undefined);
+    assert.equal(parseEventIsoMs("not-a-timestamp"), undefined);
+    assert.equal(parseEventIsoMs("2026-09-15"), undefined);
+  });
+});
+
 describe("kanban-data: buildKanbanSnapshot", () => {
   it("returns null for unknown runs", () => {
     const db = seedDb();
@@ -214,6 +252,32 @@ describe("kanban-data: buildKanbanSnapshot", () => {
     insertStep(db, "r-fail", "plan", "planner", 0, "failed");
     const failSnap = buildKanbanSnapshot(db, "r-fail")!;
     assert.ok(failSnap.run.elapsed_seconds !== null);
+  });
+
+  it("computes elapsed_seconds from real offsets in a frozen terminal run (US-007)", () => {
+    const db = seedDb();
+    // Both instants carry +03:00 offsets and are 90s apart. The legacy
+    // Z-append parser turned them into NaN → 0 → elapsed null.
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) " +
+      "VALUES ('r-offset', 1, 'feature-dev-merge', 'demo', 'completed', '{}', 0, '2026-05-01T13:00:00+03:00', '2026-05-01T13:01:30+03:00')",
+    ).run();
+    insertStep(db, "r-offset", "plan", "planner", 0, "done");
+
+    const snap = buildKanbanSnapshot(db, "r-offset")!;
+    assert.equal(snap.run.elapsed_seconds, 90);
+  });
+
+  it("leaves elapsed_seconds null when a terminal run timestamp is unparseable (US-007)", () => {
+    const db = seedDb();
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) " +
+      "VALUES ('r-bad', 1, 'feature-dev-merge', 'demo', 'completed', '{}', 0, 'not-a-timestamp', '2026-05-01T10:01:30Z')",
+    ).run();
+    insertStep(db, "r-bad", "plan", "planner", 0, "done");
+
+    const snap = buildKanbanSnapshot(db, "r-bad")!;
+    assert.equal(snap.run.elapsed_seconds, null);
   });
 
   it("renders stories as cards for loop-type lanes", () => {
@@ -660,6 +724,63 @@ describe("kanban-data: buildKanbanCardDetail", () => {
     // Tokens still aggregate correctly from the included events
     assert.ok(detail.tokens);
     assert.equal(detail.tokens.total, 150);
+  });
+
+  it("computes event timing from real offsets (US-007)", () => {
+    const db = seedDb();
+    insertRun(db, "r-off", "running");
+    insertStep(db, "r-off", "plan", "planner", 0, "done", { input_template: "Plan" });
+
+    const events: TamanduaEvent[] = [
+      // 12:00+03:00 === 09:00Z, 30 minutes before the 09:30Z event.
+      makeEvent("2025-01-02T12:00:00+03:00", "step.running", { runId: "r-off", stepId: "plan" }),
+      makeEvent("2025-01-02T09:30:00Z", "step.done", { runId: "r-off", stepId: "plan" }),
+    ];
+
+    const detail = buildKanbanCardDetail(db, "r-off", "plan", events);
+    assert.ok(detail);
+    assert.ok(detail.timing);
+    assert.equal(detail.timing.durationMs, 30 * 60 * 1000);
+  });
+
+  it("returns undefined timing when an event timestamp is unparseable (US-007)", () => {
+    const db = seedDb();
+    insertRun(db, "r-bad-ts", "running");
+    insertStep(db, "r-bad-ts", "plan", "planner", 0, "done", { input_template: "Plan" });
+
+    const events: TamanduaEvent[] = [
+      makeEvent("not-a-timestamp", "step.running", { runId: "r-bad-ts", stepId: "plan" }),
+      makeEvent("2025-01-02T09:30:00Z", "step.done", { runId: "r-bad-ts", stepId: "plan" }),
+    ];
+
+    const detail = buildKanbanCardDetail(db, "r-bad-ts", "plan", events);
+    assert.ok(detail);
+    assert.equal(detail.timing, undefined);
+  });
+
+  it("picks the most recent story.failed across mixed offset instants (US-007)", () => {
+    const db = seedDb();
+    insertRun(db, "r-off-fail", "running");
+    insertStep(db, "r-off-fail", "implement", "developer", 0, "running", {
+      type: "loop",
+      input_template: "Implement",
+    });
+    insertStory(db, "r-off-fail", "US-001", 0, "Story", "failed");
+
+    const events: TamanduaEvent[] = [
+      // 10:00+03:00 === 07:00Z is NEWER than 05:00Z, but the legacy
+      // Z-append parser scored the offset value 0 (oldest).
+      makeEvent("2025-01-01T10:00:00+03:00", "story.failed", {
+        runId: "r-off-fail", stepId: "implement", storyId: "US-001", detail: "offset detail",
+      }),
+      makeEvent("2025-01-01T05:00:00Z", "story.failed", {
+        runId: "r-off-fail", stepId: "implement", storyId: "US-001", detail: "utc detail",
+      }),
+    ];
+
+    const detail = buildKanbanCardDetail(db, "r-off-fail", "US-001", events);
+    assert.ok(detail);
+    assert.equal(detail.failureDetail, "offset detail");
   });
 });
 

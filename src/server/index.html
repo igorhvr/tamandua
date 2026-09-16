@@ -750,7 +750,8 @@
       }
 
       const rows = events.map(e => {
-        const ts = e.ts ? new Date(e.ts).toLocaleTimeString() : "--";
+        const eventInstant = parseStoredInstant(e.ts);
+        const ts = eventInstant ? eventInstant.toLocaleTimeString() : "--";
         const runId = (e.runId || "").slice(0, 8);
         const detail = e.detail || e.stepId || e.agentId || "";
         return `<div class="event-row">
@@ -1067,9 +1068,34 @@
       return div.innerHTML;
     }
 
+    // BEGIN instant-parser: browser copy of the shared parseInstant rules in
+    // src/lib/instant.ts. Stored instants are ISO-8601 UTC with milliseconds and
+    // "Z", but legacy rows still hold naive "YYYY-MM-DD HH:MM:SS" values (UTC by
+    // construction) and some hold real numeric offsets. A naive value is pinned
+    // to UTC -- never host-local -- a real offset is honored, and anything
+    // unparseable is rejected rather than falling back to "now".
+    const STORED_NAIVE_UTC_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+    const STORED_ZONED_ISO_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+
+    function parseStoredInstant(value) {
+      if (typeof value !== "string") return null;
+      const raw = value.trim();
+      if (raw === "") return null;
+      let candidate = raw;
+      if (STORED_NAIVE_UTC_RE.test(raw)) {
+        // No zone designator: legacy naive values were written as UTC.
+        candidate = `${raw.replace(" ", "T")}Z`;
+      } else if (!STORED_ZONED_ISO_RE.test(raw)) {
+        return null;
+      }
+      const parsed = new Date(candidate);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+
     function timeAgo(iso) {
-      if (!iso) return "--";
-      const diff = Date.now() - new Date(iso).getTime();
+      const parsed = parseStoredInstant(iso);
+      if (!parsed) return "--";
+      const diff = Date.now() - parsed.getTime();
       const mins = Math.floor(diff / 60000);
       if (mins < 1) return "just now";
       if (mins < 60) return `${mins}m ago`;
@@ -1077,6 +1103,7 @@
       if (hrs < 24) return `${hrs}h ago`;
       return `${Math.floor(hrs / 24)}d ago`;
     }
+    // END instant-parser
 
     async function pauseRun(id, drain) {
       const qs = drain ? '?drain=true' : '';

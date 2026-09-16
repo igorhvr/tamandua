@@ -611,6 +611,38 @@ describe("CLI worktree prune", () => {
     }
   });
 
+  it("skips worktrees whose created_at is unparseable (never treated as old)", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "bad-ts-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      seedRunRow(dbPath, runId, { status: "completed" });
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE run_worktrees SET created_at = ? WHERE run_id = ?").run("not-a-timestamp", runId);
+      db.close();
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "1m"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /No worktrees to prune/);
+      // The row must remain untouched: an unknown age is never "old".
+      const db2 = new DatabaseSync(dbPath);
+      const row = db2.prepare("SELECT status, removed_at FROM run_worktrees WHERE run_id = ?").get(runId) as { status: string; removed_at: string | null } | undefined;
+      db2.close();
+      assert.ok(row, "row should still exist");
+      assert.equal(row!.status, "ready");
+      assert.equal(row!.removed_at, null);
+      assert.equal(fs.existsSync(worktreePath), true, "worktree dir should not be removed");
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
   it("errors without --completed flag", async () => {
     const env = await createTempEnv();
     try {

@@ -24,6 +24,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { logger } from "../lib/logger.js";
+import { SQL_NOW_ISO } from "../lib/instant.js";
 import { getProcessStartIdentity } from "../lib/process-start-identity.js";
 import { getBuildVersion } from "../lib/version.js";
 import { assertPortIsolation, assertStatePathIsolation, testGuardActive } from "../lib/test-guard.js";
@@ -303,7 +304,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
          SET scheduling_status = 'waiting',
              scheduling_error = ?,
              scheduling_requested_at = COALESCE(scheduling_requested_at, ?),
-             updated_at = datetime('now')
+             updated_at = ${SQL_NOW_ISO}
          WHERE id = ?`,
       )
       .run(reason, new Date().toISOString(), run.id);
@@ -330,7 +331,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
   if (requiredTimers > 0 && existingForRun >= requiredTimers) {
     getDb()
       .prepare(
-        "UPDATE runs SET scheduling_status = 'active', scheduling_error = NULL, updated_at = datetime('now') WHERE id = ?",
+        `UPDATE runs SET scheduling_status = 'active', scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
       )
       .run(run.id);
     markActiveAfterAdmission(run.id, requiredTimers, wasWaiting);
@@ -346,7 +347,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
       `Run requires ${requiredTimers} scheduler timer(s), but TAMANDUA_MAX_ACTIVE_TIMERS is ${maxActiveTimers}.`;
     getDb()
       .prepare(
-        "UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
+        `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
       )
       .run(message, run.id);
     logger.error("control-server: register-run unschedulable", {
@@ -365,7 +366,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
          SET scheduling_status = 'queued',
              scheduling_requested_at = COALESCE(scheduling_requested_at, ?),
              scheduling_error = NULL,
-             updated_at = datetime('now')
+             updated_at = ${SQL_NOW_ISO}
          WHERE id = ?`,
       )
       .run(new Date().toISOString(), run.id);
@@ -401,7 +402,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
 
   getDb()
     .prepare(
-      "UPDATE runs SET scheduling_status = 'active', scheduling_error = NULL, updated_at = datetime('now') WHERE id = ?",
+      `UPDATE runs SET scheduling_status = 'active', scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
     )
     .run(run.id);
 
@@ -964,7 +965,7 @@ async function handleRegisterRun(runId: string): Promise<JsonResponse> {
     try {
       getDb()
         .prepare(
-          "UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
+          `UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
         )
         .run(message, runId);
     } catch {
@@ -1030,7 +1031,7 @@ async function handleTerminateRun(runId: string, suiteRuntime?: SuiteClaimRuntim
     try {
       getDb()
         .prepare(
-          "UPDATE runs SET scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
+          `UPDATE runs SET scheduling_status = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
         )
         .run(runId);
     } catch {
@@ -1083,7 +1084,7 @@ async function handlePauseRun(
     try {
       getDb()
         .prepare(
-          "UPDATE runs SET scheduling_status = 'draining_pause', updated_at = datetime('now') WHERE id = ?",
+          `UPDATE runs SET scheduling_status = 'draining_pause', updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
         )
         .run(runId);
     } catch (err) {
@@ -1111,7 +1112,7 @@ async function handlePauseRun(
   try {
     getDb()
       .prepare(
-        "UPDATE runs SET status = 'paused', scheduling_status = 'paused', updated_at = datetime('now') WHERE id = ?",
+        `UPDATE runs SET status = 'paused', scheduling_status = 'paused', updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
       )
       .run(runId);
   } catch (err) {
@@ -1165,7 +1166,7 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
     try {
       getDb()
         .prepare(
-          "UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
+          `UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
         )
         .run(message, runId);
     } catch {
@@ -1176,7 +1177,7 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
   try {
     getDb()
       .prepare(
-        "UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = datetime('now') WHERE id = ?",
+        `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
       )
       .run(new Date().toISOString(), runId);
     if (cancelledDrain) {

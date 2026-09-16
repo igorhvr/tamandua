@@ -2239,6 +2239,38 @@ describe("formatRunsSummary", () => {
     assert.match(result, /\(1 completed, 1 failed runs not shown\)/);
   });
 
+  it("interprets a legacy naive UTC updated_at as UTC, not host-local (TIME-STORAGE US-006)", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const { ABANDONED_THRESHOLD_MS } = await import("../../dist/installer/step-ops.js");
+    // Just inside the abandon threshold when read as UTC. Re-reading it with the
+    // host offset (the old `new Date(...)` bug) pushes it past the threshold on
+    // hosts ahead of UTC and produces a spurious stale annotation.
+    const naive = new Date(Date.now() - (ABANDONED_THRESHOLD_MS - 60_000))
+      .toISOString().slice(0, 19).replace("T", " ");
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix bug", status: "running", createdAt: naive, updatedAt: naive, tokensSpent: 100 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    assert.match(result, /\[running\] aaaaaaaa/);
+    assert.doesNotMatch(result, /stale/);
+  });
+
+  it("annotates a legacy naive UTC updated_at just past the threshold as stale", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const { ABANDONED_THRESHOLD_MS } = await import("../../dist/installer/step-ops.js");
+    const naive = new Date(Date.now() - (ABANDONED_THRESHOLD_MS + 60_000))
+      .toISOString().slice(0, 19).replace("T", " ");
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix bug", status: "running", createdAt: naive, updatedAt: naive, tokensSpent: 100 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    assert.match(result, /\[running \(stale — daemon down\?\)\] aaaaaaaa/);
+  });
+
   it("annotates active runs in an instant-fail loop (RSPN DDTH surfacing)", async () => {
     const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
     const now = new Date().toISOString();

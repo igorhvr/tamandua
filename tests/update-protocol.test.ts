@@ -2980,10 +2980,13 @@ process.stdout.write(JSON.stringify({ completion, closed: true }) + "\\n");`,
       try {
         assert.deepStrictEqual(artifactSnapshot(db), artifactsBefore);
         const rowsAfter = mutationSnapshot(db);
-        assert.match(rowsAfter.runs[0].updated_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+        // TIME-STORAGE: every stored instant is ISO-8601 UTC with ms and Z,
+        // including the step-completion/run-status writes through step-ops.
+        const ISO_MS_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+        assert.match(rowsAfter.runs[0].updated_at, ISO_MS_Z);
         assert.notStrictEqual(rowsAfter.runs[0].updated_at, rowsBefore.runs[0].updated_at);
-        assert.match(rowsAfter.steps[0].updated_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
-        assert.match(rowsAfter.steps[1].updated_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+        assert.match(rowsAfter.steps[0].updated_at, ISO_MS_Z);
+        assert.match(rowsAfter.steps[1].updated_at, ISO_MS_Z);
         assert.deepStrictEqual(rowsAfter, {
           runs: [
             {

@@ -12,6 +12,7 @@ import {
   type ManagedRunWorktree,
 } from "../../installer/worktree-manager.js";
 import { parseDuration } from "../shared.js";
+import { parseInstant } from "../../lib/instant.js";
 
 function formatWorktreeStatus(wt: ManagedRunWorktree): string {
   const idShort = wt.runId.substring(0, 8);
@@ -288,8 +289,12 @@ export async function handleWorktree(group: string, args: string[]): Promise<boo
 
       if (!row) continue;
 
-      const createdAt = new Date(row.created_at).getTime();
-      if (createdAt >= cutoff) continue;
+      // TIME-STORAGE US-006: parse the stored instant with the shared reader.
+      // An undefined/unparseable created_at MUST skip the row — never treat it
+      // as ancient (which would prune a worktree whose age is unknown).
+      const createdAt = parseInstant(row.created_at);
+      if (!createdAt) continue;
+      if (createdAt.getTime() >= cutoff) continue;
 
       // Remove (force for non-ready status, since it's terminal pruning)
       try {

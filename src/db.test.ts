@@ -10,7 +10,7 @@ import { createTempHome } from "../tests/helpers/test-env.ts";
 // We test the migration by directly importing getDb, which calls migrate().
 // But since getDb() uses a cached connection and resolves DB path from
 // env/home, we test the migration logic directly with an isolated DB.
-import { getDb, getDbPath, SCHEMA_VERSION, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults } from "../dist/db.js";
+import { getDb, getDbPath, SCHEMA_VERSION, migrateInstantsToIsoZ, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults } from "../dist/db.js";
 
 describe("PRAGMA synchronous", () => {
   let tempHome: string;
@@ -1161,6 +1161,282 @@ describe("IFLB harness probe persistence columns migration", () => {
     assert.equal(second.at, 1, "harness_probe_at must not be duplicated by repeated migration");
     assert.equal(second.user_version, SCHEMA_VERSION,
       "repeated migration should keep user_version stamped at SCHEMA_VERSION");
+  });
+});
+
+describe("TIME-STORAGE instant migration (v10)", () => {
+  // TIME-STORAGE US-002: migrateInstantsToIsoZ() rewrites every legacy naive
+  // UTC instant (`YYYY-MM-DD HH:MM:SS`, 19 chars) in every timestamp column to
+  // the canonical ISO-8601 UTC form with milliseconds and `Z`
+  // (`YYYY-MM-DDTHH:MM:SS.000Z`). ISO-Z values, values with a real offset,
+  // NULLs and non-timestamp strings stay byte-identical, so the migration is
+  // idempotent. SCHEMA_VERSION is bumped 9 → 10 so existing DBs (user_version
+  // === 9) actually run applySchema() instead of early-returning.
+
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  function runInSubprocess(
+    th: { homeDir: string },
+    dbPath: string,
+    script: string,
+  ): string {
+    return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    }).trim();
+  }
+
+  // Boot the full current schema at v10 through the real getDb()/applySchema
+  // path, so the fixture shapes are exactly production shapes.
+  function bootCurrentSchema(th: { homeDir: string }, dbPath: string): void {
+    runInSubprocess(
+      th,
+      dbPath,
+      `import { getDb } from ${JSON.stringify(path.join(distDir(), "db.js"))}; getDb();`,
+    );
+  }
+
+  // Seed a fixture that mixes naive, ISO-Z, offset, NULL, empty and
+  // non-timestamp values across every table/column in the migration map, then
+  // rewind user_version to the pre-v10 value so getDb() takes the migration
+  // path. medic_checks is created here (it is NOT created by applySchema) to
+  // prove an existing medic_checks.checked_at is normalized too.
+  function seedMixedFixture(dbPath: string): void {
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      INSERT INTO runs (id, workflow_id, task, created_at, updated_at, scheduling_requested_at, harness_probe_at) VALUES
+        ('r-mixed', 'wf', 't', '2026-01-02 03:04:05', '2026-01-02T03:04:05.678Z', '2026-03-04 05:06:07', 'not-a-timestamp'),
+        ('r-offset', 'wf', 't', '2026-05-06T07:08:09+03:00', '2026-01-01 00:00:00', NULL, '');
+
+      INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, created_at, updated_at, claim_updated_at) VALUES
+        ('s-mixed', 'r-mixed', 'step', 'agent', 0, 'in', '{}', '2026-06-07 08:09:10', '2026-06-07T08:09:11.000Z', NULL),
+        ('s-claim', 'r-mixed', 'step', 'agent', 1, 'in', '{}', '2026-06-07T08:09:12.000Z', '2026-06-07T08:09:13.000Z', '2026-06-07 08:09:14');
+
+      INSERT INTO stories (id, run_id, story_index, story_id, title, created_at, updated_at) VALUES
+        ('st-mixed', 'r-mixed', 0, 'US-1', 'title', '2026-07-08 09:10:11', '2026-07-08T09:10:12.000Z');
+
+      INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES
+        ('ab1', 'US-1', 'r-mixed', 'reason', 1, '2026-08-09 10:11:12');
+
+      INSERT INTO run_worktrees (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path, created_at, removed_at) VALUES
+        ('r-mixed', '/x', '/x/.git', '/x/wt', '2026-09-10 11:12:13', NULL),
+        ('r-offset', '/x', '/x/.git', '/x/wt2', '2026-09-11T12:13:14.000Z', '2026-09-12 13:14:15');
+
+      INSERT INTO autoresearch_sessions (id, cwd, created_at, updated_at, last_seen_at, last_run_at) VALUES
+        ('ar1', '/x', '2026-10-11 13:14:15', '2026-10-11T13:14:16.000Z', '2026-10-12 14:15:16', NULL),
+        ('ar2', '/y', '2026-10-11T13:14:17.000Z', '2026-10-11T13:14:18.000Z', '2026-10-12T14:15:19.000Z', '2026-10-13 15:16:17');
+
+      INSERT INTO suite_results (id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, created_at) VALUES
+        (1, '/x', 'th', 'ch', 'npm test', 0, 5, '2026-11-12 16:17:18');
+
+      CREATE TABLE IF NOT EXISTS medic_checks (
+        id TEXT PRIMARY KEY,
+        checked_at TEXT NOT NULL,
+        issues_found INTEGER DEFAULT 0,
+        actions_taken INTEGER DEFAULT 0,
+        summary TEXT,
+        details TEXT
+      );
+      INSERT INTO medic_checks (id, checked_at) VALUES ('m1', '2026-12-13 17:18:19');
+
+      PRAGMA user_version = ${SCHEMA_VERSION - 1};
+    `);
+    db.close();
+  }
+
+  // Opens the DB through getDb() (running the migration on the slow path when
+  // user_version is stale) and dumps every mapped timestamp column. With
+  // `rerun` the normalization SQL is executed twice more explicitly, proving
+  // the rewrite itself is idempotent rather than merely skipped by the fast
+  // path.
+  function dumpInstants(
+    th: { homeDir: string },
+    dbPath: string,
+    rerun = false,
+  ): { version: number; rows: Record<string, unknown> } {
+    const script = `
+import { getDb, migrateInstantsToIsoZ } from ${JSON.stringify(path.join(distDir(), "db.js"))};
+const db = getDb();
+${rerun ? "migrateInstantsToIsoZ(db); migrateInstantsToIsoZ(db);" : ""}
+const rows = {};
+rows.runs = db.prepare("SELECT id, created_at, updated_at, scheduling_requested_at, harness_probe_at FROM runs ORDER BY id").all();
+rows.steps = db.prepare("SELECT id, created_at, updated_at, claim_updated_at FROM steps ORDER BY id").all();
+rows.stories = db.prepare("SELECT id, created_at, updated_at FROM stories ORDER BY id").all();
+rows.story_abandonments = db.prepare("SELECT id, created_at FROM story_abandonments ORDER BY id").all();
+rows.run_worktrees = db.prepare("SELECT run_id, created_at, removed_at FROM run_worktrees ORDER BY run_id").all();
+rows.autoresearch_sessions = db.prepare("SELECT id, created_at, updated_at, last_seen_at, last_run_at FROM autoresearch_sessions ORDER BY id").all();
+rows.suite_results = db.prepare("SELECT id, created_at FROM suite_results ORDER BY id").all();
+rows.medic_checks = db.prepare("SELECT id, checked_at FROM medic_checks ORDER BY id").all();
+const version = db.prepare("PRAGMA user_version").get().user_version;
+console.log(JSON.stringify({ version, rows }));
+`;
+    return JSON.parse(runInSubprocess(th, dbPath, script)) as {
+      version: number;
+      rows: Record<string, unknown>;
+    };
+  }
+
+  before(() => {
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  it("SCHEMA_VERSION is 10 (the v10 instant-normalization bump)", () => {
+    assert.equal(SCHEMA_VERSION, 10, "SCHEMA_VERSION must be 10 for the instant migration");
+  });
+
+  it("mixed-format fixture: rewrites every naive instant, leaves ISO-Z/offset/NULL/other values byte-identical", () => {
+    const th = createTempHome("tamandua-instant-mixed-");
+    const dbPath = path.join(th.root, "legacy.db");
+    bootCurrentSchema(th, dbPath);
+    seedMixedFixture(dbPath);
+
+    const { version, rows } = dumpInstants(th, dbPath);
+
+    assert.equal(version, SCHEMA_VERSION, "migration must re-stamp user_version to SCHEMA_VERSION");
+
+    assert.deepEqual(rows.runs, [
+      {
+        id: "r-mixed",
+        created_at: "2026-01-02T03:04:05.000Z",
+        updated_at: "2026-01-02T03:04:05.678Z",
+        scheduling_requested_at: "2026-03-04T05:06:07.000Z",
+        harness_probe_at: "not-a-timestamp",
+      },
+      {
+        id: "r-offset",
+        created_at: "2026-05-06T07:08:09+03:00",
+        updated_at: "2026-01-01T00:00:00.000Z",
+        scheduling_requested_at: null,
+        harness_probe_at: "",
+      },
+    ]);
+
+    assert.deepEqual(rows.steps, [
+      {
+        id: "s-claim",
+        created_at: "2026-06-07T08:09:12.000Z",
+        updated_at: "2026-06-07T08:09:13.000Z",
+        claim_updated_at: "2026-06-07T08:09:14.000Z",
+      },
+      {
+        id: "s-mixed",
+        created_at: "2026-06-07T08:09:10.000Z",
+        updated_at: "2026-06-07T08:09:11.000Z",
+        claim_updated_at: null,
+      },
+    ]);
+
+    assert.deepEqual(rows.stories, [
+      {
+        id: "st-mixed",
+        created_at: "2026-07-08T09:10:11.000Z",
+        updated_at: "2026-07-08T09:10:12.000Z",
+      },
+    ]);
+
+    assert.deepEqual(rows.story_abandonments, [
+      { id: "ab1", created_at: "2026-08-09T10:11:12.000Z" },
+    ]);
+
+    assert.deepEqual(rows.run_worktrees, [
+      {
+        run_id: "r-mixed",
+        created_at: "2026-09-10T11:12:13.000Z",
+        removed_at: null,
+      },
+      {
+        run_id: "r-offset",
+        created_at: "2026-09-11T12:13:14.000Z",
+        removed_at: "2026-09-12T13:14:15.000Z",
+      },
+    ]);
+
+    assert.deepEqual(rows.autoresearch_sessions, [
+      {
+        id: "ar1",
+        created_at: "2026-10-11T13:14:15.000Z",
+        updated_at: "2026-10-11T13:14:16.000Z",
+        last_seen_at: "2026-10-12T14:15:16.000Z",
+        last_run_at: null,
+      },
+      {
+        id: "ar2",
+        created_at: "2026-10-11T13:14:17.000Z",
+        updated_at: "2026-10-11T13:14:18.000Z",
+        last_seen_at: "2026-10-12T14:15:19.000Z",
+        last_run_at: "2026-10-13T15:16:17.000Z",
+      },
+    ]);
+
+    assert.deepEqual(rows.suite_results, [
+      { id: 1, created_at: "2026-11-12T16:17:18.000Z" },
+    ]);
+
+    assert.deepEqual(rows.medic_checks, [
+      { id: "m1", checked_at: "2026-12-13T17:18:19.000Z" },
+    ]);
+  });
+
+  it("is idempotent: a second migration and an explicit rerun leave every value unchanged", () => {
+    const th = createTempHome("tamandua-instant-idempotent-");
+    const dbPath = path.join(th.root, "legacy.db");
+    bootCurrentSchema(th, dbPath);
+    seedMixedFixture(dbPath);
+
+    const first = dumpInstants(th, dbPath);
+    assert.equal(first.version, SCHEMA_VERSION, "first migration stamps SCHEMA_VERSION");
+
+    // Second subprocess: getDb() sees user_version === SCHEMA_VERSION and
+    // early-returns, then the normalization SQL runs twice more explicitly.
+    const second = dumpInstants(th, dbPath, true);
+    assert.equal(second.version, SCHEMA_VERSION, "repeated migration keeps SCHEMA_VERSION");
+    assert.deepEqual(second.rows, first.rows, "second migration must not change any value");
+  });
+
+  it("does not throw on an empty DB and handles the absent medic_checks table", () => {
+    const th = createTempHome("tamandua-instant-empty-");
+    const dbPath = path.join(th.root, "fresh.db");
+
+    const out = runInSubprocess(
+      th,
+      dbPath,
+      [
+        `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+        "const db = getDb();",
+        'const version = db.prepare("PRAGMA user_version").get().user_version;',
+        'const medic = db.prepare("SELECT name FROM sqlite_master WHERE type=\'table\' AND name=\'medic_checks\'").all();',
+        "console.log(JSON.stringify({ version, expected: SCHEMA_VERSION, medicExists: medic.length }));",
+      ].join("\n"),
+    );
+    const parsed = JSON.parse(out) as { version: number; expected: number; medicExists: number };
+    assert.equal(parsed.version, SCHEMA_VERSION, "fresh DB is stamped at SCHEMA_VERSION");
+    assert.equal(parsed.expected, SCHEMA_VERSION);
+    assert.equal(parsed.medicExists, 0, "fixture precondition: medic_checks is absent at migrate() time");
   });
 });
 

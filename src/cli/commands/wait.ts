@@ -9,6 +9,7 @@ import { getDb } from "../../db.js";
 import { resolvePiStateDir } from "../../installer/paths.js";
 import { readHarnessProbeFailureBlock } from "../../installer/status.js";
 import { parseDuration, readOption } from "../shared.js";
+import { parseInstant } from "../../lib/instant.js";
 import fs from "node:fs";
 import path from "node:path";
 import { prefixRunId } from "../../lib/id-prefix.js";
@@ -141,22 +142,25 @@ export function computeExitCode(states: RunState[], timedOut: boolean): number {
 
 export function formatJsonOutput(result: WaitResult): string {
   return JSON.stringify({
-    runs: result.runs.map((r) => ({
-      runId: prefixRunId(r.runId),
-      runNumber: r.runNumber,
-      workflowId: r.workflowId,
-      status: r.status,
-      tokensSpent: r.tokensSpent,
-      durationMs: r.createdAt
-        ? Date.now() - new Date(r.createdAt).getTime()
-        : 0,
-      steps: {
-        done: r.steps.done,
-        failed: r.steps.failed,
-        pending: r.steps.pending,
-        running: r.steps.running,
-      },
-    })),
+    runs: result.runs.map((r) => {
+      // TIME-STORAGE US-006: the shared reader pins legacy naive UTC values to
+      // UTC instead of the host offset. Missing/unparseable -> 0, as before.
+      const createdAt = parseInstant(r.createdAt);
+      return {
+        runId: prefixRunId(r.runId),
+        runNumber: r.runNumber,
+        workflowId: r.workflowId,
+        status: r.status,
+        tokensSpent: r.tokensSpent,
+        durationMs: createdAt ? Date.now() - createdAt.getTime() : 0,
+        steps: {
+          done: r.steps.done,
+          failed: r.steps.failed,
+          pending: r.steps.pending,
+          running: r.steps.running,
+        },
+      };
+    }),
     timedOut: result.timedOut,
   }) + "\n";
 }
@@ -165,9 +169,8 @@ export function formatHumanOutput(result: WaitResult): string {
   return result.runs
     .map((r) => {
       const snapshot = r.runNumber !== null ? `#${r.runNumber}` : `run-${r.runId.slice(0, 8)}`;
-      const duration = r.createdAt
-        ? formatElapsed(Date.now() - new Date(r.createdAt).getTime())
-        : "?";
+      const createdAt = parseInstant(r.createdAt);
+      const duration = createdAt ? formatElapsed(Date.now() - createdAt.getTime()) : "?";
       return `${snapshot} run-${r.runId.slice(0, 8)} ${r.workflowId} ${r.status} ${duration} ${r.tokensSpent.toLocaleString()} tokens`;
     })
     .join("\n") + "\n";

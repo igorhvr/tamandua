@@ -132,8 +132,16 @@ describe("completeStep basic paths", () => {
     const result = completeStep("s1-id", "CHANGES: done");
     assert.ok(result.status === "advanced" || result.status === "completed");
 
-    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get("s1-id") as { status: string };
+    const step = db.prepare("SELECT status, updated_at FROM steps WHERE id = ?").get("s1-id") as { status: string; updated_at: string };
     assert.equal(step.status, "done");
+    // TIME-STORAGE US-004: completion stamps updated_at with the ONE stored
+    // instant format (ISO-8601 UTC with milliseconds and Z), never the old
+    // naive datetime('now') shape.
+    assert.match(
+      step.updated_at,
+      /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/,
+      `completeStep must persist updated_at as ISO-Z, got ${step.updated_at}`,
+    );
   });
 
   it("blocks completion for failed runs", () => {

@@ -1,0 +1,12 @@
+[
+  {
+    "file": "src/medic/medic.ts",
+    "match": "datetime('now', '-24 hours')",
+    "reason": "SQLite comparison window for the medic 24h check (WHERE checked_at > ...), not a writer; SQL comparison rewrites are an explicitly skipped TIME item (4) and pinned by the coordinator audit."
+  },
+  {
+    "file": "src/server/control-server.ts",
+    "match": "new Date(existing.claimedAt)",
+    "reason": "claimedAt is an in-memory epoch-millisecond number in the control plane's suite-claim map, not a stored instant string; new Date(number) is exact and deliberate."
+  }
+]

@@ -18,6 +18,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { realpathSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { getProcessStartIdentity } from "../lib/process-start-identity.js";
+import { parseInstant } from "../lib/instant.js";
 import {
   TTL_GREEN_MS,
   RED_CONTEXT_WINDOW_MS,
@@ -42,6 +43,18 @@ const FORWARDED_SIGNALS: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGQUIT", "SIG
 // savedCmdString is used by the SHSH fix (shell semantics via sh -c).
 let savedCmdArgs: string[] = [];
 let savedCmdString: string = "";
+
+/**
+ * Age in ms of a stored instant (e.g. suite_results.created_at), or `NaN` when
+ * the value is missing/unparseable. The shared `parseInstant` reader treats a
+ * legacy naive UTC timestamp as UTC (never host-local) and honors real numeric
+ * offsets. The existing callers already treat a `NaN` age as "not within the
+ * TTL/window" — that safe behavior is preserved explicitly here.
+ */
+function storedInstantAgeMs(value: unknown): number {
+  const parsed = parseInstant(value);
+  return parsed ? Date.now() - parsed.getTime() : Number.NaN;
+}
 
 // ── CLI argument parsing ──────────────────────────────────────────────
 
@@ -397,8 +410,7 @@ async function pollForResult(
     if (latest && typeof latest.exit_code === "number") {
       if (!force && latest.exit_code === 0) {
         // Green result recorded by the claim owner → replay if fresh enough.
-        const createdAt = String(latest.created_at ?? "");
-        const ageMs = Date.now() - new Date(createdAt).getTime();
+        const ageMs = storedInstantAgeMs(latest.created_at);
         if (!isNaN(ageMs) && ageMs <= TTL_GREEN_MS) {
           return { action: "replay", latest, ageMs };
         }
@@ -642,8 +654,7 @@ async function main(): Promise<void> {
 
   // R5: Green within TTL and --force absent → replay.
   if (latest && typeof latest.exit_code === "number" && latest.exit_code === 0 && !force) {
-    const createdAt = String(latest.created_at ?? "");
-    const ageMs = Date.now() - new Date(createdAt).getTime();
+    const ageMs = storedInstantAgeMs(latest.created_at);
     if (ageMs <= TTL_GREEN_MS) {
       await replayCachedResult(latest, preTreeHash, ageMs);
     }
@@ -651,8 +662,7 @@ async function main(): Promise<void> {
 
   // R6: Red entry → execute (with context note if recent).
   if (latest && typeof latest.exit_code === "number" && latest.exit_code !== 0) {
-    const createdAt = String(latest.created_at ?? "");
-    const ageMs = Date.now() - new Date(createdAt).getTime();
+    const ageMs = storedInstantAgeMs(latest.created_at);
     if (ageMs <= RED_CONTEXT_WINDOW_MS) {
       printRedContextNote(latest, cmdString.slice(0, 200) || cmdString, ageMs);
     }
@@ -718,16 +728,16 @@ async function main(): Promise<void> {
       currentLatest
       && currentLatest.exit_code === 0
       && !force
-      && Date.now() - new Date(String(currentLatest.created_at ?? "")).getTime() <= TTL_GREEN_MS
+      && storedInstantAgeMs(currentLatest.created_at) <= TTL_GREEN_MS
     ) {
       await replayCachedResult(
         currentLatest,
         preTreeHash,
-        Date.now() - new Date(String(currentLatest.created_at ?? "")).getTime(),
+        storedInstantAgeMs(currentLatest.created_at),
       );
     }
     if (currentLatest && typeof currentLatest.exit_code === "number" && currentLatest.exit_code !== 0) {
-      const currentAgeMs = Date.now() - new Date(String(currentLatest.created_at ?? "")).getTime();
+      const currentAgeMs = storedInstantAgeMs(currentLatest.created_at);
       if (currentAgeMs <= RED_CONTEXT_WINDOW_MS) {
         printRedContextNote(currentLatest, cmdString.slice(0, 200) || cmdString, currentAgeMs);
       }
@@ -827,17 +837,17 @@ async function main(): Promise<void> {
       rekeyLatest
       && rekeyLatest.exit_code === 0
       && !force
-      && Date.now() - new Date(String(rekeyLatest.created_at ?? "")).getTime() <= TTL_GREEN_MS
+      && storedInstantAgeMs(rekeyLatest.created_at) <= TTL_GREEN_MS
     ) {
       await replayCachedResult(
         rekeyLatest,
         preTreeHash,
-        Date.now() - new Date(String(rekeyLatest.created_at ?? "")).getTime(),
+        storedInstantAgeMs(rekeyLatest.created_at),
       );
       // unreachable — replayCachedResult calls process.exit(0) on success
     }
     if (rekeyLatest && typeof rekeyLatest.exit_code === "number" && rekeyLatest.exit_code !== 0) {
-      const rekeyAgeMs = Date.now() - new Date(String(rekeyLatest.created_at ?? "")).getTime();
+      const rekeyAgeMs = storedInstantAgeMs(rekeyLatest.created_at);
       if (rekeyAgeMs <= RED_CONTEXT_WINDOW_MS) {
         printRedContextNote(rekeyLatest, cmdString.slice(0, 200) || cmdString, rekeyAgeMs);
       }

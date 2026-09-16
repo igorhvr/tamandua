@@ -1788,6 +1788,111 @@ exit 0
     assert.equal(count, 1, "counter should increment on execution (no NaN replay)");
   });
 
+  // ── US-007: created_at is read as UTC ────────────────────────────────
+
+  /** The legacy naive UTC shape `YYYY-MM-DD HH:MM:SS` (no zone, no ms). */
+  function naiveUtc(ms: number): string {
+    return new Date(ms).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+  }
+
+  /** Seed one green suite_results row for the counterScript cache key. */
+  async function seedGreenCreatedAt(createdAt: string): Promise<void> {
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = committedTreeHash(repoDir);
+    assert.ok(treeHash, "counterScript repo must have a committed tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+    const db = new DatabaseSync(controlEnv.dbPath);
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 0, 42, 'US-007 seeded green', 'r-us007-prime', 's-prime', ?)`,
+    ).run(originRepo, treeHash, cmdHash, counterScript.slice(0, 200), createdAt);
+    db.close();
+  }
+
+  it("expired naive UTC created_at (>24h) does NOT replay (US-007)", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+    // True age 24.5h in the legacy naive shape: a host-local read on a host
+    // behind UTC would make it look fresh and wrongly replay it.
+    await seedGreenCreatedAt(naiveUtc(Date.now() - 24.5 * 3600 * 1000));
+
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-us007-expired", "--step", "s1", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0);
+    assert.ok(
+      !r.stdout.includes("TAMANDUA-TEST CACHED"),
+      "an expired naive green must not replay",
+    );
+    assert.equal(
+      parseInt(readFileSync(counterFile, "utf-8").trim(), 10),
+      1,
+      "expired naive green must execute",
+    );
+  });
+
+  it("fresh naive UTC created_at (<24h) replays (US-007)", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+    // True age 23.5h: a host-local read on a host ahead of UTC would make it
+    // look expired and skip the replay.
+    await seedGreenCreatedAt(naiveUtc(Date.now() - 23.5 * 3600 * 1000));
+
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-us007-fresh", "--step", "s1", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0);
+    assert.ok(
+      r.stdout.includes("TAMANDUA-TEST CACHED"),
+      "a fresh naive green must replay as UTC",
+    );
+    assert.equal(
+      parseInt(readFileSync(counterFile, "utf-8").trim(), 10),
+      0,
+      "replay must not execute the command",
+    );
+  });
+
+  it("created_at with a real offset is honored (US-007)", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+    // Same instant as "1 minute ago", expressed with a +00:00 offset.
+    await seedGreenCreatedAt(new Date(Date.now() - 60_000).toISOString().replace("Z", "+00:00"));
+
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-us007-offset", "--step", "s1", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0);
+    assert.ok(r.stdout.includes("TAMANDUA-TEST CACHED"), "an offset green must replay");
+  });
+
+  it("unparseable created_at does NOT replay (US-007)", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+    await seedGreenCreatedAt("not-a-timestamp");
+
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-us007-bad", "--step", "s1", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0);
+    assert.ok(
+      !r.stdout.includes("TAMANDUA-TEST CACHED"),
+      "an unparseable green must not replay",
+    );
+    assert.equal(
+      parseInt(readFileSync(counterFile, "utf-8").trim(), 10),
+      1,
+      "unparseable green must execute",
+    );
+  });
+
   // ── US-009: Suite events for observability ──────────────────────────
 
   it("emits suite.cache_hit event on replay", async () => {

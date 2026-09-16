@@ -1,4 +1,5 @@
 import { getDb } from "../db.js";
+import { SQL_NOW_ISO } from "../lib/instant.js";
 import { scheduleRunCronTeardown, getWorkflowId, emitRunTerminalEvent, parseRunContext } from "./step-ops.js";
 import { removeRunCrons, settleRunInFlightRounds, HARNESS_TEARDOWN_GRACE_MS } from "./agent-scheduler.js";
 import { terminateRunWithDaemon } from "../server/control-client.js";
@@ -264,12 +265,12 @@ export async function deleteWorkflow(
   if (isActive) {
     // Cancel pending/running steps
     db.prepare(
-      "UPDATE steps SET status = 'canceled', updated_at = datetime('now') WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')",
+      `UPDATE steps SET status = 'canceled', updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')`,
     ).run(runId);
 
     // Mark run as canceled and clear scheduling
     db.prepare(
-      "UPDATE runs SET status = 'canceled', scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
+      `UPDATE runs SET status = 'canceled', scheduling_status = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
     ).run(runId);
 
     // Tear down cron jobs and notify daemon
@@ -348,13 +349,13 @@ export async function stopWorkflow(
 
   // Cancel any pending/running steps
   db.prepare(
-    "UPDATE steps SET status = 'canceled', updated_at = datetime('now') WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')",
+    `UPDATE steps SET status = 'canceled', updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')`,
   ).run(runId);
 
   // Mark the run as canceled and clear scheduling status (terminal runs
   // never carry a scheduling_status).
   db.prepare(
-    "UPDATE runs SET status = 'canceled', scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
+    `UPDATE runs SET status = 'canceled', scheduling_status = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
   ).run(runId);
 
   // Tear down run-scoped cron jobs in this process (best-effort), and
@@ -506,12 +507,12 @@ export async function forceFailRun(
 
   // Cancel pending/waiting/running steps
   db.prepare(
-    "UPDATE steps SET status = 'canceled', updated_at = datetime('now') WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')",
+    `UPDATE steps SET status = 'canceled', updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')`,
   ).run(runId);
 
   // Set run to failed and clear scheduling status
   db.prepare(
-    "UPDATE runs SET status = 'failed', scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
+    `UPDATE runs SET status = 'failed', scheduling_status = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
   ).run(runId);
 
   // Emit run.force_failed event with reason (reason field per the

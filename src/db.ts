@@ -34,7 +34,16 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // leaves existing DBs (user_version === 8) early-returning and skipping the
 // migration, so the dispatch motor's probe status reads crash with
 // "no such column: harness_probe_status".
-export const SCHEMA_VERSION = 9;
+// v10: TIME-STORAGE US-002 normalized every stored instant to the ONE format
+// (ISO-8601 UTC with milliseconds and Z). Before this, JS writers wrote
+// `YYYY-MM-DDTHH:MM:SS.sssZ` while SQL writers wrote naive UTC
+// `YYYY-MM-DD HH:MM:SS`; readers interpreted the naive form as host-local
+// time. migrateInstantsToIsoZ() rewrites the legacy naive values already in
+// every timestamp column. The bump is REQUIRED (see the WLST5.1 note below):
+// without it existing DBs (user_version === 9) early-return from migrate()
+// and skip the rewrite, so their stored instants stay naive and keep being
+// misread.
+export const SCHEMA_VERSION = 10;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -580,7 +589,66 @@ function applySchema(db: DatabaseSync): void {
     "CREATE INDEX IF NOT EXISTS idx_suite_results_lookup ON suite_results(origin_repo, tree_hash, cmd_hash, created_at)",
   );
 
+  // ── TIME-STORAGE v10: rewrite legacy naive instants to ISO-Z ──
+  // Runs inside the enclosing migration write lock, immediately before the
+  // version re-stamp, so a DB at v10 always has normalized instants.
+  migrateInstantsToIsoZ(db);
+
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+}
+
+// ── TIME-STORAGE v10: normalize stored instants ────────────────────────────
+// The timestamp columns that carry a stored instant, grouped by table. Every
+// table is probed for existence because applySchema() does NOT create
+// medic_checks — src/medic/medic.ts ensureMedicTables() does, lazily, and it
+// may not exist when migrate() runs. Columns are probed too so a table in an
+// older shape can never abort the migration with "no such column".
+const INSTANT_COLUMNS: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
+  ["runs", ["created_at", "updated_at", "scheduling_requested_at", "harness_probe_at"]],
+  ["steps", ["created_at", "updated_at", "claim_updated_at"]],
+  ["stories", ["created_at", "updated_at"]],
+  ["story_abandonments", ["created_at"]],
+  ["run_worktrees", ["created_at", "removed_at"]],
+  ["autoresearch_sessions", ["created_at", "updated_at", "last_seen_at", "last_run_at"]],
+  ["suite_results", ["created_at"]],
+  ["medic_checks", ["checked_at"]],
+];
+
+// Exact-shape GLOB for the legacy naive UTC form `YYYY-MM-DD HH:MM:SS` (19
+// chars). GLOB is anchored and case-sensitive, so ISO-Z (`...T...Z`) values,
+// values with a real offset, NULL and every non-timestamp string fail the
+// predicate and are left byte-identical. Rewrite is `replace(col,' ','T') ||
+// '.000Z'` — pure string surgery, no date parsing and no new columns.
+const NAIVE_INSTANT_GLOB =
+  "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]";
+
+/**
+ * Rewrites every legacy naive UTC instant (`YYYY-MM-DD HH:MM:SS`) still stored
+ * in a timestamp column to the canonical ISO-8601 UTC form with milliseconds
+ * and `Z` (`YYYY-MM-DDTHH:MM:SS.000Z`). Values already in the canonical form,
+ * values with a real offset, NULLs and non-timestamp strings are untouched, so
+ * the function is idempotent. Callers MUST hold the migration write lock; it
+ * is invoked from applySchema() inside the serialized migrate() transaction.
+ */
+export function migrateInstantsToIsoZ(db: DatabaseSync): void {
+  const tableExists = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+  );
+  for (const [table, columns] of INSTANT_COLUMNS) {
+    if (!tableExists.get(table)) continue;
+    const tableCols = new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+        (c) => c.name,
+      ),
+    );
+    for (const column of columns) {
+      if (!tableCols.has(column)) continue;
+      db.exec(
+        `UPDATE ${table} SET ${column} = replace(${column}, ' ', 'T') || '.000Z' ` +
+          `WHERE ${column} GLOB '${NAIVE_INSTANT_GLOB}'`,
+      );
+    }
+  }
 }
 
 export function closeDb(): void {

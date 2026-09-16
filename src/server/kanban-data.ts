@@ -21,6 +21,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { TamanduaEvent } from "../installer/events.js";
 import { displayStepStatus } from "../lib/step-display.js";
+import { parseInstant } from "../lib/instant.js";
 
 export type VisualStatus = "todo" | "running" | "done" | "failed" | "verifying";
 
@@ -211,19 +212,26 @@ function stepCardSub(step: StepRow): string {
 
 // ── Helpers for buildKanbanCardDetail ──────────────────────────────
 
-function parseEventIsoMs(ts: string | undefined): number {
-  if (!ts) return 0;
-  // SQLite datetime('now') returns space-separated UTC without timezone.
-  // Normalize to ISO-8601 so JS parses as UTC, not local time.
-  // Matches parseTimestamp logic in kanban.html.
-  const iso = /Z$/.test(ts) ? ts : ts.replace(" ", "T") + "Z";
-  const d = new Date(iso);
-  return Number.isFinite(d.getTime()) ? d.getTime() : 0;
+/**
+ * Parse a stored/event instant to epoch milliseconds using the shared
+ * `parseInstant` reader semantics, or `undefined` when the value is
+ * missing/unparseable.
+ *
+ * Kept under this name (the coordinator O12 audit extracts it by name). The
+ * legacy naive space-separated UTC shape is treated as UTC, real numeric
+ * offsets (`+03:00`) are honored, and arbitrary input is never silently
+ * coerced to `0` by appending a `Z` to it.
+ */
+export function parseEventIsoMs(ts: string | undefined): number | undefined {
+  const parsed = parseInstant(ts);
+  return parsed ? parsed.getTime() : undefined;
 }
 
 function computeElapsed(status: string, created_at: string, updated_at: string): number | null {
   const createdMs = parseEventIsoMs(created_at);
   const updatedMs = parseEventIsoMs(updated_at);
+  // `!` covers both `undefined` (unparseable) and the epoch-0 sentinel the
+  // previous implementation used for missing values.
   if (!createdMs || !updatedMs) return null;
   const statusKey = String(status).toLowerCase();
   // Terminal runs: freeze duration so the dashboard does not keep counting after completion.
@@ -235,7 +243,7 @@ function computeElapsed(status: string, created_at: string, updated_at: string):
 function extractFailureDetail(events: TamanduaEvent[]): string | undefined {
   // Prefer story.failed then step.failed, most recent first.
   const sorted = [...events].sort(
-    (a, b) => parseEventIsoMs(b.ts) - parseEventIsoMs(a.ts),
+    (a, b) => (parseEventIsoMs(b.ts) ?? 0) - (parseEventIsoMs(a.ts) ?? 0),
   );
   for (const e of sorted) {
     if (e.event === "story.failed" && e.detail) return e.detail;
@@ -369,11 +377,11 @@ export function buildKanbanCardDetail(
 function buildTiming(events: TamanduaEvent[]): KanbanCardDetail["timing"] {
   if (events.length === 0) return undefined;
   const sorted = [...events].sort(
-    (a, b) => parseEventIsoMs(a.ts) - parseEventIsoMs(b.ts),
+    (a, b) => (parseEventIsoMs(a.ts) ?? 0) - (parseEventIsoMs(b.ts) ?? 0),
   );
   const first = parseEventIsoMs(sorted[0].ts);
   const last = parseEventIsoMs(sorted[sorted.length - 1].ts);
-  if (first === 0 || last === 0) return undefined;
+  if (!first || !last) return undefined;
   const durationMs = last - first;
   return {
     firstEvent: sorted[0].ts,

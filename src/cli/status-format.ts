@@ -9,6 +9,7 @@
 import { execSync } from "node:child_process";
 import { getDaemonStatus, getDashboardStatus, getMcpStatus, getControlPlaneStatus, getMcpStatusAsync, getControlPlaneStatusAsync, isRunning } from "../server/daemonctl.js";
 import { ABANDONED_THRESHOLD_MS } from "../installer/step-ops.js";
+import { parseInstant } from "../lib/instant.js";
 import {
   acknowledgeDaemonDeath,
   getLastDaemonDeath,
@@ -345,7 +346,12 @@ export function formatRunsSummary(opts?: {
       // Staleness annotation: if updatedAt is older than the abandon threshold
       // AND the daemon is not running, annotate the status as stale.
       let displayStatus = r.status;
-      const updatedAtMs = r.updatedAt ? new Date(r.updatedAt).getTime() : 0;
+      // TIME-STORAGE US-006: parse the stored instant with the shared reader so
+      // legacy naive UTC values are not shifted by the host offset. A missing /
+      // unparseable value keeps the previous safe behavior (0), which still
+      // produces the stale annotation below.
+      const updatedAt = parseInstant(r.updatedAt);
+      const updatedAtMs = updatedAt ? updatedAt.getTime() : 0;
       if (
         (r.status === "running" || r.status === "paused")
         && !daemonRunning

@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolveTamanduaCli, resolveWorkflowDir, resolveWorkflowWorkspaceDir } from "./paths.js";
 import type { WorkflowSpec, WorkflowAgent, HarnessType } from "./types.js";
 import { logger } from "../lib/logger.js";
+import { SQL_NOW_ISO } from "../lib/instant.js";
 import { getRoleTimeoutSeconds, inferRole } from "./install.js";
 import { formatPiCommandPreview } from "./pi-command-preview.js";
 import { emitEvent, getRunEvents, type TamanduaEvent } from "./events.js";
@@ -902,7 +903,7 @@ async function incrementRunTokenSpend(runId: string, tokenUsage: number): Promis
   const { getDb } = await import("../db.js");
   const db = getDb();
   const result = db
-    .prepare("UPDATE runs SET tokens_spent = tokens_spent + ?, updated_at = datetime('now') WHERE id = ?")
+    .prepare(`UPDATE runs SET tokens_spent = tokens_spent + ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`)
     .run(tokenUsage, runId);
 
   if ((result.changes ?? 0) <= 0) return null;

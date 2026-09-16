@@ -4,6 +4,7 @@ import { writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { getDb } from "../db.js";
+import { SQL_NOW_ISO } from "../lib/instant.js";
 import { loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir, resolvePiStateDir } from "./paths.js";
 import {
@@ -94,7 +95,7 @@ function failPersistedRunLaunch(params: {
       `UPDATE runs
        SET status = 'failed', context = ?, scheduling_status = NULL,
            scheduling_requested_at = NULL, scheduling_error = ?,
-           updated_at = datetime('now')
+           updated_at = ${SQL_NOW_ISO}
        WHERE id = ?`,
     ).run(JSON.stringify(params.context), message, params.runId);
   } catch {
@@ -543,7 +544,7 @@ export async function runWorkflow(
           ? registration.body.error
           : "daemon registration failed";
       db.prepare(
-        "UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
+        `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
       ).run(message, runId);
       emitEvent({
         ts: new Date().toISOString(),
@@ -619,7 +620,7 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
   // Reset the run to running and request fresh scheduling admission.
   const resumeNow = new Date().toISOString();
   db.prepare(
-    "UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = datetime('now') WHERE id = ?",
+    `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
   ).run(resumeNow, run.id);
 
   // Find the first failed step and reset it + subsequent steps
@@ -633,7 +634,7 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
   if (failedStep) {
     // Reset this step and all subsequent steps back to waiting
     db.prepare(
-      "UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = datetime('now') WHERE run_id = ? AND step_index >= ?",
+      `UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND step_index >= ?`,
     ).run(run.id, failedStep.step_index);
   } else {
     // Force-failed shape: forceFailRun leaves the run 'failed' with ALL
@@ -648,7 +649,7 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
     ).get(run.id) as { step_id: string; step_index: number } | undefined;
     if (firstNonDone) {
       db.prepare(
-        "UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = datetime('now') WHERE run_id = ? AND step_index >= ?",
+        `UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND step_index >= ?`,
       ).run(run.id, firstNonDone.step_index);
       restartStepId = firstNonDone.step_id;
     }
@@ -681,7 +682,7 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
         ? registration.body.error
         : "daemon registration failed";
     db.prepare(
-      "UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
+      `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
     ).run(message, run.id);
     // Retriable teardown: the daemon is still draining the run's in-flight
     // workers (e.g. an immediate resume right after force-fail). The run's

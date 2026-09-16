@@ -617,12 +617,32 @@
     return String(v);
   }
 
+  // BEGIN instant-parser: browser copy of the shared parseInstant rules in
+  // src/lib/instant.ts. Stored instants are ISO-8601 UTC with milliseconds and
+  // "Z", but legacy rows still hold naive "YYYY-MM-DD HH:MM:SS" values (UTC by
+  // construction) and some hold real numeric offsets. A naive value is pinned
+  // to UTC -- never host-local -- a real offset is honored, and anything
+  // unparseable is rejected rather than falling back to "now". parseTimestamp
+  // is self-contained on purpose: the coordinator O12 audit extracts this exact
+  // function by name and runs it in an isolated VM with no other bindings.
   function parseTimestamp(ts) {
-    if (!ts) return NaN;
-    // Tamandua mixes ISO-Z and naive space-separated UTC strings.
-    const iso = /Z$/.test(ts) ? ts : ts.replace(" ", "T") + "Z";
-    return Date.parse(iso);
+    if (typeof ts !== "string") return NaN;
+    const raw = ts.trim();
+    if (raw === "") return NaN;
+    // Legacy naive UTC: no zone designator, so pin it to UTC explicitly.
+    const NAIVE_UTC_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+    // ISO-8601 with an explicit zone: `Z` or a real numeric offset.
+    const ZONED_ISO_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+    let candidate = raw;
+    if (NAIVE_UTC_RE.test(raw)) {
+      candidate = `${raw.replace(" ", "T")}Z`;
+    } else if (!ZONED_ISO_RE.test(raw)) {
+      return NaN;
+    }
+    const parsed = new Date(candidate);
+    return Number.isNaN(parsed.getTime()) ? NaN : parsed.getTime();
   }
+  // END instant-parser
 
   function fmtTime(ts) {
     const t = parseTimestamp(ts);

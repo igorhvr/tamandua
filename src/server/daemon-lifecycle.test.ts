@@ -208,6 +208,11 @@ function appendJournalEntry(opts: { homeDir: string }, entry: Record<string, unk
   fs.appendFileSync(log, JSON.stringify(entry) + "\n", "utf-8");
 }
 
+/** Legacy SQLite naive UTC shape: `YYYY-MM-DD HH:MM:SS` (no zone, no ms). */
+function naiveUtc(ms: number): string {
+  return new Date(ms).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
 function readJournal(opts: { homeDir: string }): Record<string, unknown>[] {
   const log = path.join(opts.homeDir, ".tamandua", "lifecycle.log");
   if (!fs.existsSync(log)) return [];
@@ -402,6 +407,135 @@ describe("daemon unclean-exit detection", () => {
     assert.equal(death!.pid, 666);
     assert.equal(death!.priorPid, 666);
     assert.equal(death!.lastHeartbeatAgeMs, 200);
+  });
+
+  // ── US-007: lifecycle journal/marker instants go through parseInstant ──
+
+  it("detectUncleanExit treats a naive UTC marker.startedAt as UTC (US-007)", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const pid = 4242;
+    const startedAtMs = Date.now() - 60_000;
+    seedMarker(opts, pid, naiveUtc(startedAtMs), new Date(startedAtMs).toISOString());
+    // A shutdown 60s BEFORE the true marker start must not account for it.
+    appendJournalEntry(opts, {
+      ts: new Date(startedAtMs - 60_000).toISOString(),
+      action: "daemon.shutdown",
+      targetPid: pid,
+    });
+
+    const facts = detectUncleanExit(opts);
+    assert.ok(
+      facts,
+      "a shutdown before the naive-UTC startedAt must not count as a clean exit",
+    );
+    assert.equal(facts!.priorPid, pid);
+  });
+
+  it("detectUncleanExit accounts for a shutdown after a naive UTC marker.startedAt (US-007)", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const pid = 4242;
+    const startedAtMs = Date.now() - 60_000;
+    seedMarker(opts, pid, naiveUtc(startedAtMs), new Date(startedAtMs).toISOString());
+    // A shutdown 30s AFTER the true marker start accounts for it (clean exit).
+    appendJournalEntry(opts, {
+      ts: new Date(startedAtMs + 30_000).toISOString(),
+      action: "daemon.shutdown",
+      targetPid: pid,
+    });
+
+    assert.equal(
+      detectUncleanExit(opts),
+      null,
+      "a shutdown after the naive-UTC startedAt must suppress unclean detection",
+    );
+    assert.ok(
+      !readJournal(opts).some((entry) => entry.action === "daemon.uncleanExit"),
+      "no uncleanExit entry may be journaled for an accounted marker",
+    );
+  });
+
+  it("detectUncleanExit honors a real offset in marker and journal timestamps (US-007)", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const pid = 4242;
+    const startedAtMs = Date.now() - 60_000;
+    const offsetStartedAt = new Date(startedAtMs).toISOString().replace("Z", "+00:00");
+    seedMarker(opts, pid, offsetStartedAt, new Date(startedAtMs).toISOString());
+    appendJournalEntry(opts, {
+      ts: new Date(startedAtMs + 1_000).toISOString(),
+      action: "daemon.shutdown",
+      targetPid: pid,
+    });
+
+    assert.equal(detectUncleanExit(opts), null);
+  });
+
+  it("getLastDaemonDeath orders a newer naive UTC ts as UTC (US-007)", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    appendJournalEntry(opts, {
+      ts: new Date(Date.now() - 120_000).toISOString(),
+      action: "daemon.shutdown",
+      targetPid: 111,
+      signal: "SIGTERM",
+    });
+    appendJournalEntry(opts, {
+      ts: naiveUtc(Date.now() - 30_000),
+      action: "daemon.shutdown",
+      targetPid: 222,
+      signal: "SIGINT",
+    });
+
+    const death = getLastDaemonDeath(opts);
+    assert.ok(death);
+    assert.equal(death!.pid, 222, "the truly-newer naive-UTC death must win");
+  });
+
+  it("getLastDaemonDeath orders an older naive UTC ts as UTC (US-007)", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    appendJournalEntry(opts, {
+      ts: naiveUtc(Date.now() - 120_000),
+      action: "daemon.shutdown",
+      targetPid: 111,
+      signal: "SIGTERM",
+    });
+    appendJournalEntry(opts, {
+      ts: new Date(Date.now() - 30_000).toISOString(),
+      action: "daemon.shutdown",
+      targetPid: 222,
+      signal: "SIGINT",
+    });
+
+    const death = getLastDaemonDeath(opts);
+    assert.ok(death);
+    assert.equal(death!.pid, 222, "the ISO-Z (truly newer) death must win");
+  });
+
+  it("getLastDaemonDeath ignores death entries with an unparseable ts (US-007)", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    appendJournalEntry(opts, { ts: "not-a-timestamp", action: "daemon.shutdown", targetPid: 111 });
+    appendJournalEntry(opts, { ts: "", action: "daemon.uncleanExit", targetPid: 222 });
+    appendJournalEntry(opts, {
+      ts: new Date(Date.now() - 60_000).toISOString(),
+      action: "daemon.shutdown",
+      targetPid: 333,
+      signal: "SIGTERM",
+    });
+
+    const death = getLastDaemonDeath(opts);
+    assert.ok(death);
+    assert.equal(death!.pid, 333, "the only parseable death must win");
+  });
+
+  it("getLastDaemonDeath returns null when every death ts is unparseable (US-007)", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    appendJournalEntry(opts, { ts: "nope", action: "daemon.shutdown", targetPid: 111 });
+    assert.equal(getLastDaemonDeath(opts), null);
   });
 });
 

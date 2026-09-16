@@ -303,8 +303,83 @@ describe("wait command", () => {
     assert.ok(lines[1].includes("failed"));
   });
 
-  // ── Unit: formatElapsed ────────────────────────────────────────────
+  // ── Unit: TIME-STORAGE stored-instant reading ──────────────────────
 
+  // A legacy naive UTC instant (`YYYY-MM-DD HH:MM:SS`, no zone) written by the
+  // old datetime('now') writers. `new Date(...)` would apply the host offset;
+  // the shared parseInstant must pin it to UTC.
+  const naiveUtc = (epochMs: number): string =>
+    new Date(epochMs).toISOString().slice(0, 19).replace("T", " ");
+
+  it("formatJsonOutput interprets a naive stored instant as UTC, not host-local", async () => {
+    const { formatJsonOutput } = await import("../../../dist/cli/commands/wait.js");
+    const result = {
+      runs: [{
+        runId: "aaa-bbb-ccc",
+        runNumber: 1,
+        workflowId: "test-wf",
+        status: "running",
+        tokensSpent: 0,
+        createdAt: naiveUtc(Date.now() - 120_000),
+        updatedAt: "",
+        steps: { done: 0, failed: 0, pending: 1, running: 0, waiting: 0, canceled: 0 },
+      }],
+      timedOut: false,
+    };
+    const parsed = JSON.parse(formatJsonOutput(result));
+    // ~2 minutes of age when read as UTC. A host-local misread shifts this by
+    // the host offset (e.g. +3h) and fails the tolerance below.
+    assert.ok(
+      Math.abs(parsed.runs[0].durationMs - 120_000) < 5_000,
+      `expected ~120000ms, got ${parsed.runs[0].durationMs}`,
+    );
+  });
+
+  it("formatHumanOutput interprets a naive stored instant as UTC, not host-local", async () => {
+    const { formatHumanOutput } = await import("../../../dist/cli/commands/wait.js");
+    const result = {
+      runs: [{
+        runId: "aaa-bbb-ccc",
+        runNumber: 1,
+        workflowId: "test-wf",
+        status: "running",
+        tokensSpent: 0,
+        createdAt: naiveUtc(Date.now() - 120_000),
+        updatedAt: "",
+        steps: { done: 0, failed: 0, pending: 1, running: 0, waiting: 0, canceled: 0 },
+      }],
+      timedOut: false,
+    };
+    const output = formatHumanOutput(result);
+    const match = output.match(/(\d+)m(\d+)s/);
+    assert.ok(match, `no duration in: ${output}`);
+    assert.ok(
+      Number(match![1]) <= 3,
+      `expected ~2 minutes of age, got ${match![0]} (host-local misread)`,
+    );
+  });
+
+  it("formatJsonOutput uses 0 and formatHumanOutput uses ? for missing/unparseable created_at", async () => {
+    const { formatJsonOutput, formatHumanOutput } = await import("../../../dist/cli/commands/wait.js");
+    for (const createdAt of ["", "not-a-timestamp"]) {
+      const runs = [{
+        runId: "aaa-bbb-ccc",
+        runNumber: 1,
+        workflowId: "test-wf",
+        status: "running",
+        tokensSpent: 0,
+        createdAt,
+        updatedAt: "",
+        steps: { done: 0, failed: 0, pending: 1, running: 0, waiting: 0, canceled: 0 },
+      }];
+      const parsed = JSON.parse(formatJsonOutput({ runs, timedOut: false }));
+      assert.equal(parsed.runs[0].durationMs, 0, `json fallback for ${JSON.stringify(createdAt)}`);
+      const human = formatHumanOutput({ runs, timedOut: false });
+      assert.match(human, /running \? /, `human fallback for ${JSON.stringify(createdAt)}: ${human}`);
+    }
+  });
+
+  // ── Unit: formatElapsed ────────────────────────────────────────────
   it("formatElapsed formats seconds only", async () => {
     const { formatElapsed } = await import("../../../dist/cli/commands/wait.js");
     assert.equal(formatElapsed(5_000), "0m05s");

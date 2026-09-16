@@ -25,6 +25,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { assertStatePathIsolation } from "../lib/test-guard.js";
+import { parseInstant } from "../lib/instant.js";
 import { recordLifecycleEvent } from "./daemonctl.js";
 
 /**
@@ -261,23 +262,24 @@ function readLifecycleLogEntries(opts?: DaemonctlPathOptions): Record<string, un
  * idempotent per stale marker — a death is proven and journaled once.
  */
 function markerAccountedFor(marker: HeartbeatMarker, opts?: DaemonctlPathOptions): boolean {
-  const startedAtMs = Date.parse(marker.startedAt);
-  if (Number.isNaN(startedAtMs)) return false;
+  const startedAt = parseInstant(marker.startedAt);
+  if (!startedAt) return false;
+  const startedAtMs = startedAt.getTime();
   for (const entry of readLifecycleLogEntries(opts)) {
     if (entry.action !== "daemon.shutdown" && entry.action !== "daemon.uncleanExit") continue;
     if (entry.targetPid !== marker.pid) continue;
-    const tsMs = typeof entry.ts === "string" ? Date.parse(entry.ts) : NaN;
-    if (Number.isNaN(tsMs)) continue;
-    if (tsMs >= startedAtMs) return true;
+    const entryTs = parseInstant(entry.ts);
+    if (!entryTs) continue;
+    if (entryTs.getTime() >= startedAtMs) return true;
   }
   return false;
 }
 
 /** Age of a heartbeat timestamp in ms at now, clamped to >= 0. */
 function heartbeatAgeMs(lastHeartbeatAt: string): number {
-  const parsed = Date.parse(lastHeartbeatAt);
-  if (Number.isNaN(parsed)) return 0;
-  return Math.max(0, Date.now() - parsed);
+  const parsed = parseInstant(lastHeartbeatAt);
+  if (!parsed) return 0;
+  return Math.max(0, Date.now() - parsed.getTime());
 }
 
 /**
@@ -323,7 +325,7 @@ export function detectUncleanExit(opts?: DaemonctlPathOptions): UncleanExitFacts
 /** Normalize one lifecycle.log entry into a DaemonDeath, or null. */
 function normalizeDeath(entry: Record<string, unknown>): DaemonDeath | null {
   const ts = typeof entry.ts === "string" ? entry.ts : null;
-  if (!ts || Number.isNaN(Date.parse(ts))) return null;
+  if (!ts || !parseInstant(ts)) return null;
 
   if (entry.action === "daemon.shutdown") {
     const pid = typeof entry.targetPid === "number" ? entry.targetPid : null;
@@ -363,7 +365,7 @@ export function getLastDaemonDeath(opts?: DaemonctlPathOptions): DaemonDeath | n
       if (death) deaths.push(death);
     }
     if (deaths.length === 0) return null;
-    deaths.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+    deaths.sort((a, b) => (parseInstant(b.ts)?.getTime() ?? 0) - (parseInstant(a.ts)?.getTime() ?? 0));
     return deaths[0];
   } catch {
     return null;
@@ -441,10 +443,10 @@ export function isUnseenDaemonDeath(death: DaemonDeath, opts?: DaemonctlPathOpti
     if (death.kind !== "unclean") return false;
     const seenTs = getLifecycleSeenTs(opts);
     if (seenTs === null) return true;
-    const deathMs = Date.parse(death.ts);
-    const seenMs = Date.parse(seenTs);
-    if (Number.isNaN(deathMs) || Number.isNaN(seenMs)) return true;
-    return deathMs > seenMs;
+    const deathMs = parseInstant(death.ts);
+    const seenMs = parseInstant(seenTs);
+    if (!deathMs || !seenMs) return true;
+    return deathMs.getTime() > seenMs.getTime();
   } catch {
     return true;
   }
