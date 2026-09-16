@@ -44,7 +44,11 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // without it existing DBs (user_version === 9) early-return from migrate()
 // and skip the rewrite, so their stored instants stay naive and keep being
 // misread.
-export const SCHEMA_VERSION = 10;
+// v11 (REROUTE-BUDGET): steps.target_moved_reroute_count. Bumping is REQUIRED
+// (WLST5.1 failure mode): without it existing DBs (user_version === 10)
+// early-return from migrate() and skip the guarded ALTER, so any SQL touching
+// the new column crashes with "no such column: target_moved_reroute_count".
+export const SCHEMA_VERSION = 11;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -331,6 +335,17 @@ function applySchema(db: DatabaseSync): void {
   // reroutes still count every retry_step traversal for max_reroutes.
   if (!stepColNames.has("terminal_reroute_count")) {
     db.exec("ALTER TABLE steps ADD COLUMN terminal_reroute_count INTEGER DEFAULT 0");
+  }
+
+  // ── REROUTE-BUDGET target_moved subset counter ──
+  // FAILURE_CLASS target_moved (stale-tip) reroutes do NOT consume the shared
+  // max_reroutes budget; they are budgeted separately against
+  // on_fail.max_target_moved_reroutes (default 16). This counter is the
+  // class-specific subset of reroute_count, exactly like terminal_reroute_count
+  // is for the terminal class. reroute_count stays the total reroute counter
+  // (reroute_count == count(step.rerouted)).
+  if (!stepColNames.has("target_moved_reroute_count")) {
+    db.exec("ALTER TABLE steps ADD COLUMN target_moved_reroute_count INTEGER DEFAULT 0");
   }
 
   // Ledger-gate concessions are distinct from general terminal reroutes so

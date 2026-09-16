@@ -109,6 +109,8 @@ function readEvents(eventsPath: string): Array<{
   event: string;
   runId?: string;
   checkoutRefresh?: string;
+  targetTipBefore?: string;
+  targetTipAfter?: string;
   parkedBranch?: string;
   parkedReason?: string;
   signingSkipped?: string;
@@ -313,7 +315,11 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, /multiple worktrees/i);
     assert.match(result.stdout, /invalid or ambiguous worktree metadata/i);
     assert.match(result.stdout, /operation in progress/i);
-    assert.match(result.stdout, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| not-applicable \| parked:branch>/);
+    assert.match(result.stdout, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| no-checkout-to-refresh \| checkout-not-at-tip \| parked:branch>/);
+    assert.match(result.stdout, /TARGET_TIP_BEFORE: <sha>/);
+    assert.match(result.stdout, /TARGET_TIP_AFTER: <sha>/);
+    assert.match(result.stdout, /no-checkout-to-refresh[\s\S]*No usable target checkout/i);
+    assert.match(result.stdout, /checkout-not-at-tip[\s\S]*is not at the target tip/i);
     assert.match(result.stdout, /SIGNING: <signed \| unsigned \| unsigned-matchlock>/);
     assert.doesNotMatch(result.stdout, /Operator remedy/i);
     assert.doesNotMatch(result.stdout, /git (?:checkout|reset|symbolic-ref|read-tree)/i);
@@ -534,16 +540,25 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, /^MERGED_COMMIT: [0-9a-f]{40}$/m);
     assert.match(result.stdout, /^MERGED_TREE: [0-9a-f]{40}$/m);
     assert.match(result.stdout, /^TARGET: refs\/heads\/scratch$/m);
-    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
+    assert.match(result.stdout, new RegExp(`^TARGET_TIP_BEFORE: ${initial}$`, "m"));
+    assert.match(result.stdout, /^TARGET_TIP_AFTER: [0-9a-f]{40}$/m);
+    const landedAfter = result.stdout.match(/^TARGET_TIP_AFTER: ([0-9a-f]{40})$/m)![1]!;
+    assert.equal(landedAfter, git(repo, ["rev-parse", "refs/heads/scratch"]));
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: no-checkout-to-refresh$/m);
     assert.equal(git(repo, ["symbolic-ref", "--short", "HEAD"]), branchBefore);
     assert.equal(git(repo, ["write-tree"]), indexTreeBefore);
     assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf-8"), baseBefore);
     assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
     assert.equal(git(repo, ["show", "refs/heads/scratch:feature.txt"]), "feature");
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+
+    // The emitted merge.landed event carries the same verified tips.
+    const [landedEvent] = readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"));
+    assert.equal(landedEvent?.targetTipBefore, initial);
+    assert.equal(landedEvent?.targetTipAfter, landedAfter);
   });
 
-  it("reports an already-landed unowned branch with not-applicable and no target mutation", () => {
+  it("reports an already-landed unowned branch with no-checkout-to-refresh and no target mutation", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
     git(repo, ["merge", "--ff-only", "feature"]);
@@ -561,7 +576,9 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, new RegExp(`^MERGED_COMMIT: ${targetBefore}$`, "m"));
     assert.match(result.stdout, new RegExp(`^MERGED_TREE: ${treeBefore}$`, "m"));
     assert.match(result.stdout, /^TARGET: refs\/heads\/main$/m);
-    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
+    assert.match(result.stdout, new RegExp(`^TARGET_TIP_BEFORE: ${targetBefore}$`, "m"));
+    assert.match(result.stdout, new RegExp(`^TARGET_TIP_AFTER: ${targetBefore}$`, "m"));
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: no-checkout-to-refresh$/m);
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), targetBefore);
     assert.equal(git(repo, ["rev-list", "--count", "refs/heads/main"]), commitCountBefore);
 
@@ -575,16 +592,20 @@ describe("tamandua merge-branch CLI", () => {
         mergedCommit?: string;
         mergedTree?: string;
         checkoutRefresh?: string;
+        targetTipBefore?: string;
+        targetTipAfter?: string;
       });
     assert.equal(events.length, 1);
     assert.equal(events[0]?.event, "merge.landed");
     assert.equal(events[0]?.noop, true);
     assert.equal(events[0]?.mergedCommit, targetBefore);
     assert.equal(events[0]?.mergedTree, treeBefore);
-    assert.equal(events[0]?.checkoutRefresh, "not-applicable");
+    assert.equal(events[0]?.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(events[0]?.targetTipBefore, targetBefore);
+    assert.equal(events[0]?.targetTipAfter, targetBefore);
   });
 
-  it("reports not-applicable for an unowned no-op without altering checkout state", () => {
+  it("reports no-checkout-to-refresh for an unowned no-op without altering checkout state", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
     const featureTip = git(repo, ["rev-parse", "refs/heads/feature"]);
@@ -595,8 +616,8 @@ describe("tamandua merge-branch CLI", () => {
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^NOOP: true$/m);
-    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
-    assert.equal(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"))[0]?.checkoutRefresh, "not-applicable");
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: no-checkout-to-refresh$/m);
+    assert.equal(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"))[0]?.checkoutRefresh, "no-checkout-to-refresh");
     assert.deepEqual(captureCheckoutState(repo), before);
   });
 
@@ -818,7 +839,7 @@ describe("tamandua merge-branch CLI", () => {
     fs.unlinkSync(lockPath);
   });
 
-  it("reports not-applicable CHECKOUT_REFRESH for a bare origin", () => {
+  it("reports no-checkout-to-refresh CHECKOUT_REFRESH for a bare origin", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
     const cloneRoot = tamanduaTempDir("tamandua-merge-branch-cli-bare-");
@@ -832,7 +853,7 @@ describe("tamandua merge-branch CLI", () => {
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^STATUS: landed$/m);
-    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: no-checkout-to-refresh$/m);
     assert.notEqual(git(bareRepo, ["rev-parse", "refs/heads/main"]), initial);
   });
 

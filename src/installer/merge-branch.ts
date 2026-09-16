@@ -57,6 +57,16 @@ export interface MergeBranchEvent extends TamanduaEvent {
   actualTip?: string;
   mergedTree?: string;
   mergedCommit?: string;
+  /**
+   * NPF-1: the verified CAS tip (the caller's --expect-tip) that this landed
+   * result landed on top of. Present on every merge.landed event.
+   */
+  targetTipBefore?: string;
+  /**
+   * NPF-1: the live refs/heads/<target> tip re-read immediately before the
+   * landed result was reported. Present on every merge.landed event.
+   */
+  targetTipAfter?: string;
   noop?: boolean;
   parkedBranch?: string;
   parkedReason?: string;
@@ -75,6 +85,10 @@ export type PlumbingMergeResult =
       mergedCommit: string;
       mergedTree: string;
       target: string;
+      /** NPF-1: the verified --expect-tip this landing was based on. */
+      targetTipBefore: string;
+      /** NPF-1: the live refs/heads/<target> tip re-read before reporting. */
+      targetTipAfter: string;
       noop: boolean;
       checkoutRefresh: CheckoutRefreshOutcome;
       parkedBranch?: string;
@@ -478,19 +492,53 @@ export function runPlumbingMerge(
   }
   const targetTree = targetTreeResult.stdout;
 
+  /**
+   * NPF-1: re-read the live target ref immediately before reporting a landed
+   * result so the report states the tip that actually existed at report time
+   * (and never a label that was not checked).
+   */
+  const readLiveTargetTip = (): GitResult => git(params.origin, ["rev-parse", "--verify", target]);
+
   const noOpLanding = (): PlumbingMergeResult => {
-    let checkoutRefresh: CheckoutRefreshOutcome = "not-applicable";
-    if (targetWorktree.owner?.head === actualTip) {
-      const ownerHead = git(targetWorktree.owner.path, ["rev-parse", "--verify", "HEAD^{commit}"]);
-      if (ownerHead.status === 0 && ownerHead.stdout === actualTip) {
+    const targetTipBefore = params.expectTip;
+    const liveTip = readLiveTargetTip();
+    if (liveTip.status !== 0 || !liveTip.stdout) {
+      return {
+        status: "operational_error",
+        exitCode: MERGE_BRANCH_EXIT_CODES.operationalError,
+        detail: commandError(["rev-parse", "--verify", target], liveTip),
+      };
+    }
+    const targetTipAfter = liveTip.stdout;
+
+    let checkoutRefresh: CheckoutRefreshOutcome;
+    const owner = targetWorktree.owner;
+    if (!owner) {
+      // No owner, multiple owners, or unusable worktree metadata: there is no
+      // single checkout whose coherence we can verify.
+      checkoutRefresh = "no-checkout-to-refresh";
+    } else {
+      // Always inspect the owner's live HEAD. The worktree-list metadata HEAD
+      // can be stale, so it is not a substitute for a live read (NPF-1).
+      const ownerHead = git(owner.path, ["rev-parse", "--verify", "HEAD^{commit}"]);
+      if (ownerHead.status !== 0 || !ownerHead.stdout) {
+        // An owner exists but we could not read a live HEAD: report the lack
+        // of a verifiable checkout rather than an unverified coherence claim.
+        checkoutRefresh = "no-checkout-to-refresh";
+      } else if (ownerHead.stdout === targetTipAfter) {
         checkoutRefresh = "already-coherent";
+      } else {
+        checkoutRefresh = "checkout-not-at-tip";
       }
     }
+
     emit({
       ...eventBase,
       event: "merge.landed",
       mergedTree: targetTree,
       mergedCommit: actualTip,
+      targetTipBefore,
+      targetTipAfter,
       noop: true,
       checkoutRefresh,
     });
@@ -500,6 +548,8 @@ export function runPlumbingMerge(
       mergedCommit: actualTip,
       mergedTree: targetTree,
       target,
+      targetTipBefore,
+      targetTipAfter,
       noop: true,
       checkoutRefresh,
       identity,
@@ -749,12 +799,25 @@ export function runPlumbingMerge(
       checkoutRefresh = `parked:${backupName}`;
     }
 
+    const liveTipResult = readLiveTargetTip();
+    if (liveTipResult.status !== 0 || !liveTipResult.stdout) {
+      return {
+        status: "operational_error",
+        exitCode: MERGE_BRANCH_EXIT_CODES.operationalError,
+        detail: commandError(["rev-parse", "--verify", target], liveTipResult),
+      };
+    }
+    const targetTipAfter = liveTipResult.stdout;
+    const targetTipBefore = params.expectTip;
+
     const result: PlumbingMergeResult = {
       status: "landed",
       exitCode: MERGE_BRANCH_EXIT_CODES.landed,
       mergedCommit,
       mergedTree,
       target,
+      targetTipBefore,
+      targetTipAfter,
       noop: false,
       checkoutRefresh,
       identity,
@@ -767,6 +830,8 @@ export function runPlumbingMerge(
       event: "merge.landed",
       mergedTree,
       mergedCommit,
+      targetTipBefore,
+      targetTipAfter,
       noop: false,
       checkoutRefresh,
       ...signingSkippedFields,
@@ -805,14 +870,27 @@ export function runPlumbingMerge(
     };
   }
 
+  const liveTipResult = readLiveTargetTip();
+  if (liveTipResult.status !== 0 || !liveTipResult.stdout) {
+    return {
+      status: "operational_error",
+      exitCode: MERGE_BRANCH_EXIT_CODES.operationalError,
+      detail: commandError(["rev-parse", "--verify", target], liveTipResult),
+    };
+  }
+  const targetTipBefore = params.expectTip;
+  const targetTipAfter = liveTipResult.stdout;
+
   const result: PlumbingMergeResult = {
     status: "landed",
     exitCode: MERGE_BRANCH_EXIT_CODES.landed,
     mergedCommit,
     mergedTree,
     target,
+    targetTipBefore,
+    targetTipAfter,
     noop: false,
-    checkoutRefresh: "not-applicable",
+    checkoutRefresh: "no-checkout-to-refresh",
     identity,
     signing: signingOutcome,
     ...signingSkippedFields,
@@ -822,6 +900,8 @@ export function runPlumbingMerge(
     event: "merge.landed",
     mergedTree,
     mergedCommit,
+    targetTipBefore,
+    targetTipAfter,
     noop: false,
     checkoutRefresh: result.checkoutRefresh,
     ...signingSkippedFields,

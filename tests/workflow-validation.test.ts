@@ -2014,7 +2014,7 @@ describe("US-003: Static bundled workflow compliance tests", () => {
   // The loader already rejects unknown keys at parse time, but this static
   // test provides a build-failing assertion over every bundled workflow.
   it("no bundled workflow has unknown on_fail keys", async () => {
-    const validKeys = new Set(["retry_step", "max_reroutes", "retry_on"]);
+    const validKeys = new Set(["retry_step", "max_reroutes", "max_target_moved_reroutes", "retry_on"]);
     for (const id of workflowIds) {
       const spec = await loadWorkflowSpec(wfDir(id));
       for (const step of spec.steps) {
@@ -2022,7 +2022,7 @@ describe("US-003: Static bundled workflow compliance tests", () => {
         for (const key of Object.keys(step.on_fail as Record<string, unknown>)) {
           assert.ok(
             validKeys.has(key),
-            `${id}: step "${step.id}" on_fail has unknown key "${key}". Valid: retry_step, max_reroutes, retry_on`,
+            `${id}: step "${step.id}" on_fail has unknown key "${key}". Valid: retry_step, max_reroutes, max_target_moved_reroutes, retry_on`,
           );
         }
       }

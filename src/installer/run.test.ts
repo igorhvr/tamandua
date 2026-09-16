@@ -1307,7 +1307,7 @@ describe("runWorkflow", () => {
       const skippedEvents = events.filter((e) => e.event === "run.base_capture_skipped");
       const failedEvents = events.filter((e) => e.event === "run.base_capture_failed");
 
-      // A non-git directory is not-applicable, not a failure: one skipped
+      // A non-git directory is a skip, not a failure: one skipped
       // event and zero error-class capture events.
       assert.equal(failedEvents.length, 0,
         `Expected 0 base_capture_failed events for a non-git dir, got ${failedEvents.length}`);
@@ -1413,7 +1413,7 @@ describe("runWorkflow", () => {
       writeMinimalWorkflow(tempHome, workflowId, "direct");
       // Explicit fixture dir: a plain directory holding ordinary files and no
       // .git entry anywhere in its ancestry (tamanduaTempDir lives under the
-      // OS temp root), proving base capture is not-applicable rather than
+      // OS temp root), proving base capture is reported as a skip rather than
       // failing twice.
       const fixtureDir = tamanduaTempDir("tamandua-bsha-fixture-");
       fs.writeFileSync(path.join(fixtureDir, "notes.txt"), "not a repository\n", "utf-8");

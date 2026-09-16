@@ -557,12 +557,16 @@ git rev-parse --verify {{branch}} || exit 1
 ```
 
 **RETR-rugpull interaction:** When `finalize_merge` declares `on_fail.retry_step`
-for rebase-loopback, reroute cycles consume the reroute budget first. If the budget
+for rebase-loopback, reroute cycles consume the reroute budget first; stale-tip
+(`FAILURE_CLASS: target_moved`) refusals consume their own
+`max_target_moved_reroutes` budget instead, so landing contention never exhausts
+the shared `max_reroutes` rebase loopback budget. If a budget
 exhausts, the run still fails at `finalize_merge`, at which point rugpull detection
 (`detectRugpull` in `src/installer/rugpull.ts`) still sees a failed `finalize_merge`
 + moved base branch tip and owns true merge-conflict recovery. Reroute cycles handle
 rebase-test-merge convergence; rugpull is the last-resort recovery for genuine merge
-conflicts. Both mechanisms coexist without conflict.
+conflicts. Both mechanisms coexist without conflict; the rugpull replacement-run
+logic is unchanged.
 
 **Linter enforcement:** The contract lint test
 (`tests/workflow-contract-lint.test.ts`) verifies that every `STATUS` variant offered
@@ -621,17 +625,18 @@ When a step exhausts its retries, Tamandua checks `on_fail.retry_step`. If decla
 
 When a reroute fires:
 1. The **producer** (the step named by `retry_step`) is re-pended with status `pending` — its `retry_count` is _unchanged_. A bounded excerpt of the consumer's failure reason is written into the producer's output as `retry_feedback`, surfaced to the agent on its next run.
-2. The **consumer** (the failing step) is reset to `waiting` with `retry_count = 0` — it earns a fresh chance after the producer redo. A per-step `reroute_count` counter (separate from `retry_count`) increments on each reroute.
+2. The **consumer** (the failing step) is reset to `waiting` with `retry_count = 0` — it earns a fresh chance after the producer redo. A per-step `reroute_count` counter (separate from `retry_count`) increments on each reroute; a `target_moved` reroute also increments its own class-specific `target_moved_reroute_count` (see below).
 3. Intermediate `done` steps between producer and consumer are left untouched. The existing pipeline advancement logic (`advancePipeline`) naturally re-pends the consumer when the producer completes again.
 
 **Constraints:**
 - `retry_step` MUST name an upstream step (lower `step_index`) in the same workflow. A downstream or unknown target is treated as a workflow spec error and fails the run with a clear message.
-- `max_reroutes` applies to the consumer's `reroute_count`. When the consumer reaches this budget, the system falls through to normal failure behavior (run fails). Default is `2`.
+- `max_reroutes` applies to the consumer's shared reroute budget (`reroute_count - target_moved_reroute_count`). When the consumer reaches this budget, the system falls through to normal failure behavior (run fails). Default is `2`. Stale-tip (`target_moved`) reroutes are excluded from this budget — see `max_target_moved_reroutes` below.
+- `max_target_moved_reroutes` bounds a separate counter, `target_moved_reroute_count`. A `FAILURE_CLASS: target_moved` reroute (a landing refusal because the target tip moved between verification and landing) does **not** consume `max_reroutes`; it increments `target_moved_reroute_count` and is bounded by `on_fail.max_target_moved_reroutes` (default `16`). When the cap is reached the run fails with the `target_moved_exhausted` class. This keeps concurrent landing contention from terminally exhausting an otherwise healthy merge run.
 - The reroute budget is **separate** from `retry_count`: the producer's `retry_count` never changes across reroutes; the consumer's `retry_count` resets to 0 on each reroute.
 - Rerouting does **NOT** apply to `verify_each` verify steps (those referenced as `verify_step` in a loop's `loop_config`).
-- `finalize_merge` steps **MAY** be wired with `retry_step` for rebase-loopback — reroute cycles consume the reroute budget first; if the budget exhausts and the run still fails at `finalize_merge`, rugpull detection (`detectRugpull` in `src/installer/rugpull.ts`) still owns true merge-conflict recovery. See [Rebase-Loopback + Tree-Hash Attestation Idiom](#rebase-loopback--tree-hash-attestation-idiom) for the full pattern.
+- `finalize_merge` steps **MAY** be wired with `retry_step` for rebase-loopback — reroute cycles consume the reroute budget first; stale-tip (`target_moved`) refusals consume their own `max_target_moved_reroutes` budget. If a budget exhausts and the run still fails at `finalize_merge`, rugpull detection (`detectRugpull` in `src/installer/rugpull.ts`) still owns true merge-conflict recovery. See [Rebase-Loopback + Tree-Hash Attestation Idiom](#rebase-loopback--tree-hash-attestation-idiom) for the full pattern.
 
-**Observability:** Every reroute emits a `step.rerouted` event. The event carries the rerouted consumer step's id (`stepId`), a bounded reason for the reroute, and a detail string of the form `Rerouted to <producer> (<rerouteCount>/<budget>). Consumer failure: <reason>`. It also flags the reroute's failure class: `rerouteMode` is the classification (`'legacy'` for ordinary motor/expects/retry/orphan feedback with no `FAILURE_CLASS` header, `'declared_retryable'` for a declared retryable class, `'terminal'` for FAILURE_CLASS terminal decisions and ledger-gate terminal refusals) and `terminal` is `true` exactly when `rerouteMode === 'terminal'`. The two per-step counters reconcile against this stream: `reroute_count` counts **every** reroute (`reroute_count == count(step.rerouted)` while every reroute charges the shared budget), while `terminal_reroute_count` is a **gate control** that counts only terminal-CLASS reroutes and equals `count(step.rerouted where terminal === true)`. Because ordinary (transient/`legacy`) reroutes never increment `terminal_reroute_count`, they never consume the consumer's one-shot terminal allowance — a terminal-class refusal can still reroute once (even across an exhausted shared budget) before the run falls through to failure. Budget exhaustion emits `step.reroute_budget_exhausted`. Both events are logged with the same structured metadata.
+**Observability:** Every reroute emits a `step.rerouted` event. The event carries the rerouted consumer step's id (`stepId`), a bounded reason for the reroute, and a detail string of the form `Rerouted to <producer> (<rerouteCount>/<budget>). Consumer failure: <reason>`. It also flags the reroute's failure class: `rerouteMode` is the classification (`'legacy'` for ordinary motor/expects/retry/orphan feedback with no `FAILURE_CLASS` header, `'declared_retryable'` for a declared retryable class, `'terminal'` for FAILURE_CLASS terminal decisions and ledger-gate terminal refusals) and `terminal` is `true` exactly when `rerouteMode === 'terminal'`; `failureClass` is the parsed class (e.g. `target_moved`, `conflicts`), and the event also carries `targetMovedRerouteCount`/`targetMovedBudget`. The per-step counters reconcile against this stream: `reroute_count` counts **every** reroute (`reroute_count == count(step.rerouted)`), `target_moved_reroute_count` is a **class-specific subset** counter incremented only for `target_moved` reroutes (`target_moved_reroute_count == count(step.rerouted where failureClass === 'target_moved')`), and shared-budget consumption is `reroute_count - target_moved_reroute_count`. `terminal_reroute_count` is a **gate control** that counts only terminal-CLASS reroutes and equals `count(step.rerouted where terminal === true)`. Because ordinary (transient/`legacy`) reroutes never increment `terminal_reroute_count`, they never consume the consumer's one-shot terminal allowance — a terminal-class refusal can still reroute once (even across an exhausted shared budget) before the run falls through to failure. `target_moved` reroutes never consume `max_reroutes`; they are bounded instead by `on_fail.max_target_moved_reroutes` (default `16`). Budget exhaustion emits `step.reroute_budget_exhausted`, or `step.target_moved_reroute_exhausted` for the target-moved budget, in which case the step fails with `FAILURE_CLASS: target_moved_exhausted` as the first line of its output. These events are logged with the same structured metadata.
 
 **Worker death / respawn:** When watchdog or dead-worker recovery (`recoverOrphanedStepsForAgent` in `src/installer/step-ops.ts`) re-dispatches a claimed step, the event stream reads `step.running` → `step.worker_lost` (or `step.timeout` / `step.ceiling_expiry`) → `step.respawned` → `step.running`. The `step.respawned` event carries the prior worker's identity (`priorPid` = recovered `claim_pid`, `priorRound` = recovered `claim_job_id`), the recovery class as `reason` (`worker_lost` | `timeout` | `ceiling_expiry` | `no_work_release`), and the step's `retry` count after re-dispatch — so operators can distinguish a respawn from an anomalous duplicate `step.running`.
 
@@ -675,7 +680,8 @@ In this example: if `setup` exhausts its 4 retries, it reroutes to `plan` (up to
 | `max_retries` (step-level) | Individual step retries | 4 | Times the step retries _itself_ |
 | `on_fail.max_retries` | — | — | **Not read** by the runtime — do not use |
 | `on_fail.retry_step` | Cross-step reroute trigger | none | Upstream step to reroute to on retry exhaustion |
-| `on_fail.max_reroutes` | Reroute budget on the consumer | 2 | How many times the consumer can trigger a reroute |
+| `on_fail.max_reroutes` | Shared reroute budget on the consumer | 2 | How many times the consumer can trigger a reroute for classes other than `target_moved` |
+| `on_fail.max_target_moved_reroutes` | Stale-tip (`target_moved`) reroute budget on the consumer | 16 | Cap for `target_moved` reroutes; they never consume `max_reroutes` |
 
 ## Loops
 

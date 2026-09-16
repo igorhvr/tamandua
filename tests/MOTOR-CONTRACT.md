@@ -449,16 +449,22 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
   verdict + REBASED/CONFLICT_NOTES as `retry_feedback`).  Only after
   `max_retries` exhaustion does the guard fall through to C19 RETR routing:
   the `on_fail.retry_step` target is re-pended, consuming the per-step
-  `max_reroutes` budget.  If the reroute budget also exhausts after
-  repeated rebase→test→merge cycles fail to converge, the run falls
-  through to normal merge-step failure.  At that point, `detectRugpull`
+  `max_reroutes` budget for ordinary classes.  REROUTE-BUDGET (NPF-3): a
+  `FAILURE_CLASS: target_moved` stale-tip refusal instead charges its own
+  `target_moved_reroute_count` budget (`on_fail.max_target_moved_reroutes`,
+  default 16) and never consumes `max_reroutes`; the rugpull replacement-run
+  logic is unchanged by that split.  If the relevant reroute budget also
+  exhausts after repeated rebase→test→merge cycles fail to converge, the run
+  falls through to normal merge-step failure.  At that point, `detectRugpull`
   (`src/installer/rugpull.ts`) still owns true merge-conflict recovery — it
   sees a failed `finalize_merge` with a moved base-branch tip and triggers
   relaunch.  The three mechanisms coexist without conflict: C22 retry
   verdict (local `max_retries`), C19 RETR `retry_step` (per-step
-  `max_reroutes`), and C8-rugpull (last-resort, genuine merge conflicts).
-  Rugpull is never bypassed — a merge failure that exhausts both budgets
-  ends the same way any other merge failure does.
+  `max_reroutes` for real rejections and `max_target_moved_reroutes` for
+  stale-tip refusals), and C8-rugpull (last-resort, genuine merge
+  conflicts).  Rugpull replacement-run logic is unchanged and never
+  bypassed — a merge failure that exhausts its reroute budget ends the same
+  way any other merge failure does.
 - **C19 (RETR — declarative cross-step retry routing)** When a step declares
   `on_fail.retry_step` and exhausts its local retries, the run does NOT
   immediately fail. Instead the run reroutes to the named upstream producer
@@ -469,7 +475,8 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
   and `reroute_count` incremented; intermediate `done` steps between
   producer and consumer are untouched — `advancePipeline` naturally
   re-pends the consumer after the producer completes. When the consumer's
-  `reroute_count` reaches `max_reroutes`, the budget is exhausted and the
+  shared reroute budget (`reroute_count - target_moved_reroute_count`)
+  reaches `max_reroutes`, the budget is exhausted and the
   run falls through to normal failure semantics (including rugpull detection
   on merge-step failures). The reroute budget is separate from `retry_count`:
   the producer's `retry_count` stays unchanged; the consumer's `retry_count`
@@ -481,9 +488,34 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
   reroutes (expects-validation, retry-verdict, orphan-recovery) increment
   `reroute_count` but not `terminal_reroute_count`, and each `step.rerouted`
   event flags `terminal`/`rerouteMode` so the two counters reconcile against
-  the event stream (`reroute_count == count(step.rerouted)` while every
-  reroute charges the shared budget; `terminal_reroute_count ==
-  count(step.rerouted where terminal === true)` in every corridor). RETR does
+  the event stream (`reroute_count == count(step.rerouted)`; `terminal_reroute_count ==
+  count(step.rerouted where terminal === true)` in every corridor).
+
+  **REROUTE-BUDGET (NPF-3) — the `target_moved` class has its own budget.**
+  `FAILURE_CLASS: target_moved` reroutes (stale-tip landing refusals on
+  `finalize_merge`) never consume `max_reroutes`. `reroute_count` remains the
+  TOTAL reroute counter (`reroute_count == count(step.rerouted)`) and every
+  reroute still increments it, but `target_moved_reroute_count` is a
+  class-specific SUBSET counter incremented only for `target_moved`
+  (`target_moved_reroute_count == count(step.rerouted where failureClass ===
+  'target_moved')`). Shared-budget consumption is therefore
+  `reroute_count - target_moved_reroute_count` (clamped at 0), compared
+  against `on_fail.max_reroutes` (default 2) for every non-`target_moved`
+  class. A `target_moved` reroute skips that comparison entirely and instead
+  compares `target_moved_reroute_count` against
+  `on_fail.max_target_moved_reroutes` (default 16) — so eight-way landing
+  contention can never terminally exhaust an otherwise healthy merge run.
+  When the target-moved budget is reached, the run fails with the distinct
+  `FAILURE_CLASS: target_moved_exhausted` reason (written as the first line of
+  the step output) and emits `step.target_moved_reroute_exhausted` (carrying
+  `failureClass`, `targetMovedRerouteCount`, and `targetMovedBudget`) — NOT
+  `step.reroute_budget_exhausted`. Real rejections (`conflicts` and every
+  other class) keep `max_reroutes` untouched. Every `step.rerouted` event
+  carries `failureClass` plus `targetMovedRerouteCount`/`targetMovedBudget`
+  so the counter and its effective cap are auditable. Rugpull
+  replacement-run logic is unchanged.
+
+  RETR does
   NOT fire for loop-step
   story-level exhaustion (`verify_each` territory) or for expects-accepted
   `STATUS: retry` verdicts (C22 handles verdict retries first).  For `finalize_merge`,

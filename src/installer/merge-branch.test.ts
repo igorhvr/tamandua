@@ -192,7 +192,8 @@ describe("runPlumbingMerge", () => {
     const outcomes: CheckoutRefreshOutcome[] = [
       "refreshed",
       "already-coherent",
-      "not-applicable",
+      "no-checkout-to-refresh",
+      "checkout-not-at-tip",
       "parked:main-tamandua-parked-20260720T152300Z-db40fbc2",
     ];
     const event: MergeBranchEvent = {
@@ -203,11 +204,14 @@ describe("runPlumbingMerge", () => {
       branch: "feature",
       target: "refs/heads/main",
       expectedTip: "1".repeat(40),
+      targetTipBefore: "1".repeat(40),
+      targetTipAfter: "2".repeat(40),
       parkedBranch: "main-tamandua-parked-20260720T152300Z-db40fbc2",
       parkedReason: "local-changes",
     };
-    assert.equal(outcomes[3]?.startsWith("parked:"), true);
+    assert.equal(outcomes[4]?.startsWith("parked:"), true);
     assert.equal(event.parkedReason, "local-changes");
+    assert.equal(event.targetTipAfter, "2".repeat(40));
   });
 
   it("returns an already-coherent ancestor no-op for a single attached owner without checkout mutation", () => {
@@ -235,12 +239,16 @@ describe("runPlumbingMerge", () => {
     if (result.status !== "landed") return;
     assert.equal(result.noop, true);
     assert.equal(result.checkoutRefresh, "already-coherent");
+    assert.equal(result.targetTipBefore, targetTip);
+    assert.equal(result.targetTipAfter, targetTip);
     assert.deepEqual(captureCheckoutState(repo), checkoutBefore);
     assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
     assert.equal(events[0]?.checkoutRefresh, "already-coherent");
+    assert.equal(events[0]?.targetTipBefore, targetTip);
+    assert.equal(events[0]?.targetTipAfter, targetTip);
   });
 
-  it("reports not-applicable when a no-op owner's live HEAD no longer matches metadata", () => {
+  it("reports checkout-not-at-tip when a no-op owner's live HEAD differs from the target tip", () => {
     const { repo } = createRepo();
     const featureTip = createFeature(repo);
     git(repo, ["merge", "--ff-only", "feature"]);
@@ -263,19 +271,23 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.status, "landed");
     if (result.status !== "landed") return;
     assert.equal(result.noop, true);
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "checkout-not-at-tip");
+    assert.equal(result.targetTipBefore, featureTip);
+    assert.equal(result.targetTipAfter, featureTip);
     assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
   });
 
-  it("reports not-applicable when no-op ownership metadata has a stale HEAD", () => {
+  it("reports already-coherent when no-op ownership metadata HEAD is stale but the live HEAD matches the target tip", () => {
     const { repo } = createRepo();
     const featureTip = createFeature(repo);
     git(repo, ["merge", "--ff-only", "feature"]);
+    const commands: string[][] = [];
 
     const result = runPlumbingMerge(
       { origin: repo, branch: "feature", into: "main", expectTip: featureTip, message: "stale metadata no-op" },
       {
         runGit: (origin, args) => {
+          commands.push([...args]);
           const actual = rawGit(origin, args);
           if (args[0] === "worktree" && args[1] === "list") {
             return { ...actual, stdout: actual.stdout.replace(featureTip, "e".repeat(40)) };
@@ -289,10 +301,18 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.status, "landed");
     if (result.status !== "landed") return;
     assert.equal(result.noop, true);
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "already-coherent");
+    assert.equal(result.targetTipBefore, featureTip);
+    assert.equal(result.targetTipAfter, featureTip);
+    // The live HEAD inspection must have happened despite the stale metadata.
+    assert.ok(
+      commands.some((args) => args.join(" ") === "rev-parse --verify HEAD^{commit}"),
+      "no-op must always inspect the owner's live HEAD",
+    );
+    assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
   });
 
-  it("allows a no-op with unusable ownership metadata and reports not-applicable", () => {
+  it("allows a no-op with unusable ownership metadata and reports no-checkout-to-refresh", () => {
     const { repo } = createRepo();
     const featureTip = createFeature(repo);
     git(repo, ["merge", "--ff-only", "feature"]);
@@ -314,7 +334,9 @@ describe("runPlumbingMerge", () => {
 
     assert.equal(result.status, "landed");
     if (result.status !== "landed") return;
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(result.targetTipBefore, featureTip);
+    assert.equal(result.targetTipAfter, featureTip);
     assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
   });
 
@@ -342,6 +364,8 @@ describe("runPlumbingMerge", () => {
     if (result.status !== "landed") return;
     assert.equal(result.noop, true);
     assert.equal(result.checkoutRefresh, "already-coherent");
+    assert.equal(result.targetTipBefore, equivalentTarget);
+    assert.equal(result.targetTipAfter, equivalentTarget);
     assert.deepEqual(captureCheckoutState(repo), before);
     assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
   });
@@ -926,11 +950,13 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.exitCode, 0);
     if (result.status !== "landed") return;
     assert.equal(result.noop, false);
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(result.targetTipBefore, initial);
+    assert.equal(result.targetTipAfter, result.mergedCommit);
     assert.equal(git(repo, ["rev-parse", "refs/heads/release"]), result.mergedCommit);
     assert.equal(git(detachedWorktree, ["rev-parse", "HEAD"]), initial);
     assert.deepEqual(events.map(({ event, checkoutRefresh, noop }) => ({ event, checkoutRefresh, noop })), [
-      { event: "merge.landed", checkoutRefresh: "not-applicable", noop: false },
+      { event: "merge.landed", checkoutRefresh: "no-checkout-to-refresh", noop: false },
     ]);
   });
 
@@ -963,7 +989,9 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.noop, true);
     assert.equal(result.mergedCommit, targetTip);
     assert.equal(result.mergedTree, targetTree);
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(result.targetTipBefore, targetTip);
+    assert.equal(result.targetTipAfter, targetTip);
     assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), targetTip);
     assert.deepEqual(captureCheckoutState(repo), checkoutBefore);
     assert.equal(commands.some((args) => args[0] === "commit-tree"), false);
@@ -979,7 +1007,9 @@ describe("runPlumbingMerge", () => {
         expectedTip: targetTip,
         mergedTree: targetTree,
         mergedCommit: targetTip,
-        checkoutRefresh: "not-applicable",
+        targetTipBefore: targetTip,
+        targetTipAfter: targetTip,
+        checkoutRefresh: "no-checkout-to-refresh",
         noop: true,
       },
     ]);
@@ -1013,7 +1043,9 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.noop, true);
     assert.equal(result.mergedCommit, equivalentTarget);
     assert.equal(result.mergedTree, targetTree);
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(result.targetTipBefore, equivalentTarget);
+    assert.equal(result.targetTipAfter, equivalentTarget);
     assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), equivalentTarget);
     assert.deepEqual(captureCheckoutState(repo), checkoutBefore);
     assert.equal(commands.some((args) => args[0] === "commit-tree"), false);
@@ -1023,10 +1055,11 @@ describe("runPlumbingMerge", () => {
     assert.equal(events[0]?.noop, true);
     assert.equal(events[0]?.mergedCommit, equivalentTarget);
     assert.equal(events[0]?.mergedTree, targetTree);
-    assert.equal(events[0]?.checkoutRefresh, "not-applicable");
+    assert.equal(events[0]?.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(events[0]?.targetTipAfter, equivalentTarget);
   });
 
-  it("reports not-applicable for an unowned no-op target without mutating checkout bytes", () => {
+  it("reports no-checkout-to-refresh for an unowned no-op target without mutating checkout bytes", () => {
     const { repo } = createRepo();
     const featureTip = createFeature(repo);
     git(repo, ["branch", "staging", featureTip]);
@@ -1049,13 +1082,15 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.status, "landed");
     if (result.status !== "landed") return;
     assert.equal(result.noop, true);
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(result.targetTipBefore, featureTip);
+    assert.equal(result.targetTipAfter, featureTip);
     assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), featureTip);
     assert.deepEqual(captureCheckoutState(repo), checkoutBefore);
     assert.equal(commands.some((args) => args[0] === "read-tree"), false);
     assert.equal(commands.some((args) => args[0] === "update-ref"), false);
     assert.deepEqual(events.map(({ event, noop, checkoutRefresh }) => ({ event, noop, checkoutRefresh })), [
-      { event: "merge.landed", noop: true, checkoutRefresh: "not-applicable" },
+      { event: "merge.landed", noop: true, checkoutRefresh: "no-checkout-to-refresh" },
     ]);
   });
 
@@ -1090,8 +1125,10 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.status, "landed");
     if (result.status !== "landed") return;
     assert.equal(result.noop, false);
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
     assert.notEqual(result.mergedCommit, targetTip);
+    assert.equal(result.targetTipBefore, targetTip);
+    assert.equal(result.targetTipAfter, result.mergedCommit);
     assert.equal(git(repo, ["rev-parse", `${result.mergedCommit}^`]), targetTip);
     assert.equal(git(repo, ["show", `${result.mergedCommit}:shared.txt`]), "shared");
     assert.equal(git(repo, ["show", `${result.mergedCommit}:remaining.txt`]), "remaining");
@@ -1100,7 +1137,9 @@ describe("runPlumbingMerge", () => {
     assert.equal(events.length, 1);
     assert.equal(events[0]?.event, "merge.landed");
     assert.equal(events[0]?.noop, false);
-    assert.equal(events[0]?.checkoutRefresh, "not-applicable");
+    assert.equal(events[0]?.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(events[0]?.targetTipBefore, targetTip);
+    assert.equal(events[0]?.targetTipAfter, result.mergedCommit);
   });
 
   it("STCK leaves the checkout untouched when landing into a non-checked-out branch", () => {
@@ -1117,10 +1156,14 @@ describe("runPlumbingMerge", () => {
 
     assert.equal(result.status, "landed");
     if (result.status !== "landed") return;
-    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(result.targetTipBefore, initial);
+    assert.equal(result.targetTipAfter, result.mergedCommit);
     assert.deepEqual(captureCheckoutState(repo), checkoutBefore);
     assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
-    assert.equal(events[0]?.checkoutRefresh, "not-applicable");
+    assert.equal(events[0]?.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(events[0]?.targetTipBefore, initial);
+    assert.equal(events[0]?.targetTipAfter, result.mergedCommit);
   });
 
   it("fails closed on duplicate target owners before merge object creation", () => {
@@ -1183,7 +1226,7 @@ describe("runPlumbingMerge", () => {
     }
   });
 
-  it("STCK reports checkout refresh as not applicable for a bare origin", () => {
+  it("STCK reports no-checkout-to-refresh for a bare origin", () => {
     const { repo, initial } = createRepo();
     createFeature(repo);
     const bare = tamanduaTempDir("tamandua-merge-branch-bare-");
@@ -1198,8 +1241,48 @@ describe("runPlumbingMerge", () => {
 
     assert.equal(result.status, "landed");
     if (result.status !== "landed") return;
-    assert.equal(result.checkoutRefresh, "not-applicable");
-    assert.equal(events[0]?.checkoutRefresh, "not-applicable");
+    assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(result.targetTipBefore, initial);
+    assert.equal(result.targetTipAfter, result.mergedCommit);
+    // targetTipAfter is the live ref value, not a value we assumed.
+    assert.equal(git(bare, ["rev-parse", "refs/heads/main"]), result.targetTipAfter);
+    assert.equal(events[0]?.checkoutRefresh, "no-checkout-to-refresh");
+    assert.equal(events[0]?.targetTipBefore, initial);
+    assert.equal(events[0]?.targetTipAfter, result.mergedCommit);
+  });
+
+  it("re-reads the live target tip after landing so targetTipAfter reflects a concurrent landing", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    git(repo, ["branch", "release", initial]);
+    let landedCommit = "";
+    let competingTip = "";
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "release", expectTip: initial, message: "live re-read", runId: "run-live-reread" },
+      {
+        runGit: (origin, args) => {
+          const actual = rawGit(origin, args);
+          if (args[0] === "update-ref" && args[3] === "refs/heads/release" && args[5] === initial) {
+            landedCommit = args[4]!;
+            const tree = git(repo, ["rev-parse", `${landedCommit}^{tree}`]);
+            competingTip = git(repo, ["commit-tree", tree, "-p", landedCommit, "-m", "competing sibling"]);
+            git(repo, ["update-ref", "refs/heads/release", competingTip, landedCommit]);
+          }
+          return actual;
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.targetTipBefore, initial);
+    assert.equal(result.mergedCommit, landedCommit);
+    // The report states the live tip, not the tip this landing assumed it left.
+    assert.equal(result.targetTipAfter, competingTip);
+    assert.notEqual(result.targetTipAfter, result.mergedCommit);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/release"]), competingTip);
   });
 
   it("reports preflight target movement before creating merge objects", () => {
@@ -1422,6 +1505,7 @@ describe("runPlumbingMerge", () => {
       { status: 0, stdout: tree, stderr: "" },
       { status: 0, stdout: commit, stderr: "" },
       { status: 0, stdout: "", stderr: "" },
+      { status: 0, stdout: commit, stderr: "" },
     ];
 
     const result = runPlumbingMerge(
@@ -1436,6 +1520,11 @@ describe("runPlumbingMerge", () => {
     );
 
     assert.equal(result.status, "landed");
+    if (result.status === "landed") {
+      assert.equal(result.targetTipBefore, expected);
+      assert.equal(result.targetTipAfter, commit);
+      assert.equal(result.checkoutRefresh, "no-checkout-to-refresh");
+    }
     assert.deepEqual(commands, [
       ["rev-parse", "--verify", "refs/heads/release"],
       ["worktree", "list", "--porcelain", "-z"],
@@ -1445,6 +1534,7 @@ describe("runPlumbingMerge", () => {
       ["merge-tree", "--write-tree", expected, "refs/heads/feature"],
       ["commit-tree", tree, "-p", expected, "-m", "plumbing only"],
       ["update-ref", "-m", `tamandua: merge.landed (manual) tree=${tree}`, "refs/heads/release", commit, expected],
+      ["rev-parse", "--verify", "refs/heads/release"],
     ]);
     assert.equal(
       commands.some((args) =>

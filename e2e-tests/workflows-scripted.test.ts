@@ -510,7 +510,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         );
         assert.match(mergeStep.output, /^STATUS: landed$/m);
         assert.match(mergeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
-        assert.match(mergeStep.output, /^CHECKOUT_REFRESH: not-applicable$/m);
+        assert.match(mergeStep.output, /^CHECKOUT_REFRESH: no-checkout-to-refresh$/m);
         const mergeEvents = fs
           .readFileSync(path.join(ctx.env.tamanduaDir, "events", `${runId}.jsonl`), "utf-8")
           .trim()
@@ -518,7 +518,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           .map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string })
           .filter((event) => event.event.startsWith("merge.") && event.event !== "merge.gate_overridden");
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
-        assert.equal(mergeEvents[0]?.checkoutRefresh, "not-applicable");
+        assert.equal(mergeEvents[0]?.checkoutRefresh, "no-checkout-to-refresh");
 
         const targetLog = execSync(`git log --oneline -5 "refs/heads/${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" });
         assert.ok(
@@ -816,6 +816,262 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         const originLog = execSync("git log --oneline -5", { cwd: repoDir, encoding: "utf-8" });
         assert.match(originLog, /fix: deterministic target-moved retry/);
         assert.ok(originLog.includes(mergedCommit.slice(0, 7)), `origin working-copy log should contain ${mergedCommit}:\n${originLog}`);
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "RAMP bug-fix-merge-worktree: consecutive target_moved refusals keep the shared reroute budget",
+    { timeout: 300_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        // REROUTE-BUDGET / NPF-3: K >= 2 consecutive stale-tip refusals, each
+        // produced by (a) landing an independent marker branch to advance the
+        // target and then (b) probing the feature landing with the now-stale
+        // --expect-tip (CLI exit 2 -> merge.target_moved). Under the shared
+        // max_reroutes budget this would exhaust after 8; target_moved reroutes
+        // must NOT consume it, so the run still reaches a successful landing.
+        const TARGET_MOVED_REFUSALS = 2;
+        const staleProbeCommand = (attempt: number): string =>
+          [
+            "set -e",
+            'origin="{{input.WORKTREE_ORIGIN_REPOSITORY}}"',
+            'target="refs/heads/{{input.ORIGINAL_BRANCH}}"',
+            'expected_tip=$(git -C "$origin" rev-parse "$target")',
+            `"${process.execPath}" "${cliPath}" merge-branch --origin "$origin" --branch "cdet-target-marker-${attempt}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "test: advance target during scripted merge ${attempt}"`,
+            "set +e",
+            `merge_output=$(TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "$origin" --branch "${BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: deterministic target-moved retry ${attempt} (squash of ${BRANCH})" 2>&1)`,
+            "merge_exit=$?",
+            "set -e",
+            'printf "%s\\n" "$merge_output"',
+            'printf "CLI_EXIT_CODE: %s\\n" "$merge_exit"',
+            `printf "%s\\n" "$merge_exit" > "$origin/.git/cdet-target-moved-exit-${attempt}"`,
+            'test "$merge_exit" -eq 2',
+          ].join("; ");
+        const finalLandingCommand = [
+          'expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}")',
+          `TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: deterministic target-moved retry (squash of ${BRANCH})"`,
+        ].join(" && ");
+        const consecutiveTargetMovedBehaviors: ScriptedAgentConfig = {
+          agents: {
+            ...bugFixBehaviors.agents,
+            verifier: {
+              output: [
+                "STATUS: done",
+                "VERIFIED: feature tree revalidated after target movement",
+                "TESTED_TREE: scripted-tree-after-target-move",
+              ].join("\n"),
+            },
+            merger: [
+              {
+                commands: [staleProbeCommand(1)],
+                includeCommandOutput: true,
+                output: "STATUS: failed\nREASON: target moved before landing",
+                stepAction: "fail",
+                failReason: "FAILURE_CLASS: target_moved\ntarget moved before landing",
+              },
+              {
+                commands: [staleProbeCommand(2)],
+                includeCommandOutput: true,
+                output: "STATUS: failed\nREASON: target moved before landing",
+                stepAction: "fail",
+                failReason: "FAILURE_CLASS: target_moved\ntarget moved before landing",
+              },
+              {
+                commands: [finalLandingCommand],
+                includeCommandOutput: true,
+                output: [
+                  "STATUS: done",
+                  "REBASED: false",
+                  "MERGED_INTO: {{input.ORIGINAL_BRANCH}}",
+                ].join("\n"),
+              },
+            ],
+          },
+        };
+
+        ctx = await startScriptedEnvironment("bug-fix-merge-worktree", consecutiveTargetMovedBehaviors);
+        const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const initialTip = execSync(`git rev-parse "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        // One independent marker branch per refusal so each stale probe has a
+        // fresh, real target movement to detect.
+        for (let attempt = 1; attempt <= TARGET_MOVED_REFUSALS; attempt++) {
+          execSync(`git switch -c cdet-target-marker-${attempt}`, { cwd: repoDir, encoding: "utf-8" });
+          fs.writeFileSync(
+            path.join(repoDir, `contention-marker-${attempt}.txt`),
+            `independent target update ${attempt}\n`,
+            "utf-8",
+          );
+          execSync(
+            `git add "contention-marker-${attempt}.txt" && git commit -m 'test: prepare independent target update ${attempt}'`,
+            { cwd: repoDir, encoding: "utf-8" },
+          );
+          execSync(`git switch "${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" });
+        }
+
+        const runIdPrefix = await spawnWorkflowRun(
+          [
+            "workflow",
+            "run",
+            "bug-fix-merge-worktree",
+            "The add function in src/math.ts returns a - b instead of a + b",
+            "--worktree-origin-repository",
+            repoDir,
+            "--worktree-origin-ref",
+            originalBranch,
+          ],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+        );
+        const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+
+        const status = await waitForRun(ctx, runId, 240_000);
+        assert.ok(
+          status === "completed" || status === "done",
+          `run should complete after ${TARGET_MOVED_REFUSALS} target_moved refusals, got "${status}"\n${diagnostics(ctx)}`,
+        );
+
+        // Every stale probe really refused (exit 2) — the reroute was driven
+        // by target movement, not by a malformed command.
+        for (let attempt = 1; attempt <= TARGET_MOVED_REFUSALS; attempt++) {
+          assert.equal(
+            fs.readFileSync(path.join(repoDir, ".git", `cdet-target-moved-exit-${attempt}`), "utf-8").trim(),
+            "2",
+            `feature landing probe ${attempt} should exit 2`,
+          );
+        }
+
+        // Each refusal reroutes through the verifier: initial verify + one per
+        // refusal. The merger then runs once per verifier pass.
+        assert.equal(
+          ctx.scripted.workInvocations("verifier").length,
+          TARGET_MOVED_REFUSALS + 1,
+          "each target_moved refusal must reroute through the verifier",
+        );
+        assert.equal(
+          ctx.scripted.workInvocations("merger").length,
+          TARGET_MOVED_REFUSALS + 1,
+          "merger should retry after each revalidation and land once",
+        );
+
+        // ── REROUTE-BUDGET (NPF-3) accounting ─────────────────────
+        const steps = dbRows<{
+          step_id: string;
+          status: string;
+          reroute_count: number | null;
+          target_moved_reroute_count: number | null;
+        }>(
+          ctx.env.tamanduaDir,
+          "SELECT step_id, status, reroute_count, target_moved_reroute_count FROM steps WHERE run_id = ? ORDER BY step_index",
+          runId,
+        );
+        assert.equal(steps.length, 8);
+        for (const step of steps) assert.equal(step.status, "done", `${step.step_id} should finish done`);
+        const finalize = steps.find((step) => step.step_id === "finalize_merge");
+        assert.ok(finalize, "finalize_merge step missing");
+        assert.equal(
+          finalize.target_moved_reroute_count,
+          TARGET_MOVED_REFUSALS,
+          "target_moved_reroute_count must equal the number of stale-tip refusals",
+        );
+        assert.equal(
+          (finalize.reroute_count ?? 0) - (finalize.target_moved_reroute_count ?? 0),
+          0,
+          "target_moved reroutes must not consume the shared max_reroutes budget",
+        );
+
+        const events = readRunEvents(ctx.env.tamanduaDir, runId);
+        const rerouted = events.filter((event) => event.event === "step.rerouted");
+        assert.equal(
+          rerouted.length,
+          TARGET_MOVED_REFUSALS,
+          `expected one step.rerouted per refusal; events: ${events.map((e) => e.event).join(", ")}`,
+        );
+        for (const event of rerouted) {
+          assert.equal(event.stepId, "finalize_merge");
+          assert.match(String(event.detail), /FAILURE_CLASS: target_moved/);
+          assert.equal(event.failureClass, "target_moved");
+        }
+        assert.ok(
+          !events.some((event) => event.event === "step.reroute_budget_exhausted"),
+          "shared-budget exhaustion must not fire for target_moved reroutes",
+        );
+        assert.ok(
+          !events.some((event) => event.event === "step.target_moved_reroute_exhausted"),
+          "the target-moved budget must not exhaust well below the default cap",
+        );
+
+        const mergeEvents = events.filter(
+          (event) => String(event.event).startsWith("merge.") && event.event !== "merge.gate_overridden",
+        );
+        // [marker1 landed, target_moved, marker2 landed, target_moved, final landed]
+        const expectedMergeSequence: string[] = ["merge.landed"];
+        for (let attempt = 0; attempt < TARGET_MOVED_REFUSALS; attempt++) {
+          expectedMergeSequence.push("merge.target_moved", "merge.landed");
+        }
+        assert.deepEqual(
+          mergeEvents.map((event) => event.event),
+          expectedMergeSequence,
+          "one merge.target_moved per refusal, with a landing between and after them",
+        );
+        // TATR: every merge event is attributed to this run.
+        for (const event of mergeEvents) {
+          assert.equal(event.runId, runId);
+          assert.equal(event.origin, repoDir);
+          assert.equal(event.target, `refs/heads/${originalBranch}`);
+        }
+        // Each refusal's target_moved saw exactly the previous marker landing's
+        // commit as the live tip, and the final landing expected that same tip.
+        let previousTip = initialTip;
+        for (let attempt = 1; attempt <= TARGET_MOVED_REFUSALS; attempt++) {
+          const markerLanding = mergeEvents[(attempt - 1) * 2];
+          const movedEvent = mergeEvents[(attempt - 1) * 2 + 1];
+          assert.equal(markerLanding.branch, `cdet-target-marker-${attempt}`);
+          assert.equal(markerLanding.expectedTip, previousTip);
+          assert.equal(movedEvent.branch, BRANCH);
+          assert.equal(movedEvent.expectedTip, previousTip);
+          assert.equal(movedEvent.actualTip, markerLanding.mergedCommit);
+          assert.notEqual(movedEvent.actualTip, movedEvent.expectedTip);
+          previousTip = String(markerLanding.mergedCommit);
+        }
+        const landed = mergeEvents[mergeEvents.length - 1];
+        assert.equal(landed.branch, BRANCH);
+        assert.equal(landed.expectedTip, previousTip);
+
+        // ── Final target state: every marker plus the feature fix ──
+        const mergedCommit = execSync(`git rev-parse "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        assert.equal(landed.mergedCommit, mergedCommit);
+        for (let attempt = 1; attempt <= TARGET_MOVED_REFUSALS; attempt++) {
+          assert.equal(
+            execSync(`git show "refs/heads/${originalBranch}:contention-marker-${attempt}.txt"`, {
+              cwd: repoDir,
+              encoding: "utf-8",
+            }),
+            `independent target update ${attempt}\n`,
+          );
+        }
+        const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        });
+        assert.ok(targetMath.includes("a + b"), `target should contain the feature fix:\n${targetMath}`);
+
+        const finalizeStep = dbRow<{ output: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+          runId,
+        );
+        assert.match(finalizeStep.output, /^STATUS: landed$/m);
+        assert.match(finalizeStep.output, new RegExp(`^TARGET: refs/heads/${originalBranch}$`, "m"));
       } finally {
         await teardown(ctx);
       }

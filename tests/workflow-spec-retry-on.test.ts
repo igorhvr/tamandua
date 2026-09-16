@@ -105,3 +105,63 @@ describe("on_fail.retry_on workflow contract", () => {
     assert.deepEqual(syncSpec.steps[0].on_fail?.retry_on, []);
   });
 });
+
+describe("on_fail.max_target_moved_reroutes workflow contract", () => {
+  it("both loaders preserve max_target_moved_reroutes alongside max_reroutes", async () => {
+    const workflowDir = writeWorkflow(
+      "    on_fail:\n      retry_step: implement\n      max_reroutes: 2\n      max_target_moved_reroutes: 8\n      retry_on: [target_moved]\n",
+    );
+
+    const asyncSpec = await loadWorkflowSpec(workflowDir);
+    const syncSpec = loadWorkflowSpecSync(workflowDir);
+
+    for (const spec of [asyncSpec, syncSpec]) {
+      assert.deepEqual(spec.steps[0].on_fail, {
+        retry_step: "implement",
+        max_reroutes: 2,
+        max_target_moved_reroutes: 8,
+        retry_on: ["target_moved"],
+      });
+    }
+  });
+
+  it("both loaders leave max_target_moved_reroutes undefined when absent", async () => {
+    const workflowDir = writeWorkflow(
+      "    on_fail:\n      retry_step: implement\n      max_reroutes: 3\n",
+    );
+
+    const asyncSpec = await loadWorkflowSpec(workflowDir);
+    const syncSpec = loadWorkflowSpecSync(workflowDir);
+
+    assert.equal(asyncSpec.steps[0].on_fail?.max_target_moved_reroutes, undefined);
+    assert.equal(syncSpec.steps[0].on_fail?.max_target_moved_reroutes, undefined);
+  });
+
+  for (const { label, literal } of [
+    { label: "zero", literal: "0" },
+    { label: "a negative number", literal: "-1" },
+    { label: "a non-integer", literal: "1.5" },
+    { label: "a quoted string", literal: '"16"' },
+    { label: "a boolean", literal: "true" },
+    { label: "null", literal: "null" },
+    { label: "an object", literal: "{}" },
+    { label: "an array", literal: "[]" },
+  ]) {
+    it(`both loaders reject max_target_moved_reroutes: ${label}`, async () => {
+      const workflowDir = writeWorkflow(
+        `    on_fail:\n      max_target_moved_reroutes: ${literal}\n`,
+      );
+      const expectedMessage =
+        `workflow.yml step[0] ("implement") on_fail.max_target_moved_reroutes in ${workflowDir} must be a positive integer`;
+
+      await assert.rejects(
+        loadWorkflowSpec(workflowDir),
+        new Error(expectedMessage),
+      );
+      assert.throws(
+        () => loadWorkflowSpecSync(workflowDir),
+        new Error(expectedMessage),
+      );
+    });
+  }
+});

@@ -339,7 +339,7 @@ export function prepareGitRepo(fixtureDir: string, targetDir: string) {
  * Detach the origin checkout to exercise the managed landing contract's
  * unowned-target path. Captures the pre-detach tip and tree SHA for later
  * assertions that the detached origin remained unchanged while the target
- * ref advanced with CHECKOUT_REFRESH: not-applicable.
+ * ref advanced with CHECKOUT_REFRESH: no-checkout-to-refresh.
  */
 export function detachOriginCheckout(repoDir: string): { branch: string; tip: string; tree: string } {
   const { status: s1, stdout: branchOut, stderr: e1 } = spawnSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: repoDir, encoding: "utf-8" });

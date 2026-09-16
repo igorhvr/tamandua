@@ -3519,7 +3519,7 @@ describe("BSHA CLI capture warnings", () => {
       assert.equal(result.status, 0,
         `Expected exit code 0, got ${result.status}. stderr: ${result.stderr}`);
 
-      // BCAP: a non-git working directory is classified as not-applicable, so no
+      // BCAP: a non-git working directory is classified as a skip, so no
       // rugpull-degradation warnings are printed to stderr.
       const stderr = result.stderr ?? "";
       assert.doesNotMatch(stderr, /Unable to capture original branch at launch/,
@@ -3529,7 +3529,7 @@ describe("BSHA CLI capture warnings", () => {
       assert.doesNotMatch(stderr, /rugpull detection degraded/,
         `Expected no rugpull degradation notice for a non-git dir. Got: ${stderr}`);
 
-      // The run event stream still records the single not-applicable classification.
+      // The run event stream still records the single skip classification.
       const eventsFile = path.join(stateDir, "events", "all.jsonl");
       const events = fs.readFileSync(eventsFile, "utf-8")
         .split("\n")

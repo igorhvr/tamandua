@@ -106,7 +106,7 @@
       <article>
         <span class="feature-icon" aria-hidden="true">🔄</span>
         <h3>Retry and Reroute</h3>
-        <p>Failed steps retry automatically. Steps can reroute back to upstream producers for correction via <code>on_fail.retry_step</code> (bounded by a <code>max_reroutes</code> budget, default 2). When the budget exhausts, the run fails permanently. Nothing fails silently.</p>
+        <p>Failed steps retry automatically. Steps can reroute back to upstream producers for correction via <code>on_fail.retry_step</code> (bounded by a <code>max_reroutes</code> budget, default 2). Stale-tip (<code>target_moved</code>) reroutes have their own budget (<code>on_fail.max_target_moved_reroutes</code>, default 16) and do not consume <code>max_reroutes</code>. When a budget exhausts, the run fails permanently. Nothing fails silently.</p>
       </article>
 
       <article>
@@ -429,7 +429,7 @@ cd tamandua
         </li>
         <li>
           <strong>Retry and reroute</strong>
-          <p>Failed steps retry automatically. Steps can reroute back to upstream producers for correction via <code>on_fail.retry_step</code> (bounded by a <code>max_reroutes</code> budget, default 2). When the budget exhausts, the run fails permanently. Nothing fails silently.</p>
+          <p>Failed steps retry automatically. Steps can reroute back to upstream producers for correction via <code>on_fail.retry_step</code> (bounded by a <code>max_reroutes</code> budget, default 2). Stale-tip (<code>target_moved</code>) reroutes have their own budget (<code>on_fail.max_target_moved_reroutes</code>, default 16) and do not consume <code>max_reroutes</code>. When a budget exhausts, the run fails permanently. Nothing fails silently.</p>
         </li>
         <li>
           <strong>Zero tokens when idle</strong>

@@ -1047,14 +1047,21 @@ step via `on_fail` in the workflow YAML:
   producer step. The producer re-executes, and the downstream step that
   failed gets a fresh chance after the upstream fix.
 - **`max_reroutes`** — limits how many times a step can be rerouted before
-  giving up (default 2). When the reroute budget exhausts, the run
-  permanently fails.
+  giving up (default 2), counting every class except stale-tip
+  (`target_moved`) refusals. When the shared reroute budget exhausts, the
+  run permanently fails.
+- **`max_target_moved_reroutes`** — a separate budget (default 16) for
+  `FAILURE_CLASS: target_moved` reroutes (a landing refused because the
+  target tip moved). These reroutes never consume `max_reroutes`, so
+  concurrent landing contention cannot terminally fail a healthy merge run.
 
 Events emitted during routing:
 
 - `step.rerouted` — step was sent back to an upstream producer
-- `step.reroute_budget_exhausted` — reroute limit reached; step is
+- `step.reroute_budget_exhausted` — shared reroute limit reached; step is
   permanently failed
+- `step.target_moved_reroute_exhausted` — target-moved reroute limit reached;
+  step fails with `FAILURE_CLASS: target_moved_exhausted`
 These events are visible in `tamandua logs` and `tamandua logs-tail`.
 Permanently failed runs can be reattempted with
 `tamandua workflow resume <run-id>`; fix the underlying issue before

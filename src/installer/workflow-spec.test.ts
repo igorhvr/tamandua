@@ -499,7 +499,7 @@ steps:
 });
 
 describe("validateOnFail — on_fail key validation and M4 attestation rule", () => {
-  it("accepts valid on_fail keys: retry_step, max_reroutes, retry_on", async () => {
+  it("accepts valid on_fail keys: retry_step, max_reroutes, max_target_moved_reroutes, retry_on", async () => {
     const yml = `
 id: test-valid-on-fail
 agents:
@@ -518,11 +518,13 @@ steps:
     on_fail:
       retry_step: step1
       max_reroutes: 4
+      max_target_moved_reroutes: 8
       retry_on: [conflicts, target_moved]
 `;
     const dir = createTempWorkflow(yml);
     const spec = await loadWorkflowSpec(dir);
     assert.equal(spec.id, "test-valid-on-fail");
+    assert.equal(spec.steps[1].on_fail?.max_target_moved_reroutes, 8);
   });
 
   it("rejects unknown on_fail key naming the step and key", async () => {
@@ -544,7 +546,7 @@ steps:
     const dir = createTempWorkflow(yml);
     await assert.rejects(
       () => loadWorkflowSpec(dir),
-      /on_fail.*contains unknown key.*"max_retries".*retry_step, max_reroutes, retry_on/i,
+      /on_fail.*contains unknown key.*"max_retries".*retry_step, max_reroutes, max_target_moved_reroutes, retry_on/i,
     );
     await assert.rejects(
       () => loadWorkflowSpec(dir),
@@ -849,9 +851,69 @@ steps:
     // Throws on the first bad key — 'foo' (Object.keys order)
     await assert.rejects(
       () => loadWorkflowSpec(dir),
-      /on_fail.*contains unknown key.*"foo".*retry_step, max_reroutes, retry_on/i,
+      /on_fail.*contains unknown key.*"foo".*retry_step, max_reroutes, max_target_moved_reroutes, retry_on/i,
     );
   });
+});
+
+describe("on_fail.max_target_moved_reroutes validation (REROUTE-BUDGET)", () => {
+  function targetMovedYml(onFailValueLine: string): string {
+    return `
+id: test-target-moved-budget
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    input: "TESTED_TREE: treehash"
+    expects: "STATUS: done"
+  - id: step2
+    agent: dev
+    input: "consume TESTED_TREE"
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: step1
+${onFailValueLine}`;
+  }
+
+  it("accepts a missing key (runtime default applies)", async () => {
+    const dir = createTempWorkflow(targetMovedYml(""));
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.steps[1].on_fail?.max_target_moved_reroutes, undefined);
+  });
+
+  it("accepts a positive integer cap", async () => {
+    const dir = createTempWorkflow(
+      targetMovedYml("      max_target_moved_reroutes: 8\n"),
+    );
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.steps[1].on_fail?.max_target_moved_reroutes, 8);
+  });
+
+  const invalidValues: Array<[string, string]> = [
+    ["zero", "0"],
+    ["a negative number", "-1"],
+    ["a non-integer", "1.5"],
+    ["a quoted string", '"16"'],
+    ["a boolean", "true"],
+    ["null", "null"],
+    ["an object", "{}"],
+    ["an array", "[]"],
+  ];
+
+  for (const [label, literal] of invalidValues) {
+    it(`rejects ${label}`, async () => {
+      const dir = createTempWorkflow(
+        targetMovedYml(`      max_target_moved_reroutes: ${literal}\n`),
+      );
+      await assert.rejects(
+        () => loadWorkflowSpec(dir),
+        /workflow\.yml step\[1\] \("step2"\) on_fail\.max_target_moved_reroutes in .* must be a positive integer/,
+      );
+    });
+  }
 });
 
 describe("conditional step type validation", () => {

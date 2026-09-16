@@ -132,7 +132,11 @@ validation exhaustion, worker death — permanently fail the run
 UNLESS the workflow declares `on_fail.retry_step`, in which case
 the run reroutes to the named upstream producer (bounded by
 `max_reroutes`, default 2 before falling through to permanent
-failure). No automatic replacement is triggered for these failures.
+failure). Stale-tip (`FAILURE_CLASS: target_moved`) reroutes get
+their own budget — `on_fail.max_target_moved_reroutes`, default 16 —
+and do not consume `max_reroutes`, so concurrent landing contention
+cannot terminally fail a merge run. No automatic replacement is
+triggered for these failures.
 Use `tamandua workflow resume <run-id>` to reattempt a permanently
 failed run; fix the underlying issue before resuming.
 
@@ -297,7 +301,7 @@ $ tamandua workflow install --all
 - **Deterministic workflows** — Same workflow, same steps, same order. Not "hopefully the agent remembers to test."
 - **Agents verify each other** — The developer doesn't mark their own homework. A separate verifier checks every story against acceptance criteria.
 - **Fresh context, every step** — Each agent gets a clean session. No context window bloat. No hallucinated state from 50 messages ago.
-- **Retry and reroute** — Failed steps retry automatically, and can be rerouted to upstream producers for fresh context. When budgets exhaust, the run fails — terminally and automatically. Nothing fails silently.
+- **Retry and reroute** — Failed steps retry automatically, and can be rerouted to upstream producers for fresh context. Stale-tip (`target_moved`) reroutes have their own budget (default 16) and do not consume `max_reroutes`. When budgets exhaust, the run fails — terminally and automatically. Nothing fails silently.
 - **Zero tokens when idle** — Checking for work is a database peek, not a model call; agents spawn only when a step is ready, and completion nudges make step-to-step latency near zero. The old polling motor measured roughly 30% token overhead; the new motor: zero.
 
 ---
@@ -653,7 +657,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 
 | Command | Description |
 |---------|-------------|
-| `tamandua merge-branch --origin <repo> --branch <branch> --into <target> --expect-tip <sha> --message <message>` | Atomically land a plumbing-based squash merge with managed checkout parking. A clean attached target is refreshed in place (`refreshed`); a dirty attached target remains safely on a backup branch (`parked:<branch>`); a coherent owned no-op reports `already-coherent`; and a bare or unowned target reports `not-applicable`. Multiple owners, invalid or ambiguous ownership metadata, and an owner operation in progress remain bounded refusals. See [Atomic merge-branch landing](docs/merge-branch.md). |
+| `tamandua merge-branch --origin <repo> --branch <branch> --into <target> --expect-tip <sha> --message <message>` | Atomically land a plumbing-based squash merge with managed checkout parking. A clean attached target is refreshed in place (`refreshed`); a dirty attached target remains safely on a backup branch (`parked:<branch>`); a coherent owned no-op reports `already-coherent`; a stale owned no-op reports `checkout-not-at-tip`; and a bare or unowned target reports `no-checkout-to-refresh`. Every landing also reports the verified `TARGET_TIP_BEFORE` and live-reread `TARGET_TIP_AFTER`. Multiple owners, invalid or ambiguous ownership metadata, and an owner operation in progress remain bounded refusals. See [Atomic merge-branch landing](docs/merge-branch.md). |
 
 ### Management
 

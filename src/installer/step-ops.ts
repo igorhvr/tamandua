@@ -1929,9 +1929,11 @@ export function recoverOrphanedStepsForAgent(
       // Orphan recovery exhaustion means the agent (or harness) died
       // without completing or failing the step. If the workflow declares
       // a retry_step target, reroute instead of killing the run.
+      const orphanRecoveryReason = "Agent terminated without completing step; retries exhausted";
+      let orphanFailureReason = orphanRecoveryReason;
       try {
         const rerouteResult = rerouteStepSync(step.run_id, step.step_id, step.id,
-          "Agent terminated without completing step; retries exhausted");
+          orphanRecoveryReason);
         if (rerouteResult === "rerouted") {
           // Rerouted successfully — do not count this step as failed.
           // The run stays alive; recovered++ to indicate we handled it.
@@ -1942,7 +1944,16 @@ export function recoverOrphanedStepsForAgent(
           const policy = getOnFailPolicySync(step.run_id, step.step_id);
           logger.error(`Run failed: step "${step.step_id}" declares on_fail.retry_step "${policy?.retry_step ?? "?"}" which is not a valid upstream step (must have lower step_index).`, { runId: step.run_id, stepId: step.step_id, agentId });
         }
-        // budget_exhausted / not_found falls through to normal failure below
+        if (rerouteResult === "target_moved_exhausted") {
+          // REROUTE-BUDGET: never silently drop the sentinel — surface the
+          // legible class so the terminal writes below stay greppable.
+          orphanFailureReason = buildTargetMovedExhaustedReason(
+            step.id,
+            getOnFailPolicySync(step.run_id, step.step_id),
+            orphanRecoveryReason,
+          );
+        }
+        // budget_exhausted / not_found fall through to normal failure below
       } catch (e) {
         logger.error("reroute failed", { runId: step.run_id, stepId: step.step_id, error: e });
         emitEvent({ ts: new Date().toISOString(), event: "step.reroute_error", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: String(e) });
@@ -1950,13 +1961,13 @@ export function recoverOrphanedStepsForAgent(
       }
 
       db.prepare(
-        `UPDATE steps SET status = 'failed', retry_count = ?, output = 'Agent terminated without completing step; retries exhausted', updated_at = ${SQL_NOW_ISO} WHERE id = ?`
-      ).run(newRetry, step.id);
+        `UPDATE steps SET status = 'failed', retry_count = ?, output = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
+      ).run(newRetry, orphanFailureReason, step.id);
       db.prepare(
         `UPDATE runs SET status = 'failed', updated_at = ${SQL_NOW_ISO} WHERE id = ?`
       ).run(step.run_id);
-      emitEvent({ ts: new Date().toISOString(), event: "step.timeout", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: "Agent terminated without completing step; retries exhausted" });
-      emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: "Agent terminated without completing step; retries exhausted" });
+      emitEvent({ ts: new Date().toISOString(), event: "step.timeout", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: orphanFailureReason });
+      emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: orphanFailureReason });
       emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Step terminated and retries exhausted" });
       scheduleRunCronTeardown(step.run_id);
       logger.warn(`Orphaned step retries exhausted`, { runId: step.run_id, stepId: step.step_id, agentId, retryCount: newRetry, maxRetries: step.max_retries });
@@ -3614,6 +3625,7 @@ function completeStepInternal(
       // ── RETR: check on_fail.retry_step before failing the run ──
       // Rerouting to an upstream producer allows the run to recover when
       // expects validation exhausts and the root cause is in producer output.
+      let validationFailureReason = validationError;
       try {
         const rerouteResult = rerouteStepSync(step.run_id, step.step_id, step.id, validationError);
         if (rerouteResult === "rerouted") {
@@ -3623,7 +3635,16 @@ function completeStepInternal(
           const policy = getOnFailPolicySync(step.run_id, step.step_id);
           logger.error(`Run failed: step "${step.step_id}" declares on_fail.retry_step "${policy?.retry_step ?? "?"}" which is not a valid upstream step (must have lower step_index).`, { runId: step.run_id, stepId: step.step_id });
         }
-        // budget_exhausted / not_found falls through to normal failure below
+        if (rerouteResult === "target_moved_exhausted") {
+          // REROUTE-BUDGET: surface the legible class instead of dropping the
+          // sentinel into the generic expects-validation failure.
+          validationFailureReason = buildTargetMovedExhaustedReason(
+            step.id,
+            getOnFailPolicySync(step.run_id, step.step_id),
+            validationError,
+          );
+        }
+        // budget_exhausted / not_found fall through to normal failure below
       } catch (e) {
         logger.error("reroute failed", { runId: step.run_id, stepId: step.step_id, error: e });
         emitEvent({ ts: new Date().toISOString(), event: "step.reroute_error", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: String(e) });
@@ -3632,11 +3653,11 @@ function completeStepInternal(
 
       db.prepare(
         `UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
-      ).run(validationError, newRetry, stepId);
+      ).run(validationFailureReason, newRetry, stepId);
       db.prepare(
         `UPDATE runs SET status = 'failed', updated_at = ${SQL_NOW_ISO} WHERE id = ?`
       ).run(step.run_id);
-      emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: validationError });
+      emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: validationFailureReason });
       emitRunTerminalEvent({ event: "run.failed", runId, workflowId: wfId, detail: "Expects validation failed and retries exhausted" });
       scheduleRunCronTeardown(runId);
       finalizeDrainingPause(runId);
@@ -4008,6 +4029,7 @@ function completeStepInternal(
 
     if (newRetry > maxRetries) {
       // ── RETR: check on_fail.retry_step before failing the run ──
+      let verdictFailureReason = output;
       try {
         const rerouteResult = rerouteStepSync(step.run_id, step.step_id, step.id, output);
         if (rerouteResult === "rerouted") {
@@ -4017,7 +4039,17 @@ function completeStepInternal(
           const policy = getOnFailPolicySync(step.run_id, step.step_id);
           logger.error(`Run failed: step "${step.step_id}" returned STATUS: retry, retries exhausted, declares on_fail.retry_step "${policy?.retry_step ?? "?"}" which is not a valid upstream step.`, { runId: step.run_id, stepId: step.step_id });
         }
-        // budget_exhausted / not_found falls through to normal failure below
+        if (rerouteResult === "target_moved_exhausted") {
+          // REROUTE-BUDGET: a STATUS: retry verdict whose first line is a
+          // target_moved refusal can exhaust the stale-tip budget. Surface the
+          // legible class rather than emitting the raw verdict as the failure.
+          verdictFailureReason = buildTargetMovedExhaustedReason(
+            step.id,
+            getOnFailPolicySync(step.run_id, step.step_id),
+            output,
+          );
+        }
+        // budget_exhausted / not_found fall through to normal failure below
       } catch (e) {
         logger.error("reroute failed", { runId: step.run_id, stepId: step.step_id, error: e });
         emitEvent({ ts: new Date().toISOString(), event: "step.reroute_error", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: String(e) });
@@ -4026,7 +4058,7 @@ function completeStepInternal(
 
       db.prepare(
         `UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
-      ).run(output, newRetry, stepId);
+      ).run(verdictFailureReason, newRetry, stepId);
       db.prepare(
         `UPDATE runs SET status = 'failed', updated_at = ${SQL_NOW_ISO} WHERE id = ?`
       ).run(step.run_id);
@@ -4889,6 +4921,37 @@ function parseFailureClass(reason: string): string | null {
   return match?.[1] ?? null;
 }
 
+/**
+ * REROUTE-BUDGET (NPF-3): terminal failure reason used when a consumer's
+ * target_moved reroute budget is exhausted. The FIRST line is exactly
+ * `FAILURE_CLASS: target_moved_exhausted` so operators can grep the class
+ * (and distinguish contention exhaustion from ordinary reroute exhaustion);
+ * the remainder is a bounded explanation naming the consumed count, the
+ * effective cap and the declared retry_step target. The count/cap are read
+ * from the consumer row at call time, which is exactly the value the
+ * target_moved budget check refused, so the reason can never drift.
+ */
+function buildTargetMovedExhaustedReason(
+  consumerRowId: string,
+  policy: WorkflowStepFailure | null | undefined,
+  consumerFailure: string,
+): string {
+  const db = getDb();
+  const row = db.prepare(
+    "SELECT target_moved_reroute_count FROM steps WHERE id = ?",
+  ).get(consumerRowId) as { target_moved_reroute_count: number | null } | undefined;
+  const count = row?.target_moved_reroute_count ?? 0;
+  const cap = policy?.max_target_moved_reroutes ?? 16;
+  const target = policy?.retry_step ?? "?";
+  const bounded =
+    consumerFailure.length > 200 ? consumerFailure.slice(0, 197) + "..." : consumerFailure;
+  return (
+    "FAILURE_CLASS: target_moved_exhausted\n" +
+    `Target-moved reroute budget exhausted: ${count}/${cap} stale-tip reroutes to "${target}". ` +
+    `Consumer failure: ${bounded}`
+  );
+}
+
 /** Unknown and undeclared nonterminal classes retain legacy behavior. */
 function getFailureRerouteMode(
   reason: string,
@@ -4951,10 +5014,23 @@ function getOnFailPolicySync(runId: string, stepId: string): WorkflowStepFailure
  * carries terminal:false + rerouteMode so the counters reconcile against
  * the event stream.
  *
- * Returns "rerouted" on success, "budget_exhausted" when max_reroutes
- * is reached, "invalid_target" when the declared retry_step target
- * doesn't exist or isn't upstream, or "not_found" when the consumer
- * step isn't found in the database.
+ * REROUTE-BUDGET (NPF-3): target_moved reroutes (stale-tip landing refusals)
+ * get their OWN budget and never consume max_reroutes. reroute_count stays
+ * the TOTAL reroute counter (reroute_count == count(step.rerouted)), while
+ * target_moved_reroute_count is a class-specific SUBSET counter incremented
+ * only for target_moved reroutes. Shared-budget consumption is therefore
+ * effectiveShared = max(0, reroute_count - target_moved_reroute_count),
+ * compared against max_reroutes for every non-target_moved reroute.
+ * target_moved reroutes instead compare target_moved_reroute_count against
+ * on_fail.max_target_moved_reroutes (default 16). This keeps 8-way landing
+ * contention from terminally exhausting an otherwise healthy merge run.
+ *
+ * Returns "rerouted" on success, "budget_exhausted" when the shared
+ * max_reroutes budget is reached by a non-target_moved reroute,
+ * "target_moved_exhausted" when the target_moved budget is reached,
+ * "invalid_target" when the declared retry_step target doesn't exist or
+ * isn't upstream, or "not_found" when the consumer step isn't found in the
+ * database.
  */
 function rerouteWithPolicy(
   policy: WorkflowStepFailure,
@@ -4963,26 +5039,29 @@ function rerouteWithPolicy(
   consumerRowId: string,
   error: string,
   hasIndependentGateAllowance = false,
-): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
+): "rerouted" | "budget_exhausted" | "target_moved_exhausted" | "invalid_target" | "not_found" {
   const db = getDb();
   const targetStepId = policy.retry_step!;
 
   // Integrity-gate terminal refusals carry the durable ledger evidence needed
   // to diagnose and recover the run. RAMP transports those mechanically
   // generated reasons verbatim; ordinary agent-authored feedback remains
-  // bounded to keep prompts and event records small.
+  // bounded to keep prompts and event records small. A bounded reason keeps
+  // its leading FAILURE_CLASS line intact (the first line is short), so the
+  // verbatim class line survives truncation.
   const boundedReason = error.length > 200 ? error.slice(0, 197) + "..." : error;
   const rerouteReason = /^FAILURE_CLASS: refused_permanent$/m.test(error) ? error : boundedReason;
 
   // Look up the consumer step metadata
   const consumerStep = db.prepare(
-    "SELECT step_id, step_index, reroute_count, terminal_reroute_count FROM steps WHERE id = ?"
+    "SELECT step_id, step_index, reroute_count, terminal_reroute_count, target_moved_reroute_count FROM steps WHERE id = ?"
   ).get(consumerRowId) as
     {
       step_id: string;
       step_index: number;
       reroute_count: number | null;
       terminal_reroute_count: number | null;
+      target_moved_reroute_count: number | null;
     } | undefined;
   if (!consumerStep) return "not_found";
 
@@ -4997,33 +5076,68 @@ function rerouteWithPolicy(
   if (targetStep.step_index >= consumerStep.step_index) return "invalid_target";
 
   const rerouteMode = getFailureRerouteMode(error, policy);
+  const failureClass = parseFailureClass(error);
+  const isTargetMoved = failureClass === "target_moved";
   const hasIndependentTerminalAllowance = rerouteMode === "terminal" && (
     (consumerStep.terminal_reroute_count ?? 0) < 1 || hasIndependentGateAllowance
   );
 
-  // Check the shared reroute budget (default 2 when not declared in YAML).
-  // A terminal refusal with an unspent durable allowance can cross an
-  // exhausted shared budget without charging it again.
+  // Shared reroute budget (default 2 when not declared in YAML). REROUTE-BUDGET:
+  // target_moved reroutes are excluded from the shared budget entirely and get
+  // their own cap below, so landing contention cannot exhaust max_reroutes.
+  // A terminal refusal with an unspent durable allowance can cross an exhausted
+  // shared budget without charging it again.
   const maxReroutes = policy.max_reroutes ?? 2;
+  const maxTargetMovedReroutes = policy.max_target_moved_reroutes ?? 16;
   const currentReroutes = consumerStep.reroute_count ?? 0;
-  if (currentReroutes >= maxReroutes && !hasIndependentTerminalAllowance) {
+  const currentTargetMovedReroutes = consumerStep.target_moved_reroute_count ?? 0;
+  // Shared-budget consumption excludes the target_moved subset counter.
+  const effectiveShared = Math.max(0, currentReroutes - currentTargetMovedReroutes);
+
+  if (isTargetMoved) {
+    if (currentTargetMovedReroutes >= maxTargetMovedReroutes) {
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "step.target_moved_reroute_exhausted",
+        runId,
+        workflowId: getWorkflowId(runId),
+        stepId: consumerStepId,
+        detail:
+          `Target-moved reroute budget exhausted: ${currentTargetMovedReroutes}/${maxTargetMovedReroutes} to ${targetStepId}. ` +
+          `Consumer failure: ${rerouteReason}`,
+        failureClass,
+        targetMovedRerouteCount: currentTargetMovedReroutes,
+        targetMovedBudget: maxTargetMovedReroutes,
+      });
+      logger.warn("Target-moved reroute budget exhausted", {
+        runId, fromStep: consumerStepId, toStep: targetStepId,
+        targetMovedRerouteCount: currentTargetMovedReroutes,
+        targetMovedBudget: maxTargetMovedReroutes, reason: rerouteReason,
+      });
+      return "target_moved_exhausted";
+    }
+  } else if (effectiveShared >= maxReroutes && !hasIndependentTerminalAllowance) {
     emitEvent({
       ts: new Date().toISOString(),
       event: "step.reroute_budget_exhausted",
       runId,
       workflowId: getWorkflowId(runId),
       stepId: consumerStepId,
-      detail: `Reroute budget exhausted: ${currentReroutes}/${maxReroutes} to ${targetStepId}. Consumer failure: ${rerouteReason}`,
+      detail:
+        `Reroute budget exhausted: ${effectiveShared}/${maxReroutes} to ${targetStepId}. Consumer failure: ${rerouteReason}`,
+      failureClass,
+      targetMovedRerouteCount: currentTargetMovedReroutes,
+      targetMovedBudget: maxTargetMovedReroutes,
     });
     logger.warn("Reroute budget exhausted", {
       runId, fromStep: consumerStepId, toStep: targetStepId,
-      rerouteCount: currentReroutes, budget: maxReroutes, reason: rerouteReason,
+      rerouteCount: effectiveShared, budget: maxReroutes, reason: rerouteReason,
     });
     return "budget_exhausted";
   }
 
   const usesBudgetIndependentAllowance =
-    currentReroutes >= maxReroutes && hasIndependentTerminalAllowance;
+    effectiveShared >= maxReroutes && hasIndependentTerminalAllowance;
   const newRerouteCount = currentReroutes + (usesBudgetIndependentAllowance ? 0 : 1);
   // WAVE-B.1: terminal_reroute_count is a GATE CONTROL counting only
   // terminal-CLASS reroutes (rerouteMode === "terminal"). Ordinary
@@ -5036,10 +5150,21 @@ function rerouteWithPolicy(
   const newTerminalRerouteCount =
     (consumerStep.terminal_reroute_count ?? 0) +
     (rerouteMode === "terminal" ? 1 : 0);
+  // REROUTE-BUDGET: target_moved_reroute_count is a class-specific SUBSET
+  // counter (incremented only when the driving failure class is target_moved).
+  // It reconciles against the step.rerouted event stream's failureClass field,
+  // and is unchanged by every other reroute class.
+  const newTargetMovedRerouteCount =
+    currentTargetMovedReroutes + (isTargetMoved ? 1 : 0);
 
-  // Build bounded feedback for the producer
+  // Build bounded feedback for the producer. The budget label reflects the
+  // class being charged: target_moved reroutes read "(target-moved reroute
+  // N/<cap>)"; every other class keeps the shared "(reroute N/<max>)" label.
+  const budgetLabel = isTargetMoved
+    ? `target-moved reroute ${newTargetMovedRerouteCount}/${maxTargetMovedReroutes}`
+    : `reroute ${newRerouteCount}/${maxReroutes}`;
   const feedback =
-    `Reroute from "${consumerStep.step_id}" (reroute ${newRerouteCount}/${maxReroutes}). ` +
+    `Reroute from "${consumerStep.step_id}" (${budgetLabel}). ` +
     `Consumer failure: ${boundedReason}`;
 
   // (a) Re-pend producer: status=pending, retry_count UNCHANGED.
@@ -5062,20 +5187,23 @@ function rerouteWithPolicy(
   writeRerouteFeedbackContext(db, runId, targetStep, error);
 
   // (b) Reset consumer: status=waiting, retry_count=0, increment the general
-  //     counter and, for a terminal-class reroute, the dedicated gate-control
-  //     counter. Both counters update in the SAME statement as the
-  //     step.rerouted event's synchronous unit — atomic by construction.
-  //     Clear output and ownership so it looks like a fresh step.
+  //     counter and the class-specific subset counters. All counters update in
+  //     the SAME statement as the step.rerouted event's synchronous unit —
+  //     atomic by construction. Clear output and ownership so it looks like a
+  //     fresh step.
   db.prepare(
-    `UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, terminal_reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
-  ).run(newRerouteCount, newTerminalRerouteCount, consumerRowId);
+    `UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, terminal_reroute_count = ?, target_moved_reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
+  ).run(newRerouteCount, newTerminalRerouteCount, newTargetMovedRerouteCount, consumerRowId);
 
   // (c) Intermediate done steps are left untouched — advancePipeline will
   //     naturally re-pend the consumer after the producer completes.
 
   // Emit event. The event flags the reroute's class so consumers reconcile
-  // reroute_count == count(step.rerouted) and terminal_reroute_count ==
-  // count(step.rerouted where terminal === true).
+  // reroute_count == count(step.rerouted), terminal_reroute_count ==
+  // count(step.rerouted where terminal === true), and
+  // target_moved_reroute_count == count(step.rerouted where failureClass ===
+  // 'target_moved'). targetMovedRerouteCount/targetMovedBudget are always
+  // present so the counter and its effective cap are auditable.
   const wfId = getWorkflowId(runId);
   emitEvent({
     ts: new Date().toISOString(),
@@ -5084,20 +5212,26 @@ function rerouteWithPolicy(
     workflowId: wfId,
     stepId: consumerStepId,
     detail:
-      `Rerouted to ${targetStepId} (${newRerouteCount}/${maxReroutes}). ` +
+      `Rerouted to ${targetStepId} (${budgetLabel}). ` +
       `Consumer failure: ${rerouteReason}`,
     rerouteMode,
     terminal: rerouteMode === "terminal",
+    failureClass,
+    targetMovedRerouteCount: newTargetMovedRerouteCount,
+    targetMovedBudget: maxTargetMovedReroutes,
   });
 
   logger.info(
-    `Step rerouted: ${consumerStepId} → ${targetStepId} (${newRerouteCount}/${maxReroutes})`,
+    `Step rerouted: ${consumerStepId} → ${targetStepId} (${budgetLabel})`,
     {
       runId,
       fromStep: consumerStepId,
       toStep: targetStepId,
       rerouteCount: newRerouteCount,
       budget: maxReroutes,
+      targetMovedRerouteCount: newTargetMovedRerouteCount,
+      targetMovedBudget: maxTargetMovedReroutes,
+      failureClass,
       reason: rerouteReason,
     },
   );
@@ -5407,6 +5541,7 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
     // Falls through to normal run failure on budget exhaustion,
     // invalid target, or when no retry_step is declared.
     let terminalRerouteLimitExhausted = false;
+    let targetMovedBudgetExhausted = false;
     try {
       const policy = await getOnFailPolicy(step.run_id, step.step_id);
       const rerouteMode = getFailureRerouteMode(error, policy);
@@ -5426,6 +5561,15 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
         // Spec error: retry_step targets a downstream or unknown step.
         // Fail the run with a clear message so the bug is visible.
         error = `Run failed: step "${step.step_id}" declares on_fail.retry_step "${policy?.retry_step ?? "?"}" which is not a valid upstream step (must have lower step_index).`;
+        logger.error(error, { runId: step.run_id, stepId: step.step_id });
+      }
+      if (rerouteResult === "target_moved_exhausted") {
+        // REROUTE-BUDGET (NPF-3): the stale-tip budget is spent. Replace the
+        // raw refusal with a legible, greppable reason so the terminal block
+        // below writes FAILURE_CLASS: target_moved_exhausted to steps.output
+        // and to the step.failed / run.failed events verbatim.
+        targetMovedBudgetExhausted = true;
+        error = buildTargetMovedExhaustedReason(stepId, policy, error);
         logger.error(error, { runId: step.run_id, stepId: step.step_id });
       }
       // budget_exhausted falls through to normal failure below
@@ -5448,7 +5592,7 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
       event: "run.failed",
       runId: step.run_id,
       workflowId: wfId2,
-      detail: terminalRerouteLimitExhausted ? error : "Step retries exhausted",
+      detail: terminalRerouteLimitExhausted || targetMovedBudgetExhausted ? error : "Step retries exhausted",
     });
     scheduleRunCronTeardown(step.run_id);
     finalizeDrainingPause(step.run_id);
@@ -5688,7 +5832,7 @@ function rerouteStepSync(
   consumerStepId: string,
   consumerRowId: string,
   error: string,
-): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
+): "rerouted" | "budget_exhausted" | "target_moved_exhausted" | "invalid_target" | "not_found" {
   const policy = getOnFailPolicySync(runId, consumerStepId);
   if (!policy?.retry_step) return "not_found";
   return rerouteWithPolicy(policy, runId, consumerStepId, consumerRowId, error);

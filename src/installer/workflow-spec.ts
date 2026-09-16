@@ -4,7 +4,12 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { WorkflowSpec } from "./types.js";
 
-const VALID_ON_FAIL_KEYS = new Set(["retry_step", "max_reroutes", "retry_on"]);
+const VALID_ON_FAIL_KEYS = new Set([
+  "retry_step",
+  "max_reroutes",
+  "max_target_moved_reroutes",
+  "retry_on",
+]);
 
 /**
  * Allowed values for a step's `type` field. Absent type defaults to
@@ -14,7 +19,8 @@ const VALID_STEP_TYPES = new Set(["single", "loop", "conditional"]);
 
 /**
  * Validates on_fail blocks on every step:
- * - Rejects unknown keys (only retry_step, max_reroutes, retry_on are valid).
+ * - Rejects unknown keys (only retry_step, max_reroutes,
+ *   max_target_moved_reroutes, retry_on are valid).
  * - Enforces the M4 attestation rule: if a step has on_fail.retry_step, it must
  *   match the nearest upstream step whose input template contains TESTED_TREE
  *   (the attesting step).
@@ -35,7 +41,7 @@ function validateOnFail(
     for (const key of Object.keys(onFail)) {
       if (!VALID_ON_FAIL_KEYS.has(key)) {
         throw new Error(
-          `workflow.yml step[${i}] ("${stepId}") on_fail in ${workflowDir} contains unknown key: "${key}". Valid keys are: retry_step, max_reroutes, retry_on.`,
+          `workflow.yml step[${i}] ("${stepId}") on_fail in ${workflowDir} contains unknown key: "${key}". Valid keys are: retry_step, max_reroutes, max_target_moved_reroutes, retry_on.`,
         );
       }
     }
@@ -90,6 +96,30 @@ function validateRetryOn(
   ) {
     throw new Error(
       `workflow.yml step[${stepIndex}] ("${String(step.id)}") on_fail.retry_on in ${workflowDir} must be an array of non-empty strings`,
+    );
+  }
+}
+
+/**
+ * REROUTE-BUDGET (NPF-3): `on_fail.max_target_moved_reroutes` caps how many
+ * FAILURE_CLASS target_moved (stale-tip) reroutes a step may take on its own
+ * budget. When present it must be a positive integer; omitting it is valid and
+ * leaves the runtime default (16) in effect.
+ */
+function validateMaxTargetMovedReroutes(
+  step: Record<string, unknown>,
+  stepIndex: number,
+  workflowDir: string,
+): void {
+  if (!step.on_fail || typeof step.on_fail !== "object") return;
+
+  const value = (step.on_fail as Record<string, unknown>)
+    .max_target_moved_reroutes;
+  if (value === undefined) return;
+
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error(
+      `workflow.yml step[${stepIndex}] ("${String(step.id)}") on_fail.max_target_moved_reroutes in ${workflowDir} must be a positive integer`,
     );
   }
 }
@@ -183,6 +213,7 @@ function parseAndValidateWorkflowSpec(
       );
     }
     validateRetryOn(step, i, workflowDir);
+    validateMaxTargetMovedReroutes(step, i, workflowDir);
   }
 
   // Validate on_fail blocks after all steps are parsed (needed for M4 attestation rule)

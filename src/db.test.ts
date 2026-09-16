@@ -632,6 +632,7 @@ describe("stories abandoned_count migration", () => {
     assert.ok(stepCols.has("abandoned_count"), "steps.abandoned_count should exist");
     assert.ok(stepCols.has("reroute_count"), "steps.reroute_count should exist");
     assert.ok(stepCols.has("terminal_reroute_count"), "steps.terminal_reroute_count should exist");
+    assert.ok(stepCols.has("target_moved_reroute_count"), "steps.target_moved_reroute_count should exist");
 
     const storyCols = columnNames(db, "stories");
     assert.ok(storyCols.has("id"), "stories.id should exist");
@@ -1197,7 +1198,7 @@ describe("TIME-STORAGE instant migration (v10)", () => {
     }).trim();
   }
 
-  // Boot the full current schema at v10 through the real getDb()/applySchema
+  // Boot the full current schema at v11 through the real getDb()/applySchema
   // path, so the fixture shapes are exactly production shapes.
   function bootCurrentSchema(th: { homeDir: string }, dbPath: string): void {
     runInSubprocess(
@@ -1209,7 +1210,7 @@ describe("TIME-STORAGE instant migration (v10)", () => {
 
   // Seed a fixture that mixes naive, ISO-Z, offset, NULL, empty and
   // non-timestamp values across every table/column in the migration map, then
-  // rewind user_version to the pre-v10 value so getDb() takes the migration
+  // rewind user_version to the pre-v11 value so getDb() takes the migration
   // path. medic_checks is created here (it is NOT created by applySchema) to
   // prove an existing medic_checks.checked_at is normalized too.
   function seedMixedFixture(dbPath: string): void {
@@ -1305,8 +1306,8 @@ console.log(JSON.stringify({ version, rows }));
     }
   });
 
-  it("SCHEMA_VERSION is 10 (the v10 instant-normalization bump)", () => {
-    assert.equal(SCHEMA_VERSION, 10, "SCHEMA_VERSION must be 10 for the instant migration");
+  it("SCHEMA_VERSION is 11 (v10 instant-normalization + v11 target-moved reroute budget)", () => {
+    assert.equal(SCHEMA_VERSION, 11, "SCHEMA_VERSION must be 11 after the target_moved_reroute_count bump");
   });
 
   it("mixed-format fixture: rewrites every naive instant, leaves ISO-Z/offset/NULL/other values byte-identical", () => {
@@ -3723,6 +3724,210 @@ describe("MIGV upgrade path (pre-WLST5 DB → current)", () => {
     assert.equal(migrated.row.instant_fail_count, 0, "legacy row gets instant_fail_count = 0 via DEFAULT");
     assert.equal(migrated.row.worker_lost_count, 3, "existing WLST5 counters untouched");
     assert.equal(migrated.row.ceiling_expiry_count, 0, "existing WLST5 counters untouched");
+  });
+});
+
+describe("REROUTE-BUDGET steps.target_moved_reroute_count migration (v11)", () => {
+  // REROUTE-BUDGET US-001: steps gains target_moved_reroute_count
+  // (INTEGER DEFAULT 0) via a guarded idempotent ALTER, with SCHEMA_VERSION
+  // bumped (v10 → v11). Without the bump, existing v10 DBs early-return from
+  // migrate() and skip the ALTER, so any SQL touching the new column crashes
+  // with "no such column: target_moved_reroute_count" (the WLST5.1 failure
+  // mode). This fixture pins exactly that broken pre-bump state.
+
+  // The pre-bump version is the literal v10, NOT SCHEMA_VERSION - 1: deriving
+  // it from SCHEMA_VERSION would let the test pass on unbumped code (fixture
+  // at v9, migrate() still runs because 9 !== 10) and miss the very
+  // regression it exists to catch.
+  const PRE_REROUTE_BUDGET_SCHEMA_VERSION = 10;
+
+  // v10 runs/steps/stories schema: identical to the pre-bump shape except
+  // steps lacks target_moved_reroute_count.
+  const LEGACY_V10_DDL = `
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      run_number INTEGER,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      notify_url TEXT,
+      scheduling_status TEXT,
+      scheduling_requested_at TEXT,
+      scheduling_error TEXT,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      parent_run_id TEXT,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      input_template TEXT NOT NULL,
+      expects TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      claim_job_id TEXT,
+      claim_pid INTEGER,
+      claim_pgid INTEGER,
+      claim_updated_at TEXT,
+      reroute_count INTEGER DEFAULT 0,
+      terminal_reroute_count INTEGER DEFAULT 0,
+      ledger_concession_count INTEGER DEFAULT 0,
+      claim_invalidated_by TEXT,
+      conditional_condition TEXT,
+      auto_completed INTEGER NOT NULL DEFAULT 0,
+      auto_complete_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE stories (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      story_index INTEGER NOT NULL,
+      story_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      abandoned_count INTEGER DEFAULT 0,
+      resume_reset_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO runs (
+      id, run_number, workflow_id, task, status, context, tokens_spent,
+      worker_lost_count, ceiling_expiry_count, instant_fail_count,
+      created_at, updated_at
+    ) VALUES (
+      'legacy-run', 1, 'workflow', 'task', 'running', '{}', 0, 0, 0, 0,
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+    INSERT INTO steps (
+      id, run_id, step_id, agent_id, step_index, input_template, expects,
+      status, reroute_count, terminal_reroute_count, created_at, updated_at
+    ) VALUES (
+      'legacy-step', 'legacy-run', 'finalize_merge', 'developer', 0, '', '{}',
+      'waiting', 2, 1, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+  `;
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  function runInSubprocess(th: { homeDir: string }, dbPath: string, script: string): string {
+    return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    }).trim();
+  }
+
+  const INSPECT_SCRIPT = [
+    `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "db.js"))};`,
+    "const db = getDb();",
+    'const col = db.prepare("PRAGMA table_info(steps)").all().find((c) => c.name === "target_moved_reroute_count");',
+    'const ver = db.prepare("PRAGMA user_version").get();',
+    'const step = db.prepare("SELECT id, reroute_count, terminal_reroute_count, target_moved_reroute_count FROM steps WHERE id = ?").get("legacy-step");',
+    // The exact SELECT from src/installer/status.ts over runs — must not throw.
+    'const row = db.prepare("SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?").get("legacy-run");',
+    "console.log(JSON.stringify({ col, user_version: ver.user_version, schemaVersion: SCHEMA_VERSION, step, row }));",
+  ].join("\n");
+
+  it("migrates a pre-REROUTE-BUDGET v10 DB: adds target_moved_reroute_count, re-stamps version, status SELECT works", () => {
+    const th = createTempHome("tamandua-migv-reroute-budget-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V10_DDL}
+      PRAGMA user_version = ${PRE_REROUTE_BUDGET_SCHEMA_VERSION};
+    `);
+    // Sanity: the legacy DB really is in the pre-bump broken state.
+    const preStepCols = legacyDb.prepare("PRAGMA table_info(steps)").all() as Array<{ name: string }>;
+    assert.ok(preStepCols.some((c) => c.name === "terminal_reroute_count"),
+      "precondition: legacy steps has terminal_reroute_count");
+    assert.ok(!preStepCols.some((c) => c.name === "target_moved_reroute_count"),
+      "precondition: legacy steps lacks target_moved_reroute_count");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, PRE_REROUTE_BUDGET_SCHEMA_VERSION,
+      "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, INSPECT_SCRIPT)) as {
+      col?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+      schemaVersion: number;
+      step: {
+        id: string;
+        reroute_count: number;
+        terminal_reroute_count: number;
+        target_moved_reroute_count: number;
+      };
+      row: { id: string };
+    };
+
+    assert.ok(parsed.col, "target_moved_reroute_count column should be added by migration");
+    assert.equal(parsed.col.type, "INTEGER");
+    assert.equal(parsed.col.notnull, 0, "target_moved_reroute_count is nullable, matching reroute_count");
+    assert.equal(parsed.col.dflt_value, "0", "target_moved_reroute_count should default to 0");
+    assert.equal(parsed.user_version, SCHEMA_VERSION,
+      `user_version should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
+    assert.equal(parsed.step.target_moved_reroute_count, 0,
+      "legacy step row gets target_moved_reroute_count = 0 via DEFAULT");
+    assert.equal(parsed.step.reroute_count, 2, "existing reroute_count untouched");
+    assert.equal(parsed.step.terminal_reroute_count, 1, "existing terminal_reroute_count untouched");
+    assert.equal(parsed.row.id, "legacy-run", "status SELECT over runs still works");
+  });
+
+  it("re-opening an already-migrated DB is idempotent and does not error", () => {
+    const th = createTempHome("tamandua-migv-reroute-budget-idem-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V10_DDL}
+      PRAGMA user_version = ${PRE_REROUTE_BUDGET_SCHEMA_VERSION};
+    `);
+    legacyDb.close();
+
+    const first = JSON.parse(runInSubprocess(th, dbPath, INSPECT_SCRIPT)) as {
+      col?: { name: string };
+      user_version: number;
+      step: { target_moved_reroute_count: number };
+    };
+    assert.ok(first.col, "first open adds the column");
+    assert.equal(first.user_version, SCHEMA_VERSION, "first open re-stamps the version");
+
+    // A second fresh process on the same file must not error and must leave
+    // the column/version intact.
+    const second = JSON.parse(runInSubprocess(th, dbPath, INSPECT_SCRIPT)) as {
+      col?: { name: string };
+      user_version: number;
+      step: { target_moved_reroute_count: number };
+    };
+    assert.ok(second.col, "second open leaves the column present");
+    assert.equal(second.user_version, SCHEMA_VERSION, "second open keeps the version stamped");
+    assert.equal(second.step.target_moved_reroute_count, 0, "second open preserves the defaulted value");
   });
 });
 

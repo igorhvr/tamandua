@@ -18,6 +18,11 @@ const EVENT_LABELS: Record<string, string> = {
   "step.timeout": "Step timed out",
   "step.respawned": "Step respawned",
   "step.rerouted": "Step rerouted",
+  "step.reroute_budget_exhausted": "Reroute budget exhausted",
+  // REROUTE-BUDGET (NPF-3): stale-tip (target_moved) reroutes have their own
+  // budget, so their exhaustion gets its own label — operators can tell
+  // landing contention from ordinary shared-budget exhaustion at a glance.
+  "step.target_moved_reroute_exhausted": "Target-moved reroute budget exhausted",
   "story.started": "Story started",
   "story.done": "Story done",
   "story.verified": "Story verified",

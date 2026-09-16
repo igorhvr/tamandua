@@ -105,7 +105,11 @@ describe("SPL2 merge-branch command module", () => {
     assert.match(help, /multiple worktrees/i);
     assert.match(help, /invalid or ambiguous worktree metadata/i);
     assert.match(help, /operation in progress/i);
-    assert.match(help, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| not-applicable \| parked:branch>/);
+    assert.match(help, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| no-checkout-to-refresh \| checkout-not-at-tip \| parked:branch>/);
+    assert.match(help, /TARGET_TIP_BEFORE: <sha>/);
+    assert.match(help, /TARGET_TIP_AFTER: <sha>/);
+    assert.match(help, /no-checkout-to-refresh[\s\S]*No usable target checkout/i);
+    assert.match(help, /checkout-not-at-tip[\s\S]*is not at the target tip/i);
     assert.match(help, /PARKED_BRANCH: <branch>/);
     assert.match(help, /PARKED_REASON: <local-changes \| advance-refused: detail>/);
     assert.doesNotMatch(help, /Operator remedy/i);
@@ -125,7 +129,10 @@ describe("SPL2 merge-branch command module", () => {
     assert.match(documentation, /clean[\s\S]*CHECKOUT_REFRESH: refreshed/i);
     assert.match(documentation, /dirty[\s\S]*CHECKOUT_REFRESH: parked:<backup-branch>/i);
     assert.match(documentation, /no-op[\s\S]*CHECKOUT_REFRESH: already-coherent/i);
-    assert.match(documentation, /unowned[\s\S]*CHECKOUT_REFRESH: not-applicable/i);
+    assert.match(documentation, /unowned[\s\S]*CHECKOUT_REFRESH: no-checkout-to-refresh/i);
+    assert.match(documentation, /TARGET_TIP_BEFORE/);
+    assert.match(documentation, /TARGET_TIP_AFTER/);
+    assert.match(documentation, /checkout-not-at-tip/);
     assert.match(documentation, /multiple worktrees[\s\S]*invalid or ambiguous[\s\S]*operation in progress/i);
     assert.doesNotMatch(documentation, /Operator remedy/i);
     assert.doesNotMatch(documentation, /(?:detach|manually switch|manual(?:ly)? reset|edit (?:worktree )?metadata|direct(?:ly)? rewrite refs)/i);
@@ -134,7 +141,8 @@ describe("SPL2 merge-branch command module", () => {
     assert.match(readmeAtomicLanding, /clean[\s\S]*refreshed/i);
     assert.match(readmeAtomicLanding, /dirty[\s\S]*parked/i);
     assert.match(readmeAtomicLanding, /no-op[\s\S]*already-coherent/i);
-    assert.match(readmeAtomicLanding, /unowned[\s\S]*not-applicable/i);
+    assert.match(readmeAtomicLanding, /unowned[\s\S]*no-checkout-to-refresh/i);
+    assert.match(readmeAtomicLanding, /TARGET_TIP_BEFORE[\s\S]*TARGET_TIP_AFTER/i);
     assert.doesNotMatch(readmeAtomicLanding, /any checked-out target is refused/i);
     assert.doesNotMatch(readmeAtomicLanding, /(?:detach|manually switch|manual(?:ly)? reset|edit (?:worktree )?metadata|direct(?:ly)? rewrite refs)/i);
   });
@@ -142,6 +150,10 @@ describe("SPL2 merge-branch command module", () => {
   it("limits successful merge event checkout outcomes to truthful values", () => {
     const eventTypes = readFileSync(join(process.cwd(), "src/installer/events.ts"), "utf8");
     assert.match(eventTypes, /`parked:\$\{string\}`/);
+    assert.match(eventTypes, /"no-checkout-to-refresh"/);
+    assert.match(eventTypes, /"checkout-not-at-tip"/);
+    assert.match(eventTypes, /targetTipBefore\?: string;/);
+    assert.match(eventTypes, /targetTipAfter\?: string;/);
     assert.match(eventTypes, /parkedBranch\?: string;/);
     assert.match(eventTypes, /parkedReason\?: string;/);
     assert.doesNotMatch(eventTypes, /skipped:/);

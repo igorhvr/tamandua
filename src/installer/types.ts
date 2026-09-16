@@ -33,6 +33,12 @@ export type WorkflowStepFailure = {
   retry_step?: string;
   max_retries?: number;
   max_reroutes?: number;
+  /**
+   * REROUTE-BUDGET (NPF-3): separate budget for FAILURE_CLASS target_moved
+   * (stale-tip) reroutes. Stale-tip refusals do not consume `max_reroutes`;
+   * they are capped by this field instead. Defaults to 16 when absent.
+   */
+  max_target_moved_reroutes?: number;
   /** Failure classes explicitly eligible for this reroute policy. */
   retry_on?: string[];
 };

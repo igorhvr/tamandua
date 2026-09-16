@@ -80,7 +80,9 @@ Machine-readable results:
   MERGED_COMMIT: <sha>
   MERGED_TREE: <tree-sha>
   TARGET: refs/heads/<target-ref>
-  CHECKOUT_REFRESH: <refreshed | already-coherent | not-applicable | parked:branch>
+  TARGET_TIP_BEFORE: <sha>   The verified --expect-tip this landing was based on
+  TARGET_TIP_AFTER: <sha>    Live refs/heads/<target-ref> tip re-read before reporting
+  CHECKOUT_REFRESH: <refreshed | already-coherent | no-checkout-to-refresh | checkout-not-at-tip | parked:branch>
   SIGNING: <signed | unsigned | unsigned-matchlock>
   PARKED_BRANCH: <branch> (parked outcomes only)
   PARKED_REASON: <local-changes | advance-refused: detail> (parked outcomes only)
@@ -98,10 +100,11 @@ Commit signing outcomes:
                      configured: signing keys are never projected into the guest
 
 Checkout refresh outcomes:
-  refreshed          A clean attached target was advanced in place and remains attached
-  already-coherent   An attached no-op target was already coherent at the target tip
-  not-applicable     Origin is bare or the target branch is not checked out anywhere
-  parked:<branch>    The target landed while its prior checkout stayed safely on <branch>
+  refreshed              A clean attached target was advanced in place and remains attached
+  already-coherent       An attached no-op target's live checkout HEAD equals the target tip
+  no-checkout-to-refresh No usable target checkout was found to verify or refresh
+  checkout-not-at-tip    A live target checkout was read and is not at the target tip
+  parked:<branch>        The target landed while its prior checkout stayed safely on <branch>
 
 Checked-out target safety — managed parking:
   Tamandua discovers target ownership from strict git worktree list --porcelain -z
@@ -155,7 +158,7 @@ export function handleMergeBranch(group: string, args: string[]): boolean {
     ...(runId !== undefined ? { runId } : {}),
   });
   if (result.status === "landed") {
-    let output = `STATUS: landed\nNOOP: ${result.noop}\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\nSIGNING: ${result.signing}\n`;
+    let output = `STATUS: landed\nNOOP: ${result.noop}\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nTARGET_TIP_BEFORE: ${result.targetTipBefore}\nTARGET_TIP_AFTER: ${result.targetTipAfter}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\nSIGNING: ${result.signing}\n`;
     if (result.checkoutRefresh.startsWith("parked:")) {
       output += `PARKED_BRANCH: ${result.parkedBranch}\nPARKED_REASON: ${result.parkedReason}\n`;
     }

@@ -24,10 +24,25 @@ export const MAX_ROTATED_EVENTS_FILES = 3;
 
 // ── Types ────────────────────────────────────────────────────────────
 
+/**
+ * NPF-1 (REROUTE-BUDGET): the landing report states only what was actually
+ * verified about a checkout of the target branch.
+ *
+ * - `refreshed`                 a clean attached owner was advanced in place
+ * - `already-coherent`          a live owner HEAD was read and equals the target tip
+ * - `checkout-not-at-tip`       a live owner HEAD was read and differs from the target tip
+ * - `no-checkout-to-refresh`    no usable owner checkout exists to verify
+ * - `parked:<branch>`           the landing parked the prior checkout on <branch>
+ *
+ * The old unverified label is gone: it claimed a checkout state without
+ * inspecting one (a no-op could report it while, in fact, a stale-metadata
+ * owner checkout existed).
+ */
 export type CheckoutRefreshOutcome =
   | "refreshed"
   | "already-coherent"
-  | "not-applicable"
+  | "no-checkout-to-refresh"
+  | "checkout-not-at-tip"
   | `parked:${string}`;
 
 export interface TamanduaEvent {
@@ -201,6 +216,16 @@ export interface TamanduaEvent {
   actualTip?: string;
   mergedTree?: string;
   mergedCommit?: string;
+  /**
+   * NPF-1 (US-007): the verified CAS tip (the caller's --expect-tip) the
+   * landed result was based on. Present on merge.landed events.
+   */
+  targetTipBefore?: string;
+  /**
+   * NPF-1 (US-007): the live refs/heads/<target> tip re-read immediately
+   * before the landed result was reported. Present on merge.landed events.
+   */
+  targetTipAfter?: string;
   noop?: boolean;
   checkoutRefresh?: CheckoutRefreshOutcome;
   parkedBranch?: string;
@@ -221,6 +246,19 @@ export interface TamanduaEvent {
    */
   rerouteMode?: string;
   terminal?: boolean;
+  /**
+   * REROUTE-BUDGET (NPF-3): present on step.rerouted and the reroute-budget
+   * exhaustion events. failureClass is the parsed FAILURE_CLASS of the driving
+   * reason (or null when the reason carries none). targetMovedRerouteCount is
+   * the durable steps.target_moved_reroute_count AFTER the reroute (the
+   * class-specific subset counter), and targetMovedBudget is the effective cap
+   * it is compared against (on_fail.max_target_moved_reroutes, default 16).
+   * These fields let consumers reconcile target_moved_reroute_count ==
+   * count(step.rerouted where failureClass === 'target_moved').
+   */
+  failureClass?: string | null;
+  targetMovedRerouteCount?: number;
+  targetMovedBudget?: number;
   // Mechanical output-contract evidence (O11). These fields describe the
   // validator/lifecycle decision only; submitted output and rendered prompts
   // are deliberately excluded.

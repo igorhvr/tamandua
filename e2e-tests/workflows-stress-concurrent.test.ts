@@ -701,8 +701,8 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           const outputRefresh = mergeOutput.match(/^CHECKOUT_REFRESH: (.+)$/m)?.[1];
           assert.equal(
             outputRefresh,
-            "not-applicable",
-            `feature-${i + 1}: detached origin should report CHECKOUT_REFRESH not-applicable, got ${outputRefresh}`,
+            "no-checkout-to-refresh",
+            `feature-${i + 1}: detached origin should report CHECKOUT_REFRESH no-checkout-to-refresh, got ${outputRefresh}`,
           );
           const mergeEvents = fs
             .readFileSync(path.join(runEnv.env.tamanduaDir, "events", `${rid}.jsonl`), "utf-8")
@@ -723,7 +723,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           assert.equal(mergeEvents.filter((event) => event.event === "merge.conflicts").length, 0);
           assert.equal(landedEvents[0].mergedCommit, mergedCommit);
           assert.equal(landedEvents[0].mergedTree, mergedTree);
-          assert.equal(landedEvents[0].checkoutRefresh, "not-applicable");
+          assert.equal(landedEvents[0].checkoutRefresh, "no-checkout-to-refresh");
           assert.ok(targetLandingCommits.has(mergedCommit));
           eventLandingCommits.add(mergedCommit);
           for (const event of movedEvents) {
