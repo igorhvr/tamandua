@@ -54,9 +54,10 @@ describe("US-004 step-ops writers: comment-blind source scan", () => {
   it("interpolates SQL_NOW_ISO exactly once per former datetime('now') writer", () => {
     const code = stripComments(readStepOps());
     const interpolations = code.match(/\$\{SQL_NOW_ISO\}/g) ?? [];
-    // 124 total occurrences across 121 source lines (3 lines carry two:
-    // claim_updated_at + updated_at).
-    assert.equal(interpolations.length, 124, "every former datetime('now') writer must interpolate SQL_NOW_ISO");
+    // 127 total occurrences across 124 source lines (3 lines carry two:
+    // claim_updated_at + updated_at). Up from 124 when the PKIL
+    // paused_by_operator recovery branches added 3 updated_at writers.
+    assert.equal(interpolations.length, 127, "every former datetime('now') writer must interpolate SQL_NOW_ISO");
   });
 
   it("never leaves a SQL_NOW_ISO interpolation inside a double-quoted string", () => {
@@ -95,18 +96,20 @@ describe("US-004 step-ops writers: comment-blind source scan", () => {
   });
 
   it("preserves the writer distribution of the naive-instant baseline", () => {
-    // Parent baseline: 124 datetime('now') occurrences = 119 updated_at
-    // assignments, 3 claim_updated_at assignments co-located with 3 of those
-    // updated_at assignments, and 2 story_abandonments created_at inserts.
+    // Parent baseline: 127 SQL_NOW_ISO occurrences = 122 updated_at
+    // assignments (including the 3 PKIL paused_by_operator recovery writers
+    // added on top of the original 119), 3 claim_updated_at assignments
+    // co-located with 3 of those updated_at assignments, and 2
+    // story_abandonments created_at inserts.
     const code = stripComments(readStepOps());
     const totalInterpolations = code.match(/\$\{SQL_NOW_ISO\}/g) ?? [];
     const claimUpdated = code.match(/claim_updated_at = \$\{SQL_NOW_ISO\}/g) ?? [];
     const createdInserts = code.match(/created_at\) VALUES \([^)]*\$\{SQL_NOW_ISO\}/g) ?? [];
     const updatedAt = code.match(/updated_at = \$\{SQL_NOW_ISO\}/g) ?? []; // includes claim_updated_at
-    assert.equal(totalInterpolations.length, 124);
+    assert.equal(totalInterpolations.length, 127);
     assert.equal(claimUpdated.length, 3);
     assert.equal(createdInserts.length, 2);
-    assert.equal(updatedAt.length, 122);
+    assert.equal(updatedAt.length, 125);
   });
 
 });

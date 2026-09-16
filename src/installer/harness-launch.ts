@@ -12,15 +12,18 @@
  *    SIGNAL-scope ruleset to itself, reports READY over a private control
  *    fd, and only execs the harness after the parent releases it.
  *  - macOS   -> /usr/bin/sandbox-exec -p <seatbelt profile> /bin/sh: the
- *    bridge shell exports TAMANDUA_WORKER_PGID, performs the same private
- *    READY/release handshake on fd 3, then execs the harness.
+ *    bridge shell exports TAMANDUA_WORKER_PGID and TAMANDUA_WORKER_PID,
+ *    performs the same private READY/release handshake on fd 3, then execs
+ *    the harness.
  *
  * The setup child is always a FRESH process in its own detached process
  * group; it self-restricts and then execs the existing `/bin/sh` PGID
- * wrapper (`export TAMANDUA_WORKER_PGID="$$"; exec "$0" "$@"`, double-dollar
- * expansion preserved verbatim) so pid/pgid/TAMANDUA_WORKER_PGID identity is
+ * wrapper (`export TAMANDUA_WORKER_PGID="$$"; export TAMANDUA_WORKER_PID="$$";
+ * exec "$0" "$@"`, double-dollar expansion preserved verbatim) so
+ * pid/pgid/TAMANDUA_WORKER_PGID/TAMANDUA_WORKER_PID identity is
  * preserved across exec exactly as before — no extra supervisor shell stays
- * in the ancestry, and the shared daemon is never sandboxed.
+ * in the ancestry, and the shared daemon is never sandboxed. CPID2: the
+ * worker pid exported here is what `step claim` records in `claim_pid`.
  *
  * Non-negotiable launch/fallback contract (see the KHYG task):
  *  - A setup child that never receives release can never have executed the
@@ -79,19 +82,23 @@ export const SETUP_READY_WALL_MS = 10_000;
  * with detached:true the spawned child is its own group leader, so $$ (the
  * shell pid, preserved across exec) equals the process-group id. The claim
  * CLI prefers TAMANDUA_WORKER_PGID over self-detected PGID, which on macOS
- * would otherwise pick up the transient tool-call subshell.
+ * would otherwise pick up the transient tool-call subshell. CPID2: the same
+ * $$ is exported as TAMANDUA_WORKER_PID so `step claim` records the harness
+ * worker pid (never the daemon pid).
  */
-const PGID_SHELL_WRAPPER = `export TAMANDUA_WORKER_PGID="$$"; exec "$0" "$@"`;
+const PGID_SHELL_WRAPPER = `export TAMANDUA_WORKER_PGID="$$"; export TAMANDUA_WORKER_PID="$$"; exec "$0" "$@"`;
 
 /**
- * macOS seatbelt bridge wrapper: the same PGID export plus the private
- * control-channel handshake, because sandbox-exec has no native readiness
- * signal. Runs INSIDE the sandbox (sandbox-exec execs /bin/sh, which execs
- * the harness — no extra process stays in the ancestry). Exit 125 on any
- * pre-release failure matches the landlock helper's setup-failure code.
+ * macOS seatbelt bridge wrapper: the same PGID/worker-pid exports plus the
+ * private control-channel handshake, because sandbox-exec has no native
+ * readiness signal. Runs INSIDE the sandbox (sandbox-exec execs /bin/sh,
+ * which execs the harness — no extra process stays in the ancestry). Exit
+ * 125 on any pre-release failure matches the landlock helper's
+ * setup-failure code.
  */
 const SEATBELT_BRIDGE_WRAPPER =
   `export TAMANDUA_WORKER_PGID="$$"; ` +
+  `export TAMANDUA_WORKER_PID="$$"; ` +
   `printf "READY mode=seatbelt\\n" >&3 || exit 125; ` +
   `IFS= read -r __tamandua_release <&3 || exit 125; ` +
   `[ "$__tamandua_release" = "GO" ] || exit 125; ` +

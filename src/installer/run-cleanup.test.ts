@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { sweepRunProcesses } from "../../dist/installer/run-cleanup.js";
+import { matchRunEvidence, sweepRunProcesses } from "../../dist/installer/run-cleanup.js";
 import type { RunCleanupResult } from "../../dist/installer/run-cleanup.js";
 import { readEventsFromCursor, emitEvent, type TamanduaEvent } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
@@ -267,6 +267,140 @@ describe("run-cleanup", () => {
 
       const exited = await waitForExit(child, 2000);
       assert.ok(exited, "child should have exited after SIGKILL");
+    });
+  });
+
+  // ── Kill processes with exact TAMANDUA_RUN_ID=<runId> (DSWP) ─────
+
+  it("kills processes whose environ has an exact TAMANDUA_RUN_ID token", { skip: environUnreadable }, () => {
+    const unrelatedCwd = path.join(stateDir, "unrelated-run-marker");
+    fs.mkdirSync(unrelatedCwd, { recursive: true });
+
+    const child = spawn("sleep", ["30"], {
+      cwd: unrelatedCwd,
+      env: {
+        TAMANDUA_RUN_ID: "test-run-001",
+        PATH: process.env.PATH || "/usr/bin",
+      },
+      stdio: "ignore",
+    });
+    children.push(child);
+
+    return sleep(200).then(async () => {
+      const pid = child.pid!;
+      assert.ok(isAlive(pid), "child should be alive before sweep");
+
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath);
+      assert.ok(
+        result.killedPids.includes(pid),
+        `pid ${pid} with TAMANDUA_RUN_ID should be killed: killedPids=${JSON.stringify(result.killedPids)}`,
+      );
+      assert.equal(
+        result.evidence[pid],
+        "TAMANDUA_RUN_ID=test-run-001",
+        `evidence should name the exact run marker: ${JSON.stringify(result.evidence[pid])}`,
+      );
+
+      const exited = await waitForExit(child, 2000);
+      assert.ok(exited, "child should have exited after SIGKILL");
+    });
+  });
+
+  // ── matchRunEvidence with a null worktreePath (direct-mode) ───────
+
+  it("matchRunEvidence with null worktreePath skips path channels but keeps the run marker", { skip: environUnreadable }, () => {
+    const entry = {
+      cwd: "/outside/the/run",
+      environ: "PATH=/usr/bin\0TAMANDUA_RUN_ID=test-run-001\0",
+      cmdline: "sleep 30",
+    };
+    assert.equal(matchRunEvidence(entry, "test-run-001", null), "TAMANDUA_RUN_ID=test-run-001");
+    // A different run id does not match.
+    assert.equal(matchRunEvidence(entry, "other-run", null), null);
+  });
+
+  it("matchRunEvidence with null worktreePath still matches the cmdline run id", () => {
+    const entry = {
+      cwd: "/outside/the/run",
+      environ: null,
+      cmdline: "node harness.js --run-id test-run-001",
+    };
+    assert.equal(matchRunEvidence(entry, "test-run-001", null), "cmdline contains runId: test-run-001");
+  });
+
+  it("matchRunEvidence with null worktreePath ignores a cwd that would match the old path", () => {
+    // Even a process sitting under the caller's former worktree path is not
+    // matched by the (skipped) path channel when worktreePath is null.
+    const entry = {
+      cwd: fakeWorktreePath,
+      environ: null,
+      cmdline: "sleep 30",
+    };
+    assert.equal(matchRunEvidence(entry, "test-run-001", null), null);
+  });
+
+  // ── Pgid ownership (DSWP): owned group reaped, unrelated spared ──
+
+  it("sweepRunProcesses kills a process whose pgid is listed and spares an unrelated one", () => {
+    const ownedCwd = path.join(stateDir, "owned-pgid");
+    const unrelatedCwd = path.join(stateDir, "unrelated-pgid");
+    fs.mkdirSync(ownedCwd, { recursive: true });
+    fs.mkdirSync(unrelatedCwd, { recursive: true });
+
+    // detached:true makes the child its own process-group leader, so its
+    // pgid === its pid — the harness group shape the scheduler records.
+    const owned = spawn("sleep", ["30"], {
+      cwd: ownedCwd,
+      env: { PATH: process.env.PATH || "/usr/bin" },
+      stdio: "ignore",
+      detached: true,
+    });
+    const unrelated = spawn("sleep", ["30"], {
+      cwd: unrelatedCwd,
+      env: { PATH: process.env.PATH || "/usr/bin" },
+      stdio: "ignore",
+      detached: true,
+    });
+    children.push(owned, unrelated);
+
+    return sleep(300).then(async () => {
+      const ownedPid = owned.pid!;
+      const unrelatedPid = unrelated.pid!;
+      assert.ok(isAlive(ownedPid), "owned child should be alive before sweep");
+      assert.ok(isAlive(unrelatedPid), "unrelated child should be alive before sweep");
+
+      // No worktree path: the pgid channel alone must carry the sweep.
+      const result = sweepRunProcesses("test-run-001", null, { pgids: [ownedPid] });
+
+      assert.equal(result.worktreePath, null, "result should carry the null path");
+      assert.ok(
+        result.killedPids.includes(ownedPid),
+        `owned pgid ${ownedPid} should be killed: killedPids=${JSON.stringify(result.killedPids)}`,
+      );
+      assert.ok(
+        result.evidence[ownedPid]?.includes("pgid owned by run") &&
+          result.evidence[ownedPid]?.includes(String(ownedPid)),
+        `evidence should name the pgid: ${JSON.stringify(result.evidence[ownedPid])}`,
+      );
+      assert.ok(
+        !result.killedPids.includes(unrelatedPid),
+        `unrelated pid ${unrelatedPid} must not be killed: killedPids=${JSON.stringify(result.killedPids)}`,
+      );
+      assert.ok(isAlive(unrelatedPid), "unrelated process should still be alive after sweep");
+
+      const ownedExited = await waitForExit(owned, 2000);
+      assert.ok(ownedExited, "owned child should have exited after SIGKILL");
+
+      // The event detail records the path (null) and the owned pgids.
+      const runEventsFile = path.join(stateDir, "events", "test-run-001.jsonl");
+      const lines = fs.readFileSync(runEventsFile, "utf-8").trim().split("\n");
+      const lastEvent = JSON.parse(lines[lines.length - 1]) as TamanduaEvent;
+      const detail = JSON.parse(lastEvent.detail!);
+      assert.equal(detail.worktreePath, null);
+      assert.ok(
+        Array.isArray(detail.pgids) && detail.pgids.includes(ownedPid),
+        `event detail should list owned pgids: ${JSON.stringify(detail.pgids)}`,
+      );
     });
   });
 

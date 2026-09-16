@@ -277,9 +277,18 @@ describe("launch-time harness probe e2e (IFLB US-006)", () => {
         assert.match(text, /FAILURE_CLASS: harness_unavailable/, "workflow status must surface the keyline block");
         assert.match(text, /\nHARNESS: pi\n/, "workflow status must surface HARNESS: pi");
         assert.match(text, /STDERR_TAIL:/, "workflow status must surface the last STDERR_TAIL key");
+        // The daemon's background version check may have written an
+        // update-available status into the isolated state dir, so a non-update
+        // CLI command prints its environmental update warning on stderr. It is
+        // not part of the run's operator surface — strip it before asserting
+        // the keyline block is the LAST output.
+        const blockText = text
+          .split(/\r?\n/)
+          .filter((line) => !line.includes("A new version of tamandua is available"))
+          .join("\n");
         assert.ok(
-          text.trimEnd().endsWith("STDERR_TAIL:"),
-          `the keyline block must be the last output of workflow status, got tail: ${text.trimEnd().slice(-200)}`,
+          blockText.trimEnd().endsWith("STDERR_TAIL:"),
+          `the keyline block must be the last output of workflow status, got tail: ${blockText.trimEnd().slice(-200)}`,
         );
       } finally {
         await teardown(ctx);

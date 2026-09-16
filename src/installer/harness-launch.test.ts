@@ -110,8 +110,8 @@ function writeExecutable(filePath: string, content: string): void {
 
 /**
  * A fixture harness that appends one `x` line to `counterFile` per
- * execution, optionally writes TAMANDUA_WORKER_PGID/$$ forensics, prints a
- * marker to stdout, and exits `exitCode`.
+ * execution, optionally writes TAMANDUA_WORKER_PGID/TAMANDUA_WORKER_PID/$$
+ * forensics, prints a marker to stdout, and exits `exitCode`.
  */
 function makeCounterHarness(
   dir: string,
@@ -121,7 +121,7 @@ function makeCounterHarness(
   const p = path.join(dir, "counter-harness");
   const forensics =
     opts?.pgidForensicsFile !== undefined
-      ? `printf 'pgid=%s pid=%s\\n' "$TAMANDUA_WORKER_PGID" "$$" > "${opts.pgidForensicsFile}"\n`
+      ? `printf 'pgid=%s wpid=%s pid=%s\\n' "$TAMANDUA_WORKER_PGID" "$TAMANDUA_WORKER_PID" "$$" > "${opts.pgidForensicsFile}"\n`
       : "";
   const stdout = opts?.stdout ?? "HARNESS_OUT\n";
   writeExecutable(
@@ -515,12 +515,15 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
       assert.ok(done.stdout.includes("HARNESS_OUT"), "harness stdout must flow through");
 
       // PGID identity preserved across the helper -> /bin/sh -> harness exec
-      // chain: TAMANDUA_WORKER_PGID === $$ === pid === pgid.
+      // chain: TAMANDUA_WORKER_PGID === TAMANDUA_WORKER_PID === $$ ===
+      // pid === pgid. CPID2: the wrapper exports the worker pid so
+      // `step claim` records the harness pid, not the daemon pid.
       const pgidLine = fs.readFileSync(forensics, "utf8").trim();
-      const m = /^pgid=(\d+) pid=(\d+)$/.exec(pgidLine);
+      const m = /^pgid=(\d+) wpid=(\d+) pid=(\d+)$/.exec(pgidLine);
       assert.ok(m, `unexpected forensics: ${pgidLine}`);
       assert.equal(m![1], String(outcome.pid), "TAMANDUA_WORKER_PGID must equal the launcher pid");
-      assert.equal(m![2], String(outcome.pid), "harness pid must equal the launcher pid (exec preserved)");
+      assert.equal(m![2], String(outcome.pid), "TAMANDUA_WORKER_PID must equal the launcher pid");
+      assert.equal(m![3], String(outcome.pid), "harness pid must equal the launcher pid (exec preserved)");
       assert.equal(outcome.pgid, outcome.pid, "detached child must lead its own process group");
 
       // Durable mode record for the protected launch: mode + run identity + ts.

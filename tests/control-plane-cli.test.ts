@@ -115,13 +115,14 @@ function cleanStderr(stderr: string): string {
     .filter((line) => {
       if (line.includes("ExperimentalWarning") && line.includes("SQLite")) return false;
       if (line.includes("node --trace-warnings")) return false;
-      // The CLI's update banner is environment-dependent: the daemon's
-      // startup version check compares the checkout's HEAD against
-      // origin/main, and a feature worktree (or any checkout whose HEAD
-      // diverges from origin/main) legitimately reports an update
-      // available. That is unrelated to control-plane lifecycle output, so
-      // it must not fail these assertions.
-      if (line.includes("A new version of tamandua is available!")) return false;
+      // `control-plane start` spawns the daemon, which fire-and-forget runs a
+      // background version check and writes version-status.json into the
+      // (isolated) state dir. The resulting update warning is environmental
+      // (it depends on the checkout being behind origin) and races the
+      // subsequent `status`/`stop` CLI call, so it must not fail these
+      // stderr-clean assertions. The substring (without "!") also matches the
+      // punctuated banner variant.
+      if (line.includes("A new version of tamandua is available")) return false;
       return true;
     })
     .join("\n")

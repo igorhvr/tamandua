@@ -148,6 +148,17 @@ tokens (MOTOR-CONTRACT.md N1/N2). Per-(runId, agentId) in-memory
 
    tripwire: nothing writes to it anymore; tests assert it stays 0.
 
+**Claim ownership (CPID2).** `steps.claim_pid` records the HARNESS WORKER
+pid, never the scheduling daemon's pid. The scheduler exports the daemon pid
+as `TAMANDUA_DAEMON_PID` (used by the daemonctl self-stop guard) and the
+harness launch wrapper exports its own `$$` as `TAMANDUA_WORKER_PID`
+(pid === pgid for the detached group leader); `step claim` records the latter
+as `claim_pid` and the resolved harness group as `claim_pgid`, falling back to
+the resolved pgid when `TAMANDUA_WORKER_PID` is absent. `claim_job_id` is the
+dispatch round id. dead-owner detection (`recoverStepsWithDeadWorkers`, C18)
+and `step.respawned.priorPid` therefore refer to real harness processes. This
+was a semantics change only — no new column, no `SCHEMA_VERSION` bump.
+
 ### Control plane / run registration (busy harness workdir queueing)
 
 The daemon control plane (`src/server/control-server.ts`) admits at most one
@@ -202,6 +213,31 @@ other register-run failure remains fatal: missing/relative/nonexistent harness
 workdir, branch mismatch, unsupported harness, and malformed input still throw,
 are marked `scheduling_status = 'error'`, and return **422** — they never enter
 `waiting`.
+**Post-grace process sweep (DSWP).** The terminal-run sweep
+(`sweepRunProcesses` / `matchRunEvidence` in `src/installer/run-cleanup.ts`)
+identifies run-owned processes from several evidence channels: cwd under the
+recorded working path, environ containing that path, environ containing
+`TAMANDUA_WORKER_JOB_ID` with the runId, an exact `TAMANDUA_RUN_ID=<runId>`
+environ token (injected by the scheduler into every harness round), the run's
+recorded process-group ids (`options.pgids`, evidence `pgid owned by run:
+<pgid>`), and cmdline naming the path or runId. The recorded path is optional
+(`string | null`): `null` skips the path channels so a direct-mode run without
+a worktree remains sweepable via the run marker and pgids. Processes are only
+killed by pid after evidence matches — never by name or glob — and every reaped
+pid is logged with its evidence string; the `run.process_cleanup` event detail
+carries the (nullable) path and the swept `pgids`.
+
+A worktree is NOT required (DSWP part 2). `removeRunCrons` captures the run's
+`workingDirectoryForHarness` and in-flight harness child pgids before wiping
+`jobMetadata`/`inFlightChildren`, then schedules `runPostGraceSweep` (exported
+for tests) with that target. The sweep directory resolves captured working dir
+→ `getRunWorktree(runId)?.worktreePath` → `working_directory_for_harness`/`repo`
+from `runs.context`; owned pgids are the captured set plus every distinct
+non-null `steps.claim_pgid` for the run. If neither resolves, the sweep still
+runs with a null path (marker channel). This is why direct-mode runs (no
+`run_worktrees` row) are now swept too — the old "Sweep timer: no worktree
+found" early return is gone.
+
 **Round-outcome classification (PRAW).** Each dispatch round's *assistant*
 text is classified by `classifyWorkRoundOutcome` (via
 `parseWorkRoundMetadata` → `summarizeWorkRoundOutput`), and there is **no
@@ -231,6 +267,26 @@ refuses a run whose `status` is `paused` OR whose `scheduling_status` is
 at INFO with the runId/stepId and run/scheduling status. The guard is opt-in:
 the agent-issued CLI `tamandua step complete` path passes no such option, so a
 pause drain still lets in-flight agent work finish and report normally.
+
+**Paused recovery (PKIL).** A non-drain `run pause` kills the worker, but a
+pause is not a worker loss. `recoverOrphanedStepsForAgent` takes an
+`abandonReason`; `"paused_by_operator"` is a distinct recovery class that
+resets the running step (or loop step + its current story) to `pending`
+WITHOUT consuming any retry/abandon budget, leaves `runs.worker_lost_count`
+and `runs.ceiling_expiry_count` untouched, and emits `step.paused_kill`
+(carrying `exitCode`/`signal`/`stderrTail` forensics) rather than
+`step.worker_lost`; the `step.respawned` that follows carries
+`reason: "paused_by_operator"` and the unchanged retry value. The paused
+branch never runs the retry-exhaustion / `on_fail.retry_step` reroute logic,
+so a step already at `max_retries` still resets to pending and the run stays
+alive. US-005 wires the non-drain pause path to this class:
+`removeRunCrons(runId, { pausedByOperator: true })` — passed only by the
+non-drain `run pause` path — marks each in-flight dispatch round in a
+module-level registry before aborting/SIGTERMing it; `executeDispatchRound`
+reads and clears its own mark once the round settles and routes both recovery
+paths (clean-exit/empty-output and adapter-throw/SIGTERM) through
+`abandonReason: 'paused_by_operator'`. Draining pause, terminate, cancel, and
+natural completion pass no flag, so their worker_lost semantics are unchanged.
 
 ### Step Lifecycle
 
@@ -576,7 +632,7 @@ anything they spawn — must NEVER touch the live instance:
   `complete` / `fail`) is the ONLY sanctioned interaction with the live
   instance. To exercise daemon/MCP/control-plane lifecycle, start an
   ISOLATED instance (temp state dir + random ports). `stopDaemon` refuses
-  to stop the daemon scheduling you (TAMANDUA_WORKER_PID guard).
+  to stop the daemon scheduling you (TAMANDUA_DAEMON_PID guard).
 
 #### Agent Default Behavior (READ THIS)
 

@@ -115,6 +115,9 @@ function setupTempDb(): { db: DatabaseSync; dbPath: string; tempDir: string } {
     current_story_id TEXT,
     abandoned_count INTEGER DEFAULT 0,
     claim_invalidated_by TEXT,
+    claim_job_id TEXT,
+    claim_pid INTEGER,
+    claim_pgid INTEGER,
     claim_updated_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -1235,6 +1238,110 @@ describe("US-013: --run-id prefix acceptance in step peek, claim, current", () =
 
     assert.equal(getExitCode(), 1);
     assert.match(stderrOutput, /step id/);
+  });
+});
+
+describe("CPID2: step claim records the harness worker pid (not the daemon pid)", () => {
+  let tempDir: string;
+  let dbPath: string;
+  let db: DatabaseSync;
+  let savedWorkerPid: string | undefined;
+  let savedWorkerPgid: string | undefined;
+  let savedWorkerJobId: string | undefined;
+  let savedDaemonPid: string | undefined;
+
+  beforeEach(() => {
+    const setup = setupTempDb();
+    tempDir = setup.tempDir;
+    dbPath = setup.dbPath;
+    db = setup.db;
+
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.HOME = tempDir;
+    process.env.TAMANDUA_STATE_DIR = path.join(tempDir, ".tamandua");
+
+    savedWorkerPid = process.env.TAMANDUA_WORKER_PID;
+    savedWorkerPgid = process.env.TAMANDUA_WORKER_PGID;
+    savedWorkerJobId = process.env.TAMANDUA_WORKER_JOB_ID;
+    savedDaemonPid = process.env.TAMANDUA_DAEMON_PID;
+  });
+
+  afterEach(() => {
+    const restore = (key: string, value: string | undefined) => {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    restore("TAMANDUA_WORKER_PID", savedWorkerPid);
+    restore("TAMANDUA_WORKER_PGID", savedWorkerPgid);
+    restore("TAMANDUA_WORKER_JOB_ID", savedWorkerJobId);
+    restore("TAMANDUA_DAEMON_PID", savedDaemonPid);
+    applyStickyEnv();
+    db.close();
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  async function captureStdout(fn: () => Promise<void>): Promise<string> {
+    let output = "";
+    const origStdout = process.stdout.write;
+    (process.stdout as { write: typeof process.stdout.write }).write = (chunk: any, ..._rest: any[]) => {
+      output += String(chunk);
+      return true;
+    };
+    try {
+      await fn();
+    } finally {
+      (process.stdout as { write: typeof process.stdout.write }).write = origStdout;
+    }
+    return output;
+  }
+
+  function seedPendingStep(runId: string, stepId: string): void {
+    db.prepare("INSERT INTO runs (id, status) VALUES (?, 'running')").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, agent_id, step_index, status, type) VALUES (?, ?, 'test-agent', 0, 'pending', 'single')"
+    ).run(stepId, runId);
+  }
+
+  it("records TAMANDUA_WORKER_PID as claim_pid and TAMANDUA_WORKER_PGID as claim_pgid", async () => {
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    seedPendingStep(runId, stepId);
+
+    process.env.TAMANDUA_WORKER_JOB_ID = "round-cpid2-1";
+    process.env.TAMANDUA_WORKER_PID = "424242";
+    process.env.TAMANDUA_WORKER_PGID = "424242";
+    delete process.env.TAMANDUA_DAEMON_PID;
+
+    await captureStdout(async () => {
+      await handleStep("step", ["step", "claim", "test-agent", "--run-id", runId]);
+    });
+
+    const row = db.prepare("SELECT claim_pid, claim_pgid, claim_job_id FROM steps WHERE id = ?").get(stepId) as
+      { claim_pid: number; claim_pgid: number; claim_job_id: string };
+    assert.equal(row.claim_pid, 424242, "claim_pid is the harness worker pid");
+    assert.equal(row.claim_pgid, 424242, "claim_pgid is the harness process group");
+    assert.equal(row.claim_job_id, "round-cpid2-1", "claim_job_id is the dispatch round id");
+    assert.notEqual(row.claim_pid, process.pid, "claim_pid must never be the CLI/daemon pid");
+  });
+
+  it("falls back to the resolved pgid when TAMANDUA_WORKER_PID is unset", async () => {
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    seedPendingStep(runId, stepId);
+
+    process.env.TAMANDUA_WORKER_JOB_ID = "round-cpid2-2";
+    delete process.env.TAMANDUA_WORKER_PID;
+    process.env.TAMANDUA_WORKER_PGID = "515151";
+
+    await captureStdout(async () => {
+      await handleStep("step", ["step", "claim", "test-agent", "--run-id", runId]);
+    });
+
+    const row = db.prepare("SELECT claim_pid, claim_pgid FROM steps WHERE id = ?").get(stepId) as
+      { claim_pid: number; claim_pgid: number };
+    assert.equal(row.claim_pid, 515151, "claim_pid falls back to the resolved harness pgid");
+    assert.equal(row.claim_pgid, 515151, "claim_pgid is still the resolved harness group");
+    assert.notEqual(row.claim_pid, process.pid, "claim_pid must never be the CLI/daemon pid");
   });
 });
 

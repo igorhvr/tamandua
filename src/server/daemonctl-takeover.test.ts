@@ -809,20 +809,20 @@ describe("daemonctl US-006 holder scoping (fake ss/lsof)", () => {
 
 describe("daemonctl DPID takeover stop", () => {
   let homeDir: string;
-  let savedWorkerPid: string | undefined;
+  let savedDaemonPid: string | undefined;
   let savedGrace: string | undefined;
 
   beforeEach(() => {
     homeDir = tamanduaTempDir("tamandua-takeover-stop-");
     fs.mkdirSync(path.join(homeDir, ".tamandua"), { recursive: true });
-    savedWorkerPid = process.env.TAMANDUA_WORKER_PID;
+    savedDaemonPid = process.env.TAMANDUA_DAEMON_PID;
     savedGrace = process.env.TAMANDUA_TAKEOVER_GRACE_MS;
     delete process.env.TAMANDUA_TAKEOVER_GRACE_MS;
   });
 
   afterEach(() => {
-    if (savedWorkerPid === undefined) delete process.env.TAMANDUA_WORKER_PID;
-    else process.env.TAMANDUA_WORKER_PID = savedWorkerPid;
+    if (savedDaemonPid === undefined) delete process.env.TAMANDUA_DAEMON_PID;
+    else process.env.TAMANDUA_DAEMON_PID = savedDaemonPid;
     if (savedGrace === undefined) delete process.env.TAMANDUA_TAKEOVER_GRACE_MS;
     else process.env.TAMANDUA_TAKEOVER_GRACE_MS = savedGrace;
     fs.rmSync(homeDir, { recursive: true, force: true });
@@ -987,8 +987,8 @@ describe("daemonctl DPID takeover stop", () => {
     assert.deepEqual(unlinked, [], "no file may be unlinked while the pid is alive");
   });
 
-  it("refuses to stop the daemon scheduling the current agent (TAMANDUA_WORKER_PID)", async () => {
-    process.env.TAMANDUA_WORKER_PID = "4321";
+  it("refuses to stop the daemon scheduling the current agent (TAMANDUA_DAEMON_PID)", async () => {
+    process.env.TAMANDUA_DAEMON_PID = "4321";
     const signals: string[] = [];
 
     await assert.rejects(

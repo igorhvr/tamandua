@@ -2177,4 +2177,232 @@ describe("US-003 PRAW: auto-complete refuses paused/draining runs", () => {
   });
 });
 });
+
+// ── PKIL US-004: operator-pause recovery never charges a retry ──────────
+describe("PKIL US-004: paused_by_operator recovery (no retry charge)", () => {
+  function seedRun(opts: { agent: string; runId: string }): void {
+    const db = getDb();
+    const now = ts();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, worker_lost_count, ceiling_expiry_count, created_at, updated_at) VALUES (?, 'test-wf', 'paused recovery', 'running', '{}', 0, 0, ?, ?)"
+    ).run(opts.runId, now, now);
+  }
+
+  it("single-step pause resets to pending with unchanged retry_count and emits step.paused_kill (AC1/AC3/AC4)", () => {
+    const db = getDb();
+    const agent = "test_pkil-single-step";
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const now = ts();
+    seedRun({ agent, runId });
+
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+       VALUES (?, ?, 'dev-step', ?, 0, '', '', 'running', 1, 3, 'single', 'job-pause', 4242, ?, ?, ?)`
+    ).run(stepUuid, runId, agent, now, now, now);
+
+    try {
+      const result = recoverOrphanedStepsForAgent(
+        agent,
+        runId,
+        undefined,
+        undefined,
+        undefined,
+        "job-pause",
+        "paused_by_operator",
+        undefined,
+        143,
+        "SIGTERM",
+        "worker received SIGTERM during pause",
+      );
+
+      assert.equal(result.recovered, 1, "should recover 1 step");
+      assert.equal(result.failed, 0, "a pause must never fail the step");
+      assert.equal(result.skipped, 0, "should not skip");
+
+      const step = db.prepare(
+        "SELECT status, retry_count FROM steps WHERE id = ?"
+      ).get(stepUuid) as { status: string; retry_count: number };
+      assert.equal(step.status, "pending", "step must be reset to pending");
+      assert.equal(step.retry_count, 1, "retry_count must be UNCHANGED after a pause (no charge)");
+
+      const run = db.prepare(
+        "SELECT status, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?"
+      ).get(runId) as { status: string; worker_lost_count: number; ceiling_expiry_count: number };
+      assert.equal(run.status, "running", "run must stay running");
+      assert.equal(run.worker_lost_count, 0, "a pause must not bump worker_lost_count (AC3)");
+      assert.equal(run.ceiling_expiry_count, 0, "a pause must not bump ceiling_expiry_count");
+
+      const events = getRunEvents(runId);
+      const paused = events.filter((e) => e.event === "step.paused_kill");
+      assert.equal(paused.length, 1, "should emit exactly 1 step.paused_kill event");
+      assert.equal(events.filter((e) => e.event === "step.worker_lost").length, 0, "a pause must never emit step.worker_lost");
+      assert.equal(events.filter((e) => e.event === "step.timeout").length, 0, "a pause emits no step.timeout");
+      assert.equal(events.filter((e) => e.event === "step.ceiling_expiry").length, 0, "a pause emits no step.ceiling_expiry");
+      assert.equal(paused[0].stepId, "dev-step");
+      assert.equal(paused[0].exitCode, 143, "paused_kill must carry exitCode forensics");
+      assert.equal(paused[0].signal, "SIGTERM", "paused_kill must carry signal forensics");
+      assert.equal(paused[0].stderrTail, "worker received SIGTERM during pause", "paused_kill must carry stderrTail forensics");
+
+      const respawned = events.filter((e) => e.event === "step.respawned");
+      assert.equal(respawned.length, 1, "should emit step.respawned");
+      assert.equal(respawned[0].reason, "paused_by_operator", "step.respawned reason must be paused_by_operator (AC4)");
+      assert.equal(respawned[0].retry, 1, "respawn must report the unchanged retry value");
+      assert.equal(respawned[0].priorPid, 4242, "respawn must carry the prior worker pid");
+      assert.equal(respawned[0].priorRound, "job-pause", "respawn must carry the prior round");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  it("single-step pause at the retry ceiling still resets to pending without exhaustion/reroute", () => {
+    const db = getDb();
+    const agent = "test_pkil-single-step-exhausted";
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const now = ts();
+    seedRun({ agent, runId });
+
+    // retry_count === max_retries: a genuine worker loss here would fail the
+    // run. A pause must NOT — it is not exhaustion.
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'dev-step', ?, 0, '', '', 'running', 2, 2, 'single', 'job-pause', ?, ?)`
+    ).run(stepUuid, runId, agent, now, now);
+
+    try {
+      const result = recoverOrphanedStepsForAgent(
+        agent, runId, undefined, undefined, undefined, "job-pause", "paused_by_operator",
+      );
+
+      assert.equal(result.recovered, 1, "pause recovery must recover, not fail");
+      assert.equal(result.failed, 0, "pause recovery must not fail at the retry ceiling");
+
+      const step = db.prepare("SELECT status, retry_count FROM steps WHERE id = ?").get(stepUuid) as { status: string; retry_count: number };
+      assert.equal(step.status, "pending", "step must be pending after a paused recovery");
+      assert.equal(step.retry_count, 2, "retry_count must stay at max_retries (no charge)");
+
+      const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+      assert.equal(run.status, "running", "run must not be failed by a pause");
+
+      const events = getRunEvents(runId);
+      assert.equal(events.filter((e) => e.event === "step.failed").length, 0, "pause must not emit step.failed");
+      assert.equal(events.filter((e) => e.event === "run.failed").length, 0, "pause must not emit run.failed");
+      assert.equal(events.filter((e) => e.event === "step.paused_kill").length, 1, "pause must emit step.paused_kill");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  it("loop-story pause leaves story retry_count and abandoned_count unchanged and emits step.paused_kill (AC2/AC3/AC4)", () => {
+    const db = getDb();
+    const agent = "test_pkil-loop-story";
+    const runId = crypto.randomUUID();
+    const loopStepUuid = crypto.randomUUID();
+    const storyUuid = crypto.randomUUID();
+    const now = ts();
+    seedRun({ agent, runId });
+
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, loop_config, current_story_id, claim_job_id, claim_pid, created_at, updated_at)
+       VALUES (?, ?, 'implement', ?, 0, '', '', 'running', 0, 2, 'loop',
+               '{"over":"stories","completion":"all_done","fresh_session":true}', ?, 'job-pause', 7777, ?, ?)`
+    ).run(loopStepUuid, runId, agent, storyUuid, now, now);
+
+    db.prepare(
+      `INSERT INTO stories (id, run_id, story_id, story_index, title, description, acceptance_criteria, status, retry_count, max_retries, abandoned_count, created_at, updated_at)
+       VALUES (?, ?, 'US-200', 1, 'Paused Story', 'Do something', '[]', 'running', 0, 2, 2, ?, ?)`
+    ).run(storyUuid, runId, now, now);
+
+    try {
+      const result = recoverOrphanedStepsForAgent(
+        agent, runId, undefined, undefined, undefined, "job-pause", "paused_by_operator",
+        undefined, 0, "SIGTERM", "pause",
+      );
+
+      assert.equal(result.recovered, 1, "should recover the story");
+      assert.equal(result.failed, 0, "a pause must never abandon-fail the story");
+
+      const story = db.prepare(
+        "SELECT status, retry_count, abandoned_count FROM stories WHERE id = ?"
+      ).get(storyUuid) as { status: string; retry_count: number; abandoned_count: number };
+      assert.equal(story.status, "pending", "story must be reset to pending");
+      assert.equal(story.retry_count, 0, "story retry_count must be unchanged (AC2)");
+      assert.equal(story.abandoned_count, 2, "story abandoned_count must be unchanged, not incremented (AC2)");
+
+      const loopStep = db.prepare(
+        "SELECT status, current_story_id FROM steps WHERE id = ?"
+      ).get(loopStepUuid) as { status: string; current_story_id: string | null };
+      assert.equal(loopStep.status, "pending", "loop step must be reset to pending");
+      assert.equal(loopStep.current_story_id, null, "current_story_id must be cleared");
+
+      const run = db.prepare(
+        "SELECT status, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?"
+      ).get(runId) as { status: string; worker_lost_count: number; ceiling_expiry_count: number };
+      assert.equal(run.status, "running");
+      assert.equal(run.worker_lost_count, 0, "a pause must not bump worker_lost_count (AC3)");
+      assert.equal(run.ceiling_expiry_count, 0);
+
+      const events = getRunEvents(runId);
+      const paused = events.filter((e) => e.event === "step.paused_kill");
+      assert.equal(paused.length, 1, "should emit exactly 1 step.paused_kill event");
+      assert.equal(events.filter((e) => e.event === "step.worker_lost").length, 0, "a pause must never emit step.worker_lost");
+      assert.equal(events.filter((e) => e.event === "story.abandoned").length, 0, "a pause must not charge a story abandonment");
+      assert.equal(paused[0].storyId, "US-200");
+      assert.equal(paused[0].exitCode, 0);
+      assert.equal(paused[0].signal, "SIGTERM");
+      assert.ok(paused[0].detail?.includes("no abandon charged"), `detail should note no abandon charged, got: ${paused[0].detail}`);
+
+      const respawned = events.filter((e) => e.event === "step.respawned");
+      assert.equal(respawned.length, 1, "should emit step.respawned");
+      assert.equal(respawned[0].reason, "paused_by_operator", "step.respawned reason must be paused_by_operator (AC4)");
+      assert.equal(respawned[0].retry, 0, "respawn reports the unchanged step retry value");
+      assert.equal(respawned[0].priorPid, 7777);
+      assert.equal(respawned[0].priorRound, "job-pause");
+    } finally {
+      db.prepare("DELETE FROM stories WHERE id = ?").run(storyUuid);
+      db.prepare("DELETE FROM steps WHERE id = ?").run(loopStepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  it("non-pause abandonReason still charges a retry (regression guard)", () => {
+    const db = getDb();
+    const agent = "test_pkil-non-pause";
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const now = ts();
+    seedRun({ agent, runId });
+
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'dev-step', ?, 0, '', '', 'running', 0, 3, 'single', 'job-crash', ?, ?)`
+    ).run(stepUuid, runId, agent, now, now);
+
+    try {
+      const result = recoverOrphanedStepsForAgent(
+        agent, runId, undefined, undefined, undefined, "job-crash", "worker_died",
+      );
+      assert.equal(result.recovered, 1);
+      const step = db.prepare("SELECT status, retry_count FROM steps WHERE id = ?").get(stepUuid) as { status: string; retry_count: number };
+      assert.equal(step.status, "pending");
+      assert.equal(step.retry_count, 1, "worker_lost recovery must still charge a retry");
+      const run = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
+      assert.equal(run.worker_lost_count, 1, "worker_lost recovery must still bump worker_lost_count");
+      const events = getRunEvents(runId);
+      assert.equal(events.filter((e) => e.event === "step.worker_lost").length, 1);
+      assert.equal(events.filter((e) => e.event === "step.paused_kill").length, 0);
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+});
+
 });

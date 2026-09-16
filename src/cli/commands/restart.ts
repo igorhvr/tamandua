@@ -11,7 +11,7 @@
  *  4. Does NOT: git pull, rebuild, reinstall workflows, or touch ~/.tamandua/workflows.
  *  5. Output: one line per service per phase, final "All services restarted."
  *  6. Reuses primitives from daemonctl — no duplicated process-management logic.
- *  7. Respects the self-stop guard (underlying stop functions check TAMANDUA_WORKER_PID).
+ *  7. Respects the self-stop guard (underlying stop functions check TAMANDUA_DAEMON_PID).
  */
 
 import { checkActiveRuns, type ActiveRunInfo } from "../../installer/uninstall.js";

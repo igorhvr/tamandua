@@ -430,19 +430,20 @@ async function probeLiveServiceIdentity(
  * Guard: refuse to signal the daemon that is scheduling the CURRENT agent.
  *
  * Tamandua agents inherit the daemon's environment, including
- * TAMANDUA_WORKER_PID (the scheduling daemon's own pid). An agent working
- * on daemon-lifecycle features that runs `tamandua dashboard stop` (or
- * restart) with the real HOME would therefore SIGTERM the very daemon
- * dispatching it — the dying daemon then kills the agent mid-restart and
- * strands the run. Lifecycle testing from inside a run must target an
+ * TAMANDUA_DAEMON_PID (the scheduling daemon's own pid; the harness launch
+ * wrapper exports the WORKER pid separately as TAMANDUA_WORKER_PID). An
+ * agent working on daemon-lifecycle features that runs `tamandua dashboard
+ * stop` (or restart) with the real HOME would therefore SIGTERM the very
+ * daemon dispatching it — the dying daemon then kills the agent mid-restart
+ * and strands the run. Lifecycle testing from inside a run must target an
  * isolated instance instead.
  */
 function assertNotSchedulingDaemon(targetPid: number, what: string): void {
-  const workerPid = Number(process.env.TAMANDUA_WORKER_PID ?? "");
-  if (Number.isInteger(workerPid) && workerPid > 0 && workerPid === targetPid) {
+  const daemonPid = Number(process.env.TAMANDUA_DAEMON_PID ?? "");
+  if (Number.isInteger(daemonPid) && daemonPid > 0 && daemonPid === targetPid) {
     throw new Error(
       `Refusing to stop the ${what} (pid ${targetPid}): it is the daemon scheduling ` +
-        `the current tamandua agent run (TAMANDUA_WORKER_PID matches). Stopping it ` +
+        `the current tamandua agent run (TAMANDUA_DAEMON_PID matches). Stopping it ` +
         `would kill this agent and strand the run. To exercise daemon lifecycle from ` +
         `inside a run, start an ISOLATED instance: point HOME/TAMANDUA_STATE_DIR at a ` +
         `temp directory and use non-default ports (TAMANDUA_CONTROL_PORT plus a custom ` +

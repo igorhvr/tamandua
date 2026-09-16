@@ -586,7 +586,13 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
 
 - **C11** Pause stops dispatch for the run (draining in-flight work); resume
   restarts it; terminate tears down scheduling and kills in-flight harness
-  processes.
+  processes. A NON-DRAIN `run pause` kills the in-flight worker immediately
+  (`removeRunCrons` with `graceMs: 0`) but is NOT a worker loss: the pause
+  path marks each in-flight round (PKIL operator-pause registry) before the
+  abort/SIGTERM, and the round's post-round recovery classifies the resulting
+  exit as `paused_by_operator` (`step.paused_kill`, no retry charge, no
+  `runs.worker_lost_count`). Draining pause is unchanged — it never reaches
+  that teardown and lets in-flight work finish normally.
 - **C12** Run-scoped scheduling is torn down when the run reaches a terminal
   state (no leaked timers dispatching for completed runs). Teardown triggered
   by *natural completion* gives in-flight harness processes a grace window
@@ -599,16 +605,21 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
   (first tick ~1 s after startup, then every cycle) and nudges the affected
   runs. A daemon crash/reboot/kill therefore un-wedges interrupted runs in
   seconds — not the 1.5×timeout age threshold (up to 45 min), and never
-  "forever" when no dispatch was running. Survivor guard: if the step's
-  claim_pgid (the harness process group, self-detected by `step claim`) is
-  still ALIVE, the step is left alone — an ungracefully killed daemon does
-  not kill its detached harness children, and requeuing would put two
-  agents in one workdir; the survivor's late completion is accepted (C5).
-  Pinned by `tests/dead-worker-recovery.test.ts` and the scripted e2e
-  daemon-SIGKILL test. Relatedly, `stopDaemon`/`stopMcp`/`stopControlPlane`
-  refuse to signal the daemon named by TAMANDUA_WORKER_PID — an agent can
-  no longer stop the very daemon scheduling it
-  (`src/server/daemonctl-self-stop-guard.test.ts`).
+  "forever" when no dispatch was running. `claim_pid` is the HARNESS WORKER
+  pid (CPID2): the launch wrapper exports its own `$$` as
+  `TAMANDUA_WORKER_PID` and `step claim` records it; the scheduling daemon's
+  pid is a separate env var (`TAMANDUA_DAEMON_PID`) and is never stored in
+  `claim_pid`. Survivor guard: if the step's claim_pgid (the harness process
+  group, self-detected by `step claim`, equal to the worker pid for the
+  detached group leader) is still ALIVE, the step is left alone — an
+  ungracefully killed daemon does not kill its detached harness children, and
+  requeuing would put two agents in one workdir; the survivor's late
+  completion is accepted (C5). Pinned by `tests/dead-worker-recovery.test.ts`
+  and the scripted e2e daemon-SIGKILL test. Relatedly,
+  `stopDaemon`/`stopMcp`/`stopControlPlane` refuse to signal the daemon named
+  by TAMANDUA_DAEMON_PID — an agent can no longer stop the very daemon
+  scheduling it (`src/server/daemonctl-self-stop-guard.test.ts`). The worker
+  pid (TAMANDUA_WORKER_PID) is irrelevant to that guard.
 - **C23 (WDOG — per-tick PGID liveness watchdog)** Every dispatch round
   tick (`executeDispatchRound`) runs a PGID-based liveness check
   (`checkRunningWorkersLiveness` in `src/installer/step-ops.ts`) BEFORE the
@@ -619,8 +630,11 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
   set, the watchdog probes `process.kill(-pgid, 0)` — works on both Linux
   and macOS (no `/proc` dependency).  ESRCH means the process group is dead;
   EPERM means it exists but belongs to another user (treated as alive).
-  Steps WITHOUT a `claim_pgid` (legacy/manual claims) are SKIPPED — they
-  fall back to the existing timeout × 1.5 sweeper (C18).
+  `claim_pgid` (like `claim_pid`, CPID2) identifies the HARNESS worker: the
+  launch wrapper exports `TAMANDUA_WORKER_PGID="$$"`, so for the detached
+  group leader the worker pid and pgid are the same process. Steps WITHOUT a
+  `claim_pgid` (legacy/manual claims) are SKIPPED — they fall back to the
+  existing timeout × 1.5 sweeper (C18).
 
   **Grace period:** Claims younger than `LIVENESS_GRACE_PERIOD_MS` (30 s)
   are skipped to avoid racing a round that just finished and is
@@ -662,6 +676,36 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
   watchdog tests covering dead-pgid recovery, live-pgid untouched,
   ownerless skipped, grace period respected, event detail prefix,
   and story-level abandon accounting).
+- **C24 (PKIL — operator-pause recovery never charges a retry)** An operator
+  pause is NOT a worker loss. `recoverOrphanedStepsForAgent` recognizes
+  `abandonReason === "paused_by_operator"` as its own recovery class: it
+  resets the running single step (or the loop step + its current story) to
+  `pending` while persisting the SAME `retry_count` / `abandoned_count`,
+  does NOT bump `runs.worker_lost_count` or `runs.ceiling_expiry_count`, and
+  emits `step.paused_kill` (with `exitCode` / `signal` / `stderrTail`
+  forensics) instead of `step.worker_lost`. The subsequent `step.respawned`
+  carries `reason: "paused_by_operator"` and the unchanged retry value. The
+  paused branch never enters the retry-exhaustion / `on_fail.retry_step`
+  reroute logic — a pause is not exhaustion, so a step already at its
+  `max_retries` still resets to `pending` and the run stays alive. All other
+  abandon reasons keep the existing worker-lost / ceiling-expiry /
+  no-work-release semantics. Pinned by
+  `tests/orphaned-step-recovery.test.ts` (PKIL US-004 suite).
+- **C25 (PKIL — the scheduler classifies an operator-paused round as a pause)**
+  The PKIL recovery class is reachable from the motor: `removeRunCrons` takes
+  `pausedByOperator?: boolean`; when true (only the non-drain `run pause`
+  path passes it) every in-flight dispatch round for the run is marked in a
+  module-level operator-pause registry BEFORE `abortDispatchRound`/SIGTERM.
+  `executeDispatchRound` reads and clears its own mark once the round settles
+  and routes BOTH post-round recovery paths — the clean-exit/empty-output
+  branch and the adapter-throw/SIGTERM branch — through
+  `abandonReason: "paused_by_operator"` when marked, so a paused round emits
+  `step.paused_kill` and never `step.worker_lost` / never increments
+  `steps.retry_count` or `runs.worker_lost_count`. The mark is also cleared in
+  the round's `finally`, and `shutdownAllCrons` clears the registry. Terminate,
+  cancel, drain pause, and natural completion pass no flag, so their
+  worker-lost semantics are unchanged. Pinned by
+  `src/installer/agent-scheduler.test.ts` (PKIL US-005 suite).
 
 ### Post-grace process cleanup sweep
 
@@ -676,11 +720,40 @@ surviving orphan processes associated with the run.
 - **Daemon-resident scheduling:** `removeRunCrons` in
   `src/installer/agent-scheduler.ts` schedules a one-shot, unref-ed timer at
   `HARNESS_TEARDOWN_GRACE_MS + 2 s` for every run whose crons are torn down.
-  When the timer fires, `sweepRunProcesses` is called with the daemon PID
-  excluded and NO `excludePgids` — after the grace window, any remaining
-  harness process group was not cleaned up by the leak guard (C12) and IS a
-  leak. The 2 s buffer gives the leak guard's immediate kill time to
-  complete before the sweep runs.
+  Before it deletes `jobMetadata`/`inFlightChildren`, it captures that run's
+  `workingDirectoryForHarness` and its in-flight harness child pgids and
+  threads them into the timer target (`scheduleSweepTimer(runId, target)`).
+  When the timer fires it calls the exported `runPostGraceSweep(runId,
+  target)`, which invokes `sweepRunProcesses` with the daemon PID excluded
+  and NO `excludePgids` — after the grace window, any remaining harness
+  process group was not cleaned up by the leak guard (C12) and IS a leak.
+  The 2 s buffer gives the leak guard's immediate kill time to complete
+  before the sweep runs.
+- **Direct-mode target resolution (DSWP part 2):** a worktree is NOT
+  required. Direct-mode runs have no `run_worktrees` row, and the old
+  "no worktree found" early return skipped every one of them (92x on
+  vaivm). `runPostGraceSweep` resolves the sweep directory in order:
+  (1) the working directory captured at teardown, (2) the managed worktree
+  path via `getRunWorktree`, (3) `working_directory_for_harness`, then
+  `repo`, from the run's DB context. It gathers owned pgids from the
+  captured in-flight children plus `SELECT DISTINCT claim_pgid FROM steps
+  WHERE run_id = ? AND claim_pgid IS NOT NULL`. If no directory AND no pgid
+  resolves, it logs a debug line and still runs the marker/pgid sweep with a
+  null path. `runPostGraceSweep` is exported so the sweep is unit-testable
+  without waiting out the grace window.
+- **Ownership evidence channels (DSWP):** `matchRunEvidence` matches on
+  (a) cwd under the recorded path, (b) environ containing the path, (c)
+  `TAMANDUA_WORKER_JOB_ID` containing the runId, (d) an exact
+  `TAMANDUA_RUN_ID=<runId>` environ token (the marker the scheduler injects
+  into every harness round), (e) the run's process-group ids listed in
+  `options.pgids` (evidence `pgid owned by run: <pgid>`), and (f) cmdline
+  naming the path or the runId. The recorded path is OPTIONAL
+  (`worktreePath: string | null`): `null` skips channels (a), (b) and the
+  path half of (f), so a direct-mode run with no worktree is still covered
+  by the marker, cmdline and pgid channels. Every reaped pid is logged with
+  the evidence string that matched, and processes are killed only by pid
+  after a match — never by name or glob. The `run.process_cleanup` event
+  detail carries `worktreePath` (nullable) and `pgids`.
 - **Deduplication:** At most one pending timer per run (module-level
   `Map<runId, Timeout>` in agent-scheduler.ts). Duplicate `removeRunCrons`
   calls (e.g., control-plane terminate + natural completion race) do not
@@ -696,6 +769,15 @@ surviving orphan processes associated with the run.
   `sweepRunProcesses` WITH `excludePgids` at worktree removal time, and
   remains unchanged. This sweep handles cleanup during worktree garbage
   collection, not during teardown.
+- **Direct-mode e2e coverage (DSWP US-007):** `tests/direct-mode-sweep-e2e.test.ts`
+  (serial lane; real isolated daemon + scripted agent; zero tokens) drives a
+  direct-mode run with NO `run_worktrees` row to completion, then waits out
+  the grace window and asserts: a `run.process_cleanup` event exists; a
+  child left inside the harness process group that IGNORES SIGTERM (so only
+  the sweep's SIGKILL can reap it) is dead and listed in `killedPids` with
+  evidence; an unrelated child (own pgid, no run marker, cwd outside the
+  run directory) survives and is never listed; and every killed pid carries
+  an evidence string.
 
 **Accepted-miss risks:**
 

@@ -1549,6 +1549,13 @@ export function cleanupAbandonedSteps(): void {
  *   than a harness loss (step.worker_lost, runs.worker_lost_count) — both
  *   reset the step/story exactly the same way; only the observability
  *   counters and event names differ.
+ * @param abandonReason - Optional: why the prior execution is being
+ *   abandoned. `"paused_by_operator"` selects the PKIL pause class: the
+ *   step/story is reset to pending WITHOUT consuming any retry/abandon
+ *   budget, no worker_lost/ceiling counter is bumped, and step.paused_kill
+ *   is emitted instead of step.worker_lost. A pause is never exhaustion, so
+ *   it never triggers the retry-exhaustion / on_fail.retry_step reroute
+ *   path. All other reasons keep the existing worker-lost semantics.
  */
 
 /**
@@ -1557,14 +1564,17 @@ export function cleanupAbandonedSteps(): void {
  * selection in recoverOrphanedStepsForAgent: a workerJobId-scoped round
  * killed at the worker time ceiling is `ceiling_expiry`; a round that
  * replied NO_WORK and released a dangling claim is `no_work_release`; a
- * recovery with no worker job (stale sweeper, control-plane release) is
- * `timeout`; everything else that lost a live worker is `worker_lost`.
+ * round torn down by a non-drain operator pause is `paused_by_operator`
+ * (PKIL, no retry charged); a recovery with no worker job (stale sweeper,
+ * control-plane release) is `timeout`; everything else that lost a live
+ * worker is `worker_lost`.
  */
 function respawnReasonFor(
   abandonReason: string | undefined,
   workerJobId: string | undefined,
   timedOut: boolean | undefined,
-): "worker_lost" | "timeout" | "ceiling_expiry" | "no_work_release" {
+): "worker_lost" | "timeout" | "ceiling_expiry" | "no_work_release" | "paused_by_operator" {
+  if (abandonReason === "paused_by_operator") return "paused_by_operator";
   if (workerJobId !== undefined && timedOut === true) return "ceiling_expiry";
   if (abandonReason === "no_work_release") return "no_work_release";
   if (workerJobId === undefined) return "timeout";
@@ -1667,6 +1677,72 @@ export function recoverOrphanedStepsForAgent(
         const newAbandoned = (story.abandoned_count ?? 0) + 1;
         const wfId = getWorkflowId(step.run_id);
         const effectiveReason = abandonReason ?? "worker_lost";
+
+        // PKIL (US-004): an operator pause is not a crash. Reset the
+        // story/step claim to pending WITHOUT charging the story abandon
+        // budget, and emit step.paused_kill instead of step.worker_lost so a
+        // pause is distinguishable from a genuine harness loss. A pause is
+        // never retry exhaustion, so this branch must not fall through to the
+        // abandon-budget / story.failed path below.
+        if (effectiveReason === "paused_by_operator") {
+          const currentAbandoned = story.abandoned_count ?? 0;
+          db.prepare(`UPDATE stories SET status = 'pending', updated_at = ${SQL_NOW_ISO} WHERE id = ?`).run(story.id);
+          db.prepare(`UPDATE steps SET status = 'pending', current_story_id = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`).run(step.id);
+          const pausePrefix = detailPrefix ? `[${detailPrefix}] ` : "";
+          const pauseDetail = `${pausePrefix}Operator pause killed the worker without completing story ${story.story_id}; reset to pending (no abandon charged; story abandon ${currentAbandoned}/${ABANDON_STORY_MAX})`;
+          try {
+            emitEvent({
+              ts: new Date().toISOString(),
+              event: "step.paused_kill",
+              runId: step.run_id,
+              workflowId: wfId,
+              stepId: step.step_id,
+              agentId,
+              storyId: story.story_id,
+              storyTitle: story.title,
+              retry: step.retry_count,
+              exitCode: exitCode ?? undefined,
+              signal: signal ?? undefined,
+              stderrTail,
+              detail: pauseDetail,
+            });
+          } catch (err) {
+            logger.warn(`step.paused_kill event emit failed for story ${story.story_id} (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}`, {
+              runId: step.run_id,
+              stepId: step.step_id,
+              agentId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // RVOC US-002 ordering: the respawn record follows the recovery
+          // event. The story's retry/abandon counters are unchanged, so the
+          // respawn reports the pre-pause retry value.
+          try {
+            emitEvent({
+              ts: new Date().toISOString(),
+              event: "step.respawned",
+              runId: step.run_id,
+              workflowId: wfId,
+              stepId: step.step_id,
+              agentId,
+              priorPid: step.claim_pid ?? undefined,
+              priorRound: step.claim_job_id ?? undefined,
+              reason: respawnReasonFor(abandonReason, workerJobId, timedOut),
+              retry: step.retry_count,
+              detail: `Step respawned after step.paused_kill (story ${story.story_id}); prior worker pid ${step.claim_pid ?? "unknown"}, round ${step.claim_job_id ?? "unknown"}`,
+            });
+          } catch (err) {
+            logger.warn(`step.respawned event emit failed for story ${story.story_id} (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}`, {
+              runId: step.run_id,
+              stepId: step.step_id,
+              agentId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          logger.info(`Orphaned step recovery: story ${story.story_id} reset to pending after operator pause (no abandon charged)`, { runId: step.run_id, stepId: step.step_id, agentId });
+          recovered++;
+          continue;
+        }
 
         // Persist abandonment into story_abandonments table (telemetry — must not block recovery)
         try {
@@ -1793,6 +1869,61 @@ export function recoverOrphanedStepsForAgent(
     // Single steps (or loop steps without a current story): use step retry_count
     const newRetry = step.retry_count + 1;
     const wfId = getWorkflowId(step.run_id);
+
+    // PKIL (US-004): an operator pause is not a crash and never charges the
+    // retry budget. Reset the step to pending with the SAME retry_count, emit
+    // step.paused_kill instead of step.worker_lost/step.timeout, and skip the
+    // exhaustion / on_fail.retry_step reroute path entirely (a pause is not
+    // exhaustion).
+    if (abandonReason === "paused_by_operator") {
+      db.prepare(
+        `UPDATE steps SET status = 'pending', updated_at = ${SQL_NOW_ISO} WHERE id = ?`
+      ).run(step.id);
+      const pausePrefix = detailPrefix ? `[${detailPrefix}] ` : "";
+      const pauseDetail = `${pausePrefix}Operator pause killed the worker without completing step; reset to pending (retry ${step.retry_count}/${step.max_retries}, no retry charged)`;
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "step.paused_kill",
+        runId: step.run_id,
+        workflowId: wfId,
+        stepId: step.step_id,
+        agentId,
+        retry: step.retry_count,
+        exitCode: exitCode ?? undefined,
+        signal: signal ?? undefined,
+        stderrTail,
+        detail: pauseDetail,
+      });
+      // RVOC US-002 ordering: the respawn record follows the recovery event.
+      // The retry counter is unchanged, so the respawn reports the pre-pause
+      // retry value.
+      try {
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "step.respawned",
+          runId: step.run_id,
+          workflowId: wfId,
+          stepId: step.step_id,
+          agentId,
+          priorPid: step.claim_pid ?? undefined,
+          priorRound: step.claim_job_id ?? undefined,
+          reason: respawnReasonFor(abandonReason, workerJobId, timedOut),
+          retry: step.retry_count,
+          detail: `Step respawned after step.paused_kill; prior worker pid ${step.claim_pid ?? "unknown"}, round ${step.claim_job_id ?? "unknown"}`,
+        });
+      } catch (err) {
+        logger.warn(`step.respawned event emit failed (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}`, {
+          runId: step.run_id,
+          stepId: step.step_id,
+          agentId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      logger.info(`Orphaned step reset to pending after operator pause (retry ${step.retry_count}/${step.max_retries}, no retry charged)`, { runId: step.run_id, stepId: step.step_id, agentId });
+      recovered++;
+      continue;
+    }
+
     if (newRetry > step.max_retries) {
       // ── RETR: check on_fail.retry_step before failing the run ──
       // Orphan recovery exhaustion means the agent (or harness) died

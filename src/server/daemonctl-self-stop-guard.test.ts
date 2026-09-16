@@ -1,6 +1,6 @@
 /**
  * Self-stop guard: an agent must not be able to stop the daemon that is
- * scheduling it. Agents inherit TAMANDUA_WORKER_PID (the scheduling
+ * scheduling it. Agents inherit TAMANDUA_DAEMON_PID (the scheduling
  * daemon's pid) from the harness env; stopDaemon/stopMcp/stopControlPlane
  * refuse to SIGTERM that pid with an actionable error pointing at
  * isolated instances. Any other pid — e.g. an isolated test daemon the
@@ -15,15 +15,19 @@ import { spawn } from "node:child_process";
 import { stopDaemon, stopMcp, stopControlPlane, stopDashboardStandalone } from "../../dist/server/daemonctl.js";
 
 let tempHome: string;
+let savedDaemonPid: string | undefined;
 let savedWorkerPid: string | undefined;
 
 beforeEach(() => {
   tempHome = tamanduaTempDir("tamandua-self-stop-");
   fs.mkdirSync(path.join(tempHome, ".tamandua"), { recursive: true });
+  savedDaemonPid = process.env.TAMANDUA_DAEMON_PID;
   savedWorkerPid = process.env.TAMANDUA_WORKER_PID;
 });
 
 afterEach(() => {
+  if (savedDaemonPid === undefined) delete process.env.TAMANDUA_DAEMON_PID;
+  else process.env.TAMANDUA_DAEMON_PID = savedDaemonPid;
   if (savedWorkerPid === undefined) delete process.env.TAMANDUA_WORKER_PID;
   else process.env.TAMANDUA_WORKER_PID = savedWorkerPid;
   fs.rmSync(tempHome, { recursive: true, force: true });
@@ -52,10 +56,10 @@ function spawnFakeDaemon(pidFileName: string): { pid: number; kill: () => void }
 }
 
 describe("daemonctl self-stop guard", () => {
-  it("stopDaemon refuses when the target is the scheduling daemon (TAMANDUA_WORKER_PID)", () => {
+  it("stopDaemon refuses when the target is the scheduling daemon (TAMANDUA_DAEMON_PID)", () => {
     const fake = spawnFakeDaemon("tamandua.pid");
     try {
-      process.env.TAMANDUA_WORKER_PID = String(fake.pid);
+      process.env.TAMANDUA_DAEMON_PID = String(fake.pid);
       assert.throws(
         () => stopDaemon({ homeDir: tempHome }),
         /Refusing to stop the daemon .*scheduling\s+.*the current tamandua agent run/s,
@@ -71,10 +75,10 @@ describe("daemonctl self-stop guard", () => {
     const fakeMcp = spawnFakeDaemon("mcp.pid");
     const fakeCp = spawnFakeDaemon("control-plane.pid");
     try {
-      process.env.TAMANDUA_WORKER_PID = String(fakeMcp.pid);
+      process.env.TAMANDUA_DAEMON_PID = String(fakeMcp.pid);
       assert.throws(() => stopMcp({ homeDir: tempHome }), /Refusing to stop the MCP server/);
 
-      process.env.TAMANDUA_WORKER_PID = String(fakeCp.pid);
+      process.env.TAMANDUA_DAEMON_PID = String(fakeCp.pid);
       assert.throws(() => stopControlPlane({ homeDir: tempHome }), /Refusing to stop the control plane/);
     } finally {
       fakeMcp.kill();
@@ -85,7 +89,7 @@ describe("daemonctl self-stop guard", () => {
   it("stopDashboardStandalone refuses when the target is the scheduling daemon", () => {
     const fake = spawnFakeDaemon("dashboard.pid");
     try {
-      process.env.TAMANDUA_WORKER_PID = String(fake.pid);
+      process.env.TAMANDUA_DAEMON_PID = String(fake.pid);
       assert.throws(
         () => stopDashboardStandalone({ homeDir: tempHome }),
         /Refusing to stop the dashboard server/,
@@ -100,7 +104,7 @@ describe("daemonctl self-stop guard", () => {
   it("stopDashboardStandalone still stops dashboards that are NOT the scheduling daemon", () => {
     const fake = spawnFakeDaemon("dashboard.pid");
     try {
-      process.env.TAMANDUA_WORKER_PID = String(process.pid);
+      process.env.TAMANDUA_DAEMON_PID = String(process.pid);
       const stopped = stopDashboardStandalone({ homeDir: tempHome });
       assert.equal(stopped, true, "non-scheduling dashboard should be stoppable");
     } finally {
@@ -113,7 +117,7 @@ describe("daemonctl self-stop guard", () => {
     try {
       // Simulate an agent env pointing at a DIFFERENT daemon pid: stopping
       // an isolated instance the agent started itself must keep working.
-      process.env.TAMANDUA_WORKER_PID = String(process.pid);
+      process.env.TAMANDUA_DAEMON_PID = String(process.pid);
       const stopped = stopDaemon({ homeDir: tempHome });
       assert.equal(stopped, true, "non-scheduling daemon should be stoppable");
     } finally {
@@ -121,12 +125,26 @@ describe("daemonctl self-stop guard", () => {
     }
   });
 
-  it("guard is inert outside agent runs (no TAMANDUA_WORKER_PID)", () => {
+  it("guard is inert outside agent runs (no TAMANDUA_DAEMON_PID)", () => {
     const fake = spawnFakeDaemon("tamandua.pid");
     try {
-      delete process.env.TAMANDUA_WORKER_PID;
+      delete process.env.TAMANDUA_DAEMON_PID;
       const stopped = stopDaemon({ homeDir: tempHome });
       assert.equal(stopped, true, "user-invoked stop must work as always");
+    } finally {
+      fake.kill();
+    }
+  });
+
+  it("guard ignores TAMANDUA_WORKER_PID — only the daemon pid can trip it (CPID2)", () => {
+    const fake = spawnFakeDaemon("tamandua.pid");
+    try {
+      // The harness launch wrapper exports the WORKER pid here; it must not
+      // be mistaken for the scheduling daemon's pid.
+      delete process.env.TAMANDUA_DAEMON_PID;
+      process.env.TAMANDUA_WORKER_PID = String(fake.pid);
+      const stopped = stopDaemon({ homeDir: tempHome });
+      assert.equal(stopped, true, "worker pid must not trip the self-stop guard");
     } finally {
       fake.kill();
     }

@@ -297,6 +297,13 @@ function applySchema(db: DatabaseSync): void {
 
   // ── Worker ownership columns for steps ──
   // Tracks which worker process (job/PID/PGID) claimed each step.
+  // CPID2: `claim_pid` is the HARNESS WORKER pid (the round's pid, exported
+  // by the harness launch wrapper as TAMANDUA_WORKER_PID; for the detached
+  // group leader pid === claim_pgid). It is NOT the scheduling daemon's pid
+  // — the daemon pid travels in TAMANDUA_DAEMON_PID. claim_job_id is the
+  // dispatch round id and claim_pgid the harness process group. This is a
+  // semantics clarification only: no column is added and SCHEMA_VERSION does
+  // not change.
   // Nullable — legacy rows stay NULL, ownership-agnostic callers are unaffected.
   const stepCols = db.prepare("PRAGMA table_info(steps)").all() as Array<{ name: string }>;
   const stepColNames = new Set(stepCols.map((c) => c.name));

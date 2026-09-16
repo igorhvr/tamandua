@@ -10,6 +10,7 @@ import { describe, it, afterEach, beforeEach } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
@@ -17,12 +18,14 @@ import {
   createAgentCronJob,
   _scheduledJobCountForRun,
   removeRunCrons,
+  runPostGraceSweep,
   settleRunInFlightRounds,
   shutdownAllCrons,
   tryMarkJobInFlight,
   nudgeScheduledRuns,
   _pendingSweepTimerCount,
   _hasPendingSweepTimer,
+  _pendingSweepTarget,
   _schedulerGeneration,
   executeDispatchRound,
   DISPATCH_INTERVAL_MS,
@@ -30,6 +33,7 @@ import {
   getRunTeardownGraceMs,
   _instantFailStreakFor,
   _resetInstantFailStreaks,
+  _operatorPausedRoundIds,
 } from "../../dist/installer/agent-scheduler.js";
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
@@ -742,6 +746,311 @@ describe("removeRunCrons sweep timer scheduling", () => {
   });
 });
 
+// ── Post-grace sweep: direct-mode runs (DSWP part 2) ────────────────
+
+describe("runPostGraceSweep direct-mode runs", () => {
+  let children: ChildProcess[];
+  let sweepDir: string;
+  let outsideDir: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    children = [];
+    sweepDir = tamanduaTempDir("tamandua-direct-sweep-");
+    outsideDir = tamanduaTempDir("tamandua-direct-sweep-outside-");
+    saved = {
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+      TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+    };
+  });
+
+  afterEach(() => {
+    // Tear down scheduler/child state BEFORE restoring env so any late
+    // round logging still lands in the isolated test state dir.
+    shutdownAllCrons();
+    for (const child of children) {
+      try {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      } catch {
+        // already dead
+      }
+    }
+    children.length = 0;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(sweepDir, { recursive: true, force: true });
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  });
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function waitForExit(child: ChildProcess, timeoutMs = 4000): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeoutMs);
+      child.on("exit", () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+      child.on("error", () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  }
+
+  /**
+   * Seed a direct-mode run (no run_worktrees row). When `claimPgid` is
+   * given, a step row records it as this run's harness process group.
+   */
+  function seedDirectRun(
+    runId: string,
+    context: Record<string, unknown>,
+    claimPgid?: number,
+  ): void {
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'direct sweep task', 'completed', ?, ?, ?)",
+    ).run(runId, JSON.stringify(context), now, now);
+    if (claimPgid !== undefined) {
+      db.prepare(
+        "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, claim_pid, claim_pgid, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'done', ?, ?, ?, ?)",
+      ).run(crypto.randomUUID(), runId, claimPgid, claimPgid, now, now);
+    }
+  }
+
+  it("sweeps a direct-mode run using the captured directory and pgids", async () => {
+    const runId = "run-direct-captured";
+    const ownedCwd = path.join(outsideDir, "owned");
+    const unrelatedCwd = path.join(outsideDir, "unrelated");
+    fs.mkdirSync(ownedCwd, { recursive: true });
+    fs.mkdirSync(unrelatedCwd, { recursive: true });
+
+    // cwd is OUTSIDE the sweep directory, so only the pgid channel can
+    // match the owned child — proving the captured pgid is threaded through.
+    const owned = spawn("sleep", ["30"], {
+      cwd: ownedCwd,
+      env: { PATH: process.env.PATH || "/usr/bin" },
+      stdio: "ignore",
+      detached: true,
+    });
+    const unrelated = spawn("sleep", ["30"], {
+      cwd: unrelatedCwd,
+      env: { PATH: process.env.PATH || "/usr/bin" },
+      stdio: "ignore",
+      detached: true,
+    });
+    children.push(owned, unrelated);
+
+    await sleep(300);
+    const ownedPid = owned.pid!;
+    const unrelatedPid = unrelated.pid!;
+    assert.ok(isAlive(ownedPid), "owned child should be alive before the sweep");
+    assert.ok(isAlive(unrelatedPid), "unrelated child should be alive before the sweep");
+
+    // Direct-mode run: no run_worktrees row. The captured target names the
+    // working directory (for the event detail) and the owned pgid.
+    seedDirectRun(runId, {});
+    await runPostGraceSweep(runId, { workingDirectory: sweepDir, pgids: [ownedPid] });
+
+    const cleanup = getRunEvents(runId).filter((e) => e.event === "run.process_cleanup");
+    assert.equal(cleanup.length, 1, "exactly one run.process_cleanup event");
+    const detail = JSON.parse(cleanup[0].detail!);
+    assert.equal(detail.worktreePath, sweepDir);
+    assert.ok(
+      Array.isArray(detail.pgids) && detail.pgids.includes(ownedPid),
+      `event detail should name the owned pgid: ${JSON.stringify(detail.pgids)}`,
+    );
+    assert.ok(
+      detail.killedPids.includes(ownedPid),
+      `owned child should be recorded as killed: ${JSON.stringify(detail.killedPids)}`,
+    );
+    assert.ok(
+      !detail.killedPids.includes(unrelatedPid),
+      "unrelated pid must not be recorded as killed",
+    );
+
+    const ownedExited = await waitForExit(owned, 2000);
+    assert.ok(ownedExited, "owned child should have exited after SIGKILL");
+    assert.ok(!isAlive(ownedPid), "owned child should be gone");
+    assert.ok(isAlive(unrelatedPid), "unrelated child must survive the sweep");
+  });
+
+  it("resolves directory from run context and pgids from steps.claim_pgid (no worktree row)", async () => {
+    const runId = "run-direct-db-resolved";
+    const ownedCwd = path.join(outsideDir, "owned-db");
+    fs.mkdirSync(ownedCwd, { recursive: true });
+
+    const owned = spawn("sleep", ["30"], {
+      cwd: ownedCwd,
+      env: { PATH: process.env.PATH || "/usr/bin" },
+      stdio: "ignore",
+      detached: true,
+    });
+    children.push(owned);
+    await sleep(300);
+    const ownedPid = owned.pid!;
+
+    seedDirectRun(
+      runId,
+      { workspace_mode: "direct", working_directory_for_harness: sweepDir },
+      ownedPid,
+    );
+
+    // No captured target: the sweep must resolve both the directory (from
+    // runs.context) and the pgid (from steps.claim_pgid).
+    await runPostGraceSweep(runId);
+
+    const cleanup = getRunEvents(runId).filter((e) => e.event === "run.process_cleanup");
+    assert.equal(cleanup.length, 1);
+    const detail = JSON.parse(cleanup[0].detail!);
+    assert.equal(detail.worktreePath, sweepDir);
+    assert.ok(
+      detail.killedPids.includes(ownedPid),
+      `child in the recorded claim_pgid should be reaped: ${JSON.stringify(detail.killedPids)}`,
+    );
+
+    const ownedExited = await waitForExit(owned, 2000);
+    assert.ok(ownedExited, "owned child should have exited after SIGKILL");
+    assert.ok(!isAlive(ownedPid), "owned child should be gone");
+  });
+
+  it("runs the marker sweep with a null path when no directory or pgid resolves", {
+    skip: process.platform === "darwin" ? "environ evidence is unreadable on macOS" : false,
+  }, async () => {
+    const runId = "run-direct-marker-only";
+    const ownedCwd = path.join(outsideDir, "marker-only");
+    fs.mkdirSync(ownedCwd, { recursive: true });
+
+    const owned = spawn("sleep", ["30"], {
+      cwd: ownedCwd,
+      env: { PATH: process.env.PATH || "/usr/bin", TAMANDUA_RUN_ID: runId },
+      stdio: "ignore",
+      detached: true,
+    });
+    children.push(owned);
+    await sleep(300);
+    const ownedPid = owned.pid!;
+
+    // Empty context, no worktree row, no pgids: the sweep must still run
+    // (no "no worktree found" early return) and match the run marker.
+    seedDirectRun(runId, {});
+    await runPostGraceSweep(runId);
+
+    const cleanup = getRunEvents(runId).filter((e) => e.event === "run.process_cleanup");
+    assert.equal(cleanup.length, 1);
+    const detail = JSON.parse(cleanup[0].detail!);
+    assert.equal(detail.worktreePath, null);
+    assert.ok(
+      detail.killedPids.includes(ownedPid),
+      `TAMANDUA_RUN_ID child should be reaped with a null path: ${JSON.stringify(detail.killedPids)}`,
+    );
+    assert.ok(
+      String(detail.evidence[ownedPid]).includes(`TAMANDUA_RUN_ID=${runId}`),
+      `evidence should name the run marker: ${JSON.stringify(detail.evidence[ownedPid])}`,
+    );
+
+    const ownedExited = await waitForExit(owned, 2000);
+    assert.ok(ownedExited, "owned child should have exited after SIGKILL");
+    assert.ok(!isAlive(ownedPid), "owned child should be gone");
+  });
+
+  it("removeRunCrons captures the working directory and in-flight harness pgid", async () => {
+    // No "run-" prefix: peekStep strips that prefix, and this round goes
+    // through the real deterministic peek.
+    const runId = "direct-capture-1";
+    const workdir = path.join(outsideDir, "capture-work");
+    fs.mkdirSync(workdir, { recursive: true });
+    const now = new Date().toISOString();
+    const db = getDb();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'capture task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    const marker = path.join(outsideDir, "capture-inflight.marker");
+    const fakePi = path.join(outsideDir, "pi-capture-hang");
+    // Deliberately does NOT claim the step: the round still registers the
+    // harness pgid at spawn (what this test asserts), but the post-round
+    // orphan recovery finds no running claim to release — avoiding a
+    // fire-and-forget control-plane call that would outlive the test env.
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(process.env.TAMANDUA_ROUND_MARKER, "inflight");
+await new Promise((resolve) => setTimeout(resolve, 30000));
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+
+    // workflowId "test-wf" so the setup job id matches the round below.
+    const workflow = { ...makeWorkflow(), id: "test-wf" };
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    const round = executeDispatchRound(
+      {
+        id: jobId,
+        workflowId: "test-wf",
+        runId,
+        agentId: "test-wf_test-agent",
+        harnessType: "pi",
+        workingDirectoryForHarness: workdir,
+        createdAt: "",
+      },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 60 },
+    );
+
+    const startedAt = Date.now();
+    while (!fs.existsSync(marker) && Date.now() - startedAt < 5000) {
+      await sleep(20);
+    }
+    assert.ok(fs.existsSync(marker), "round never reached the in-flight state");
+
+    await removeRunCrons(runId);
+
+    const target = _pendingSweepTarget(runId);
+    assert.ok(target, "removeRunCrons must capture a sweep target");
+    assert.equal(
+      target.workingDirectory,
+      workdir,
+      "the run's workingDirectoryForHarness must be captured before jobMetadata is wiped",
+    );
+    assert.ok(
+      Array.isArray(target.pgids) && target.pgids.length >= 1,
+      `the in-flight harness pgid must be captured: ${JSON.stringify(target?.pgids)}`,
+    );
+    assert.ok(
+      target.pgids!.every((pgid) => Number.isInteger(pgid) && pgid > 0),
+      `captured pgids must be positive integers: ${JSON.stringify(target.pgids)}`,
+    );
+
+    // Let the torn-down round settle inside the isolated test env (its child
+    // was killed by removeRunCrons) before afterEach tears the env down.
+    await round;
+  });
+});
+
 // ── WLST5 round-termination classification ──────────────────────────
 // A work round that ends without a STATUS marker is recovered as an
 // orphaned step. The recovery must classify WHY the round ended: a round
@@ -887,7 +1196,337 @@ process.exit(1);
   });
 });
 
-// ── RSPN instant-fail classification, backoff, escalation ────────────
+// ── PKIL US-005: operator-pause round classification ─────────────────
+// A NON-DRAIN `run pause` tears the round down with removeRunCrons, which
+// aborts the round and SIGTERMs the harness pgid. That exit must classify as
+// an operator pause (PKIL): step.paused_kill, no retry charge, never
+// step.worker_lost / runs.worker_lost_count. removeRunCrons marks each
+// in-flight round BEFORE the abort/kill; the settling round consumes the mark
+// and threads `abandonReason: "paused_by_operator"` through BOTH recovery
+// paths (clean-exit/empty-output and adapter-throw).
+
+describe("PKIL US-005: operator-pause round classification", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-pkil-us005-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+      TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+      TAMANDUA_HARNESS_INVOCATIONS: process.env.TAMANDUA_HARNESS_INVOCATIONS,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-pkil-us005"),
+    );
+  });
+
+  afterEach(() => {
+    shutdownAllCrons();
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  function workflowSpec() {
+    return { ...makeWorkflow(), id: "test-wf" };
+  }
+
+  function jobFor(runId: string, jobId: string, workdir: string) {
+    return {
+      id: jobId,
+      workflowId: "test-wf",
+      runId,
+      agentId: "test-wf_test-agent",
+      harnessType: "pi" as const,
+      workingDirectoryForHarness: workdir,
+      createdAt: "",
+    };
+  }
+
+  function agentSpec() {
+    return { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 60 };
+  }
+
+  /**
+   * Seed a running run with one pending step plus a fake pi that claims the
+   * step, records the invocation, and hangs. Invocation 1 hangs (the round to
+   * be paused); invocation 2+ reports STATUS: done so a post-resume round can
+   * auto-complete the step.
+   */
+  function setupPausingRound(): {
+    runId: string;
+    jobId: string;
+    workdir: string;
+    marker: string;
+    invocations: string;
+  } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    const marker = path.join(tempHome, "round.marker");
+    const invocations = path.join(tempHome, "invocations");
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'pkil task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    const fakePi = path.join(tempHome, "pi-pkil");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+let inv = 0;
+try { inv = Number(fs.readFileSync(process.env.TAMANDUA_HARNESS_INVOCATIONS, "utf8")) || 0; } catch {}
+inv += 1;
+fs.writeFileSync(process.env.TAMANDUA_HARNESS_INVOCATIONS, String(inv));
+if (inv === 1) {
+  fs.writeFileSync(process.env.TAMANDUA_ROUND_MARKER, "inflight");
+  await new Promise((resolve) => setTimeout(resolve, 30000));
+  process.exit(143);
+}
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+    process.env.TAMANDUA_HARNESS_INVOCATIONS = invocations;
+
+    return { runId, jobId: `tamandua-test-wf-${runId}-test-agent`, workdir, marker, invocations };
+  }
+
+  async function waitForFile(file: string, timeoutMs = 5000): Promise<void> {
+    const startedAt = Date.now();
+    while (!fs.existsSync(file) && Date.now() - startedAt < timeoutMs) {
+      await sleep(20);
+    }
+    assert.ok(fs.existsSync(file), `file never appeared: ${file}`);
+  }
+
+  it("marks the in-flight round and classifies the SIGTERM exit as paused_by_operator (AC1-AC4)", async () => {
+    const { runId, jobId, workdir, marker } = setupPausingRound();
+    const workflow = workflowSpec();
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    const round = executeDispatchRound(jobFor(runId, jobId, workdir), agentSpec());
+    await waitForFile(marker);
+
+    // removeRunCrons runs synchronously through its teardown loop (graceMs 0),
+    // so the mark is observable on the returned-but-unawaited promise.
+    const removal = removeRunCrons(runId, { pausedByOperator: true });
+    assert.deepEqual(
+      _operatorPausedRoundIds(),
+      [jobId],
+      "a non-drain pause must mark the in-flight round before aborting/killing it",
+    );
+    await removal;
+    await round;
+
+    // The settling round consumed its own mark.
+    assert.deepEqual(_operatorPausedRoundIds(), [], "the operator-pause mark must be consumed once the round settles");
+
+    const db = getDb();
+    const runRow = db
+      .prepare("SELECT worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?")
+      .get(runId) as { worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(runRow.worker_lost_count, 0, "an operator pause must NOT tick worker_lost_count");
+    assert.equal(runRow.ceiling_expiry_count, 0, "an operator pause must NOT tick ceiling_expiry_count");
+
+    const step = db
+      .prepare("SELECT status, retry_count FROM steps WHERE id = ?")
+      .get(`${runId}-step`) as { status: string; retry_count: number };
+    assert.equal(step.status, "pending", "a paused step must reset to pending so resume re-dispatches it");
+    assert.equal(step.retry_count, 0, "an operator pause must NOT charge a retry");
+
+    const events = getRunEvents(runId);
+    assert.equal(
+      events.filter((e) => e.event === "step.worker_lost").length,
+      0,
+      "an operator pause must never emit step.worker_lost",
+    );
+    const paused = events.filter((e) => e.event === "step.paused_kill");
+    assert.equal(paused.length, 1, "an operator pause must emit exactly one step.paused_kill");
+    assert.equal(paused[0].signal, "SIGTERM");
+    const respawned = events.filter((e) => e.event === "step.respawned");
+    assert.equal(respawned.length, 1, "a paused recovery must emit step.respawned");
+    assert.equal(respawned[0].reason, "paused_by_operator", "step.respawned must carry reason paused_by_operator");
+  });
+
+  it("does not mark the round for a non-pause teardown (AC1 negative)", async () => {
+    const { runId, jobId, workdir, marker } = setupPausingRound();
+    const workflow = workflowSpec();
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    const round = executeDispatchRound(jobFor(runId, jobId, workdir), agentSpec());
+    await waitForFile(marker);
+
+    const removal = removeRunCrons(runId);
+    assert.deepEqual(_operatorPausedRoundIds(), [], "a terminate/natural-completion teardown must not mark a round");
+    await removal;
+    await round;
+
+    // Unchanged semantics for every other teardown caller: the round is
+    // recovered as a genuine loss (here the SIGTERM-killed running child is
+    // the existing ceiling-expiry classification) and a retry IS charged —
+    // unlike the operator-pause path.
+    const db = getDb();
+    const runRow = db
+      .prepare("SELECT worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?")
+      .get(runId) as { worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(
+      runRow.worker_lost_count + runRow.ceiling_expiry_count,
+      1,
+      "a non-pause teardown of a claimed worker must still book a genuine loss",
+    );
+    const step = db
+      .prepare("SELECT status, retry_count FROM steps WHERE id = ?")
+      .get(`${runId}-step`) as { status: string; retry_count: number };
+    assert.equal(step.status, "pending");
+    assert.equal(step.retry_count, 1, "a non-pause loss still charges one retry");
+    const events = getRunEvents(runId);
+    assert.equal(events.filter((e) => e.event === "step.paused_kill").length, 0);
+    assert.equal(events.filter((e) => e.event === "step.respawned").length, 1);
+    assert.notEqual(
+      events.filter((e) => e.event === "step.respawned")[0].reason,
+      "paused_by_operator",
+      "a non-pause teardown must not use the paused_by_operator respawn reason",
+    );
+  });
+
+  it("classifies an adapter-throw round as paused_by_operator (AC3 catch path)", async () => {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work-throw");
+    fs.mkdirSync(workdir, { recursive: true });
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'pkil throw task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    // A pending step so the deterministic peek reports HAS_WORK.
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-pending', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-pending`, runId, now, now);
+    // A step already claimed by this round's worker — the adapter then throws
+    // before the worker can report, exercising the catch-block recovery.
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, claim_job_id, retry_count, created_at, updated_at) VALUES (?, ?, 'step-claimed', 'test-wf_test-agent', 1, 'do work', 'STATUS', 'running', ?, 0, ?, ?)",
+    ).run(`${runId}-claimed`, runId, jobId, now, now);
+
+    // Executable path that fails findBinary's X_OK check → adapter throw.
+    const broken = path.join(tempHome, "pi-broken");
+    fs.writeFileSync(broken, "not executable\n", { mode: 0o644 });
+    process.env.TAMANDUA_PI_BINARY = broken;
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+
+    const workflow = workflowSpec();
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    const round = executeDispatchRound(jobFor(runId, jobId, workdir), agentSpec());
+    const removal = removeRunCrons(runId, { pausedByOperator: true });
+    assert.deepEqual(_operatorPausedRoundIds(), [jobId], "the in-flight round must be marked before the abort");
+    await removal;
+    await round;
+
+    assert.deepEqual(_operatorPausedRoundIds(), [], "the mark must be consumed by the settling round");
+
+    const runRow = db
+      .prepare("SELECT worker_lost_count FROM runs WHERE id = ?")
+      .get(runId) as { worker_lost_count: number };
+    assert.equal(runRow.worker_lost_count, 0, "the adapter-throw pause path must NOT tick worker_lost_count");
+    const claimed = db
+      .prepare("SELECT status, retry_count FROM steps WHERE id = ?")
+      .get(`${runId}-claimed`) as { status: string; retry_count: number };
+    assert.equal(claimed.status, "pending", "the claimed step must reset to pending");
+    assert.equal(claimed.retry_count, 0, "the adapter-throw pause path must NOT charge a retry");
+
+    const events = getRunEvents(runId);
+    assert.equal(events.filter((e) => e.event === "step.worker_lost").length, 0);
+    assert.equal(events.filter((e) => e.event === "step.paused_kill").length, 1);
+    const respawned = events.filter((e) => e.event === "step.respawned");
+    assert.equal(respawned.length, 1);
+    assert.equal(respawned[0].reason, "paused_by_operator");
+  });
+
+  it("re-dispatches the reset step after resume and the run completes (AC5)", async () => {
+    const { runId, jobId, workdir, marker } = setupPausingRound();
+    const workflow = workflowSpec();
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    const round = executeDispatchRound(jobFor(runId, jobId, workdir), agentSpec());
+    await waitForFile(marker);
+    const removal = removeRunCrons(runId, { pausedByOperator: true });
+    await removal;
+    await round;
+
+    const db = getDb();
+    let step = db
+      .prepare("SELECT status, retry_count FROM steps WHERE id = ?")
+      .get(`${runId}-step`) as { status: string; retry_count: number };
+    assert.equal(step.status, "pending", "the paused step must be pending before resume");
+    assert.equal(step.retry_count, 0);
+
+    // Simulate resume: the control plane flips the run back to running and
+    // re-creates the run's dispatch jobs.
+    db.prepare(
+      "UPDATE runs SET status = 'running', scheduling_status = 'active', updated_at = ? WHERE id = ?",
+    ).run(new Date().toISOString(), runId);
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    // The resumed round's worker claims the pending step and reports done.
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agentSpec());
+
+    step = db
+      .prepare("SELECT status, retry_count FROM steps WHERE id = ?")
+      .get(`${runId}-step`) as { status: string; retry_count: number };
+    assert.equal(step.status, "done", "the resumed round must complete the previously-paused step");
+    assert.equal(step.retry_count, 0, "the resumed completion must not charge a retry");
+
+    const runRow = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(runRow.status, "completed", "the run must complete after the resumed step completes");
+    const events = getRunEvents(runId);
+    assert.equal(
+      events.filter((e) => e.event === "run.completed").length,
+      1,
+      "resume after a paused kill must end in run.completed",
+    );
+    assert.equal(
+      events.filter((e) => e.event === "step.worker_lost").length,
+      0,
+      "no worker_lost may be booked anywhere in the pause → resume flow",
+    );
+  });
+});
+
+
 // A harness that exits nonzero with zero output before claiming any step
 // is an instant-fail round: no step is ever claimed, so clean-exit
 // recovery finds nothing, no WLST5 counter ticks, and the fixed dispatch
@@ -1525,6 +2164,13 @@ describe("executeDispatchRound harness env run identity (TATR)", () => {
       TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
       TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
       TAMANDUA_RUN_ID: process.env.TAMANDUA_RUN_ID,
+      // CPID2: the scheduler now exports the DAEMON pid as
+      // TAMANDUA_DAEMON_PID; the harness launch wrapper exports the WORKER
+      // pid as TAMANDUA_WORKER_PID. Save/restore both so ambient bleed from
+      // the (possibly agent-hosted) test process cannot skew the assertions.
+      TAMANDUA_WORKER_PID: process.env.TAMANDUA_WORKER_PID,
+      TAMANDUA_DAEMON_PID: process.env.TAMANDUA_DAEMON_PID,
+      TAMANDUA_WORKER_PGID: process.env.TAMANDUA_WORKER_PGID,
       // The canned fake-pi shim never answers a launch-time harness probe
       // prompt (it claims the step and prints STATUS: done regardless of
       // the prompt), so the probe is disabled for these rounds — exactly as
@@ -1539,6 +2185,11 @@ describe("executeDispatchRound harness env run identity (TATR)", () => {
     // Drop any ambient TAMANDUA_RUN_ID so the child-env observation can
     // only come from the scheduler's harnessEnv (not process-env bleed).
     delete process.env.TAMANDUA_RUN_ID;
+    // Same for the worker/daemon pid vars: the wrapper (not ambient env)
+    // must be the source of TAMANDUA_WORKER_PID.
+    delete process.env.TAMANDUA_WORKER_PID;
+    delete process.env.TAMANDUA_DAEMON_PID;
+    delete process.env.TAMANDUA_WORKER_PGID;
     // Guard awareness (test-isolation-guard): this suite emits events and
     // reads the run DB through the same isolated temp state dir it creates.
     assert.doesNotThrow(() =>
@@ -1555,7 +2206,7 @@ describe("executeDispatchRound harness env run identity (TATR)", () => {
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
-  it("passes TAMANDUA_RUN_ID (and preserves job id / worker pid) into the worker subprocess env", async () => {
+  it("passes TAMANDUA_RUN_ID (and daemon/worker pid identity) into the worker subprocess env", async () => {
     const db = getDb();
     const runId = crypto.randomUUID();
     const now = new Date().toISOString();
@@ -1590,6 +2241,7 @@ fs.writeFileSync(process.env.TAMANDUA_ENV_DUMP, JSON.stringify({
   TAMANDUA_RUN_ID: process.env.TAMANDUA_RUN_ID ?? null,
   TAMANDUA_WORKER_JOB_ID: process.env.TAMANDUA_WORKER_JOB_ID ?? null,
   TAMANDUA_WORKER_PID: process.env.TAMANDUA_WORKER_PID ?? null,
+  TAMANDUA_DAEMON_PID: process.env.TAMANDUA_DAEMON_PID ?? null,
 }));
 console.log("STATUS: done");
 process.exit(0);
@@ -1610,6 +2262,7 @@ process.exit(0);
       TAMANDUA_RUN_ID: string | null;
       TAMANDUA_WORKER_JOB_ID: string | null;
       TAMANDUA_WORKER_PID: string | null;
+      TAMANDUA_DAEMON_PID: string | null;
     };
     assert.equal(
       observed.TAMANDUA_RUN_ID,
@@ -1621,10 +2274,24 @@ process.exit(0);
       jobId,
       "existing TAMANDUA_WORKER_JOB_ID env entry must be preserved",
     );
+    // CPID2: the scheduler exports the DAEMON pid under TAMANDUA_DAEMON_PID;
+    // the launch wrapper exports the WORKER pid (`$$`) under
+    // TAMANDUA_WORKER_PID. `step claim` records the latter as claim_pid.
     assert.equal(
-      observed.TAMANDUA_WORKER_PID,
+      observed.TAMANDUA_DAEMON_PID,
       String(process.pid),
-      "existing TAMANDUA_WORKER_PID env entry must be preserved",
+      "TAMANDUA_DAEMON_PID must carry the scheduling daemon pid",
+    );
+    assert.ok(observed.TAMANDUA_WORKER_PID !== null, "the launch wrapper must export TAMANDUA_WORKER_PID");
+    const observedWorkerPid = Number(observed.TAMANDUA_WORKER_PID);
+    assert.ok(
+      Number.isInteger(observedWorkerPid) && observedWorkerPid > 0,
+      `TAMANDUA_WORKER_PID must be a real worker pid, got ${observed.TAMANDUA_WORKER_PID}`,
+    );
+    assert.notEqual(
+      String(observedWorkerPid),
+      String(process.pid),
+      "TAMANDUA_WORKER_PID must NOT be the daemon pid (CPID2)",
     );
 
     // The round completed cleanly: the claimed step was auto-completed.

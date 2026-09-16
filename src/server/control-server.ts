@@ -1144,7 +1144,12 @@ async function handlePauseRun(
 
   try {
     const { removeRunCrons } = await import("../installer/agent-scheduler.js");
-    await removeRunCrons(runId);
+    // PKIL (US-005): a NON-DRAIN pause kills the in-flight worker, but it must
+    // not book a retry. Mark each in-flight round before the abort/SIGTERM so
+    // its post-round recovery classifies the exit as paused_by_operator
+    // (step.paused_kill, no retry charge). Drain pause returns above and never
+    // reaches this path; terminate/cancel call removeRunCrons with no flag.
+    await removeRunCrons(runId, { pausedByOperator: true });
   } catch (err) {
     logger.warn("control-server: pause removeRunCrons threw", { runId, error: String(err) });
   }

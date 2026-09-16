@@ -346,15 +346,23 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       return true;
     }
     const jobId = process.env.TAMANDUA_WORKER_JOB_ID;
-    const pidStr = process.env.TAMANDUA_WORKER_PID;
     // Harness process group: env override, else self-detected — the CLI
     // descends from the detached harness (its group leader), so our own
     // pgid IS the harness group. Lets the dead-worker sweep (C18) tell a
     // surviving harness apart from a fully dead one.
     const pgidStr = process.env.TAMANDUA_WORKER_PGID;
     const pgid = pgidStr ? Number(pgidStr) : getOwnProcessGroupId();
-    const workerOwnership = (jobId && pidStr)
-      ? { jobId, pid: Number(pidStr), ...(pgid ? { pgid } : {}) }
+    // CPID2: the WORKER pid is the harness process, exported by the harness
+    // launch wrapper as `TAMANDUA_WORKER_PID="$$"` (pid === pgid for the
+    // detached group leader). Fall back to the resolved pgid when the env
+    // var is absent so we still record the harness group; never record this
+    // CLI/daemon process's own pid, which would make dead-owner detection
+    // and step.respawned.priorPid meaningless.
+    const pidStr = process.env.TAMANDUA_WORKER_PID;
+    const parsedPid = pidStr ? Number(pidStr) : NaN;
+    const workerPid = Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : pgid;
+    const workerOwnership = (jobId && typeof workerPid === "number" && workerPid > 0)
+      ? { jobId, pid: workerPid, ...(pgid ? { pgid } : {}) }
       : undefined;
     let result: ReturnType<typeof claimStep>;
     try {

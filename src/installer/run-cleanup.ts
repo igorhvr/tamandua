@@ -17,7 +17,8 @@ import {
 
 export interface RunCleanupResult {
   runId: string;
-  worktreePath: string;
+  /** Recorded working directory (worktree or direct-mode dir); null when unknown. */
+  worktreePath: string | null;
   scannedPids: number;
   killedPids: number[];
   evidence: Record<number, string>;
@@ -28,6 +29,11 @@ export interface SweepOptions {
   daemonPid?: number;
   /** Process groups to spare (in-grace harness groups; leak guard owns them). */
   excludePgids?: number[];
+  /**
+   * Process groups provably owned by the run (harness pgids). A process whose
+   * pgid is in this set is run-owned regardless of cwd/environ/cmdline.
+   */
+  pgids?: number[];
 }
 
 /** One process observation: pid plus the evidence channels we match on. */
@@ -78,22 +84,29 @@ function safeRealpath(p: string): string {
  * Evidence matcher over already-collected process observations.
  * Returns the evidence string (which check matched), or null if no match.
  *
- * Channels (a)–(d) are exact when the underlying reader is available. On
+ * Channels (a)–(e) are exact when the underlying reader is available. On
  * macOS environ is read through the native KERN_PROCARGS2 helper (never
- * `ps -E`), so (b)/(c) fire there too when a same-user process is inspected;
- * (a) cwd and (d) cmdline remain the broadest evidence — harness argv contains
- * the run/agent ids, and run children get their cwd set inside the worktree.
+ * `ps -E`), so (b)/(c)/(e) fire there too when a same-user process is
+ * inspected; (a) cwd and (d) cmdline remain the broadest evidence — harness
+ * argv contains the run/agent ids, and run children get their cwd set inside
+ * the worktree.
+ *
+ * `worktreePath` may be null for direct-mode runs with no worktree: the
+ * path-based channels (a), (b) and the path half of (d) are then skipped,
+ * while the marker/cmdline channels (c), (e) and the runId half of (d) still
+ * apply. Pgid ownership is evaluated by `sweepRunProcesses` (it needs the
+ * live pgid per pid).
  */
 export function matchRunEvidence(
   entry: Pick<ProcessSnapshotEntry, "cwd" | "environ" | "cmdline">,
   runId: string,
-  worktreePath: string,
+  worktreePath: string | null,
 ): string | null {
   const { cwd, environ, cmdline } = entry;
 
   // (a) cwd resolves to or under worktreePath (realpath both sides: lsof
   // reports canonical paths while callers may hold the symlinked spelling)
-  if (cwd) {
+  if (worktreePath && cwd) {
     const resolvedCwd = safeRealpath(cwd);
     const resolvedWorktree = safeRealpath(worktreePath);
     if (resolvedCwd === resolvedWorktree || resolvedCwd.startsWith(resolvedWorktree + path.sep)) {
@@ -102,7 +115,7 @@ export function matchRunEvidence(
   }
 
   // (b) environ contains the string worktreePath
-  if (environ && environ.includes(worktreePath)) {
+  if (worktreePath && environ && environ.includes(worktreePath)) {
     return `environ contains worktree path: ${worktreePath}`;
   }
 
@@ -114,10 +127,20 @@ export function matchRunEvidence(
     }
   }
 
+  // (e) environ contains an exact TAMANDUA_RUN_ID=<runId> token — the
+  // scheduler injects TAMANDUA_RUN_ID into every harness round, so this is
+  // the run-ownership marker for direct-mode children.
+  if (environ) {
+    const m = environ.match(/TAMANDUA_RUN_ID=([^\0\s]*)/);
+    if (m && m[1] === runId) {
+      return `TAMANDUA_RUN_ID=${runId}`;
+    }
+  }
+
   // (d) command line names the worktree or the run id (run ids are UUIDs,
   // so a substring hit is unambiguous)
   if (cmdline) {
-    if (cmdline.includes(worktreePath)) {
+    if (worktreePath && cmdline.includes(worktreePath)) {
       return `cmdline contains worktree path: ${worktreePath}`;
     }
     if (cmdline.includes(runId)) {
@@ -131,11 +154,12 @@ export function matchRunEvidence(
 /**
  * Check if a process belongs to the run by inspecting its cwd, environ,
  * and command line. Returns the evidence string, or null if no match.
+ * `worktreePath` may be null for direct-mode runs (path channels skipped).
  */
 export function processBelongsToRun(
   pid: number,
   runId: string,
-  worktreePath: string,
+  worktreePath: string | null,
 ): string | null {
   return matchRunEvidence(
     { cwd: readProcCwd(pid), environ: readProcEnviron(pid), cmdline: getCmdline(pid) },
@@ -214,16 +238,26 @@ export function collectProcessSnapshot(): ProcessSnapshotEntry[] {
  * A process belongs to the run when:
  *  - its cwd resolves to or under `worktreePath`, OR
  *  - its environ contains the string `worktreePath`, OR
- *  - its environ contains `TAMANDUA_WORKER_JOB_ID=...` where `runId` is a substring
+ *  - its environ contains `TAMANDUA_WORKER_JOB_ID=...` where `runId` is a substring, OR
+ *  - its environ contains an exact `TAMANDUA_RUN_ID=<runId>` token, OR
+ *  - its process group is listed in `options.pgids` (provably owned harness
+ *    groups recorded for the run), OR
+ *  - its command line names `worktreePath` or `runId`.
  *
- * Never kills: pid 1 (init), our own process (process.pid), the daemonPid (if provided).
+ * `worktreePath` may be null for direct-mode runs without a worktree; the
+ * path channels are then skipped and the run-marker/pgid channels carry the
+ * sweep. Processes are only killed by pid after evidence matched — never by
+ * name or glob.
+ *
+ * Never kills: pid 1 (init), our own process (process.pid), the daemonPid (if
+ * provided), and any pid whose pgid is in `excludePgids`.
  *
  * Logs every kill via `logger.info` with pid and evidence, and emits a
  * `run.process_cleanup` event summarizing the sweep.
  */
 export function sweepRunProcesses(
   runId: string,
-  worktreePath: string,
+  worktreePath: string | null,
   options?: SweepOptions,
 ): RunCleanupResult {
   const skipPids = new Set<number>([1, process.pid]);
@@ -231,6 +265,7 @@ export function sweepRunProcesses(
     skipPids.add(options.daemonPid);
   }
   const excludePgids = new Set<number>(options?.excludePgids ?? []);
+  const ownedPgids = new Set<number>(options?.pgids ?? []);
 
   const killedPids: number[] = [];
   const evidence: Record<number, string> = {};
@@ -244,14 +279,20 @@ export function sweepRunProcesses(
     scannedPids++;
 
     try {
+      // Resolve the live pgid once when any pgid decision is needed.
+      let pgid: number | null = null;
+      if (excludePgids.size > 0 || ownedPgids.size > 0) {
+        pgid = getPgid(pid);
+      }
+
       // Spare in-grace harness groups: the run's final work round may still
       // be flushing its token usage (HARNESS_TEARDOWN_GRACE_MS); the
       // scheduler's leak guard kills those groups after the grace window.
-      if (excludePgids.size > 0) {
-        const pgid = getPgid(pid);
-        if (pgid !== null && excludePgids.has(pgid)) continue;
-      }
-      const matchReason = matchRunEvidence(entry, runId, worktreePath);
+      if (pgid !== null && excludePgids.has(pgid)) continue;
+
+      const matchReason =
+        matchRunEvidence(entry, runId, worktreePath) ??
+        (pgid !== null && ownedPgids.has(pgid) ? `pgid owned by run: ${pgid}` : null);
       if (matchReason) {
         process.kill(pid, "SIGKILL");
         killedPids.push(pid);
@@ -287,6 +328,7 @@ export function sweepRunProcesses(
     runId,
     detail: JSON.stringify({
       worktreePath,
+      pgids: [...ownedPgids],
       scannedPids,
       killedPids,
       evidence,

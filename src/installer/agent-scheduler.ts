@@ -244,6 +244,44 @@ function abortDispatchRound(jobId: string): void {
 }
 
 /**
+ * PKIL (US-005): job ids whose in-flight dispatch round is being torn down
+ * by a NON-DRAIN operator `run pause`.
+ *
+ * `removeRunCrons({ pausedByOperator: true })` records every in-flight round
+ * for the run BEFORE it aborts the round controller / SIGTERMs the harness
+ * pgid, so the round can read the mark after it settles and classify its exit
+ * as `paused_by_operator` (PKIL recovery class, US-004) instead of
+ * `worker_lost` — an operator pause must never charge a retry.
+ *
+ * The mark is consumed (read + deleted) once by the round that owns it, and
+ * unconditionally deleted in the round's `finally`, so a stale mark can never
+ * leak into a later round that reuses the deterministic job id. Only rounds
+ * that are genuinely in flight (`inFlightJobs.has(id)`) are marked, so a
+ * teardown of an idle job cannot strand an entry.
+ *
+ * Cleared by `shutdownAllCrons` for test isolation.
+ *
+ * @internal — exposed for test introspection via `_operatorPausedRoundIds`.
+ */
+const operatorPausedRounds = new Set<string>();
+
+/**
+ * Read-and-clear the PKIL operator-pause mark for a dispatch round.
+ * Returns `true` only when a non-drain pause marked this exact job id before
+ * tearing it down.
+ */
+function consumeOperatorPausedRound(jobId: string): boolean {
+  if (!operatorPausedRounds.has(jobId)) return false;
+  operatorPausedRounds.delete(jobId);
+  return true;
+}
+
+/** @internal test introspection for the PKIL operator-pause mark. */
+export function _operatorPausedRoundIds(): string[] {
+  return [...operatorPausedRounds];
+}
+
+/**
  * Pending post-grace process-cleanup sweep timers keyed by runId.
  * At most one timer per run: `removeRunCrons` schedules a one-shot
  * unref-ed timer at HARNESS_TEARDOWN_GRACE_MS + 2s after the last
@@ -256,6 +294,17 @@ function abortDispatchRound(jobId: string): void {
  * @internal — exposed for test introspection via `_pendingSweepTimerCount`.
  */
 const pendingSweepTimers = new Map<string, NodeJS.Timeout>();
+
+/**
+ * Captured sweep target per runId (working directory + in-flight pgids at
+ * teardown time). Set when the sweep timer is scheduled, deleted when the
+ * timer fires, and cleared by `shutdownAllCrons`. Exposed for tests via
+ * `_pendingSweepTarget` so the `removeRunCrons` capture path is assertable
+ * without waiting out the grace window.
+ *
+ * @internal
+ */
+const pendingSweepTargets = new Map<string, PostGraceSweepTarget>();
 
 /**
  * Monotonic scheduler generation/epoch counter.
@@ -1471,6 +1520,11 @@ export async function executeDispatchRound(
   // instant-fail (RSPN) — the classifier must never count them toward the
   // instant-fail streak.
   let roundRecoveredOrphans = false;
+  // PKIL (US-005): set when a non-drain operator pause marked this round
+  // before tearing it down. Read (and cleared) once the round settles, then
+  // threaded into the recovery paths so their abandonReason is
+  // 'paused_by_operator' (no retry charge) instead of 'worker_lost'.
+  let operatorPaused = false;
   // Round-start timestamp captured for dsh token accounting. dsh never
   // prints usage; tokens are read from $DSH_HOME session files keyed on
   // the workdir + a "created since this time" scan. Captured BEFORE
@@ -1880,6 +1934,12 @@ export async function executeDispatchRound(
     // the raw JSONL transcript (tool payloads can contain a literal STATUS).
     const outputSummary = summarizeWorkRoundOutput(metadata.assistantOutput);
 
+    // PKIL (US-005): the round has settled. Read (and clear) the operator-pause
+    // mark so the recovery branches below classify this exit as
+    // paused_by_operator rather than worker_lost. A SIGTERM (exit 143) or a
+    // clean exit after the pause both land here.
+    operatorPaused = consumeOperatorPausedRound(job.id);
+
     logger.info("Work round complete", {
       ...context,
       outcome: outputSummary.outcome,
@@ -1975,7 +2035,7 @@ export async function executeDispatchRound(
           undefined,
           undefined,
           job.id,
-          "worker_lost",
+          operatorPaused ? "paused_by_operator" : "worker_lost",
           undefined, // detailPrefix
           result?.exitCode,
           result?.signal,
@@ -2059,6 +2119,16 @@ export async function executeDispatchRound(
     const errorMessage = err instanceof Error ? err.message : String(err);
     const errorSummary = buildBoundedPreview(errorMessage, MAX_WORK_ERROR_PREVIEW);
 
+    // PKIL (US-005): the adapter threw (e.g. the cancellation signal aborted
+    // the launch, or the SIGTERM'd process rejected). Read (and clear) the
+    // operator-pause mark so the recovery below classifies this as a pause
+    // (step.paused_kill, no retry charge) rather than a worker loss. Keep a
+    // mark the clean path already consumed before a later post-round throw —
+    // re-consuming would erase the pause classification.
+    if (!operatorPaused) {
+      operatorPaused = consumeOperatorPausedRound(job.id);
+    }
+
     logger.error("Work round failed", {
       ...context,
       errorBytes: errorSummary.bytes,
@@ -2080,7 +2150,7 @@ export async function executeDispatchRound(
         timeoutRetryReason,
         undefined,
         job.id,
-        "worker_lost",
+        operatorPaused ? "paused_by_operator" : "worker_lost",
         undefined, // detailPrefix
         result?.exitCode,
         result?.signal,
@@ -2193,6 +2263,11 @@ export async function executeDispatchRound(
   } finally {
     inFlightJobs.delete(job.id);
     inFlightChildren.delete(job.id);
+    // PKIL (US-005): drop any operator-pause mark for this round. The normal
+    // paths consume it before recovery; this unconditional clear covers early
+    // returns (idle peek, probe failure) so a stale mark can never leak into
+    // a later round that reuses the deterministic job id.
+    operatorPausedRounds.delete(job.id);
     // KHYG US-002: the round's launch-cancellation signal lives for the
     // whole round (teardown may abort it while inFlightChildren is being
     // cleared); drop it only once the round itself is finished. The delete
@@ -2218,18 +2293,24 @@ export async function executeDispatchRound(
 
 /**
  * Build the child environment for one harness invocation of a dispatch job:
- * the standard worker identity vars (job id / worker pid / run id), the
+ * the standard worker identity vars (job id / daemon pid / run id), the
  * per-harness binary env override, and a PATH that prepends the resolved
  * binary's directory so nested pi/hermes/dsh invocations inside the agent
  * session resolve to the same binary even when the daemon's own PATH lacks
  * it. Shared by the work round and the launch-time harness probe round so
  * the probe exercises the exact environment a real work round receives.
+ *
+ * CPID2: `TAMANDUA_DAEMON_PID` carries the SCHEDULING DAEMON's pid (used by
+ * the daemonctl self-stop guard). The WORKER pid is deliberately NOT set
+ * here — the harness launch wrapper exports its own `$$` into
+ * `TAMANDUA_WORKER_PID`, so `step claim` records the actual harness process
+ * (pid === pgid for the detached group leader) rather than the daemon pid.
  */
 function buildHarnessChildEnv(job: CronJobInfo, binaryPath: string): Record<string, string> {
   const harnessType = job.harnessType ?? "pi";
   const harnessEnv: Record<string, string> = {
     TAMANDUA_WORKER_JOB_ID: job.id,
-    TAMANDUA_WORKER_PID: String(process.pid),
+    TAMANDUA_DAEMON_PID: String(process.pid),
     // Run identity for the worker subprocess: nested CLI invocations
     // (tamandua merge-branch, tamandua workflow run) read this to
     // attribute themselves to the run that spawned them (TATR facets 1
@@ -2724,6 +2805,136 @@ export interface RemoveRunCronsOptions {
    * tear-down), which behave exactly as before.
    */
   schedulerGeneration?: number;
+  /**
+   * PKIL (US-005): set by the NON-DRAIN operator `run pause` teardown. When
+   * true, every in-flight dispatch round for the run is marked (PKIL
+   * operator-pause registry) BEFORE it is aborted/killed, so its post-round
+   * recovery classifies the exit as `paused_by_operator` — `step.paused_kill`
+   * with no retry charge — rather than `worker_lost`. Draining pause,
+   * terminate, cancel, and natural completion pass no flag, so their
+   * worker-lost semantics are unchanged.
+   */
+  pausedByOperator?: boolean;
+}
+
+/**
+ * Teardown-time target for a run's post-grace sweep.
+ *
+ * Both fields are optional. Direct-mode runs have no managed worktree row,
+ * so the sweep cannot rely on `getRunWorktree`; the scheduler captures the
+ * run's harness working directory and in-flight child pgids while it still
+ * has them (`removeRunCrons`) and threads them through to the timer.
+ */
+export interface PostGraceSweepTarget {
+  /** `workingDirectoryForHarness` captured from the run's dispatch jobs. */
+  workingDirectory?: string;
+  /** pgids captured from the run's in-flight harness children at teardown. */
+  pgids?: number[];
+}
+
+/**
+ * Execute the post-grace process sweep for a run.
+ *
+ * Direct-mode runs never get a `run_worktrees` row, so the sweep no longer
+ * requires a worktree (the old "no worktree found" early return skipped
+ * every direct-mode run). The sweep directory is resolved in order:
+ *
+ *   1. the working directory captured at teardown (`removeRunCrons`),
+ *   2. the run's managed worktree path (`getRunWorktree`), when one exists,
+ *   3. `working_directory_for_harness`, then `repo`, from the run's DB context.
+ *
+ * Owned pgids are the captured in-flight children PLUS every distinct
+ * non-null `steps.claim_pgid` recorded for the run (CPID2). When neither a
+ * directory nor any pgid resolves, the sweep still runs with a null path so
+ * the `TAMANDUA_RUN_ID` marker channel can reap run-owned children.
+ *
+ * Exported so tests can invoke the sweep directly without waiting for the
+ * `HARNESS_TEARDOWN_GRACE_MS + 2 s` timer.
+ */
+export async function runPostGraceSweep(
+  runId: string,
+  target: PostGraceSweepTarget = {},
+): Promise<void> {
+  try {
+    let dir: string | null = target.workingDirectory?.trim() || null;
+
+    if (!dir) {
+      try {
+        const { getRunWorktree } = await import("./worktree-manager.js");
+        dir = getRunWorktree(runId)?.worktreePath ?? null;
+      } catch (err) {
+        logger.debug("Post-grace sweep: worktree lookup failed", {
+          runId,
+          error: String(err),
+        });
+      }
+    }
+
+    const ownedPgids = new Set<number>(target.pgids ?? []);
+
+    // Resolve the run context (fallback directory) and the recorded claim
+    // pgids from the DB. A DB failure degrades to the captured target
+    // rather than aborting the sweep.
+    try {
+      const { getDb } = await import("../db.js");
+      const db = getDb();
+
+      if (!dir) {
+        const runRow = db
+          .prepare("SELECT context FROM runs WHERE id = ?")
+          .get(runId) as { context: string } | undefined;
+        if (runRow) {
+          const ctx = parseRunContext(runId, runRow.context || "{}");
+          const candidate = ctx.working_directory_for_harness || ctx.repo;
+          if (typeof candidate === "string" && candidate.trim()) {
+            dir = candidate.trim();
+          }
+        }
+      }
+
+      const rows = db
+        .prepare(
+          "SELECT DISTINCT claim_pgid FROM steps WHERE run_id = ? AND claim_pgid IS NOT NULL",
+        )
+        .all(runId) as Array<{ claim_pgid: number | bigint | null }>;
+      for (const row of rows) {
+        const pgid = Number(row.claim_pgid);
+        if (Number.isFinite(pgid) && pgid > 0) ownedPgids.add(pgid);
+      }
+    } catch (err) {
+      logger.debug("Post-grace sweep: DB resolution failed", { runId, error: String(err) });
+    }
+
+    if (!dir && ownedPgids.size === 0) {
+      logger.debug(
+        "Post-grace sweep: no directory or pgids resolved; running run-marker sweep",
+        { runId },
+      );
+    }
+
+    const { sweepRunProcesses } = await import("./run-cleanup.js");
+    const result = sweepRunProcesses(runId, dir, {
+      daemonPid: process.pid,
+      // After grace, the leak guard already killed harness groups;
+      // survivors ARE leaks — no exclusions.
+      pgids: [...ownedPgids],
+    });
+
+    if (result.killedPids.length > 0) {
+      logger.info("Post-grace sweep killed leaked processes", {
+        runId,
+        killedPids: result.killedPids,
+        evidence: result.evidence,
+      });
+    } else {
+      logger.debug("Post-grace sweep found no leaked processes", { runId });
+    }
+  } catch (err) {
+    logger.warn("Post-grace sweep failed", {
+      runId,
+      error: (err as Error).message,
+    });
+  }
 }
 
 /**
@@ -2733,46 +2944,19 @@ export interface RemoveRunCronsOptions {
  * `removeRunCrons` so every run teardown path (control-plane terminate,
  * dispatch-round run_not_running) gets a sweep scheduled.
  */
-function scheduleSweepTimer(runId: string): void {
+function scheduleSweepTimer(runId: string, target: PostGraceSweepTarget = {}): void {
   if (pendingSweepTimers.has(runId)) return;
 
   const delayMs = HARNESS_TEARDOWN_GRACE_MS + 2_000;
-  const timer = setTimeout(async () => {
+  const timer = setTimeout(() => {
     pendingSweepTimers.delete(runId);
-    try {
-      const { getRunWorktree } = await import("./worktree-manager.js");
-      const wt = getRunWorktree(runId);
-      if (!wt) {
-        logger.info("Sweep timer: no worktree found for run (already removed?)", { runId });
-        return;
-      }
-
-      const { sweepRunProcesses } = await import("./run-cleanup.js");
-      const result = sweepRunProcesses(runId, wt.worktreePath, {
-        daemonPid: process.pid,
-        // After grace, the leak guard already killed harness groups;
-        // survivors ARE leaks — no exclusions.
-      });
-
-      if (result.killedPids.length > 0) {
-        logger.info("Post-grace sweep killed leaked processes", {
-          runId,
-          killedPids: result.killedPids,
-          evidence: result.evidence,
-        });
-      } else {
-        logger.debug("Post-grace sweep found no leaked processes", { runId });
-      }
-    } catch (err) {
-      logger.warn("Post-grace sweep timer callback failed", {
-        runId,
-        error: (err as Error).message,
-      });
-    }
+    pendingSweepTargets.delete(runId);
+    void runPostGraceSweep(runId, target);
   }, delayMs);
 
   timer.unref();
   pendingSweepTimers.set(runId, timer);
+  pendingSweepTargets.set(runId, target);
 
   logger.debug("Scheduled post-grace sweep timer", { runId, delayMs });
 }
@@ -2901,8 +3085,19 @@ export async function removeRunCrons(
   const graceMs = options.graceMs ?? 0;
   const removed: string[] = [];
 
+  // DSWP (US-003): capture the run's harness working directory and in-flight
+  // child pgids BEFORE the loop deletes jobMetadata/inFlightChildren. The
+  // post-grace sweep needs them to identify a direct-mode run's processes
+  // (direct runs have no managed worktree row for the sweep to resolve).
+  let sweepWorkingDirectory: string | undefined;
+  const sweepPgids = new Set<number>();
+
   for (const [id, info] of jobMetadata) {
     if (info.runId !== runId) continue;
+
+    if (!sweepWorkingDirectory && info.workingDirectoryForHarness) {
+      sweepWorkingDirectory = info.workingDirectoryForHarness;
+    }
 
     const pending = pendingStartTimers.get(id);
     if (pending) {
@@ -2916,6 +3111,16 @@ export async function removeRunCrons(
       activeTimers.delete(id);
     }
 
+    // PKIL (US-005): a non-drain operator pause marks each genuinely
+    // in-flight round for the run BEFORE aborting/killing it, so the round's
+    // post-round recovery classifies the exit as paused_by_operator and never
+    // books a retry. Only in-flight rounds are marked (an idle job in
+    // jobMetadata has no round to classify), and the round's own finally
+    // clears the mark, so a stale entry cannot leak into a later round.
+    if (options.pausedByOperator && inFlightJobs.has(id)) {
+      operatorPausedRounds.add(id);
+    }
+
     // KHYG US-002: record explicit cancellation intent for EVERY round
     // torn down with this run, REGARDLESS of child presence — a registered
     // round can be awaiting binary resolution with no published child yet,
@@ -2924,6 +3129,9 @@ export async function removeRunCrons(
     // child exists) then terminates the process group exactly as before.
     abortDispatchRound(id);
     const child = inFlightChildren.get(id);
+    // Capture the harness pgid even when the child was already marked
+    // killed: the sweep must know every group this run owns.
+    if (child?.pgid) sweepPgids.add(child.pgid);
     if (child && !child.killed) {
       child.killed = true;
       if (child.pgid) {
@@ -2981,7 +3189,10 @@ export async function removeRunCrons(
   const epoch = options.schedulerGeneration;
   const epochStale = epoch !== undefined && epoch !== schedulerGeneration;
   if (removed.length > 0 && !epochStale) {
-    scheduleSweepTimer(runId);
+    scheduleSweepTimer(runId, {
+      workingDirectory: sweepWorkingDirectory,
+      pgids: [...sweepPgids],
+    });
   }
 
   // ── F3: closing run.tokens.final ────────────────────────────────
@@ -3188,6 +3399,7 @@ export function shutdownAllCrons(): void {
     clearTimeout(timer);
     pendingSweepTimers.delete(runId);
   }
+  pendingSweepTargets.clear();
   // F3: cancel pending run.tokens.final timers and mark their runs as no
   // longer active so a late race callback cannot emit after shutdown.
   // `finalizedTokenRuns` is intentionally left intact: a shut-down scheduler
@@ -3208,6 +3420,9 @@ export function shutdownAllCrons(): void {
   inFlightJobs.clear();
   jobMetadata.clear();
   instantFailStreaks.clear();
+  // PKIL (US-005): a full shutdown leaves no round to classify — drop the
+  // operator-pause marks so they cannot survive into a later test/run.
+  operatorPausedRounds.clear();
   // KHYG US-002: every round's cancellation controller was aborted above
   // (or belongs to a round that already finished); a full scheduler
   // shutdown leaves nothing in flight, so drop the registry too.
@@ -3391,6 +3606,12 @@ export function _pendingSweepTimerCount(): number {
 /** @internal — exposed for tests to check whether a timer is pending for a runId. */
 export function _hasPendingSweepTimer(runId: string): boolean {
   return pendingSweepTimers.has(runId);
+}
+
+/** @internal — exposed for tests to inspect a run's captured sweep target. */
+export function _pendingSweepTarget(runId: string): PostGraceSweepTarget | undefined {
+  const target = pendingSweepTargets.get(runId);
+  return target ? { ...target, pgids: target.pgids ? [...target.pgids] : undefined } : undefined;
 }
 
 /** @internal — exposed for tests to observe scheduler generation/epoch bumps. */

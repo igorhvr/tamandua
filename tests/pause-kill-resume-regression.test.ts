@@ -99,6 +99,7 @@ interface DbRun {
   status: string;
   scheduling_status: string | null;
   context: string;
+  worker_lost_count: number;
 }
 
 function getStepFromDb(dbPath: string, runId: string, stepIndex = 0): DbStep | null {
@@ -117,7 +118,7 @@ function getRunFromDb(dbPath: string, runId: string): DbRun | null {
   const db = new DatabaseSync(dbPath);
   try {
     const row = db
-      .prepare("SELECT status, scheduling_status, context FROM runs WHERE id = ?")
+      .prepare("SELECT status, scheduling_status, context, worker_lost_count FROM runs WHERE id = ?")
       .get(runId) as DbRun | undefined;
     return row ?? null;
   } finally {
@@ -340,10 +341,22 @@ describe("pause-kill-resume regression (PAUS)", { concurrency: 1 }, () => {
     assert.ok(runAfterPause, "run should exist after pause");
     assert.equal(runAfterPause.status, "paused", "run status should be paused");
 
-    // Verify step is still running (non-drain pause kills worker, step stays running)
+    // Verify step recovery: a non-drain pause kills the worker, but PKIL
+    // classifies that exit as step.paused_kill and resets the claim to
+    // pending WITHOUT charging a retry (US-004/US-005). Wait for the settling
+    // round's recovery so the assertions below are deterministic.
+    await waitForStepStatus(dbPath, runId, "pending", 5000);
     const stepAfterPause = getStepFromDb(dbPath, runId);
     assert.ok(stepAfterPause, "step should exist after pause");
-    assert.equal(stepAfterPause.status, "running", "step should be running after non-drain pause");
+    assert.equal(stepAfterPause.status, "pending", "step should be reset to pending after non-drain pause");
+    assert.equal(stepAfterPause.retry_count, 0, "an operator pause must NOT charge a retry");
+    const runAfterRecovery = getRunFromDb(dbPath, runId);
+    assert.ok(runAfterRecovery, "run should still exist after pause recovery");
+    assert.equal(
+      runAfterRecovery.worker_lost_count,
+      0,
+      "an operator pause must NOT increment runs.worker_lost_count",
+    );
 
     // ── Phase 2: Assert attribution context keys ───────────────────
     const ctx = JSON.parse(runAfterPause.context);
@@ -381,6 +394,31 @@ describe("pause-kill-resume regression (PAUS)", { concurrency: 1 }, () => {
     assert.equal(pauseReqDetail.requestedBy, "tester@test:12345 (cli)");
     assert.equal(pauseReqDetail.drain, false);
 
+    // PKIL (US-004/US-005): the pause teardown classifies the killed round as
+    // an operator pause, never a worker loss. The event stream is run-scoped,
+    // but pin the run identity, the unchanged retry charge, and the follow-up
+    // respawn reason so the classification cannot silently regress.
+    const pausedKills = events.filter((e) => e.event === "step.paused_kill");
+    assert.ok(pausedKills.length >= 1, "a non-drain pause must emit step.paused_kill");
+    assert.ok(
+      pausedKills.every((e) => e.runId === runId),
+      "every step.paused_kill must be attributed to this run",
+    );
+    assert.equal(
+      pausedKills[0].retry,
+      0,
+      "step.paused_kill must carry the unchanged (zero) retry count",
+    );
+    const pausedRespawns = events.filter(
+      (e) => e.event === "step.respawned" && e.reason === "paused_by_operator",
+    );
+    assert.ok(
+      pausedRespawns.length >= 1,
+      "the paused kill must emit step.respawned with reason paused_by_operator",
+    );
+    const workerLostEvents = events.filter((e) => e.event === "step.worker_lost");
+    assert.equal(workerLostEvents.length, 0, "a non-drain pause must never emit step.worker_lost");
+
     // Verify scheduler timers are removed
     const jobsBeforeResume = await controlFetch(
       controlPort,
@@ -413,8 +451,10 @@ describe("pause-kill-resume regression (PAUS)", { concurrency: 1 }, () => {
     const stepAfterResume = getStepFromDb(dbPath, runId);
     assert.equal(stepAfterResume?.status, "pending", "step should be recovered to pending after resume");
 
-    // Verify retry_count bumped for orphan recovery
-    assert.equal(stepAfterResume?.retry_count, 1, "retry_count should be bumped by orphan recovery");
+    // PKIL: the paused claim reset never charged a retry, so resume must not
+    // have bumped it either (the resume orphan sweep finds nothing to recover
+    // once the paused round has settled the step back to pending).
+    assert.equal(stepAfterResume?.retry_count, 0, "retry_count must stay 0 across the non-drain pause");
 
     // ── Phase 5: Assert resume attribution ─────────────────────────
     const runAfterResume = getRunFromDb(dbPath, runId);
@@ -509,5 +549,25 @@ describe("pause-kill-resume regression (PAUS)", { concurrency: 1 }, () => {
 
     const completedEvent = events3.find((e) => e.event === "run.completed");
     assert.ok(completedEvent, "run.completed event should exist after completion");
+
+    // ── Phase 12: PKIL invariants hold across the WHOLE run ────────
+    // The no-retry / no-worker-lost guarantee is not just a pause-instant
+    // artifact: the resumed, completed run must never have charged a retry or
+    // recorded a worker loss.
+    assert.equal(
+      runFinal.worker_lost_count,
+      0,
+      "runs.worker_lost_count must stay 0 across pause, resume and completion",
+    );
+    assert.equal(
+      stepFinal.retry_count,
+      0,
+      "steps.retry_count must stay 0 across pause, resume and completion",
+    );
+    assert.equal(
+      events3.filter((e) => e.event === "step.worker_lost").length,
+      0,
+      "the resumed run must never emit step.worker_lost",
+    );
   });
 });
