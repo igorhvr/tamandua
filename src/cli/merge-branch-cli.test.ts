@@ -5,6 +5,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
+import {
+  MATCHLOCK_GUEST_ENV_VAR,
+  MATCHLOCK_SIGNING_SKIP_REASON,
+} from "../../dist/installer/git-signing.js";
 import { cleanChildEnv, createTempHome } from "../../tests/helpers/test-env.ts";
 
 const cleanup: string[] = [];
@@ -107,6 +111,7 @@ function readEvents(eventsPath: string): Array<{
   checkoutRefresh?: string;
   parkedBranch?: string;
   parkedReason?: string;
+  signingSkipped?: string;
 }> {
   if (!fs.existsSync(eventsPath)) return [];
   const contents = fs.readFileSync(eventsPath, "utf-8").trim();
@@ -309,6 +314,7 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, /invalid or ambiguous worktree metadata/i);
     assert.match(result.stdout, /operation in progress/i);
     assert.match(result.stdout, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| not-applicable \| parked:branch>/);
+    assert.match(result.stdout, /SIGNING: <signed \| unsigned \| unsigned-matchlock>/);
     assert.doesNotMatch(result.stdout, /Operator remedy/i);
     assert.doesNotMatch(result.stdout, /git (?:checkout|reset|symbolic-ref|read-tree)/i);
     assert.match(result.stdout, /Exit codes:[\s\S]*0\s+Newly landed or already landed \(no-op\)[\s\S]*2[\s\S]*3/);
@@ -416,6 +422,79 @@ describe("tamandua merge-branch CLI", () => {
     assert.equal(runlessEvents.length, 1);
     assert.equal(runlessEvents[0]?.event, "merge.landed");
     assert.equal(runlessEvents[0]?.runId, "");
+  });
+
+  it("reports SIGNING: unsigned on a landing when no signing is configured (MSIG US-005)", () => {
+    const { repo, initial } = createRepo();
+    git(repo, ["branch", "scratch", initial]);
+    createFeature(repo, initial);
+
+    const result = runCli(validArgs(repo, initial));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^SIGNING: unsigned$/m);
+    const commit = git(repo, ["rev-parse", "refs/heads/scratch"]);
+    assert.doesNotMatch(git(repo, ["cat-file", "-p", commit]), /gpgsig/);
+  });
+
+  it("reports SIGNING: signed and lands a gpgsig commit when commit.gpgsign=true (MSIG US-005)", () => {
+    const { repo, initial } = createRepo();
+    git(repo, ["branch", "scratch", initial]);
+    createFeature(repo, initial);
+    const keyDir = tamanduaTempDir("tamandua-merge-branch-cli-signing-");
+    cleanup.push(keyDir);
+    const keyPath = path.join(keyDir, "landing_signing_key");
+    const keygen = spawnSync(
+      "ssh-keygen",
+      ["-t", "ed25519", "-N", "", "-f", keyPath, "-C", "landing-test"],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    assert.equal(keygen.status, 0, `ssh-keygen failed: ${keygen.stderr || keygen.stdout}`);
+    git(repo, ["config", "commit.gpgsign", "true"]);
+    git(repo, ["config", "gpg.format", "ssh"]);
+    git(repo, ["config", "user.signingkey", `${keyPath}.pub`]);
+
+    const result = runCli(validArgs(repo, initial));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^SIGNING: signed$/m);
+    const commit = git(repo, ["rev-parse", "refs/heads/scratch"]);
+    assert.match(git(repo, ["cat-file", "-p", commit]), /\ngpgsig /);
+  });
+
+  it("leaves a Matchlock guest-context landing unsigned and reports it (MSIG US-006)", () => {
+    const { repo, initial } = createRepo();
+    git(repo, ["branch", "scratch", initial]);
+    createFeature(repo, initial);
+    const keyDir = tamanduaTempDir("tamandua-merge-branch-cli-matchlock-");
+    cleanup.push(keyDir);
+    const keyPath = path.join(keyDir, "landing_signing_key");
+    const keygen = spawnSync(
+      "ssh-keygen",
+      ["-t", "ed25519", "-N", "", "-f", keyPath, "-C", "landing-test"],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    assert.equal(keygen.status, 0, `ssh-keygen failed: ${keygen.stderr || keygen.stdout}`);
+    // A valid signing key is configured: signing would succeed for a native run.
+    git(repo, ["config", "commit.gpgsign", "true"]);
+    git(repo, ["config", "gpg.format", "ssh"]);
+    git(repo, ["config", "user.signingkey", `${keyPath}.pub`]);
+
+    const result = runCli(validArgs(repo, initial), {
+      TAMANDUA_RUN_ID: "run-cli-matchlock",
+      [MATCHLOCK_GUEST_ENV_VAR]: "1",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^SIGNING: unsigned-matchlock$/m);
+    const commit = git(repo, ["rev-parse", "refs/heads/scratch"]);
+    assert.doesNotMatch(git(repo, ["cat-file", "-p", commit]), /gpgsig/);
+    // The landing still advanced; only signing was exempted.
+    assert.notEqual(commit, initial);
+
+    const [event] = readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"));
+    assert.equal(event?.event, "merge.landed");
+    assert.equal(event?.signingSkipped, MATCHLOCK_SIGNING_SKIP_REASON);
   });
 
   it("rejects unknown, duplicate, positional, and valueless options", () => {
@@ -554,6 +633,7 @@ describe("tamandua merge-branch CLI", () => {
     const parkedBranch = lines[checkoutRefreshIndex]!.slice("CHECKOUT_REFRESH: parked:".length);
     assert.deepEqual(lines.slice(checkoutRefreshIndex), [
       `CHECKOUT_REFRESH: parked:${parkedBranch}`,
+      "SIGNING: unsigned",
       `PARKED_BRANCH: ${parkedBranch}`,
       "PARKED_REASON: local-changes",
     ]);
@@ -699,12 +779,13 @@ describe("tamandua merge-branch CLI", () => {
     const parkedBranch = parkedMatch[1]!;
     const lines = result.stdout.trimEnd().split("\n");
     const checkoutRefreshIndex = lines.findIndex((line) => line === `CHECKOUT_REFRESH: parked:${parkedBranch}`);
-    assert.deepEqual(lines.slice(checkoutRefreshIndex, checkoutRefreshIndex + 2), [
+    assert.deepEqual(lines.slice(checkoutRefreshIndex, checkoutRefreshIndex + 3), [
       `CHECKOUT_REFRESH: parked:${parkedBranch}`,
+      "SIGNING: unsigned",
       `PARKED_BRANCH: ${parkedBranch}`,
     ]);
-    assert.match(lines[checkoutRefreshIndex + 2]!, /^PARKED_REASON: advance-refused:/);
-    assert.equal(lines.length, checkoutRefreshIndex + 3);
+    assert.match(lines[checkoutRefreshIndex + 3]!, /^PARKED_REASON: advance-refused:/);
+    assert.equal(lines.length, checkoutRefreshIndex + 4);
     assert.equal(result.stderr, "");
     assert.notEqual(git(repo, ["rev-parse", "refs/heads/staging"]), stagingTip);
     assert.equal(git(targetWorktree, ["symbolic-ref", "HEAD"]), `refs/heads/${parkedBranch}`);
@@ -719,7 +800,11 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(String(events[0]?.parkedReason), /^advance-refused:/);
 
     // The checkout is parked before the target CAS, and refresh is attempted only afterwards.
-    const ledger = wrapper.getLedger();
+    // Drop the run-identity config reads (GIDN US-004) — they are not merge
+    // plumbing and are asserted separately; this ledger pins the merge order.
+    const ledger = wrapper
+      .getLedger()
+      .filter((cmd) => !(cmd.includes("config") && (cmd.includes("--local") || cmd.includes("--global"))));
     assert.deepEqual(ledger[0], ["-C", repo, "rev-parse", "--verify", "refs/heads/staging"]);
     assert.deepEqual(ledger[1], ["-C", repo, "worktree", "list", "--porcelain", "-z"]);
     const commandNames = ledger.map((cmd) => cmd[0] === "-C" ? cmd[2] : cmd[0]);

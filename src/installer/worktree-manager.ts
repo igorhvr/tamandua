@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { getDb } from "../db.js";
 import { logger } from "../lib/logger.js";
 import { sweepRunProcesses } from "./run-cleanup.js";
+import { gitIdentityEnv, resolveRunGitIdentity } from "./git-identity.js";
 
 // ── Types ──
 
@@ -37,11 +38,13 @@ export interface ManagedRunWorktree {
 function runGit(
   args: string[],
   cwd?: string,
+  extraEnv?: NodeJS.ProcessEnv,
 ): { stdout: string; stderr: string; status: number } {
   const fullArgs = cwd ? ["-C", cwd, ...args] : args;
   const result = spawnSync("git", fullArgs, {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
+    ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
   });
   return {
     stdout: (result.stdout ?? "").trim(),
@@ -54,8 +57,9 @@ function gitMustSucceed(
   args: string[],
   cwd?: string,
   errorPrefix?: string,
+  extraEnv?: NodeJS.ProcessEnv,
 ): string {
-  const result = runGit(args, cwd);
+  const result = runGit(args, cwd, extraEnv);
   if (result.status !== 0) {
     const prefix = errorPrefix ? `${errorPrefix}: ` : "";
     throw new Error(
@@ -167,17 +171,27 @@ export function createRunWorktree(
     throw err;
   }
 
+  // Resolve the run's ONE commit identity (GIDN US-004) from the origin
+  // repository and apply it to every git invocation this function makes, so
+  // no Tamandua git operation silently falls back to the host process
+  // identity. Env only — git config is never written.
+  const identityEnv = gitIdentityEnv(
+    resolveRunGitIdentity(params.runId, originRepo, process.env),
+  );
+
   // Validate origin is a git repo
   gitMustSucceed(
     ["rev-parse", "--show-toplevel"],
     originRepo,
     "origin repository is not a git working tree",
+    identityEnv,
   );
 
   const dirtyStatus = gitMustSucceed(
     ["status", "--porcelain"],
     originRepo,
     "cannot inspect origin repository status",
+    identityEnv,
   );
   if (hasTrackedChanges(dirtyStatus)) {
     throw new Error(
@@ -189,13 +203,15 @@ export function createRunWorktree(
   const gitCommonDirRaw = gitMustSucceed(
     ["rev-parse", "--git-common-dir"],
     originRepo,
+    undefined,
+    identityEnv,
   );
   const gitCommonDir = path.isAbsolute(gitCommonDirRaw)
     ? gitCommonDirRaw
     : path.resolve(originRepo, gitCommonDirRaw);
 
   // Capture original branch
-  const branchResult = runGit(["branch", "--show-current"], originRepo);
+  const branchResult = runGit(["branch", "--show-current"], originRepo, identityEnv);
   const originalBranch =
     branchResult.status === 0 && branchResult.stdout
       ? branchResult.stdout
@@ -214,6 +230,7 @@ export function createRunWorktree(
     ["rev-parse", originRef],
     originRepo,
     `cannot resolve origin ref "${originRef}"`,
+    identityEnv,
   );
 
   // Build worktree path
@@ -252,6 +269,7 @@ export function createRunWorktree(
       ["worktree", "add", "--detach", worktreePath, originRef],
       originRepo,
       "failed to create managed worktree",
+      identityEnv,
     );
   } catch (err) {
     const errorMsg = (err as Error).message;
@@ -383,6 +401,13 @@ export function removeRunWorktree(params: {
   }
 
   if (pathExists) {
+    // Resolve the run's identity from the origin repository and apply it to
+    // the removal invocations too (GIDN US-004): even a non-committing git
+    // operation runs under the run's identity, never the host's.
+    const identityEnv = gitIdentityEnv(
+      resolveRunGitIdentity(params.runId, wt.worktreeOriginRepository, process.env),
+    );
+
     // Sweep for surviving processes tied to this worktree before removal.
     // Exclude the run's own harness process groups (steps.claim_pgid): the
     // final work round may still be flushing token usage inside the
@@ -404,7 +429,7 @@ export function removeRunWorktree(params: {
 
     // Check dirty state
     if (!params.force) {
-      const statusResult = runGit(["status", "--porcelain"], wt.worktreePath);
+      const statusResult = runGit(["status", "--porcelain"], wt.worktreePath, identityEnv);
       if (statusResult.status === 0 && statusResult.stdout.length > 0) {
         throw new Error(
           `Run ${params.runId} managed worktree is dirty. Use --force to remove anyway.`,
@@ -419,7 +444,7 @@ export function removeRunWorktree(params: {
       ? ["worktree", "remove", "--force", "--force", wt.worktreePath]
       : ["worktree", "remove", wt.worktreePath];
 
-    const result = runGit(removeArgs, wt.worktreeOriginRepository);
+    const result = runGit(removeArgs, wt.worktreeOriginRepository, identityEnv);
     if (result.status !== 0) {
       throw new Error(
         `Failed to remove managed worktree for run ${params.runId}: ${result.stderr || result.stdout}`,

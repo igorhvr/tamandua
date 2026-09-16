@@ -7,6 +7,17 @@ import {
   type CheckoutRefreshOutcome,
   type TamanduaEvent,
 } from "./events.js";
+import {
+  gitIdentityEnv,
+  readRunContextFromDb,
+  resolveRunGitIdentity,
+  type ResolvedGitIdentity,
+} from "./git-identity.js";
+import {
+  MATCHLOCK_SIGNING_SKIP_REASON,
+  isMatchlockGuestContext,
+  resolveGitSigningConfig,
+} from "./git-signing.js";
 
 export const MERGE_BRANCH_EXIT_CODES = {
   landed: 0,
@@ -15,6 +26,12 @@ export const MERGE_BRANCH_EXIT_CODES = {
   conflicts: 3,
 } as const;
 
+/**
+ * Signing outcome recorded on a landed merge (MSIG). `"unsigned-matchlock"` is
+ * produced only by the Matchlock guest-context exemption (US-006).
+ */
+export type MergeSigningOutcome = "signed" | "unsigned" | "unsigned-matchlock";
+
 export interface PlumbingMergeParams {
   origin: string;
   branch: string;
@@ -22,6 +39,13 @@ export interface PlumbingMergeParams {
   expectTip: string;
   message: string;
   runId?: string;
+  /**
+   * Explicit identity override (GIDN US-004). When omitted, the identity is
+   * resolved by `resolveRunGitIdentity(runId, origin, process.env)` — the run
+   * context first, then the origin repo's config tiers. Callers may pass one
+   * only in tests; production always resolves.
+   */
+  identity?: ResolvedGitIdentity;
 }
 
 export interface MergeBranchEvent extends TamanduaEvent {
@@ -36,6 +60,12 @@ export interface MergeBranchEvent extends TamanduaEvent {
   noop?: boolean;
   parkedBranch?: string;
   parkedReason?: string;
+  /**
+   * Present only when configured signing was intentionally skipped because the
+   * landing ran in a Matchlock guest context (MSIG US-006); the value documents
+   * why (no signing keys are projected into the guest).
+   */
+  signingSkipped?: string;
 }
 
 export type PlumbingMergeResult =
@@ -49,6 +79,21 @@ export type PlumbingMergeResult =
       checkoutRefresh: CheckoutRefreshOutcome;
       parkedBranch?: string;
       parkedReason?: string;
+      /** Identity applied to the landing commit's author/committer (GIDN US-004). */
+      identity: ResolvedGitIdentity;
+      /**
+       * Signing outcome of the landing commit (MSIG US-005). `"signed"` when the
+       * configured signing produced a `gpgsig` header, `"unsigned"` when no
+       * signing was configured or the landing was a no-op. `"unsigned-matchlock"`
+       * when the run was a Matchlock guest context and signing was configured but
+       * exempted (MSIG US-006).
+       */
+      signing: MergeSigningOutcome;
+      /**
+       * Why signing was skipped for a Matchlock guest-context landing (MSIG
+       * US-006); absent unless `signing === "unsigned-matchlock"`.
+       */
+      signingSkipped?: string;
     }
   | {
       status: "target_moved";
@@ -82,12 +127,19 @@ export interface PlumbingMergeDependencies {
   /** @deprecated Checkout safety uses only the injected runGit dependency. */
   runGitWithIndex?: (origin: string, args: string[], indexPath: string) => GitResult;
   emitEvent?: (event: MergeBranchEvent) => void;
+  /**
+   * Reads a run's persisted context. Defaults to the `runs.context` DB read;
+   * injected in unit tests so the Matchlock guest-context exemption (MSIG
+   * US-006) can be exercised without a database.
+   */
+  readRunContext?: (runId: string) => Record<string, unknown> | null;
 }
 
-function runGit(origin: string, args: string[]): GitResult {
+function runGit(origin: string, args: string[], extraEnv?: NodeJS.ProcessEnv): GitResult {
   const result = spawnSync("git", ["-C", origin, ...args], {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
+    ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
   });
   return {
     stdout: (result.stdout ?? "").trim(),
@@ -326,11 +378,53 @@ export function runPlumbingMerge(
   params: PlumbingMergeParams,
   dependencies: PlumbingMergeDependencies = {},
 ): PlumbingMergeResult {
-  const git = dependencies.runGit ?? runGit;
-  const emit = dependencies.emitEvent ?? emitTamanduaEvent;
   const target = `refs/heads/${params.into}`;
   const branchRef = `refs/heads/${params.branch}`;
   const runId = params.runId ?? process.env.TAMANDUA_RUN_ID ?? "";
+  // Resolve the run's ONE identity (GIDN US-004) and thread it through every
+  // git invocation below via the runGit wrapper. The host process's ambient
+  // identity must never author a landing: `commit-tree` derives author and
+  // committer from GIT_AUTHOR_*/GIT_COMMITTER_* in the child env.
+  const identity = params.identity ?? resolveRunGitIdentity(runId, params.origin, process.env);
+  const identityEnv = gitIdentityEnv(identity);
+  // MSIG US-006: a Matchlock guest-context run (run context
+  // `matchlock_context=true`, or `TAMANDUA_MATCHLOCK_GUEST=1` in the process
+  // env) is detected from the run's persisted context. The DB read is the same
+  // one the identity resolver performs; injecting `readRunContext` lets unit
+  // tests exercise the exemption without a database.
+  const readRunContext = dependencies.readRunContext ?? readRunContextFromDb;
+  const matchlockGuestContext = isMatchlockGuestContext(
+    runId ? readRunContext(runId) : null,
+    process.env,
+  );
+  // MSIG US-005: honor the operator's configured commit signing on the landing
+  // squash commit. Read once from the landing repository (local then global);
+  // `git commit-tree` does not consult `commit.gpgsign`, so the `-S` flag and
+  // the format/key overrides below are passed explicitly on that invocation.
+  const signingConfig = resolveGitSigningConfig({ repoDir: params.origin, env: process.env });
+  // MSIG US-006: Matchlock guest-context landings stay unsigned even when
+  // commit.gpgsign=true. Matchlock guests receive the four
+  // GIT_AUTHOR / GIT_COMMITTER variables through the guest env projection, but
+  // NO signing keys are projected into the guest, so there is nothing to sign
+  // with. Gating the `enabled` flag here (rather than in the resolver) keeps
+  // `resolveGitSigningConfig` a pure description of the configured signing.
+  const signingEnabled = signingConfig.enabled && !matchlockGuestContext;
+  const signingConfigArgs: string[] = [];
+  if (signingEnabled) {
+    if (signingConfig.format) signingConfigArgs.push("-c", `gpg.format=${signingConfig.format}`);
+    if (signingConfig.signingKey) {
+      signingConfigArgs.push("-c", `user.signingkey=${signingConfig.signingKey}`);
+    }
+  }
+  const signingOutcome: MergeSigningOutcome = matchlockGuestContext && signingConfig.enabled
+    ? "unsigned-matchlock"
+    : signingEnabled
+      ? "signed"
+      : "unsigned";
+  const signingSkippedFields =
+    signingOutcome === "unsigned-matchlock" ? { signingSkipped: MATCHLOCK_SIGNING_SKIP_REASON } : {};
+  const git = dependencies.runGit ?? ((origin: string, args: string[]) => runGit(origin, args, identityEnv));
+  const emit = dependencies.emitEvent ?? emitTamanduaEvent;
   const eventBase = {
     ts: new Date().toISOString(),
     runId,
@@ -408,6 +502,9 @@ export function runPlumbingMerge(
       target,
       noop: true,
       checkoutRefresh,
+      identity,
+      // No commit is created for a no-op landing, so nothing is signed.
+      signing: "unsigned",
     };
   };
 
@@ -452,10 +549,32 @@ export function runPlumbingMerge(
     };
   }
 
-  const commitArgs = ["commit-tree", mergedTree, "-p", params.expectTip, "-m", params.message];
+  const commitArgs = [
+    ...signingConfigArgs,
+    "commit-tree",
+    ...(signingEnabled ? ["-S"] : []),
+    mergedTree,
+    "-p",
+    params.expectTip,
+    "-m",
+    params.message,
+  ];
   const commitResult = git(params.origin, commitArgs);
   const mergedCommit = commitResult.stdout.split(/\r?\n/, 1)[0]?.trim();
   if (commitResult.status !== 0 || !mergedCommit) {
+    if (signingEnabled) {
+      // Never retry silently unsigned: when signing was requested and the
+      // landing commit could not be signed, fail closed with a detail that
+      // names signing. No ref has been advanced yet.
+      const diagnostics = commitResult.stderr || commitResult.stdout || "git commit-tree failed";
+      return {
+        status: "operational_error",
+        exitCode: MERGE_BRANCH_EXIT_CODES.operationalError,
+        detail: boundedDiagnostic(
+          `signing is configured (commit.gpgsign=true) but the landing commit could not be signed: ${diagnostics}`,
+        ),
+      };
+    }
     return {
       status: "operational_error",
       exitCode: MERGE_BRANCH_EXIT_CODES.operationalError,
@@ -638,6 +757,9 @@ export function runPlumbingMerge(
       target,
       noop: false,
       checkoutRefresh,
+      identity,
+      signing: signingOutcome,
+      ...signingSkippedFields,
       ...(parkedBranch && parkedReason ? { parkedBranch, parkedReason } : {}),
     };
     emit({
@@ -647,6 +769,7 @@ export function runPlumbingMerge(
       mergedCommit,
       noop: false,
       checkoutRefresh,
+      ...signingSkippedFields,
       ...(parkedBranch && parkedReason ? { parkedBranch, parkedReason } : {}),
     });
     return result;
@@ -690,6 +813,9 @@ export function runPlumbingMerge(
     target,
     noop: false,
     checkoutRefresh: "not-applicable",
+    identity,
+    signing: signingOutcome,
+    ...signingSkippedFields,
   };
   emit({
     ...eventBase,
@@ -698,6 +824,7 @@ export function runPlumbingMerge(
     mergedCommit,
     noop: false,
     checkoutRefresh: result.checkoutRefresh,
+    ...signingSkippedFields,
   });
   return result;
 }

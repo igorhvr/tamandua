@@ -9,6 +9,7 @@ import { getRoleTimeoutSeconds, inferRole } from "./install.js";
 import { formatPiCommandPreview } from "./pi-command-preview.js";
 import { emitEvent, getRunEvents, type TamanduaEvent } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
+import { gitIdentityEnv, readGitIdentityFromContext } from "./git-identity.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
 import {
@@ -334,6 +335,15 @@ export interface CronJobInfo {
   workingDirectoryForHarness?: string;
   /** Harness binary to use for agent invocations ("pi", "hermes", or "dsh"). */
   harnessType?: HarnessType;
+  /**
+   * Resolved commit identity for this run (GIDN US-003), captured from the
+   * run context (`git_identity_name`/`git_identity_email`) when the dispatch
+   * job is created. Every harness round child env carries it as
+   * GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL. Left undefined when
+   * the run context carries no identity — the four variables are then simply
+   * not set, never fabricated.
+   */
+  gitIdentity?: { name: string; email: string };
   createdAt: string;
 }
 
@@ -2294,17 +2304,33 @@ export async function executeDispatchRound(
 /**
  * Build the child environment for one harness invocation of a dispatch job:
  * the standard worker identity vars (job id / daemon pid / run id), the
- * per-harness binary env override, and a PATH that prepends the resolved
- * binary's directory so nested pi/hermes/dsh invocations inside the agent
- * session resolve to the same binary even when the daemon's own PATH lacks
- * it. Shared by the work round and the launch-time harness probe round so
- * the probe exercises the exact environment a real work round receives.
+ * run's resolved git commit identity (GIT_AUTHOR_NAME/EMAIL and
+ * GIT_COMMITTER_NAME/EMAIL, GIDN US-003), the per-harness binary env
+ * override, and a PATH that prepends the resolved binary's directory so
+ * nested pi/hermes/dsh invocations inside the agent session resolve to the
+ * same binary even when the daemon's own PATH lacks it. Shared by the work
+ * round and the launch-time harness probe round so the probe exercises the
+ * exact environment a real work round receives.
  *
  * CPID2: `TAMANDUA_DAEMON_PID` carries the SCHEDULING DAEMON's pid (used by
  * the daemonctl self-stop guard). The WORKER pid is deliberately NOT set
  * here — the harness launch wrapper exports its own `$$` into
  * `TAMANDUA_WORKER_PID`, so `step claim` records the actual harness process
  * (pid === pgid for the detached group leader) rather than the daemon pid.
+ *
+ * The four identity variables are set AFTER the TAMANDUA_* vars so they
+ * override any GIT_AUTHOR / GIT_COMMITTER values inherited from the daemon
+ * process env (the adapter merges this object over `process.env`). When the
+ * job carries no resolved identity, the variables are left unset rather than
+ * fabricated.
+ *
+ * ── Matchlock guest env projection contract ──────────────────────────────
+ * A Matchlock-backed (in-VM) round receives this same environment, but only
+ * the projected variables cross the guest boundary: the guest env projection
+ * MUST forward exactly GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME,
+ * and GIT_COMMITTER_EMAIL, and MUST NEVER mount or copy a gitconfig into the
+ * guest. Mounting a gitconfig would reintroduce a second, divergent identity
+ * source inside the VM.
  */
 function buildHarnessChildEnv(job: CronJobInfo, binaryPath: string): Record<string, string> {
   const harnessType = job.harnessType ?? "pi";
@@ -2318,6 +2344,11 @@ function buildHarnessChildEnv(job: CronJobInfo, binaryPath: string): Record<stri
     // already rely on.
     TAMANDUA_RUN_ID: job.runId,
   };
+  // GIDN US-003: the run's resolved commit identity, so no agent commit can
+  // fall back to an improvised identity or the daemon's ambient git config.
+  if (job.gitIdentity) {
+    Object.assign(harnessEnv, gitIdentityEnv(job.gitIdentity));
+  }
   if (harnessType === "hermes") {
     harnessEnv.TAMANDUA_HERMES_BINARY = binaryPath;
   } else if (harnessType === "dsh") {
@@ -2651,8 +2682,10 @@ export async function createAgentCronJob(
 
   const fullAgentId = agent.id.startsWith(`${workflowId}_`) ? agent.id : `${workflowId}_${agent.id}`;
 
-  // Read harness_type from run context; default to "pi" if not set.
+  // Read harness_type (and the run's resolved git commit identity) from the
+  // run context; default the harness to "pi" if not set.
   let harnessType: HarnessType = "pi";
+  let gitIdentity: { name: string; email: string } | undefined;
   try {
     const { getDb } = await import("../db.js");
     const db = getDb();
@@ -2664,9 +2697,16 @@ export async function createAgentCronJob(
       } else if (ctx.harness_type === "dsh") {
         harnessType = "dsh";
       }
+      // GIDN US-003: carry the identity resolved at launch (US-002) into
+      // every round this job dispatches. readGitIdentityFromContext returns
+      // null for a partial/absent record — never fabricate an identity.
+      const resolved = readGitIdentityFromContext(ctx);
+      if (resolved) {
+        gitIdentity = { name: resolved.name, email: resolved.email };
+      }
     }
   } catch {
-    // If we can't read the context, default to "pi"
+    // If we can't read the context, default to "pi" and no identity.
   }
 
   const jobInfo: CronJobInfo = {
@@ -2678,6 +2718,7 @@ export async function createAgentCronJob(
     timeoutSeconds,
     workingDirectoryForHarness,
     harnessType,
+    gitIdentity,
     createdAt: new Date().toISOString(),
   };
 
@@ -3634,6 +3675,14 @@ export function _resetInstantFailStreaks(): void {
 export function _scheduledJobHarnessType(runId: string): string | undefined {
   for (const info of jobMetadata.values()) {
     if (info.runId === runId) return info.harnessType ?? "pi";
+  }
+  return undefined;
+}
+
+/** @internal — exposed for tests to introspect a scheduled job's resolved git identity (GIDN US-003). */
+export function _scheduledJobGitIdentity(runId: string): { name: string; email: string } | undefined {
+  for (const info of jobMetadata.values()) {
+    if (info.runId === runId) return info.gitIdentity ? { ...info.gitIdentity } : undefined;
   }
   return undefined;
 }

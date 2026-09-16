@@ -34,6 +34,7 @@ import {
   _instantFailStreakFor,
   _resetInstantFailStreaks,
   _operatorPausedRoundIds,
+  _scheduledJobGitIdentity,
 } from "../../dist/installer/agent-scheduler.js";
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
@@ -2297,6 +2298,249 @@ process.exit(0);
     // The round completed cleanly: the claimed step was auto-completed.
     const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step`) as { status: string };
     assert.equal(step.status, "done", "a clean STATUS: done round must auto-complete the claimed step");
+  });
+});
+
+// ── GIDN US-003: the resolved identity reaches every harness round ──
+// The identity resolved once at launch (US-002) is stored on the run context
+// as git_identity_name/git_identity_email. createAgentCronJob captures it
+// into the dispatch job, and buildHarnessChildEnv — shared by the work round
+// and the launch-time harness probe round — turns it into the four
+// GIT_AUTHOR_*/GIT_COMMITTER_* variables so no agent commit can fall back to
+// an improvised or daemon-ambient identity.
+
+describe("executeDispatchRound harness env git identity (GIDN US-003)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  const IDENTITY = { name: "Ada Lovelace", email: "ada@example.com" };
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-gitid-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_RUN_ID: process.env.TAMANDUA_RUN_ID,
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+      TAMANDUA_ENV_DUMP: process.env.TAMANDUA_ENV_DUMP,
+      GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME,
+      GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL,
+      GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME,
+      GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // The canned shims never answer a probe prompt in the work-round cases,
+    // so the probe is disabled there; the probe case re-enables it.
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+    delete process.env.TAMANDUA_RUN_ID;
+    // Drop any ambient identity so a child observation can only come from the
+    // scheduler's harnessEnv (individual cases set impostor values as needed).
+    delete process.env.GIT_AUTHOR_NAME;
+    delete process.env.GIT_AUTHOR_EMAIL;
+    delete process.env.GIT_COMMITTER_NAME;
+    delete process.env.GIT_COMMITTER_EMAIL;
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-gidn-us003"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    _resetInstantFailStreaks();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  function seedRun(context: Record<string, unknown>): { runId: string; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'git identity task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir, ...context }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+    return { runId, workdir };
+  }
+
+  const jobFor = (
+    runId: string,
+    workdir: string,
+    gitIdentity?: { name: string; email: string },
+  ): CronJobInfo => ({
+    id: `tamandua-test-wf-${runId}-test-agent`,
+    workflowId: "test-wf",
+    runId,
+    agentId: "test-wf_test-agent",
+    harnessType: "pi",
+    workingDirectoryForHarness: workdir,
+    gitIdentity,
+    createdAt: "",
+  });
+
+  const agentFor = () => ({
+    id: "test-agent",
+    model: "fake",
+    workspace: { baseDir: "." },
+    timeoutSeconds: 10,
+  });
+
+  /** Minimal fake pi: records the four identity vars, claims the step via the DB, reports done. */
+  function writeIdentityDumpFakePi(): string {
+    const fakePi = path.join(tempHome, "pi-identity-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+fs.writeFileSync(process.env.TAMANDUA_ENV_DUMP, JSON.stringify({
+  GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? null,
+  GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? null,
+  GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? null,
+  GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? null,
+}));
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    return fakePi;
+  }
+
+  /** Probe-aware fake pi: records the probe child env then answers the probe with a nonzero exit. */
+  function writeProbeEnvDumpFakePi(): string {
+    const fakePi = path.join(tempHome, "pi-probe-env-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(process.env.TAMANDUA_ENV_DUMP + ".probe", JSON.stringify({
+  GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? null,
+  GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? null,
+  GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? null,
+  GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? null,
+}));
+process.exit(1);
+`,
+      { mode: 0o755 },
+    );
+    return fakePi;
+  }
+
+  it("createAgentCronJob captures the resolved identity from the run context", async () => {
+    const withIdentity = seedRun({
+      git_identity_name: IDENTITY.name,
+      git_identity_email: IDENTITY.email,
+      git_identity_source: "env",
+    }).runId;
+    const withoutIdentity = seedRun({}).runId;
+
+    await createAgentCronJob({
+      workflowId: "test-wf",
+      runId: withIdentity,
+      agent: { id: "test-agent", model: "fake", workspace: { baseDir: "." } },
+      workingDirectoryForHarness: path.join(tempHome, "work"),
+    });
+    await createAgentCronJob({
+      workflowId: "test-wf",
+      runId: withoutIdentity,
+      agent: { id: "test-agent", model: "fake", workspace: { baseDir: "." } },
+      workingDirectoryForHarness: path.join(tempHome, "work"),
+    });
+
+    assert.deepEqual(
+      _scheduledJobGitIdentity(withIdentity),
+      { name: IDENTITY.name, email: IDENTITY.email },
+      "the dispatch job must carry the identity persisted on the run context",
+    );
+    assert.equal(
+      _scheduledJobGitIdentity(withoutIdentity),
+      undefined,
+      "a context without identity keys must leave the job identity undefined (never fabricated)",
+    );
+  });
+
+  it("work round carries the identity and overrides inherited daemon identity vars", async () => {
+    const { runId, workdir } = seedRun({
+      git_identity_name: IDENTITY.name,
+      git_identity_email: IDENTITY.email,
+      git_identity_source: "env",
+    });
+    // Impostor values in the daemon's own environment: the round env must win.
+    process.env.GIT_AUTHOR_NAME = "Daemon Impostor";
+    process.env.GIT_AUTHOR_EMAIL = "impostor@daemon.local";
+    process.env.GIT_COMMITTER_NAME = "Daemon Impostor";
+    process.env.GIT_COMMITTER_EMAIL = "impostor@daemon.local";
+    const envDump = path.join(tempHome, "env-dump.json");
+    process.env.TAMANDUA_ENV_DUMP = envDump;
+    process.env.TAMANDUA_PI_BINARY = writeIdentityDumpFakePi();
+
+    await executeDispatchRound(jobFor(runId, workdir, IDENTITY), agentFor());
+
+    const observed = JSON.parse(fs.readFileSync(envDump, "utf8")) as Record<string, string | null>;
+    assert.deepEqual(observed, {
+      GIT_AUTHOR_NAME: IDENTITY.name,
+      GIT_AUTHOR_EMAIL: IDENTITY.email,
+      GIT_COMMITTER_NAME: IDENTITY.name,
+      GIT_COMMITTER_EMAIL: IDENTITY.email,
+    });
+
+    const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step`) as { status: string };
+    assert.equal(step.status, "done", "the work round must complete normally");
+  });
+
+  it("launch-time harness probe round receives the same four identity variables", async () => {
+    const { runId, workdir } = seedRun({
+      git_identity_name: IDENTITY.name,
+      git_identity_email: IDENTITY.email,
+      git_identity_source: "repo-local",
+    });
+    delete process.env.TAMANDUA_HARNESS_PROBE; // probe ENABLED
+    const envDump = path.join(tempHome, "probe-env-dump.json");
+    process.env.TAMANDUA_ENV_DUMP = envDump;
+    process.env.TAMANDUA_PI_BINARY = writeProbeEnvDumpFakePi();
+
+    await executeDispatchRound(jobFor(runId, workdir, IDENTITY), agentFor());
+
+    const observed = JSON.parse(fs.readFileSync(`${envDump}.probe`, "utf8")) as Record<string, string | null>;
+    assert.deepEqual(observed, {
+      GIT_AUTHOR_NAME: IDENTITY.name,
+      GIT_AUTHOR_EMAIL: IDENTITY.email,
+      GIT_COMMITTER_NAME: IDENTITY.name,
+      GIT_COMMITTER_EMAIL: IDENTITY.email,
+    }, "the probe round shares buildHarnessChildEnv and must carry the identity too");
+  });
+
+  it("leaves the four identity variables unset when the job has no identity (defensive)", async () => {
+    const { runId, workdir } = seedRun({});
+    const envDump = path.join(tempHome, "env-dump-null.json");
+    process.env.TAMANDUA_ENV_DUMP = envDump;
+    process.env.TAMANDUA_PI_BINARY = writeIdentityDumpFakePi();
+
+    await executeDispatchRound(jobFor(runId, workdir, undefined), agentFor());
+
+    const observed = JSON.parse(fs.readFileSync(envDump, "utf8")) as Record<string, string | null>;
+    assert.deepEqual(observed, {
+      GIT_AUTHOR_NAME: null,
+      GIT_AUTHOR_EMAIL: null,
+      GIT_COMMITTER_NAME: null,
+      GIT_COMMITTER_EMAIL: null,
+    }, "no resolved identity means no fabricated GIT_AUTHOR_*/GIT_COMMITTER_* variables");
   });
 });
 

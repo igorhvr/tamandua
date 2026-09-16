@@ -180,6 +180,36 @@ to pass while preserving the test logic for future fixes.
 Co-Authored-By: Tamandua <tamandua@tetradactyla.org>
 ```
 
+## Git Identity, Signing, and Landing Commit Messages
+
+The platform provides your git identity and signing configuration — you never
+configure either yourself.
+
+- **Identity resolution order** (the platform resolves ONE identity per run; the
+  first tier that supplies both a name and an email wins):
+  1. `GIT_USER_NAME` + `GIT_USER_EMAIL` from the submitting context;
+  2. the working repository's local `user.name` / `user.email`;
+  3. the operator's global git config;
+  4. last resort: `Tamandua <tamandua@tetradactyla.org>`.
+- **NEVER run `git config --global` or `git config --system`** — not to set an
+  identity, not for signing, not for anything else. Writing a global or system
+  identity mutates the operator's account and is forbidden. Read-only
+  `git config --get` is fine.
+- The harness round environment already carries `GIT_AUTHOR_NAME` /
+  `GIT_AUTHOR_EMAIL` and `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL`, so any
+  commit you create in your workspace inherits the run identity without any
+  configuration. Do not set `user.name` / `user.email` locally either.
+- The landed squash commit honors the operator's configured commit signing
+  (`commit.gpgsign` / `gpg.format` / `user.signingkey`), **except in Matchlock
+  guest contexts**, where the landing stays unsigned because no signing keys are
+  projected into the guest. `tamandua merge-branch` applies this automatically —
+  never disable or work around signing, and never retry a signing failure
+  unsigned.
+- The landing commit message MUST NOT contain session URLs (no links back to
+  agent/session transcripts, dashboards, or chat sessions). The
+  `Co-Authored-By: Tamandua <tamandua@tetradactyla.org>` footer stays in the
+  message.
+
 ## CRITICAL — STATUS Line Requirement
 
 Your output is parsed by an automated scheduler. It looks for **exact markers** to determine step outcome:

@@ -19,6 +19,11 @@ import {
   validateRunHarnessForScheduling,
 } from "./run-harness.js";
 import { createRunWorktree, type ManagedRunWorktree } from "./worktree-manager.js";
+import {
+  gitIdentityContextPatch,
+  resolveGitIdentity,
+  type ResolvedGitIdentity,
+} from "./git-identity.js";
 import type { HarnessType } from "./types.js";
 
 export interface RunWorkflowParams {
@@ -171,6 +176,12 @@ export async function runWorkflow(
   const runId = crypto.randomUUID();
   let runNumber: number;
   let runPersisted = false;
+  // GIDN US-002: the ONE identity every git operation of this run uses,
+  // resolved as soon as the harness working directory is final (direct mode:
+  // workingDirectoryForHarness; worktree mode: managedWorktree.worktreePath).
+  // Assigned on every reachable path through the workspace-mode branch below
+  // (the invalid-mode branch throws).
+  let gitIdentity: ResolvedGitIdentity;
 
   const workspaceMode = workflow.run?.workspace ?? "direct";
   const warnings: string[] = [];
@@ -233,6 +244,16 @@ export async function runWorkflow(
 
     seededContext[RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY] =
       workingDirectoryForHarness;
+
+    // GIDN US-002: resolve the run's ONE commit identity now that the harness
+    // working directory is final, and persist it into the run context so later
+    // dispatch rounds and product-owned git operations recover the exact
+    // identity chosen at launch (src/installer/git-identity.ts).
+    gitIdentity = resolveGitIdentity({
+      repoDir: workingDirectoryForHarness,
+      env: process.env,
+    });
+    Object.assign(seededContext, gitIdentityContextPatch(gitIdentity));
 
     // BCAP (US-001): determine git-repository applicability ONCE for the
     // resolved harness working directory. A non-git directory is a
@@ -451,6 +472,16 @@ export async function runWorkflow(
       seededContext.tested_tree = "";
     }
 
+    // GIDN US-002: resolve the run's ONE commit identity once the managed
+    // worktree path is final. The worktree shares the origin repository's
+    // `.git` common dir, so `git config --local` reads the same local config;
+    // the identity must be in the context BEFORE the follow-up UPDATE below.
+    gitIdentity = resolveGitIdentity({
+      repoDir: workingDirectoryForHarness,
+      env: process.env,
+    });
+    Object.assign(seededContext, gitIdentityContextPatch(gitIdentity));
+
     // Update the run's context with the now-available worktree-specific fields.
     const fullContextJson = JSON.stringify(seededContext);
     db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(fullContextJson, runId);
@@ -544,6 +575,14 @@ export async function runWorkflow(
     runId,
     workflowId,
     ...(parentRunId ? { parentRunId } : {}),
+    // GIDN US-002: record the identity every git operation of this run uses,
+    // together with the source it was resolved from (the resolver always
+    // returns an identity, so this field is always populated).
+    gitIdentity: {
+      name: gitIdentity.name,
+      email: gitIdentity.email,
+      source: gitIdentity.source,
+    },
     detail: `Run #${runNumber}: ${taskTitle}`,
   });
 

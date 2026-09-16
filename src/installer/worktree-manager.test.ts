@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
@@ -216,6 +216,39 @@ describe("worktree-manager", () => {
 
       // Clean up
       removeRunWorktree({ runId: "run-create-001", force: true });
+    });
+
+    it("applies the run's resolved git identity env to its git invocations (GIDN US-004)", () => {
+      // `git worktree add` runs the post-checkout hook in the origin's hooks
+      // dir; the hook dumps the env git handed it, which is how the identity
+      // env threaded into createRunWorktree's git invocations is observed.
+      const hookOutput = path.join(tempHome, "create-worktree-identity.txt");
+      const hookPath = path.join(originRepo, ".git", "hooks", "post-checkout");
+      writeFileSync(
+        hookPath,
+        `#!/bin/sh\nprintf '%s|%s|%s|%s' "$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL" "$GIT_COMMITTER_NAME" "$GIT_COMMITTER_EMAIL" > '${hookOutput}'\n`,
+        { mode: 0o755 },
+      );
+
+      try {
+        const result = createRunWorktree({
+          runId: "run-create-identity",
+          runNumber: 95,
+          workflowId: "test-workflow",
+          worktreeOriginRepository: originRepo,
+        });
+
+        assert.equal(result.status, "ready");
+        // The origin repo-local config is "Tamandua Test <test@tamandua.local>".
+        assert.equal(
+          readFileSync(hookOutput, "utf-8"),
+          "Tamandua Test|test@tamandua.local|Tamandua Test|test@tamandua.local",
+        );
+
+        removeRunWorktree({ runId: "run-create-identity", force: true });
+      } finally {
+        rmSync(hookPath, { force: true });
+      }
     });
 
     it("rejects non-git origin repos with clear error", () => {

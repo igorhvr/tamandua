@@ -81,12 +81,21 @@ Machine-readable results:
   MERGED_TREE: <tree-sha>
   TARGET: refs/heads/<target-ref>
   CHECKOUT_REFRESH: <refreshed | already-coherent | not-applicable | parked:branch>
+  SIGNING: <signed | unsigned | unsigned-matchlock>
   PARKED_BRANCH: <branch> (parked outcomes only)
   PARKED_REASON: <local-changes | advance-refused: detail> (parked outcomes only)
 
 Landing outcomes:
   true               Feature content was already landed; target tip/tree are unchanged
   false              A new squash commit was created and landed
+
+Commit signing outcomes:
+  signed             The configured commit signing was applied to the squash commit
+                     (gpgsig header present)
+  unsigned           No signing was configured (commit.gpgsign unset/false), or the
+                     landing was a no-op with no new commit
+  unsigned-matchlock A Matchlock guest-context run stays unsigned even when signing is
+                     configured: signing keys are never projected into the guest
 
 Checkout refresh outcomes:
   refreshed          A clean attached target was advanced in place and remains attached
@@ -146,7 +155,7 @@ export function handleMergeBranch(group: string, args: string[]): boolean {
     ...(runId !== undefined ? { runId } : {}),
   });
   if (result.status === "landed") {
-    let output = `STATUS: landed\nNOOP: ${result.noop}\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\n`;
+    let output = `STATUS: landed\nNOOP: ${result.noop}\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\nSIGNING: ${result.signing}\n`;
     if (result.checkoutRefresh.startsWith("parked:")) {
       output += `PARKED_BRANCH: ${result.parkedBranch}\nPARKED_REASON: ${result.parkedReason}\n`;
     }

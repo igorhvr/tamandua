@@ -1,4 +1,4 @@
-import { afterEach, describe, it } from "node:test";
+import { after, afterEach, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,10 +9,51 @@ import {
   runPlumbingMerge,
   type MergeBranchEvent,
 } from "../../dist/installer/merge-branch.js";
+import { getDb } from "../../dist/db.js";
 import type { CheckoutRefreshOutcome } from "../../dist/installer/events.js";
+import {
+  MATCHLOCK_GUEST_ENV_VAR,
+  MATCHLOCK_SIGNING_SKIP_REASON,
+} from "../../dist/installer/git-signing.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 
 const cleanup: string[] = [];
+
+// Isolate the identity resolver from the operator's real git config and DB:
+// every run-scoped landing reads `runs.context` and falls back to the origin
+// repo's local config. HOME / GIT_CONFIG_GLOBAL / TAMANDUA_DB_PATH all point
+// into a per-file temp directory.
+let identityEnvHome: string;
+let savedHome: string | undefined;
+let savedGitConfigGlobal: string | undefined;
+let savedDbPath: string | undefined;
+let savedMatchlockGuest: string | undefined;
+
+before(() => {
+  identityEnvHome = tamanduaTempDir("tamandua-merge-branch-env-");
+  savedHome = process.env.HOME;
+  savedGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL;
+  savedDbPath = process.env.TAMANDUA_DB_PATH;
+  savedMatchlockGuest = process.env[MATCHLOCK_GUEST_ENV_VAR];
+  process.env.HOME = identityEnvHome;
+  process.env.GIT_CONFIG_GLOBAL = path.join(identityEnvHome, ".gitconfig");
+  process.env.TAMANDUA_DB_PATH = path.join(identityEnvHome, "tamandua.db");
+  // The Matchlock guest flag is process-global; make every test deterministic.
+  delete process.env[MATCHLOCK_GUEST_ENV_VAR];
+  assertStatePathIsolation(process.env.TAMANDUA_DB_PATH, "merge-branch.test");
+});
+
+after(() => {
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+  if (savedGitConfigGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+  else process.env.GIT_CONFIG_GLOBAL = savedGitConfigGlobal;
+  if (savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+  else process.env.TAMANDUA_DB_PATH = savedDbPath;
+  if (savedMatchlockGuest === undefined) delete process.env[MATCHLOCK_GUEST_ENV_VAR];
+  else process.env[MATCHLOCK_GUEST_ENV_VAR] = savedMatchlockGuest;
+  fs.rmSync(identityEnvHome, { recursive: true, force: true });
+});
 
 function git(repo: string, args: string[]): string {
   const result = rawGit(repo, args);
@@ -77,6 +118,33 @@ function createFeature(repo: string, branch = "feature"): string {
   const featureTip = git(repo, ["rev-parse", "HEAD"]);
   git(repo, ["switch", "main"]);
   return featureTip;
+}
+
+/**
+ * Generate a throwaway ed25519 ssh signing key (MSIG US-005). Returns the
+ * public-key path, which is what `user.signingkey` must name for
+ * `gpg.format=ssh`; git finds the private key beside it.
+ */
+function generateSshSigningKey(prefix: string): string {
+  const dir = tamanduaTempDir(prefix);
+  cleanup.push(dir);
+  const keyPath = path.join(dir, "landing_signing_key");
+  const result = spawnSync("ssh-keygen", ["-t", "ed25519", "-N", "", "-f", keyPath, "-C", "landing-test"], {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(
+    result.status,
+    0,
+    `ssh-keygen failed: ${result.stderr || result.stdout}`,
+  );
+  return `${keyPath}.pub`;
+}
+
+function configureSshSigning(repo: string, signingKey: string): void {
+  git(repo, ["config", "commit.gpgsign", "true"]);
+  git(repo, ["config", "gpg.format", "ssh"]);
+  git(repo, ["config", "user.signingkey", signingKey]);
 }
 
 function captureFileBytes(worktree: string, args: string[]): Array<[string, Buffer]> {
@@ -1300,6 +1368,13 @@ describe("runPlumbingMerge", () => {
     const bare = tamanduaTempDir("tamandua-merge-branch-reflog-bare-");
     cleanup.push(bare);
     git(bare, ["clone", "--bare", repo, "."]);
+    // GIDN: the suite isolates HOME/GIT_CONFIG_GLOBAL from the operator's real
+    // config, and this test injects a runGit that (unlike the production
+    // default) does not carry the resolved identity env. Give the bare clone a
+    // repo-local identity the landing commit-tree can fall back to, exactly as
+    // createRepo does for the non-bare fixtures.
+    git(bare, ["config", "user.email", "test@tamandua.local"]);
+    git(bare, ["config", "user.name", "Tamandua Test"]);
     const commands: string[][] = [];
 
     const result = runPlumbingMerge(
@@ -1412,5 +1487,283 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.status, "operational_error");
     assert.equal(result.exitCode, 1);
     assert.deepEqual(events, []);
+  });
+
+  it("authors and commits the landing squash commit with the resolved run identity (GIDN US-004)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-identity");
+    const identity = {
+      name: "Landing Author",
+      email: "landing@example.test",
+      source: "env" as const,
+    };
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-identity",
+        into: "main",
+        expectTip: initial,
+        message: "Land with the run identity",
+        runId: "run-landing-identity",
+        identity,
+      },
+      { emitEvent: () => undefined },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.deepEqual(result.identity, identity);
+    assert.equal(
+      git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>", "refs/heads/main"]),
+      "Landing Author <landing@example.test>|Landing Author <landing@example.test>",
+    );
+  });
+
+  it("prefers the run-context identity over the repo-local config (GIDN US-004)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-run-context");
+
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'wf', 'task', 'running', ?, ?, ?)",
+    ).run(
+      "run-context-landing",
+      JSON.stringify({
+        git_identity_name: "Context Landing",
+        git_identity_email: "context-landing@example.test",
+        git_identity_source: "global",
+      }),
+      now,
+      now,
+    );
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-run-context",
+        into: "main",
+        expectTip: initial,
+        message: "Land with the run context identity",
+        runId: "run-context-landing",
+      },
+      { emitEvent: () => undefined },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.deepEqual(result.identity, {
+      name: "Context Landing",
+      email: "context-landing@example.test",
+      source: "run-context",
+    });
+    // The repo-local config names "Tamandua Test"; the run context must win.
+    assert.equal(
+      git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>", "refs/heads/main"]),
+      "Context Landing <context-landing@example.test>|Context Landing <context-landing@example.test>",
+    );
+  });
+
+  it("falls back to the origin repo-local identity for a runless landing (GIDN US-004)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-runless-identity");
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-runless-identity",
+        into: "main",
+        expectTip: initial,
+        message: "Runless landing",
+        runId: "",
+      },
+      { emitEvent: () => undefined },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.deepEqual(result.identity, {
+      name: "Tamandua Test",
+      email: "test@tamandua.local",
+      source: "repo-local",
+    });
+    assert.equal(
+      git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>", "refs/heads/main"]),
+      "Tamandua Test <test@tamandua.local>|Tamandua Test <test@tamandua.local>",
+    );
+  });
+
+  it("signs the landing squash commit when commit.gpgsign=true with an ssh key (MSIG US-005)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-signed");
+    const signingKey = generateSshSigningKey("tamandua-merge-branch-signing-");
+    configureSshSigning(repo, signingKey);
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-signed",
+        into: "main",
+        expectTip: initial,
+        message: "Signed landing",
+        runId: "run-signed-landing",
+      },
+      { emitEvent: () => undefined },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.signing, "signed");
+    assert.equal(result.noop, false);
+    const commitBody = git(repo, ["cat-file", "-p", result.mergedCommit]);
+    assert.match(commitBody, /\ngpgsig /);
+    // The target advanced to the signed squash commit.
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
+  });
+
+  it("leaves the landing squash commit unsigned when commit.gpgsign is unset (MSIG US-005)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-unsigned");
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-unsigned",
+        into: "main",
+        expectTip: initial,
+        message: "Unsigned landing",
+        runId: "run-unsigned-landing",
+      },
+      { emitEvent: () => undefined },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.signing, "unsigned");
+    const commitBody = git(repo, ["cat-file", "-p", result.mergedCommit]);
+    assert.doesNotMatch(commitBody, /gpgsig/);
+  });
+
+  it("fails legibly and never advances the target when signing is configured but unusable (MSIG US-005)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-bad-signing");
+    configureSshSigning(repo, path.join(repo, "missing-signing-key.pub"));
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-bad-signing",
+        into: "main",
+        expectTip: initial,
+        message: "Must not land unsigned",
+        runId: "run-bad-signing-landing",
+      },
+      { emitEvent: () => undefined },
+    );
+
+    assert.equal(result.status, "operational_error");
+    assert.equal(result.exitCode, 1);
+    if (result.status !== "operational_error") return;
+    assert.match(result.detail, /signing is configured \(commit\.gpgsign=true\)/);
+    assert.match(result.detail, /could not be signed/i);
+    // Fail closed: the target ref must not have advanced to an unsigned commit.
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+  });
+
+  it("leaves a Matchlock guest-context landing unsigned and reports the exemption (MSIG US-006)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-matchlock-context");
+    const signingKey = generateSshSigningKey("tamandua-merge-branch-matchlock-");
+    configureSshSigning(repo, signingKey);
+    const events: MergeBranchEvent[] = [];
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-matchlock-context",
+        into: "main",
+        expectTip: initial,
+        message: "Matchlock landing",
+        runId: "run-matchlock-context",
+      },
+      {
+        emitEvent: (event) => events.push(event),
+        // The fixture flag: the run context records a Matchlock guest context.
+        readRunContext: () => ({ matchlock_context: true }),
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.signing, "unsigned-matchlock");
+    assert.equal(result.signingSkipped, MATCHLOCK_SIGNING_SKIP_REASON);
+    const commitBody = git(repo, ["cat-file", "-p", result.mergedCommit]);
+    assert.doesNotMatch(commitBody, /gpgsig/);
+    // The landing still advanced; it is simply unsigned.
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.event, "merge.landed");
+    assert.equal(events[0]?.signingSkipped, MATCHLOCK_SIGNING_SKIP_REASON);
+  });
+
+  it("honors TAMANDUA_MATCHLOCK_GUEST=1 as a Matchlock guest context (MSIG US-006)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-matchlock-env");
+    const signingKey = generateSshSigningKey("tamandua-merge-branch-matchlock-env-");
+    configureSshSigning(repo, signingKey);
+    const events: MergeBranchEvent[] = [];
+    process.env[MATCHLOCK_GUEST_ENV_VAR] = "1";
+    try {
+      const result = runPlumbingMerge(
+        {
+          origin: repo,
+          branch: "feature-matchlock-env",
+          into: "main",
+          expectTip: initial,
+          message: "Matchlock env landing",
+          runId: "run-matchlock-env",
+        },
+        { emitEvent: (event) => events.push(event) },
+      );
+
+      assert.equal(result.status, "landed");
+      if (result.status !== "landed") return;
+      assert.equal(result.signing, "unsigned-matchlock");
+      assert.doesNotMatch(git(repo, ["cat-file", "-p", result.mergedCommit]), /gpgsig/);
+      assert.equal(events[0]?.signingSkipped, MATCHLOCK_SIGNING_SKIP_REASON);
+    } finally {
+      delete process.env[MATCHLOCK_GUEST_ENV_VAR];
+    }
+  });
+
+  it("still signs a non-Matchlock run with the same signing config (MSIG US-006)", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-native-signed");
+    const signingKey = generateSshSigningKey("tamandua-merge-branch-native-");
+    configureSshSigning(repo, signingKey);
+    const events: MergeBranchEvent[] = [];
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-native-signed",
+        into: "main",
+        expectTip: initial,
+        message: "Native signed landing",
+        runId: "run-native-signed",
+      },
+      {
+        emitEvent: (event) => events.push(event),
+        readRunContext: () => ({ matchlock_context: false }),
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.signing, "signed");
+    assert.equal("signingSkipped" in result, false);
+    assert.match(git(repo, ["cat-file", "-p", result.mergedCommit]), /\ngpgsig /);
+    assert.equal("signingSkipped" in events[0]!, false);
   });
 });

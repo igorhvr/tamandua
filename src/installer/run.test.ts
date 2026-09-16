@@ -1880,6 +1880,300 @@ try {
     });
   });
 
+  // ══════════════════════════════════════════════════════════════════
+  // GIDN US-002: resolve and record the run identity at launch
+  // ══════════════════════════════════════════════════════════════════
+  // runWorkflow resolves exactly ONE commit identity once the harness
+  // working directory is final, persists it into runs.context as
+  // git_identity_name/git_identity_email/git_identity_source, and carries it
+  // on the run.started event as gitIdentity {name,email,source}. The
+  // resolution order is pinned by src/installer/git-identity.test.ts; here we
+  // prove the launch wiring for every source and both workspace modes.
+
+  describe("GIDN US-002: launch-time git identity resolution", () => {
+    const IDENTITY_ENV_KEYS = [
+      "GIT_USER_NAME",
+      "GIT_USER_EMAIL",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_NOSYSTEM",
+    ] as const;
+
+    /**
+     * Run `fn` with the identity-relevant env vars reset to a known baseline
+     * (undefining GIT_USER_NAME/GIT_USER_EMAIL/GIT_CONFIG_GLOBAL and forcing
+     * GIT_CONFIG_NOSYSTEM=1) plus the supplied overrides, restoring the
+     * previous values afterwards. Mirrors the explicit-env isolation the
+     * test-isolation guard expects (never a spread of process.env).
+     */
+    async function withIdentityEnv(
+      overrides: Record<string, string>,
+      fn: () => Promise<void>,
+    ): Promise<void> {
+      const saved: Record<string, string | undefined> = {};
+      for (const key of IDENTITY_ENV_KEYS) {
+        saved[key] = process.env[key];
+        delete process.env[key];
+      }
+      process.env.GIT_CONFIG_NOSYSTEM = "1";
+      for (const [key, value] of Object.entries(overrides)) {
+        process.env[key] = value;
+      }
+      try {
+        await fn();
+      } finally {
+        for (const key of IDENTITY_ENV_KEYS) {
+          const value = saved[key];
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    }
+
+    async function latestRun(
+      workflowId: string,
+    ): Promise<{ id: string; context: Record<string, string> }> {
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const row = db.prepare(
+        "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1",
+      ).get(workflowId) as { id: string; context: string } | undefined;
+      assert.ok(row, `expected a run record for workflow ${workflowId}`);
+      return { id: row.id, context: JSON.parse(row.context) as Record<string, string> };
+    }
+
+    function startedGitIdentity(runId: string): {
+      name: string;
+      email: string;
+      source: string;
+    } {
+      const started = getRunEvents(runId).find((e) => e.event === "run.started");
+      assert.ok(started, "run.started should be emitted for a persisted run");
+      assert.ok(started.gitIdentity, "run.started should carry gitIdentity");
+      return started.gitIdentity;
+    }
+
+    it("env GIT_USER_NAME/GIT_USER_EMAIL wins and is recorded in context + run.started (direct)", async () => {
+      const workflowId = "test-gidn-env-direct";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = tamanduaTempDir("tamandua-gidn-env-");
+      try {
+        initGitRepo(repoDir);
+        await withIdentityEnv(
+          {
+            GIT_USER_NAME: "GIDN Env Author",
+            GIT_USER_EMAIL: "gidn-env@example.test",
+          },
+          async () => {
+            try {
+              await runWorkflow({
+                workflowId,
+                taskTitle: "GIDN env identity",
+                workingDirectoryForHarness: repoDir,
+              });
+            } catch {
+              // Daemon registration may fail after the run row is persisted;
+              // the assertions below only need the persisted run + event.
+            }
+          },
+        );
+
+        const { id, context } = await latestRun(workflowId);
+        assert.equal(context.git_identity_name, "GIDN Env Author");
+        assert.equal(context.git_identity_email, "gidn-env@example.test");
+        assert.equal(context.git_identity_source, "env");
+        assert.deepEqual(startedGitIdentity(id), {
+          name: "GIDN Env Author",
+          email: "gidn-env@example.test",
+          source: "env",
+        });
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+
+    it("falls back to the working repository's local config when env is unset (direct)", async () => {
+      const workflowId = "test-gidn-repo-local";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = tamanduaTempDir("tamandua-gidn-local-");
+      try {
+        // initGitRepo sets local user.name "Tamandua Test" and
+        // user.email "test@tamandua.local".
+        initGitRepo(repoDir);
+        await withIdentityEnv({}, async () => {
+          try {
+            await runWorkflow({
+              workflowId,
+              taskTitle: "GIDN repo-local identity",
+              workingDirectoryForHarness: repoDir,
+            });
+          } catch {
+            // See above.
+          }
+        });
+
+        const { id, context } = await latestRun(workflowId);
+        assert.equal(context.git_identity_name, "Tamandua Test");
+        assert.equal(context.git_identity_email, "test@tamandua.local");
+        assert.equal(context.git_identity_source, "repo-local");
+        const identity = startedGitIdentity(id);
+        assert.equal(identity.source, "repo-local");
+        assert.equal(identity.name, "Tamandua Test");
+        assert.equal(identity.email, "test@tamandua.local");
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+
+    it("falls back to the operator's global config when env and repo-local are unset", async () => {
+      const workflowId = "test-gidn-global";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = tamanduaTempDir("tamandua-gidn-global-repo-");
+      const globalCfgDir = tamanduaTempDir("tamandua-gidn-global-cfg-");
+      const globalConfig = path.join(globalCfgDir, "gitconfig");
+      try {
+        // A non-git working directory skips the repo-local tier.
+        fs.mkdirSync(repoDir, { recursive: true });
+        fs.writeFileSync(
+          globalConfig,
+          "[user]\n\tname = GIDN Global Author\n\temail = gidn-global@example.test\n",
+          "utf-8",
+        );
+        await withIdentityEnv({ GIT_CONFIG_GLOBAL: globalConfig }, async () => {
+          try {
+            await runWorkflow({
+              workflowId,
+              taskTitle: "GIDN global identity",
+              workingDirectoryForHarness: repoDir,
+            });
+          } catch {
+            // See above.
+          }
+        });
+
+        const { id, context } = await latestRun(workflowId);
+        assert.equal(context.git_identity_name, "GIDN Global Author");
+        assert.equal(context.git_identity_email, "gidn-global@example.test");
+        assert.equal(context.git_identity_source, "global");
+        assert.deepEqual(startedGitIdentity(id), {
+          name: "GIDN Global Author",
+          email: "gidn-global@example.test",
+          source: "global",
+        });
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+        fs.rmSync(globalCfgDir, { recursive: true, force: true });
+      }
+    });
+
+    it("uses the Tamandua fallback when no source supplies both fields", async () => {
+      const workflowId = "test-gidn-fallback";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = tamanduaTempDir("tamandua-gidn-fallback-repo-");
+      const globalCfgDir = tamanduaTempDir("tamandua-gidn-fallback-cfg-");
+      const missingGlobal = path.join(globalCfgDir, "no-such-gitconfig");
+      try {
+        fs.mkdirSync(repoDir, { recursive: true });
+        await withIdentityEnv({ GIT_CONFIG_GLOBAL: missingGlobal }, async () => {
+          try {
+            await runWorkflow({
+              workflowId,
+              taskTitle: "GIDN fallback identity",
+              workingDirectoryForHarness: repoDir,
+            });
+          } catch {
+            // See above.
+          }
+        });
+
+        const { id, context } = await latestRun(workflowId);
+        assert.equal(context.git_identity_name, "Tamandua");
+        assert.equal(context.git_identity_email, "tamandua@tetradactyla.org");
+        assert.equal(context.git_identity_source, "fallback");
+        assert.deepEqual(startedGitIdentity(id), {
+          name: "Tamandua",
+          email: "tamandua@tetradactyla.org",
+          source: "fallback",
+        });
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+        fs.rmSync(globalCfgDir, { recursive: true, force: true });
+      }
+    });
+
+    it("records the resolved identity for worktree-mode runs (context UPDATE + run.started)", async () => {
+      const workflowId = "test-gidn-worktree";
+      writeMinimalWorkflow(tempHome, workflowId, "worktree");
+      const originDir = tamanduaTempDir("tamandua-gidn-wt-");
+      try {
+        initGitRepo(originDir);
+        await withIdentityEnv(
+          {
+            GIT_USER_NAME: "GIDN Worktree Author",
+            GIT_USER_EMAIL: "gidn-worktree@example.test",
+          },
+          async () => {
+            try {
+              await runWorkflow({
+                workflowId,
+                taskTitle: "GIDN worktree identity",
+                worktreeOriginRepository: originDir,
+              });
+            } catch {
+              // See above.
+            }
+          },
+        );
+
+        const { id, context } = await latestRun(workflowId);
+        // The follow-up `UPDATE runs SET context = ?` must carry the keys
+        // alongside the worktree fields.
+        assert.ok(context.worktree_path, "worktree run should record worktree_path");
+        assert.equal(context.git_identity_name, "GIDN Worktree Author");
+        assert.equal(context.git_identity_email, "gidn-worktree@example.test");
+        assert.equal(context.git_identity_source, "env");
+        assert.deepEqual(startedGitIdentity(id), {
+          name: "GIDN Worktree Author",
+          email: "gidn-worktree@example.test",
+          source: "env",
+        });
+      } finally {
+        fs.rmSync(originDir, { recursive: true, force: true });
+      }
+    });
+
+    it("run.started gitIdentity.source is always one of env|repo-local|global|fallback", async () => {
+      const workflowId = "test-gidn-source-enum";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = tamanduaTempDir("tamandua-gidn-enum-");
+      const globalCfgDir = tamanduaTempDir("tamandua-gidn-enum-cfg-");
+      const missingGlobal = path.join(globalCfgDir, "no-such-gitconfig");
+      try {
+        fs.mkdirSync(repoDir, { recursive: true });
+        await withIdentityEnv({ GIT_CONFIG_GLOBAL: missingGlobal }, async () => {
+          try {
+            await runWorkflow({
+              workflowId,
+              taskTitle: "GIDN source enum",
+              workingDirectoryForHarness: repoDir,
+            });
+          } catch {
+            // See above.
+          }
+        });
+
+        const { id } = await latestRun(workflowId);
+        const identity = startedGitIdentity(id);
+        assert.ok(
+          ["env", "repo-local", "global", "fallback"].includes(identity.source),
+          `unexpected identity source: ${identity.source}`,
+        );
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+        fs.rmSync(globalCfgDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("conditional step creation (US-002)", () => {
     it("persists type 'conditional' and the declared condition into steps.conditional_condition", async () => {
       const workflowId = "test-us002-conditional";

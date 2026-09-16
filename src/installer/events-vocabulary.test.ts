@@ -144,6 +144,20 @@ const TAMANDUA_EVENT_ISOLATION_PAYLOAD_FIELDS: TamanduaEvent = {
 void TAMANDUA_EVENT_ISOLATION_PAYLOAD_FIELDS;
 
 /**
+ * Compile-time pin of the GIDN US-002 run-identity payload field on
+ * TamanduaEvent: run.started carries gitIdentity {name,email,source}. If the
+ * field is dropped from TamanduaEvent, this assignment fails typecheck.
+ */
+const TAMANDUA_EVENT_GIT_IDENTITY_PAYLOAD_FIELDS: TamanduaEvent = {
+  ts: "static-pin",
+  event: "run.started",
+  runId: "static-pin",
+  workflowId: "static-pin",
+  gitIdentity: { name: "static-pin", email: "static-pin", source: "env" },
+};
+void TAMANDUA_EVENT_GIT_IDENTITY_PAYLOAD_FIELDS;
+
+/**
  * The run-level alert vocabulary (RSPN). These are NON-terminal diagnostic
  * events emitted while a run is still active — they surface a pathology
  * (e.g. a worker instant-fail loop heading toward force-fail escalation)
@@ -593,5 +607,23 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     assert.match(window, /emitEvent\(\{/, "run.started must be emitted via emitEvent");
     assert.match(window, /\bts\s*:/, "run.started must carry ts");
     assert.match(window, /\brunId\s*[,}]/, "run.started must carry runId");
+  });
+
+  it("run.started emitter (src/installer/run.ts) carries gitIdentity (source pin, GIDN US-002)", () => {
+    const runTsPath = path.resolve(import.meta.dirname, "run.ts");
+    const source = fs.readFileSync(runTsPath, "utf-8");
+
+    const marker = 'event: "run.started"';
+    const idx = source.indexOf(marker);
+    assert.ok(idx !== -1, "run.started emitter not found in src/installer/run.ts");
+    const window = source.slice(Math.max(0, idx - 400), idx + 800);
+    assert.match(
+      window,
+      /gitIdentity\s*:/,
+      "run.started must carry the resolved gitIdentity",
+    );
+    assert.match(window, /\.name\b/, "run.started gitIdentity must carry name");
+    assert.match(window, /\.email\b/, "run.started gitIdentity must carry email");
+    assert.match(window, /\.source\b/, "run.started gitIdentity must carry source");
   });
 });

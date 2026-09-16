@@ -113,6 +113,18 @@ export interface TamanduaEvent {
    * tests/MOTOR-CONTRACT.md (run identity, parent linkage).
    */
   parentRunId?: string;
+  /**
+   * GIDN US-002: the ONE commit identity resolved for this run at launch
+   * (env GIT_USER_NAME/GIT_USER_EMAIL -> working repo local config -> global
+   * config -> Tamandua fallback). Carried on run.started so the run's event
+   * stream records exactly who its commits are authored/committed by and
+   * where that identity came from (`source` is one of
+   * env|repo-local|global|fallback). The same identity is persisted into the
+   * run context as git_identity_name/git_identity_email/git_identity_source.
+   * The resolver always returns an identity, so run.started always carries
+   * this field.
+   */
+  gitIdentity?: { name: string; email: string; source: string };
   // Suite-specific fields (US-009)
   treeHash?: string;
   cmdDisplay?: string;

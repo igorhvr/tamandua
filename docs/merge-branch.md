@@ -28,6 +28,14 @@ Managed parking is crash-safe: interruption can leave the repository untouched, 
 
 Tamandua still refuses a mutating landing when multiple worktrees own the target, worktree metadata is invalid or ambiguous, or the attached owner has a Git operation in progress. These are bounded operational failures; Tamandua does not partially land the target.
 
+## Commit signing
+
+The squash commit honors the operator's configured commit signing (`commit.gpgsign`, `gpg.format`, `user.signingkey`), read from the landing repository's local config first and then the global config — each key resolved independently. `git commit-tree` does not consult `commit.gpgsign`, so when signing is enabled Tamandua passes `-S` and the resolved format/key overrides explicitly on the landing invocation.
+
+A landed result reports the outcome as `SIGNING: signed` (the commit carries a `gpgsig` header), `SIGNING: unsigned` (no signing configured, or a no-op landing with no new commit), or `SIGNING: unsigned-matchlock` (a Matchlock guest-context run, where signing keys are never projected into the guest). When signing is configured but the commit cannot be signed, the landing fails with exit code 1 and a detail that names signing; the target ref is never advanced to a silently unsigned commit.
+
+A landing is treated as a Matchlock guest context when the run context records `matchlock_context=true`, or when the process environment carries `TAMANDUA_MATCHLOCK_GUEST=1`. In that case signing is intentionally skipped even when `commit.gpgsign=true`: the guest env projection forwards the four `GIT_AUTHOR`/`GIT_COMMITTER` identity variables but no signing keys, so there is nothing to sign with. The `merge.landed` event carries a machine-readable `signingSkipped` reason explaining the exemption, and the target still advances with an unsigned squash commit.
+
 ## Exit codes
 
 | Code | Meaning |

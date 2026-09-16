@@ -261,6 +261,33 @@ Use `step stories` to inspect current story status for a run when diagnosing blo
 When invoked with `--json`, output is a single JSON object with `runId` and `stories` array —
 the preferred machine-readable path for story state inspection.
 
+## Git identity and signing
+
+Tamandua resolves ONE commit identity per run and provides it to every agent git
+operation; agents never configure git identity themselves.
+
+**Resolution order** — the first tier that supplies BOTH a name and an email wins:
+
+1. env `GIT_USER_NAME` + `GIT_USER_EMAIL` from the submitting context;
+2. the working repository's local `user.name` / `user.email`;
+3. the operator's global git config;
+4. last resort: `Tamandua <tamandua@tetradactyla.org>`.
+
+The resolved identity and its source are recorded on the run context
+(`git_identity_name` / `git_identity_email` / `git_identity_source`) and on the
+`run.started` event.
+
+- Every harness round's environment already provides `GIT_AUTHOR_NAME` /
+  `GIT_AUTHOR_EMAIL` and `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL`, so git
+  commits you create inherit the run identity without any configuration.
+- **NEVER run `git config --global` or `git config --system`** — to write an
+  identity or for anything else. Writing a global/system identity mutates the
+  operator's account and is forbidden. Read-only `git config --get` is fine.
+- Workflow landings (`finalize_merge` / `tamandua merge-branch`) honor the
+  configured commit signing (`commit.gpgsign` / `gpg.format` /
+  `user.signingkey`), except for Matchlock-backed (in-VM) runs whose landings
+  stay unsigned because no signing keys are projected into the guest.
+
 ## Supervising runs
 
 ### Launch, inspect, and stop
