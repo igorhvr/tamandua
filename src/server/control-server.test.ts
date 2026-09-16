@@ -23,6 +23,10 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { DEFAULT_CONTROL_PORT } from "../../dist/server/control-server.js";
+import {
+  getServiceSocketPath,
+  probeIdentitySocket,
+} from "../../dist/server/daemon-identity.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "server", "daemon.js");
@@ -163,6 +167,34 @@ describe("daemon control plane", { concurrency: 1 }, () => {
     assert.equal(r.body.status, "ok");
     assert.ok(typeof r.body.buildVersion === "string" && r.body.buildVersion.length > 0,
       `expected non-empty buildVersion string, got ${JSON.stringify(r.body.buildVersion)}`);
+  });
+
+  it("GET /control/health advertises the serving process's effective state dir", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+    const r = await jsonRequest("GET", "/control/health");
+    assert.equal(r.status, 200);
+    assert.equal(
+      r.body.stateDir,
+      path.join(tempHome, ".tamandua"),
+      `expected health stateDir to be the daemon's effective state dir, got ${JSON.stringify(r.body.stateDir)}`,
+    );
+  });
+
+  it("daemon identity socket advertises the daemon's effective state dir", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+    const expectedStateDir = path.join(tempHome, ".tamandua");
+    const identity = await probeIdentitySocket(
+      getServiceSocketPath("daemon", { homeDir: tempHome }),
+    );
+    assert.ok(identity, "expected the daemon identity socket to answer");
+    assert.equal(identity?.stateDir, expectedStateDir);
+    assert.equal(identity?.pid, daemon.pid);
   });
 
   it("GET /control/limits requires auth", async (t) => {

@@ -9,9 +9,9 @@
  * paths keep working. Production deployments should always run the daemon.
  */
 import http from "node:http";
-import os from "node:os";
 import pathModule from "node:path";
 import { testGuardActive, assertStatePathIsolation } from "../lib/test-guard.js";
+import { resolveStateDir } from "../lib/tamandua-config.js";
 import { getControlPort, readDaemonSecret } from "./control-server.js";
 import { startDaemon } from "./daemonctl.js";
 
@@ -38,8 +38,7 @@ async function controlRequest(
       return null;
     }
     const defaultSecretPath = pathModule.join(
-      (process.env.HOME?.trim() || os.homedir()),
-      ".tamandua",
+      resolveStateDir(),
       "daemon-secret",
     );
     try {

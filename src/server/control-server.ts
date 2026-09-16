@@ -21,7 +21,6 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import crypto from "node:crypto";
 import { logger } from "../lib/logger.js";
 import { SQL_NOW_ISO } from "../lib/instant.js";
@@ -31,6 +30,7 @@ import {
 } from "../lib/process-start-identity.js";
 import { getBuildVersion } from "../lib/version.js";
 import { assertPortIsolation, assertStatePathIsolation, testGuardActive } from "../lib/test-guard.js";
+import { resolveStateDir } from "../lib/tamandua-config.js";
 import { getDb } from "../db.js";
 import { emitEvent } from "../installer/events.js";
 import type { TamanduaEvent } from "../installer/events.js";
@@ -75,7 +75,7 @@ export function _setRunMidTeardownForTest(runId: string, mid: boolean): void {
 const buildVersion = getBuildVersion();
 
 function defaultDaemonSecretFile(): string {
-  return path.join(process.env.HOME?.trim() || os.homedir(), ".tamandua", "daemon-secret");
+  return path.join(resolveStateDir(), "daemon-secret");
 }
 
 export function getControlPort(): number {
@@ -1478,7 +1478,15 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
     // Health is exempt from auth so daemonctl liveness probes don't need
     // the secret to succeed.
     if (pathname === "/control/health" && method === "GET") {
-      respond(200, { status: "ok", pid: process.pid, timestamp: new Date().toISOString(), buildVersion });
+      respond(200, {
+        status: "ok",
+        pid: process.pid,
+        timestamp: new Date().toISOString(),
+        buildVersion,
+        // Effective state dir of the serving process (DPID scoping): lets a
+        // CLI prove a discovered control plane is OURS, not a foreign daemon.
+        stateDir: resolveStateDir(),
+      });
       return;
     }
 

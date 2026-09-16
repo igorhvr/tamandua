@@ -5,12 +5,38 @@
  */
 
 import {
-  getDaemonStatus,
-  isRunning,
+  getDaemonStatusAsync,
   restartDaemon,
   startDaemon,
-  stopDaemon,
+  stopDaemonAsync,
 } from "../../server/daemonctl.js";
+import type { ForeignDaemonHolder } from "../../server/daemonctl.js";
+
+/**
+ * Report a Tamandua daemon that holds the configured control port but belongs
+ * to a different state dir. It is never signalled; the caller continues with
+ * its own configured-state-dir behavior.
+ */
+function reportForeignHolder(holder: ForeignDaemonHolder | null | undefined): void {
+  if (!holder) return;
+  process.stderr.write(
+    `another Tamandua daemon (pid ${holder.pid}, port ${holder.port}, state dir ${holder.stateDir})\n`,
+  );
+}
+
+/**
+ * Dependency-injection seams for the daemon command handler.
+ *
+ * Production calls pass nothing and use the real daemonctl lifecycle
+ * functions; tests inject fakes to assert which path a subcommand takes
+ * without spawning or signalling anything.
+ */
+export interface DaemonCommandDeps {
+  getDaemonStatusAsync?: typeof getDaemonStatusAsync;
+  stopDaemonAsync?: typeof stopDaemonAsync;
+  restartDaemon?: typeof restartDaemon;
+  startDaemon?: typeof startDaemon;
+}
 
 export function getDaemonHelp(): string {
   return `tamandua daemon — Manage the daemon (control plane + scheduling motor)
@@ -63,6 +89,14 @@ Usage: tamandua daemon stop
 Stops the daemon if it is running. If the daemon is not running, the
 command prints a message and exits successfully.
 
+Stop is takeover-aware: the live daemon is identified by its identity
+socket (daemon.sock), then by the verified holder of the control port,
+then by the pidfile hint. The exact resolved pid receives SIGTERM; if it
+does not exit within the grace window (default 15 s, override with
+TAMANDUA_TAKEOVER_GRACE_MS) it is SIGKILLed, and the command verifies the
+control port is free before returning. A daemon whose pidfile was lost is
+therefore still stopped and replaced.
+
 Examples:
   tamandua daemon stop`;
 }
@@ -72,10 +106,12 @@ export function getDaemonRestartHelp(): string {
 
 Usage: tamandua daemon restart [--port N]
 
-Restarts the daemon. If the daemon is currently running, it is
-stopped first, then a new daemon is started on the given port (or the
-previously configured port if no --port is specified). If the daemon is
-not running, this command behaves like start.
+Restarts the daemon. If the daemon is currently running, it is stopped
+first (takeover: identity socket → verified control-port holder → pidfile
+hint, SIGTERM → bounded grace → SIGKILL, then port-free verification), then
+a new daemon is started on the given port (or the previously configured
+port if no --port is specified). If the daemon is not running, this command
+behaves like start.
 
 Options:
   --port N    Port to restart on (default: currently configured port or 3334)
@@ -90,8 +126,14 @@ export function getDaemonStatusHelp(): string {
 
 Usage: tamandua daemon status
 
-Reports whether the daemon is running. When running, it prints the PID
-and port. When not running, it indicates the daemon is down.
+Reports whether the daemon is running. When running, it prints the live
+PID, the control port, and how the daemon was resolved (source):
+  socket       identity socket answered (authoritative)
+  port-holder  verified Tamandua process holds the control port
+  pidfile      pidfile hint only
+
+A daemon that lost its pidfile is still reported running. When not
+running, it indicates the daemon is down.
 
 Examples:
   tamandua daemon status`;
@@ -182,7 +224,11 @@ Examples:
  * Handle daemon lifecycle commands and their control-plane aliases.
  * Returns true if the command was handled, false if not recognized.
  */
-export async function handleDaemon(group: string, args: string[]): Promise<boolean> {
+export async function handleDaemon(
+  group: string,
+  args: string[],
+  deps: DaemonCommandDeps = {},
+): Promise<boolean> {
   if (group !== "daemon" && group !== "control-plane") return false;
 
   const controlPlaneAlias = group === "control-plane";
@@ -191,7 +237,22 @@ export async function handleDaemon(group: string, args: string[]): Promise<boole
   const sub = args[1];
 
   if (sub === "stop") {
-    console.log(stopDaemon() ? `${serviceName} stopped.` : `${serviceName} is not running.`);
+    const stopAsync = deps.stopDaemonAsync ?? stopDaemonAsync;
+    const result = await stopAsync();
+    reportForeignHolder(result.foreignHolder);
+    if (result.pid === undefined) {
+      console.log(`${serviceName} is not running.`);
+      return true;
+    }
+    if (!result.stopped) {
+      const notes = result.portFree ? "port free" : "control port still in use";
+      console.log(`${serviceName} did not stop (PID ${result.pid}; ${notes}).`);
+      return true;
+    }
+    const notes: string[] = [];
+    if (result.escalated) notes.push("escalated to SIGKILL");
+    notes.push(result.portFree ? "port free" : "control port still in use");
+    console.log(`${serviceName} stopped (PID ${result.pid}; ${notes.join(", ")}).`);
     return true;
   }
   if (sub === "restart") {
@@ -207,7 +268,7 @@ export async function handleDaemon(group: string, args: string[]): Promise<boole
       if (!Number.isNaN(p)) port = p;
     }
     try {
-      const result = await restartDaemon(port);
+      const result = await (deps.restartDaemon ?? restartDaemon)(port);
       console.log(`${serviceName} restarted (PID ${result.pid})`);
     } catch (err) {
       process.stderr.write(`Failed to restart ${serviceNameLower}: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -216,37 +277,52 @@ export async function handleDaemon(group: string, args: string[]): Promise<boole
     return true;
   }
   if (sub === "status") {
-    const st = getDaemonStatus();
-    if (!st.running) {
+    const status = await (deps.getDaemonStatusAsync ?? getDaemonStatusAsync)();
+    reportForeignHolder(status.foreignHolder);
+    if (!status.running) {
       console.log(`${serviceName} is not running.`);
     } else {
-      console.log(`${serviceName} running (PID ${st.pid})`);
+      console.log(`${serviceName} running (PID ${status.pid}, source ${status.source ?? "unknown"})`);
     }
     return true;
   }
+
+  const startFn = deps.startDaemon ?? startDaemon;
+  const statusFn = deps.getDaemonStatusAsync ?? getDaemonStatusAsync;
 
   let port: number | undefined;
   const portIdx = args.indexOf("--port");
   if (portIdx !== -1 && args[portIdx + 1]) {
     port = parseInt(args[portIdx + 1], 10) || undefined;
-  } else if (sub && sub !== "start" && !sub.startsWith("-")) {
-    const p = parseInt(sub, 10);
-    if (!Number.isNaN(p)) port = p;
+  } else {
+    // Positional form: `tamandua daemon start <port>` (a bare port sub, e.g.
+    // `tamandua daemon <port>`, is also accepted for backward compatibility).
+    const startIdx = args.indexOf("start");
+    const posArg = startIdx !== -1 ? args[startIdx + 1] : sub;
+    if (posArg && !posArg.startsWith("-")) {
+      const p = parseInt(posArg, 10);
+      if (!Number.isNaN(p)) port = p;
+    }
   }
-  if (isRunning().running) {
-    const status = getDaemonStatus();
-    if (status.running) console.log(`${serviceName} already running (PID ${status.pid})`);
+  // Resolve by takeover (socket identity → verified port holder → pidfile) so
+  // an already-running daemon is recognized even when its pidfile is gone.
+  // The requested port is threaded through so the freshness check inspects
+  // exactly the port startDaemon() is about to bind (never the default).
+  const existing = await statusFn(port === undefined ? undefined : { port });
+  reportForeignHolder(existing.foreignHolder);
+  if (existing.running) {
+    console.log(`${serviceName} already running (PID ${existing.pid})`);
     return true;
   }
 
   if (!controlPlaneAlias) {
-    const result = await startDaemon(port);
+    const result = await startFn(port);
     console.log(`Daemon started (PID ${result.pid})`);
     return true;
   }
 
   try {
-    const result = await startDaemon(port);
+    const result = await startFn(port);
     console.log(`Control plane started (PID ${result.pid})`);
   } catch (err) {
     process.stderr.write(`Failed to start control plane: ${err instanceof Error ? err.message : String(err)}\n`);

@@ -165,9 +165,9 @@ describe("update exports", () => {
             dashboard: { running: false, pid: null, port: 3338 },
             mcp: { running: false, pid: null, port: 3339 },
           }),
-          stopDaemon: () => false,
-          stopDashboard: () => false,
-          stopMcp: () => false,
+          stopDaemon: async () => false,
+          stopDashboard: async () => false,
+          stopMcp: async () => false,
           startDaemon: async () => ({ pid: 1, port: 3334 }),
           startDashboard: async () => ({ pid: 2, port: 3338 }),
           startMcp: async () => ({ pid: 3, port: 3339 }),
@@ -264,9 +264,9 @@ describe("update exports", () => {
             dashboard: { running: false as const, pid: null, port: 3338 },
             mcp: { running: false as const, pid: null, port: 3339 },
           }),
-          stopDaemon: () => { serviceCalls.push("stopDaemon"); return true; },
-          stopDashboard: () => { serviceCalls.push("stopDashboard"); return true; },
-          stopMcp: () => { serviceCalls.push("stopMcp"); return true; },
+          stopDaemon: async () => { serviceCalls.push("stopDaemon"); return true; },
+          stopDashboard: async () => { serviceCalls.push("stopDashboard"); return true; },
+          stopMcp: async () => { serviceCalls.push("stopMcp"); return true; },
           startDaemon: async () => { serviceCalls.push("startDaemon"); return { pid: 1, port: 3334 }; },
           startDashboard: async () => { serviceCalls.push("startDashboard"); return { pid: 2, port: 3338 }; },
           startMcp: async () => { serviceCalls.push("startMcp"); return { pid: 3, port: 3339 }; },
@@ -405,6 +405,53 @@ describe("update exports", () => {
         // The build-and-install ran (status is updated, not no_change)
         // Service stop/start only happens for services that were running
         // (our dummy services report all as stopped, so no stop calls expected)
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("awaits async takeover stops before restarting services", async () => {
+      const { workingDir, cleanup } = setupRealGitRepo();
+      try {
+        const events: string[] = [];
+        const services = {
+          snapshot: () => ({
+            daemon: { running: true as const, pid: 111, port: 3334 },
+            dashboard: { running: true as const, pid: 222, port: 3338 },
+            mcp: { running: true as const, pid: 333, port: 3339 },
+          }),
+          // The default services return Promises (takeover stops). The update
+          // loop must await each one before starting any replacement.
+          stopDaemon: () => new Promise<boolean>((resolve) => {
+            setTimeout(() => { events.push("stopDaemon"); resolve(true); }, 30);
+          }),
+          stopDashboard: async () => { events.push("stopDashboard"); return true; },
+          stopMcp: async () => { events.push("stopMcp"); return true; },
+          startDaemon: async (port: number) => {
+            assert.ok(events.includes("stopDaemon"), "startDaemon must run after the awaited stopDaemon");
+            events.push("startDaemon");
+            return { pid: 1, port };
+          },
+          startDashboard: async (port: number) => { events.push("startDashboard"); return { pid: 2, port }; },
+          startMcp: async (port: number) => { events.push("startMcp"); return { pid: 3, port }; },
+        };
+
+        const result = await runUpdate({
+          force: true,
+          sourcePath: workingDir,
+          output: { log: () => {}, warn: () => {} },
+          services,
+          checkActiveRuns: async () => [],
+          listWorkflows: async () => [],
+          waitForProcessExit: async () => {},
+        });
+
+        assert.equal(result.status, "updated");
+        assert.deepEqual(
+          events,
+          ["stopDaemon", "stopDashboard", "stopMcp", "startDaemon", "startDashboard", "startMcp"],
+          "every async stop must settle before the corresponding restart",
+        );
       } finally {
         cleanup();
       }

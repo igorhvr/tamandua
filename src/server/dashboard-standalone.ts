@@ -17,12 +17,12 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
+import { resolveStateDir } from "../lib/tamandua-config.js";
 import { createDashboardServer } from "./dashboard.js";
 import { resolveDashboardPort } from "./dashboard-port.js";
 
-const DASHBOARD_PID_FILE = path.join(os.homedir(), ".tamandua", "dashboard.pid");
-const DASHBOARD_PORT_FILE = path.join(os.homedir(), ".tamandua", "port");
+const DASHBOARD_PID_FILE = path.join(resolveStateDir(), "dashboard.pid");
+const DASHBOARD_PORT_FILE = path.join(resolveStateDir(), "port");
 
 function resolvePort(): number {
   // 1. CLI argument

@@ -112,7 +112,7 @@ describe("tamandua dashboard status MCP visibility", () => {
       // Write an MCP port file with an unused port so the async status probe
       // (which probes the TCP port on the configured port) doesn't detect a
       // production MCP on the default port 3338.
-      const mcpPortDir = path.join(tempEnv.homeDir, ".tamandua");
+      const mcpPortDir = tempEnv.stateDir;
       fs.mkdirSync(mcpPortDir, { recursive: true });
       await mcpPortHandle.close();
       fs.writeFileSync(path.join(mcpPortDir, "mcp-port"), String(mcpPort), "utf-8");
@@ -170,7 +170,7 @@ describe("tamandua dashboard status MCP visibility", () => {
     /** Write an MCP port file pointing to an unused port so the async
      * status probe doesn't detect a production MCP on the default 3338. */
     const writeUnusedMcpPort = () => {
-      const mcpPortDir = path.join(tempEnv.homeDir, ".tamandua");
+      const mcpPortDir = tempEnv.stateDir;
       fs.mkdirSync(mcpPortDir, { recursive: true });
       fs.writeFileSync(path.join(mcpPortDir, "mcp-port"), String(unusedMcpPort), "utf-8");
     };
@@ -256,7 +256,7 @@ describe("tamandua dashboard status MCP visibility", () => {
     try {
       // Write the test's own MCP port into the config so the /api/mcp-status
       // endpoint reports the injected port instead of the hardcoded default.
-      const mcpPortDir = path.join(tempEnv.homeDir, ".tamandua");
+      const mcpPortDir = tempEnv.stateDir;
       fs.mkdirSync(mcpPortDir, { recursive: true });
       await mcpConfigPortHandle.close();
       fs.writeFileSync(path.join(mcpPortDir, "mcp-port"), String(mcpConfigPort), "utf-8");
@@ -355,11 +355,11 @@ describe("tamandua dashboard status MCP visibility", () => {
       const mcpStart = await runCliOnce(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(mcpStart.code, 0, mcpStart.stderr || mcpStart.stdout);
       assert.equal(
-        fs.readFileSync(path.join(tempEnv.homeDir, ".tamandua", "port"), "utf-8"),
+        fs.readFileSync(path.join(tempEnv.stateDir, "port"), "utf-8"),
         String(dashboardPort),
       );
       assert.equal(
-        fs.readFileSync(path.join(tempEnv.homeDir, ".tamandua", "mcp-port"), "utf-8"),
+        fs.readFileSync(path.join(tempEnv.stateDir, "mcp-port"), "utf-8"),
         String(mcpPort),
       );
 
@@ -418,7 +418,7 @@ describe("tamandua dashboard status MCP visibility", () => {
       // After uninstall cleans up the MCP port file, write an unused port
       // so the async status probe doesn't detect a production MCP on 3338.
       await unusedMcpPortHandle.close();
-      const mcpPortDir = path.join(tempEnv.homeDir, ".tamandua");
+      const mcpPortDir = tempEnv.stateDir;
       fs.mkdirSync(mcpPortDir, { recursive: true });
       fs.writeFileSync(path.join(mcpPortDir, "mcp-port"), String(unusedMcpPort), "utf-8");
 

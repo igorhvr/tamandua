@@ -8,16 +8,18 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { tamanduaTempDir } from "../dist/lib/temp-dir.js";
-import { removeTestTempDirWithDiagnostics } from "../tests/helpers/test-env.ts";
+import { cleanChildEnv, removeTestTempDirWithDiagnostics } from "../tests/helpers/test-env.ts";
 
 import { DatabaseSync } from "node:sqlite";
 
 import { runDoctorChecks, runLlmPromptAdherenceChecks, formatDoctorOutput,
-  checkDshSessionStore, detectDshZstdSupport, evaluateDshPermissionDump } from "../dist/doctor.js";
+  checkDshSessionStore, detectDshZstdSupport, evaluateDshPermissionDump,
+  runLivenessChecks, repairLiveness } from "../dist/doctor.js";
 import type { DoctorCheckResult, CheckGroup } from "../dist/doctor.js";
 import {
   startDaemon,
   stopDaemonFamily,
+  stopDaemonTakeover,
   isRunning,
   getLogFile,
   getPidFile,
@@ -30,8 +32,9 @@ import {
   readMcpPort,
   writeMcpPort,
 } from "../dist/server/daemonctl.js";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { getBuildVersion } from "../dist/lib/version.js";
+import { bindIdentitySocket } from "../dist/server/daemon-identity.js";
 
 // ── Test-isolation DB setup ────────────────────────────────────
 
@@ -330,15 +333,15 @@ describe("CheckGroup type", () => {
 });
 
 describe("runDoctorChecks", () => {
-  it("returns five check groups", async () => {
+  it("returns six check groups", async () => {
     const groups = await runDoctorChecks();
-    assert.strictEqual(groups.length, 5, `Expected 5 check groups, got ${groups.length}`);
+    assert.strictEqual(groups.length, 6, `Expected 6 check groups, got ${groups.length}`);
   });
 
   it("each group has a label and checks array", async () => {
     const groups = await runDoctorChecks();
     const labels = groups.map((g) => g.label);
-    assert.deepStrictEqual(labels, ["ENVIRONMENT", "SERVICES", "STALENESS", "STATE", "LLM PROMPT ADHERENCE"]);
+    assert.deepStrictEqual(labels, ["ENVIRONMENT", "SERVICES", "LIVENESS", "STALENESS", "STATE", "LLM PROMPT ADHERENCE"]);
     for (const group of groups) {
       if (group.label === "LLM PROMPT ADHERENCE") {
         // LLM PROMPT ADHERENCE can have 0 checks on an empty database
@@ -1072,7 +1075,7 @@ describe("ENVIRONMENT dsh checks (US-009)", () => {
     assert.ok(discoveryCheck!.remedy, "Warn should carry a remedy");
 
     // Doctor still runs all groups and never fails on dsh.
-    assert.strictEqual(groups.length, 5, "All five doctor groups still present");
+    assert.strictEqual(groups.length, 6, "All six doctor groups still present");
   });
 
   it("discovery reports the PATH tier", async () => {
@@ -2211,6 +2214,428 @@ describe("STALENESS check (US-005)", () => {
       }
     } finally {
       fs.rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("LIVENESS checks (US-007)", () => {
+  function findCheck(checks: DoctorCheckResult[], name: string): DoctorCheckResult {
+    const found = checks.find((c) => c.name === name);
+    assert.ok(found, `Expected LIVENESS check "${name}" (have: ${checks.map((c) => c.name).join(", ")})`);
+    return found!;
+  }
+
+  it("runDoctorChecks includes a LIVENESS group with the four DPID checks", async () => {
+    const homeDir = createTempHome();
+    try {
+      const groups = await runDoctorChecks({ homeDir });
+      const liveness = groups.find((g) => g.label === "LIVENESS");
+      assert.ok(liveness, "Expected a LIVENESS group");
+      assert.deepStrictEqual(
+        liveness!.checks.map((c) => c.name),
+        ["Daemon pidfile", "Daemon liveness socket", "Control port holder", "Running daemon build"],
+      );
+      for (const check of liveness!.checks) {
+        assert.ok(check.message.length > 0, `Check "${check.name}" has an empty message`);
+        if (check.status === "fail" || check.status === "warn") {
+          assert.ok(check.remedy, `Check "${check.name}" (${check.status}) must carry a remedy`);
+        }
+      }
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("consistent idle state passes all four checks in an isolated home", async () => {
+    const homeDir = createTempHome();
+    try {
+      const checks = await runLivenessChecks({ homeDir });
+      for (const check of checks) {
+        assert.strictEqual(check.status, "pass",
+          `Expected "${check.name}" to pass in an idle isolated home, got ${check.status}: ${check.message}`);
+      }
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("a dead pidfile fails with the pidfile path and a removal remedy (never unlinked)", async () => {
+    const homeDir = createTempHome();
+    const pidFile = path.join(homeDir, ".tamandua", "tamandua.pid");
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, "99999999", "utf-8");
+    try {
+      const checks = await runLivenessChecks({ homeDir });
+      const check = findCheck(checks, "Daemon pidfile");
+      assert.strictEqual(check.status, "fail");
+      assert.ok(check.message.includes(pidFile), `message should include the pidfile path: ${check.message}`);
+      assert.ok(check.message.includes("99999999"), `message should include the dead pid: ${check.message}`);
+      assert.ok(check.remedy && check.remedy.includes("rm -f"), `expected a removal remedy, got: ${check.remedy}`);
+      // Doctor is report-only: the stale pidfile must survive the check.
+      assert.ok(fs.existsSync(pidFile), "doctor must not unlink a stale pidfile");
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("a stale socket file warns with a removal remedy and is left on disk", async () => {
+    const homeDir = createTempHome();
+    const socketPath = path.join(homeDir, ".tamandua", "daemon.sock");
+    fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+    fs.writeFileSync(socketPath, "not a socket", "utf-8");
+    try {
+      const checks = await runLivenessChecks({ homeDir });
+      const check = findCheck(checks, "Daemon liveness socket");
+      assert.strictEqual(check.status, "warn");
+      assert.ok(check.message.includes(socketPath), `message should include the socket path: ${check.message}`);
+      assert.ok(check.message.includes("stale"), `message should mention stale: ${check.message}`);
+      assert.ok(check.remedy && check.remedy.includes("rm -f"), `expected a removal remedy, got: ${check.remedy}`);
+      assert.ok(fs.existsSync(socketPath), "doctor must not unlink a stale socket");
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("a control port held by a non-Tamandua cmdline reports the unknown pid and never signals it", async () => {
+    const homeDir = createTempHome();
+    const port = await getAvailablePort();
+    const cpPortFile = getControlPlanePortFile({ homeDir });
+    fs.mkdirSync(path.dirname(cpPortFile), { recursive: true });
+    fs.writeFileSync(cpPortFile, String(port), "utf-8");
+
+    let aliveProbed = false;
+    try {
+      const checks = await runLivenessChecks({ homeDir }, {
+        listPortHolderPids: () => [4242],
+        getCmdline: () => "python3 -m http.server 3339",
+        isPidAlive: () => {
+          aliveProbed = true;
+          return false;
+        },
+      });
+      const check = findCheck(checks, "Control port holder");
+      assert.strictEqual(check.status, "fail");
+      assert.ok(check.message.includes("held by unknown pid 4242"),
+        `message should name the unknown pid: ${check.message}`);
+      assert.ok(check.message.includes("python3 -m http.server"),
+        `message should include the holder cmdline: ${check.message}`);
+      assert.ok(check.remedy && check.remedy.length > 0, "unknown holder must carry a remedy");
+      // The report-only path probes liveness at most; the notification text is
+      // the only action. No kill/signal primitive is reachable here.
+      void aliveProbed;
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("a socket-identity build mismatch fails with the daemon restart remedy", async () => {
+    const homeDir = createTempHome();
+    const port = await getAvailablePort();
+    const cpPortFile = getControlPlanePortFile({ homeDir });
+    fs.mkdirSync(path.dirname(cpPortFile), { recursive: true });
+    fs.writeFileSync(cpPortFile, String(port), "utf-8");
+
+    const socketPath = path.join(homeDir, ".tamandua", "daemon.sock");
+    const bound = await bindIdentitySocket(socketPath, {
+      pid: process.pid,
+      buildVersion: "99999999_stale_build",
+      controlPort: port,
+      startedAt: new Date().toISOString(),
+    });
+    try {
+      const checks = await runLivenessChecks({ homeDir });
+
+      const socketCheck = findCheck(checks, "Daemon liveness socket");
+      assert.strictEqual(socketCheck.status, "pass",
+        `socket should answer: ${socketCheck.status} (${socketCheck.message})`);
+
+      const buildCheck = findCheck(checks, "Running daemon build");
+      assert.strictEqual(buildCheck.status, "fail");
+      assert.ok(buildCheck.message.includes("99999999_stale_build"),
+        `message should include the stale build: ${buildCheck.message}`);
+      assert.strictEqual(buildCheck.remedy, "Run: tamandua daemon restart");
+
+      // Socket says a daemon is live but the pidfile is gone.
+      const pidCheck = findCheck(checks, "Daemon pidfile");
+      assert.strictEqual(pidCheck.status, "fail");
+      assert.strictEqual(pidCheck.remedy, "Run: tamandua daemon restart");
+    } finally {
+      await bound.close();
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("a live daemon that lost its pidfile is reported (pidfile fail, socket pass, build pass)", { timeout: 20000 }, async () => {
+    const homeDir = createTempHome();
+    const controlPort = await getAvailablePort();
+    try {
+      await startDaemon(controlPort, { homeDir });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Delete the informational pidfile — the DPID wedge scenario.
+      fs.rmSync(getPidFile({ homeDir }), { force: true });
+
+      const checks = await runLivenessChecks({ homeDir });
+
+      const pidCheck = findCheck(checks, "Daemon pidfile");
+      assert.strictEqual(pidCheck.status, "fail",
+        `pidfile check: ${pidCheck.status} (${pidCheck.message})`);
+      assert.ok(pidCheck.message.includes("missing"),
+        `pidfile message should say missing: ${pidCheck.message}`);
+
+      const socketCheck = findCheck(checks, "Daemon liveness socket");
+      assert.strictEqual(socketCheck.status, "pass",
+        `socket check: ${socketCheck.status} (${socketCheck.message})`);
+
+      const buildCheck = findCheck(checks, "Running daemon build");
+      assert.strictEqual(buildCheck.status, "pass",
+        `build check: ${buildCheck.status} (${buildCheck.message})`);
+    } finally {
+      // The pidfile was deleted on purpose, so the family stop (pidfile-only)
+      // cannot find this daemon. Stop it by socket identity instead.
+      await stopDaemonTakeover({ homeDir });
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("a healthy isolated daemon passes all four checks", { timeout: 20000 }, async () => {
+    const homeDir = createTempHome();
+    const controlPort = await getAvailablePort();
+    try {
+      await startDaemon(controlPort, { homeDir });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      const checks = await runLivenessChecks({ homeDir });
+      for (const check of checks) {
+        assert.strictEqual(check.status, "pass",
+          `Expected "${check.name}" to pass for a healthy daemon, got ${check.status}: ${check.message}`);
+      }
+    } finally {
+      await stopDaemonFamily({ homeDir });
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+});
+
+describe("doctor --repair (US-008)", () => {
+  it("adopts a live socket daemon into a fresh pidfile", async () => {
+    const homeDir = createTempHome();
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const socketPath = path.join(stateDir, "daemon.sock");
+    const pidFile = path.join(stateDir, "tamandua.pid");
+    fs.writeFileSync(socketPath, "dummy-socket-file", "utf-8");
+    const livePid = 4242;
+    const buildVersion = getBuildVersion();
+    try {
+      const result = await repairLiveness({ homeDir }, {
+        probeSocket: async () => ({ pid: livePid, buildVersion, controlPort: 45678, startedAt: new Date().toISOString() }),
+        resolveLive: async () => ({ service: "daemon", pid: livePid, port: 45678, source: "socket", buildVersion }),
+        listPortHolderPids: () => [],
+        isPidAlive: (pid) => pid === livePid,
+      });
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(fs.readFileSync(pidFile, "utf-8").trim(), String(livePid));
+      assert.ok(
+        result.actions.some((a) => a.includes("adopted live daemon pid 4242") && a.includes("socket")),
+        `expected an adopt action, got: ${result.actions.join(" | ")}`,
+      );
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("adopts a live port-holder daemon into a fresh pidfile", async () => {
+    const homeDir = createTempHome();
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const pidFile = path.join(stateDir, "tamandua.pid");
+    const livePid = 5252;
+    try {
+      const result = await repairLiveness({ homeDir }, {
+        probeSocket: async () => null,
+        resolveLive: async () => ({ service: "daemon", pid: livePid, port: 45679, source: "port-holder" }),
+        listPortHolderPids: () => [],
+        isPidAlive: (pid) => pid === livePid,
+      });
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(fs.readFileSync(pidFile, "utf-8").trim(), String(livePid));
+      assert.ok(
+        result.actions.some((a) => a.includes("adopted live daemon pid 5252") && a.includes("port-holder")),
+        `expected a port-holder adopt action, got: ${result.actions.join(" | ")}`,
+      );
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("removes a stale daemon.sock and a dead-pid tamandua.pid", async () => {
+    const homeDir = createTempHome();
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const socketPath = path.join(stateDir, "daemon.sock");
+    const pidFile = path.join(stateDir, "tamandua.pid");
+    fs.writeFileSync(socketPath, "stale", "utf-8");
+    fs.writeFileSync(pidFile, "99999999", "utf-8");
+    try {
+      const result = await repairLiveness({ homeDir }, {
+        probeSocket: async () => null,
+        resolveLive: async () => null,
+        listPortHolderPids: () => [],
+        isPidAlive: () => false,
+      });
+      assert.strictEqual(result.ok, true);
+      assert.ok(!fs.existsSync(socketPath), "stale socket should be unlinked");
+      assert.ok(!fs.existsSync(pidFile), "dead pidfile should be unlinked");
+      assert.ok(result.actions.some((a) => a.includes("removed stale daemon identity socket")));
+      assert.ok(result.actions.some((a) => a.includes("removed stale daemon pidfile") && a.includes("99999999")));
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("stops and restarts a daemon whose socket build differs from the installed build", async () => {
+    const homeDir = createTempHome();
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const socketPath = path.join(stateDir, "daemon.sock");
+    fs.writeFileSync(socketPath, "dummy", "utf-8");
+    const oldPid = 6363;
+    const newPid = 7373;
+    const controlPort = 45680;
+    const staleBuild = "00000000_stale_build";
+    assert.notStrictEqual(staleBuild, getBuildVersion());
+    const stopCalls: number[] = [];
+    const startCalls: number[] = [];
+    try {
+      const result = await repairLiveness({ homeDir }, {
+        probeSocket: async () => ({ pid: oldPid, buildVersion: staleBuild, controlPort, startedAt: new Date().toISOString() }),
+        resolveLive: async () => ({ service: "daemon", pid: oldPid, port: controlPort, source: "socket", buildVersion: staleBuild }),
+        listPortHolderPids: () => [],
+        isPidAlive: (pid) => pid === oldPid,
+        stopDaemon: async () => {
+          stopCalls.push(oldPid);
+          return { stopped: true, pid: oldPid, escalated: false, portFree: true };
+        },
+        startDaemon: async (port) => {
+          startCalls.push(port);
+          return { pid: newPid, port };
+        },
+      });
+      assert.strictEqual(result.ok, true);
+      assert.deepStrictEqual(stopCalls, [oldPid]);
+      assert.deepStrictEqual(startCalls, [controlPort]);
+      assert.ok(result.actions.some((a) => a.includes("stopped daemon pid 6363") && a.includes(staleBuild)));
+      assert.ok(result.actions.some((a) => a.includes("started installed build") && a.includes("7373")));
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("reports ok=false when a stopped daemon cannot be restarted", async () => {
+    const homeDir = createTempHome();
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "daemon.sock"), "dummy", "utf-8");
+    const staleBuild = "00000000_stale_build";
+    try {
+      const result = await repairLiveness({ homeDir }, {
+        probeSocket: async () => ({ pid: 6400, buildVersion: staleBuild, controlPort: 45682, startedAt: new Date().toISOString() }),
+        resolveLive: async () => ({ service: "daemon", pid: 6400, port: 45682, source: "socket", buildVersion: staleBuild }),
+        listPortHolderPids: () => [],
+        isPidAlive: (pid) => pid === 6400,
+        stopDaemon: async () => ({ stopped: true, pid: 6400, escalated: false, portFree: true }),
+        startDaemon: async () => { throw new Error("spawn failed"); },
+      });
+      assert.strictEqual(result.ok, false);
+      assert.ok(result.actions.some((a) => a.includes("failed to start the installed build") && a.includes("spawn failed")));
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("never signals or removes a non-Tamandua port holder and reports a skip", async () => {
+    const homeDir = createTempHome();
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const controlPort = 45681;
+    fs.writeFileSync(path.join(stateDir, "control-plane-port"), String(controlPort), "utf-8");
+    let stopCalled = false;
+    try {
+      const result = await repairLiveness({ homeDir }, {
+        probeSocket: async () => null,
+        resolveLive: async () => null,
+        listPortHolderPids: (port) => (port === controlPort ? [4242] : []),
+        getCmdline: () => "python3 -m http.server 3339",
+        isPidAlive: () => false,
+        stopDaemon: async () => {
+          stopCalled = true;
+          return { stopped: false, escalated: false, portFree: true };
+        },
+      });
+      assert.strictEqual(stopCalled, false, "must never signal an unknown port holder");
+      assert.strictEqual(result.ok, false, "an unknown holder is an unrepaired failure");
+      assert.ok(
+        result.actions.some((a) =>
+          a.includes("skip:") &&
+          a.includes("unknown pid 4242") &&
+          a.includes("python3 -m http.server"),
+        ),
+        `expected an unknown-holder skip, got: ${result.actions.join(" | ")}`,
+      );
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("plain runLivenessChecks performs no repair writes (stale files survive)", async () => {
+    const homeDir = createTempHome();
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const socketPath = path.join(stateDir, "daemon.sock");
+    const pidFile = path.join(stateDir, "tamandua.pid");
+    fs.writeFileSync(socketPath, "stale", "utf-8");
+    fs.writeFileSync(pidFile, "99999999", "utf-8");
+    try {
+      const checks = await runLivenessChecks({ homeDir });
+      assert.ok(checks.length > 0);
+      assert.ok(fs.existsSync(socketPath), "plain doctor must not unlink the stale socket");
+      assert.ok(fs.existsSync(pidFile), "plain doctor must not unlink the dead pidfile");
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
+    }
+  });
+
+  it("tamandua doctor --repair repairs stale liveness files in an isolated home (end-to-end)", { timeout: 120000 }, async () => {
+    const homeDir = createTempHome();
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const socketPath = path.join(stateDir, "daemon.sock");
+    const pidFile = path.join(stateDir, "tamandua.pid");
+    fs.writeFileSync(socketPath, "stale", "utf-8");
+    fs.writeFileSync(pidFile, "99999999", "utf-8");
+    const controlPort = await getAvailablePort();
+    fs.writeFileSync(path.join(stateDir, "control-plane-port"), String(controlPort), "utf-8");
+    try {
+      const result = spawnSync(process.execPath, [path.resolve("dist/cli/cli.js"), "doctor", "--repair"], {
+        encoding: "utf8",
+        timeout: 90000,
+        env: cleanChildEnv({ HOME: homeDir, TAMANDUA_STATE_DIR: stateDir, TAMANDUA_TEST_GUARD: "1" }),
+      });
+      assert.strictEqual(
+        result.status,
+        0,
+        `doctor --repair exited ${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.match(result.stdout ?? "", /─── REPAIR ───/);
+      assert.match(result.stdout ?? "", /removed stale daemon identity socket/);
+      // The stale pidfile is gone by the time repair runs regardless of which
+      // check removed it (the SERVICES isRunning check also cleans a dead
+      // pidfile); repair-direct pidfile removal is covered by the unit test.
+      assert.ok(!fs.existsSync(socketPath), "stale socket should be removed");
+      assert.ok(!fs.existsSync(pidFile), "stale pidfile should be removed");
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
     }
   });
 });

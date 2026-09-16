@@ -13,9 +13,9 @@ import {
   startDaemon,
   startDashboardStandalone,
   startMcp,
-  stopDaemon,
-  stopDashboardStandalone,
-  stopMcp,
+  stopDaemonAsync,
+  stopDashboardAsync,
+  stopMcpAsync,
 } from "../server/daemonctl.js";
 import { runVersionCheck } from "../lib/version-check.js";
 
@@ -31,9 +31,15 @@ export interface UpdateServiceSnapshot {
 
 export interface UpdateServices {
   snapshot: () => UpdateServiceSnapshot;
-  stopDaemon: () => boolean;
-  stopDashboard: () => boolean;
-  stopMcp: () => boolean;
+  /**
+   * Stop one service. Sync `boolean` is still accepted; the default services
+   * return the async takeover result (SIGTERM → grace → SIGKILL → port-free),
+   * which `stopRunningServices` awaits so a wedged/pidfile-less service is
+   * fully replaced before the new build starts.
+   */
+  stopDaemon: () => boolean | Promise<boolean>;
+  stopDashboard: () => boolean | Promise<boolean>;
+  stopMcp: () => boolean | Promise<boolean>;
   startDaemon: (port: number) => Promise<{ pid: number; port: number }>;
   startDashboard: (port: number) => Promise<{ pid: number; port: number }>;
   startMcp: (port: number) => Promise<{ pid: number; port: number }>;
@@ -101,14 +107,22 @@ function assertSourceCheckout(sourcePath: string): void {
 
 export function createDefaultUpdateServices(): UpdateServices {
   return {
+    // snapshot() stays synchronous: getDaemonStatus/getDashboardStatus/
+    // getMcpStatus now fall back to the verified TCP port holder, so a live
+    // service whose pidfile was lost is still detected (DPID).
     snapshot: () => ({
       daemon: normalizeServiceStatus(getDaemonStatus()),
       dashboard: normalizeServiceStatus(getDashboardStatus()),
       mcp: normalizeServiceStatus(getMcpStatus()),
     }),
-    stopDaemon,
-    stopDashboard: stopDashboardStandalone,
-    stopMcp,
+    // Default stops are the takeover variants: resolve by identity socket →
+    // verified port holder → pidfile, then SIGTERM → bounded grace → SIGKILL →
+    // port-free verification. This is what lets `update --force` replace a
+    // wedged or older service that ignores HTTP. stopRunningServices awaits
+    // them.
+    stopDaemon: () => stopDaemonAsync().then((result) => result.stopped),
+    stopDashboard: () => stopDashboardAsync().then((result) => result.stopped),
+    stopMcp: () => stopMcpAsync().then((result) => result.stopped),
     startDaemon: (port) => startDaemon(port),
     startDashboard: (port) => startDashboardStandalone(port),
     startMcp: (port) => startMcp(port),
@@ -233,20 +247,23 @@ async function stopRunningServices(
 ): Promise<void> {
   const stoppedPids: number[] = [];
 
-  // Stop daemon first (control-plane+motor), then dashboard, then MCP
+  // Stop daemon first (control-plane+motor), then dashboard, then MCP.
+  // Each stop is awaited: the default services perform the async takeover
+  // stop (SIGTERM → grace → SIGKILL → port-free), so the port is actually
+  // released before a new build is started.
   if (snapshot.daemon.running) {
     output.log(`Stopping daemon (PID ${snapshot.daemon.pid})...`);
-    services.stopDaemon();
+    await services.stopDaemon();
     stoppedPids.push(snapshot.daemon.pid);
   }
   if (snapshot.dashboard.running) {
     output.log(`Stopping dashboard (PID ${snapshot.dashboard.pid})...`);
-    services.stopDashboard();
+    await services.stopDashboard();
     stoppedPids.push(snapshot.dashboard.pid);
   }
   if (snapshot.mcp.running) {
     output.log(`Stopping standalone MCP server (PID ${snapshot.mcp.pid})...`);
-    services.stopMcp();
+    await services.stopMcp();
     stoppedPids.push(snapshot.mcp.pid);
   }
 

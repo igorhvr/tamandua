@@ -12,13 +12,24 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import net from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_MCP_PORT, MCP_ENDPOINT_PATH } from "./mcp-server.js";
 import { DEFAULT_CONTROL_PORT } from "./control-server.js";
-import { assertStatePathIsolation, spawnChildAttributionEnv } from "../lib/test-guard.js";
+import { resolveEffectiveHomeDir, resolveStateDir } from "../lib/tamandua-config.js";
+import {
+  getServiceSocketPath,
+  probeIdentitySocket,
+  type DaemonIdentity,
+} from "./daemon-identity.js";
+import {
+  isTamanduaServiceCmdline,
+  resolvePortHolder,
+  type ServiceHolderOptions,
+  type ServiceKind,
+} from "../lib/service-holder.js";
+import { assertStatePathIsolation, spawnChildAttributionEnv, testGuardActive } from "../lib/test-guard.js";
 import { environHasEntry, getCmdline, getElapsedSeconds, hasProcfs, processHasOpenFileUnder } from "../lib/proc-info.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -85,18 +96,14 @@ export function recordLifecycleEvent(
 
 // ── MCP file paths ─────────────────────────────────────────────────
 
-function defaultTamanduaDir(): string {
-  return path.join(process.env.HOME?.trim() || os.homedir(), ".tamandua");
-}
-
-export const MCP_PID_FILE = path.join(defaultTamanduaDir(), "mcp.pid");
-export const MCP_PORT_FILE = path.join(defaultTamanduaDir(), "mcp-port");
+export const MCP_PID_FILE = path.join(resolveStateDir(), "mcp.pid");
+export const MCP_PORT_FILE = path.join(resolveStateDir(), "mcp-port");
 
 // ── Control plane file paths ──────────────────────────────────────
 
-export const CONTROL_PLANE_PID_FILE = path.join(defaultTamanduaDir(), "control-plane.pid");
-export const CONTROL_PLANE_PORT_FILE = path.join(defaultTamanduaDir(), "control-plane-port");
-export const CONTROL_PLANE_LOG_FILE = path.join(defaultTamanduaDir(), "control-plane.log");
+export const CONTROL_PLANE_PID_FILE = path.join(resolveStateDir(), "control-plane.pid");
+export const CONTROL_PLANE_PORT_FILE = path.join(resolveStateDir(), "control-plane-port");
+export const CONTROL_PLANE_LOG_FILE = path.join(resolveStateDir(), "control-plane.log");
 
 export interface DaemonctlPathOptions {
   /**
@@ -109,7 +116,7 @@ export interface DaemonctlPathOptions {
 // ── File path helpers ───────────────────────────────────────────────
 
 function getTamanduaDir(opts?: DaemonctlPathOptions): string {
-  return opts?.homeDir ? path.join(opts.homeDir, ".tamandua") : defaultTamanduaDir();
+  return resolveStateDir(opts);
 }
 
 export function getPidFile(opts?: DaemonctlPathOptions): string {
@@ -313,8 +320,74 @@ function processHomeMatches(pid: number, homeDir: string): boolean {
   return processHasOpenFileUnder(pid, dir);
 }
 
-function canSignalPid(pid: number, opts?: DaemonctlPathOptions): boolean {
-  return !opts?.homeDir || processHomeMatches(pid, opts.homeDir);
+/**
+ * Whether `pid` provably belongs to the effective Tamandua configuration.
+ *
+ * A process is OURS when its environment's effective state dir equals ours:
+ *  - its `TAMANDUA_STATE_DIR` names the effective state dir exactly, or
+ *  - it names our `HOME` and the effective state dir IS that home's default
+ *    `.tamandua` (no separate state-dir override in force).
+ *
+ * Both values are read exactly from procfs on Linux. On macOS the kernel
+ * hides other processes' environments, so the existing pidfile-age /
+ * open-file-under-the-state-dir provenance check is used instead, applied to
+ * the effective home dir.
+ *
+ * This is deliberately NOT conditioned on `opts.homeDir`: a CLI configured
+ * only through `HOME` / `TAMANDUA_STATE_DIR` must still reject a daemon that
+ * belongs to another state dir (the production daemon on port 3339), which is
+ * exactly the defect the old `return true` when `opts.homeDir` was absent
+ * caused.
+ */
+function processBelongsToEffectiveConfig(pid: number, opts?: DaemonctlPathOptions): boolean {
+  const effectiveHome = resolveEffectiveHomeDir(opts);
+  const effectiveStateDir = path.resolve(resolveStateDir(opts));
+
+  // Linux: exact environ membership — the strongest binding.
+  if (hasProcfs()) {
+    if (environHasEntry(pid, "TAMANDUA_STATE_DIR", effectiveStateDir)) return true;
+    // A process that only names our HOME owns <effectiveHome>/.tamandua; that
+    // is our state dir exactly when no separate state-dir override is set.
+    if (
+      effectiveStateDir === path.resolve(path.join(effectiveHome, ".tamandua")) &&
+      environHasEntry(pid, "HOME", effectiveHome)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  // macOS: provenance binding against the effective home dir.
+  return processHomeMatches(pid, effectiveHome);
+}
+
+/**
+ * Home/state-dir binding guard used by every takeover/liveness path: true
+ * ONLY when the candidate pid provably belongs to the effective Tamandua
+ * state dir. Exported so tests can pin the scoping directly.
+ *
+ * Callers may still inject `opts.canSignal` on the resolver options to
+ * override this default (tests and doctor use that seam).
+ */
+export function canSignalPid(pid: number, opts?: DaemonctlPathOptions): boolean {
+  return processBelongsToEffectiveConfig(pid, opts);
+}
+
+/**
+ * Whether a probed identity belongs to the effective Tamandua configuration.
+ *
+ * The identity socket is authoritative for LIVENESS, but a socket can hold a
+ * leftover claim from a daemon started under a different state dir. An
+ * identity that advertises a `stateDir` (DPID) is accepted only when it equals
+ * the effective state dir; identities without one (pre-DPID fixtures and
+ * builds) stay valid.
+ */
+function identityBelongsToEffectiveStateDir(
+  identity: DaemonIdentity,
+  opts?: DaemonctlPathOptions,
+): boolean {
+  if (identity.stateDir === undefined) return true;
+  return path.resolve(identity.stateDir) === path.resolve(resolveStateDir(opts));
 }
 
 /**
@@ -402,22 +475,101 @@ async function waitForDaemonPid(
   return null;
 }
 
+/** True when an error is the test-isolation guard refusing production state. */
+function isIsolationViolation(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("TEST ISOLATION VIOLATION");
+}
+
+/**
+ * Resolve a live service from the TCP holder of one of its ports
+ * (synchronous).
+ *
+ * This is the pidfile-less fallback for {@link isRunning} /
+ * {@link isDashboardRunning} / {@link isMcpRunning}: it runs the platform's
+ * `ss`/`lsof` via {@link resolvePortHolder}, verifies the holder's command line
+ * is the named Tamandua service, and then applies the same home-binding guard
+ * (`canSignalPid`) the takeover path uses so an isolated caller can never adopt
+ * a production process.
+ *
+ * Returns the holder pid, or null when nothing verified. When the guard is
+ * active and no explicit `homeDir` is set the fallback is skipped entirely —
+ * resolving by a bare default port would otherwise adopt the live production
+ * service (the daemonctl-guard contract).
+ */
+function resolveServicePortHolder(
+  service: ServiceKind,
+  readPortFn: (opts?: DaemonctlPathOptions) => number,
+  opts?: ResolveLiveDaemonOptions,
+): number | null {
+  if (!opts?.homeDir && testGuardActive()) return null;
+
+  const canSignal = opts?.canSignal ?? canSignalPid;
+  let port: number;
+  try {
+    port = readPortFn(opts);
+  } catch (err) {
+    if (isIsolationViolation(err)) return null;
+    throw err;
+  }
+
+  let holder: { pid: number; cmdline: string } | null;
+  try {
+    holder = resolvePortHolder(port, service, opts?.holder ?? {});
+  } catch (err) {
+    if (isIsolationViolation(err)) return null;
+    throw err;
+  }
+  if (!holder) return null;
+  if (!canSignal(holder.pid, opts)) return null;
+  return holder.pid;
+}
+
+/** Daemon-specific shim over {@link resolveServicePortHolder}. */
+function resolveDaemonPortHolder(opts?: ResolveLiveDaemonOptions): number | null {
+  return resolveServicePortHolder("daemon", readControlPlanePort, opts);
+}
+
+/**
+ * Dashboard-specific shim over {@link resolveServicePortHolder}. The
+ * standalone dashboard has no identity socket (yet), so a lost pidfile is
+ * recovered from the verified holder of `readPort(opts)` (3334 by default).
+ */
+function resolveDashboardPortHolder(opts?: ResolveLiveDaemonOptions): number | null {
+  return resolveServicePortHolder("dashboard", readPort, opts);
+}
+
+/**
+ * MCP-specific shim over {@link resolveServicePortHolder}. A daemon.js holder
+ * is accepted too: the daemon hosts MCP in-process, so the MCP port may be
+ * held by the daemon process (see isTamanduaServiceCmdline).
+ */
+function resolveMcpPortHolder(opts?: ResolveLiveDaemonOptions): number | null {
+  return resolveServicePortHolder("mcp", readMcpPort, opts);
+}
+
 /**
  * Check if the daemon process is running.
- * Uses PID file and kill(0) for existence check.
+ *
+ * Keeps the pidfile as a fast path (and informational hint), then falls back
+ * to the verified control-port holder so a daemon that lost its pidfile is
+ * still reported running (DPID takeover).
  */
 export function isRunning(opts?: DaemonctlPathOptions): { running: true; pid: number } | { running: false } {
-  if (!opts?.homeDir) {
-    try {
-      return checkPidFile(getPidFile(opts));
-    } catch (err) {
-      if (err instanceof Error && err.message.includes("TEST ISOLATION VIOLATION")) {
-        return { running: false };
-      }
-      throw err;
-    }
+  let pidFile: string;
+  try {
+    pidFile = getPidFile(opts);
+  } catch (err) {
+    if (isIsolationViolation(err)) return { running: false };
+    throw err;
   }
-  return checkPidFile(getPidFile(opts));
+
+  const fromPidFile = checkPidFile(pidFile);
+  if (fromPidFile.running) return fromPidFile;
+
+  const holderPid = resolveDaemonPortHolder(opts);
+  if (holderPid !== null) return { running: true, pid: holderPid };
+
+  return { running: false };
 }
 
 /**
@@ -434,6 +586,57 @@ export function getDaemonStatus(opts?: DaemonctlPathOptions): { running: false; 
     running: true,
     pid: status.pid,
     port,
+  };
+}
+
+/**
+ * Async daemon status that resolves by socket identity → verified port holder
+ * → pidfile, so `daemon status` can name both the live pid and HOW it was
+ * found even when the pidfile is gone.
+ */
+export async function getDaemonStatusAsync(opts?: ResolveLiveDaemonOptions): Promise<{
+  running: boolean;
+  pid: number | null;
+  port: number;
+  source: LiveServiceSource | null;
+  /** A Tamandua daemon on the configured port for another state dir, if any. */
+  foreignHolder?: ForeignDaemonHolder | null;
+}> {
+  let port: number;
+  try {
+    port = opts?.port ?? readControlPlanePort(opts);
+  } catch (err) {
+    if (isIsolationViolation(err)) {
+      return { running: false, pid: null, port: DEFAULT_CONTROL_PORT, source: null };
+    }
+    throw err;
+  }
+
+  let resolution: LiveDaemonResolution;
+  try {
+    resolution = await resolveLiveDaemonDetailed(opts);
+  } catch (err) {
+    if (isIsolationViolation(err)) {
+      return { running: false, pid: null, port, source: null };
+    }
+    throw err;
+  }
+  const live = resolution.live;
+  if (!live) {
+    return {
+      running: false,
+      pid: null,
+      port,
+      source: null,
+      foreignHolder: resolution.foreignHolder,
+    };
+  }
+  return {
+    running: true,
+    pid: live.pid,
+    port: live.port || port,
+    source: live.source,
+    foreignHolder: null,
   };
 }
 
@@ -525,6 +728,14 @@ export async function startDaemon(port?: number, opts?: StartOptions): Promise<{
     return { pid: status.pid, port: existingPort };
   }
 
+  // Refuse to spawn a colliding daemon when one is already live but its
+  // pidfile is gone: resolve by identity socket, then the verified holder of
+  // the requested control port.
+  const liveBeforeStart = await resolveLiveDaemonForStart(controlPort, opts);
+  if (liveBeforeStart) {
+    return { pid: liveBeforeStart.pid, port: liveBeforeStart.port };
+  }
+
   fs.mkdirSync(tamanduaDir, { recursive: true });
   const lockFd = acquireStartLock(lockFile);
   if (lockFd === null) {
@@ -547,6 +758,11 @@ export async function startDaemon(port?: number, opts?: StartOptions): Promise<{
       return { pid: recheck.pid, port: existingPort };
     }
 
+    const liveAfterLock = await resolveLiveDaemonForStart(controlPort, opts);
+    if (liveAfterLock) {
+      return { pid: liveAfterLock.pid, port: liveAfterLock.port };
+    }
+
     fs.writeFileSync(portFile, String(controlPort), "utf-8");
 
     const out = fs.openSync(logFile, "a");
@@ -559,6 +775,11 @@ export async function startDaemon(port?: number, opts?: StartOptions): Promise<{
     const daemonEnv: Record<string, string> = { TAMANDUA_CONTROL_PORT: String(controlPort) };
     if (opts?.homeDir) {
       daemonEnv.HOME = opts.homeDir;
+      // Pin the child's effective state dir to the one the parent resolved.
+      // resolveStateDir() prefers TAMANDUA_STATE_DIR over HOME, so inheriting
+      // a stale override would make the child write its pid/socket somewhere
+      // other than getPidFile()/getServiceSocketPath() look.
+      daemonEnv.TAMANDUA_STATE_DIR = resolveStateDir(opts);
     }
     const spawnOpts: Parameters<typeof spawn>[2] = {
       detached: true,
@@ -608,10 +829,32 @@ export async function startDaemon(port?: number, opts?: StartOptions): Promise<{
 }
 
 /**
+ * Signal exactly one resolved, verified daemon pid (shared by the synchronous
+ * {@link stopDaemon} and the async takeover path).
+ *
+ * The only signal ever sent here is SIGTERM to the exact pid; callers are
+ * responsible for having verified the pid first. The scheduling-daemon guard
+ * runs before any signal so an agent inside a run can never kill its own
+ * dispatcher.
+ */
+function signalDaemonPid(pid: number, opts?: DaemonctlPathOptions, event = "stop.daemon"): void {
+  assertNotSchedulingDaemon(pid, "daemon");
+  recordLifecycleEvent(event, pid, opts);
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // Process may have already exited
+  }
+}
+
+/**
  * Stop the daemon (control-plane+motor).
  *
  * Sends SIGTERM to the daemon process and cleans up the PID file.
  * Returns true if a daemon was stopped, false if none was running.
+ *
+ * Resolution is takeover-aware: {@link isRunning} reports a daemon that lost
+ * its pidfile as long as a verified Tamandua process holds the control port.
  */
 export function stopDaemon(opts?: DaemonctlPathOptions): boolean {
   if (!opts?.homeDir) {
@@ -620,14 +863,8 @@ export function stopDaemon(opts?: DaemonctlPathOptions): boolean {
   const status = isRunning(opts);
   if (!status.running) return false;
   if (!canSignalPid(status.pid, opts)) return false;
-  assertNotSchedulingDaemon(status.pid, "daemon");
 
-  recordLifecycleEvent("stop.daemon", status.pid, opts);
-  try {
-    process.kill(status.pid, "SIGTERM");
-  } catch {
-    // Process may have already exited
-  }
+  signalDaemonPid(status.pid, opts);
 
   // Clean up PID file — the daemon also cleans up on exit,
   // but we do it here as a safety measure
@@ -659,12 +896,22 @@ export function stopDaemon(opts?: DaemonctlPathOptions): boolean {
 export async function restartDaemon(port?: number, opts?: StartOptions): Promise<{ pid: number; port: number }> {
   const currentPort = port ?? readControlPlanePort(opts);
 
-  const runningStatus = isRunning(opts);
-  if (runningStatus.running) {
-    recordLifecycleEvent("restart.daemon", runningStatus.pid ?? null, opts);
-    stopDaemon(opts);
-    // Brief pause to let the port be released and process fully exit
-    await new Promise((resolve) => setTimeout(resolve, 500));
+  // Takeover stop resolves by socket identity → verified port holder →
+  // pidfile, so a daemon that lost its pidfile is still replaced instead of
+  // collided with. It also waits (bounded) for the exact pid to exit and the
+  // control port to free before startDaemon() binds again.
+  let stopResult: TakeoverResult;
+  try {
+    stopResult = await stopDaemonTakeover(opts);
+  } catch (err) {
+    if (!isIsolationViolation(err)) throw err;
+    stopResult = { stopped: false, escalated: false, portFree: false };
+  }
+  if (stopResult.pid !== undefined) {
+    recordLifecycleEvent("restart.daemon", stopResult.pid, opts, {
+      escalated: stopResult.escalated,
+      portFree: stopResult.portFree,
+    });
   }
 
   if (opts) {
@@ -672,6 +919,690 @@ export async function restartDaemon(port?: number, opts?: StartOptions): Promise
   }
   return startDaemon(currentPort);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// DPID takeover — find and replace a live daemon that has no pidfile
+// ═══════════════════════════════════════════════════════════════════
+//
+// The historical defect: a daemon that lost the control-port bind race
+// unlinked the pidfile (which held the LIVE daemon's pid) on its way out,
+// leaving a running daemon with no pidfile. `daemon status` then said "not
+// running" and restart/update spawned colliding daemons instead of replacing
+// it. Resolution below never depends on the pidfile: it prefers the identity
+// socket, then the TCP port holder, and only then the pidfile hint.
+
+/** How a live daemon was discovered. */
+export type LiveServiceSource = "socket" | "port-holder" | "pidfile";
+
+/** A live Tamandua service located by {@link resolveLiveDaemon}. */
+export interface LiveService {
+  service: ServiceKind;
+  pid: number;
+  /** TCP port the service is relevant on (control port for the daemon). */
+  port: number;
+  source: LiveServiceSource;
+  /** Build version — only known from the identity socket. */
+  buildVersion?: string;
+  /** ISO start time — only known from the identity socket. */
+  startedAt?: string;
+}
+
+/** Outcome of a {@link stopDaemonTakeover} attempt. */
+export interface TakeoverResult {
+  /** True when a resolved service died as a result of the takeover. */
+  stopped: boolean;
+  /** The pid that was resolved and signalled, when one was found. */
+  pid?: number;
+  /** True when SIGTERM did not suffice and SIGKILL was sent. */
+  escalated: boolean;
+  /** True only once the control port stopped accepting TCP connections. */
+  portFree: boolean;
+  /**
+   * A Tamandua daemon discovered on the configured control port that belongs
+   * to a DIFFERENT state dir (DPID scoping). Present only when nothing of ours
+   * was resolved and a foreign holder was proven; it is never signalled.
+   */
+  foreignHolder?: ForeignDaemonHolder | null;
+}
+
+/** Default SIGTERM → SIGKILL grace window (TAMANDUA_TAKEOVER_GRACE_MS). */
+export const DEFAULT_TAKEOVER_GRACE_MS = 15_000;
+const TAKEOVER_POLL_MS = 100;
+const TAKEOVER_KILL_WAIT_MS = 2_000;
+const TAKEOVER_PORT_VERIFY_TIMEOUT_MS = 5_000;
+
+/** What a live `/control/health` probe reports about the serving daemon. */
+export interface ControlPlaneHealthInfo {
+  /** Serving pid, when advertised. */
+  pid: number | null;
+  /** Serving process's effective state dir, when advertised. */
+  stateDir: string | null;
+}
+
+/**
+ * Options for {@link resolveLiveDaemon} / {@link stopDaemonTakeover}.
+ *
+ * Extends the usual path options with injectable probes so unit tests can
+ * exercise both platform formats and every resolution branch without spawning
+ * `ss`/`lsof`/`ps` or touching a real process.
+ */
+export interface ResolveLiveDaemonOptions extends DaemonctlPathOptions {
+  /**
+   * Explicit control-plane port override. When set, liveness resolution
+   * inspects ONLY this port — the control-plane port file is never read, so a
+   * `start --port N` check and its bind target cannot disagree.
+   */
+  port?: number;
+  /** Identity-socket probe override (default: probeIdentitySocket). */
+  probeSocket?: (socketPath: string, timeoutMs?: number) => Promise<DaemonIdentity | null>;
+  /** Port-holder resolver options (default: real ss/lsof + proc-info). */
+  holder?: ServiceHolderOptions;
+  /** Home-binding guard override (default: canSignalPid). */
+  canSignal?: (pid: number, opts?: DaemonctlPathOptions) => boolean;
+  /** Pidfile probe override (default: checkPidFile — kill(0) liveness). */
+  checkPid?: (pidFile: string) => { running: true; pid: number } | { running: false };
+  /**
+   * `/control/health` probe override for the CONFIGURED control port (default:
+   * a bounded HTTP GET). Returns null when the endpoint does not answer, so
+   * "no evidence" stays distinct from a state-dir mismatch.
+   */
+  probeHealth?: (port: number) => Promise<ControlPlaneHealthInfo | null>;
+}
+
+/** A Tamandua daemon holding the configured port that is NOT ours. */
+export interface ForeignDaemonHolder {
+  /** Pid holding the configured port. */
+  pid: number;
+  /** The configured port the holder listens on. */
+  port: number;
+  /** State dir the holder reported via `/control/health`. */
+  stateDir: string;
+}
+
+/** Full outcome of {@link resolveLiveDaemonDetailed}. */
+export interface LiveDaemonResolution {
+  /** Our live daemon, or null when none belongs to the effective config. */
+  live: LiveService | null;
+  /**
+   * A Tamandua daemon holding the configured port that proved it belongs to a
+   * DIFFERENT state dir. Distinct from `live: null, foreignHolder: null`,
+   * where nothing verified was found at all.
+   */
+  foreignHolder: ForeignDaemonHolder | null;
+}
+
+/** Injectable process/time/filesystem dependencies for {@link stopDaemonTakeover}. */
+export interface TakeoverStopDeps {
+  /** Signal sender (default: process.kill). */
+  kill?: (pid: number, signal: NodeJS.Signals) => void;
+  /** Liveness probe (default: kill(pid, 0)). */
+  isAlive?: (pid: number) => boolean;
+  /** Sleep primitive (default: setTimeout). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Monotonic-ish clock (default: Date.now). */
+  now?: () => number;
+  /** Resolver override (default: resolveLiveDaemon). */
+  resolve?: (opts?: ResolveLiveDaemonOptions) => Promise<LiveService | null>;
+  /**
+   * Detailed resolver override. When set (and `resolve` is not), the foreign
+   * holder a detailed resolution surfaces is carried on the result instead of
+   * being dropped, so `stop` can report a foreign daemon it never signals.
+   */
+  resolveDetailed?: (opts?: ResolveLiveDaemonOptions) => Promise<LiveDaemonResolution>;
+  /** TCP connect probe (default: isTcpPortOpen). */
+  isPortOpen?: (port: number, timeoutMs?: number) => Promise<boolean>;
+  /** Best-effort unlink (default: fs.unlinkSync). */
+  unlink?: (file: string) => void;
+  /** Grace override; takes precedence over TAMANDUA_TAKEOVER_GRACE_MS. */
+  graceMs?: number;
+  /** Poll interval for the liveness/port loops. */
+  pollMs?: number;
+  /** Bounded wait after SIGKILL (default 2 s). */
+  killWaitMs?: number;
+  /** Bounded wait for the control port to free (default 5 s). */
+  portVerifyTimeoutMs?: number;
+}
+
+/** Resolve the takeover grace window (dept override → env → 15 s default). */
+export function readTakeoverGraceMs(override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override) && override > 0) {
+    return override;
+  }
+  const fromEnv = Number(process.env.TAMANDUA_TAKEOVER_GRACE_MS ?? "");
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return DEFAULT_TAKEOVER_GRACE_MS;
+}
+
+/** kill(pid, 0) liveness probe. */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Best-effort unlink that never throws. */
+function unlinkBestEffort(file: string): void {
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    // Already gone / not allowed — best effort.
+  }
+}
+
+/**
+ * Resolve a live daemon without trusting the pidfile, surfacing foreign holders.
+ *
+ * Order (mirrors the DPID contract):
+ *  (a) probe `<state>/daemon.sock` — authoritative live identity (pid, build,
+ *      control port, startedAt);
+ *  (b) else the holder of the CONFIGURED control port — `opts.port` when given,
+ *      else the control-plane port file — verified as a Tamandua daemon via
+ *      its command line. `/control/health` on that same port then proves which
+ *      state dir it serves: an equal state dir accepts the holder; a different
+ *      one classifies it as a foreign candidate and yields no live service;
+ *  (c) else the pidfile hint, accepted only when the pid is alive AND verifies
+ *      as a Tamandua daemon.
+ *
+ * ONLY the configured control port is ever inspected — a Tamandua daemon on
+ * any other port is invisible here. Every non-socket candidate must also be
+ * within the effective state dir when `/control/health` cannot prove
+ * ownership (`canSignalPid`), so a different state dir can never be adopted.
+ */
+export async function resolveLiveDaemonDetailed(
+  opts?: ResolveLiveDaemonOptions,
+): Promise<LiveDaemonResolution> {
+  const probeSocket = opts?.probeSocket ?? probeIdentitySocket;
+  const canSignal = opts?.canSignal ?? canSignalPid;
+  const holderOptions: ServiceHolderOptions = opts?.holder ?? {};
+  const checkPid = opts?.checkPid ?? checkPidFile;
+  const readCmdline = holderOptions.getCmdline ?? getCmdline;
+  const probeHealth = opts?.probeHealth ?? probeControlPlaneHealthInfo;
+
+  // (a) Identity socket — the authoritative liveness primitive. An identity
+  // advertising a DIFFERENT state dir is not ours (DPID scoping), so it is
+  // treated as absent and resolution falls through to the port holder.
+  const identity = await probeSocket(getServiceSocketPath("daemon", opts));
+  if (identity && identityBelongsToEffectiveStateDir(identity, opts)) {
+    return {
+      live: {
+        service: "daemon",
+        pid: identity.pid,
+        port: identity.controlPort,
+        source: "socket",
+        buildVersion: identity.buildVersion,
+        startedAt: identity.startedAt,
+      },
+      foreignHolder: null,
+    };
+  }
+
+  // The one and only port inspected: an explicit override wins over the file.
+  const port = opts?.port ?? readControlPlanePort(opts);
+  const effectiveStateDir = path.resolve(resolveStateDir(opts));
+
+  // (b) TCP port holder, verified as a Tamandua daemon.
+  const holder = resolvePortHolder(port, "daemon", holderOptions);
+  if (holder) {
+    // Ask the holder's /control/health (same configured port) which state dir
+    // it serves. A reported mismatch proves a foreign daemon; a match accepts
+    // the cmdline-verified holder.
+    let health: ControlPlaneHealthInfo | null = null;
+    try {
+      health = await probeHealth(port);
+    } catch {
+      health = null;
+    }
+    if (health && health.stateDir !== null && health.stateDir !== "") {
+      if (path.resolve(health.stateDir) !== effectiveStateDir) {
+        return {
+          live: null,
+          foreignHolder: { pid: holder.pid, port, stateDir: health.stateDir },
+        };
+      }
+      return {
+        live: { service: "daemon", pid: holder.pid, port, source: "port-holder" },
+        foreignHolder: null,
+      };
+    }
+    // No health evidence: fall back to the effective-state-dir process guard
+    // (US-003). A verified holder failing the guard is never adopted; without
+    // advertised state-dir evidence it is not claimed to be foreign either.
+    if (!canSignal(holder.pid, opts)) return { live: null, foreignHolder: null };
+    return {
+      live: { service: "daemon", pid: holder.pid, port, source: "port-holder" },
+      foreignHolder: null,
+    };
+  }
+
+  // (c) Pidfile hint — alive, verified Tamandua daemon, within this home.
+  const status = checkPid(getPidFile(opts));
+  if (status.running) {
+    const cmdline = readCmdline(status.pid);
+    if (isTamanduaServiceCmdline(cmdline, "daemon") && canSignal(status.pid, opts)) {
+      return {
+        live: { service: "daemon", pid: status.pid, port, source: "pidfile" },
+        foreignHolder: null,
+      };
+    }
+  }
+
+  return { live: null, foreignHolder: null };
+}
+
+/**
+ * Resolve a live daemon without trusting the pidfile.
+ *
+ * Thin wrapper over {@link resolveLiveDaemonDetailed} that returns only our
+ * live service (a foreign holder is dropped). Callers that must report a
+ * foreign daemon use the detailed resolver.
+ */
+export async function resolveLiveDaemon(
+  opts?: ResolveLiveDaemonOptions,
+): Promise<LiveService | null> {
+  return (await resolveLiveDaemonDetailed(opts)).live;
+}
+
+/**
+ * Shared socket → port-holder → pidfile resolution for one Tamandua service.
+ *
+ *  (a) probe the service identity socket — authoritative live identity;
+ *  (b) else the TCP holder of `port`, verified as `service` via cmdline;
+ *  (c) else the pidfile hint, accepted only when alive AND verified.
+ *
+ * Every non-socket candidate must be within the requested home when
+ * `opts.homeDir` is set (`canSignalPid`). A verified holder outside the home
+ * yields `null` rather than falling through to a possibly-unrelated pidfile.
+ */
+async function resolveLiveService(
+  service: ServiceKind,
+  port: number,
+  pidFile: string,
+  opts?: ResolveLiveDaemonOptions,
+): Promise<LiveService | null> {
+  const probeSocket = opts?.probeSocket ?? probeIdentitySocket;
+  const canSignal = opts?.canSignal ?? canSignalPid;
+  const holderOptions: ServiceHolderOptions = opts?.holder ?? {};
+  const checkPid = opts?.checkPid ?? checkPidFile;
+  const readCmdline = holderOptions.getCmdline ?? getCmdline;
+
+  // (a) Identity socket — the authoritative liveness primitive. A payload
+  // advertising a different state dir is not ours; fall through to the scoped
+  // port-holder / pidfile stages.
+  const identity = await probeSocket(getServiceSocketPath(service, opts));
+  if (identity && identityBelongsToEffectiveStateDir(identity, opts)) {
+    return {
+      service,
+      pid: identity.pid,
+      port: identity.controlPort,
+      source: "socket",
+      buildVersion: identity.buildVersion,
+      startedAt: identity.startedAt,
+    };
+  }
+
+  // (b) TCP port holder, verified as this Tamandua service.
+  const holder = resolvePortHolder(port, service, holderOptions);
+  if (holder) {
+    if (!canSignal(holder.pid, opts)) return null; // verified but outside this home
+    return { service, pid: holder.pid, port, source: "port-holder" };
+  }
+
+  // (c) Pidfile hint — alive, verified Tamandua service, within this home.
+  const status = checkPid(pidFile);
+  if (status.running) {
+    const cmdline = readCmdline(status.pid);
+    if (isTamanduaServiceCmdline(cmdline, service) && canSignal(status.pid, opts)) {
+      return { service, pid: status.pid, port, source: "pidfile" };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolve a live standalone dashboard without trusting the pidfile.
+ *
+ * The dashboard has no identity socket yet, so the practical path is the
+ * verified holder of `readPort(opts)` (default 3334); the pidfile remains a
+ * fallback hint. Under the test guard without an explicit `homeDir` resolution
+ * is skipped entirely (never adopt a production dashboard).
+ */
+export async function resolveLiveDashboard(
+  opts?: ResolveLiveDaemonOptions,
+): Promise<LiveService | null> {
+  if (!opts?.homeDir && testGuardActive()) return null;
+  try {
+    const port = readPort(opts);
+    return await resolveLiveService("dashboard", port, getDashboardPidFile(opts), opts);
+  } catch (err) {
+    if (isIsolationViolation(err)) return null;
+    throw err;
+  }
+}
+
+/**
+ * Resolve a live MCP server without trusting the pidfile.
+ *
+ * A `daemon.js` holder is accepted (the daemon hosts MCP in-process with
+ * `--with-mcp`), which is exactly what `isTamanduaServiceCmdline(_, "mcp")`
+ * already permits. Under the test guard without an explicit `homeDir`
+ * resolution is skipped entirely.
+ */
+export async function resolveLiveMcp(
+  opts?: ResolveLiveDaemonOptions,
+): Promise<LiveService | null> {
+  if (!opts?.homeDir && testGuardActive()) return null;
+  try {
+    const port = readMcpPort(opts);
+    return await resolveLiveService("mcp", port, getMcpPidFile(opts), opts);
+  } catch (err) {
+    if (isIsolationViolation(err)) return null;
+    throw err;
+  }
+}
+
+/**
+ * Resolve a live daemon that {@link startDaemon} must not collide with.
+ *
+ * Unlike {@link resolveLiveDaemon} this checks the identity socket and the
+ * holder of the *requested* control port (the caller's argument), not the
+ * port file, and never falls through to a pidfile (the caller already checked
+ * it). Returns null when nothing verified — including when the test-isolation
+ * guard blocks production path resolution.
+ */
+async function resolveLiveDaemonForStart(
+  controlPort: number,
+  opts?: ResolveLiveDaemonOptions,
+): Promise<LiveService | null> {
+  // (a) Identity socket — authoritative when it answers.
+  let identity: DaemonIdentity | null = null;
+  try {
+    identity = await (opts?.probeSocket ?? probeIdentitySocket)(
+      getServiceSocketPath("daemon", opts),
+    );
+  } catch (err) {
+    if (isIsolationViolation(err)) return null;
+    throw err;
+  }
+  if (identity && identityBelongsToEffectiveStateDir(identity, opts)) {
+    return {
+      service: "daemon",
+      pid: identity.pid,
+      port: identity.controlPort,
+      source: "socket",
+      buildVersion: identity.buildVersion,
+      startedAt: identity.startedAt,
+    };
+  }
+
+  // (b) Verified holder of the requested control port. Skipped under the guard
+  // without an explicit homeDir so a test can never adopt a production daemon
+  // listening on the same (default) port.
+  if (!opts?.homeDir && testGuardActive()) return null;
+  const canSignal = opts?.canSignal ?? canSignalPid;
+  let holder: { pid: number; cmdline: string } | null;
+  try {
+    holder = resolvePortHolder(controlPort, "daemon", opts?.holder ?? {});
+  } catch (err) {
+    if (isIsolationViolation(err)) return null;
+    throw err;
+  }
+  if (!holder) return null;
+  if (!canSignal(holder.pid, opts)) return null;
+  return { service: "daemon", pid: holder.pid, port: controlPort, source: "port-holder" };
+}
+
+/** Poll `isAlive` until it reports dead, the deadline passes, or attempts cap. */
+async function waitForPidExit(
+  pid: number,
+  timeoutMs: number,
+  deps: {
+    isAlive: (pid: number) => boolean;
+    sleep: (ms: number) => Promise<void>;
+    now: () => number;
+    pollMs: number;
+  },
+): Promise<void> {
+  const deadline = deps.now() + timeoutMs;
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / Math.max(1, deps.pollMs)) + 1);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (!deps.isAlive(pid)) return;
+    if (deps.now() >= deadline) return;
+    await deps.sleep(deps.pollMs);
+  }
+}
+
+/** Poll the TCP connect probe until the port is free or the deadline passes. */
+async function waitForPortFree(
+  port: number,
+  timeoutMs: number,
+  deps: {
+    isPortOpen: (port: number, timeoutMs?: number) => Promise<boolean>;
+    sleep: (ms: number) => Promise<void>;
+    now: () => number;
+    pollMs: number;
+  },
+): Promise<boolean> {
+  const deadline = deps.now() + timeoutMs;
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / Math.max(1, deps.pollMs)) + 1);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (!(await deps.isPortOpen(port, 300))) return true;
+    if (deps.now() >= deadline) break;
+    await deps.sleep(deps.pollMs);
+  }
+  return !(await deps.isPortOpen(port, 300));
+}
+
+/** Internal description of one service's takeover stop (DPID). */
+interface TakeoverServiceSpec {
+  /** Human label used by assertNotSchedulingDaemon diagnostics. */
+  label: string;
+  /** Lifecycle breadcrumb action, e.g. `takeover.daemon`. */
+  event: string;
+  /** Resolver for the live service (per-service defaults in the wrappers). */
+  resolve: (opts?: ResolveLiveDaemonOptions) => Promise<LiveService | null>;
+  /**
+   * Optional detailed resolver. When present (and no explicit `deps.resolve`),
+   * resolution goes through it so a proven foreign holder is carried on the
+   * result rather than silently dropped.
+   */
+  resolveDetailed?: (opts?: ResolveLiveDaemonOptions) => Promise<LiveDaemonResolution>;
+  /** Identity socket path (lazy: evaluation may hit the isolation guard). */
+  socketPath: (opts?: DaemonctlPathOptions) => string;
+  /** Informational pidfile path (lazy). */
+  pidFile: (opts?: DaemonctlPathOptions) => string;
+}
+
+/**
+ * Stop the live service described by `spec` by identity: SIGTERM the exact
+ * resolved pid, wait up to the grace window, SIGKILL when it survives, then
+ * verify its TCP port is free. The stale identity socket/pidfile are unlinked
+ * only AFTER the pid is gone, so a live owner's files are never removed.
+ *
+ * Refuses — via {@link assertNotSchedulingDaemon} — to stop the daemon that is
+ * scheduling the current agent, and never signals a pid that failed
+ * verification (resolution only returns verified services).
+ *
+ * All process/time/filesystem primitives are injectable so unit tests need no
+ * real processes and no 15 s wait.
+ */
+async function stopServiceTakeover(
+  spec: TakeoverServiceSpec,
+  opts?: ResolveLiveDaemonOptions,
+  deps?: TakeoverStopDeps,
+): Promise<TakeoverResult> {
+  const kill = deps?.kill ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+  const isAlive = deps?.isAlive ?? isPidAlive;
+  const sleepFn = deps?.sleep ?? sleep;
+  const now = deps?.now ?? Date.now;
+  const isPortOpen = deps?.isPortOpen ?? isTcpPortOpen;
+  const unlink = deps?.unlink ?? unlinkBestEffort;
+  const pollMs = deps?.pollMs ?? TAKEOVER_POLL_MS;
+  const graceMs = readTakeoverGraceMs(deps?.graceMs);
+  const killWaitMs = deps?.killWaitMs ?? TAKEOVER_KILL_WAIT_MS;
+  const portVerifyTimeoutMs = deps?.portVerifyTimeoutMs ?? TAKEOVER_PORT_VERIFY_TIMEOUT_MS;
+
+  // Prefer an explicit resolver override; otherwise use a detailed resolver
+  // when one is available so a proven foreign holder is not silently dropped.
+  const explicitResolve = deps?.resolve;
+  const detailedResolve = deps?.resolveDetailed ?? (explicitResolve ? undefined : spec.resolveDetailed);
+  let live: LiveService | null;
+  let foreignHolder: ForeignDaemonHolder | null = null;
+  if (explicitResolve) {
+    live = await explicitResolve(opts);
+  } else if (detailedResolve) {
+    const resolution = await detailedResolve(opts);
+    live = resolution.live;
+    foreignHolder = resolution.foreignHolder;
+  } else {
+    live = await spec.resolve(opts);
+  }
+
+  if (!live) {
+    // Nothing resolved: nothing to stop and no port we can claim is held. A
+    // proven foreign holder is surfaced (never signalled) so the CLI can say
+    // which daemon on the configured port belongs to another state dir.
+    if (foreignHolder) {
+      return { stopped: false, escalated: false, portFree: true, foreignHolder };
+    }
+    return { stopped: false, escalated: false, portFree: true };
+  }
+
+  assertNotSchedulingDaemon(live.pid, spec.label);
+  recordLifecycleEvent(spec.event, live.pid, opts, {
+    source: live.source,
+    port: live.port,
+    buildVersion: live.buildVersion,
+  });
+
+  let escalated = false;
+  try {
+    kill(live.pid, "SIGTERM");
+  } catch {
+    // Process may have already exited.
+  }
+
+  await waitForPidExit(live.pid, graceMs, { isAlive, sleep: sleepFn, now, pollMs });
+
+  if (isAlive(live.pid)) {
+    escalated = true;
+    try {
+      kill(live.pid, "SIGKILL");
+    } catch {
+      // Already gone between the check and the signal.
+    }
+    await waitForPidExit(live.pid, killWaitMs, { isAlive, sleep: sleepFn, now, pollMs });
+  }
+
+  const portFree = await waitForPortFree(live.port, portVerifyTimeoutMs, {
+    isPortOpen,
+    sleep: sleepFn,
+    now,
+    pollMs,
+  });
+
+  const stopped = !isAlive(live.pid);
+  if (stopped) {
+    // Only after the owner pid is gone: unlink the now-stale socket + pidfile.
+    try {
+      unlink(spec.socketPath(opts));
+      unlink(spec.pidFile(opts));
+    } catch {
+      // Path resolution must never turn a successful stop into a failure.
+    }
+  }
+
+  return { stopped, pid: live.pid, escalated, portFree };
+}
+
+/**
+ * Stop the live daemon by identity (socket → verified control-port holder →
+ * pidfile), escalating SIGTERM → SIGKILL → control-port-free verification.
+ */
+export async function stopDaemonTakeover(
+  opts?: ResolveLiveDaemonOptions,
+  deps?: TakeoverStopDeps,
+): Promise<TakeoverResult> {
+  return stopServiceTakeover(
+    {
+      label: "daemon",
+      event: "takeover.daemon",
+      resolve: deps?.resolve ?? resolveLiveDaemon,
+      // Keep the foreign holder a detailed resolution proves (never signalled).
+      resolveDetailed: resolveLiveDaemonDetailed,
+      socketPath: (o) => getServiceSocketPath("daemon", o),
+      pidFile: (o) => getPidFile(o),
+    },
+    opts,
+    deps,
+  );
+}
+
+/**
+ * Stop the live standalone dashboard by identity (identity socket if present,
+ * else the verified holder of the dashboard port), escalating SIGTERM →
+ * SIGKILL → port-free verification. This lets update/restart replace a
+ * dashboard whose pidfile is gone or that ignores HTTP.
+ */
+export async function stopDashboardTakeover(
+  opts?: ResolveLiveDaemonOptions,
+  deps?: TakeoverStopDeps,
+): Promise<TakeoverResult> {
+  return stopServiceTakeover(
+    {
+      label: "dashboard server",
+      event: "takeover.dashboard",
+      resolve: deps?.resolve ?? resolveLiveDashboard,
+      socketPath: (o) => getServiceSocketPath("dashboard", o),
+      pidFile: (o) => getDashboardPidFile(o),
+    },
+    opts,
+    deps,
+  );
+}
+
+/**
+ * Stop the live MCP server by identity (identity socket if present, else the
+ * verified holder of the MCP port — a daemon.js holder counts because the
+ * daemon hosts MCP in-process), escalating SIGTERM → SIGKILL → port-free.
+ */
+export async function stopMcpTakeover(
+  opts?: ResolveLiveDaemonOptions,
+  deps?: TakeoverStopDeps,
+): Promise<TakeoverResult> {
+  return stopServiceTakeover(
+    {
+      label: "MCP server",
+      event: "takeover.mcp",
+      resolve: deps?.resolve ?? resolveLiveMcp,
+      socketPath: (o) => getServiceSocketPath("mcp", o),
+      pidFile: (o) => getMcpPidFile(o),
+    },
+    opts,
+    deps,
+  );
+}
+
+/**
+ * Async daemon stop used by `tamandua daemon stop` and update: the takeover
+ * stop (SIGTERM the exact verified pid → bounded grace → SIGKILL → port-free
+ * verification), so a daemon that lost its pidfile or ignores HTTP/IPC is
+ * still replaced. Alias of {@link stopDaemonTakeover}.
+ */
+export const stopDaemonAsync = stopDaemonTakeover;
+
+/**
+ * Async dashboard stop alias used by update (takeover-aware).
+ */
+export const stopDashboardAsync = stopDashboardTakeover;
+
+/**
+ * Async MCP stop alias used by update (takeover-aware).
+ */
+export const stopMcpAsync = stopMcpTakeover;
 
 // ═══════════════════════════════════════════════════════════════════
 // MCP standalone lifecycle management
@@ -729,20 +1660,28 @@ export function writeMcpPort(port: number, opts?: DaemonctlPathOptions): void {
 
 /**
  * Check if the standalone MCP server is running.
- * Uses the MCP PID file and kill(0) for existence check.
+ *
+ * Keeps the pidfile as a fast path (and informational hint), then falls back to
+ * the verified holder of the MCP port so an MCP server that lost its pidfile is
+ * still reported running (DPID takeover). A `daemon.js` holder counts: the
+ * daemon hosts MCP in-process.
  */
 export function isMcpRunning(opts?: DaemonctlPathOptions): { running: true; pid: number } | { running: false } {
-  if (!opts?.homeDir) {
-    try {
-      return checkPidFile(getMcpPidFile(opts));
-    } catch (err) {
-      if (err instanceof Error && err.message.includes("TEST ISOLATION VIOLATION")) {
-        return { running: false };
-      }
-      throw err;
-    }
+  let pidFile: string;
+  try {
+    pidFile = getMcpPidFile(opts);
+  } catch (err) {
+    if (isIsolationViolation(err)) return { running: false };
+    throw err;
   }
-  return checkPidFile(getMcpPidFile(opts));
+
+  const fromPidFile = checkPidFile(pidFile);
+  if (fromPidFile.running) return fromPidFile;
+
+  const holderPid = resolveMcpPortHolder(opts);
+  if (holderPid !== null) return { running: true, pid: holderPid };
+
+  return { running: false };
 }
 
 /**
@@ -814,6 +1753,9 @@ export async function startMcp(port?: number, opts?: StartOptions): Promise<{ pi
   const mcpEnv: Record<string, string> = {};
   if (opts?.homeDir) {
     mcpEnv.HOME = opts.homeDir;
+    // Keep the child's effective state dir pinned to the parent's (see
+    // startDaemon for the TAMANDUA_STATE_DIR precedence rationale).
+    mcpEnv.TAMANDUA_STATE_DIR = resolveStateDir(opts);
   }
   const spawnOpts: Parameters<typeof spawn>[2] = {
     detached: true,
@@ -873,19 +1815,29 @@ export async function startMcp(port?: number, opts?: StartOptions): Promise<{ pi
 /**
  * Restart the standalone MCP server.
  *
- * If the MCP server is currently running, stops it first, then starts a new
- * server on the previously configured port (or the port argument).
- * If no MCP server is running, starts one on the given port (default DEFAULT_MCP_PORT=3338).
+ * Takeover-aware: the running MCP server is resolved by identity socket → the
+ * verified holder of the MCP port → pidfile, stopped with SIGTERM → bounded
+ * grace → SIGKILL → port-free verification, then a new server is started on the
+ * previously configured port (or the port argument). If no MCP server is
+ * running, starts one on the given port (default DEFAULT_MCP_PORT=3338).
  *
  * Returns { pid, port } like startMcp.
  */
 export async function restartMcp(port?: number, opts?: StartOptions): Promise<{ pid: number; port: number }> {
   const currentPort = port ?? readMcpPort(opts);
 
-  if (isMcpRunning(opts).running) {
-    stopMcp(opts);
-    // Brief pause to let the port be released and process fully exit
-    await new Promise((resolve) => setTimeout(resolve, 500));
+  let stopResult: TakeoverResult;
+  try {
+    stopResult = await stopMcpTakeover(opts);
+  } catch (err) {
+    if (!isIsolationViolation(err)) throw err;
+    stopResult = { stopped: false, escalated: false, portFree: false };
+  }
+  if (stopResult.pid !== undefined) {
+    recordLifecycleEvent("restart.mcp", stopResult.pid, opts, {
+      escalated: stopResult.escalated,
+      portFree: stopResult.portFree,
+    });
   }
 
   if (opts) {
@@ -986,7 +1938,13 @@ async function isTcpPortOpen(port: number, timeoutMs = 500): Promise<boolean> {
   });
 }
 
-async function fetchControlPlaneHealth(port: number, timeoutMs = 1000): Promise<{ healthy: true; pid: number | null } | { healthy: false; status?: number }> {
+async function fetchControlPlaneHealth(
+  port: number,
+  timeoutMs = 1000,
+): Promise<
+  | { healthy: true; pid: number | null; stateDir: string | null }
+  | { healthy: false; status?: number }
+> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -995,20 +1953,39 @@ async function fetchControlPlaneHealth(port: number, timeoutMs = 1000): Promise<
     });
     if (!res.ok) return { healthy: false, status: res.status };
     let pid: number | null = null;
+    let stateDir: string | null = null;
     try {
-      const body = await res.json() as { pid?: unknown };
+      const body = await res.json() as { pid?: unknown; stateDir?: unknown };
       if (typeof body.pid === "number" && Number.isFinite(body.pid) && body.pid > 0) {
         pid = body.pid;
+      }
+      if (typeof body.stateDir === "string" && body.stateDir.trim() !== "") {
+        stateDir = body.stateDir.trim();
       }
     } catch {
       // Treat a 2xx health response as healthy even if the body is malformed.
     }
-    return { healthy: true, pid };
+    return { healthy: true, pid, stateDir };
   } catch {
     return { healthy: false };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * Probe `/control/health` on `port` for the daemon's own state-dir claim.
+ *
+ * Returns null when the endpoint does not answer (or answers non-2xx), so a
+ * caller can distinguish "no evidence" from a reported state-dir mismatch.
+ */
+async function probeControlPlaneHealthInfo(
+  port: number,
+  timeoutMs = 1000,
+): Promise<ControlPlaneHealthInfo | null> {
+  const health = await fetchControlPlaneHealth(port, timeoutMs);
+  if (!health.healthy) return null;
+  return { pid: health.pid, stateDir: health.stateDir };
 }
 
 /** Probe the MCP server's HTTP endpoint to verify it is alive.
@@ -1269,6 +2246,9 @@ export async function startControlPlane(port?: number, opts?: StartOptions): Pro
   const cpEnv: Record<string, string> = {};
   if (opts?.homeDir) {
     cpEnv.HOME = opts.homeDir;
+    // Keep the child's effective state dir pinned to the parent's (see
+    // startDaemon for the TAMANDUA_STATE_DIR precedence rationale).
+    cpEnv.TAMANDUA_STATE_DIR = resolveStateDir(opts);
   }
   const spawnOpts: Parameters<typeof spawn>[2] = {
     detached: true,
@@ -1432,20 +2412,27 @@ export function getDashboardLogFile(opts?: DaemonctlPathOptions): string {
 
 /**
  * Check if the standalone dashboard server is running.
- * Uses the dashboard PID file and kill(0) for existence check.
+ *
+ * Keeps the pidfile as a fast path (and informational hint), then falls back to
+ * the verified holder of the dashboard port so a dashboard that lost its
+ * pidfile is still reported running (DPID takeover).
  */
 export function isDashboardRunning(opts?: DaemonctlPathOptions): { running: true; pid: number } | { running: false } {
-  if (!opts?.homeDir) {
-    try {
-      return checkPidFile(getDashboardPidFile(opts));
-    } catch (err) {
-      if (err instanceof Error && err.message.includes("TEST ISOLATION VIOLATION")) {
-        return { running: false };
-      }
-      throw err;
-    }
+  let pidFile: string;
+  try {
+    pidFile = getDashboardPidFile(opts);
+  } catch (err) {
+    if (isIsolationViolation(err)) return { running: false };
+    throw err;
   }
-  return checkPidFile(getDashboardPidFile(opts));
+
+  const fromPidFile = checkPidFile(pidFile);
+  if (fromPidFile.running) return fromPidFile;
+
+  const holderPid = resolveDashboardPortHolder(opts);
+  if (holderPid !== null) return { running: true, pid: holderPid };
+
+  return { running: false };
 }
 
 /**
@@ -1510,6 +2497,9 @@ export async function startDashboardStandalone(port?: number, opts?: StartOption
   const dashEnv: Record<string, string> = {};
   if (opts?.homeDir) {
     dashEnv.HOME = opts.homeDir;
+    // Keep the child's effective state dir pinned to the parent's (see
+    // startDaemon for the TAMANDUA_STATE_DIR precedence rationale).
+    dashEnv.TAMANDUA_STATE_DIR = resolveStateDir(opts);
   }
   const spawnOpts: Parameters<typeof spawn>[2] = {
     detached: true,
@@ -1595,19 +2585,29 @@ export function stopDashboardStandalone(opts?: DaemonctlPathOptions): boolean {
 /**
  * Restart the standalone dashboard server.
  *
- * If the dashboard is currently running, stops it first, then starts a new
- * server on the previously configured port (or the port argument).
- * If no dashboard is running, starts one on the given port (default 3334).
+ * Takeover-aware: the running dashboard is resolved by identity socket → the
+ * verified holder of the dashboard port → pidfile, stopped with SIGTERM →
+ * bounded grace → SIGKILL → port-free verification, then a new server is
+ * started on the previously configured port (or the port argument). If no
+ * dashboard is running, starts one on the given port (default 3334).
  *
  * Returns { pid, port } like startDashboardStandalone.
  */
 export async function restartDashboardStandalone(port?: number, opts?: StartOptions): Promise<{ pid: number; port: number }> {
   const currentPort = port ?? readPort(opts);
 
-  if (isDashboardRunning(opts).running) {
-    stopDashboardStandalone(opts);
-    // Brief pause to let the port be released and process fully exit
-    await new Promise((resolve) => setTimeout(resolve, 500));
+  let stopResult: TakeoverResult;
+  try {
+    stopResult = await stopDashboardTakeover(opts);
+  } catch (err) {
+    if (!isIsolationViolation(err)) throw err;
+    stopResult = { stopped: false, escalated: false, portFree: false };
+  }
+  if (stopResult.pid !== undefined) {
+    recordLifecycleEvent("restart.dashboard", stopResult.pid, opts, {
+      escalated: stopResult.escalated,
+      portFree: stopResult.portFree,
+    });
   }
 
   if (opts) {

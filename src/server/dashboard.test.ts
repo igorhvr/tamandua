@@ -729,17 +729,18 @@ describe("dashboard stats API", () => {
 });
 
 describe("dashboard daemon-lifecycle surfacing", () => {
-  // Seed one lifecycle.log entry under a temp HOME. The daemon-lifecycle
-  // reader resolves state via <HOME>/.tamandua/ (daemon-lifecycle.ts
-  // defaultTamanduaDir), so the dashboard tests set HOME to the temp dir.
-  function seedLifecycleEntry(homeDir: string, entry: Record<string, unknown>): void {
-    const log = path.join(homeDir, ".tamandua", "lifecycle.log");
+  // Seed one lifecycle.log entry under the effective state dir. The
+  // daemon-lifecycle reader resolves state via resolveStateDir() (HOME or the
+  // TAMANDUA_STATE_DIR override), and isolateDashboardState() points
+  // TAMANDUA_STATE_DIR at the temp state dir.
+  function seedLifecycleEntry(stateDir: string, entry: Record<string, unknown>): void {
+    const log = path.join(stateDir, "lifecycle.log");
     fs.mkdirSync(path.dirname(log), { recursive: true });
     fs.appendFileSync(log, `${JSON.stringify(entry)}\n`, "utf-8");
   }
 
-  function seedCleanDeath(homeDir: string, ts: string, pid: number, signal = "SIGTERM"): void {
-    seedLifecycleEntry(homeDir, {
+  function seedCleanDeath(stateDir: string, ts: string, pid: number, signal = "SIGTERM"): void {
+    seedLifecycleEntry(stateDir, {
       ts,
       action: "daemon.shutdown",
       targetPid: pid,
@@ -748,8 +749,8 @@ describe("dashboard daemon-lifecycle surfacing", () => {
     });
   }
 
-  function seedUncleanDeath(homeDir: string, ts: string, pid: number): void {
-    seedLifecycleEntry(homeDir, {
+  function seedUncleanDeath(stateDir: string, ts: string, pid: number): void {
+    seedLifecycleEntry(stateDir, {
       ts,
       action: "daemon.uncleanExit",
       targetPid: pid,
@@ -760,8 +761,8 @@ describe("dashboard daemon-lifecycle surfacing", () => {
     });
   }
 
-  const lifecycleSeenPath = (homeDir: string) =>
-    path.join(homeDir, ".tamandua", "lifecycle-seen.json");
+  const lifecycleSeenPath = (stateDir: string) =>
+    path.join(stateDir, "lifecycle-seen.json");
 
   interface HealthBody {
     status: string;
@@ -795,10 +796,10 @@ describe("dashboard daemon-lifecycle surfacing", () => {
   });
 
   it("GET /api/health returns lastDaemonDeath matching a seeded clean death", async () => {
-    const { homeDir, restore } = isolateDashboardState("tamandua-dashboard-dl-");
+    const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-dl-");
 
     const ts = new Date(Date.now() - 60_000).toISOString();
-    seedCleanDeath(homeDir, ts, 4242, "SIGINT");
+    seedCleanDeath(stateDir, ts, 4242, "SIGINT");
 
     const { server, baseUrl } = await startDashboard();
 
@@ -819,10 +820,10 @@ describe("dashboard daemon-lifecycle surfacing", () => {
   });
 
   it("GET /api/health returns unseen=true for a fresh unclean exit and does not modify lifecycle-seen.json", async () => {
-    const { homeDir, restore } = isolateDashboardState("tamandua-dashboard-dl-");
+    const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-dl-");
 
     const ts = new Date(Date.now() - 30_000).toISOString();
-    seedUncleanDeath(homeDir, ts, 5150);
+    seedUncleanDeath(stateDir, ts, 5150);
 
     const { server, baseUrl } = await startDashboard();
 
@@ -839,7 +840,7 @@ describe("dashboard daemon-lifecycle surfacing", () => {
       assert.equal(body.lastDaemonDeath!.unseen, true, "a fresh unclean exit must be unseen");
 
       assert.ok(
-        !fs.existsSync(lifecycleSeenPath(homeDir)),
+        !fs.existsSync(lifecycleSeenPath(stateDir)),
         "dashboard must NOT acknowledge (must not write lifecycle-seen.json)",
       );
     } finally {
@@ -849,12 +850,12 @@ describe("dashboard daemon-lifecycle surfacing", () => {
   });
 
   it("GET /api/health returns unseen=false when lifecycle-seen.json acknowledges the unclean death", async () => {
-    const { homeDir, restore } = isolateDashboardState("tamandua-dashboard-dl-");
+    const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-dl-");
 
     const ts = new Date(Date.now() - 30_000).toISOString();
-    seedUncleanDeath(homeDir, ts, 5150);
-    fs.mkdirSync(path.dirname(lifecycleSeenPath(homeDir)), { recursive: true });
-    fs.writeFileSync(lifecycleSeenPath(homeDir), JSON.stringify({ ts }), "utf-8");
+    seedUncleanDeath(stateDir, ts, 5150);
+    fs.mkdirSync(path.dirname(lifecycleSeenPath(stateDir)), { recursive: true });
+    fs.writeFileSync(lifecycleSeenPath(stateDir), JSON.stringify({ ts }), "utf-8");
 
     const { server, baseUrl } = await startDashboard();
 

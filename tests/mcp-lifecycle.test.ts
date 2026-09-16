@@ -486,8 +486,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       // The async status probe checks the HTTP endpoint on the configured port.
       // After stop cleans up the port file, readMcpPort falls back to the default
       // port (3338), which may have a production MCP. Write an unused port so the
-      // probe correctly reports DOWN.
-      const portDir = path.join(tempEnv.homeDir, ".tamandua");
+      // probe correctly reports DOWN. With TAMANDUA_STATE_DIR set, the CLI's
+      // state files live in the effective state dir (not HOME/.tamandua).
+      const portDir = tempEnv.stateDir;
       fs.mkdirSync(portDir, { recursive: true });
       fs.writeFileSync(path.join(portDir, "mcp-port"), String(unusedPort), "utf-8");
 
@@ -499,7 +500,7 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       await waitForHttpDown(baseUrl);
 
       // Also verify the PID file in the isolated environment is cleaned up
-      const isolatedPidFile = path.join(tempEnv.homeDir, ".tamandua", "mcp.pid");
+      const isolatedPidFile = path.join(tempEnv.stateDir, "mcp.pid");
       assert.equal(
         fs.existsSync(isolatedPidFile),
         false,
@@ -713,8 +714,8 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       TAMANDUA_CONTROL_PORT: String(tempEnv.controlPort),
     };
 
-    // The MCP port file path in the isolated environment
-    const isolatedPortFile = path.join(tempEnv.homeDir, ".tamandua", "mcp-port");
+    // The MCP port file path in the isolated environment (effective state dir)
+    const isolatedPortFile = path.join(tempEnv.stateDir, "mcp-port");
 
     const secondPortHandle = await reservePortHandle();
     const secondPort = secondPortHandle.port;
@@ -735,7 +736,7 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       assert.equal(parseInt(portContent1, 10), mcpPort, `Port file should contain ${mcpPort}, got ${portContent1}`);
 
       // Also verify PID file exists
-      const isolatedPidFile = path.join(tempEnv.homeDir, ".tamandua", "mcp.pid");
+      const isolatedPidFile = path.join(tempEnv.stateDir, "mcp.pid");
       assert.ok(fs.existsSync(isolatedPidFile), "PID file should exist after MCP start");
 
       // Stop MCP
@@ -827,7 +828,7 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       assert.equal(startCmd.code, 0);
 
       // Verify via isMcpRunning() on the isolated PID file
-      const isolatedPidFile = path.join(tempEnv.homeDir, ".tamandua", "mcp.pid");
+      const isolatedPidFile = path.join(tempEnv.stateDir, "mcp.pid");
 
       // Verify the isolated PID file directly.
       assert.ok(fs.existsSync(isolatedPidFile), "PID file should exist in isolated env");

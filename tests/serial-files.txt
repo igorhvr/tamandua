@@ -67,10 +67,12 @@ src/installer/step-ops-verify-each-eligibility.test.ts
 src/installer/worktree-manager.test.ts
 src/lib/proc-info.test.ts
 src/lib/process-start-identity.test.ts
+src/lib/service-holder.test.ts
 src/lib/version-check.test.ts
 src/server/control-client.test.ts
 src/server/control-server-harness-workdir.test.ts
 src/server/control-server.test.ts
+src/server/daemon-bind-race.test.ts
 src/server/daemon-lifecycle.test.ts
 src/server/daemon.test.ts
 src/server/daemonctl-controlplane-restart.test.ts
@@ -82,6 +84,9 @@ src/server/daemonctl-port.test.ts
 src/server/daemonctl-restart.test.ts
 src/server/daemonctl-self-stop-guard.test.ts
 src/server/daemonctl-stop-barrier.test.ts
+src/server/daemonctl-takeover-dashboard-mcp.test.ts
+src/server/daemonctl-takeover-lifecycle.test.ts
+src/server/daemonctl-takeover.test.ts
 src/server/daemonctl.test.ts
 src/server/dashboard.test.ts
 src/server/suite-claim-liveness.test.ts

@@ -1,7 +1,7 @@
 /**
  * Doctor — tamandua one-shot diagnostic tool.
  *
- * Runs grouped health checks (ENVIRONMENT, SERVICES, STALENESS, STATE, LLM PROMPT ADHERENCE)
+ * Runs grouped health checks (ENVIRONMENT, SERVICES, LIVENESS, STALENESS, STATE, LLM PROMPT ADHERENCE)
  * and produces pass/fail output with exact remedy commands for failures.
  * All functions return results rather than printing directly, so the
  * CLI layer handles I/O and tests can assert on data.
@@ -25,8 +25,30 @@ import {
   getLogFile,
   getDashboardLogFile,
   getMcpPidFile,
+  getPidFile,
+  resolveLiveDaemon,
+  startDaemon,
+  stopDaemonTakeover,
 } from "./server/daemonctl.js";
-import type { DaemonctlPathOptions } from "./server/daemonctl.js";
+import type {
+  DaemonctlPathOptions,
+  LiveService,
+  ResolveLiveDaemonOptions,
+  StartOptions,
+  TakeoverResult,
+} from "./server/daemonctl.js";
+import {
+  isTamanduaServiceCmdline,
+  resolvePortHolderPids,
+} from "./lib/service-holder.js";
+import type { ServiceHolderOptions } from "./lib/service-holder.js";
+import {
+  getServiceSocketPath,
+  probeIdentitySocket,
+} from "./server/daemon-identity.js";
+import type { DaemonIdentity } from "./server/daemon-identity.js";
+import { getCmdline } from "./lib/proc-info.js";
+import { testGuardActive } from "./lib/test-guard.js";
 import { getBuildVersion } from "./lib/version.js";
 import { readInstalledCatalogStamp } from "./installer/catalog-version.js";
 import { parseExpectedKeys, parseRunContext } from "./installer/step-ops.js";
@@ -975,6 +997,410 @@ async function runServicesChecks(opts?: DoctorOpts): Promise<DoctorCheckResult[]
   return results;
 }
 
+// ── LIVENESS checks (US-007 / DPID) ────────────────────────────────
+
+/**
+ * Injectable probes for {@link runLivenessChecks}.
+ *
+ * Every field defaults to the real report-only helper, so production code
+ * passes no deps while unit tests can fake process introspection (no spawning,
+ * no real pids) and still exercise the real identity-socket / file paths.
+ */
+export interface LivenessCheckDeps {
+  /** Identity-socket prober (default: probeIdentitySocket). */
+  probeSocket?: (socketPath: string, timeoutMs?: number) => Promise<DaemonIdentity | null>;
+  /** Live-daemon resolver (default: resolveLiveDaemon). */
+  resolveLive?: (opts?: ResolveLiveDaemonOptions) => Promise<LiveService | null>;
+  /** All pids listening on a port, unfiltered (default: resolvePortHolderPids). */
+  listPortHolderPids?: (port: number, opts?: ServiceHolderOptions) => number[];
+  /** Process cmdline reader (default: getCmdline from proc-info). */
+  getCmdline?: (pid: number) => string;
+  /** Pid liveness probe (default: kill(pid, 0) — never signals). */
+  isPidAlive?: (pid: number) => boolean;
+}
+
+/** Default `kill(pid, 0)` liveness probe — a pure existence check. */
+function defaultIsPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read the pid recorded in a pidfile WITHOUT unlinking a stale file.
+ *
+ * Deliberately not daemonctl's `checkPidFile`: that helper removes a stale
+ * pidfile, and doctor must never repair (or delete) anything.
+ */
+function readPidFileHint(pidFile: string): number | null {
+  try {
+    const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run LIVENESS checks: pidfile/socket/port-holder consistency and the running
+ * daemon's build version.
+ *
+ * Report-only by construction — it reads files, probes the identity socket,
+ * resolves the control-port holder's command line, and compares build strings.
+ * It never signals a pid, unlinks a stale file, or performs a takeover; the
+ * remedies it prints are commands for the operator. `tamandua doctor --repair`
+ * (a separate, explicitly-requested path) owns the repair actions.
+ *
+ * This is what makes the wedged-daemon state visible: a live daemon that lost
+ * its pidfile (or left a stale socket, or runs an older build) is reported
+ * instead of silently showing "not running".
+ */
+export async function runLivenessChecks(
+  opts?: DoctorOpts,
+  deps?: LivenessCheckDeps,
+): Promise<DoctorCheckResult[]> {
+  const dctlOpts: DaemonctlPathOptions | undefined = opts?.homeDir ? { homeDir: opts.homeDir } : undefined;
+  const probeSocket = deps?.probeSocket ?? probeIdentitySocket;
+  const resolveLive = deps?.resolveLive ?? resolveLiveDaemon;
+  const listPortHolderPids = deps?.listPortHolderPids ?? resolvePortHolderPids;
+  const readCmdline = deps?.getCmdline ?? getCmdline;
+  const isPidAlive = deps?.isPidAlive ?? defaultIsPidAlive;
+
+  const localVersion = getBuildVersion();
+  const pidFile = getPidFile(dctlOpts);
+  const socketPath = getServiceSocketPath("daemon", dctlOpts);
+
+  // Under the test-isolation guard without an explicit homeDir, never let the
+  // port-holder/pidfile fallbacks adopt production state (mirrors daemonctl's
+  // resolveServicePortHolder skip).
+  const guardedNoHome = !opts?.homeDir && testGuardActive();
+
+  const pidHint = readPidFileHint(pidFile);
+  const pidHintAlive = pidHint !== null && isPidAlive(pidHint);
+
+  const socketFileExists = fs.existsSync(socketPath);
+  const identity = socketFileExists ? await probeSocket(socketPath) : null;
+
+  // A read-only pidfile probe for the resolver — never unlinks a stale file.
+  const readOnlyCheckPid = (file: string): { running: true; pid: number } | { running: false } => {
+    const pid = readPidFileHint(file);
+    if (pid === null) return { running: false };
+    return isPidAlive(pid) ? { running: true, pid } : { running: false };
+  };
+
+  const live = await resolveLive({
+    ...(dctlOpts ?? {}),
+    probeSocket,
+    checkPid: readOnlyCheckPid,
+    canSignal: guardedNoHome ? () => false : undefined,
+  });
+
+  const results: DoctorCheckResult[] = [];
+
+  // 1. Daemon pidfile — informational hint; staleness is the defect signal.
+  if (pidHint !== null && pidHintAlive) {
+    results.push({
+      name: "Daemon pidfile",
+      status: "pass",
+      message: `Daemon pidfile ${pidFile} names live pid ${pidHint}`,
+    });
+  } else if (pidHint !== null) {
+    results.push({
+      name: "Daemon pidfile",
+      status: "fail",
+      message: `Daemon pidfile ${pidFile} names pid ${pidHint}, which is not alive`,
+      remedy: `Remove the stale pidfile: rm -f ${pidFile}`,
+    });
+  } else if (live) {
+    results.push({
+      name: "Daemon pidfile",
+      status: "fail",
+      message: `Daemon pidfile missing at ${pidFile} while a live daemon (pid ${live.pid}, resolved by ${live.source}) is running`,
+      remedy: "Run: tamandua daemon restart",
+    });
+  } else {
+    results.push({
+      name: "Daemon pidfile",
+      status: "pass",
+      message: `No daemon pidfile at ${pidFile} (daemon not running)`,
+    });
+  }
+
+  // 2. Daemon liveness socket — the authoritative liveness primitive.
+  if (identity) {
+    results.push({
+      name: "Daemon liveness socket",
+      status: "pass",
+      message: `Daemon identity socket ${socketPath} answers with pid ${identity.pid} (control port ${identity.controlPort})`,
+    });
+  } else if (socketFileExists) {
+    results.push({
+      name: "Daemon liveness socket",
+      status: "warn",
+      message: `Daemon identity socket ${socketPath} is stale — no listener answers`,
+      remedy: `Remove the stale socket: rm -f ${socketPath}`,
+    });
+  } else if (live) {
+    results.push({
+      name: "Daemon liveness socket",
+      status: "fail",
+      message: `Daemon identity socket missing at ${socketPath} while a live daemon (pid ${live.pid}, resolved by ${live.source}) is running`,
+      remedy: "Run: tamandua daemon restart",
+    });
+  } else {
+    results.push({
+      name: "Daemon liveness socket",
+      status: "pass",
+      message: `No daemon identity socket at ${socketPath} (daemon not running)`,
+    });
+  }
+
+  // 3. Control port holder — report only; never signal an unverified pid.
+  const controlPort = identity?.controlPort ?? live?.port ?? readControlPlanePort(dctlOpts);
+  if (guardedNoHome) {
+    results.push({
+      name: "Control port holder",
+      status: "info",
+      message: `Control port holder check skipped under the test-isolation guard (port ${controlPort})`,
+    });
+  } else {
+    const holderPids = listPortHolderPids(controlPort);
+    const described = (pid: number): string => {
+      const cmdline = readCmdline(pid);
+      return `${pid} (${cmdline || "cmdline unavailable"})`;
+    };
+    const unknown = holderPids.filter(
+      (pid) => !isTamanduaServiceCmdline(readCmdline(pid), "daemon"),
+    );
+
+    if (unknown.length > 0) {
+      results.push({
+        name: "Control port holder",
+        status: "fail",
+        message: `Control port ${controlPort} is held by unknown pid ${unknown.map(described).join(", ")} — not a Tamandua daemon`,
+        remedy: `Identify and stop the process outside tamandua (tamandua never signals an unverified pid): lsof -nP -iTCP:${controlPort} -sTCP:LISTEN`,
+      });
+    } else if (holderPids.length > 0) {
+      results.push({
+        name: "Control port holder",
+        status: "pass",
+        message: `Control port ${controlPort} is held by Tamandua daemon pid ${holderPids.join(", ")}`,
+      });
+    } else {
+      results.push({
+        name: "Control port holder",
+        status: "pass",
+        message: `Control port ${controlPort} is free (no TCP listener)`,
+      });
+    }
+  }
+
+  // 4. Running daemon build — socket identity vs installed build.
+  if (identity) {
+    if (identity.buildVersion === localVersion) {
+      results.push({
+        name: "Running daemon build",
+        status: "pass",
+        message: `Running daemon build ${identity.buildVersion} matches installed build ${localVersion}`,
+      });
+    } else {
+      results.push({
+        name: "Running daemon build",
+        status: "fail",
+        message: `Running daemon (pid ${identity.pid}) build ${identity.buildVersion} differs from installed build ${localVersion}`,
+        remedy: "Run: tamandua daemon restart",
+      });
+    }
+  } else if (live) {
+    results.push({
+      name: "Running daemon build",
+      status: "warn",
+      message: `Daemon (pid ${live.pid}, resolved by ${live.source}) does not answer the identity socket — build version unknown`,
+      remedy: "Run: tamandua daemon restart",
+    });
+  } else {
+    results.push({
+      name: "Running daemon build",
+      status: "pass",
+      message: "No running daemon to compare against the installed build",
+    });
+  }
+
+  return results;
+}
+
+// ── LIVENESS repair (US-008 / DPID) ────────────────────────────────
+
+/**
+ * Injectable process/lifecycle primitives for {@link repairLiveness}.
+ *
+ * Every field defaults to the real helper, so production passes no deps while
+ * unit tests can drive the repair decision logic (adopt / unlink / restart)
+ * with fakes and no real processes.
+ */
+export interface RepairLivenessDeps {
+  /** Identity-socket prober (default: probeIdentitySocket). */
+  probeSocket?: (socketPath: string, timeoutMs?: number) => Promise<DaemonIdentity | null>;
+  /** Live-daemon resolver (default: resolveLiveDaemon). */
+  resolveLive?: (opts?: ResolveLiveDaemonOptions) => Promise<LiveService | null>;
+  /** All pids listening on a port, unfiltered (default: resolvePortHolderPids). */
+  listPortHolderPids?: (port: number, opts?: ServiceHolderOptions) => number[];
+  /** Process cmdline reader (default: getCmdline from proc-info). */
+  getCmdline?: (pid: number) => string;
+  /** Pid liveness probe (default: kill(pid, 0) — never signals). */
+  isPidAlive?: (pid: number) => boolean;
+  /** Takeover stop (default: stopDaemonTakeover). */
+  stopDaemon?: (opts?: ResolveLiveDaemonOptions) => Promise<TakeoverResult>;
+  /** Daemon start (default: startDaemon). */
+  startDaemon?: (port: number, opts?: StartOptions) => Promise<{ pid: number; port: number }>;
+  /** Best-effort unlink (default: fs.unlinkSync). */
+  unlink?: (file: string) => void;
+  /** Pidfile writer (default: mkdir + fs.writeFileSync). */
+  writePidFile?: (pidFile: string, pid: number) => void;
+}
+
+/**
+ * Explicitly repair daemon liveness inconsistencies (doctor --repair).
+ *
+ * Actions, in order:
+ *  1. A stale `daemon.sock` (a file no listener answers) is unlinked so the
+ *     next daemon can rebind it.
+ *  2. A control port held by a non-Tamandua pid is reported as a `skip` and
+ *     left untouched — tamandua never signals an unverified pid — and the
+ *     overall result is `ok: false` because that failure remains.
+ *  3. When the identity socket reports a build different from the installed
+ *     build, the live daemon is stopped with {@link stopDaemonTakeover}
+ *     (SIGTERM → grace → SIGKILL → port-free) and the freshly installed build
+ *     is started on the same control port.
+ *  4. A pidfile whose pid is not alive is removed.
+ *  5. A live daemon resolved by socket/port-holder is adopted into a fresh
+ *     pidfile (writing its pid), so the informational hint matches reality.
+ *
+ * Report-and-act is explicitly requested (doctor without `--repair` never
+ * writes/deletes/signals). All primitives are injectable so the decision
+ * logic is testable without real processes.
+ *
+ * @returns `actions` — one human-readable line per performed/skipped action —
+ *          and `ok` — false when a liveness failure remains unrepaired.
+ */
+export async function repairLiveness(
+  opts?: DoctorOpts,
+  deps?: RepairLivenessDeps,
+): Promise<{ actions: string[]; ok: boolean }> {
+  const dctlOpts: DaemonctlPathOptions | undefined = opts?.homeDir ? { homeDir: opts.homeDir } : undefined;
+  const probeSocket = deps?.probeSocket ?? probeIdentitySocket;
+  const resolveLive = deps?.resolveLive ?? resolveLiveDaemon;
+  const listPortHolderPids = deps?.listPortHolderPids ?? resolvePortHolderPids;
+  const readCmdline = deps?.getCmdline ?? getCmdline;
+  const isPidAlive = deps?.isPidAlive ?? defaultIsPidAlive;
+  const stopDaemon = deps?.stopDaemon ?? ((o?: ResolveLiveDaemonOptions) => stopDaemonTakeover(o));
+  const startDaemonFn =
+    deps?.startDaemon ?? ((port: number, o?: StartOptions) => startDaemon(port, o ?? {}));
+  const unlink = deps?.unlink ?? ((file: string) => {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // Already gone / not removable — best effort.
+    }
+  });
+  const writePidFileFn = deps?.writePidFile ?? ((file: string, pid: number) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, String(pid), "utf-8");
+  });
+
+  const actions: string[] = [];
+  let ok = true;
+
+  const localVersion = getBuildVersion();
+  const pidFile = getPidFile(dctlOpts);
+  const socketPath = getServiceSocketPath("daemon", dctlOpts);
+
+  // Under the test-isolation guard without an explicit homeDir, never let the
+  // port-holder fallback adopt or signal production state (mirrors
+  // runLivenessChecks / daemonctl's resolveServicePortHolder skip).
+  const guardedNoHome = !opts?.homeDir && testGuardActive();
+
+  const pidHint = readPidFileHint(pidFile);
+  const pidHintAlive = pidHint !== null && isPidAlive(pidHint);
+
+  const socketFileExists = fs.existsSync(socketPath);
+  const identity = socketFileExists ? await probeSocket(socketPath) : null;
+
+  const readOnlyCheckPid = (file: string): { running: true; pid: number } | { running: false } => {
+    const pid = readPidFileHint(file);
+    if (pid === null) return { running: false };
+    return isPidAlive(pid) ? { running: true, pid } : { running: false };
+  };
+
+  const live = await resolveLive({
+    ...(dctlOpts ?? {}),
+    probeSocket,
+    checkPid: readOnlyCheckPid,
+    canSignal: guardedNoHome ? () => false : undefined,
+  });
+
+  // 1. Stale identity socket — a file no listener answers is only in the way.
+  if (socketFileExists && !identity) {
+    unlink(socketPath);
+    actions.push(`removed stale daemon identity socket ${socketPath}`);
+  }
+
+  // 2. Unknown non-Tamandua control-port holder — report, never touch.
+  const controlPort = identity?.controlPort ?? live?.port ?? readControlPlanePort(dctlOpts);
+  if (!guardedNoHome) {
+    for (const pid of listPortHolderPids(controlPort)) {
+      const cmdline = readCmdline(pid);
+      if (!isTamanduaServiceCmdline(cmdline, "daemon")) {
+        ok = false;
+        actions.push(
+          `skip: control port ${controlPort} is held by unknown pid ${pid} (${cmdline || "cmdline unavailable"}) — not a Tamandua daemon; leaving it untouched`,
+        );
+      }
+    }
+  }
+
+  // 3. Build mismatch — replace the older daemon with the installed build.
+  if (identity && identity.buildVersion !== localVersion) {
+    const stopResult = await stopDaemon({ ...(dctlOpts ?? {}), probeSocket });
+    actions.push(
+      `stopped daemon pid ${identity.pid} running build ${identity.buildVersion} (escalated=${stopResult.escalated}, portFree=${stopResult.portFree})`,
+    );
+    if (!stopResult.stopped) {
+      actions.push(`could not stop daemon pid ${identity.pid}; skipping restart of the installed build`);
+      return { actions, ok: false };
+    }
+    try {
+      const started = await startDaemonFn(controlPort, dctlOpts);
+      actions.push(`started installed build ${localVersion} as daemon pid ${started.pid} on port ${started.port}`);
+    } catch (err) {
+      ok = false;
+      actions.push(
+        `failed to start the installed build on port ${controlPort}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return { actions, ok };
+  }
+
+  // 4. Dead pidfile — the socket/port-holder identity is authoritative.
+  if (pidHint !== null && !pidHintAlive) {
+    unlink(pidFile);
+    actions.push(`removed stale daemon pidfile ${pidFile} (pid ${pidHint} is not alive)`);
+  }
+
+  // 5. Adopt a live daemon into a fresh pidfile so the hint matches reality.
+  const livePid = live?.pid ?? identity?.pid;
+  if (livePid !== undefined && livePid !== pidHint) {
+    writePidFileFn(pidFile, livePid);
+    const how = live ? `resolved by ${live.source}` : "identity socket";
+    actions.push(`adopted live daemon pid ${livePid} (${how}) into ${pidFile}`);
+  }
+
+  return { actions, ok };
+}
+
 // ── STATE checks (US-006) ──────────────────────────────────────────
 
 /** Map MedicFinding severity to DoctorCheckResult status. */
@@ -1283,8 +1709,10 @@ interface DshDiscoveryResult {
  * Orchestrates the check categories:
  *   1. ENVIRONMENT — runtime environment checks (Node.js, pi, gh, etc.)
  *   2. SERVICES    — daemon, control plane, dashboard, MCP liveness
- *   3. STALENESS   — running daemon build vs. installed build
- *   4. STATE       — database health, run-level anomalies, process leaks
+ *   3. LIVENESS    — pidfile/socket/control-port-holder consistency and the
+ *                    running daemon's build version (report-only, DPID)
+ *   4. STALENESS   — running daemon build vs. installed build
+ *   5. STATE       — database health, run-level anomalies, process leaks
  */
 /**
  * Run LLM PROMPT ADHERENCE checks: per-step key-emission rates.
@@ -1481,6 +1909,9 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
   // SERVICES — wired in US-004
   const servicesChecks = await guardedChecks("Services checks", () => runServicesChecks(opts));
 
+  // LIVENESS — wired in US-007 (report-only pidfile/socket/port-holder/build)
+  const livenessChecks = await guardedChecks("Liveness checks", () => runLivenessChecks(opts));
+
   // STALENESS — wired in US-005
   const stalenessChecks = await guardedChecks("Staleness check", () => runStalenessCheck(opts));
 
@@ -1504,6 +1935,7 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
   return [
     { label: "ENVIRONMENT", checks: environmentChecks },
     { label: "SERVICES", checks: servicesChecks },
+    { label: "LIVENESS", checks: livenessChecks },
     { label: "STALENESS", checks: stalenessChecks },
     { label: "STATE", checks: stateChecks },
     { label: "LLM PROMPT ADHERENCE", checks: adherenceChecks },

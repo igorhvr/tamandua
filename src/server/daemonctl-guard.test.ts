@@ -638,3 +638,42 @@ describe("daemonctl isolation via HOME env (no opts.homeDir)", { concurrency: 1 
     );
   });
 });
+
+// ── Effective state-dir routing (DPID scoping) ─────────────────────
+//
+// US-001: daemonctl and daemon-identity must share ONE effective state-dir
+// resolver. With HOME deliberately set to the REAL user home, a
+// TAMANDUA_STATE_DIR override must still be honored by every state path —
+// otherwise an isolated CLI silently falls back to production ~/.tamandua
+// (the coordinator's live daemon on port 3339).
+
+describe("daemonctl effective state dir via TAMANDUA_STATE_DIR", { concurrency: 1 }, () => {
+  it("derives pid/port/socket paths from the same TAMANDUA_STATE_DIR", async () => {
+    const { tamanduaDir } = createTempHome("tamandua-dc-state-");
+    process.env.HOME = os.userInfo().homedir; // deliberately the REAL home
+    process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+
+    const { getPidFile, getControlPlanePidFile, getControlPlanePortFile } =
+      await importDaemonctl();
+    const { getServiceSocketPath } = await import("../../dist/server/daemon-identity.js");
+
+    assert.equal(getPidFile(), path.join(tamanduaDir, "tamandua.pid"));
+    assert.equal(getControlPlanePidFile(), path.join(tamanduaDir, "control-plane.pid"));
+    assert.equal(getControlPlanePortFile(), path.join(tamanduaDir, "control-plane-port"));
+    assert.equal(getServiceSocketPath("daemon"), path.join(tamanduaDir, "daemon.sock"));
+  });
+
+  it("opts.homeDir wins over the env and agrees across both modules", async () => {
+    const { homeDir } = createTempHome("tamandua-dc-opts-");
+    process.env.HOME = os.userInfo().homedir;
+    delete process.env.TAMANDUA_STATE_DIR;
+
+    const { getPidFile, getControlPlanePortFile } = await importDaemonctl();
+    const { getServiceSocketPath } = await import("../../dist/server/daemon-identity.js");
+    const expected = path.join(homeDir, ".tamandua");
+
+    assert.equal(getPidFile({ homeDir }), path.join(expected, "tamandua.pid"));
+    assert.equal(getControlPlanePortFile({ homeDir }), path.join(expected, "control-plane-port"));
+    assert.equal(getServiceSocketPath("daemon", { homeDir }), path.join(expected, "daemon.sock"));
+  });
+});

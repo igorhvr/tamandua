@@ -18,8 +18,8 @@
 import fs from "node:fs";
 import { assertPortIsolation } from "../lib/test-guard.js";
 import path from "node:path";
-import os from "node:os";
 import http from "node:http";
+import { resolveStateDir } from "../lib/tamandua-config.js";
 import {
   DEFAULT_CONTROL_PORT,
   createControlServer,
@@ -27,8 +27,8 @@ import {
   getControlPort,
 } from "./control-server.js";
 
-const CONTROL_PLANE_PID_FILE = path.join(os.homedir(), ".tamandua", "control-plane.pid");
-const CONTROL_PLANE_PORT_FILE = path.join(os.homedir(), ".tamandua", "control-plane-port");
+const CONTROL_PLANE_PID_FILE = path.join(resolveStateDir(), "control-plane.pid");
+const CONTROL_PLANE_PORT_FILE = path.join(resolveStateDir(), "control-plane-port");
 
 function resolvePort(): number {
   // 1. CLI argument

@@ -13,7 +13,10 @@ describe("SPL2 status and doctor command module", () => {
     assert.match(getStatusHelp(), /Running Processes/);
     assert.match(getStatusHelp(), /--json/);
     assert.match(getDoctorHelp(), /tamandua doctor/);
+    assert.match(getDoctorHelp(), /LIVENESS/);
     assert.match(getDoctorHelp(), /LLM PROMPT/);
+    assert.match(getDoctorHelp(), /--repair/);
+    assert.match(getDoctorHelp(), /tamandua doctor --repair/);
   });
 
   it("declines commands owned by other command groups", async () => {

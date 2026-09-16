@@ -2730,7 +2730,7 @@ describe("nudge command", { concurrency: 1 }, () => {
       }
 
       // Run nudge with the daemon's HOME and control port
-      const result = cli(["nudge"], { HOME: tmpDir, TAMANDUA_CONTROL_PORT: String(cp) });
+      const result = cli(["nudge"], { HOME: tmpDir, TAMANDUA_STATE_DIR: path.join(tmpDir, ".tamandua"), TAMANDUA_CONTROL_PORT: String(cp) });
       try {
         assert.equal(result.status, 0);
         assert.match(result.stdout ?? "", /No running Tamandua runs to nudge/);
@@ -2811,7 +2811,7 @@ describe("nudge command", { concurrency: 1 }, () => {
       db.close();
 
       // Run nudge with the daemon's HOME and control port
-      const result = cli(["nudge"], { HOME: tmpDir, TAMANDUA_CONTROL_PORT: String(cp) });
+      const result = cli(["nudge"], { HOME: tmpDir, TAMANDUA_STATE_DIR: path.join(tmpDir, ".tamandua"), TAMANDUA_CONTROL_PORT: String(cp) });
       try {
         assert.equal(result.status, 0);
         // Should print a summary; there is 1 running run but no agents scheduled,
@@ -3346,12 +3346,13 @@ describe("autoresearch prune CLI", () => {
 });
 
 describe("tamandua doctor", () => {
-  it("tamandua doctor --help prints help with four check categories", () => {
+  it("tamandua doctor --help prints help with the check categories", () => {
     const result = cli(["doctor", "--help"]);
     try {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /ENVIRONMENT/);
       assert.match(result.stdout ?? "", /SERVICES/);
+      assert.match(result.stdout ?? "", /LIVENESS/);
       assert.match(result.stdout ?? "", /STALENESS/);
       assert.match(result.stdout ?? "", /STATE/);
       assert.match(result.stdout ?? "", /node:sqlite/);
@@ -3404,6 +3405,27 @@ describe("tamandua doctor", () => {
     try {
       assert.notEqual(result.status, 0);
       assert.match(result.stderr ?? "", /Unknown doctor option/);
+    } finally {
+    }
+  });
+
+  it("tamandua doctor --bogus exits 1 with the usage message", () => {
+    const result = cli(["doctor", "--bogus"]);
+    try {
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr ?? "", /Unknown doctor option: --bogus/);
+      assert.match(result.stderr ?? "", /Usage: tamandua doctor \[--repair\]/);
+    } finally {
+    }
+  });
+
+  it("tamandua doctor --repair is accepted and prints the REPAIR section", () => {
+    const result = cli(["doctor", "--repair"]);
+    try {
+      assert.doesNotMatch(result.stderr ?? "", /Unknown doctor option/);
+      assert.match(result.stdout ?? "", /─── REPAIR ───/);
+      // A clean isolated home has no liveness failure to repair → exit 0.
+      assert.equal(result.status, 0);
     } finally {
     }
   });

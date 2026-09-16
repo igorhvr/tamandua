@@ -10,6 +10,9 @@
  * 6. tamandua control-plane status shows not running when down
  * 7. tamandua control-plane stop kills control plane process and prints confirmation
  * 8. tamandua control-plane stop when not running prints not running message
+ * 9. tamandua control-plane status/stop report not running for a fresh private
+ *    state dir with NO port file while a foreign daemon is live on the default
+ *    control port (DPID US-006 scoping regression)
  *
  * All tests use isolated temp HOME directories so they do not share
  * PID/port files with parallel tests (US-004 isolation).
@@ -364,13 +367,33 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     fs.unlinkSync(getIsolatedControlPlanePidFile(tempHome));
 
-    // After the split, the CLI start handler relies on the PID file for
-    // "already running" detection. Without the PID file, startDaemon tries
-    // to spawn a new process, which fails with EADDRINUSE on the port.
+    // DPID: start resolves the live daemon by its identity socket (then the
+    // verified control-port holder) instead of trusting the pidfile, so a
+    // daemon whose pidfile was lost is reported "already running" and no
+    // colliding second daemon is spawned.
     const second = await runCli(["control-plane", "start", "--port", String(port)], tempHome);
-    assert.equal(second.exitCode, 1, cleanStderr(second.stderr));
-    assert.ok(second.stderr.includes("Failed to start control plane"), `Expected failure, got: ${second.stderr}`);
-    assert.ok(!second.stdout.includes("Control plane started"));
+    assert.equal(second.exitCode, 0, cleanStderr(second.stderr));
+    assert.ok(
+      second.stdout.includes("already running"),
+      `Expected "already running", got: ${second.stdout}`,
+    );
+    assert.ok(
+      second.stdout.includes(`PID ${capturedPid}`),
+      `Expected PID ${capturedPid}, got: ${second.stdout}`,
+    );
+    assert.ok(
+      !second.stdout.includes("Control plane started"),
+      "the second start must not spawn a colliding daemon",
+    );
+
+    // The original daemon is still the one serving; no second process was
+    // spawned and the health endpoint is unchanged.
+    const stillUp = await waitForHttpUp(`http://127.0.0.1:${port}/control/health`);
+    assert.equal(stillUp.status, 200);
+    const afterStatus = isIsolatedControlPlaneRunning(tempHome);
+    assert.equal(afterStatus.running, false, "the pidfile must still be gone");
+    // Restore the pidfile from the captured pid so identity-safe teardown works.
+    fs.writeFileSync(getIsolatedControlPlanePidFile(tempHome), String(capturedPid), "utf-8");
 
     } finally {
       const pidFile = getIsolatedControlPlanePidFile(tempHome);
@@ -480,6 +503,50 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.equal(exitCode, 0);
     assert.ok(stdout.includes("not running"), `Expected "not running", got: ${stdout}`);
     assert.equal(cleanStderr(stderr), "");
+    } finally {
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
+    }
+  });
+
+  // DPID US-006 scoping regression: a fresh private state dir with NO
+  // control-plane-port file must never adopt the host's production daemon,
+  // which lives on the default control port. Before the scoping fix the
+  // fallback resolved that foreign daemon and both status and stop reported it
+  // as ours. The foreign daemon is never signalled; when it advertises a
+  // provably different state dir it is merely reported on stderr.
+  it("control-plane status and stop report not running with a private state dir and no port file", async () => {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    // Remove any pidfile/port file a prior case may have left behind. With no
+    // port file, resolution falls back to the DEFAULT control port, where the
+    // host's production daemon is live during the coordinator certification.
+    cleanupIsolatedControlPlaneFiles(tempHome);
+    try {
+      assert.equal(fs.existsSync(getIsolatedControlPlanePidFile(tempHome)), false);
+      assert.equal(fs.existsSync(getIsolatedControlPlanePortFile(tempHome)), false);
+
+      const status = await runCli(["control-plane", "status"], tempHome);
+      assert.equal(status.exitCode, 0, cleanStderr(status.stderr));
+      assert.ok(
+        status.stdout.includes("not running"),
+        `Expected "not running" status, got: ${status.stdout}`,
+      );
+
+      const stop = await runCli(["control-plane", "stop"], tempHome);
+      assert.equal(stop.exitCode, 0, cleanStderr(stop.stderr));
+      assert.ok(
+        stop.stdout.includes("not running"),
+        `Expected "not running" stop, got: ${stop.stdout}`,
+      );
+
+      // A detected foreign daemon (newer build advertising its state dir) is
+      // reported on stderr as "another Tamandua daemon (...)" — never treated
+      // as ours, never signalled. Reject any OTHER stderr noise.
+      const unexpectedStderr = [status, stop]
+        .map((r) => cleanStderr(r.stderr))
+        .flatMap((s) => s.split("\n"))
+        .filter((line) => line.length > 0)
+        .filter((line) => !line.includes("another Tamandua daemon"));
+      assert.deepEqual(unexpectedStderr, [], "only the foreign-daemon notice is allowed on stderr");
     } finally {
       await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }

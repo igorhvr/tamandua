@@ -15,7 +15,6 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import {
   DEFAULT_MCP_PORT,
   startTamanduaMcpServer,
@@ -28,8 +27,15 @@ import {
   startControlServer,
   startReconciler,
 } from "./control-server.js";
+import {
+  bindIdentitySocket,
+  getServiceSocketPath,
+  IdentitySocketInUseError,
+  type BoundIdentitySocket,
+} from "./daemon-identity.js";
 import { shutdownAllCrons } from "../installer/agent-scheduler.js";
 import { recordLifecycleEvent } from "./daemonctl.js";
+import { resolveStateDir } from "../lib/tamandua-config.js";
 import { runVersionCheck } from "../lib/version-check.js";
 import { getBuildVersion } from "../lib/version.js";
 import {
@@ -41,7 +47,7 @@ import {
   writeHeartbeatMarker,
 } from "./daemon-lifecycle.js";
 
-const PID_FILE = path.join(os.homedir(), ".tamandua", "tamandua.pid");
+const PID_FILE = path.join(resolveStateDir(), "tamandua.pid");
 
 interface DaemonArgs {
   withMcp: boolean;
@@ -101,6 +107,57 @@ function closeServer(server: http.Server): Promise<void> {
   });
 }
 
+/**
+ * Close and unlink the identity socket this process bound (async path).
+ *
+ * The pidfile is only an informational hint; the socket is the authoritative
+ * liveness primitive. `BoundIdentitySocket.close()` unlinks ONLY the file this
+ * process created, so a losing bind-race daemon can never remove the live
+ * daemon's socket.
+ */
+async function closeIdentitySocket(): Promise<void> {
+  const current = identitySocket;
+  identitySocket = undefined;
+  if (!current) return;
+  try {
+    await current.close();
+  } catch {
+    // Best effort teardown.
+  }
+}
+
+/**
+ * Synchronous identity-socket teardown for the `process.on("exit")` handler,
+ * which cannot await. Safe to call after {@link closeIdentitySocket}: the
+ * reference is cleared, so this is a no-op then.
+ */
+function closeIdentitySocketSync(): void {
+  const current = identitySocket;
+  identitySocket = undefined;
+  if (!current) return;
+  try {
+    current.server.close();
+  } catch {
+    // Best effort teardown.
+  }
+  try {
+    fs.unlinkSync(current.socketPath);
+  } catch {
+    // Already gone or never created.
+  }
+}
+
+function formatControlBindError(port: number, err: unknown): string {
+  const nodeErr = err as NodeJS.ErrnoException;
+  if (nodeErr?.code === "EADDRINUSE") {
+    return (
+      `Failed to start control plane: port ${port} already in use; ` +
+      `another Tamandua daemon is probably live. Refusing to start.`
+    );
+  }
+  return `Failed to start control plane: ${err instanceof Error ? err.message : String(err)}`;
+}
+
 function formatMcpBindError(port: number, err: unknown): string {
   const nodeErr = err as NodeJS.ErrnoException;
   if (nodeErr?.code === "EADDRINUSE") {
@@ -116,6 +173,7 @@ const args = parseArgs();
 
 let mcpServer: TamanduaMcpServer | undefined;
 let controlServer: http.Server | undefined;
+let identitySocket: BoundIdentitySocket | undefined;
 let reconciler: { stop: () => void } | undefined;
 let isShuttingDown = false;
 let versionCheckInterval: ReturnType<typeof setInterval> | undefined;
@@ -177,6 +235,7 @@ async function shutdown(signal: string, exitCode: number): Promise<void> {
   }
 
   await stopListeners();
+  await closeIdentitySocket();
   cleanupPidFile();
   finalizeHeartbeatMarker();
 
@@ -190,6 +249,7 @@ async function failStartup(err: unknown): Promise<void> {
     exitCode: 1,
   });
   await stopListeners();
+  await closeIdentitySocket();
   cleanupPidFile();
   finalizeHeartbeatMarker();
   process.exit(1);
@@ -216,6 +276,7 @@ process.on("uncaughtException", (err) => {
 });
 
 process.on("exit", () => {
+  closeIdentitySocketSync();
   cleanupPidFile();
   // Best-effort finalize covers exits that bypass shutdown() (e.g. a
   // process.exit() from a startup failure path that skipped the marker, or
@@ -224,32 +285,75 @@ process.on("exit", () => {
 });
 
 async function bootstrap(): Promise<void> {
-  writePidFile();
+  const controlPort = getControlPort();
+
+  // Bind-first (DPID): the identity socket is claimed BEFORE the TCP port and
+  // before any pidfile is written. A daemon that loses the bind race must leave
+  // no trace: it never overwrites or unlinks the live daemon's files.
+  try {
+    identitySocket = await bindIdentitySocket(getServiceSocketPath("daemon"), {
+      pid: process.pid,
+      buildVersion: getBuildVersion(),
+      controlPort,
+      startedAt: new Date().toISOString(),
+      stateDir: resolveStateDir(),
+    });
+  } catch (err) {
+    if (err instanceof IdentitySocketInUseError) {
+      console.error(
+        `Failed to start daemon: identity socket ${err.socketPath} is already owned by a ` +
+          `live daemon (pid ${err.pid}, control port ${err.identity.controlPort}). Refusing to start.`,
+      );
+      recordLifecycleEvent("daemon.shutdown", process.pid, undefined, {
+        reason: `another Tamandua daemon is live (pid ${err.pid})`,
+        exitCode: 1,
+      });
+      finalizeHeartbeatMarker();
+      process.exit(1);
+      return;
+    }
+
+    const message = `Failed to start daemon: could not bind identity socket: ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+    console.error(message);
+    recordLifecycleEvent("daemon.shutdown", process.pid, undefined, {
+      reason: message,
+      exitCode: 1,
+    });
+    finalizeHeartbeatMarker();
+    process.exit(1);
+    return;
+  }
 
   // Always start the run-scoped scheduling control plane. If the control
   // port can't bind, surface a clear error rather than silently degrading.
   try {
     const secret = ensureDaemonSecret();
-    const controlPort = getControlPort();
     controlServer = await startControlServer({ port: controlPort, secret });
     reconciler = startReconciler();
     console.log(
       `Tamandua control plane listening on http://127.0.0.1:${controlPort} (pid ${process.pid})`,
     );
   } catch (err) {
-    console.error(
-      `Failed to start control plane: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    const message = formatControlBindError(controlPort, err);
+    console.error(message);
     recordLifecycleEvent("daemon.shutdown", process.pid, undefined, {
-      reason: `Failed to start control plane: ${err instanceof Error ? err.message : String(err)}`,
+      reason: message,
       exitCode: 1,
     });
     await stopListeners();
+    // Unlink ONLY the socket this process created; no pidfile was written.
+    await closeIdentitySocket();
     cleanupPidFile();
     finalizeHeartbeatMarker();
     process.exit(1);
     return;
   }
+
+  // Control plane bound successfully: ONLY NOW claim liveness on disk. The
+  // pidfile stays an informational hint (the identity socket is authoritative).
+  writePidFile();
 
   if (args.withMcp) {
     try {

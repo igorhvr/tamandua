@@ -22,10 +22,10 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import crypto from "node:crypto";
 import { assertStatePathIsolation } from "../lib/test-guard.js";
 import { parseInstant } from "../lib/instant.js";
+import { resolveStateDir } from "../lib/tamandua-config.js";
 import { recordLifecycleEvent } from "./daemonctl.js";
 
 /**
@@ -58,7 +58,7 @@ export interface HeartbeatMarker {
 }
 
 function defaultTamanduaDir(): string {
-  return path.join(process.env.HOME?.trim() || os.homedir(), ".tamandua");
+  return resolveStateDir();
 }
 
 function getTamanduaDir(opts?: DaemonctlPathOptions): string {
