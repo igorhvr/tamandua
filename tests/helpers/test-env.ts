@@ -325,12 +325,70 @@ export function listRemainingEntries(dir: string): string[] {
 }
 
 /**
+ * Best-effort recursive permission repair for a temp tree that contains
+ * read-only entries (e.g. the hermes skills fixture materializes a 0o500
+ * directory holding 0o400 files under the isolated HOME). `fs.rmSync` cannot
+ * unlink an entry whose parent directory lacks owner write/execute permission,
+ * which surfaced only on macOS as
+ * `EACCES: permission denied, unlink '.../apple-notes/SKILL.md'`.
+ *
+ * Before removal, walk the tree and grant:
+ *  - every directory (including the root) owner rwx (0o700)
+ *  - every regular file owner rw (0o600)
+ *
+ * Symlinks are deliberately never followed: `fs.Dirent.isDirectory()` /
+ * `isFile()` report false for a link entry itself (they do not stat the
+ * target), so a link's target is left untouched. Each chmod is best-effort —
+ * a single failure (race, EPERM) is swallowed so it cannot abort the walk;
+ * an entry that genuinely cannot be removed is still reported by the
+ * diagnostic in {@link removeTestTempDirWithDiagnostics}.
+ */
+function chmodTreeWritableForRemoval(dir: string): void {
+  // Repair this directory first so a read-only directory can still be
+  // traversed by the readdir/recursion below.
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // Best-effort: rmSync or the diagnostic below reports a genuine problem.
+  }
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    // Unreadable or vanished — nothing more to repair.
+    return;
+  }
+
+  for (const entry of entries) {
+    const child = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      chmodTreeWritableForRemoval(child);
+    } else if (entry.isFile()) {
+      try {
+        fs.chmodSync(child, 0o600);
+      } catch {
+        // Best-effort per-entry: keep repairing siblings.
+      }
+    }
+    // Symlinks and other special entries are intentionally not chmod'ed —
+    // never follow a link out of the tree.
+  }
+}
+
+/**
  * Remove a test temp dir with the same retries as the historical teardown,
  * but on failure throw an error that NAMES the entries still occupying the
  * directory instead of surfacing a bare ENOTEMPTY. This turns a flaky
  * teardown race into a diagnosable failure.
+ *
+ * Read-only fixtures (hermes skills: 0o500 dirs with 0o400 files) are repaired
+ * to owner-writable first (see {@link chmodTreeWritableForRemoval}) so the
+ * existing retry loop can actually unlink them; the diagnostic path is
+ * unchanged and still fires when removal genuinely fails.
  */
 export function removeTestTempDirWithDiagnostics(dir: string): void {
+  chmodTreeWritableForRemoval(dir);
   try {
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 200 });
   } catch (err: unknown) {

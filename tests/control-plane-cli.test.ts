@@ -16,6 +16,29 @@
  *
  * All tests use isolated temp HOME directories so they do not share
  * PID/port files with parallel tests (US-004 isolation).
+ *
+ * Two distinct intents are deliberately kept apart here:
+ *
+ * - The "control-plane stop when not running prints not running" case (AC 7) is
+ *   the ISOLATED EPHEMERAL-PORT check. It reserves an ephemeral port with
+ *   reservePortHandle(), writes it into the isolated control-plane-port file,
+ *   and holds the handle for the test's duration. Because no Tamandua daemon
+ *   can be listening on that never-exported port, no foreign daemon is ever
+ *   detected and stderr must stay completely empty. This keeps the test
+ *   host-independent: it must not depend on whether the host's production
+ *   daemon is live on DEFAULT_CONTROL_PORT 3339 or whether that build
+ *   advertises an identity socket.
+ *
+ * - The "control-plane status and stop report not running with a private state
+ *   dir and no port file" case (test 9) is the DPID FOREIGN-HOLDER SCOPING
+ *   REGRESSION. It intentionally leaves the state dir without a port file so
+ *   resolution falls back to DEFAULT_CONTROL_PORT, where the host's production
+ *   daemon may be live. That foreign daemon must never be adopted, reported as
+ *   ours, or signalled; when its build advertises a provably different state
+ *   dir it is reported once on stderr as "another Tamandua daemon (...)". That
+ *   operator-visible notice is legitimate product output, so this test asserts
+ *   it is the ONLY stderr line, while the AC 7 test above asserts truly empty
+ *   stderr under a guaranteed-no-holder port.
  */
 
 import { describe, it } from "node:test";
@@ -500,11 +523,21 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     }
   });
 
-  // AC 7: tamandua control-plane stop when not running prints not running message
+  // AC 7: tamandua control-plane stop when not running prints not running message.
+  // Host-independent: hold an ephemeral port and point the isolated
+  // control-plane-port file at it, so no foreign daemon (e.g. the host's
+  // production daemon on DEFAULT_CONTROL_PORT) can ever be detected and stderr
+  // must stay empty. The DPID foreign-holder notice is covered separately by
+  // the private-state-dir/no-port-file test below.
   it("control-plane stop when not running prints not running", async () => {
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    const portHandle = await reservePortHandle();
+    const unusedPort = portHandle.port;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
+
+    fs.mkdirSync(path.join(tempHome, ".tamandua"), { recursive: true });
+    fs.writeFileSync(getIsolatedControlPlanePortFile(tempHome), String(unusedPort), "utf-8");
 
     const { stdout, stderr, exitCode } = await runCli(["control-plane", "stop"], tempHome);
 
@@ -512,6 +545,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(stdout.includes("not running"), `Expected "not running", got: ${stdout}`);
     assert.equal(cleanStderr(stderr), "");
     } finally {
+      portHandle.close().catch(() => {});
       await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
