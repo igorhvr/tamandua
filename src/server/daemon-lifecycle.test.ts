@@ -13,6 +13,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
 import {
+  DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS,
   HEARTBEAT_INTERVAL_DEFAULT_MS,
   computeConfigFingerprint,
   detectUncleanExit,
@@ -20,10 +21,13 @@ import {
   getHeartbeatIntervalMs,
   getHeartbeatPath,
   getLastDaemonDeath,
+  getLifecycleSeenPath,
+  isUnseenDaemonDeath,
   readHeartbeatMarker,
   touchHeartbeat,
   writeHeartbeatMarker,
 } from "../../dist/server/daemon-lifecycle.js";
+import type { DaemonDeath } from "../../dist/server/daemon-lifecycle.js";
 
 describe("daemon heartbeat marker module", () => {
   it("exports the required API surface", () => {
@@ -536,6 +540,186 @@ describe("daemon unclean-exit detection", () => {
     const opts = { homeDir: th.homeDir };
     appendJournalEntry(opts, { ts: "nope", action: "daemon.shutdown", targetPid: 111 });
     assert.equal(getLastDaemonDeath(opts), null);
+  });
+});
+
+// ── Durable-instant comparisons (US-009) ─────────────────────────────
+//
+// Heartbeat / death instants survive restarts, so their ages are numeric
+// comparisons against the wall clock via the shared instantAgeMs/isOlderThan
+// helpers, with an explicit documented tolerance. These tests drive the
+// comparison with an injected Date.now and with unparseable instants.
+
+describe("daemon-lifecycle durable-instant comparisons (US-009)", () => {
+  it("clamps an unparseable heartbeat instant to age 0 instead of fabricating an age", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const pid = 4242;
+    seedMarker(opts, pid, new Date(Date.now() - 60_000).toISOString(), "not-a-timestamp");
+
+    const facts = detectUncleanExit(opts);
+    assert.ok(facts, "a stale marker with an unparseable heartbeat must still be detected");
+    assert.equal(
+      facts!.lastHeartbeatAgeMs,
+      0,
+      "an unknown heartbeat instant must not fabricate an age",
+    );
+
+    const ue = readJournal(opts).find((entry) => entry.action === "daemon.uncleanExit");
+    assert.ok(ue, "the unclean exit must be journaled");
+    assert.equal(ue!.lastHeartbeatAgeMs, 0);
+  });
+
+  it("computes the heartbeat age numerically from the wall clock (forward jump grows, backward clamps)", () => {
+    const realNow = Date.now();
+    const realDateNow = Date.now;
+    const pid = 4242;
+
+    const forwardHome = createTempHome("tamandua-ue-");
+    const forwardOpts = { homeDir: forwardHome.homeDir };
+    seedMarker(
+      forwardOpts,
+      pid,
+      new Date(realNow - 60_000).toISOString(),
+      new Date(realNow - 5_000).toISOString(),
+    );
+    try {
+      Date.now = () => realNow + 3_600_000;
+      const forward = detectUncleanExit(forwardOpts);
+      assert.ok(forward);
+      assert.equal(forward!.lastHeartbeatAgeMs, 3_605_000);
+    } finally {
+      Date.now = realDateNow;
+    }
+
+    const backwardHome = createTempHome("tamandua-ue-");
+    const backwardOpts = { homeDir: backwardHome.homeDir };
+    seedMarker(
+      backwardOpts,
+      pid,
+      new Date(realNow - 60_000).toISOString(),
+      new Date(realNow + 5_000).toISOString(),
+    );
+    try {
+      Date.now = () => realNow;
+      const backward = detectUncleanExit(backwardOpts);
+      assert.ok(backward);
+      assert.equal(
+        backward!.lastHeartbeatAgeMs,
+        0,
+        "a future heartbeat must clamp to 0, never negative",
+      );
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  it("accounts for a journal entry at the marker start within the documented tolerance", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const pid = 4242;
+    const startedAtMs = Date.now() - 60_000;
+    seedMarker(opts, pid, new Date(startedAtMs).toISOString(), new Date(startedAtMs).toISOString());
+    appendJournalEntry(opts, {
+      ts: new Date(startedAtMs - 500).toISOString(), // inside the 1s tolerance
+      action: "daemon.shutdown",
+      targetPid: pid,
+    });
+
+    assert.equal(detectUncleanExit(opts), null, "an entry just before the start must still account");
+  });
+
+  it("does not account for a journal entry older than the marker start beyond tolerance", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const pid = 4242;
+    const startedAtMs = Date.now() - 60_000;
+    seedMarker(opts, pid, new Date(startedAtMs).toISOString(), new Date(startedAtMs).toISOString());
+    appendJournalEntry(opts, {
+      ts: new Date(startedAtMs - (DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS + 5_000)).toISOString(),
+      action: "daemon.shutdown",
+      targetPid: pid,
+    });
+
+    const facts = detectUncleanExit(opts);
+    assert.ok(facts, "a shutdown before the start beyond tolerance must not count as clean");
+    assert.equal(facts!.priorPid, pid);
+  });
+
+  it("never lets an unparseable journal ts account for a death", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const pid = 4242;
+    const startedAtMs = Date.now() - 60_000;
+    seedMarker(opts, pid, new Date(startedAtMs).toISOString(), new Date(startedAtMs).toISOString());
+    appendJournalEntry(opts, {
+      ts: "not-a-timestamp",
+      action: "daemon.shutdown",
+      targetPid: pid,
+    });
+
+    const facts = detectUncleanExit(opts);
+    assert.ok(facts, "an unknown journal ts must never account for the marker");
+    assert.equal(facts!.priorPid, pid);
+  });
+});
+
+describe("isUnseenDaemonDeath durable-instant comparison (US-009)", () => {
+  function uncleanDeath(ts: string): DaemonDeath {
+    return { kind: "unclean", ts, pid: 999, priorPid: 999 };
+  }
+
+  function seedSeen(opts: { homeDir: string }, ts: string): void {
+    const file = getLifecycleSeenPath(opts);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ ts }), "utf-8");
+  }
+
+  it("treats a death newer than the acknowledged ts beyond tolerance as unseen", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const deathTs = Date.now() - 10_000;
+    seedSeen(
+      opts,
+      new Date(deathTs - (DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS + 5_000)).toISOString(),
+    );
+    assert.equal(isUnseenDaemonDeath(uncleanDeath(new Date(deathTs).toISOString()), opts), true);
+  });
+
+  it("suppresses a re-alert for a death only slightly newer than the acknowledged ts", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const deathTs = Date.now() - 10_000;
+    // Acknowledged 500ms BEFORE the death: newer by less than the 1s tolerance
+    // -> treated as already seen, so a same-second re-death does not re-alert.
+    seedSeen(opts, new Date(deathTs - 500).toISOString());
+    assert.equal(isUnseenDaemonDeath(uncleanDeath(new Date(deathTs).toISOString()), opts), false);
+  });
+
+  it("treats an equal acknowledged ts as seen and a clean death as never unseen", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    const ts = new Date(Date.now() - 10_000).toISOString();
+    seedSeen(opts, ts);
+    assert.equal(isUnseenDaemonDeath(uncleanDeath(ts), opts), false);
+    assert.equal(
+      isUnseenDaemonDeath({ kind: "clean", ts, pid: 1 }, opts),
+      false,
+      "clean deaths are never unseen",
+    );
+  });
+
+  it("treats an unparseable acknowledged ts as unseen (cannot prove acknowledgment)", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    seedSeen(opts, "garbage");
+    assert.equal(isUnseenDaemonDeath(uncleanDeath(new Date().toISOString()), opts), true);
+  });
+
+  it("flags an unclean death as unseen when nothing has been acknowledged", () => {
+    const th = createTempHome("tamandua-ue-");
+    const opts = { homeDir: th.homeDir };
+    assert.equal(isUnseenDaemonDeath(uncleanDeath(new Date().toISOString()), opts), true);
   });
 });
 

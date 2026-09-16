@@ -93,9 +93,10 @@ export interface InstantFailRoundSignals {
   /**
    * Wall-clock duration of the round in ms. Adapter-reported
    * (HarnessRoundResult.durationMs) on resolved rounds; scheduler-computed
-   * (Date.now() - roundStartMs) on adapter-throw rounds. Absent when there
-   * is no duration signal — classification is impossible and the round is
-   * left alone.
+   * from the MONOTONIC round-start Stopwatch on adapter-throw rounds
+   * (TIME-CLOCKS rule 1 — never a `Date.now()` difference). Absent when
+   * there is no duration signal — classification is impossible and the
+   * round is left alone.
    */
   wallMs?: number;
   /** Resolved harness round result. Absent when the adapter threw (spawn/findBinary failure). */

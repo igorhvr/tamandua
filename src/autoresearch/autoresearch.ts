@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { nowIso } from "../lib/instant.js";
+import { nowIso, Stopwatch } from "../lib/instant.js";
 import { parsePiOutputStream } from "../installer/pi-stream-parser.js";
 
 export type AutoresearchDirection = "lower" | "higher";
@@ -689,7 +689,10 @@ function nextRunNumber(entries: AutoresearchLogEntry[]): number {
 
 function runCommand(command: string, cwd: string, timeoutMs: number): Promise<CommandResult> {
   return new Promise((resolve) => {
-    const started = Date.now();
+    // TIME-CLOCKS rule 1: an in-process command duration is measured with a
+    // monotonic Stopwatch, never `Date.now()` arithmetic, so a wall-clock jump
+    // during the command cannot report a negative or inflated duration.
+    const watch = new Stopwatch();
     const child = spawn(command, {
       cwd,
       shell: true,
@@ -709,11 +712,11 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Co
     child.stderr?.on("data", (chunk) => { stderr += chunk.toString("utf-8"); });
     child.on("close", (code) => {
       clearTimeout(timeout);
-      resolve({ exitCode: timedOut ? null : code, stdout, stderr, durationMs: Date.now() - started, timedOut });
+      resolve({ exitCode: timedOut ? null : code, stdout, stderr, durationMs: watch.elapsedMs(), timedOut });
     });
     child.on("error", (err) => {
       clearTimeout(timeout);
-      resolve({ exitCode: null, stdout, stderr: stderr + err.message, durationMs: Date.now() - started, timedOut });
+      resolve({ exitCode: null, stdout, stderr: stderr + err.message, durationMs: watch.elapsedMs(), timedOut });
     });
   });
 }

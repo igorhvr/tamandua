@@ -4,7 +4,7 @@ import path from "node:path";
 import { resolveTamanduaCli, resolveWorkflowDir, resolveWorkflowWorkspaceDir } from "./paths.js";
 import type { WorkflowSpec, WorkflowAgent, HarnessType } from "./types.js";
 import { logger } from "../lib/logger.js";
-import { SQL_NOW_ISO } from "../lib/instant.js";
+import { SQL_NOW_ISO, monotonicNow, Stopwatch } from "../lib/instant.js";
 import { getRoleTimeoutSeconds, inferRole } from "./install.js";
 import { formatPiCommandPreview } from "./pi-command-preview.js";
 import { emitEvent, getRunEvents, type TamanduaEvent } from "./events.js";
@@ -112,8 +112,11 @@ interface InstantFailStreak {
   /** Consecutive classified instant-fail rounds for this job. */
   consecutive: number;
   /**
-   * Epoch ms before which the job's next dispatch round is skipped
-   * (backoff). 0 when no backoff is active.
+   * Monotonic ms (TIME-CLOCKS rule 1) before which the job's next dispatch
+   * round is skipped (backoff). 0 when no backoff is active. This is an
+   * in-process deadline — it never survives a restart and must never be
+   * mixed with `Date.now()`/epoch instants, so a wall-clock jump cannot
+   * release or extend the backoff.
    */
   nextAllowedDispatchAt: number;
 }
@@ -1268,6 +1271,60 @@ async function attributeWorkRoundTokenUsage(
 // ── Instant-fail round tracking (RSPN) ───────────────────────────────
 
 /**
+ * Monotonic elapsed ms for a round-start {@link Stopwatch}.
+ *
+ * The watch is created in the work-spawn section, after the launch-time
+ * probe and immediately before binary resolution. If the round throws
+ * before that point there is no duration signal at all, so return a
+ * sentinel FAR above any instant-fail threshold: an unmeasurable round must
+ * never be classified as an instant fail on a duration it never measured
+ * (the pre-TIME-CLOCKS code produced the same "not an instant fail"
+ * outcome via an epoch-sized `Date.now()` difference against a zero
+ * round-start). Never reads the wall clock.
+ */
+function roundElapsedMs(watch: Stopwatch | undefined): number {
+  return watch ? watch.elapsedMs() : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Arm the instant-fail relaunch backoff as a MONOTONIC deadline (TIME-CLOCKS
+ * rule 1): `nextAllowedDispatchAt` is an opaque `monotonicNow()` reading plus
+ * the backoff delay, never an epoch instant, so a wall-clock jump (NTP step,
+ * suspend/resume) can neither release the gate early nor extend the backoff.
+ *
+ * `now` is injectable for the cross-cutting wall-jump regression suite; the
+ * default is the production monotonic clock.
+ *
+ * @returns the armed monotonic deadline.
+ */
+export function armInstantFailBackoff(
+  jobId: string,
+  consecutive: number,
+  delayMs: number,
+  now: number = monotonicNow(),
+): number {
+  const nextAllowedDispatchAt = now + delayMs;
+  instantFailStreaks.set(jobId, { consecutive, nextAllowedDispatchAt });
+  return nextAllowedDispatchAt;
+}
+
+/**
+ * True while a job's instant-fail backoff deadline has not yet passed.
+ *
+ * TIME-CLOCKS rule 1: `now` defaults to `monotonicNow()` and the stored
+ * `nextAllowedDispatchAt` is monotonic, so the gate cannot be released (or
+ * extended) by a forward/backward wall-clock jump. Exported so the
+ * cross-cutting wall-jump suite can exercise the gate without a live harness;
+ * `executeDispatchRound` passes its own `monotonicNow()` reading explicitly.
+ */
+export function isInstantFailBackoffActive(
+  streak: { nextAllowedDispatchAt: number } | undefined,
+  now: number = monotonicNow(),
+): boolean {
+  return streak !== undefined && streak.nextAllowedDispatchAt > now;
+}
+
+/**
  * Classify a completed dispatch round as an instant fail (conservatively:
  * wall time below the threshold AND zero TRIMMED output bytes AND nonzero
  * exit or signal-death) and update the per-job consecutive streak:
@@ -1337,8 +1394,11 @@ async function trackInstantFailRound(
 
   if (consecutive >= k) {
     const delayMs = instantFailBackoffDelayMs(consecutive);
-    const nextAllowedDispatchAt = Date.now() + delayMs;
-    instantFailStreaks.set(job.id, { consecutive, nextAllowedDispatchAt });
+    // TIME-CLOCKS rule 1: the backoff window is an in-process deadline, so
+    // it is armed and gated on the monotonic clock — a wall-clock jump
+    // (NTP step, suspend/resume) can neither release the gate early nor
+    // extend the backoff.
+    const nextAllowedDispatchAt = armInstantFailBackoff(job.id, consecutive, delayMs);
     logger.warn("Instant-fail loop detected — backing off relaunch", {
       ...context,
       consecutiveInstantFails: consecutive,
@@ -1467,13 +1527,18 @@ export async function executeDispatchRound(
   // window elapses, N unreachable, run idle with a pending step (IFLB-mid
   // regression).
   const backoff = instantFailStreaks.get(job.id);
-  if (backoff && backoff.nextAllowedDispatchAt > Date.now()) {
+  // TIME-CLOCKS rule 1: `nextAllowedDispatchAt` is a monotonic deadline, so
+  // the gate and its remaining-time readout must use `monotonicNow()` —
+  // comparing it to `Date.now()` would mix clocks and let a wall jump
+  // release the backoff (or report a nonsensical remaining time).
+  const nowMonotonic = monotonicNow();
+  if (backoff && isInstantFailBackoffActive(backoff, nowMonotonic)) {
     logger.debug("Dispatch round skipped — instant-fail backoff", {
       ...context,
       reason: "instant_fail_backoff",
       consecutiveInstantFails: backoff.consecutive,
       backoffUntilMs: backoff.nextAllowedDispatchAt,
-      backoffRemainingMs: backoff.nextAllowedDispatchAt - Date.now(),
+      backoffRemainingMs: backoff.nextAllowedDispatchAt - nowMonotonic,
     });
     return;
   }
@@ -1518,13 +1583,16 @@ export async function executeDispatchRound(
 
   // Declared outside try so catch/post-round handlers can access exit diagnostics
   let result: HarnessRoundResult | undefined;
-  // Round-start timestamp for instant-fail classification (RSPN). The
+  // Round-start stopwatch for instant-fail classification (RSPN). The
   // adapters now report their own durationMs on resolved rounds; this
   // capture covers the adapter-throw path (deleted/broken harness binary
   // — findBinary/spawn failure), where no result ever exists to carry a
-  // duration. Captured in the work-spawn section BEFORE binary resolution
-  // so the throw path can still be classified on wall time.
-  let roundStartMs = 0;
+  // duration. Created in the work-spawn section BEFORE binary resolution so
+  // the throw path can still be classified. TIME-CLOCKS rule 1: it is a
+  // Stopwatch over the MONOTONIC clock — a wall-clock jump during the round
+  // must not shrink or inflate the measured duration (which would flip the
+  // instant-fail classification).
+  let roundStartWatch: Stopwatch | undefined;
   // Set when this round's orphan recovery actually recovered a claimed
   // step (the worker claimed and died). Such rounds are worker_lost, not
   // instant-fail (RSPN) — the classifier must never count them toward the
@@ -1899,15 +1967,20 @@ export async function executeDispatchRound(
     let output: string;
     const adapter = getHarnessAdapter(harnessType);
     if (harnessType === "dsh") {
+      // TIME-CLOCKS allow-list (rule 3): dsh session attribution compares
+      // this round-start stamp against OS file mtimes ($DSH_HOME session
+      // files), so it stays an epoch-ms instant and MUST NOT be switched to
+      // monotonic time. US-010 routes that comparison through the shared
+      // instant helpers/tolerance (dsh-usage's `createdSinceSpawn` /
+      // `instantAgeMs` with `DSH_SESSION_MTIME_TOLERANCE_MS`).
       dshRoundStartedAtMs = Date.now();
     }
-    // Round-start timestamp for instant-fail classification (RSPN). The
+    // Round-start stopwatch for instant-fail classification (RSPN). The
     // adapters now report their own durationMs on resolved rounds; this
     // capture covers the adapter-throw path (deleted/broken harness binary
     // — findBinary/spawn failure), where no result ever exists to carry a
-    // duration. Captured BEFORE binary resolution so the throw path can
-    // still be classified on wall time.
-    roundStartMs = Date.now();
+    // duration. Created BEFORE binary resolution (see roundElapsedMs).
+    roundStartWatch = new Stopwatch();
     // Pre-resolve the binary path. For hermes and dsh, this goes through
     // the same shared resolvers that admission validation uses,
     // guaranteeing single-source dispatch — no disagreement between
@@ -2118,10 +2191,11 @@ export async function executeDispatchRound(
     // the wall threshold before claiming any step — increments the
     // per-job streak, applies escalating backoff at K consecutive rounds,
     // and force-fails the run at N (with a distinct alert event). The
-    // adapter's durationMs is the round's wall time; the roundStartMs
-    // fallback covers rounds where the adapter never returned one.
+    // adapter's durationMs is the round's wall time; the monotonic
+    // roundStartWatch fallback covers rounds where the adapter never
+    // returned one.
     await trackInstantFailRound(job, context, {
-      wallMs: result?.durationMs ?? Date.now() - roundStartMs,
+      wallMs: result?.durationMs ?? roundElapsedMs(roundStartWatch),
       result,
       recoveredOrphans: roundRecoveredOrphans,
     });
@@ -2260,7 +2334,7 @@ export async function executeDispatchRound(
       // existing worker_lost path (which recovers nothing for unclaimed
       // steps); this adds the streak/backoff/escalation handling.
       await trackInstantFailRound(job, context, {
-        wallMs: Date.now() - roundStartMs,
+        wallMs: roundElapsedMs(roundStartWatch),
         adapterThrew: true,
         recoveredOrphans: roundRecoveredOrphans,
       });
@@ -2421,7 +2495,10 @@ async function runLaunchTimeHarnessProbe(params: {
   const harnessType = job.harnessType ?? "pi";
   const probeCmd = buildHarnessProbeCommand();
   const prompt = buildHarnessProbePrompt();
-  const probeStartedAtMs = Date.now();
+  // TIME-CLOCKS rule 1: the probe's duration fallback is an in-process
+  // interval, measured by a monotonic Stopwatch so a wall-clock jump cannot
+  // produce a negative or inflated probe duration.
+  const probeWatch = new Stopwatch();
   // dsh probe rounds need a round-start timestamp for the session-file
   // token scan (dsh prints no session id; usage lives in $DSH_HOME files).
   let dshProbeStartedAtMs: number | undefined;
@@ -2431,7 +2508,7 @@ async function runLaunchTimeHarnessProbe(params: {
     harness: fields.harness,
     probeCmd: fields.probeCmd,
     expected: fields.expected,
-    durationMs: fields.durationMs ?? Math.max(0, Date.now() - probeStartedAtMs),
+    durationMs: fields.durationMs ?? Math.max(0, probeWatch.elapsedMs()),
     tokens: 0,
     failureBlock: buildHarnessProbeFailureBlock(fields),
     observed: harnessProbeObservedDisplay(fields.observed),
@@ -2461,6 +2538,11 @@ async function runLaunchTimeHarnessProbe(params: {
   }
 
   if (harnessType === "dsh") {
+    // TIME-CLOCKS allow-list (rule 3): the dsh probe's session scan
+    // compares this stamp against OS file mtimes, so it stays epoch ms and
+    // MUST NOT be switched to monotonic time. US-010 routes that comparison
+    // through the shared instant helpers (dsh-usage's `createdSinceSpawn` /
+    // `instantAgeMs` with `DSH_SESSION_MTIME_TOLERANCE_MS`).
     dshProbeStartedAtMs = Date.now();
   }
   const harnessEnv = buildHarnessChildEnv(job, binaryPath);
@@ -2527,7 +2609,7 @@ async function runLaunchTimeHarnessProbe(params: {
     });
   }
 
-  const durationMs = result.durationMs ?? Math.max(0, Date.now() - probeStartedAtMs);
+  const durationMs = result.durationMs ?? Math.max(0, probeWatch.elapsedMs());
 
   // The observed message is the harness's final assistant message — for pi
   // (--mode json) that is the message_end assistant text, for text-only

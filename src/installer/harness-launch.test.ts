@@ -52,6 +52,7 @@ import {
 import { getRunEvents } from "../../dist/installer/events.js";
 import { formatLogsTailLine } from "../../dist/installer/logs-tail-format.js";
 import { getHarnessAdapter } from "../../dist/installer/harness-adapter.js";
+import { monotonicNow } from "../../dist/lib/instant.js";
 
 // ── Test-isolation state env ───────────────────────────────────────
 // Launches emit logger lines and (with identity) run.harness_isolation
@@ -895,7 +896,10 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
       const counter = path.join(root, "harness-executions");
       const harness = makeCounterHarness(root, counter);
       makeFakeHelper(root, "hang");
-      const started = Date.now();
+      // US-003: wallDeadlineMs is on the MONOTONIC clock (the adapters pass
+      // monotonicNow()-based deadlines), so the test budget must use the same
+      // base — never Date.now().
+      const started = monotonicNow();
       // Count REAL OS spawns via the launch's own onSpawn handles — not the
       // helper's journal, whose first line can lose the race with an early
       // overall-budget SIGKILL on slow hosts (same fix as the cancellation
@@ -918,13 +922,57 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
           .then(resolve)
           .catch(reject);
       });
-      const elapsed = Date.now() - started;
+      const elapsed = monotonicNow() - started;
       assert.equal(outcome.status, "aborted", "the overall budget must abort the launch");
       if (outcome.status !== "aborted") return;
       assert.equal(outcome.timedOut, true, "budget exhaustion is a timed-out abort");
       assert.equal(readCounter(counter), 0, "zero harness executions after the budget expired");
       assert.equal(spawnHandles, 1, "the setup child was spawned exactly once and killed");
       assert.ok(elapsed < 2000, `launch must settle near the 250ms budget, took ${elapsed}ms`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("US-003: a monotonic wall budget is honored despite a backward wall-clock jump", async () => {
+    const root = tamanduaTempDir("tamandua-launch-monotonic-wall-");
+    try {
+      const counter = path.join(root, "harness-executions");
+      makeFakeHelper(root, "hang"); // never reports READY: the budget must fire
+      const harness = makeCounterHarness(root, counter);
+      const realDateNow = Date.now;
+      let spawnHandles = 0;
+      const started = monotonicNow();
+      // Backward wall jump for the whole launch. The launch's deadline is
+      // monotonic (the adapters pass monotonicNow()-based budgets), so the
+      // setup child must still be spawned once and killed at ~250ms. Mixing
+      // an epoch clock into the comparison would either treat the budget as
+      // already expired (zero spawns) or never expire it (20s setup wall).
+      Date.now = () => realDateNow() - 24 * 60 * 60 * 1000;
+      try {
+        const outcome = await launchHarnessExecution({
+          harness: "test",
+          command: [harness],
+          cwd: root,
+          seams: { probe: { platform: "linux", artifactDir: root }, setupWallMs: 20_000 },
+          wallDeadlineMs: started + 250,
+          onSpawn: () => {
+            spawnHandles++;
+          },
+        });
+        const elapsed = monotonicNow() - started;
+        assert.equal(outcome.status, "aborted", "the monotonic overall budget must abort the launch");
+        if (outcome.status !== "aborted") return;
+        assert.equal(outcome.timedOut, true, "budget exhaustion is a timed-out abort");
+        assert.equal(readCounter(counter), 0, "zero harness executions after the budget expired");
+        assert.equal(spawnHandles, 1, "the setup child was spawned exactly once and killed");
+        assert.ok(
+          elapsed < 2000,
+          `the monotonic budget must fire near 250ms despite the wall jump, took ${elapsed}ms`,
+        );
+      } finally {
+        Date.now = realDateNow;
+      }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -945,7 +993,7 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
         cwd: root,
         identity: { runId: "run-launch-expired-forced-1" },
         seams: { forceFallbackReason: "forced-by-test" },
-        wallDeadlineMs: Date.now() - 100,
+        wallDeadlineMs: monotonicNow() - 100,
       });
       assert.equal(outcome.status, "aborted", "an expired deadline must abort the launch");
       if (outcome.status !== "aborted") return;
@@ -975,7 +1023,7 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
         cwd: root,
         identity: { runId: "run-launch-expired-unavail-1" },
         seams: { probe: { platform: "linux", artifactDir: emptyArtifact } },
-        wallDeadlineMs: Date.now() - 100,
+        wallDeadlineMs: monotonicNow() - 100,
       });
       assert.equal(outcome.status, "aborted", "an expired deadline must abort the launch");
       if (outcome.status !== "aborted") return;
@@ -1012,7 +1060,7 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
             sandboxExecPath: "/usr/bin/false",
           },
         },
-        wallDeadlineMs: Date.now() - 100,
+        wallDeadlineMs: monotonicNow() - 100,
       });
       assert.equal(outcome.status, "aborted", "an expired deadline must abort the launch");
       if (outcome.status !== "aborted") return;
@@ -1223,28 +1271,23 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
     }
   });
 
-  it("an overall-budget timer firing marginally before the clock crosses its deadline NEVER falls back (retained armed cause)", async (t) => {
-    // Deterministic regression for the timer-cause defect the US-005 full
-    // gate caught (harness-launch.ts setup timer): the timer was armed for
+  it("an overall-armed setup timer aborts timed out and NEVER falls back (retained armed cause)", async () => {
+    // Regression for the timer-cause defect the US-005 full gate caught
+    // (harness-launch.ts setup timer): the timer was armed for
     // min(overall deadline, setup wall) but the callback DECIDED which
-    // deadline fired by re-reading Date.now(). Wall-clock vs timer skew can
-    // deliver the overall-budget timer marginally BEFORE Date.now() crosses
+    // deadline fired by re-reading the clock. Clock vs timer skew can
+    // deliver the overall-budget timer marginally BEFORE the clock crosses
     // that deadline, and the old code then mislabeled the kill as a
     // readiness-wall expiry -> settleFallback -> an unprotected fallback ran
     // AFTER the round's overall budget expired. The fix retains the ARMED
     // cause: an overall-armed fire always aborts timed out with zero starts.
     //
-    // Repro: freeze the mocked Date at T0+49 while the real ~50ms setup
-    // timer (armed at T0+50) fires. Real setTimeout still fires on real
-    // time, but Date.now() reads T0+49 < the armed T0+50 deadline the whole
-    // time — the exact skew window. Old code: wallExhausted() false ->
-    // missing-readiness -> fallback (counter 1, two spawns). Fixed code:
-    // armedForOverall -> abort timedOut (counter 0, one spawn).
-    t.mock.timers.enable({ apis: ["Date"] });
+    // US-003: both deadlines are monotonic now, so the test arms a short
+    // overall budget (50ms) well below the 20s readiness wall — the setup
+    // timer is armed FOR THE OVERALL BUDGET and fires first. The retained
+    // armed cause must abort timedOut with zero starts and no fallback.
     const root = tamanduaTempDir("tamandua-launch-timercause-");
     try {
-      const T0 = 1_000_000;
-      t.mock.timers.setTime(T0);
       const counter = path.join(root, "harness-executions");
       makeFakeHelper(root, "hang"); // never reports READY
       const harness = makeCounterHarness(root, counter);
@@ -1255,12 +1298,9 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
         cwd: root,
         identity: { runId: "run-timercause-1" },
         seams: { probe: { platform: "linux", artifactDir: root }, setupWallMs: 20_000 },
-        wallDeadlineMs: T0 + 50,
+        wallDeadlineMs: monotonicNow() + 50,
         onSpawn: (h) => spawnHandles.push(h),
       });
-      // Hold the mocked wall clock 1ms BELOW the armed overall deadline for
-      // the whole real-time wait, then let the real timer fire.
-      t.mock.timers.setTime(T0 + 49);
       const outcome = await outcomePromise;
       assert.equal(outcome.status, "aborted", `overall-budget fire must abort (${outcome.reason ?? ""})`);
       if (outcome.status !== "aborted") return;
@@ -1271,7 +1311,6 @@ describe("shared harness launch mechanism (fixture helpers)", () => {
       const records = isolationRecords("run-timercause-1");
       assert.equal(records.length, 0, "no unprotected-fallback record may exist for an overall-budget abort");
     } finally {
-      t.mock.timers.reset();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

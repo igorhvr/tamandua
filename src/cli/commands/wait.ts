@@ -9,7 +9,7 @@ import { getDb } from "../../db.js";
 import { resolvePiStateDir } from "../../installer/paths.js";
 import { readHarnessProbeFailureBlock } from "../../installer/status.js";
 import { parseDuration, readOption } from "../shared.js";
-import { parseInstant } from "../../lib/instant.js";
+import { monotonicNow, instantAgeMs } from "../../lib/instant.js";
 import fs from "node:fs";
 import path from "node:path";
 import { prefixRunId } from "../../lib/id-prefix.js";
@@ -143,16 +143,18 @@ export function computeExitCode(states: RunState[], timedOut: boolean): number {
 export function formatJsonOutput(result: WaitResult): string {
   return JSON.stringify({
     runs: result.runs.map((r) => {
-      // TIME-STORAGE US-006: the shared reader pins legacy naive UTC values to
-      // UTC instead of the host offset. Missing/unparseable -> 0, as before.
-      const createdAt = parseInstant(r.createdAt);
+      // TIME-CLOCKS US-012 (rule 2): the durable stored createdAt is aged
+      // NUMERICALLY through the shared helper (legacy naive UTC read as UTC,
+      // never host-local). Missing/unparseable -> 0, exactly as before. This is
+      // a durable instant, not an in-process interval.
+      const ageMs = instantAgeMs(r.createdAt);
       return {
         runId: prefixRunId(r.runId),
         runNumber: r.runNumber,
         workflowId: r.workflowId,
         status: r.status,
         tokensSpent: r.tokensSpent,
-        durationMs: createdAt ? Date.now() - createdAt.getTime() : 0,
+        durationMs: ageMs ?? 0,
         steps: {
           done: r.steps.done,
           failed: r.steps.failed,
@@ -169,8 +171,9 @@ export function formatHumanOutput(result: WaitResult): string {
   return result.runs
     .map((r) => {
       const snapshot = r.runNumber !== null ? `#${r.runNumber}` : `run-${r.runId.slice(0, 8)}`;
-      const createdAt = parseInstant(r.createdAt);
-      const duration = createdAt ? formatElapsed(Date.now() - createdAt.getTime()) : "?";
+      // Durable stored instant (TIME-CLOCKS US-012 rule 2) — see formatJsonOutput.
+      const ageMs = instantAgeMs(r.createdAt);
+      const duration = ageMs === undefined ? "?" : formatElapsed(ageMs);
       return `${snapshot} run-${r.runId.slice(0, 8)} ${r.workflowId} ${r.status} ${duration} ${r.tokensSpent.toLocaleString()} tokens`;
     })
     .join("\n") + "\n";
@@ -333,7 +336,10 @@ export async function handleWait(args: string[]): Promise<number> {
   }
 
   // ── Wait loop ────────────────────────────────────────────────────
-  const startTime = Date.now();
+  // TIME-CLOCKS item 11 / US-007: the wait budget and the 60s heartbeat
+  // throttle are in-process intervals, so both run on the monotonic clock.
+  // The stored createdAt-based durations below stay wall-based (rule 2).
+  const startTime = monotonicNow();
   const stateDir = resolvePiStateDir();
   const db = getDb();
 
@@ -388,7 +394,8 @@ export async function handleWait(args: string[]): Promise<number> {
     }
 
     while (exitCode === null) {
-      const elapsed = Date.now() - startTime;
+      const now = monotonicNow();
+      const elapsed = now - startTime;
 
       // Check timeout
       if (timeoutMs !== null && elapsed >= timeoutMs) {
@@ -419,12 +426,12 @@ export async function handleWait(args: string[]): Promise<number> {
       const allTerminal = states.every((s) => isTerminal(s.status));
 
       // Heartbeat on transition or every 60s
-      const heartbeatDue = (elapsed - lastHeartbeatTime) >= HEARTBEAT_INTERVAL_MS;
+      const heartbeatDue = (now - lastHeartbeatTime) >= HEARTBEAT_INTERVAL_MS;
       for (const s of states) {
         heartbeat(s, elapsed, heartbeatDue || allTerminal);
       }
       if (heartbeatDue) {
-        lastHeartbeatTime = Date.now();
+        lastHeartbeatTime = now;
       }
 
       // Daemon-down warning

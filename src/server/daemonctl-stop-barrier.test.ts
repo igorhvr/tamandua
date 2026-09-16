@@ -14,6 +14,7 @@ import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
 import {
@@ -189,6 +190,46 @@ describe("stop-barrier helpers", () => {
       assert.ok(barrierError !== null, "expected waitForDaemonStop to throw on timeout");
       assert.match(barrierError!.message, /daemon/i, "error should name the daemon");
       assert.match(barrierError!.message, /10s|within/i, "error should mention the timeout");
+    });
+  });
+
+  // ── US-004: monotonic wait deadlines ─────────────────────────────
+  //
+  // These prove the stop barriers poll on a monotonic budget: a wall-clock
+  // jump (NTP step / suspend-resume) can neither end a wait early nor extend
+  // it. Under the old `Date.now()`-derived deadlines a forward jump made the
+  // 10s budget look already-expired on the first iteration, so the barrier
+  // threw while the process was still alive.
+  describe("US-004 monotonic wait deadlines", () => {
+    it("a forward wall-clock jump does not shorten waitForDashboardStop", async () => {
+      const { homeDir } = createTempHome("tamandua-barrier-monotonic-fwd-");
+      fs.mkdirSync(path.join(homeDir, ".tamandua"), { recursive: true });
+
+      // Child outlives the first poll interval, so the barrier must keep
+      // polling until it really exits.
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 600)"], {
+        stdio: "ignore",
+      });
+      const pid = child.pid;
+      assert.ok(pid, "child should have a pid");
+      const port = await reserveRandomPort();
+      writeServiceFiles(homeDir, "dashboard.pid", "port", pid!, port);
+
+      const realNow = Date.now;
+      let reads = 0;
+      const DAY = 24 * 60 * 60 * 1000;
+      // Every wall-clock read jumps a full day forward.
+      Date.now = () => realNow() + (++reads) * DAY;
+      try {
+        // If the barrier used wall time the jump would look like the 10s
+        // budget had expired, and the diagnostic below would throw while the
+        // child is still alive. Monotonic time polls until the child exits.
+        await waitForDashboardStop({ homeDir });
+      } finally {
+        Date.now = realNow;
+        try { child.kill("SIGKILL"); } catch {}
+        fs.rmSync(homeDir, { recursive: true, force: true });
+      }
     });
   });
 });

@@ -170,6 +170,7 @@ tests/run-token-migration.test.ts
 tests/runner-scripts.test.ts
 tests/sample-project-fixture.test.ts
 tests/step-ops-dispatch-races.test.ts
+tests/step-ops-instant-staleness.test.ts
 tests/step-ops-tstx-pq-shell.test.ts
 tests/step-ops.test.ts
 tests/step-ownership-columns-migration.test.ts
@@ -179,6 +180,7 @@ tests/step-respawned.test.ts
 tests/stories-json-validation.test.ts
 tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
+tests/time-clocks-wall-jump.test.ts
 tests/time-output-tz.test.ts
 tests/token-log-formatting.test.ts
 tests/token-usage-policy.test.ts

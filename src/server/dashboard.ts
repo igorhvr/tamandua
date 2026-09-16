@@ -31,6 +31,7 @@ import { pauseRunWithDaemon, resumeRunWithDaemon } from "./control-client.js";
 import { runWorkflow } from "../installer/run.js";
 import { stopWorkflow, deleteWorkflow, getWorkflowStatus } from "../installer/status.js";
 import { parseRunContext } from "../installer/step-ops.js";
+import { monotonicNow, instantAgeMs, isOlderThan } from "../lib/instant.js";
 import { readVersionStatus } from "../lib/version-check.js";
 import { getBuildVersion } from "../lib/version.js";
 import {
@@ -49,11 +50,20 @@ const KANBAN_HTML = path.join(__dirname, "kanban.html");
 
 // ── Runs List Cache ────────────────────────────────────────────────
 
+// TIME-CLOCKS rule 1: the cache TTL is an in-process interval, so `timestamp`
+// is a MONOTONIC reading (monotonicNow), never an epoch instant. A wall-clock
+// jump (NTP step, suspend/resume) must not expire a still-fresh cache entry or
+// extend its life. The cached JSON and the response shape are unchanged.
 let runsCache: { json: string; timestamp: number } | null = null;
 const RUNS_CACHE_TTL_MS = 2000;
 
 export function invalidateRunsCache(): void {
   runsCache = null;
+}
+
+/** @internal Test seam: the monotonic timestamp of the cached /api/runs body. */
+export function _runsCacheTimestampForTest(): number | null {
+  return runsCache?.timestamp ?? null;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -155,8 +165,8 @@ function buildAutoresearchExperiments(entries: AutoresearchLogEntry[]) {
 
 function handleListRuns(_req: http.IncomingMessage, res: http.ServerResponse): void {
   try {
-    // Serve from cache if fresh enough
-    if (runsCache !== null && Date.now() - runsCache.timestamp < RUNS_CACHE_TTL_MS) {
+    // Serve from cache if fresh enough (monotonic TTL — rule 1)
+    if (runsCache !== null && monotonicNow() - runsCache.timestamp < RUNS_CACHE_TTL_MS) {
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": "*",
@@ -204,7 +214,7 @@ function handleListRuns(_req: http.IncomingMessage, res: http.ServerResponse): v
     });
 
     const responseBody = JSON.stringify({ runs });
-    runsCache = { json: responseBody, timestamp: Date.now() };
+    runsCache = { json: responseBody, timestamp: monotonicNow() };
 
     jsonResponse(res, { runs });
   } catch (err) {
@@ -914,6 +924,80 @@ function handleVersionStatus(_req: http.IncomingMessage, res: http.ServerRespons
 
 const FLAKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h
 
+/**
+ * Tolerance for the FLAKE_WINDOW_MS age comparison (TIME-CLOCKS rule 2).
+ *
+ * The window is a coarse 24h bucket over a ledger written by multiple
+ * processes/hosts whose wall clocks may differ by sub-second amounts, so 1s
+ * of slack keeps a row written just inside the window from being dropped by
+ * skew. The comparison stays strict at the widened boundary
+ * (`age > FLAKE_WINDOW_MS + tolerance`).
+ */
+const FLAKE_WINDOW_TOLERANCE_MS = 1_000;
+
+interface SuiteFlakyKey {
+  tree_hash: string;
+  cmd_hash: string;
+  cmd_display: string;
+  pass_count: number;
+  fail_count: number;
+}
+
+/**
+ * Aggregate flaky keys — a `(tree_hash, cmd_hash)` that has both a green and
+ * a red run — inside the 24h flake window.
+ *
+ * Each stored `created_at` is aged numerically via `instantAgeMs` /
+ * `isOlderThan` (TIME-CLOCKS US-011) instead of a `created_at >= ?` SQL
+ * string bound, so legacy naive-UTC instants compare correctly and an
+ * unparseable instant is NEVER counted inside the window (`isOlderThan` alone
+ * treats an unknown instant as fresh, so the parseability check is explicit).
+ *
+ * Grouping and ordering (descending total runs) are unchanged, and so is the
+ * dashboard's existing exit-code semantics: exit 0 counts as a pass, every
+ * non-zero exit counts as a fail (this endpoint does not special-case 87).
+ * `nowMs` is injectable for tests; production uses `Date.now()`.
+ */
+export function flakyKeysWithinWindow(
+  db: ReturnType<typeof getDb>,
+  nowMs: number = Date.now(),
+): SuiteFlakyKey[] {
+  const rows = db.prepare(
+    "SELECT tree_hash, cmd_hash, cmd_display, exit_code, created_at FROM suite_results",
+  ).all() as Array<{
+    tree_hash: string;
+    cmd_hash: string;
+    cmd_display: string;
+    exit_code: number;
+    created_at: string;
+  }>;
+
+  const byKey = new Map<string, SuiteFlakyKey>();
+  for (const row of rows) {
+    if (instantAgeMs(row.created_at, nowMs) === undefined) continue;
+    if (isOlderThan(row.created_at, FLAKE_WINDOW_MS, nowMs, FLAKE_WINDOW_TOLERANCE_MS)) continue;
+
+    const key = `${row.tree_hash}\u0000${row.cmd_hash}`;
+    let agg = byKey.get(key);
+    if (!agg) {
+      agg = {
+        tree_hash: row.tree_hash,
+        cmd_hash: row.cmd_hash,
+        cmd_display: row.cmd_display,
+        pass_count: 0,
+        fail_count: 0,
+      };
+      byKey.set(key, agg);
+    }
+    if (row.exit_code === 0) agg.pass_count++;
+    else agg.fail_count++;
+  }
+
+  return [...byKey.values()]
+    .filter((key) => key.pass_count > 0 && key.fail_count > 0)
+    .sort((a, b) => (b.pass_count + b.fail_count) - (a.pass_count + a.fail_count));
+}
+
 function handleRunSuiteStats(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -961,38 +1045,9 @@ function handleRunSuiteStats(
 function handleSuiteFlaky(_req: http.IncomingMessage, res: http.ServerResponse): void {
   try {
     const db = getDb();
-    const cutoff = new Date(Date.now() - FLAKE_WINDOW_MS).toISOString();
-
-    // Find keys that have both green (exit_code=0) and red (exit_code!=0) within FLAKE_WINDOW
-    const rows = db.prepare(`
-      SELECT
-        tree_hash,
-        cmd_hash,
-        cmd_display,
-        SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS pass_count,
-        SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) AS fail_count
-      FROM suite_results
-      WHERE created_at >= ?
-      GROUP BY tree_hash, cmd_hash
-      HAVING pass_count > 0 AND fail_count > 0
-      ORDER BY (pass_count + fail_count) DESC
-    `).all(cutoff) as Array<{
-      tree_hash: string;
-      cmd_hash: string;
-      cmd_display: string;
-      pass_count: number;
-      fail_count: number;
-    }>;
-
-    const flakyKeys = rows.map((row) => ({
-      tree_hash: row.tree_hash,
-      cmd_hash: row.cmd_hash,
-      cmd_display: row.cmd_display,
-      pass_count: row.pass_count,
-      fail_count: row.fail_count,
-    }));
-
-    jsonResponse(res, { flaky_keys: flakyKeys });
+    // US-011: age each row numerically via the shared instant helpers rather
+    // than a `created_at >= ?` string cutoff.
+    jsonResponse(res, { flaky_keys: flakyKeysWithinWindow(db) });
   } catch (err) {
     errorResponse(res, `Failed to get flaky keys: ${(err as Error).message}`);
   }

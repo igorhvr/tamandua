@@ -11,6 +11,7 @@ import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
   STALE_LAUNCH_PHANTOM_AGE_MS,
   STALE_LAUNCH_PHANTOM_REASON,
+  STALE_LAUNCH_PHANTOM_TOLERANCE_MS,
   recoverStaleLaunchPhantoms,
 } from "../../dist/installer/run-recovery.js";
 
@@ -227,5 +228,84 @@ describe("recoverStaleLaunchPhantoms", () => {
 
     const row = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
     assert.equal(row.status, "running");
+  });
+
+  // ── US-009: numeric, injected-now age comparison (no SQL datetime bound) ──
+
+  function insertPhantom(
+    id: string,
+    createdAt: string,
+    updatedAt: string = createdAt,
+  ): void {
+    getDb()
+      .prepare(
+        `INSERT INTO runs
+           (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at)
+         VALUES (?, 'lncz-recovery-test', 'test', 'running', '{}', 0, 'pending_register', ?, ?)`,
+      )
+      .run(id, createdAt, updatedAt);
+  }
+
+  function runStatus(id: string): string {
+    return (getDb().prepare("SELECT status FROM runs WHERE id = ?").get(id) as { status: string })
+      .status;
+  }
+
+  it("uses the injected now: a forward wall jump ages a fresh run past the window and a backward one cannot (US-009)", () => {
+    const realNow = Date.now();
+    const runId = crypto.randomUUID();
+    // Fresh at realNow (age < the 30-minute window).
+    insertPhantom(runId, new Date(realNow - STALE_LAUNCH_PHANTOM_AGE_MS + 60_000).toISOString());
+
+    // A backward injected now makes the durable age negative: never stale.
+    const backward = recoverStaleLaunchPhantoms(realNow - 10 * STALE_LAUNCH_PHANTOM_AGE_MS);
+    assert.ok(
+      !backward.runIds.includes(runId),
+      "a backward wall jump must not recover a run that is fresh relative to realNow",
+    );
+    assert.equal(runStatus(runId), "running");
+
+    // A forward injected now ages the same created_at numerically past the window.
+    const forward = recoverStaleLaunchPhantoms(realNow + 2 * STALE_LAUNCH_PHANTOM_AGE_MS);
+    assert.ok(forward.runIds.includes(runId), "a forward wall jump must age the instant past the window");
+    assert.equal(runStatus(runId), "failed");
+  });
+
+  it("applies the documented phantom-age tolerance at the boundary (US-009)", () => {
+    // Floor to the second so the sub-second tolerance boundary is deterministic
+    // (the old `datetime()` SQL bound truncated to whole seconds).
+    const now = Math.floor(Date.now() / 1000) * 1000;
+    const insideId = crypto.randomUUID();
+    const outsideId = crypto.randomUUID();
+    // Age = window + 500ms <= window + tolerance -> NOT stale.
+    insertPhantom(insideId, new Date(now - STALE_LAUNCH_PHANTOM_AGE_MS - 500).toISOString());
+    // Age = window + 5s > window + tolerance -> stale.
+    insertPhantom(outsideId, new Date(now - STALE_LAUNCH_PHANTOM_AGE_MS - 5_000).toISOString());
+
+    const result = recoverStaleLaunchPhantoms(now);
+    assert.ok(
+      !result.runIds.includes(insideId),
+      "an age inside the documented tolerance must not be recovered",
+    );
+    assert.equal(runStatus(insideId), "running");
+    assert.ok(
+      result.runIds.includes(outsideId),
+      "an age beyond the documented tolerance must be recovered",
+    );
+    assert.equal(runStatus(outsideId), "failed");
+  });
+
+  it("never recovers a run whose created_at is unparseable (US-009)", () => {
+    const runId = crypto.randomUUID();
+    // Sanity: the constant is the documented one, not a fabricated small value.
+    assert.equal(STALE_LAUNCH_PHANTOM_TOLERANCE_MS, 1_000);
+    insertPhantom(runId, "not-a-timestamp");
+
+    const result = recoverStaleLaunchPhantoms(Date.now() + 10 * STALE_LAUNCH_PHANTOM_AGE_MS);
+    assert.ok(
+      !result.runIds.includes(runId),
+      "an unknown created_at must never fabricate a stale age",
+    );
+    assert.equal(runStatus(runId), "running");
   });
 });

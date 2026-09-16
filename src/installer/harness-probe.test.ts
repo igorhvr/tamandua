@@ -529,6 +529,45 @@ describe("harness-probe once-per-run DB helpers (IFLB)", () => {
     assert.equal(reserveHarnessProbe("failed-run", { wallMs: 1000, nowMs: T0 + 5000 }), false);
   });
 
+  it("uses isOlderThan with the documented tolerance at the wall boundary (US-011)", () => {
+    insertRun("boundary-run");
+    const T0 = Date.UTC(2026, 8, 3, 12, 0, 0);
+    assert.equal(reserveHarnessProbe("boundary-run", { wallMs: 1000, nowMs: T0 }), true);
+    // Age exactly equal to the wall is NOT strictly older -> still in flight.
+    assert.equal(reserveHarnessProbe("boundary-run", { wallMs: 1000, nowMs: T0 + 1000 }), false);
+    // One millisecond past the wall is stale -> re-reservable.
+    assert.equal(reserveHarnessProbe("boundary-run", { wallMs: 1000, nowMs: T0 + 1001 }), true);
+  });
+
+  it("only one caller wins a stale re-reservation (US-011 single-winner CAS)", () => {
+    insertRun("stale-race-run");
+    const T0 = Date.UTC(2026, 8, 3, 12, 0, 0);
+    assert.equal(reserveHarnessProbe("stale-race-run", { wallMs: 1000, nowMs: T0 }), true);
+
+    const staleNow = T0 + 5000;
+    assert.equal(reserveHarnessProbe("stale-race-run", { wallMs: 1000, nowMs: staleNow }), true);
+    assert.equal(
+      reserveHarnessProbe("stale-race-run", { wallMs: 1000, nowMs: staleNow }),
+      false,
+      "a second caller must not double-claim the same reservation",
+    );
+  });
+
+  it("never treats an unparseable reservation stamp as stale (US-011 safe skip)", () => {
+    insertRun("bad-stamp-run");
+    getDb()
+      .prepare("UPDATE runs SET harness_probe_status = 'probing', harness_probe_at = 'not-a-timestamp' WHERE id = ?")
+      .run("bad-stamp-run");
+
+    const T0 = Date.UTC(2026, 8, 3, 12, 0, 0);
+    assert.equal(
+      reserveHarnessProbe("bad-stamp-run", { wallMs: 1000, nowMs: T0 + 1_000_000 }),
+      false,
+      "an unknown age must never steal the reservation",
+    );
+    assert.equal(readHarnessProbeStatus("bad-stamp-run"), "probing");
+  });
+
   it("reserving a run that does not exist returns false", () => {
     assert.equal(reserveHarnessProbe("never-created"), false);
   });

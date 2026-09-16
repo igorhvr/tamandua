@@ -1,6 +1,7 @@
 import { getDb } from "../db.js";
 import { emitEvent } from "./events.js";
 import { logger } from "../lib/logger.js";
+import { isOlderThan } from "../lib/instant.js";
 
 /**
  * Launch setup normally creates steps and managed-worktree state within seconds.
@@ -8,6 +9,15 @@ import { logger } from "../lib/logger.js";
  * allowing the daemon to recover legacy rows left by crashes or older versions.
  */
 export const STALE_LAUNCH_PHANTOM_AGE_MS = 30 * 60 * 1000;
+
+/**
+ * Tolerance (ms) for the stale-launch-phantom age comparison (TIME-CLOCKS rule
+ * 2). `runs.created_at` and the injected `nowMs` share the host clock, so the
+ * tolerance only absorbs sub-second storage/rounding granularity; it widens the
+ * 30-minute window slightly so a run sitting right at the boundary is never
+ * recovered prematurely.
+ */
+export const STALE_LAUNCH_PHANTOM_TOLERANCE_MS = 1_000;
 
 export const STALE_LAUNCH_PHANTOM_REASON =
   "Daemon recovery: stale launch phantom had no steps and worktree state was absent or stuck in a launch-failure state after 30 minutes";
@@ -21,6 +31,7 @@ interface PhantomCandidate {
   id: string;
   workflow_id: string;
   tokens_spent: number;
+  created_at: string;
 }
 
 /**
@@ -42,20 +53,32 @@ export function recoverStaleLaunchPhantoms(
   nowMs: number = Date.now(),
 ): StaleLaunchPhantomSweepResult {
   const db = getDb();
-  const cutoff = new Date(nowMs - STALE_LAUNCH_PHANTOM_AGE_MS).toISOString();
   const recoveredAt = new Date(nowMs).toISOString();
   const candidates = db.prepare(
-    `SELECT r.id, r.workflow_id, r.tokens_spent
+    `SELECT r.id, r.workflow_id, r.tokens_spent, r.created_at
      FROM runs r
      WHERE r.status = 'running'
-       AND datetime(r.created_at) < datetime(?)
        AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.run_id = r.id)
        AND (NOT EXISTS (SELECT 1 FROM run_worktrees rw WHERE rw.run_id = r.id)
             OR EXISTS (SELECT 1 FROM run_worktrees rw
                        WHERE rw.run_id = r.id
                          AND rw.status IN ('creating', 'error', 'cleanup_failed')))
      ORDER BY r.created_at ASC, r.id ASC`,
-  ).all(cutoff) as unknown as PhantomCandidate[];
+  ).all() as unknown as PhantomCandidate[];
+
+  // The age cutoff is a numeric durable-instant comparison (rule 2): each
+  // run's stored created_at is aged against the injected nowMs via the shared
+  // helper instead of a `datetime(created_at) < datetime(?)` SQL string bound.
+  // An unparseable/missing instant is never stale (isOlderThan -> false), so an
+  // unknown created_at is left alone rather than recovered on a fabricated age.
+  const staleCandidates = candidates.filter((candidate) =>
+    isOlderThan(
+      candidate.created_at,
+      STALE_LAUNCH_PHANTOM_AGE_MS,
+      nowMs,
+      STALE_LAUNCH_PHANTOM_TOLERANCE_MS,
+    ),
+  );
 
   const runIds: string[] = [];
   const failCandidate = db.prepare(
@@ -66,7 +89,6 @@ export function recoverStaleLaunchPhantoms(
          updated_at = ?
      WHERE id = ?
        AND status = 'running'
-       AND datetime(created_at) < datetime(?)
        AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.run_id = runs.id)
        AND (NOT EXISTS (SELECT 1 FROM run_worktrees rw WHERE rw.run_id = runs.id)
             OR EXISTS (SELECT 1 FROM run_worktrees rw
@@ -74,12 +96,11 @@ export function recoverStaleLaunchPhantoms(
                          AND rw.status IN ('creating', 'error', 'cleanup_failed')))`,
   );
 
-  for (const candidate of candidates) {
+  for (const candidate of staleCandidates) {
     const result = failCandidate.run(
       STALE_LAUNCH_PHANTOM_REASON,
       recoveredAt,
       candidate.id,
-      cutoff,
     );
     if (Number(result.changes) !== 1) continue;
 

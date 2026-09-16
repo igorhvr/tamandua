@@ -41,6 +41,7 @@ import { getRunEvents } from "../../dist/installer/events.js";
 import { emitRunTerminalEvent } from "../../dist/installer/step-ops.js";
 import { getHarnessAdapter } from "../../dist/installer/harness-adapter.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
+import { monotonicNow } from "../../dist/lib/instant.js";
 import type { SetupAgentCronsOptions, NudgeResult, CronJobInfo } from "../../dist/installer/agent-scheduler.js";
 import type { WorkflowSpec } from "../../dist/installer/types.js";
 
@@ -1667,7 +1668,10 @@ process.exit(1);
   async function waitPastInstantFailBackoff(jobId: string): Promise<void> {
     const streak = _instantFailStreakFor(jobId);
     const untilMs = streak?.nextAllowedDispatchAt ?? 0;
-    const waitMs = Math.max(0, untilMs - Date.now()) + 150;
+    // US-002: the armed backoff is a MONOTONIC deadline, so the wait must
+    // read the same clock (mixing with Date.now() would compute a
+    // nonsensical wait and never actually cross the window).
+    const waitMs = Math.max(0, untilMs - monotonicNow()) + 150;
     await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
 
@@ -1707,7 +1711,7 @@ process.exit(1);
     let streak = _instantFailStreakFor(jobId);
     assert.equal(streak?.consecutive, 2, "streak must reach K after K instant-fail rounds");
     assert.ok(
-      (streak?.nextAllowedDispatchAt ?? 0) > Date.now(),
+      (streak?.nextAllowedDispatchAt ?? 0) > monotonicNow(),
       "after K consecutive instant-fails the next relaunch must be delayed (backoff)",
     );
 
@@ -1752,7 +1756,7 @@ process.exit(1);
     let streak = _instantFailStreakFor(jobId);
     assert.equal(streak?.consecutive, 2, "streak must reach K after K instant-fail rounds");
     const backoffUntilMs = streak?.nextAllowedDispatchAt ?? 0;
-    assert.ok(backoffUntilMs > Date.now(), "after K consecutive instant-fails the next relaunch must be delayed (backoff armed)");
+    assert.ok(backoffUntilMs > monotonicNow(), "after K consecutive instant-fails the next relaunch must be delayed (backoff armed)");
 
     // Tick 3 inside the backoff window: skipped at the gate — no spawn, no
     // streak change, and (the regression) no in-flight mark leaked.
@@ -1764,7 +1768,7 @@ process.exit(1);
     // Advance past nextAllowedDispatchAt, then tick: the relaunch MUST
     // happen (counter 2 → 3). On the pre-fix code this tick was skipped as
     // previous_round_in_flight and the counter stayed 2 forever.
-    const waitMs = Math.max(0, backoffUntilMs - Date.now()) + 500;
+    const waitMs = Math.max(0, backoffUntilMs - monotonicNow()) + 500;
     await new Promise((resolve) => setTimeout(resolve, waitMs));
     await executeDispatchRound(job, agent);
 
@@ -1807,7 +1811,7 @@ process.exit(1);
     let streak = _instantFailStreakFor(jobId);
     assert.equal(streak?.consecutive, 2, "streak must reach K after K instant-fail rounds");
     assert.ok(
-      (streak?.nextAllowedDispatchAt ?? 0) > Date.now(),
+      (streak?.nextAllowedDispatchAt ?? 0) > monotonicNow(),
       "after K consecutive instant-fails the next relaunch must be delayed (backoff armed)",
     );
 
@@ -1888,7 +1892,7 @@ process.exit(1);
     await executeDispatchRound(job, agent);
     let streak = _instantFailStreakFor(jobId);
     assert.equal(streak?.consecutive, 2, "two instant-fail rounds must reach K=2");
-    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > Date.now(), "the relaunch must be backed off after the K-th round");
+    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > monotonicNow(), "the relaunch must be backed off after the K-th round");
     assert.equal(count(), 2);
 
     // A real tick inside the first window is gated at the backoff gate —
@@ -1904,7 +1908,7 @@ process.exit(1);
     await executeDispatchRound(job, agent);
     streak = _instantFailStreakFor(jobId);
     assert.equal(streak?.consecutive, 3, "the relaunched round must advance the streak to 3");
-    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > Date.now(), "the relaunch must be backed off again (widened window)");
+    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > monotonicNow(), "the relaunch must be backed off again (widened window)");
     assert.equal(count(), 3);
 
     // Advance past the widened window, then tick: round 4 is the N=4th
@@ -2013,7 +2017,7 @@ process.exit(1);
     await executeDispatchRound(job, agent);
     let streak = _instantFailStreakFor(jobId);
     assert.equal(streak?.consecutive, 1, "after a reset the streak must restart from 1 (not accumulate across the reset)");
-    assert.ok((streak?.nextAllowedDispatchAt ?? 0) <= Date.now(), "below K the relaunch must not be backed off");
+    assert.ok((streak?.nextAllowedDispatchAt ?? 0) <= monotonicNow(), "below K the relaunch must not be backed off");
     assert.equal(count(), 2);
 
     // One more instant fail reaches K=2 from the restart and re-arms the
@@ -2022,7 +2026,7 @@ process.exit(1);
     await executeDispatchRound(job, agent);
     streak = _instantFailStreakFor(jobId);
     assert.equal(streak?.consecutive, 2, "K consecutive instant fails from the restart must re-arm the backoff");
-    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > Date.now(), "the relaunch must be backed off at K from the restart");
+    assert.ok((streak?.nextAllowedDispatchAt ?? 0) > monotonicNow(), "the relaunch must be backed off at K from the restart");
     assert.equal(count(), 3);
 
     const row = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
@@ -2074,7 +2078,7 @@ process.exit(1);
     let streak = _instantFailStreakFor(jobId);
     assert.equal(streak?.consecutive, 2, "streak must reach K after two '\n'-only rounds");
     assert.ok(
-      (streak?.nextAllowedDispatchAt ?? 0) > Date.now(),
+      (streak?.nextAllowedDispatchAt ?? 0) > monotonicNow(),
       "K backoff must engage for the '\n'-only shape (next relaunch delayed)",
     );
 
@@ -2139,6 +2143,111 @@ process.exit(1);
     assert.equal(_instantFailStreakFor(jobId)?.consecutive, 1, "the streak must increment for the signal-death round");
     const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step`) as { status: string };
     assert.equal(step.status, "pending", "an instant-fail round claims no step — it must stay pending");
+  });
+
+  // ── US-002: the instant-fail gate and round durations are monotonic ──
+  it("US-002: arms the backoff on the monotonic clock — a wall-clock jump cannot release the gate", async () => {
+    // TIME-CLOCKS rule 1: nextAllowedDispatchAt is an in-process deadline,
+    // so it must be armed/gated on the monotonic clock. A gate that read
+    // Date.now() would be released (or held open) by an NTP step or a
+    // suspend/resume, which is exactly the class of bug this pins.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "60000"; // 60s window — far beyond this test
+    process.env.TAMANDUA_DEBUG = "1";
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+    const db = getDb();
+    const count = () => (db.prepare("SELECT instant_fail_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number }).instant_fail_count;
+
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+    const streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "two instant-fail rounds must reach K=2");
+
+    const armedAt = streak?.nextAllowedDispatchAt ?? 0;
+    // The armed deadline is a process-relative monotonic count, NOT an
+    // epoch instant: it must sit in the future per monotonicNow() and be
+    // orders of magnitude below Date.now().
+    assert.ok(armedAt > monotonicNow(), "the backoff deadline must be in the future on the monotonic clock");
+    assert.ok(
+      armedAt < Date.now() / 2,
+      "the backoff deadline must be monotonic time, not an epoch-ms wall instant",
+    );
+
+    // Hostile wall jump FORWARD: a gate reading Date.now() would see the
+    // window as long elapsed and relaunch the broken harness; the monotonic
+    // gate must keep skipping.
+    const realDateNow = Date.now;
+    try {
+      Date.now = () => realDateNow() + 24 * 60 * 60 * 1000;
+      await executeDispatchRound(job, agent);
+    } finally {
+      Date.now = realDateNow;
+    }
+    assert.equal(count(), 2, "a forward wall-clock jump must NOT release the monotonic backoff gate");
+
+    // Hostile wall jump BACKWARD: likewise must not release (or extend) the
+    // gate — the window is measured on the monotonic clock.
+    try {
+      Date.now = () => realDateNow() - 24 * 60 * 60 * 1000;
+      await executeDispatchRound(job, agent);
+    } finally {
+      Date.now = realDateNow;
+    }
+    assert.equal(count(), 2, "a backward wall-clock jump must NOT release the monotonic backoff gate");
+    assert.match(
+      readStateLog(),
+      /Dispatch round skipped — instant-fail backoff/,
+      "both wall jumps must be gated at the monotonic backoff gate",
+    );
+  });
+
+  it("US-002: adapter-throw round duration is monotonic — a wall jump cannot distort the wallMs classification", async () => {
+    // The adapter-throw fallback is the one round duration the scheduler
+    // computes itself (findBinary/spawn failure carries no result). It must
+    // come from the monotonic round-start Stopwatch: an epoch-based
+    // `Date.now() - roundStartMs` would log a wildly wrong (or negative)
+    // wallMs under a wall jump and flip the instant-fail classification.
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    // A nonexistent executable makes adapter.findBinary throw — the
+    // adapter-throw path — after the round-start watch is created.
+    process.env.TAMANDUA_PI_BINARY = path.join(tempHome, "does-not-exist-harness");
+    process.env.TAMANDUA_INSTANT_FAIL_WALL_MS = "10000";
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+    const db = getDb();
+
+    // Every wall-clock read during the round steps +1 day, so a
+    // Date.now()-based duration would be epoch-sized and never classify.
+    const realDateNow = Date.now;
+    let wallReads = 0;
+    try {
+      Date.now = () => realDateNow() + (++wallReads) * 24 * 60 * 60 * 1000;
+      await executeDispatchRound(job, agent);
+    } finally {
+      Date.now = realDateNow;
+    }
+
+    const row = db.prepare("SELECT instant_fail_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number };
+    assert.equal(
+      row.instant_fail_count,
+      1,
+      "an adapter-throw round must still classify as an instant fail despite the wall jump",
+    );
+
+    const log = readStateLog();
+    const wallValues = [...log.matchAll(/"wallMs":(-?\d+(?:\.\d+)?)/g)].map((m) => Number(m[1]));
+    assert.ok(wallValues.length >= 1, "the instant-fail classification must log the round wallMs");
+    for (const wallMs of wallValues) {
+      assert.ok(Number.isFinite(wallMs), `wallMs must be finite, got ${wallMs}`);
+      assert.ok(wallMs >= 0, `a monotonic round duration can never be negative (got ${wallMs})`);
+      assert.ok(
+        wallMs < 10000,
+        `the monotonic round duration must stay sub-threshold under a wall jump (got ${wallMs})`,
+      );
+    }
   });
 });
 

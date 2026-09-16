@@ -18,7 +18,12 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { realpathSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { getProcessStartIdentity } from "../lib/process-start-identity.js";
-import { parseInstant } from "../lib/instant.js";
+import {
+  instantAgeMs,
+  Stopwatch,
+  Deadline,
+  type InstantInput,
+} from "../lib/instant.js";
 import {
   TTL_GREEN_MS,
   RED_CONTEXT_WINDOW_MS,
@@ -45,15 +50,25 @@ let savedCmdArgs: string[] = [];
 let savedCmdString: string = "";
 
 /**
- * Age in ms of a stored instant (e.g. suite_results.created_at), or `NaN` when
- * the value is missing/unparseable. The shared `parseInstant` reader treats a
- * legacy naive UTC timestamp as UTC (never host-local) and honors real numeric
- * offsets. The existing callers already treat a `NaN` age as "not within the
- * TTL/window" — that safe behavior is preserved explicitly here.
+ * Age in ms of a durable stored instant (e.g. suite_results.created_at), or
+ * `NaN` when the value is missing/unparseable.
+ *
+ * TIME-CLOCKS US-012 (rule 2): the age is computed numerically by the shared
+ * `instantAgeMs()` helper — never an epoch-millisecond difference of
+ * `Date.now()` values and never a string comparison. `instantAgeMs()` reads a
+ * legacy naive UTC value as UTC (never host-local) and honors real numeric
+ * offsets; it returns `undefined` for an unknown instant, which this wrapper
+ * maps back to `NaN` so every existing caller's "not within the TTL/window"
+ * check keeps its fail-closed behavior (the shim may only replay a result it
+ * can PROVE fresh).
+ *
+ * Tolerance: deliberately NONE (exact age). Widening the replay window would
+ * let the shim skip work it cannot prove redundant, which the strictly-monotone
+ * contract forbids.
  */
 function storedInstantAgeMs(value: unknown): number {
-  const parsed = parseInstant(value);
-  return parsed ? Date.now() - parsed.getTime() : Number.NaN;
+  const ageMs = instantAgeMs(value as InstantInput);
+  return ageMs === undefined ? Number.NaN : ageMs;
 }
 
 // ── CLI argument parsing ──────────────────────────────────────────────
@@ -208,7 +223,9 @@ interface ExecuteResult {
  */
 function executeAndCapture(cmdString: string): Promise<ExecuteResult> {
   return new Promise((resolve) => {
-    const startTime = Date.now();
+    // Monotonic duration (TIME-CLOCKS rule 1): a wall-clock jump during the
+    // suite cannot make the reported duration negative or inflated.
+    const watch = new Stopwatch();
     const child: ChildProcess = spawn("/bin/sh", ["-c", cmdString], {
       stdio: ["ignore", "pipe", "pipe"],
       // Give the shell and its descendants a process group so timeout signals
@@ -225,7 +242,7 @@ function executeAndCapture(cmdString: string): Promise<ExecuteResult> {
       completed = true;
       resolve({
         exitCode,
-        durationMs: Date.now() - startTime,
+        durationMs: watch.elapsedMs(),
         output,
       });
     };
@@ -389,12 +406,14 @@ async function pollForResult(
   ownership: ClaimOwnership,
   force: boolean,
 ): Promise<PollResult> {
-  const startTime = Date.now();
+  // Monotonic claim budget (TIME-CLOCKS rule 1): a wall-clock jump cannot end
+  // the single-flight wait early or extend it past CLAIM_TIMEOUT_MS.
+  const deadline = new Deadline(CLAIM_TIMEOUT_MS);
   // Dynamic import inside poll — by the time we reach here, the module
   // is already loaded via the earlier lookup import.
   const { lookupSuiteRecord, claimSuiteKey } = await import("../server/control-client.js");
 
-  while (Date.now() - startTime < CLAIM_TIMEOUT_MS) {
+  while (!deadline.expired()) {
     await sleep(SINGLEFLIGHT_POLL_INTERVAL_MS);
 
     const lookup = await lookupSuiteRecord(originRepo, treeHash, cmdHash);

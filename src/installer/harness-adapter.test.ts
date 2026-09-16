@@ -2469,6 +2469,136 @@ echo "Traceback (most recent call last):" >&2
   });
 });
 
+// ── US-003: harness deadlines are measured on the monotonic clock ─────
+// TIME-CLOCKS rule 1: pi/hermes/dsh runRound start, remainingWallMs and
+// durationMs are derived from the round's monotonic Stopwatch, never a
+// Date.now()/wall difference. These tests inject hostile wall-clock
+// movement during a live round and assert the budget/duration is
+// unaffected: a forward jump cannot collapse remainingWallMs to 1ms and
+// kill a healthy round, and a backward jump cannot make durationMs
+// negative or inflated.
+describe("US-003 monotonic harness round budgets", () => {
+  const piAdapter = getHarnessAdapter("pi");
+
+  function writeHealthyHarness(dir: string, name: string, delayMs: number): string {
+    const p = path.join(dir, name);
+    fs.writeFileSync(
+      p,
+      `#!/usr/bin/env node\nsetTimeout(() => { process.stdout.write('slow-but-healthy'); }, ${delayMs});\n`,
+      "utf-8",
+    );
+    fs.chmodSync(p, 0o755);
+    return p;
+  }
+
+  it("pi: a forward wall jump cannot shorten remainingWallMs (healthy round completes)", async () => {
+    const { root: tmpDir } = createTempHome("tamandua-us003-pi-fwd-");
+    const fakePi = writeHealthyHarness(tmpDir, "pi", 250);
+    const realDateNow = Date.now;
+    const savedPi = process.env.TAMANDUA_PI_BINARY;
+    let wallReads = 0;
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    try {
+      // Every wall read jumps one more day: a Date.now()-based remaining
+      // budget would compute ~1 day of elapsed and clamp to 1ms, killing
+      // this healthy round immediately.
+      Date.now = () => realDateNow() + ++wallReads * 24 * 60 * 60 * 1000;
+      const result = await piAdapter.runRound("prompt", { timeout: 60, workdir: tmpDir });
+      assert.equal(result.exitCode, 0, "the healthy pi round must complete, not be killed early");
+      assert.equal(result.timedOut, undefined, "a wall jump must NOT fire the timeout guard");
+      assert.match(result.output, /slow-but-healthy/);
+      assert.ok(Number.isFinite(result.durationMs), "durationMs must be measured");
+      assert.ok(result.durationMs! >= 0, `durationMs must be non-negative, got ${result.durationMs}`);
+      assert.ok(
+        result.durationMs! < 10_000,
+        `durationMs must stay the real ~250ms interval, got ${result.durationMs}`,
+      );
+    } finally {
+      Date.now = realDateNow;
+      if (savedPi === undefined) delete process.env.TAMANDUA_PI_BINARY;
+      else process.env.TAMANDUA_PI_BINARY = savedPi;
+    }
+  });
+
+  it("pi: a backward wall jump mid-round cannot make durationMs negative or inflated", async () => {
+    const { root: tmpDir } = createTempHome("tamandua-us003-pi-back-");
+    const fakePi = writeHealthyHarness(tmpDir, "pi", 250);
+    const realDateNow = Date.now;
+    const savedPi = process.env.TAMANDUA_PI_BINARY;
+    let offset = 0;
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    // Jump the wall clock BACK one day while the round is in flight; the
+    // monotonic duration must ignore it entirely.
+    const jump = setTimeout(() => {
+      offset = -24 * 60 * 60 * 1000;
+    }, 40);
+    try {
+      Date.now = () => realDateNow() + offset;
+      const result = await piAdapter.runRound("prompt", { timeout: 60, workdir: tmpDir });
+      assert.equal(result.exitCode, 0);
+      assert.ok(
+        result.durationMs! >= 0,
+        `a backward wall jump must not make durationMs negative, got ${result.durationMs}`,
+      );
+      assert.ok(
+        result.durationMs! < 10_000,
+        `durationMs must stay the real interval, got ${result.durationMs}`,
+      );
+    } finally {
+      clearTimeout(jump);
+      Date.now = realDateNow;
+      if (savedPi === undefined) delete process.env.TAMANDUA_PI_BINARY;
+      else process.env.TAMANDUA_PI_BINARY = savedPi;
+    }
+  });
+
+  it("hermes: a forward wall jump cannot shorten remainingWallMs (healthy round completes)", async () => {
+    const { root: tmpDir } = createTempHome("tamandua-us003-hermes-fwd-");
+    const fakeHermes = writeHealthyHarness(tmpDir, "hermes", 250);
+    const realDateNow = Date.now;
+    let wallReads = 0;
+    try {
+      Date.now = () => realDateNow() + ++wallReads * 24 * 60 * 60 * 1000;
+      const result = await getHarnessAdapter("hermes").runRound("prompt", {
+        timeout: 60,
+        workdir: tmpDir,
+        binaryPath: fakeHermes,
+      });
+      assert.equal(result.exitCode, 0, "the healthy hermes round must complete");
+      assert.equal(result.timedOut, undefined, "a wall jump must NOT fire the timeout guard");
+      assert.ok(
+        result.durationMs! >= 0 && result.durationMs! < 10_000,
+        `durationMs must stay the real interval, got ${result.durationMs}`,
+      );
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  it("dsh: a forward wall jump cannot shorten remainingWallMs (healthy round completes)", async () => {
+    const { root: tmpDir } = createTempHome("tamandua-us003-dsh-fwd-");
+    const fakeDsh = writeHealthyHarness(tmpDir, "dsh", 250);
+    const realDateNow = Date.now;
+    let wallReads = 0;
+    try {
+      Date.now = () => realDateNow() + ++wallReads * 24 * 60 * 60 * 1000;
+      const result = await getHarnessAdapter("dsh").runRound("prompt", {
+        timeout: 60,
+        workdir: tmpDir,
+        binaryPath: fakeDsh,
+      });
+      assert.equal(result.exitCode, 0, "the healthy dsh round must complete");
+      assert.equal(result.timedOut, undefined, "a wall jump must NOT fire the timeout guard");
+      assert.ok(
+        result.durationMs! >= 0 && result.durationMs! < 10_000,
+        `durationMs must stay the real interval, got ${result.durationMs}`,
+      );
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+});
+
 // ── Type-level checks that the implement types work ────────────────
 
 describe("HarnessRoundResult shape", () => {

@@ -7,7 +7,8 @@ import { once } from "node:events";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createDashboardServer, invalidateRunsCache } from "../../dist/server/dashboard.js";
+import { createDashboardServer, invalidateRunsCache, _runsCacheTimestampForTest, flakyKeysWithinWindow } from "../../dist/server/dashboard.js";
+import { monotonicNow } from "../../dist/lib/instant.js";
 import { type TamanduaEvent } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import { DEFAULT_MCP_PORT } from "../../dist/server/mcp-server.js";
@@ -3407,6 +3408,90 @@ describe("dashboard /api/runs cache", () => {
     }
   });
 
+  // US-006: the runs cache TTL is an in-process interval and must be driven by
+  // the monotonic clock, not Date.now(), so a wall-clock jump cannot expire a
+  // still-fresh cache entry.
+  it("stamps the runs cache with a monotonic (process-relative) timestamp", async () => {
+    const { restore } = isolateDashboardState("tamandua-dashboard-runs-cache-mono-");
+
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES ('run-mono-ts', 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run();
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const r1 = await fetch(`${baseUrl}/api/runs`);
+      assert.equal(r1.status, 200);
+
+      const stamped = _runsCacheTimestampForTest();
+      assert.ok(stamped !== null, "the runs cache should record a timestamp after a fresh query");
+      // A monotonic reading is process-relative (small); an epoch reading is
+      // ~1.7e12. This asserts the source is monotonicNow(), not Date.now().
+      assert.ok(
+        stamped !== null && stamped < 1e12,
+        `runs cache timestamp should be process-relative monotonic ms, got ${stamped}`,
+      );
+      assert.ok(
+        stamped !== null && stamped <= monotonicNow() + 1,
+        "runs cache timestamp must not be ahead of the monotonic clock",
+      );
+    } finally {
+      await stopDashboard(server);
+      restore();
+    }
+  });
+
+  it("a forward wall-clock jump cannot expire a still-fresh runs cache", async () => {
+    const { restore } = isolateDashboardState("tamandua-dashboard-runs-cache-jump-");
+
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES ('run-jump-cached', 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run();
+
+    const { server, baseUrl } = await startDashboard();
+    const realDateNow = Date.now;
+
+    try {
+      // Prime the cache.
+      const r1 = await fetch(`${baseUrl}/api/runs`);
+      assert.equal(r1.status, 200);
+
+      // A row that would appear only if the DB were re-queried.
+      db.prepare(`
+        INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+        VALUES ('run-jump-new', 2, 'wf-1', 'task2', 'running', '{}', 0, '2026-01-02', '2026-01-02')
+      `).run();
+
+      // Jump the wall clock well past RUNS_CACHE_TTL_MS (2000ms) without
+      // sleeping. An epoch-based TTL would re-query and expose the new row; the
+      // monotonic TTL keeps serving the cached body.
+      let reads = 0;
+      Date.now = () => realDateNow() + (++reads) * 10_000;
+
+      const r2 = await fetch(`${baseUrl}/api/runs`);
+      assert.equal(r2.status, 200);
+      const body2 = await r2.json() as { runs: Array<{ id: string }> };
+      assert.ok(
+        body2.runs.some((r) => r.id === "run-jump-cached"),
+        "cached run should still be served after a forward wall jump",
+      );
+      assert.equal(
+        body2.runs.some((r) => r.id === "run-jump-new"),
+        false,
+        "a forward wall-clock jump must not expire the monotonic cache TTL",
+      );
+    } finally {
+      Date.now = realDateNow;
+      await stopDashboard(server);
+      restore();
+    }
+  });
+
   it("queries fresh from DB after cache invalidation", async () => {
     const { restore } = isolateDashboardState("tamandua-dashboard-runs-cache-");
 
@@ -4751,5 +4836,74 @@ describe("dashboard bind host", () => {
       if (previousBindHost === undefined) delete process.env.TAMANDUA_BIND_HOST;
       else process.env.TAMANDUA_BIND_HOST = previousBindHost;
     }
+  });
+});
+
+// ── US-011: server-side durable flake-window cutoffs ──────────────────
+describe("dashboard flake-window numeric ages (US-011)", () => {
+  const FLAKE_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const FLAKE_WINDOW_TOLERANCE_MS = 1_000;
+  let state: ReturnType<typeof isolateDashboardState>;
+
+  beforeEach(() => {
+    state = isolateDashboardState("tamandua-dashboard-flake-window-");
+  });
+
+  afterEach(() => {
+    state.restore();
+  });
+
+  function insertSuite(treeHash: string, cmdHash: string, exitCode: number, createdAt: string): void {
+    getDb().prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("/repo", treeHash, cmdHash, "npm test", exitCode, 100, createdAt);
+  }
+
+  it("computes each row's age from an injected now (no Date.now() cutoff)", () => {
+    const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+    // Inside the 24h window: flaky.
+    insertSuite("inside", "cmd", 0, new Date(now - 60_000).toISOString());
+    insertSuite("inside", "cmd", 1, new Date(now - 60_000).toISOString());
+    // One full day + tolerance outside: everything there is ignored.
+    const outside = new Date(now - (FLAKE_WINDOW_MS + FLAKE_WINDOW_TOLERANCE_MS + 1)).toISOString();
+    insertSuite("outside", "cmd", 0, outside);
+    insertSuite("outside", "cmd", 1, outside);
+
+    const keys = flakyKeysWithinWindow(getDb(), now);
+    assert.deepEqual(keys.map((k) => k.tree_hash), ["inside"]);
+    assert.equal(keys[0].pass_count, 1);
+    assert.equal(keys[0].fail_count, 1);
+  });
+
+  it("keeps a row exactly at the widened boundary and drops one millisecond past it", () => {
+    const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+    const atBoundary = new Date(now - (FLAKE_WINDOW_MS + FLAKE_WINDOW_TOLERANCE_MS)).toISOString();
+    const pastBoundary = new Date(now - (FLAKE_WINDOW_MS + FLAKE_WINDOW_TOLERANCE_MS + 1)).toISOString();
+    insertSuite("at-boundary", "cmd", 0, atBoundary);
+    insertSuite("at-boundary", "cmd", 1, atBoundary);
+    insertSuite("past-boundary", "cmd", 0, pastBoundary);
+    insertSuite("past-boundary", "cmd", 1, pastBoundary);
+
+    const keys = flakyKeysWithinWindow(getDb(), now);
+    assert.deepEqual(keys.map((k) => k.tree_hash), ["at-boundary"]);
+  });
+
+  it("never counts an unparseable created_at inside the window", () => {
+    const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+    insertSuite("unparseable", "cmd", 0, "not-a-timestamp");
+    insertSuite("unparseable", "cmd", 1, "not-a-timestamp");
+
+    assert.deepEqual(flakyKeysWithinWindow(getDb(), now), []);
+  });
+
+  it("still detects a legacy naive-UTC created_at inside the window", () => {
+    const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+    // SQLite-naive shape, one minute before the injected now.
+    insertSuite("naive", "cmd", 0, "2026-09-16 11:59:00");
+    insertSuite("naive", "cmd", 1, "2026-09-16 11:59:00");
+
+    const keys = flakyKeysWithinWindow(getDb(), now);
+    assert.deepEqual(keys.map((k) => k.tree_hash), ["naive"]);
   });
 });

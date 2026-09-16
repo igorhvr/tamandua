@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { resolvePiStateDir } from "./paths.js";
 import { logger } from "../lib/logger.js";
-import { formatInstant, nowIso } from "../lib/instant.js";
+import { Deadline, formatInstant, isOlderThan, nowIso } from "../lib/instant.js";
 import { assertStatePathIsolation } from "../lib/test-guard.js";
 
 // ── Rotation constants (global events file) ────────────────────────
@@ -632,7 +632,10 @@ function withEventFileQueue(filePath: string, operation: () => void): void {
  * its existence plus mtime are the whole protocol state.
  */
 function acquireEventFileLock(lockPath: string, timeoutMs: number): number | null {
-  const deadline = Date.now() + timeoutMs;
+  // Rule 1: the retry budget is an in-process deadline, so it runs on the
+  // monotonic clock — a wall-clock step cannot make the wait expire early or
+  // hang past its intended bound.
+  const deadline = new Deadline(timeoutMs);
   for (;;) {
     try {
       return fs.openSync(lockPath, "wx"); // O_CREAT | O_EXCL
@@ -646,7 +649,10 @@ function acquireEventFileLock(lockPath: string, timeoutMs: number): number | nul
     // Lock exists — take it over if it looks abandoned, otherwise wait.
     try {
       const st = fs.statSync(lockPath);
-      if (Date.now() - st.mtimeMs > EVENT_LOCK_STALE_MS) {
+      // Rule 3: the lock file's mtime is an OS-epoch file instant (no monotonic
+      // analogue); age it through the shared `isOlderThan` helper with the
+      // documented EVENT_LOCK_STALE_MS tolerance.
+      if (isOlderThan(st.mtimeMs, 0, Date.now(), EVENT_LOCK_STALE_MS)) {
         try {
           fs.unlinkSync(lockPath);
         } catch {
@@ -659,7 +665,7 @@ function acquireEventFileLock(lockPath: string, timeoutMs: number): number | nul
       continue;
     }
 
-    const remaining = deadline - Date.now();
+    const remaining = deadline.remainingMs();
     if (remaining <= 0) return null;
     sleepSync(Math.min(EVENT_LOCK_RETRY_MS, remaining));
   }

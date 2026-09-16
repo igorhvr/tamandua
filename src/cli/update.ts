@@ -18,6 +18,7 @@ import {
   stopMcpAsync,
 } from "../server/daemonctl.js";
 import { runVersionCheck } from "../lib/version-check.js";
+import { Deadline } from "../lib/instant.js";
 
 export type UpdateServiceStatus =
   | { running: true; pid: number; port: number }
@@ -227,9 +228,16 @@ function formatActiveRuns(activeRuns: ActiveRunInfo[]): string {
     .join("\n");
 }
 
+/**
+ * Poll until `pid` is gone or `timeoutMs` elapses.
+ *
+ * TIME-CLOCKS item 11 / US-007: the wait budget is enforced with a monotonic
+ * `Deadline`, so a wall-clock jump (NTP step, suspend/resume) can neither end
+ * the wait prematurely nor extend it.
+ */
 async function defaultWaitForProcessExit(pid: number, timeoutMs = 5000): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
+  const deadline = new Deadline(timeoutMs);
+  while (!deadline.expired()) {
     try {
       process.kill(pid, 0);
     } catch {
@@ -238,6 +246,12 @@ async function defaultWaitForProcessExit(pid: number, timeoutMs = 5000): Promise
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
   }
 }
+
+/**
+ * @internal Exported only so tests can exercise the monotonic wait budget
+ * directly (the production caller injects the function above).
+ */
+export const _defaultWaitForProcessExitForTest = defaultWaitForProcessExit;
 
 async function stopRunningServices(
   snapshot: UpdateServiceSnapshot,

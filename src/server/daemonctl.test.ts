@@ -41,6 +41,11 @@ import {
   stopDashboardStandalone,
   restartDashboardStandalone,
   recordLifecycleEvent,
+  PIDFILE_AGE_SLACK_SECONDS,
+  START_LOCK_STALE_MS,
+  _pidfileProvenanceMatchesForTest,
+  _startLockIsStaleForTest,
+  _acquireStartLockForTest,
 } from "../../dist/server/daemonctl.js";
 import { DEFAULT_MCP_PORT } from "../../dist/server/mcp-server.js";
 import { DEFAULT_CONTROL_PORT } from "../../dist/server/control-server.js";
@@ -1359,5 +1364,136 @@ describe("recordLifecycleEvent", () => {
       if (prevExpect === undefined) delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
       else process.env.TAMANDUA_TEST_GUARD_EXPECT = prevExpect;
     }
+  });
+});
+
+// ── File-mtime provenance staleness (TIME-CLOCKS rule 3, US-010) ───
+//
+// The pidfile-age and start-lock checks age OS-epoch file mtimes via the
+// shared instant helpers. These exercise the documented tolerance boundaries
+// with injected `nowMs`, plus the real start-lock file behavior (missing vs
+// fresh vs stale), with an isolated temp HOME and no daemon spawned.
+
+describe("daemonctl file-mtime provenance (US-010)", () => {
+  const NOW = 1_700_000_000_000;
+
+  it("pidfile provenance matches at the process-age + slack tolerance boundary", () => {
+    const elapsedSeconds = 100;
+    const atBoundaryMs =
+      NOW - (elapsedSeconds + PIDFILE_AGE_SLACK_SECONDS) * 1000;
+
+    assert.equal(
+      _pidfileProvenanceMatchesForTest(atBoundaryMs, elapsedSeconds, NOW),
+      true,
+      "exactly at process age + slack must still match (strict >)",
+    );
+    assert.equal(
+      _pidfileProvenanceMatchesForTest(atBoundaryMs + 1, elapsedSeconds, NOW),
+      true,
+      "1ms inside the tolerance must match",
+    );
+    assert.equal(
+      _pidfileProvenanceMatchesForTest(atBoundaryMs - 1, elapsedSeconds, NOW),
+      false,
+      "1ms past the tolerance means a reused pid — refuse",
+    );
+  });
+
+  it("pidfile provenance refuses an unknown process age or an unparseable mtime", () => {
+    assert.equal(_pidfileProvenanceMatchesForTest(NOW - 1_000, null, NOW), false);
+    assert.equal(
+      _pidfileProvenanceMatchesForTest(NOW - 1_000, Number.NaN, NOW),
+      false,
+    );
+    assert.equal(
+      _pidfileProvenanceMatchesForTest(NOW - 1_000, Number.POSITIVE_INFINITY, NOW),
+      false,
+    );
+    assert.equal(
+      _pidfileProvenanceMatchesForTest(Number.NaN, 10, NOW),
+      false,
+      "a NaN mtime must never fabricate provenance",
+    );
+    assert.equal(
+      _pidfileProvenanceMatchesForTest(Number.POSITIVE_INFINITY, 10, NOW),
+      false,
+    );
+  });
+
+  it("pidfile provenance accepts a pidfile newer than the process (normal case)", () => {
+    assert.equal(_pidfileProvenanceMatchesForTest(NOW - 1_000, 3_600, NOW), true);
+  });
+
+  it("start-lock staleness honors the START_LOCK_STALE_MS tolerance boundary", () => {
+    assert.equal(
+      _startLockIsStaleForTest(NOW - START_LOCK_STALE_MS, NOW),
+      false,
+      "exactly at the threshold is NOT stale (strict >)",
+    );
+    assert.equal(
+      _startLockIsStaleForTest(NOW - START_LOCK_STALE_MS + 1, NOW),
+      false,
+    );
+    assert.equal(
+      _startLockIsStaleForTest(NOW - START_LOCK_STALE_MS - 1, NOW),
+      true,
+    );
+  });
+
+  it("start-lock staleness treats an unparseable mtime as never stale", () => {
+    assert.equal(_startLockIsStaleForTest(Number.NaN, NOW), false);
+    assert.equal(_startLockIsStaleForTest(Number.POSITIVE_INFINITY, NOW), false);
+  });
+
+  it("acquireStartLock: missing file created, fresh lock refused, stale lock replaced", () => {
+    const { root: tempHome } = createTempHome("tamandua-startlock-");
+    const lockFile = path.join(tempHome, ".tamandua", "start.lock");
+
+    // Missing path: the lock is created (and the parent dir materialized).
+    const fd1 = _acquireStartLockForTest(lockFile);
+    assert.notEqual(fd1, null, "a missing lock file must be created");
+    assert.equal(fs.existsSync(lockFile), true);
+    fs.closeSync(fd1!);
+
+    // Fresh existing lock: refused (conservative — never steal a live lock).
+    assert.equal(
+      _acquireStartLockForTest(lockFile),
+      null,
+      "a fresh lock must not be stolen",
+    );
+
+    // Stale mtime (older than the documented threshold): replaced.
+    const stale = new Date(Date.now() - (START_LOCK_STALE_MS + 60_000));
+    fs.utimesSync(lockFile, stale, stale);
+    const fd2 = _acquireStartLockForTest(lockFile);
+    assert.notEqual(fd2, null, "a stale lock must be replaced");
+    fs.closeSync(fd2!);
+    fs.unlinkSync(lockFile);
+  });
+
+  it("production call sites route mtime staleness through the shared helpers", () => {
+    const source = fs.readFileSync(path.resolve(__dirname, "daemonctl.ts"), "utf8");
+
+    assert.match(
+      source,
+      /pidfileProvenanceMatches\(fs\.statSync\(pidFile\)\.mtimeMs, getElapsedSeconds\(pid\)\)/,
+      "processHomeMatches must age the pidfile mtime via the shared predicate",
+    );
+    assert.match(
+      source,
+      /startLockIsStale\(stat\.mtimeMs\)/,
+      "acquireStartLock must route staleness through the shared predicate",
+    );
+    assert.match(source, /isOlderThan\(/, "the predicate must use the shared helper");
+    assert.doesNotMatch(
+      source,
+      /\(Date\.now\(\) - fs\.statSync\(pidFile\)\.mtimeMs\)/,
+      "no ad-hoc Date.now pidfile age math",
+    );
+    assert.doesNotMatch(
+      source,
+      /Date\.now\(\) - stat\.mtimeMs/,
+      "no ad-hoc Date.now start-lock age math",
+    );
   });
 });

@@ -1,9 +1,31 @@
 /**
- * Instant storage format — the ONE format for every instant Tamandua writes
- * to durable storage.
+ * Time contract — instants, monotonic intervals, and durable staleness.
  *
- * Storage format: ISO-8601 UTC with milliseconds and a `Z` suffix, e.g.
- * `2026-09-15T22:00:00.123Z`. This module owns the writer half of the
+ * ┌────────────────────────────────────────────────────────────────────────┐
+ * │ THE ONE RULE                                                           │
+ * │                                                                        │
+ * │ 1. In-process intervals and deadlines (retry backoff, elapsed/remaining│
+ * │    wall budgets, wait loops, cache TTLs) MUST use the monotonic clock  │
+ * │    — `monotonicNow()` / `Stopwatch` / `Deadline` — and NEVER a         │
+ * │    difference of `Date.now()` values. A wall-clock jump (NTP step,     │
+ * │    suspend/resume) must not produce negative, inflated, or premature   │
+ * │    results.                                                            │
+ * │                                                                        │
+ * │ 2. Values that must survive a restart (claim leases, staleness         │
+ * │    thresholds, recovery windows, reconciler cutoffs) are stored as     │
+ * │    UTC ISO-8601 `...Z` instants via `nowIso()` / `SQL_NOW_ISO`, read   │
+ * │    via `parseInstant()`, and compared NUMERICALLY via `instantAgeMs()` │
+ * │    / `isOlderThan()` — never as string comparisons. Each call site     │
+ * │    documents the explicit tolerance it passes.                         │
+ * │                                                                        │
+ * │ 3. File-mtime provenance (daemon pidfile / start lock, dsh session     │
+ * │    "created since spawn") keeps OS-epoch semantics, but the age /      │
+ * │    since-threshold decisions still route through `instantAgeMs()` /    │
+ * │    `isOlderThan()` with the same documented-tolerance discipline.      │
+ * └────────────────────────────────────────────────────────────────────────┘
+ *
+ * Instant storage format: ISO-8601 UTC with milliseconds and a `Z` suffix,
+ * e.g. `2026-09-15T22:00:00.123Z`. This module owns the writer half of the
  * contract:
  *
  *   - `nowIso()` for instants produced in JavaScript.
@@ -18,7 +40,13 @@
  * the contract) so legacy naive values are interpreted as UTC — never as
  * host-local time — and so invalid input surfaces as `undefined` rather than
  * `NaN`, `0`, or a fabricated "now".
+ *
+ * The monotonic and durable-staleness helpers (`monotonicNow`, `Stopwatch`,
+ * `Deadline`, `instantAgeMs`, `isOlderThan`) added by TIME-CLOCKS US-001 live
+ * below. The storage writer/reader functions above them are unchanged.
  */
+
+import { performance } from "node:perf_hooks";
 
 /**
  * Returns the current instant as an ISO-8601 UTC string with milliseconds and
@@ -146,4 +174,177 @@ function toValidInstant(value: unknown): Date | undefined {
     return Number.isNaN(value.getTime()) ? undefined : value;
   }
   return parseInstant(value);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Monotonic clock (rule 1) — in-process intervals and deadlines
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A clock function returning milliseconds for the interval/deadline helpers. */
+export type ClockFn = () => number;
+
+/**
+ * The monotonic clock for every in-process interval/deadline (rule 1).
+ *
+ * Backed by `performance.now()`: it advances at real elapsed time and is
+ * unaffected by wall-clock jumps (NTP steps, suspend/resume), so it can never
+ * go backwards and cannot inflate or shrink a measured interval. The value is
+ * an opaque millisecond count (relative to an arbitrary origin) — NEVER
+ * persist it, NEVER mix it with `Date.now()`/epoch milliseconds, and never use
+ * it to label a durable instant (use `nowIso()` for that).
+ */
+export function monotonicNow(): number {
+  return performance.now();
+}
+
+/**
+ * A monotonic stopwatch for measuring an in-process interval.
+ *
+ * Constructed already running; `restart()` (alias `start()`) resets the origin
+ * to "now". `elapsedMs()` is always `clock() - origin`, so under the default
+ * `monotonicNow` clock a backward wall-clock jump can never make elapsed time
+ * negative and a forward jump can never inflate it.
+ *
+ * Inject a clock (`new Stopwatch(() => fakeMs)`) in tests to simulate hostile
+ * wall movement deterministically; production call sites omit the argument.
+ */
+export class Stopwatch {
+  private readonly clock: ClockFn;
+  private originMs: number;
+
+  constructor(clock: ClockFn = monotonicNow) {
+    this.clock = clock;
+    this.originMs = clock();
+  }
+
+  /** Restarts the stopwatch from "now" and returns it for chaining. */
+  start(): this {
+    this.originMs = this.clock();
+    return this;
+  }
+
+  /** Alias of `start()` — resets the origin to "now". */
+  restart(): this {
+    return this.start();
+  }
+
+  /** Milliseconds elapsed since the origin (never negative for a monotonic clock). */
+  elapsedMs(): number {
+    return this.clock() - this.originMs;
+  }
+}
+
+/**
+ * A monotonic deadline for enforcing an in-process budget.
+ *
+ * Constructed with a budget in milliseconds; `remainingMs()` is
+ * `budgetMs - elapsed` and may be negative once the budget is exhausted, while
+ * `expired()` is `remainingMs() <= 0`. Built on the same injectable clock as
+ * `Stopwatch` (default `monotonicNow`), so a wall-clock jump cannot make a
+ * wait return prematurely or hang past its timeout.
+ */
+export class Deadline {
+  private readonly clock: ClockFn;
+  private readonly budgetMs: number;
+  private readonly originMs: number;
+
+  constructor(budgetMs: number, clock: ClockFn = monotonicNow) {
+    this.clock = clock;
+    this.budgetMs = budgetMs;
+    this.originMs = clock();
+  }
+
+  /** Milliseconds elapsed since the deadline was created. */
+  elapsedMs(): number {
+    return this.clock() - this.originMs;
+  }
+
+  /** Milliseconds left in the budget; negative once the budget is exhausted. */
+  remainingMs(): number {
+    return this.budgetMs - this.elapsedMs();
+  }
+
+  /** True once the budget is exhausted (`remainingMs() <= 0`). */
+  expired(): boolean {
+    return this.remainingMs() <= 0;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Durable instants (rules 2 and 3) — ages and staleness, numeric only
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Any instant shape the durable-instant helpers accept: a stored ISO string, a
+ * `Date`, or an epoch-millisecond number (used for OS file mtimes under
+ * rule 3). `null`/`undefined` are accepted only so callers can pass a possibly
+ * missing field straight through — they yield `undefined`, never a fabricated
+ * age.
+ */
+export type InstantInput = string | number | Date | null | undefined;
+
+/**
+ * Normalizes any accepted instant shape to epoch milliseconds, or `undefined`
+ * when it cannot be understood. Strings go through `parseInstant()` so the
+ * legacy naive-UTC rule applies; numbers and `Date`s must be finite.
+ */
+function toEpochMs(instant: InstantInput): number | undefined {
+  if (instant instanceof Date) {
+    const ms = instant.getTime();
+    return Number.isFinite(ms) ? ms : undefined;
+  }
+  if (typeof instant === "number") {
+    return Number.isFinite(instant) ? instant : undefined;
+  }
+  const parsed = parseInstant(instant);
+  return parsed === undefined ? undefined : parsed.getTime();
+}
+
+/**
+ * Age in milliseconds of a durable instant relative to `nowMs` (default
+ * `Date.now()`), computed numerically — NEVER as a string comparison (rule 2).
+ *
+ * Returns `undefined` for an unparseable, missing, `NaN`, or `Infinity`
+ * instant, or a non-finite `nowMs`. It never fabricates an age: callers that
+ * need a fallback must handle `undefined` explicitly. A future instant yields a
+ * negative age (informative, not clamped); call sites that need a non-negative
+ * value clamp explicitly.
+ *
+ * `nowMs` is a wall epoch instant because the value being aged is durable;
+ * in-process intervals must NOT be measured this way (use `Stopwatch`).
+ */
+export function instantAgeMs(
+  instant: InstantInput,
+  nowMs: number = Date.now(),
+): number | undefined {
+  const epochMs = toEpochMs(instant);
+  if (epochMs === undefined) return undefined;
+  if (!Number.isFinite(nowMs)) return undefined;
+  return nowMs - epochMs;
+}
+
+/**
+ * True when a durable instant is strictly older than `maxAgeMs` (plus an
+ * optional `toleranceMs` of slack), computed numerically (rule 2/3).
+ *
+ * An unparseable/missing/`NaN` instant returns `false` — the SAFE default: we
+ * never treat an unknown instant as stale and so never fabricate a recovery or
+ * expiration.
+ *
+ * `toleranceMs` is the explicit per-call-site slack for clock skew and coarse
+ * mtime granularity; it widens the window (`maxAgeMs + toleranceMs`) so an
+ * instant just past the bare threshold is not considered old. Call sites MUST
+ * document why they pass the tolerance they pass. The comparison is strict
+ * (`age > maxAgeMs + toleranceMs`), so an instant exactly at the threshold is
+ * NOT older.
+ */
+export function isOlderThan(
+  instant: InstantInput,
+  maxAgeMs: number,
+  nowMs: number = Date.now(),
+  toleranceMs = 0,
+): boolean {
+  const age = instantAgeMs(instant, nowMs);
+  if (age === undefined) return false;
+  return age > maxAgeMs + toleranceMs;
 }

@@ -1,0 +1,7 @@
+[
+  {
+    "file": "src/installer/harness-probe.ts",
+    "match": "new Date(opts?.nowMs ?? Date.now()",
+    "reason": "TIME-CLOCKS rule 2 serialization site: recordHarnessProbeResult writes the durable harness_probe_at stamp as an ISO-Z instant from an injectable epoch-ms clock (the nowIso() writer path), not an in-process interval; the staleness decision itself routes through isOlderThan() with HARNESS_PROBE_STALENESS_TOLERANCE_MS (US-011)."
+  }
+]

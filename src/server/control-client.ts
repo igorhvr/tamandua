@@ -12,6 +12,7 @@ import http from "node:http";
 import pathModule from "node:path";
 import { testGuardActive, assertStatePathIsolation } from "../lib/test-guard.js";
 import { resolveStateDir } from "../lib/tamandua-config.js";
+import { Deadline } from "../lib/instant.js";
 import { getControlPort, readDaemonSecret } from "./control-server.js";
 import { startDaemon } from "./daemonctl.js";
 
@@ -112,10 +113,12 @@ function resolveProbeTimeout(defaultMs: number): number {
 
 export async function waitForDaemonControl(timeoutMs: number = 30_000): Promise<boolean> {
   const effectiveTimeout = resolveProbeTimeout(timeoutMs);
-  const startedAt = Date.now();
+  // Monotonic elapsed budget (TIME-CLOCKS rule 1): a wall-clock jump cannot
+  // end this probe wait early or extend it past its budget.
+  const deadline = new Deadline(effectiveTimeout);
   let delay = 100;
   const maxDelay = 2_000;
-  while (Date.now() - startedAt < effectiveTimeout) {
+  while (!deadline.expired()) {
     if (await isDaemonControlReachable(500)) return true;
     await new Promise((resolve) => setTimeout(resolve, delay));
     delay = Math.min(delay * 2, maxDelay);

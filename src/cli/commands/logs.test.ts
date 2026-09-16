@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import path from "node:path";
@@ -488,6 +488,64 @@ describe("tamandua logs-tail follow auto-exit (terminal run)", () => {
     assert.match(source, /from "\.\.\/\.\.\/installer\/agent-scheduler\.js"/);
     assert.doesNotMatch(source, /\b10000\b/);
     assert.doesNotMatch(source, /\b10_000\b/);
+  });
+
+  // ── US-007: monotonic follow grace ─────────────────────────────────
+
+  it("US-007 monotonic: follow grace survives a forward wall-clock jump", async () => {
+    const th = createTempHome("tamandua-logs-follow-us007-");
+    const runId = "run-follow-us007-1234";
+    const runFile = path.join(th.tamanduaDir, "events", `${runId}.jsonl`);
+    appendEvent(runFile, makeEvent(runId, "initial-1"));
+    const db = setupFollowDb(th.tamanduaDir, runId, 1, "running");
+
+    // A +1h-per-read wall jump: an epoch-based
+    // `Date.now() - terminalDetectedAt >= grace` check would close the stream
+    // on the very next 20ms poll instead of honoring the 300ms grace.
+    const preload = path.join(th.root, "us007-date-jump.cjs");
+    writeFileSync(
+      preload,
+      "const realNow = Date.now.bind(Date);\nlet reads = 0;\nDate.now = () => realNow() + ++reads * 3600000;\n",
+    );
+
+    const child = spawnFollow(th.tamanduaDir, th.homeDir, ["logs-tail", runId], {
+      NODE_OPTIONS: `--require ${preload}`,
+    });
+    const exitPromise = waitForExit(child, 8000);
+    try {
+      await waitForOutput(child, "(initial-1)");
+
+      // Flip the run terminal, then wait past several poll intervals (20ms
+      // each) but well inside the monotonic grace before appending a trailing
+      // post-terminal event.
+      db.prepare("UPDATE runs SET status = 'completed', updated_at = datetime('now') WHERE id = ?").run(runId);
+      await sleep(150);
+      appendEvent(runFile, makeEvent(runId, "us007-trailing", "run.tokens.final"));
+
+      const result = await exitPromise;
+
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      assert.match(
+        result.stdout,
+        /us007-trailing/,
+        "the monotonic grace must keep the stream open long enough to flush trailing events",
+      );
+      assert.match(result.stdout, new RegExp(`${runId} completed; stream closed`));
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      db.close();
+      rmSync(th.root, { recursive: true, force: true });
+    }
+  });
+
+  it("US-007: logs.ts follow grace uses a monotonic Stopwatch, not Date.now", () => {
+    const source = readFileSync(join(process.cwd(), "src/cli/commands/logs.ts"), "utf8");
+    assert.match(source, /new Stopwatch\(\)/);
+    assert.match(source, /terminalWatch\.elapsedMs\(\) >= getRunFollowGraceMs\(\)/);
+    assert.ok(
+      !source.includes("Date.now() - terminalDetectedAt"),
+      "the follow-grace check must not be an epoch date difference",
+    );
   });
 });
 

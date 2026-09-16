@@ -49,6 +49,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { logger } from "../lib/logger.js";
+import { monotonicNow } from "../lib/instant.js";
 import { emitEvent } from "./events.js";
 import {
   LANDLOCK_CONTROL_FD,
@@ -148,12 +149,14 @@ export interface HarnessLaunchOptions {
   identity?: HarnessRoundIdentity;
   seams?: HarnessLaunchSeams;
   /**
-   * Absolute epoch-ms deadline for the WHOLE launch (native setup +
-   * fallback). The adapters derive it from their round wall budget
-   * (startedAt + timeoutMs). Once it expires, no fresh harness work may
-   * begin: the setup child is killed and the launch aborts as timed out
-   * (zero executions, no fallback). When omitted the setup phase is only
-   * bounded by seams.setupWallMs.
+   * Absolute MONOTONIC-ms deadline for the WHOLE launch (native setup +
+   * fallback), on the same monotonic time base as the adapters' round
+   * Stopwatch (`monotonicNow()` — never an epoch instant; TIME-CLOCKS
+   * rule 1). The adapters derive it from their round wall budget
+   * (roundWatch elapsed => monotonicNow() + remaining). Once it expires,
+   * no fresh harness work may begin: the setup child is killed and the
+   * launch aborts as timed out (zero executions, no fallback). When
+   * omitted the setup phase is only bounded by seams.setupWallMs.
    */
   wallDeadlineMs?: number;
   /**
@@ -307,7 +310,7 @@ function recordMode(
  * as timed out with zero starts and NO fallback mode record.
  */
 function expiredAtEntry(opts: HarnessLaunchOptions): HarnessLaunchOutcome | null {
-  if (opts.wallDeadlineMs === undefined || Date.now() < opts.wallDeadlineMs) return null;
+  if (opts.wallDeadlineMs === undefined || monotonicNow() < opts.wallDeadlineMs) return null;
   return {
     status: "aborted",
     reason: "overall round budget already expired before launch; harness never started",
@@ -432,7 +435,7 @@ async function launchProtected(
 
     /** True when the caller's overall round budget has already expired. */
     const wallExhausted = (): boolean =>
-      wallDeadlineMs !== undefined && Date.now() >= wallDeadlineMs;
+      wallDeadlineMs !== undefined && monotonicNow() >= wallDeadlineMs;
 
     /** Explicit cancellation intent (signal aborted by the scheduler). */
     const isCancelled = (): boolean => externalCancel || opts.signal?.aborted === true;
@@ -680,21 +683,24 @@ async function launchProtected(
     opts.signal?.addEventListener("abort", onExternalCancel, { once: true });
 
     // The overall round budget and the readiness wall both bound the setup
-    // phase; whichever expires first settles it. RETAIN which deadline this
-    // timer was armed for instead of re-reading Date.now() inside the
-    // callback: wall-clock vs timer skew can deliver the overall-budget
-    // timer marginally before Date.now() crosses that deadline, and
-    // re-classifying the fire by the clock would label an overall-budget
-    // kill as a readiness-wall expiry — authorizing an unprotected fallback
-    // AFTER the round's overall budget ran out.
-    const setupWallAt = Date.now() + setupWallMs;
+    // phase; whichever expires first settles it. Both deadlines are on the
+    // monotonic clock (TIME-CLOCKS rule 1) — the readiness wall starts from
+    // monotonicNow() and the caller's wallDeadlineMs is already monotonic —
+    // so a wall-clock jump cannot shift either. RETAIN which deadline this
+    // timer was armed for instead of re-classifying by the clock inside the
+    // callback: monotonic-timer vs monotonic-clock skew can still deliver
+    // the overall-budget timer marginally before monotonicNow() crosses
+    // that deadline, and re-classifying the fire would label an
+    // overall-budget kill as a readiness-wall expiry — authorizing an
+    // unprotected fallback AFTER the round's overall budget ran out.
+    const setupWallAt = monotonicNow() + setupWallMs;
     const overallDeadline =
       wallDeadlineMs !== undefined && wallDeadlineMs <= setupWallAt
         ? wallDeadlineMs
         : undefined;
     const armedForOverall = overallDeadline !== undefined;
     const deadlineAt = overallDeadline ?? setupWallAt;
-    const delayMs = Math.max(0, deadlineAt - Date.now());
+    const delayMs = Math.max(0, deadlineAt - monotonicNow());
     setupTimer = setTimeout(() => {
       if (settled || released) return;
       if (isCancelled()) {

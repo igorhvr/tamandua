@@ -38,6 +38,120 @@ token overhead on real runs (see the historical baselines at the bottom).
   could disagree, causing the "verified" incident (two runs killed by
   producer-retry exhaustion on a key the linter said was covered).
 
+### Timing model (TIME-CLOCKS)
+
+Every in-process interval or deadline in the motor — retry backoff, round
+elapsed/remaining wall budgets, harness readiness, daemon start/stop waits,
+the control-plane probe, the suite claim timeout, the dashboard cache TTL,
+the CLI `wait --timeout` budget, the `update` process-exit wait, the
+`logs --follow` post-terminal grace, the run teardown grace
+(`HARNESS_TEARDOWN_GRACE_MS`), and the `cleanupAbandonedSteps` throttle — is
+measured with the monotonic clock
+(`monotonicNow()` / `Stopwatch` / `Deadline` in `src/lib/instant.ts`), never
+as a difference of `Date.now()` values. A wall-clock jump (NTP step,
+suspend/resume) therefore cannot produce a negative, inflated, or premature
+result.
+
+The four timing sites this contract governs map to helpers as follows: retry
+backoff (`armInstantFailBackoff` / `isInstantFailBackoffActive`, armed and
+read on the monotonic clock) — see the instant-fail backoff contract below;
+adapter elapsed/remaining wall budgets (`roundElapsedMs(watch)` over the
+round's `Stopwatch`, and `Deadline.remainingMs()` for the native readiness
+deadline) — see `src/installer/harness-adapter.ts` and
+`src/installer/agent-scheduler.ts`; the stale-claim sweep
+(`cleanupAbandonedSteps`, whose sweep throttle is a monotonic interval while
+the claim ages it compares are durable rule-2 instants) — see C18 and C23
+below; and the run teardown grace (`HARNESS_TEARDOWN_GRACE_MS`, enforced by
+`sweepRunProcesses` / `settleRunInFlightRounds` with monotonic/unref-ed
+timers) — see "Post-grace process cleanup sweep" below.
+
+Values that must survive a restart (claim leases, staleness thresholds,
+recovery windows, reconciler cutoffs, and stored `created_at` durations)
+keep wall-epoch semantics: they are written as UTC ISO-Z instants via
+`nowIso()`/`SQL_NOW_ISO`, read via `parseInstant()`, and compared numerically
+via `instantAgeMs()`/`isOlderThan()` with an explicit documented tolerance.
+The step claim/abandonment/recovery age filters
+(`recoverOrphanedStepsForAgent`, `cleanupAbandonedSteps`,
+`checkRunningWorkersLiveness`) are part of this rule — they accept an
+injected `nowMs` (default `Date.now()`), perform no SQL `julianday`
+arithmetic, and treat an unparseable/missing instant as NOT stale (safe
+skip) so an unknown age never fabricates a recovery.
+The daemon-lifecycle heartbeat/death comparisons
+(`heartbeatAgeMs`, `markerAccountedFor`, `isUnseenDaemonDeath`) and the
+stale-launch-phantom sweep (`recoverStaleLaunchPhantoms`) are also part of
+rule 2: ages/acknowledgements go through `instantAgeMs()`/`isOlderThan()`
+with the documented `DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS` /
+`STALE_LAUNCH_PHANTOM_TOLERANCE_MS` tolerance, the phantom sweep accepts an
+injected `nowMs` and no longer filters with a `datetime(created_at) <
+datetime(?)` SQL bound, an unparseable heartbeat/`created_at` never
+fabricates an age (age 0 / not stale), and a heartbeat age is clamped to
+`>= 0`.
+Server-side durable windows are also part of rule 2: the dashboard
+`/api/suite/flaky` aggregation (`flakyKeysWithinWindow`), the control-plane
+suite lookup/flaky counts (`isWithinFlakeWindow`, `suiteCountsWithinWindow`),
+the suite-ledger pruning (`pruneOldSuiteResults`), and the once-per-run
+harness-probe reservation (`reserveHarnessProbe`) all accept an injected
+`nowMs` (default `Date.now()`), age each stored `created_at` /
+`harness_probe_at` numerically via `instantAgeMs()`/`isOlderThan()` with an
+explicit documented tolerance, and treat an unparseable instant as NOT old —
+never counted inside a window, never pruned, never re-reserved. The
+flake/retention windows no longer use a `created_at >= ?` / `created_at < ?`
+SQL string bound, and `reserveHarnessProbe` keeps single-winner atomicity by
+guarding its stale re-reservation on the exact stamp it read (compare-and-
+swap).
+CLI and suite durable windows are also part of rule 2: the `tamandua-test`
+shim's stored-result age (`storedInstantAgeMs` in `src/suite/shim.ts`), the
+`tamandua status` stale annotation (`runs.updated_at` vs
+`ABANDONED_THRESHOLD_MS`), `worktree prune --older-than`
+(`run_worktrees.created_at`), `autoresearch prune --older-than`
+(`autoresearch_sessions.updated_at`), and `workflow wait`'s stored
+`created_at` durations all read the instant through `instantAgeMs()` /
+`isOlderThan()` — numerically, never as a `Date.now()` difference and never
+as a string comparison. Tolerances are explicit per call site: the status
+annotation uses `STALE_ANNOTATION_TOLERANCE_MS` (1s, legacy second-granularity
+slack), the two `prune --older-than` windows and the shim's TTL checks use
+tolerance 0 because they are explicit operator/TTL boundaries that must not
+widen, and `workflow wait` has no window (a display duration). An
+unparseable/missing instant is never stale, never pruned, and never replayed —
+the shim maps the helper's `undefined` to `NaN`, which every caller already
+treats as "not fresh" (fail-closed).
+File-mtime provenance (daemon pidfile age, start-lock staleness, dsh session
+"created since spawn") keeps OS-epoch semantics — a file mtime has no
+monotonic analogue — but the age/since-spawn decision still routes through
+`instantAgeMs()`/`isOlderThan()` with a documented tolerance, never a
+`Date.now()` difference: `daemonctl`'s `pidfileProvenanceMatches` uses the
+`PIDFILE_AGE_SLACK_SECONDS` tolerance and `startLockIsStale` uses
+`START_LOCK_STALE_MS` as its tolerance, and `dsh-usage`'s
+`createdSinceSpawn` filter/recency sort uses
+`DSH_SESSION_MTIME_TOLERANCE_MS`. An unparseable/unreadable mtime is never
+stale, never eligible, and never fabricates provenance.
+
+The cross-cutting regression suite
+`tests/time-clocks-wall-jump.test.ts` (US-013) pins all three rules together
+under hostile wall movement: injected backward/forward jumps on
+`Stopwatch`/`Deadline` (including the production default `monotonicNow()`
+path), on the dispatch instant-fail backoff gate (`armInstantFailBackoff` /
+`isInstantFailBackoffActive`, which the scheduler arms and reads on the
+monotonic clock), and on the dashboard runs-cache TTL; a forward wall jump on
+the durable harness-probe reservation and on a stored durable lease (which
+must expire, because they survive a restart); and the daemonctl pidfile /
+start-lock and dsh session-attribution mtime tolerances at, just inside, and
+just outside their boundary.
+
+Rule 1 is enforced mechanically by the fast-tier guard
+`tests/time-clocks-guard.test.ts` (US-014). It comment-blind scans every
+`src/**/*.ts` (excluding `*.test.ts`) for the raw wall-clock interval/deadline
+idioms — `Date.now() -`, `- Date.now()`, `Date.now() +`,
+`Date.now() <|>|<=|>=`, and `new Date(<... Date.now() ...>)` — and fails on any
+match without a justified entry in `tests/time-clocks-guard.allowlist.json`.
+Explicitly NOT flagged are the sanctioned rule-2/rule-3 forms (an injectable
+`nowMs: number = Date.now()` default, a bare `Date.now()` epoch capture fed to
+`instantAgeMs()`/`isOlderThan()`, and a `Date.now()` stamp compared to an OS
+file mtime) and the `nowIso()`/`SQL_NOW_ISO` writers. Allow-list entries match
+a file + a stable code snippet (never a line number), so they survive line
+drift; the only current entry is the harness-probe `harness_probe_at`
+serialization writer, which is an ISO-Z instant writer, not an interval.
+
 ### Lifecycle & pipeline
 
 - **C1** Steps advance `waiting → pending → running → done|failed`; pipeline
@@ -690,7 +804,12 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
   **Relationship to other recovery paths:**
   - **Stale-claim sweeper (C18):** Blunt timeout × 1.5 (up to 45 min)
     for steps with stale claims — covers legacy/ownerless claims and
-    serves as the safety net when liveness detection misses.
+    serves as the safety net when liveness detection misses. Per the
+    [Timing model (TIME-CLOCKS)](#timing-model-time-clocks), its sweep
+    throttle is a monotonic interval while each claim age is a durable
+    rule-2 instant compared numerically via `instantAgeMs()`/`isOlderThan()`
+    with an explicit tolerance (never a `Date.now()` difference and never a
+    string comparison).
   - **CLMR (round-completion immediate release):** Fires when a dispatch
     round's work round tracker sees the round END with outcome `no_work`
     — fast but only triggers when the round tracker is aware of the
@@ -745,7 +864,11 @@ When a run reaches a terminal state, in-flight harness processes are given a
 grace window (`HARNESS_TEARDOWN_GRACE_MS`, 10 s) to flush output and exit
 (C12). After the grace window expires, a **post-grace process cleanup
 sweep** (`sweepRunProcesses` in `src/installer/run-cleanup.ts`) kills any
-surviving orphan processes associated with the run.
+surviving orphan processes associated with the run. This grace is part of the
+[Timing model (TIME-CLOCKS)](#timing-model-time-clocks): it is enforced with
+monotonic/unref-ed timers (`monotonicNow()` / `Stopwatch` / `Deadline` in
+`src/lib/instant.ts`) and never by subtracting `Date.now()` values, so a
+wall-clock jump cannot release or extend it.
 
 **Architecture:**
 

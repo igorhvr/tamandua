@@ -904,3 +904,119 @@ describe("suite control-plane client", { concurrency: 1 }, () => {
     assert.ok(lines[1]!.includes("t2"));
   });
 });
+
+/**
+ * US-004 — waitForDaemonControl must spend its budget on the monotonic clock.
+ *
+ * These tests point the control client at a closed port (so every probe fails
+ * fast) and monkeypatch `Date.now`. Under the old epoch-based loop a forward
+ * jump made `Date.now() - startedAt` exceed the budget on the first check
+ * (returning almost immediately), while a sustained backward jump made the
+ * elapsed value negative forever. The monotonic `Deadline` ignores `Date.now`
+ * entirely, so the real wall duration tracks the requested budget.
+ */
+describe("US-004 monotonic waitForDaemonControl budget", { concurrency: 1 }, () => {
+  /** Reserve then release a random port so nothing is listening on it. */
+  async function closedPort(): Promise<number> {
+    const [handle] = await reservePortHandles(1);
+    const port = handle.port;
+    await handle.close();
+    return port;
+  }
+
+  interface SavedEnv {
+    home: string | undefined;
+    stateDir: string | undefined;
+    controlPort: string | undefined;
+    probeOverride: string | undefined;
+  }
+
+  function saveEnv(): SavedEnv {
+    return {
+      home: process.env.HOME,
+      stateDir: process.env.TAMANDUA_STATE_DIR,
+      controlPort: process.env.TAMANDUA_CONTROL_PORT,
+      probeOverride: process.env.TAMANDUA_CONTROL_PROBE_TIMEOUT_OVERRIDE,
+    };
+  }
+
+  function restoreEnv(saved: SavedEnv): void {
+    const put = (key: string, value: string | undefined) => {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    put("HOME", saved.home);
+    put("TAMANDUA_STATE_DIR", saved.stateDir);
+    put("TAMANDUA_CONTROL_PORT", saved.controlPort);
+    put("TAMANDUA_CONTROL_PROBE_TIMEOUT_OVERRIDE", saved.probeOverride);
+  }
+
+  it("a forward wall-clock jump does not shorten the control-probe budget", async () => {
+    const { root, homeDir } = createTempHome("tamandua-cc-monotonic-fwd-");
+    const saved = saveEnv();
+    const realNow = Date.now;
+    let reads = 0;
+    const DAY = 24 * 60 * 60 * 1000;
+    try {
+      process.env.HOME = homeDir;
+      process.env.TAMANDUA_STATE_DIR = path.join(homeDir, ".tamandua");
+      process.env.TAMANDUA_CONTROL_PORT = String(await closedPort());
+      process.env.TAMANDUA_CONTROL_PROBE_TIMEOUT_OVERRIDE = "600";
+
+      const { waitForDaemonControl } = await import("../../dist/server/control-client.js");
+
+      // Every wall read jumps a full day forward.
+      Date.now = () => realNow() + (++reads) * DAY;
+      const started = performance.now();
+      const reachable = await waitForDaemonControl(60_000);
+      const elapsed = performance.now() - started;
+
+      assert.equal(reachable, false, "closed port means never reachable");
+      assert.ok(
+        elapsed >= 400,
+        `a forward wall jump must not shorten the 600ms budget (elapsed ${elapsed}ms)`,
+      );
+    } finally {
+      Date.now = realNow;
+      restoreEnv(saved);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a backward wall-clock jump does not extend the control-probe budget", async () => {
+    const { root, homeDir } = createTempHome("tamandua-cc-monotonic-bwd-");
+    const saved = saveEnv();
+    const realNow = Date.now;
+    const bootReal = realNow();
+    const BACKWARD_MS = 900;
+    try {
+      process.env.HOME = homeDir;
+      process.env.TAMANDUA_STATE_DIR = path.join(homeDir, ".tamandua");
+      process.env.TAMANDUA_CONTROL_PORT = String(await closedPort());
+      process.env.TAMANDUA_CONTROL_PROBE_TIMEOUT_OVERRIDE = "600";
+
+      const { waitForDaemonControl } = await import("../../dist/server/control-client.js");
+
+      // A one-shot 900ms backward step ~50ms in. The old epoch loop would see
+      // a negative elapsed and run one extra (800ms) poll cycle; the monotonic
+      // deadline still returns at ~600ms.
+      Date.now = () => {
+        const real = realNow();
+        return real - (real - bootReal >= 50 ? BACKWARD_MS : 0);
+      };
+      const started = performance.now();
+      const reachable = await waitForDaemonControl(60_000);
+      const elapsed = performance.now() - started;
+
+      assert.equal(reachable, false, "closed port means never reachable");
+      assert.ok(
+        elapsed < 1200,
+        `a backward wall jump must not extend the 600ms budget (elapsed ${elapsed}ms)`,
+      );
+    } finally {
+      Date.now = realNow;
+      restoreEnv(saved);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

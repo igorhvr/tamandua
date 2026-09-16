@@ -62,6 +62,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import zlib from "node:zlib";
 import { logger } from "../lib/logger.js";
+import { instantAgeMs } from "../lib/instant.js";
 import { sumBillableTokens } from "./token-usage-policy.js";
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -179,6 +180,53 @@ export const DSH_LEGACY_LOGS = [
 /** The minimum dsh version whose session layout this reader understands. */
 export const DSH_MIN_SUPPORTED_VERSION = ">= 0.1.5";
 
+/**
+ * Rule-3 mtime tolerance for the "session created since spawn" scan, in
+ * milliseconds.
+ *
+ * A session directory's mtime is an OS-epoch file instant and has no monotonic
+ * analogue, so `spawnedAtMs` stays an epoch value and the comparison routes
+ * through `instantAgeMs()` — never a `Date.now()` difference. The tolerance
+ * admits a directory whose mtime lands just BEFORE the recorded spawn instant,
+ * which can happen when the file system's mtime granularity or clock skew is
+ * coarser than the spawn timestamp. It is deliberately small so an unrelated
+ * earlier session cannot be attributed: the contract remains "a supported
+ * session created since spawn, else null — never a fabricated 0".
+ */
+export const DSH_SESSION_MTIME_TOLERANCE_MS = 2_000;
+
+/** The subset of a scanned session candidate the mtime filter/sort needs. */
+interface SessionMtimeCandidate {
+  mtimeMs: number;
+}
+
+/**
+ * Rule-3 "created since spawn" predicate: age the OS-epoch session-dir mtime
+ * against `spawnedAtMs` via the shared `instantAgeMs()` helper, allowing
+ * `DSH_SESSION_MTIME_TOLERANCE_MS` of slack. An unparseable mtime is never
+ * eligible, so an unknown session can never be attributed.
+ */
+function createdSinceSpawn(
+  candidate: SessionMtimeCandidate,
+  spawnedAtMs: number,
+): boolean {
+  const ageSinceSpawnMs = instantAgeMs(candidate.mtimeMs, spawnedAtMs);
+  if (ageSinceSpawnMs === undefined) return false;
+  return ageSinceSpawnMs <= DSH_SESSION_MTIME_TOLERANCE_MS;
+}
+
+/**
+ * Recency key for the newest-first sort: the session mtime's age relative to
+ * spawn (negative when created after spawn). The smallest age is the newest
+ * session; an unparseable mtime sorts last (it was already filtered out).
+ */
+function recencyAgeMs(
+  candidate: SessionMtimeCandidate,
+  spawnedAtMs: number,
+): number {
+  return instantAgeMs(candidate.mtimeMs, spawnedAtMs) ?? Number.POSITIVE_INFINITY;
+}
+
 // ── Token lookup ───────────────────────────────────────────────────
 
 /**
@@ -186,9 +234,12 @@ export const DSH_MIN_SUPPORTED_VERSION = ">= 0.1.5";
  * in `workdir`, from dsh's own session files.
  *
  * Strategy: scan `$DSH_HOME/sessions/<escaped-cwd-of-workdir>/` for
- * session directories whose mtime is >= the spawn time (dsh creates the
- * directory when the session starts, so older sessions from other
- * processes are excluded), and pick the newest one holding a v3 log
+ * session directories "created since spawn" (dsh creates the directory
+ * when the session starts, so older sessions from other processes are
+ * excluded). The OS-epoch directory mtime is aged against `spawnedAtMs`
+ * through the shared `instantAgeMs()` helper with the documented
+ * `DSH_SESSION_MTIME_TOLERANCE_MS` slack, and the newest eligible one
+ * holding a v3 log is picked
  * (`session.v3.jsonl.zstd`, preferring it over the plain
  * `session.v3.jsonl`). Decompress/read that log and sum
  * `inputTokens + outputTokens` over every v3 record carrying a top-level
@@ -305,16 +356,20 @@ export async function lookupDshSessionTokens(
     }
 
     const eligibleV3 = v3Candidates
-      .filter((c) => c.mtimeMs >= spawnedAtMs)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      .filter((c) => createdSinceSpawn(c, spawnedAtMs))
+      .sort(
+        (a, b) => recencyAgeMs(a, spawnedAtMs) - recencyAgeMs(b, spawnedAtMs),
+      );
 
     if (eligibleV3.length === 0) {
       // No supported session since spawn. If an older-layout session
       // exists (an under-versioned dsh wrote it), say so LOUDLY and
       // name the file — the alternative is a silent 0-token run.
       const eligibleLegacy = legacyCandidates
-        .filter((c) => c.mtimeMs >= spawnedAtMs)
-        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+        .filter((c) => createdSinceSpawn(c, spawnedAtMs))
+        .sort(
+          (a, b) => recencyAgeMs(a, spawnedAtMs) - recencyAgeMs(b, spawnedAtMs),
+        );
 
       if (eligibleLegacy.length > 0) {
         const found = eligibleLegacy[0];

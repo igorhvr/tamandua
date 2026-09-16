@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { once } from "node:events";
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
 import { DatabaseSync } from "node:sqlite";
 
@@ -278,6 +279,29 @@ describe("kanban-data: buildKanbanSnapshot", () => {
 
     const snap = buildKanbanSnapshot(db, "r-bad")!;
     assert.equal(snap.run.elapsed_seconds, null);
+  });
+
+  it("computes elapsed_seconds through the shared instant age helper (US-011)", () => {
+    const db = seedDb();
+    // Sub-second ISO-Z instants: the frozen elapsed must be the numeric age,
+    // not a string/Date-parse approximation.
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) " +
+      "VALUES ('r-age', 1, 'feature-dev-merge', 'demo', 'completed', '{}', 0, '2026-05-01T10:00:00.500Z', '2026-05-01T10:01:30.250Z')",
+    ).run();
+    insertStep(db, "r-age", "plan", "planner", 0, "done");
+
+    const snap = buildKanbanSnapshot(db, "r-age")!;
+    assert.equal(snap.run.elapsed_seconds, 89.75);
+
+    // Source guard: the age comes from the shared helper, never a raw
+    // epoch-millisecond difference between the two stored instants.
+    const src = fs.readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../src/server/kanban-data.ts"),
+      "utf8",
+    );
+    assert.ok(src.includes("instantAgeMs("), "computeElapsed must age created_at via instantAgeMs");
+    assert.ok(!src.includes("updatedMs - createdMs"), "elapsed must not use a raw epoch difference");
   });
 
   it("renders stories as cards for loop-type lanes", () => {

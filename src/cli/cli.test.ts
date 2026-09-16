@@ -2298,6 +2298,51 @@ describe("formatRunsSummary", () => {
     assert.match(result, /\[running \(stale — daemon down\?\)\] aaaaaaaa/);
   });
 
+  it("does not annotate an unparseable updatedAt as stale (TIME-CLOCKS US-012 safe default)", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix bug", status: "running", createdAt: "", updatedAt: "not-a-timestamp", tokensSpent: 100 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    // An unknown instant is never treated as stale by the shared helper.
+    assert.match(result, /\[running\] aaaaaaaa/);
+    assert.doesNotMatch(result, /stale/);
+  });
+
+  it("applies the documented 1s tolerance at the stale-annotation boundary (TIME-CLOCKS US-012)", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const { ABANDONED_THRESHOLD_MS } = await import("../../dist/installer/step-ops.js");
+    const fixedNow = Date.parse("2026-09-16T12:00:00.000Z");
+    const realDateNow = Date.now;
+    Date.now = () => fixedNow;
+    try {
+      // Inside the tolerance (threshold + 500ms): NOT stale.
+      const withinTolerance = new Date(fixedNow - (ABANDONED_THRESHOLD_MS + 500)).toISOString();
+      const r1 = formatRunsSummary({
+        listRuns: () => [
+          { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix bug", status: "running", createdAt: withinTolerance, updatedAt: withinTolerance, tokensSpent: 100 },
+        ],
+        isDaemonRunning: () => false,
+      });
+      assert.match(r1, /\[running\] aaaaaaaa/);
+      assert.doesNotMatch(r1, /stale/);
+
+      // Past the tolerance (threshold + 5s): stale.
+      const pastTolerance = new Date(fixedNow - (ABANDONED_THRESHOLD_MS + 5_000)).toISOString();
+      const r2 = formatRunsSummary({
+        listRuns: () => [
+          { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix bug", status: "running", createdAt: pastTolerance, updatedAt: pastTolerance, tokensSpent: 100 },
+        ],
+        isDaemonRunning: () => false,
+      });
+      assert.match(r2, /\[running \(stale — daemon down\?\)\] aaaaaaaa/);
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
   it("annotates active runs in an instant-fail loop (RSPN DDTH surfacing)", async () => {
     const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
     const now = new Date().toISOString();
@@ -3246,6 +3291,95 @@ describe("autoresearch prune CLI", () => {
         assert.ok(fs.existsSync(path.join(cwd, "autoresearch.jsonl")), "log file should still exist");
       } finally {
       }
+    } finally {
+    }
+  });
+
+  it("skips sessions whose updated_at is unparseable (never treated as old)", async () => {
+    const env = makeSharedEnv();
+    try {
+      const cwd = path.join(env.tmpDir, "session");
+      fs.mkdirSync(cwd);
+      initSession(env, cwd);
+
+      // Corrupt the durable updated_at: an unknown instant must never be pruned.
+      const db = await openDb(env.dbPath);
+      try {
+        db.prepare("UPDATE autoresearch_sessions SET updated_at = ?").run("not-a-timestamp");
+      } finally {
+        db.close();
+      }
+
+      const result = cliShared(env, ["autoresearch", "prune", "--older-than", "0m"]);
+      assert.equal(result.status, 0);
+      assert.match(result.stdout ?? "", /No sessions to prune/);
+
+      const db2 = await openDb(env.dbPath);
+      try {
+        const rows = db2.prepare("SELECT COUNT(*) AS c FROM autoresearch_sessions").get() as { c: number };
+        assert.equal(rows.c, 1, "unparseable-updated_at session must be skipped");
+      } finally {
+        db2.close();
+      }
+    } finally {
+    }
+  });
+
+  it("does not prune a recent legacy naive UTC updated_at (numeric age, not string compare)", async () => {
+    const env = makeSharedEnv();
+    try {
+      const cwd = path.join(env.tmpDir, "session");
+      fs.mkdirSync(cwd);
+      initSession(env, cwd);
+
+      // A naive (space-separated, no zone) UTC instant one minute in the past.
+      // The old ISO-string cutoff sorted it BEFORE the cutoff (" " < "T") and
+      // wrongly pruned it; the shared numeric helper reads it as UTC and sees
+      // an age well inside the 1h window.
+      const naiveRecent = new Date(Date.now() - 60_000)
+        .toISOString().slice(0, 19).replace("T", " ");
+      const db = await openDb(env.dbPath);
+      try {
+        db.prepare("UPDATE autoresearch_sessions SET updated_at = ?").run(naiveRecent);
+      } finally {
+        db.close();
+      }
+
+      const result = cliShared(env, ["autoresearch", "prune", "--older-than", "1h"]);
+      assert.equal(result.status, 0);
+      assert.match(result.stdout ?? "", /No sessions to prune/);
+
+      const db2 = await openDb(env.dbPath);
+      try {
+        const rows = db2.prepare("SELECT COUNT(*) AS c FROM autoresearch_sessions").get() as { c: number };
+        assert.equal(rows.c, 1, "recent naive-UTC session must not be pruned");
+      } finally {
+        db2.close();
+      }
+    } finally {
+    }
+  });
+
+  it("prunes a legacy naive UTC updated_at older than the threshold", async () => {
+    const env = makeSharedEnv();
+    try {
+      const cwd = path.join(env.tmpDir, "session");
+      fs.mkdirSync(cwd);
+      initSession(env, cwd);
+
+      const naiveOld = new Date(Date.now() - 2 * 3600 * 1000)
+        .toISOString().slice(0, 19).replace("T", " ");
+      const db = await openDb(env.dbPath);
+      try {
+        db.prepare("UPDATE autoresearch_sessions SET updated_at = ?").run(naiveOld);
+      } finally {
+        db.close();
+      }
+
+      const result = cliShared(env, ["autoresearch", "prune", "--older-than", "1h"]);
+      assert.equal(result.status, 0);
+      assert.match(result.stdout ?? "", /Pruned:/);
+      assert.match(result.stdout ?? "", /Pruned 1 session/);
     } finally {
     }
   });

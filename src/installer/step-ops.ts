@@ -11,7 +11,7 @@ import { getMaxRoleTimeoutSeconds } from "./install.js";
 import { loadWorkflowSpec, loadWorkflowSpecSync } from "./workflow-spec.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
 import { stripIdPrefix } from "../lib/id-prefix.js";
-import { SQL_NOW_ISO } from "../lib/instant.js";
+import { SQL_NOW_ISO, instantAgeMs, isOlderThan, monotonicNow } from "../lib/instant.js";
 import type { LoopConfig, Story, WorkflowStepFailure } from "./types.js";
 import { detectRugpull, relaunchRunAfterRugpull } from "./rugpull.js";
 import { getPgid } from "../lib/proc-info.js";
@@ -1338,6 +1338,16 @@ export function parseAndInsertStories(output: string, runId: string): void {
 export const ABANDONED_THRESHOLD_MS = (getMaxRoleTimeoutSeconds() + 5 * 60) * 1000;
 
 /**
+ * TIME-CLOCKS (rule 2) — the explicit tolerance for this module's durable age
+ * filters. This is deliberately zero: ABANDONED_THRESHOLD_MS already carries a
+ * five-minute cushion on top of the role's max timeout, and the recovery
+ * thresholds are caller-supplied (0 means "recover regardless of age"). Adding
+ * slack here would widen those windows and break the documented 0 contract, so
+ * the tolerance is named and zero rather than an unexplained literal.
+ */
+const STEP_AGE_TOLERANCE_MS = 0;
+
+/**
  * Build an aggregate abandon-reason string for a run from the
  * story_abandonments table. Queries GROUP BY reason and produces a
  * human-readable summary like:
@@ -1371,18 +1381,29 @@ const ABANDON_STORY_MAX = 8;
  * This catches cases where an agent claimed a step but never completed/failed it.
  * Exported so it can be called from medic/health-check crons independently of claimStep.
  */
-export function cleanupAbandonedSteps(): void {
+export function cleanupAbandonedSteps(nowMs: number = Date.now()): void {
   const db = getDb();
   const thresholdMs = ABANDONED_THRESHOLD_MS;
 
+  // TIME-CLOCKS (rule 2): select the candidate rows and age them in JS via the
+  // shared instant helpers instead of SQL `julianday` arithmetic, so the one
+  // durable-instant rule owns every staleness decision. Unparseable/missing
+  // `updated_at` values yield `undefined` from `isOlderThan` and are therefore
+  // treated as NOT stale (safe skip) — never a fabricated age.
   const abandonedSteps = db.prepare(
-    "SELECT id, step_id, run_id, retry_count, max_retries, type, current_story_id, loop_config, abandoned_count FROM steps WHERE status = 'running' AND (julianday('now') - julianday(updated_at)) * 86400000 > ?"
-  ).all(thresholdMs) as {
+    "SELECT id, step_id, run_id, retry_count, max_retries, type, current_story_id, loop_config, abandoned_count, updated_at FROM steps WHERE status = 'running'"
+  ).all() as {
     id: string; step_id: string; run_id: string; retry_count: number; max_retries: number;
     type: string; current_story_id: string | null; loop_config: string | null; abandoned_count: number;
+    updated_at: string | null;
   }[];
 
   for (const step of abandonedSteps) {
+    // Strictly older than the abandonment threshold. `isOlderThan` keeps the
+    // original `> ?` semantics (including "exactly at threshold is fresh") and
+    // safely skips unknown instants.
+    if (!isOlderThan(step.updated_at, thresholdMs, nowMs, STEP_AGE_TOLERANCE_MS)) continue;
+
     // Skip loop steps waiting on verify_each (verify step still pending/running)
     if (step.type === "loop" && !step.current_story_id && step.loop_config) {
       try {
@@ -1483,12 +1504,14 @@ export function cleanupAbandonedSteps(): void {
     }
   }
 
-  // Reset running stories that are abandoned — don't touch "done" stories
+  // Reset running stories that are abandoned — don't touch "done" stories.
+  // TIME-CLOCKS (rule 2): age in JS via the shared helper; unknown instants skip.
   const abandonedStories = db.prepare(
-    "SELECT id, retry_count, max_retries, run_id FROM stories WHERE status = 'running' AND (julianday('now') - julianday(updated_at)) * 86400000 > ?"
-  ).all(thresholdMs) as { id: string; retry_count: number; max_retries: number; run_id: string }[];
+    "SELECT id, retry_count, max_retries, run_id, updated_at FROM stories WHERE status = 'running'"
+  ).all() as { id: string; retry_count: number; max_retries: number; run_id: string; updated_at: string | null }[];
 
   for (const story of abandonedStories) {
+    if (!isOlderThan(story.updated_at, thresholdMs, nowMs, STEP_AGE_TOLERANCE_MS)) continue;
     db.prepare(`UPDATE stories SET status = 'pending', updated_at = ${SQL_NOW_ISO} WHERE id = ?`).run(story.id);
   }
 
@@ -1594,6 +1617,7 @@ export function recoverOrphanedStepsForAgent(
   signal?: string | null,
   stderrTail?: string,
   timedOut?: boolean,
+  nowMs: number = Date.now(),
 ): { recovered: number; failed: number; skipped: number } {
   const db = getDb();
 
@@ -1602,10 +1626,6 @@ export function recoverOrphanedStepsForAgent(
   // workflow + agent are isolated.
   const clauses: string[] = ["agent_id = ?", "status = 'running'", "run_id = ?"];
   const params: (string | number)[] = [agentId, runId];
-  if (staleThresholdMs !== undefined) {
-    clauses.push("(julianday('now') - julianday(updated_at)) * 86400000 >= ?");
-    params.push(staleThresholdMs);
-  }
   // Ownership-aware filter: when workerJobId is provided, skip steps
   // claimed by a different worker (claim_job_id mismatch). Steps with
   // NULL claim_job_id (legacy, pre-ownership) are always recovered.
@@ -1613,15 +1633,27 @@ export function recoverOrphanedStepsForAgent(
     clauses.push("(claim_job_id IS NULL OR claim_job_id = ?)");
     params.push(workerJobId);
   }
-  const query = `SELECT id, step_id, run_id, retry_count, max_retries, type, current_story_id, loop_config, claim_pid, claim_job_id
+  const query = `SELECT id, step_id, run_id, retry_count, max_retries, type, current_story_id, loop_config, claim_pid, claim_job_id, updated_at
        FROM steps
        WHERE ${clauses.join(" AND ")}`;
 
   const steps = db.prepare(query).all(...params) as {
     id: string; step_id: string; run_id: string; retry_count: number; max_retries: number;
     type: string; current_story_id: string | null; loop_config: string | null;
-    claim_pid: number | null; claim_job_id: string | null;
+    claim_pid: number | null; claim_job_id: string | null; updated_at: string | null;
   }[];
+
+  // TIME-CLOCKS (rule 2): the stale-threshold filter is a numeric durable-age
+  // check via the shared instant helpers, never SQL `julianday` arithmetic.
+  // Semantics preserved: the old SQL used `>= ?`, so `staleThresholdMs = 0`
+  // still recovers every running step regardless of age. Unparseable/missing
+  // `updated_at` yields `undefined` and is NOT stale (safe skip).
+  const staleSteps = staleThresholdMs === undefined
+    ? steps
+    : steps.filter((s) => {
+        const age = instantAgeMs(s.updated_at, nowMs);
+        return age !== undefined && age >= staleThresholdMs + STEP_AGE_TOLERANCE_MS;
+      });
 
   let recovered = 0;
   let failed = 0;
@@ -1639,7 +1671,7 @@ export function recoverOrphanedStepsForAgent(
       });
   };
 
-  for (const step of steps) {
+  for (const step of staleSteps) {
     // Skip loop steps waiting on verify_each (mid-iteration pause, not orphaned)
     if (step.type === "loop" && !step.current_story_id && step.loop_config) {
       try {
@@ -2219,6 +2251,7 @@ const LIVENESS_GRACE_PERIOD_MS = 30_000;
  */
 export function checkRunningWorkersLiveness(
   inFlightChildren?: Map<string, { pid: number; pgid: number; killed: boolean }>,
+  nowMs: number = Date.now(),
 ): {
   recovered: number;
   failed: number;
@@ -2228,7 +2261,7 @@ export function checkRunningWorkersLiveness(
   const db = getDb();
 
   const steps = db.prepare(
-    `SELECT s.id, s.agent_id, s.run_id, s.claim_pgid, s.claim_job_id
+    `SELECT s.id, s.agent_id, s.run_id, s.claim_pgid, s.claim_job_id, s.claim_updated_at
      FROM steps s
      JOIN runs r ON r.id = s.run_id
      WHERE s.status = 'running'
@@ -2240,6 +2273,7 @@ export function checkRunningWorkersLiveness(
     run_id: string;
     claim_pgid: number;
     claim_job_id: string | null;
+    claim_updated_at: string | null;
   }[];
 
   const totals = { recovered: 0, failed: 0, skipped: 0, runIds: [] as string[] };
@@ -2259,18 +2293,18 @@ export function checkRunningWorkersLiveness(
     if (pgidAlive(step.claim_pgid)) continue;
 
     // Grace period: skip claims younger than 30s to avoid racing a
-    // round that just finished and is mid-report.
-    const claimAge = db.prepare(
-      `SELECT (julianday('now') - julianday(claim_updated_at)) * 86400000 AS age_ms
-       FROM steps WHERE id = ?`
-    ).get(step.id) as { age_ms: number | null } | undefined;
-    if (!claimAge || claimAge.age_ms === null) {
+    // round that just finished and is mid-report. TIME-CLOCKS (rule 2):
+    // numeric durable-age check via the shared instant helper, never SQL
+    // julianday arithmetic. An unparseable/missing claim_updated_at yields
+    // `undefined` and is conservatively skipped (left to the timeout sweeper).
+    const claimAgeMs = instantAgeMs(step.claim_updated_at, nowMs);
+    if (claimAgeMs === undefined) {
       // No claim timestamp available — can't determine freshness.
       // Be conservative: leave it for the timeout sweeper.
       totals.skipped += 1;
       continue;
     }
-    if (claimAge.age_ms < LIVENESS_GRACE_PERIOD_MS) {
+    if (claimAgeMs < LIVENESS_GRACE_PERIOD_MS + STEP_AGE_TOLERANCE_MS) {
       totals.skipped += 1;
       continue;
     }
@@ -2641,9 +2675,35 @@ interface ClaimResult {
 
 /**
  * Throttle cleanupAbandonedSteps: run at most once every 5 minutes.
+ *
+ * TIME-CLOCKS (rule 1): this is an in-process interval, so it is measured on
+ * the monotonic clock. `null` means "no cleanup yet in this process" so the
+ * very first call always cleans up — a monotonic reading is process-relative
+ * and starts near zero, so the old `Date.now() - 0` first-call behavior cannot
+ * be reproduced with a zero sentinel.
  */
-let lastCleanupTime = 0;
+let lastCleanupTime: number | null = null;
 const CLEANUP_THROTTLE_MS = 5 * 60 * 1000;
+
+/**
+ * @internal Test seam for the cleanup-throttle boundary: returns true (and
+ * records the reading) when a cleanup is due at the supplied monotonic `nowMs`.
+ * A pure decision over an injected monotonic reading lets tests exercise the
+ * first-call and throttle-window boundaries deterministically, without
+ * sleeping and without a wall-clock jump.
+ */
+export function _shouldRunCleanupForTest(nowMs: number): boolean {
+  if (lastCleanupTime === null || nowMs - lastCleanupTime >= CLEANUP_THROTTLE_MS) {
+    lastCleanupTime = nowMs;
+    return true;
+  }
+  return false;
+}
+
+/** @internal Reset the cleanup throttle between tests. */
+export function _resetCleanupThrottleForTest(): void {
+  lastCleanupTime = null;
+}
 
 /** POSIX single-argument quoting: wraps value in single quotes with embedded-quote escaping. */
 function posixQuoteArg(value: string): string {
@@ -2835,11 +2895,11 @@ function enforceClaimLedgerGate(
 export function claimStep(agentId: string, runId: string, workerOwnership?: WorkerOwnership): ClaimResult {
   // Defense-in-depth: strip run- prefix (US-013)
   runId = stripIdPrefix(runId);
-  // Throttle cleanup: run at most once every 5 minutes across all agents
-  const now = Date.now();
-  if (now - lastCleanupTime >= CLEANUP_THROTTLE_MS) {
+  // Throttle cleanup: run at most once every 5 minutes across all agents.
+  // TIME-CLOCKS (rule 1): monotonic reading — a wall-clock jump must neither
+  // trigger an early cleanup nor suppress a due one.
+  if (_shouldRunCleanupForTest(monotonicNow())) {
     cleanupAbandonedSteps();
-    lastCleanupTime = now;
   }
 
   // SCUR-1: Idempotent re-claim — if the calling agent already holds an

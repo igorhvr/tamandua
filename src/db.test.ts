@@ -10,7 +10,7 @@ import { createTempHome } from "../tests/helpers/test-env.ts";
 // We test the migration by directly importing getDb, which calls migrate().
 // But since getDb() uses a cached connection and resolves DB path from
 // env/home, we test the migration logic directly with an isolated DB.
-import { getDb, getDbPath, SCHEMA_VERSION, migrateInstantsToIsoZ, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults } from "../dist/db.js";
+import { getDb, getDbPath, SCHEMA_VERSION, migrateInstantsToIsoZ, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults, _enableWalModeForTest, _acquireMigrationLockForTest } from "../dist/db.js";
 
 describe("PRAGMA synchronous", () => {
   let tempHome: string;
@@ -157,6 +157,90 @@ describe("WAL initialization under a concurrent first-time initializer", () => {
         else locker.once("close", () => resolve());
       });
     }
+  });
+});
+
+// ── US-006: monotonic lock deadlines ────────────────────────────────
+//
+// The WAL-init and migration-lock retry budgets are in-process intervals and
+// must be enforced with the monotonic Deadline helper, so a wall-clock jump
+// cannot make a bounded retry loop expire early (or run long).
+describe("US-006 monotonic lock deadlines", () => {
+  /** A fake DatabaseSync whose `exec` throws "database is locked" N times. */
+  function lockedDb(failTimes: number): { db: DatabaseSync; calls: () => number } {
+    let calls = 0;
+    const fake = {
+      exec(_sql: string): void {
+        calls += 1;
+        if (calls <= failTimes) throw new Error("database is locked");
+      },
+    };
+    return { db: fake as unknown as DatabaseSync, calls: () => calls };
+  }
+
+  it("WAL-init retry budget retries through a forward wall-clock jump", () => {
+    const { db, calls } = lockedDb(3);
+    const realDateNow = Date.now;
+    let reads = 0;
+    // An epoch-based deadline (`Date.now() + TIMEOUT`) would expire on the
+    // first locked error under this +1-day-per-read jump; the monotonic
+    // deadline ignores Date.now entirely and keeps retrying to success.
+    Date.now = () => realDateNow() + (++reads) * 86_400_000;
+    try {
+      assert.doesNotThrow(() => _enableWalModeForTest(db));
+      assert.equal(calls(), 4, "WAL-init should retry each locked error before succeeding");
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  it("migration-lock retry budget retries through a forward wall-clock jump", () => {
+    const { db, calls } = lockedDb(3);
+    const realDateNow = Date.now;
+    let reads = 0;
+    Date.now = () => realDateNow() + (++reads) * 86_400_000;
+    try {
+      assert.doesNotThrow(() => _acquireMigrationLockForTest(db));
+      assert.equal(calls(), 4, "migration lock should retry each locked error before succeeding");
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  it("WAL-init retry budget is bounded by the injected monotonic clock", () => {
+    const db = lockedDb(Number.MAX_SAFE_INTEGER).db;
+    // origin read -> 0ms; the first expiry check -> 20s, past the 10s budget.
+    let reads = 0;
+    const clock = (): number => {
+      reads += 1;
+      return reads === 1 ? 0 : 20_000;
+    };
+    assert.throws(() => _enableWalModeForTest(db, clock), /database is locked/);
+    assert.equal(reads, 2, "the deadline should be read once at construction and once per expiry check");
+  });
+
+  it("migration-lock retry budget is bounded by the injected monotonic clock", () => {
+    const db = lockedDb(Number.MAX_SAFE_INTEGER).db;
+    let reads = 0;
+    const clock = (): number => {
+      reads += 1;
+      return reads === 1 ? 0 : 30_000;
+    };
+    assert.throws(() => _acquireMigrationLockForTest(db, clock), /database is locked/);
+    assert.equal(reads, 2, "the deadline should be read once at construction and once per expiry check");
+  });
+
+  it("retry loops keep their non-lock errors fatal", () => {
+    const otherError = (() => {
+      const fake = {
+        exec(): void {
+          throw new Error("some other sqlite failure");
+        },
+      };
+      return fake as unknown as DatabaseSync;
+    })();
+    assert.throws(() => _enableWalModeForTest(otherError), /some other sqlite failure/);
+    assert.throws(() => _acquireMigrationLockForTest(otherError), /some other sqlite failure/);
   });
 });
 
@@ -2905,6 +2989,60 @@ describe("suite_results pruneOldSuiteResults", () => {
       "SELECT tree_hash FROM suite_results WHERE tree_hash = ?",
     ).get(prefix + "-just");
     assert.equal(justRow, undefined, "row > 14d old should be pruned");
+  });
+
+  it("filters by numeric age against an injected now (US-011)", () => {
+    const db = getDb();
+    const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+    const retention = 14 * 24 * 60 * 60 * 1000;
+
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("/repo", "injected-old", "cmd-old", "npm test", 0, 100, new Date(now - retention - 1000).toISOString());
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("/repo", "injected-fresh", "cmd-fresh", "npm test", 0, 100, new Date(now - retention + 1000).toISOString());
+
+    // The injected now drives the decision — a row 14d+1s old relative to
+    // `now` is pruned even though it is recent relative to the real clock.
+    const pruned = pruneOldSuiteResults(now);
+    assert.equal(pruned, 1);
+
+    const oldRow = db.prepare("SELECT tree_hash FROM suite_results WHERE tree_hash = ?").get("injected-old");
+    assert.equal(oldRow, undefined, "old row must be pruned");
+    const freshRow = db.prepare("SELECT tree_hash FROM suite_results WHERE tree_hash = ?").get("injected-fresh");
+    assert.ok(freshRow, "fresh row must remain");
+  });
+
+  it("never prunes an unparseable created_at (US-011 safe skip)", () => {
+    const db = getDb();
+    const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("/repo", "unparseable", "cmd", "npm test", 0, 100, "not-a-timestamp");
+
+    assert.equal(pruneOldSuiteResults(now), 0);
+    const row = db.prepare("SELECT tree_hash FROM suite_results WHERE tree_hash = ?").get("unparseable");
+    assert.ok(row, "an unknown age must never destroy ledger history");
+  });
+
+  it("prunes a legacy naive-UTC row older than the retention window (US-011)", () => {
+    const db = getDb();
+    const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+    // Naive UTC shape written by the old SQLite datetime('now').
+    const naiveOld = new Date(now - 20 * 24 * 60 * 60 * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("/repo", "naive-old", "cmd", "npm test", 0, 100, naiveOld);
+
+    assert.equal(pruneOldSuiteResults(now), 1);
+    const row = db.prepare("SELECT tree_hash FROM suite_results WHERE tree_hash = ?").get("naive-old");
+    assert.equal(row, undefined);
   });
 });
 

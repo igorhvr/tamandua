@@ -21,7 +21,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { TamanduaEvent } from "../installer/events.js";
 import { displayStepStatus } from "../lib/step-display.js";
-import { nowIso, parseInstant } from "../lib/instant.js";
+import { nowIso, parseInstant, instantAgeMs } from "../lib/instant.js";
 
 export type VisualStatus = "todo" | "running" | "done" | "failed" | "verifying";
 
@@ -233,10 +233,14 @@ function computeElapsed(status: string, created_at: string, updated_at: string):
   // `!` covers both `undefined` (unparseable) and the epoch-0 sentinel the
   // previous implementation used for missing values.
   if (!createdMs || !updatedMs) return null;
+  // US-011: the elapsed age goes through the shared numeric instant helper
+  // rather than a raw getTime() difference.
+  const ageMs = instantAgeMs(created_at, updatedMs);
+  if (ageMs === undefined) return null;
   const statusKey = String(status).toLowerCase();
   // Terminal runs: freeze duration so the dashboard does not keep counting after completion.
   // Active runs: return null so the client uses its own clock between polls.
-  if (TERMINAL_STATUSES.has(statusKey)) return Math.max(0, (updatedMs - createdMs) / 1000);
+  if (TERMINAL_STATUSES.has(statusKey)) return Math.max(0, ageMs / 1000);
   return null;
 }
 

@@ -28,6 +28,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolveClockTicksPerSecond } from "./process-start-identity.js";
 import { logger } from "./logger.js";
+import { instantAgeMs } from "./instant.js";
 import { runLsof, type LsofProbeResult } from "./lsof-probe.js";
 
 /** Definite open-file evidence, or "unknown" when the probe could not tell. */
@@ -514,7 +515,12 @@ export function getElapsedSeconds(pid: number): number | null {
         const ticksPerSecond = resolveClockTicksPerSecond();
         const startMs =
           Number(btimeMatch[1]) * 1000 + Math.round((startTicks * 1000) / ticksPerSecond);
-        if (startMs > 0) return Math.max(0, (Date.now() - startMs) / 1000);
+        if (startMs > 0) {
+          // Rule 3: the kernel start time is an OS-epoch instant with no
+          // monotonic analogue, so age it through the shared helper.
+          const ageMs = instantAgeMs(startMs);
+          return ageMs === undefined ? null : Math.max(0, ageMs / 1000);
+        }
       }
     } catch {
       // fall through to the ps fallback
@@ -523,7 +529,8 @@ export function getElapsedSeconds(pid: number): number | null {
     const native = nativeRecord(pid);
     if (native !== null) {
       const startMs = native.startSec * 1000 + Math.floor(native.startUsec / 1000);
-      return Math.max(0, (Date.now() - startMs) / 1000);
+      const ageMs = instantAgeMs(startMs);
+      return ageMs === undefined ? null : Math.max(0, ageMs / 1000);
     }
   }
   const out = ps(["-o", "etime=", "-p", String(pid)]);

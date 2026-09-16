@@ -528,6 +528,45 @@ followed by a top-level command listing.
   `TAMANDUA_TEST_GUARD=1`), and assert the new column(s), the re-stamped
   user_version, and a status SELECT over runs.
 
+### Time and staleness (TIME-CLOCKS)
+
+ONE clock/staleness rule owns every interval, deadline, and stored instant.
+It is implemented in `src/lib/instant.ts`, documented at call sites, and
+enforced mechanically by `tests/time-clocks-guard.test.ts` (US-014) plus the
+cross-cutting wall-jump regression suite
+`tests/time-clocks-wall-jump.test.ts` (US-013).
+
+- **Rule 1 — in-process intervals and deadlines are monotonic.** Retry
+  backoff, round elapsed/remaining wall budgets, harness readiness, daemon
+  start/stop waits, the control-plane wait, the suite claim timeout, the
+  dashboard cache TTL, CLI elapsed timers, and teardown graces measure and
+  enforce their budgets with `monotonicNow()` / `Stopwatch` / `Deadline` —
+  **never** a difference of `Date.now()` values. A wall-clock jump (NTP
+  step, suspend/resume) must not produce a negative, inflated, or premature
+  result. A monotonic reading is opaque: never persist it and never mix it
+  with epoch milliseconds.
+- **Rule 2 — durable instants are UTC ISO-Z, compared numerically.** Values
+  that must survive a restart (claim leases, staleness thresholds, recovery
+  windows, reconciler cutoffs, stored `created_at` ages) are written via
+  `nowIso()` / `SQL_NOW_ISO`, read via `parseInstant()`, and compared with
+  `instantAgeMs()` / `isOlderThan()` — **never as string comparisons**. Each
+  call site passes an explicit tolerance and documents why. An unparseable
+  or missing instant is never stale (`isOlderThan()` returns `false`), so an
+  unknown age cannot fabricate a recovery, expiration, or replay.
+- **Rule 3 — file mtimes keep OS-epoch semantics.** Daemon pidfile / start
+  lock provenance and dsh session "created since spawn" have no monotonic
+  analogue, so they stay epoch-based, but the age/since-spawn decision still
+  routes through the same `instantAgeMs()` / `isOlderThan()` helpers with
+  the same documented-tolerance discipline.
+
+`tests/time-clocks-guard.test.ts` comment-blind scans `src/**/*.ts`
+(excluding `*.test.ts`) for raw `Date.now()` interval/deadline idioms and
+fails on any match not justified in
+`tests/time-clocks-guard.allowlist.json`; sanctioned serialization and
+OS-epoch sites carry a TIME-CLOCKS allow-list reason. Adding a new wall-clock
+interval or a string comparison of instants is therefore a build failure, not
+a review comment.
+
 ## Update and Catalog Staleness
 
 Installed workflows live in `~/.tamandua/workflows/` and may become older than the

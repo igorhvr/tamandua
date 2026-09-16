@@ -31,6 +31,7 @@ import {
   dshSessionProjectDir,
   sumUsageChunks,
   decompressDshSessionLog,
+  DSH_SESSION_MTIME_TOLERANCE_MS,
 } from "../../dist/installer/dsh-usage.js";
 
 // ── Real dsh 0.1.5 (v3) ground-truth fixture ───────────────────────
@@ -561,7 +562,158 @@ describe("lookupDshSessionTokens", () => {
     assert.equal(result.sessionRef, fresh);
   });
 
-  // ── v3-only layout probing (dsh >= 0.1.5) ──────────────────────
+  // ── Rule-3 mtime tolerance for "created since spawn" (US-010) ───
+  //
+  // The session-dir mtime is an OS-epoch file instant; the filter ages it
+  // against spawnedAtMs through instantAgeMs with the documented
+  // DSH_SESSION_MTIME_TOLERANCE_MS slack. These pin the boundary with real
+  // os.utimes values (no clock injection needed) and the never-0 contract.
+
+  it("includes a session whose mtime is just older than spawn within the mtime tolerance", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const spawnMs = 1_700_000_000_000;
+    const sessionName = "session-within-tolerance";
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName,
+      content: headerLine(sessionName, 1) + usageLine({ input: 40, output: 2, seq: 1 }),
+    });
+
+    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
+    const justBeforeSpawn = new Date(
+      spawnMs - (DSH_SESSION_MTIME_TOLERANCE_MS - 500),
+    );
+    fs.utimesSync(
+      path.join(sessionsDir, sessionName),
+      justBeforeSpawn,
+      justBeforeSpawn,
+    );
+
+    const binDir = makeFakeZstdBin(tmpRoot!);
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: spawnMs,
+      workdir,
+      env: envWithFakeZstd(dshHome, binDir),
+      zstdStrategy: "binary",
+    });
+
+    assert.ok(result !== null, "a just-before-spawn mtime is within tolerance");
+    assert.equal(result.totalTokens, 42);
+    assert.equal(result.sessionRef, sessionName);
+    assert.doesNotMatch(readTamanduaLog(), /no session created since spawn/);
+  });
+
+  it("excludes a session whose mtime is older than spawn beyond the mtime tolerance", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const spawnMs = 1_700_000_000_000;
+    const sessionName = "session-too-old";
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName,
+      content: headerLine(sessionName, 1) + usageLine({ input: 999, output: 9, seq: 1 }),
+    });
+
+    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
+    const tooOld = new Date(spawnMs - (DSH_SESSION_MTIME_TOLERANCE_MS + 5_000));
+    fs.utimesSync(path.join(sessionsDir, sessionName), tooOld, tooOld);
+
+    const binDir = makeFakeZstdBin(tmpRoot!);
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: spawnMs,
+      workdir,
+      env: envWithFakeZstd(dshHome, binDir),
+      zstdStrategy: "binary",
+    });
+
+    assert.equal(result, null, "beyond tolerance must never fabricate a total");
+    assert.match(readTamanduaLog(), /no session created since spawn/);
+  });
+
+  it("picks the newest eligible session when one is within tolerance and one is after spawn", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const spawnMs = 1_700_000_000_000;
+
+    const tolerated = "session-tolerated";
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName: tolerated,
+      content: headerLine(tolerated, 1) + usageLine({ input: 111, output: 1, seq: 1 }),
+    });
+    const newer = "session-newer-after-spawn";
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName: newer,
+      content: headerLine(newer, 1) + usageLine({ input: 222, output: 2, seq: 1 }),
+    });
+
+    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
+    const toleratedMtime = new Date(
+      spawnMs - (DSH_SESSION_MTIME_TOLERANCE_MS - 500),
+    );
+    fs.utimesSync(
+      path.join(sessionsDir, tolerated),
+      toleratedMtime,
+      toleratedMtime,
+    );
+    const newerMtime = new Date(spawnMs + 1_000);
+    fs.utimesSync(path.join(sessionsDir, newer), newerMtime, newerMtime);
+
+    const binDir = makeFakeZstdBin(tmpRoot!);
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: spawnMs,
+      workdir,
+      env: envWithFakeZstd(dshHome, binDir),
+      zstdStrategy: "binary",
+    });
+
+    assert.ok(result !== null);
+    assert.equal(result.totalTokens, 224, "the post-spawn session is newest");
+    assert.equal(result.sessionRef, newer);
+  });
+
+  it("applies the same mtime tolerance to the unsupported-layout probe", async () => {
+    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const spawnMs = 1_700_000_000_000;
+    const sessionName = "session-legacy-within-tolerance";
+    writeSessionDir({
+      dshHome,
+      workdir,
+      sessionName,
+      fileName: "session.v2.jsonl.zstd",
+      content: headerLine(sessionName, 1) + usageLine({ input: 5, output: 5, seq: 1 }),
+    });
+
+    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
+    const justBeforeSpawn = new Date(
+      spawnMs - (DSH_SESSION_MTIME_TOLERANCE_MS - 500),
+    );
+    fs.utimesSync(
+      path.join(sessionsDir, sessionName),
+      justBeforeSpawn,
+      justBeforeSpawn,
+    );
+
+    const result = await lookupDshSessionTokens({
+      spawnedAtMs: spawnMs,
+      workdir,
+      env: envWith(dshHome),
+    });
+
+    assert.equal(result, null);
+    assert.match(
+      readTamanduaLog(),
+      /unsupported session layout .*session\.v2\.jsonl\.zstd/,
+      "a tolerated legacy session must reach the upgrade-dsh warning, not the empty-spawn warning",
+    );
+  });
 
   it("returns null and warns once for a v1-only session.jsonl.zstd layout", async () => {
     const dshHome = path.join(tmpRoot!, "dsh-home");

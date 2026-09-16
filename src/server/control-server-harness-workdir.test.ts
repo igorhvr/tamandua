@@ -14,6 +14,8 @@ import {
   _reconcileOnce,
   _admitQueuedRunsOnce,
   WORKDIR_REFUSED_WARNING_MARKER,
+  _shouldWarnWorkdirWaitForTest,
+  _workdirWaitWarnStateSize,
 } from "../../dist/server/control-server.js";
 import {
   formatWorkdirRefusalMessage,
@@ -403,6 +405,72 @@ describe("control-server busy harness workdir waits (US-001)", () => {
       await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
       assert.equal(countWarns(), 2, "a refusal after the interval must WARN again");
     } finally {
+      await close(server);
+    }
+  });
+
+  it("throttles the WARN on an injected monotonic nowMs boundary (US-004)", () => {
+    process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS = "60000";
+    _resetWorkdirWaitWarnState();
+    try {
+      const runId = "run-throttle-monotonic";
+      assert.equal(_shouldWarnWorkdirWaitForTest(runId, 1_000), true, "first refusal warns");
+      assert.equal(
+        _shouldWarnWorkdirWaitForTest(runId, 1_000 + 59_999),
+        false,
+        "inside the interval must stay silent",
+      );
+      assert.equal(
+        _shouldWarnWorkdirWaitForTest(runId, 1_000 + 60_000),
+        true,
+        "at the interval boundary the WARN fires again",
+      );
+      assert.equal(_workdirWaitWarnStateSize(), 1, "one run tracked in the throttle map");
+    } finally {
+      _resetWorkdirWaitWarnState();
+    }
+  });
+
+  it("a forward wall-clock jump cannot defeat the monotonic WARN throttle (US-004)", async () => {
+    const { root, stateDir, dbPath } = setupState();
+    const shared = path.join(root, "shared-workdir");
+    fs.mkdirSync(shared, { recursive: true });
+
+    const runA = crypto.randomUUID();
+    const runB = crypto.randomUUID();
+    seedRun(dbPath, runA, "running", { working_directory_for_harness: shared });
+    // Merged behavior: a busy workdir is REFUSED by default (US-001 of the
+    // workdir-flags work), so the throttle path is reached only when the
+    // colliding run opted into the retriable `queue` policy. The monotonic
+    // throttle under test (US-004 TIME-CLOCKS) is unchanged.
+    seedRun(dbPath, runB, "running", {
+      working_directory_for_harness: shared,
+      workdir_collision_policy: "queue",
+    });
+
+    process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS = "600000";
+    _resetWorkdirWaitWarnState();
+
+    const server = createControlServer({ secret: SECRET, listen: false });
+    const port = await listen(server);
+    const realNow = Date.now;
+    let reads = 0;
+    const DAY = 24 * 60 * 60 * 1000;
+    try {
+      await jsonRequest(port, "POST", "/control/register-run", { runId: runA });
+      // Each wall read jumps a full day forward. The throttle interval is an
+      // in-process span measured monotonically, so the jump must not make the
+      // second refusal look like it happened after the interval.
+      Date.now = () => realNow() + (++reads) * DAY;
+      await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
+      await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
+
+      const warnCount = readLog(stateDir)
+        .split("\n")
+        .filter((line) => line.includes("WARN") && line.includes(WAIT_WARN_MARKER)).length;
+      assert.equal(warnCount, 1, "forward wall jump must not defeat the monotonic throttle");
+    } finally {
+      Date.now = realNow;
       await close(server);
     }
   });

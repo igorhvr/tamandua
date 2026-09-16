@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { assertStatePathIsolation } from "./lib/test-guard.js";
-import { nowIso } from "./lib/instant.js";
+import { nowIso, Deadline, monotonicNow, instantAgeMs, isOlderThan, type ClockFn } from "./lib/instant.js";
 import { LEDGER_RETENTION_MS } from "./suite/config.js";
 
 // Any change to migrate() MUST bump SCHEMA_VERSION. Missing a bump causes broken DBs.
@@ -128,17 +128,21 @@ function sleepSync(ms: number): void {
 // two concurrent first-time initializers without a "database is locked"
 // abort. The timeout bounds how long getDb() can block when the lock is held
 // by a genuinely long-running writer.
+//
+// TIME-CLOCKS rule 1: the retry budget is an in-process interval, so it is
+// enforced with a monotonic `Deadline` (never `Date.now()` arithmetic). A
+// wall-clock jump cannot make the retry loop expire early or run long.
 const WAL_INIT_RETRY_MS = 20;
 const WAL_INIT_TIMEOUT_MS = 10_000;
 
-function enableWalMode(db: DatabaseSync): void {
-  const deadline = Date.now() + WAL_INIT_TIMEOUT_MS;
+function enableWalMode(db: DatabaseSync, clock: ClockFn = monotonicNow): void {
+  const deadline = new Deadline(WAL_INIT_TIMEOUT_MS, clock);
   for (;;) {
     try {
       db.exec("PRAGMA journal_mode=WAL");
       return;
     } catch (err) {
-      if (!isDatabaseLockedError(err) || Date.now() >= deadline) {
+      if (!isDatabaseLockedError(err) || deadline.expired()) {
         throw err;
       }
       sleepSync(WAL_INIT_RETRY_MS);
@@ -149,24 +153,30 @@ function enableWalMode(db: DatabaseSync): void {
 // Bounded retry budget for the cross-process migration lock. The write lock
 // itself waits under the SQLite busy handler (busy_timeout is set in getDb);
 // this budget only bounds a pathological holder so getDb() cannot block
-// forever.
+// forever. TIME-CLOCKS rule 1: monotonic `Deadline`, never `Date.now()`.
 const MIGRATION_LOCK_RETRY_MS = 20;
 const MIGRATION_LOCK_TIMEOUT_MS = 15_000;
 
-function acquireMigrationLock(db: DatabaseSync): void {
-  const deadline = Date.now() + MIGRATION_LOCK_TIMEOUT_MS;
+function acquireMigrationLock(db: DatabaseSync, clock: ClockFn = monotonicNow): void {
+  const deadline = new Deadline(MIGRATION_LOCK_TIMEOUT_MS, clock);
   for (;;) {
     try {
       db.exec("BEGIN IMMEDIATE");
       return;
     } catch (err) {
-      if (!isDatabaseLockedError(err) || Date.now() >= deadline) {
+      if (!isDatabaseLockedError(err) || deadline.expired()) {
         throw err;
       }
       sleepSync(MIGRATION_LOCK_RETRY_MS);
     }
   }
 }
+
+// @internal — test seams for the US-006 monotonic lock-deadline coverage.
+export {
+  enableWalMode as _enableWalModeForTest,
+  acquireMigrationLock as _acquireMigrationLockForTest,
+};
 
 function migrate(db: DatabaseSync): void {
   // Fast path: the common case is an already-migrated database.
@@ -905,11 +915,45 @@ export function deleteAutoresearchSession(id: string): boolean {
 
 // ── TSTX suite results pruning ──
 
-export function pruneOldSuiteResults(): number {
+/**
+ * Tolerance for the 14-day ledger retention age comparison (TIME-CLOCKS rule
+ * 2). `suite_results.created_at` is written with millisecond precision by the
+ * same host that prunes it, and retention is a coarse 14-day bucket, so no
+ * slack is warranted: a row is pruned only when it is strictly older than
+ * `LEDGER_RETENTION_MS`. Zero is the documented explicit tolerance.
+ */
+const LEDGER_RETENTION_TOLERANCE_MS = 0;
+
+/**
+ * Delete suite-ledger rows older than `LEDGER_RETENTION_MS` and return the
+ * number pruned.
+ *
+ * US-011: each row's stored `created_at` is aged numerically via
+ * `instantAgeMs`/`isOlderThan` instead of a `created_at < ?` SQL string
+ * bound. Rows whose `created_at` is unparseable/missing are never pruned (an
+ * unknown age must not destroy ledger history). `nowMs` is injectable for
+ * tests; production uses `Date.now()`.
+ */
+export function pruneOldSuiteResults(nowMs: number = Date.now()): number {
   const db = getDb();
-  const cutoff = new Date(Date.now() - LEDGER_RETENTION_MS).toISOString();
-  const before = (db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number }).cnt;
-  db.prepare("DELETE FROM suite_results WHERE created_at < ?").run(cutoff);
-  const after = (db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number }).cnt;
-  return before - after;
+  const rows = db.prepare("SELECT id, created_at FROM suite_results").all() as Array<{
+    id: number;
+    created_at: string;
+  }>;
+
+  const staleIds: number[] = [];
+  for (const row of rows) {
+    if (instantAgeMs(row.created_at, nowMs) === undefined) continue;
+    if (isOlderThan(row.created_at, LEDGER_RETENTION_MS, nowMs, LEDGER_RETENTION_TOLERANCE_MS)) {
+      staleIds.push(row.id);
+    }
+  }
+  if (staleIds.length === 0) return 0;
+
+  let pruned = 0;
+  const del = db.prepare("DELETE FROM suite_results WHERE id = ?");
+  for (const id of staleIds) {
+    pruned += Number(del.run(id).changes);
+  }
+  return pruned;
 }

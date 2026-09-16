@@ -9,7 +9,7 @@
 import { execSync } from "node:child_process";
 import { getDaemonStatus, getDashboardStatus, getMcpStatus, getControlPlaneStatus, getMcpStatusAsync, getControlPlaneStatusAsync, isRunning } from "../server/daemonctl.js";
 import { ABANDONED_THRESHOLD_MS } from "../installer/step-ops.js";
-import { parseInstant, formatInstant } from "../lib/instant.js";
+import { parseInstant, formatInstant, isOlderThan } from "../lib/instant.js";
 import {
   acknowledgeDaemonDeath,
   getLastDaemonDeath,
@@ -293,6 +293,19 @@ export function formatTamanduaInfo(opts?: {
   return lines.join("\n");
 }
 
+/**
+ * Slack for the `tamandua status` stale annotation (TIME-CLOCKS US-012, rule 2).
+ *
+ * The annotation ages a durable `runs.updated_at` instant, so it is compared
+ * numerically through `isOlderThan()`, not as a `Date.now()` difference. Legacy
+ * naive-UTC values are stored at whole-second granularity, so the measured age
+ * can be up to ~1s coarse; 1s of slack keeps truncation from flipping a live
+ * run to "(stale — daemon down?)". It is vanishingly small next to
+ * `ABANDONED_THRESHOLD_MS` (minutes), so a genuinely stale run is still
+ * annotated.
+ */
+const STALE_ANNOTATION_TOLERANCE_MS = 1_000;
+
 export function formatRunsSummary(opts?: {
   listRuns?: () => RunInfo[];
   isDaemonRunning?: () => boolean;
@@ -346,16 +359,15 @@ export function formatRunsSummary(opts?: {
       // Staleness annotation: if updatedAt is older than the abandon threshold
       // AND the daemon is not running, annotate the status as stale.
       let displayStatus = r.status;
-      // TIME-STORAGE US-006: parse the stored instant with the shared reader so
-      // legacy naive UTC values are not shifted by the host offset. A missing /
-      // unparseable value keeps the previous safe behavior (0), which still
-      // produces the stale annotation below.
-      const updatedAt = parseInstant(r.updatedAt);
-      const updatedAtMs = updatedAt ? updatedAt.getTime() : 0;
+      // TIME-CLOCKS US-012 (rule 2): age the durable stored updatedAt
+      // NUMERICALLY through the shared helper — never `Date.now()` minus an
+      // epoch stamp. An unparseable instant is the helper's safe default
+      // (false = never stale); the documented slack is
+      // STALE_ANNOTATION_TOLERANCE_MS.
       if (
         (r.status === "running" || r.status === "paused")
         && !daemonRunning
-        && (now - updatedAtMs) > ABANDONED_THRESHOLD_MS
+        && isOlderThan(r.updatedAt, ABANDONED_THRESHOLD_MS, now, STALE_ANNOTATION_TOLERANCE_MS)
       ) {
         displayStatus = `${r.status} (stale — daemon down?)`;
       }

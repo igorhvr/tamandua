@@ -103,6 +103,61 @@ async function runShim(
   });
 }
 
+/**
+ * US-005: spawn the shim with a Node `--require` preload that replaces the
+ * process-wide `Date.now` BEFORE the shim's ESM entry runs. Used to simulate a
+ * hostile wall-clock jump without touching the host clock.
+ */
+async function runShimWithPreload(
+  preloadPath: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<ShimResult> {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const child: ChildProcess = spawn(
+      "node",
+      ["--require", preloadPath, SHIM_PATH, ...args],
+      { env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout!.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr!.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("close", (code: number | null) => {
+      resolve({ exitCode: code ?? 1, stdout, stderr, durationMs: Date.now() - start });
+    });
+
+    child.on("error", (err: Error) => {
+      resolve({
+        exitCode: 1,
+        stdout,
+        stderr: stderr + `\nspawn error: ${err.message}`,
+        durationMs: Date.now() - start,
+      });
+    });
+  });
+}
+
+/**
+ * US-005 preload: every `Date.now()` read returns the real wall clock plus one
+ * extra hour per read. Any interval measured as a difference of two
+ * `Date.now()` reads is therefore inflated by an hour or more, so a monotonic
+ * implementation (Stopwatch/Deadline) is required to keep the measured duration
+ * and the claim-poll budget correct.
+ */
+const MONOTONIC_FORWARD_JUMP_PRELOAD = `const realNow = Date.now.bind(Date);
+let reads = 0;
+Date.now = () => realNow() + (++reads) * 3600000;
+`;
+
 /** Spawn the shim, wait until its suite starts, then interrupt it as an external timeout would. */
 async function runInterruptedShim(
   args: string[],
@@ -1668,6 +1723,140 @@ exit 0
       .get("r-sf-run") as { cnt: number };
     assert.equal(rows.cnt, 1, "should have one recorded result in suite_results");
     db.close();
+  });
+
+  // ════════════════════════════════════════════════════════════════════
+  // US-005: Monotonic suite-shim timing (duration + claim-poll budget)
+  // ════════════════════════════════════════════════════════════════════
+
+  it("US-005 monotonic: executeAndCapture durationMs ignores a wall-clock jump", async () => {
+    const fixture = createFixtureRepo(tempBase, "us005-monotonic-duration");
+    const sleepScript = join(fixture.repoDir, "us005-sleep.sh");
+    writeFileSync(sleepScript, "#!/bin/sh\nsleep 0.35\necho 'US-005 SLEEP SUITE'\n");
+    chmodSync(sleepScript, 0o755);
+    await clearSuiteResultsForCmd(fixture.repoDir, sleepScript);
+
+    const preload = join(tempBase, "us005-duration-preload.cjs");
+    writeFileSync(preload, MONOTONIC_FORWARD_JUMP_PRELOAD);
+
+    const runId = "r-us005-monotonic-duration";
+    const result = await runShimWithPreload(
+      preload,
+      ["--repo", fixture.repoDir, "--run", runId, "--step", "s1", "--", sleepScript],
+      shimChildEnv(controlEnv),
+    );
+    assert.equal(result.exitCode, 0, `shim should pass, stderr: ${result.stderr}`);
+    assert.match(result.stdout, /US-005 SLEEP SUITE/);
+
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const row = db
+      .prepare("SELECT duration_ms FROM suite_results WHERE run_id = ?")
+      .get(runId) as { duration_ms: number } | undefined;
+    db.close();
+    assert.ok(row, "the monotonic duration result should be recorded");
+    // A wall-clock jump of +1h per Date.now read must not leak into the
+    // reported duration: an epoch-based measurement would report >= 1h.
+    assert.ok(
+      row.duration_ms >= 200,
+      `duration should reflect the ~350ms suite, got ${row.duration_ms}`,
+    );
+    assert.ok(
+      row.duration_ms < 60_000,
+      `monotonic duration must not be inflated by the wall jump, got ${row.duration_ms}`,
+    );
+  });
+
+  it("US-005 monotonic: claim-poll budget does not expire on a forward wall jump", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = committedTreeHash(repoDir);
+    assert.ok(treeHash, "should get a tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Pre-claim the key so the shim gets "wait" and enters pollForResult.
+    const claimResp = await controlPlanePost("/suite/claim", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+    });
+    assert.equal(claimResp.status, 200, "should claim successfully");
+    assert.equal(
+      (claimResp.body as Record<string, unknown>).action,
+      "run",
+      "first claim should say run",
+    );
+
+    const preload = join(tempBase, "us005-poll-preload.cjs");
+    writeFileSync(preload, MONOTONIC_FORWARD_JUMP_PRELOAD);
+
+    const shimPromise = runShimWithPreload(
+      preload,
+      ["--repo", repoDir, "--run", "r-us005-monotonic-poll", "--step", "s1", "--", counterScript],
+      env,
+    );
+
+    // Let the waiter poll well past the point where an epoch-based
+    // `Date.now() - start < CLAIM_TIMEOUT_MS` loop would have declared the
+    // 30-minute budget exhausted after the +1h jump.
+    await new Promise((r) => setTimeout(r, 2500));
+
+    // Release the claim by recording a green result; a monotonic waiter is
+    // still polling and must replay it.
+    await controlPlanePost("/suite/record", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: counterScript.slice(0, 200),
+      exit_code: 0,
+      duration_ms: 42,
+      log_tail: "GREEN: monotonic claim-poll replay",
+      run_id: "r-us005-monotonic-poll-owner",
+      step_id: "s-owner",
+    });
+
+    const r = await shimPromise;
+    assert.equal(r.exitCode, 0, `waiter should replay green, stderr: ${r.stderr}`);
+    assert.ok(
+      !r.stderr.includes("single-flight claim poll timed out"),
+      "a forward wall jump must not exhaust the monotonic claim-poll budget",
+    );
+    assert.ok(
+      r.stdout.includes("TAMANDUA-TEST CACHED"),
+      "waiter should still be polling and replay the green result",
+    );
+    assert.ok(
+      r.stdout.includes("GREEN: monotonic claim-poll replay"),
+      "waiter should surface the recorded log tail",
+    );
+    const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 0, "counter should not increment on replay");
+  });
+
+  it("US-012: storedInstantAgeMs routes the durable instant through the shared helper", () => {
+    // Durable suite_results.created_at age is rule-2 territory: it must be aged
+    // NUMERICALLY by the shared instantAgeMs helper (never a `Date.now()`
+    // difference), and an unknown instant must still surface as NaN so every
+    // caller's "not fresh" check stays fail-closed.
+    const source = readFileSync(join(__dirname, "shim.ts"), "utf-8");
+    assert.match(
+      source,
+      /instantAgeMs\(\s*value\s+as\s+InstantInput\s*\)/,
+      "storedInstantAgeMs must age the durable instant via instantAgeMs",
+    );
+    assert.match(
+      source,
+      /return ageMs === undefined \? Number\.NaN : ageMs/,
+      "an unparseable instant must map to NaN (not-fresh, fail-closed)",
+    );
+    assert.ok(
+      !source.includes("Date.now() -"),
+      "no epoch-based interval math may remain in shim.ts",
+    );
   });
 
   // ── US-001 (F2): Waiter TTL guard in pollForResult ─────────────

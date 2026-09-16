@@ -12,7 +12,17 @@ import {
   type ManagedRunWorktree,
 } from "../../installer/worktree-manager.js";
 import { parseDuration } from "../shared.js";
-import { parseInstant } from "../../lib/instant.js";
+import { isOlderThan } from "../../lib/instant.js";
+
+/**
+ * Slack for the `worktree prune --older-than` window (TIME-CLOCKS US-012,
+ * rule 2). Deliberately 0: the boundary must stay EXACT because `--older-than`
+ * is an explicit operator decision, and nonzero slack could prune a worktree
+ * the operator just placed inside the window. The age is still compared
+ * numerically through the shared helper (never a `Date.now()` difference), and
+ * an unparseable instant is never treated as old.
+ */
+const WORKTREE_PRUNE_TOLERANCE_MS = 0;
 
 function formatWorktreeStatus(wt: ManagedRunWorktree): string {
   const idShort = wt.runId.substring(0, 8);
@@ -244,7 +254,6 @@ export async function handleWorktree(group: string, args: string[]): Promise<boo
       process.exit(1);
     }
 
-    const cutoff = Date.now() - thresholdMs;
     const worktrees = listRunWorktrees();
     let pruned = 0;
 
@@ -289,12 +298,12 @@ export async function handleWorktree(group: string, args: string[]): Promise<boo
 
       if (!row) continue;
 
-      // TIME-STORAGE US-006: parse the stored instant with the shared reader.
-      // An undefined/unparseable created_at MUST skip the row — never treat it
-      // as ancient (which would prune a worktree whose age is unknown).
-      const createdAt = parseInstant(row.created_at);
-      if (!createdAt) continue;
-      if (createdAt.getTime() >= cutoff) continue;
+      // TIME-CLOCKS US-012 (rule 2): age the stored created_at numerically
+      // through the shared helper (no `Date.now()` difference, no string
+      // comparison). An undefined/unparseable created_at yields false and skips
+      // the row — never treated as ancient (which would prune a worktree whose
+      // age is unknown). Tolerance documented at WORKTREE_PRUNE_TOLERANCE_MS.
+      if (!isOlderThan(row.created_at, thresholdMs, Date.now(), WORKTREE_PRUNE_TOLERANCE_MS)) continue;
 
       // Remove (force for non-ready status, since it's terminal pruning)
       try {

@@ -8,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { getDb } from "../../db.js";
 import { HARNESS_TEARDOWN_GRACE_MS } from "../../installer/agent-scheduler.js";
+import { Stopwatch } from "../../lib/instant.js";
 import {
   getRecentEvents,
   getRunEvents,
@@ -99,7 +100,11 @@ async function streamEventSource(
     // When the run first reaches a terminal status, keep polling for the
     // teardown grace (plus a bounded buffer for the run.tokens.final event)
     // so trailing post-terminal events are flushed, then close.
-    let terminalDetectedAt: number | undefined;
+    //
+    // TIME-CLOCKS item 11 / US-007: the follow grace is an in-process
+    // interval, so it is measured with a monotonic Stopwatch — a wall-clock
+    // jump cannot shorten or extend it.
+    let terminalWatch: Stopwatch | undefined;
 
     while (!abort.signal.aborted) {
       try {
@@ -118,9 +123,9 @@ async function streamEventSource(
       if (observeRunId !== undefined) {
         const status = readRunStatus(observeRunId);
         if (status !== undefined && TERMINAL_RUN_STATUSES.has(status)) {
-          if (terminalDetectedAt === undefined) {
-            terminalDetectedAt = Date.now();
-          } else if (Date.now() - terminalDetectedAt >= getRunFollowGraceMs()) {
+          if (terminalWatch === undefined) {
+            terminalWatch = new Stopwatch();
+          } else if (terminalWatch.elapsedMs() >= getRunFollowGraceMs()) {
             console.log(`run ${observeRunId} ${status}; stream closed`);
             return;
           }

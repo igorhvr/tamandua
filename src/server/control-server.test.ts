@@ -1658,6 +1658,9 @@ import {
   ensureDaemonSecret,
   readDaemonSecret,
   isTerminal,
+  isWithinFlakeWindow,
+  flakyKeysWithinWindow,
+  suiteCountsWithinWindow,
 } from "../../dist/server/control-server.js";
 
 describe("control-server unit exports", () => {
@@ -1895,8 +1898,138 @@ describe("control-server unit exports", () => {
       }
     });
   });
-});
 
+  // ── US-011: server-side durable flake-window cutoffs ───────────────
+
+  describe("suite flake-window numeric ages (US-011)", () => {
+    const FLAKE_WINDOW_MS = 24 * 60 * 60 * 1000;
+    const FLAKE_WINDOW_TOLERANCE_MS = 1_000;
+    let origStateDir: string | undefined;
+    let origDbPath: string | undefined;
+    let tempRoot: string;
+
+    beforeEach(() => {
+      origStateDir = process.env.TAMANDUA_STATE_DIR;
+      origDbPath = process.env.TAMANDUA_DB_PATH;
+      const { root, homeDir } = createTempHome("tamandua-control-flake-window-");
+      tempRoot = root;
+      const stateDir = path.join(root, "state");
+      process.env.HOME = homeDir;
+      process.env.TAMANDUA_STATE_DIR = stateDir;
+      process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    });
+
+    afterEach(() => {
+      if (origStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = origStateDir;
+      if (origDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = origDbPath;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    });
+
+    async function db(): Promise<DatabaseSync> {
+      const { getDb } = await import("../../dist/db.js");
+      return getDb();
+    }
+
+    function insertSuite(database: DatabaseSync, repo: string, tree: string, cmd: string, exitCode: number, createdAt: string): void {
+      database.prepare(
+        `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(repo, tree, cmd, "npm test", exitCode, 100, createdAt);
+    }
+
+    it("ages window rows from an injected now, with the documented tolerance", async () => {
+      const database = await db();
+      const repo = "/repo";
+      const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+
+      insertSuite(database, repo, "inside", "cmd", 0, new Date(now - 60_000).toISOString());
+      insertSuite(database, repo, "inside", "cmd", 1, new Date(now - 60_000).toISOString());
+      const outside = new Date(now - (FLAKE_WINDOW_MS + FLAKE_WINDOW_TOLERANCE_MS + 1)).toISOString();
+      insertSuite(database, repo, "outside", "cmd", 0, outside);
+      insertSuite(database, repo, "outside", "cmd", 1, outside);
+
+      const keys = flakyKeysWithinWindow(database, repo, now);
+      assert.deepEqual(keys.map((k) => k.tree_hash), ["inside"]);
+
+      const insideCounts = suiteCountsWithinWindow(database, { originRepo: repo, treeHash: "inside", cmdHash: "cmd" }, now);
+      assert.deepEqual(insideCounts, { passCount: 1, failCount: 1 });
+      const outsideCounts = suiteCountsWithinWindow(database, { originRepo: repo, treeHash: "outside", cmdHash: "cmd" }, now);
+      assert.deepEqual(outsideCounts, { passCount: 0, failCount: 0 });
+    });
+
+    it("keeps a row exactly at the widened boundary and drops one millisecond past it", async () => {
+      const database = await db();
+      const repo = "/repo";
+      const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+      const at = new Date(now - (FLAKE_WINDOW_MS + FLAKE_WINDOW_TOLERANCE_MS)).toISOString();
+      const past = new Date(now - (FLAKE_WINDOW_MS + FLAKE_WINDOW_TOLERANCE_MS + 1)).toISOString();
+
+      assert.equal(isWithinFlakeWindow(at, now), true);
+      assert.equal(isWithinFlakeWindow(past, now), false);
+
+      insertSuite(database, repo, "at", "cmd", 0, at);
+      insertSuite(database, repo, "at", "cmd", 1, at);
+      insertSuite(database, repo, "past", "cmd", 0, past);
+      insertSuite(database, repo, "past", "cmd", 1, past);
+
+      const keys = flakyKeysWithinWindow(database, repo, now);
+      assert.deepEqual(keys.map((k) => k.tree_hash), ["at"]);
+    });
+
+    it("never counts an unparseable created_at inside the window", async () => {
+      const database = await db();
+      const repo = "/repo";
+      const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+
+      insertSuite(database, repo, "unparseable", "cmd", 0, "not-a-timestamp");
+      insertSuite(database, repo, "unparseable", "cmd", 1, "not-a-timestamp");
+
+      assert.equal(isWithinFlakeWindow("not-a-timestamp", now), false);
+      assert.deepEqual(flakyKeysWithinWindow(database, repo, now), []);
+      assert.deepEqual(
+        suiteCountsWithinWindow(database, { originRepo: repo, treeHash: "unparseable", cmdHash: "cmd" }, now),
+        { passCount: 0, failCount: 0 },
+      );
+    });
+
+    it("preserves the exit_code=87 exclusion and grouping/order semantics", async () => {
+      const database = await db();
+      const repo = "/repo";
+      const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+      const recent = new Date(now - 60_000).toISOString();
+
+      // Green + 87 must NOT be flaky.
+      insertSuite(database, repo, "green87", "cmd", 0, recent);
+      insertSuite(database, repo, "green87", "cmd", 87, recent);
+      // Green + real red must be flaky.
+      insertSuite(database, repo, "flaky", "cmd", 0, recent);
+      insertSuite(database, repo, "flaky", "cmd", 1, recent);
+      // Two greens + two reds should sort above the single-pair key.
+      insertSuite(database, repo, "flaky2", "cmd", 0, recent);
+      insertSuite(database, repo, "flaky2", "cmd", 0, recent);
+      insertSuite(database, repo, "flaky2", "cmd", 1, recent);
+      insertSuite(database, repo, "flaky2", "cmd", 1, recent);
+
+      const keys = flakyKeysWithinWindow(database, repo, now);
+      assert.deepEqual(keys.map((k) => k.tree_hash), ["flaky2", "flaky"]);
+      assert.equal(keys[0].pass_count, 2);
+      assert.equal(keys[0].fail_count, 2);
+    });
+
+    it("detects a legacy naive-UTC created_at inside the window", async () => {
+      const database = await db();
+      const repo = "/repo";
+      const now = Date.UTC(2026, 8, 16, 12, 0, 0);
+      insertSuite(database, repo, "naive", "cmd", 0, "2026-09-16 11:59:00");
+      insertSuite(database, repo, "naive", "cmd", 1, "2026-09-16 11:59:00");
+
+      const keys = flakyKeysWithinWindow(database, repo, now);
+      assert.deepEqual(keys.map((k) => k.tree_hash), ["naive"]);
+    });
+  });
+});
 // ══════════════════════════════════════════════════════════════════════
 // US-004: context no_hurry_save_tokens_mode stays accepted at admission
 // (dispatch rounds are free, so the flag no longer changes scheduling)

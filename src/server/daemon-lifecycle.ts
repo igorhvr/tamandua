@@ -24,9 +24,20 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { assertStatePathIsolation } from "../lib/test-guard.js";
-import { nowIso, parseInstant } from "../lib/instant.js";
+import { nowIso, parseInstant, instantAgeMs, isOlderThan } from "../lib/instant.js";
 import { resolveStateDir } from "../lib/tamandua-config.js";
 import { recordLifecycleEvent } from "./daemonctl.js";
+
+/**
+ * Tolerance (ms) for daemon-lifecycle durable-instant comparisons (TIME-CLOCKS
+ * rule 2). The marker's `startedAt`/`lastHeartbeatAt`, a lifecycle journal
+ * `ts`, and `lifecycle-seen.json`'s `ts` are all produced by the same host
+ * process (often within the same second), so the comparison needs only a small
+ * guard against sub-second ordering and coarse timestamp granularity. 1s is
+ * negligible against daemon lifetimes and keeps a just-before/just-after
+ * boundary from flipping while never masking a real death.
+ */
+export const DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS = 1_000;
 
 /**
  * Default heartbeat interval: 10s. Production constraint — the heartbeat must
@@ -256,10 +267,11 @@ function readLifecycleLogEntries(opts?: DaemonctlPathOptions): Record<string, un
 /**
  * True when the journal already accounts for the marker's instance: a
  * daemon.shutdown (a clean exit ran) or daemon.uncleanExit (the unclean
- * death was already reported) entry with targetPid === marker.pid and ts >=
- * marker.startedAt. A shutdown journaled before the marker was written (or
- * for a different pid) does not count. Also keeps detectUncleanExit
- * idempotent per stale marker — a death is proven and journaled once.
+ * death was already reported) entry with targetPid === marker.pid and a ts at
+ * or after (within DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS of) marker.startedAt.
+ * A shutdown journaled before the marker was written (or for a different pid)
+ * does not count. Also keeps detectUncleanExit idempotent per stale marker — a
+ * death is proven and journaled once.
  */
 function markerAccountedFor(marker: HeartbeatMarker, opts?: DaemonctlPathOptions): boolean {
   const startedAt = parseInstant(marker.startedAt);
@@ -268,18 +280,31 @@ function markerAccountedFor(marker: HeartbeatMarker, opts?: DaemonctlPathOptions
   for (const entry of readLifecycleLogEntries(opts)) {
     if (entry.action !== "daemon.shutdown" && entry.action !== "daemon.uncleanExit") continue;
     if (entry.targetPid !== marker.pid) continue;
-    const entryTs = parseInstant(entry.ts);
-    if (!entryTs) continue;
-    if (entryTs.getTime() >= startedAtMs) return true;
+    // Numeric age of the journal ts measured from the marker's start (rule 2:
+    // never a string comparison). age <= 0 means the entry is at/after the
+    // start; the documented tolerance admits a same-process entry journaled a
+    // moment before the marker line reached disk. An unparseable ts yields
+    // `undefined` and is skipped — an unknown entry can NEVER account for a
+    // death.
+    const entryAgeFromStartMs = instantAgeMs(
+      typeof entry.ts === "string" ? entry.ts : undefined,
+      startedAtMs,
+    );
+    if (entryAgeFromStartMs === undefined) continue;
+    if (entryAgeFromStartMs <= DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS) return true;
   }
   return false;
 }
 
-/** Age of a heartbeat timestamp in ms at now, clamped to >= 0. */
-function heartbeatAgeMs(lastHeartbeatAt: string): number {
-  const parsed = parseInstant(lastHeartbeatAt);
-  if (!parsed) return 0;
-  return Math.max(0, Date.now() - parsed.getTime());
+/**
+ * Age of a heartbeat instant in ms at `nowMs` (default `Date.now()`), clamped
+ * to >= 0 and safe on an unparseable instant (returns 0 rather than a
+ * fabricated age). Computed numerically via the shared durable-instant helper
+ * (rule 2) so a wall-clock jump cannot produce a NaN/negative age.
+ */
+function heartbeatAgeMs(lastHeartbeatAt: string, nowMs: number = Date.now()): number {
+  const age = instantAgeMs(lastHeartbeatAt, nowMs);
+  return age === undefined ? 0 : Math.max(0, age);
 }
 
 /**
@@ -446,7 +471,12 @@ export function isUnseenDaemonDeath(death: DaemonDeath, opts?: DaemonctlPathOpti
     const deathMs = parseInstant(death.ts);
     const seenMs = parseInstant(seenTs);
     if (!deathMs || !seenMs) return true;
-    return deathMs.getTime() > seenMs.getTime();
+    // The acknowledgement comparison is a numeric instant comparison (rule 2):
+    // the death is unseen when the acknowledged instant is strictly older than
+    // the death instant beyond the documented same-process tolerance. A ts that
+    // is unparseable on either side means we cannot prove acknowledgment, so
+    // we surface the death.
+    return isOlderThan(seenTs, 0, deathMs.getTime(), DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS);
   } catch {
     return true;
   }

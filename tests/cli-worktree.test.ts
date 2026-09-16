@@ -643,6 +643,22 @@ describe("CLI worktree prune", () => {
     }
   });
 
+  it("routes the prune age test through isOlderThan, not a Date.now() cutoff (TIME-CLOCKS US-012)", () => {
+    const source = fs.readFileSync(
+      path.resolve(process.cwd(), "src", "cli", "commands", "worktree.ts"),
+      "utf-8",
+    );
+    assert.match(
+      source,
+      /isOlderThan\(row\.created_at, thresholdMs, Date\.now\(\), WORKTREE_PRUNE_TOLERANCE_MS\)/,
+      "worktree prune must age created_at via the shared helper",
+    );
+    assert.ok(
+      !source.includes("Date.now() - thresholdMs"),
+      "the epoch cutoff must be gone",
+    );
+  });
+
   it("errors without --completed flag", async () => {
     const env = await createTempEnv();
     try {

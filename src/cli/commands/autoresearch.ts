@@ -22,6 +22,17 @@ import { getDb, upsertAutoresearchSession } from "../../db.js";
 import { getWorkflowStatus } from "../../installer/status.js";
 import { parseRunContext } from "../../installer/step-ops.js";
 import { parseDuration, readOption, requireOption } from "../shared.js";
+import { isOlderThan } from "../../lib/instant.js";
+
+/**
+ * Slack for the `autoresearch prune --older-than` window (TIME-CLOCKS US-012,
+ * rule 2). Deliberately 0: the boundary must stay EXACT because `--older-than`
+ * is an explicit operator decision, and nonzero slack could prune a session the
+ * operator placed inside the window. The age is compared numerically through
+ * the shared helper (never a `Date.now()` difference, never a string
+ * comparison), and a missing/unparseable instant is never treated as old.
+ */
+const AUTORESEARCH_PRUNE_TOLERANCE_MS = 0;
 
 function parseDirection(value: string): AutoresearchDirection {
   if (value === "lower" || value === "higher") return value;
@@ -524,15 +535,17 @@ export async function handleAutoresearch(group: string, args: string[]): Promise
 
       const dryRun = args.includes("--dry-run");
       const missingOnly = args.includes("--missing");
-      const cutoff = new Date(Date.now() - thresholdMs).toISOString();
 
       const { getAutoresearchSessions, deleteAutoresearchSession } = await import("../../db.js");
       const sessions = getAutoresearchSessions({ includeMissing: true });
 
       const candidates = sessions.filter((s) => {
-        // Check if session is older than threshold
-        const updatedAt = s.updated_at;
-        if (!updatedAt || updatedAt >= cutoff) return false;
+        // TIME-CLOCKS US-012 (rule 2): age the durable updated_at numerically
+        // through the shared helper, replacing the old ISO string cutoff
+        // (`updated_at >= new Date(...).toISOString()`). A missing/unparseable
+        // instant yields false and skips the session. Tolerance documented at
+        // AUTORESEARCH_PRUNE_TOLERANCE_MS.
+        if (!isOlderThan(s.updated_at, thresholdMs, Date.now(), AUTORESEARCH_PRUNE_TOLERANCE_MS)) return false;
 
         // If --missing, only include sessions whose files are gone
         if (missingOnly && !s.files_missing) return false;

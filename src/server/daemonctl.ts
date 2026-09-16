@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { DEFAULT_MCP_PORT, MCP_ENDPOINT_PATH } from "./mcp-server.js";
 import { DEFAULT_CONTROL_PORT } from "./control-server.js";
 import { resolveEffectiveHomeDir, resolveStateDir } from "../lib/tamandua-config.js";
+import { Deadline, isOlderThan } from "../lib/instant.js";
 import {
   getServiceSocketPath,
   probeIdentitySocket,
@@ -32,16 +33,30 @@ import {
 import { assertStatePathIsolation, spawnChildAttributionEnv, testGuardActive } from "../lib/test-guard.js";
 import { logger } from "../lib/logger.js";
 import {
+  environHasEntry,
   getCmdline,
   getElapsedSeconds,
   getEnvironText,
+  hasProcfs,
   processHasOpenFileUnder,
 } from "../lib/proc-info.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const STARTUP_ERROR_TAIL_LINES = 20;
-const START_LOCK_STALE_MS = 30_000;
+
+/**
+ * Rule-3 mtime tolerance for the start lock: a lock file whose OS-epoch mtime
+ * is older than this is considered abandoned and replaced. Passed as the
+ * `toleranceMs` of `isOlderThan(lockMtimeMs, 0, now, START_LOCK_STALE_MS)`,
+ * so the decision is exactly the old `Date.now() - mtime > START_LOCK_STALE_MS`
+ * (a fresh lock is never stolen — the conservative behavior).
+ *
+ * File mtimes are OS-epoch instants with no monotonic analogue, so this must
+ * NOT be converted to monotonic time. An unparseable/NaN mtime is treated as
+ * NOT stale (never steal a lock we cannot age).
+ */
+export const START_LOCK_STALE_MS = 30_000;
 
 // ── Lifecycle attribution ──────────────────────────────────────────
 
@@ -259,8 +274,14 @@ function checkPidFile(pidFile: string): { running: true; pid: number } | { runni
   }
 }
 
-/** Slack for comparing process age against pidfile age (seconds). */
-const PIDFILE_AGE_SLACK_SECONDS = 120;
+/**
+ * Rule-3 tolerance for the macOS pidfile provenance check, in seconds. The
+ * pidfile is written while the recorded process is alive, so a reused pid
+ * pointing at an unrelated (or production) process would have started AFTER
+ * the pidfile, i.e. be younger than it. This slack absorbs the normal race
+ * between process start and pidfile write, plus coarse mtime granularity.
+ */
+export const PIDFILE_AGE_SLACK_SECONDS = 120;
 
 /**
  * The complete set of daemon-family pid files written under a tamandua
@@ -304,6 +325,51 @@ export function processEvidencePermitsSignal(evidence: boolean | "unknown"): boo
   return evidence === true;
 }
 
+/**
+ * Rule-3 provenance predicate for macOS: true when the process recorded in a
+ * pidfile is NOT younger than that pidfile (within the documented slack).
+ *
+ * `pidfileMtimeMs` is the pidfile's OS-epoch mtime and
+ * `processElapsedSeconds` the process age reported by the OS (`null` when
+ * unavailable). The mtime is a file instant with no monotonic analogue, so the
+ * comparison keeps OS-epoch semantics and routes through the shared
+ * `isOlderThan()` helper: it is stale-for-this-process when the pidfile age
+ * exceeds the process age plus the `PIDFILE_AGE_SLACK_SECONDS` tolerance.
+ *
+ * Unknown inputs refuse the match (the caller falls through to the next
+ * pidfile, then the open-file check) rather than loosening the guard.
+ */
+function pidfileProvenanceMatches(
+  pidfileMtimeMs: number,
+  processElapsedSeconds: number | null,
+  nowMs: number = Date.now(),
+): boolean {
+  if (processElapsedSeconds === null || !Number.isFinite(processElapsedSeconds)) {
+    return false;
+  }
+  // NaN/Infinity mtime => `isOlderThan` is false => `!false` would MATCH, so
+  // refuse explicitly: we never claim provenance from an instant we cannot age.
+  if (!Number.isFinite(pidfileMtimeMs)) return false;
+  return !isOlderThan(
+    pidfileMtimeMs,
+    processElapsedSeconds * 1000,
+    nowMs,
+    PIDFILE_AGE_SLACK_SECONDS * 1000,
+  );
+}
+
+/**
+ * @internal Test seam for {@link pidfileProvenanceMatches} — the OS-epoch
+ * mtime-tolerance boundary is asserted per elapsed process age.
+ */
+export function _pidfileProvenanceMatchesForTest(
+  pidfileMtimeMs: number,
+  processElapsedSeconds: number | null,
+  nowMs: number = Date.now(),
+): boolean {
+  return pidfileProvenanceMatches(pidfileMtimeMs, processElapsedSeconds, nowMs);
+}
+
 function processHomeMatches(pid: number, stateDir: string): boolean {
   // Provenance fallback used only when the candidate's environment cannot be
   // read (native helper not built, other user). Bind by provenance to the
@@ -325,9 +391,13 @@ function processHomeMatches(pid: number, stateDir: string): boolean {
       const pidFile = path.join(dir, name);
       const recorded = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
       if (recorded !== pid) continue;
-      const pidfileAgeSeconds = (Date.now() - fs.statSync(pidFile).mtimeMs) / 1000;
-      const elapsed = getElapsedSeconds(pid);
-      if (elapsed !== null && elapsed + PIDFILE_AGE_SLACK_SECONDS >= pidfileAgeSeconds) {
+      // Rule 3: the pidfile's mtime is an OS-epoch file instant (no monotonic
+      // analogue), so `pidfileProvenanceMatches` ages it against the process
+      // age via `isOlderThan()` with the documented PIDFILE_AGE_SLACK_SECONDS
+      // tolerance. No wall-clock interval math here.
+      if (
+        pidfileProvenanceMatches(fs.statSync(pidFile).mtimeMs, getElapsedSeconds(pid))
+      ) {
         return true;
       }
     } catch {
@@ -488,6 +558,28 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Rule-3 start-lock staleness: true when the lock file's OS-epoch mtime is
+ * older than `START_LOCK_STALE_MS` (passed as `isOlderThan`'s tolerance so the
+ * constant stays the documented threshold). File mtimes have no monotonic
+ * analogue, so this keeps wall/OS-epoch semantics; a NaN/Infinity mtime is
+ * never stale (never steal a lock we cannot age).
+ */
+function startLockIsStale(lockMtimeMs: number, nowMs: number = Date.now()): boolean {
+  return isOlderThan(lockMtimeMs, 0, nowMs, START_LOCK_STALE_MS);
+}
+
+/**
+ * @internal Test seam for {@link startLockIsStale} — the OS-epoch
+ * mtime-tolerance boundary.
+ */
+export function _startLockIsStaleForTest(
+  lockMtimeMs: number,
+  nowMs: number = Date.now(),
+): boolean {
+  return startLockIsStale(lockMtimeMs, nowMs);
+}
+
 function acquireStartLock(lockFile: string): number | null {
   try {
     fs.mkdirSync(path.dirname(lockFile), { recursive: true });
@@ -498,7 +590,10 @@ function acquireStartLock(lockFile: string): number | null {
 
     try {
       const stat = fs.statSync(lockFile);
-      if (Date.now() - stat.mtimeMs > START_LOCK_STALE_MS) {
+      // Rule 3: the lock file's mtime is an OS-epoch instant, so staleness
+      // routes through `startLockIsStale`/`isOlderThan()` with the documented
+      // START_LOCK_STALE_MS tolerance — never a `Date.now()` difference.
+      if (startLockIsStale(stat.mtimeMs)) {
         fs.unlinkSync(lockFile);
         return fs.openSync(lockFile, "wx", 0o600);
       }
@@ -513,6 +608,15 @@ function acquireStartLock(lockFile: string): number | null {
   }
 }
 
+/**
+ * @internal Direct seam for the start-lock acquisition behavior: a missing
+ * lock file is created, a fresh one is refused (`null`), and a stale one is
+ * replaced. Returns the open fd (caller closes/unlinks) or `null`.
+ */
+export function _acquireStartLockForTest(lockFile: string): number | null {
+  return acquireStartLock(lockFile);
+}
+
 function releaseStartLock(fd: number | null, lockFile: string): void {
   if (fd === null) return;
   try { fs.closeSync(fd); } catch { /* ignore */ }
@@ -525,8 +629,8 @@ async function waitForDaemonPid(
   requestedPort: number,
   timeoutMs = 10_000,
 ): Promise<{ pid: number; port: number } | null> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
+  const deadline = new Deadline(timeoutMs);
+  while (!deadline.expired()) {
     const status = checkPidFile(pidFile);
     if (status.running) {
       let existingPort = requestedPort;
@@ -868,9 +972,11 @@ export async function startDaemon(port?: number, opts?: StartOptions): Promise<{
 
     // Wait for the daemon to start and write its PID file. Poll instead of a
     // single fixed sleep: under heavy load node startup can exceed a second.
-    const daemonDeadline = Date.now() + 10_000;
+    // Monotonic deadline (TIME-CLOCKS rule 1): a wall-clock jump cannot make
+    // this wait expire early or run past its budget.
+    const daemonDeadline = new Deadline(10_000);
     let check = checkPidFile(pidFile);
-    while (!check.running && Date.now() < daemonDeadline) {
+    while (!check.running && !daemonDeadline.expired()) {
       await new Promise<void>((resolve) => setTimeout(resolve, 250));
       check = checkPidFile(pidFile);
     }
@@ -1875,10 +1981,11 @@ export async function startMcp(port?: number, opts?: StartOptions): Promise<{ pi
 
   // Wait for the MCP server to start and write its PID file. Poll instead
   // of a single fixed sleep: under heavy load (e.g. the parallel test suite)
-  // node startup can take well over a second.
-  const deadline = Date.now() + 10_000;
+  // node startup can take well over a second. Monotonic deadline
+  // (TIME-CLOCKS rule 1) so a wall jump cannot shorten it.
+  const deadline = new Deadline(10_000);
   let check = checkPidFile(mcpPidFile);
-  while (!check.running && Date.now() < deadline) {
+  while (!check.running && !deadline.expired()) {
     await new Promise<void>((resolve) => setTimeout(resolve, 250));
     check = checkPidFile(mcpPidFile);
   }
@@ -1893,9 +2000,9 @@ export async function startMcp(port?: number, opts?: StartOptions): Promise<{ pi
   // Verify the MCP server is actually accepting connections on its port.
   // The /mcp endpoint uses Streamable HTTP transport (not a simple GET), so
   // we probe via TCP connect instead of a health endpoint fetch.
-  const mcpTcpDeadline = Date.now() + 10_000;
+  const mcpTcpDeadline = new Deadline(10_000);
   let mcpTcpOk = false;
-  while (!mcpTcpOk && Date.now() < mcpTcpDeadline) {
+  while (!mcpTcpOk && !mcpTcpDeadline.expired()) {
     mcpTcpOk = await isTcpPortOpen(mcpPort, 500);
     if (!mcpTcpOk) await new Promise<void>((resolve) => setTimeout(resolve, 100));
   }
@@ -2012,8 +2119,8 @@ function resolveControlStandaloneScript(): string {
 }
 
 async function waitForHealthEndpoint(url: string, timeoutMs = 10_000): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
+  const deadline = new Deadline(timeoutMs);
+  while (!deadline.expired()) {
     try {
       const res = await fetch(url);
       if (res.ok) return;
@@ -2368,9 +2475,10 @@ export async function startControlPlane(port?: number, opts?: StartOptions): Pro
 
   // Wait for the control plane to start and write its PID file. Poll instead
   // of a single fixed sleep: under heavy load node startup can exceed a second.
-  const cpDeadline = Date.now() + 10_000;
+  // Monotonic deadline (TIME-CLOCKS rule 1) so a wall jump cannot shorten it.
+  const cpDeadline = new Deadline(10_000);
   let check = checkPidFile(cpPidFile);
-  while (!check.running && Date.now() < cpDeadline) {
+  while (!check.running && !cpDeadline.expired()) {
     await new Promise<void>((resolve) => setTimeout(resolve, 250));
     check = checkPidFile(cpPidFile);
   }
@@ -2649,9 +2757,10 @@ export async function startDashboardStandalone(port?: number, opts?: StartOption
 
   // Wait for the dashboard to start and write its PID file. Poll instead
   // of a single fixed sleep: under heavy load node startup can exceed a second.
-  const deadline = Date.now() + 10_000;
+  // Monotonic deadline (TIME-CLOCKS rule 1) so a wall jump cannot shorten it.
+  const deadline = new Deadline(10_000);
   let check = checkPidFile(dashPidFile);
-  while (!check.running && Date.now() < deadline) {
+  while (!check.running && !deadline.expired()) {
     await new Promise<void>((resolve) => setTimeout(resolve, 250));
     check = checkPidFile(dashPidFile);
   }
@@ -2770,9 +2879,11 @@ export async function waitForDashboardStop(opts?: DaemonctlPathOptions): Promise
   if (!beforeStatus.running) return;
 
   const pid = beforeStatus.pid;
-  const deadline = Date.now() + 10_000;
+  // Monotonic stop-barrier deadline (TIME-CLOCKS rule 1): a wall-clock jump
+  // must not shorten or extend this 10s poll.
+  const deadline = new Deadline(10_000);
 
-  while (Date.now() < deadline) {
+  while (!deadline.expired()) {
     let pidAlive = true;
     try { process.kill(pid, 0); } catch { pidAlive = false; }
 
@@ -2814,9 +2925,11 @@ export async function waitForMcpStop(opts?: DaemonctlPathOptions): Promise<void>
   if (!beforeStatus.running) return;
 
   const pid = beforeStatus.pid;
-  const deadline = Date.now() + 10_000;
+  // Monotonic stop-barrier deadline (TIME-CLOCKS rule 1): a wall-clock jump
+  // must not shorten or extend this 10s poll.
+  const deadline = new Deadline(10_000);
 
-  while (Date.now() < deadline) {
+  while (!deadline.expired()) {
     let pidAlive = true;
     try { process.kill(pid, 0); } catch { pidAlive = false; }
 
@@ -2857,9 +2970,11 @@ export async function waitForDaemonStop(opts?: DaemonctlPathOptions): Promise<vo
   if (!beforeStatus.running) return;
 
   const pid = beforeStatus.pid;
-  const deadline = Date.now() + 10_000;
+  // Monotonic stop-barrier deadline (TIME-CLOCKS rule 1): a wall-clock jump
+  // must not shorten or extend this 10s poll.
+  const deadline = new Deadline(10_000);
 
-  while (Date.now() < deadline) {
+  while (!deadline.expired()) {
     let pidAlive = true;
     try { process.kill(pid, 0); } catch { pidAlive = false; }
 
@@ -2898,8 +3013,8 @@ const DAEMON_FAMILY_STOP_FNS: Readonly<Record<string, StopFamilyFn>> = {
 
 /** Event-driven pid-exit poll (kill(pid, 0)); bounded, never a fixed sleep. */
 async function waitForFamilyPidExit(pid: number, timeoutMs = 10_000): Promise<boolean> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
+  const deadline = new Deadline(timeoutMs);
+  while (!deadline.expired()) {
     try {
       process.kill(pid, 0);
     } catch {

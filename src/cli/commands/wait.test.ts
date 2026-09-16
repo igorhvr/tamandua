@@ -412,6 +412,42 @@ describe("wait command", () => {
     }
   });
 
+  it("ages a stored createdAt through instantAgeMs (TIME-CLOCKS US-012)", async () => {
+    const { formatJsonOutput, formatHumanOutput } = await import("../../../dist/cli/commands/wait.js");
+    const fixedNow = Date.parse("2026-09-16T12:00:00.000Z");
+    const realDateNow = Date.now;
+    Date.now = () => fixedNow;
+    try {
+      const runs = [{
+        runId: "aaa-bbb-ccc",
+        runNumber: 1,
+        workflowId: "test-wf",
+        status: "running",
+        tokensSpent: 0,
+        createdAt: new Date(fixedNow - 90_000).toISOString(),
+        updatedAt: "",
+        steps: { done: 0, failed: 0, pending: 1, running: 0, waiting: 0, canceled: 0 },
+      }];
+      const parsed = JSON.parse(formatJsonOutput({ runs, timedOut: false }));
+      assert.equal(parsed.runs[0].durationMs, 90_000, "numeric age from the shared helper");
+      assert.match(formatHumanOutput({ runs, timedOut: false }), /running 1m30s /);
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  it("routes the stored-instant durations through the shared helper, not Date.now() arithmetic", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "..", "src", "cli", "commands", "wait.ts"),
+      "utf-8",
+    );
+    assert.match(source, /instantAgeMs\(r\.createdAt\)/, "must age createdAt via instantAgeMs");
+    assert.ok(
+      !source.includes("Date.now() - createdAt.getTime()"),
+      "the epoch-difference duration math must be gone",
+    );
+  });
+
   // ── Unit: formatElapsed ────────────────────────────────────────────
   it("formatElapsed formats seconds only", async () => {
     const { formatElapsed } = await import("../../../dist/cli/commands/wait.js");
@@ -742,6 +778,61 @@ describe("wait command", () => {
     );
 
     assert.equal(result.status, 0);
+  });
+
+  // ── US-007: monotonic CLI elapsed timers ───────────────────────────
+
+  it("US-007 monotonic: --timeout budget is not cut short by a forward wall-clock jump", () => {
+    const runId = "eeeeeeee-ffff-4aaa-8bbb-222222222222";
+    insertRun(db, runId, 9, "test-wf", "running");
+    insertStep(db, "step-us007", runId, "implement", "test-wf_developer", "running", 0);
+
+    // A +1h-per-read wall jump: the old `Date.now() - startTime` progress math
+    // would see an elapsed far beyond --timeout and exit 2 immediately.
+    const preload = path.join(tempRoot, "us007-date-jump.cjs");
+    fs.writeFileSync(
+      preload,
+      "const realNow = Date.now.bind(Date);\nlet reads = 0;\nDate.now = () => realNow() + ++reads * 3600000;\n",
+    );
+
+    const startedAt = Date.now();
+    const result = runWait(
+      [runId, "--timeout", "1s", "--quiet"],
+      {
+        HOME: tempRoot,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "0",
+        NODE_OPTIONS: `--require ${preload}`,
+      },
+      15_000,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(
+      result.status,
+      2,
+      `a timed-out non-terminal run should exit 2, got ${result.status}, stderr: ${result.stderr}`,
+    );
+    assert.ok(
+      elapsedMs >= 1_000,
+      `the monotonic --timeout budget must be honored, but wait exited after ${elapsedMs}ms`,
+    );
+    assert.ok(elapsedMs < 8_000, `wait must not hang past its budget, took ${elapsedMs}ms`);
+  });
+
+  it("US-007: wait.ts progress and heartbeat math use monotonicNow", () => {
+    const source = fs.readFileSync(path.join(__dirname, "wait.ts"), "utf-8");
+    assert.match(source, /const startTime = monotonicNow\(\)/);
+    assert.match(source, /const now = monotonicNow\(\)/);
+    assert.match(source, /const heartbeatDue = \(now - lastHeartbeatTime\)/);
+    assert.ok(
+      !source.includes("Date.now() - startTime"),
+      "the progress-loop elapsed math must not be an epoch date difference",
+    );
+    assert.ok(
+      !source.includes("lastHeartbeatTime = Date.now()"),
+      "the heartbeat throttle base must be a monotonic reading",
+    );
   });
 
   // ── Integration: --help outputs help text ──────────────────────────

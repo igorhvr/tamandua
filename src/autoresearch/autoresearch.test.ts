@@ -478,6 +478,45 @@ describe("autoresearch state model", () => {
     assert.equal(result.status, "crash");
   });
 
+  // US-006: a command's duration must be measured monotonically so a
+  // wall-clock jump during the command cannot report a negative or inflated
+  // duration_ms.
+  it("reports a monotonic command duration across a forward wall-clock jump", async () => {
+    const cwd = makeTempDir();
+    initExperiment({
+      cwd,
+      goal: "reduce loss",
+      metricName: "val_bpb",
+      direction: "lower",
+      command: nodeMetricCommand("val_bpb", 1.5),
+    });
+
+    const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+      "setTimeout(() => console.log('val_bpb: 1.5'), 300)",
+    )}`;
+
+    const realDateNow = Date.now;
+    let reads = 0;
+    // An epoch-based duration would read start and close at wildly different
+    // offsets and report a huge duration; the monotonic Stopwatch ignores it.
+    Date.now = () => realDateNow() + (++reads) * 86_400_000;
+    try {
+      const result = await runExperiment({ cwd, command });
+      assert.equal(result.status, "measured");
+      assert.equal(result.metric, 1.5);
+      assert.ok(
+        result.duration_ms >= 200,
+        `expected a ~300ms monotonic duration, got ${result.duration_ms}`,
+      );
+      assert.ok(
+        result.duration_ms < 60_000,
+        `a forward wall jump must not inflate duration_ms, got ${result.duration_ms}`,
+      );
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
   it("logs metric_not_found as distinct decision in logExperiment", async () => {
     const cwd = makeTempDir();
     initExperiment({

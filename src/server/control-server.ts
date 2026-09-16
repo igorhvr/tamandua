@@ -22,8 +22,9 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import { logger } from "../lib/logger.js";
-import { SQL_NOW_ISO, formatInstant } from "../lib/instant.js";
+import { SQL_NOW_ISO, formatInstant, monotonicNow, instantAgeMs, isOlderThan } from "../lib/instant.js";
 import {
   compareProcessStartIdentities,
   getProcessStartIdentity,
@@ -211,7 +212,9 @@ export function isTerminal(status: string): boolean {
 
 /**
  * Warn-throttle state for the "harness workdir busy" retriable admission
- * condition. Maps runId -> epoch ms of the last WARN emitted for that run.
+ * condition. Maps runId -> monotonic ms of the last WARN emitted for that run
+ * (TIME-CLOCKS rule 1: this is an in-process throttle, so it is measured on
+ * the monotonic clock and a wall-clock jump cannot suppress or force a WARN).
  * The condition is NOT an error: a run whose harness working directory is
  * already held by a live scheduled run waits until the holder releases it.
  * We warn once on the first refusal and then at most once per interval
@@ -265,14 +268,32 @@ export function _workdirWaitWarnStateSize(): number {
  * Decide whether to emit the workdir-wait WARN for `runId` now: first
  * refusal always logs; subsequent refusals log at most once per interval.
  * Records the emission timestamp when it returns true.
+ *
+ * `nowMs` defaults to the monotonic clock (TIME-CLOCKS rule 1): the throttle
+ * is an in-process interval, so it must not be driven by `Date.now()`. The
+ * injectable `nowMs` parameter is retained so tests can drive the boundary
+ * directly with a monotonic value.
  */
-function shouldWarnWorkdirWait(runId: string, nowMs: number = Date.now()): boolean {
+function shouldWarnWorkdirWait(runId: string, nowMs: number = monotonicNow()): boolean {
   const last = workdirWaitWarnState.get(runId);
   if (last !== undefined && nowMs - last < getWorkdirWaitWarnIntervalMs()) {
     return false;
   }
   workdirWaitWarnState.set(runId, nowMs);
   return true;
+}
+
+/**
+ * @internal — direct test seam for the monotonic workdir-wait throttle: calls
+ * `shouldWarnWorkdirWait` with an injected monotonic `nowMs` (defaulting to the
+ * same monotonic clock production uses). Production code calls the private
+ * function directly; this alias exists only so unit tests can exercise the
+ * interval boundary deterministically.
+ */
+export function _shouldWarnWorkdirWaitForTest(runId: string, nowMs?: number): boolean {
+  return nowMs === undefined
+    ? shouldWarnWorkdirWait(runId)
+    : shouldWarnWorkdirWait(runId, nowMs);
 }
 
 function requiredTimersForRun(runId: string): number {
@@ -801,6 +822,125 @@ function cleanStaleClaims(
   }
 }
 
+/**
+ * Tolerance for the FLAKE_WINDOW_MS age comparisons (TIME-CLOCKS rule 2).
+ *
+ * The ledger is written by multiple worktrees/hosts whose wall clocks may
+ * differ by sub-second amounts and the window is a coarse 24h bucket, so 1s
+ * of slack keeps a row written just inside the window from being dropped by
+ * skew. The comparison stays strict at the widened boundary
+ * (`age > FLAKE_WINDOW_MS + tolerance`).
+ */
+const FLAKE_WINDOW_TOLERANCE_MS = 1_000;
+
+/**
+ * True when a stored `created_at` falls inside the FLAKE_WINDOW_MS window as
+ * of `nowMs`, computed numerically via `instantAgeMs`/`isOlderThan`
+ * (TIME-CLOCKS US-011) rather than a `created_at >= ?` SQL string bound.
+ *
+ * An unparseable/missing/`NaN` instant is NEVER inside the window:
+ * `isOlderThan` alone treats an unknown instant as fresh, so the explicit
+ * `instantAgeMs` parseability check is required. `nowMs` is injectable for
+ * tests; production uses `Date.now()`.
+ */
+export function isWithinFlakeWindow(
+  createdAt: string | null | undefined,
+  nowMs: number = Date.now(),
+): boolean {
+  if (instantAgeMs(createdAt, nowMs) === undefined) return false;
+  return !isOlderThan(createdAt, FLAKE_WINDOW_MS, nowMs, FLAKE_WINDOW_TOLERANCE_MS);
+}
+
+interface SuiteFlakyKey {
+  tree_hash: string;
+  cmd_hash: string;
+  cmd_display: string;
+  pass_count: number;
+  fail_count: number;
+}
+
+/**
+ * Aggregate flaky keys for `originRepo` inside the 24h flake window.
+ *
+ * Ages are computed per row via the shared instant helpers (US-011), so
+ * legacy naive-UTC instants compare correctly and an unparseable instant is
+ * never counted. Grouping and ordering (descending total runs) are unchanged,
+ * and exit-code semantics are preserved exactly: exit 87 (interrupted) rows
+ * are excluded from both counters; otherwise exit 0 is a pass and every other
+ * exit is a real failure.
+ */
+export function flakyKeysWithinWindow(
+  db: DatabaseSync,
+  originRepo: string,
+  nowMs: number = Date.now(),
+): SuiteFlakyKey[] {
+  const rows = db.prepare(
+    `SELECT tree_hash, cmd_hash, cmd_display, exit_code, created_at
+     FROM suite_results
+     WHERE origin_repo = ?`,
+  ).all(originRepo) as Array<{
+    tree_hash: string;
+    cmd_hash: string;
+    cmd_display: string;
+    exit_code: number;
+    created_at: string;
+  }>;
+
+  const byKey = new Map<string, SuiteFlakyKey>();
+  for (const row of rows) {
+    if (!isWithinFlakeWindow(row.created_at, nowMs)) continue;
+    const key = `${row.tree_hash}\u0000${row.cmd_hash}`;
+    let agg = byKey.get(key);
+    if (!agg) {
+      agg = {
+        tree_hash: row.tree_hash,
+        cmd_hash: row.cmd_hash,
+        cmd_display: row.cmd_display,
+        pass_count: 0,
+        fail_count: 0,
+      };
+      byKey.set(key, agg);
+    }
+    if (row.exit_code === 87) continue;
+    if (row.exit_code === 0) agg.pass_count++;
+    else agg.fail_count++;
+  }
+
+  return [...byKey.values()]
+    .filter((key) => key.pass_count > 0 && key.fail_count > 0)
+    .sort((a, b) => (b.pass_count + b.fail_count) - (a.pass_count + a.fail_count));
+}
+
+/**
+ * Pass/fail counts for one suite key inside the flake window, computed with
+ * the shared numeric helpers (US-011). Exit 87 rows are excluded; exit 0 is a
+ * pass and every other exit is a real failure. An unparseable `created_at` is
+ * never counted. `nowMs` is injectable for tests.
+ */
+export function suiteCountsWithinWindow(
+  db: DatabaseSync,
+  key: { originRepo: string; treeHash: string; cmdHash: string },
+  nowMs: number = Date.now(),
+): { passCount: number; failCount: number } {
+  const rows = db.prepare(
+    `SELECT exit_code, created_at FROM suite_results
+     WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?`,
+  ).all(key.originRepo, key.treeHash, key.cmdHash) as Array<{
+    exit_code: number;
+    created_at: string;
+  }>;
+
+  let passCount = 0;
+  let failCount = 0;
+  for (const row of rows) {
+    if (!isWithinFlakeWindow(row.created_at, nowMs)) continue;
+    if (row.exit_code === 87) continue;
+    if (row.exit_code === 0) passCount++;
+    else failCount++;
+  }
+  return { passCount, failCount };
+}
+
 async function handleSuiteLookup(url: string): Promise<JsonResponse> {
   const parsed = new URL(url, "http://localhost");
   const originRepo = parsed.searchParams.get("origin_repo");
@@ -813,7 +953,6 @@ async function handleSuiteLookup(url: string): Promise<JsonResponse> {
 
   try {
     const db = getDb();
-    const flakeCutoff = new Date(Date.now() - FLAKE_WINDOW_MS).toISOString();
 
     const latest = db.prepare(
       `SELECT id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at
@@ -823,15 +962,9 @@ async function handleSuiteLookup(url: string): Promise<JsonResponse> {
        LIMIT 1`,
     ).get(originRepo, treeHash, cmdHash) as Record<string, unknown> | undefined;
 
-    const passCount = (db.prepare(
-      `SELECT COUNT(*) as cnt FROM suite_results
-       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND exit_code = 0 AND exit_code != 87 AND created_at >= ?`,
-    ).get(originRepo, treeHash, cmdHash, flakeCutoff) as { cnt: number }).cnt;
-
-    const failCount = (db.prepare(
-      `SELECT COUNT(*) as cnt FROM suite_results
-       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND exit_code != 0 AND exit_code != 87 AND created_at >= ?`,
-    ).get(originRepo, treeHash, cmdHash, flakeCutoff) as { cnt: number }).cnt;
+    // US-011: age the windowed rows numerically instead of a created_at >= ?
+    // SQL string bound.
+    const { passCount, failCount } = suiteCountsWithinWindow(db, { originRepo, treeHash, cmdHash });
 
     return ok({
       latest: latest ?? null,
@@ -1067,23 +1200,12 @@ async function handleSuiteFlaky(url: string): Promise<JsonResponse> {
 
   try {
     const db = getDb();
-    const flakeCutoff = new Date(Date.now() - FLAKE_WINDOW_MS).toISOString();
 
     // Find keys that have both pass (exit_code=0) and fail (exit_code!=0 and !=87) within the window.
     // Exit code 87 (interrupted) rows are excluded from flaky detection — they are honest history,
     // not real failures, and should not poison the flaky counter.
-    const rows = db.prepare(
-      `SELECT tree_hash, cmd_hash, cmd_display,
-              SUM(CASE WHEN exit_code != 87 AND exit_code = 0 THEN 1 ELSE 0 END) as pass_count,
-              SUM(CASE WHEN exit_code != 87 AND exit_code != 0 THEN 1 ELSE 0 END) as fail_count
-       FROM suite_results
-       WHERE origin_repo = ? AND created_at >= ?
-       GROUP BY tree_hash, cmd_hash
-       HAVING pass_count > 0 AND fail_count > 0
-       ORDER BY (pass_count + fail_count) DESC`,
-    ).all(originRepo, flakeCutoff) as Array<Record<string, unknown>>;
-
-    return ok({ flaky_keys: rows });
+    // US-011: ages are computed numerically per row via the shared instant helpers.
+    return ok({ flaky_keys: flakyKeysWithinWindow(db, originRepo) });
   } catch (err) {
     logger.warn("control-server: suite flaky query failed", { error: String(err) });
     return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };

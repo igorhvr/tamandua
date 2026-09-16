@@ -586,3 +586,48 @@ describe("update exports", () => {
     });
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════
+// US-007: CLI elapsed timers are monotonic
+// ════════════════════════════════════════════════════════════════════════
+
+describe("US-007 update.ts monotonic process-exit wait", () => {
+  it("defaultWaitForProcessExit honors its budget across a forward wall-clock jump", async () => {
+    const { _defaultWaitForProcessExitForTest } = await import("../../dist/cli/update.js");
+
+    const realDateNow = Date.now.bind(Date);
+    const startedAt = performance.now();
+    let reads = 0;
+    try {
+      // +1h per Date.now() read: an epoch-based `Date.now() - startedAt`
+      // budget would be exhausted on the very first loop check.
+      Date.now = () => realDateNow() + ++reads * 3_600_000;
+      // process.pid always exists, so the poll loop keeps running until the
+      // (monotonic) deadline expires.
+      await _defaultWaitForProcessExitForTest(process.pid, 300);
+    } finally {
+      Date.now = realDateNow;
+    }
+    const elapsedMs = performance.now() - startedAt;
+
+    assert.ok(
+      elapsedMs >= 250,
+      `monotonic wait must honor the ~300ms budget despite the wall jump, took ${elapsedMs}ms`,
+    );
+    assert.ok(
+      elapsedMs < 2_000,
+      `monotonic wait must not hang past its budget, took ${elapsedMs}ms`,
+    );
+  });
+
+  it("defaultWaitForProcessExit returns promptly once the process is gone", async () => {
+    const { _defaultWaitForProcessExitForTest } = await import("../../dist/cli/update.js");
+    // A pid that cannot exist: process.kill throws ESRCH on the first poll.
+    const startedAt = performance.now();
+    await _defaultWaitForProcessExitForTest(0x7fffffff, 5_000);
+    assert.ok(
+      performance.now() - startedAt < 1_000,
+      "a dead pid must not consume the whole wait budget",
+    );
+  });
+});

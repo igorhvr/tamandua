@@ -32,6 +32,7 @@
 
 import { spawnSync } from "node:child_process";
 import { getDb } from "../db.js";
+import { isOlderThan } from "../lib/instant.js";
 import { resolveTamanduaCli } from "./paths.js";
 
 // ── Probe contract constants ────────────────────────────────────────
@@ -348,13 +349,31 @@ export interface HarnessProbeReserveOptions {
 }
 
 /**
- * Atomically claim the once-per-run probe for a run: the UPDATE only
- * matches rows that are still unprobed (harness_probe_status IS NULL) or
- * whose in-flight 'probing' reservation is stale (older than the probe
- * wall — a daemon crash mid-probe must not wedge the run). Exactly one
- * caller wins per run; 'ok'/'failed' rows never match, so a passed (or
- * definitively failed) run is never re-probed. Returns true when this
- * caller won the reservation.
+ * Tolerance for the in-flight 'probing' reservation staleness comparison
+ * (TIME-CLOCKS rule 2). The reservation wall (default 180s) is an explicit
+ * crash-recovery budget and `harness_probe_at` is written with millisecond
+ * ISO-Z precision by the same process that reads it, so no slack is
+ * warranted. Zero is the documented explicit tolerance and keeps the exact
+ * prior strict boundary (`age > wallMs`).
+ */
+const HARNESS_PROBE_STALENESS_TOLERANCE_MS = 0;
+
+/**
+ * Atomically claim the once-per-run probe for a run: the claim only succeeds
+ * when the row is still unprobed (`harness_probe_status IS NULL`) or its
+ * in-flight 'probing' reservation is stale (older than the probe wall — a
+ * daemon crash mid-probe must not wedge the run). Exactly one caller wins per
+ * run; 'ok'/'failed' rows never match, so a passed (or definitively failed)
+ * run is never re-probed. Returns true when this caller won the reservation.
+ *
+ * US-011: the staleness decision is computed numerically via `isOlderThan`
+ * with the documented tolerance instead of the old
+ * `harness_probe_at < staleBeforeIso` SQL string comparison. Atomic
+ * single-winner semantics are preserved: the unprobed case is one conditional
+ * UPDATE, and the stale case reads the reservation stamp and then re-updates
+ * with the exact prior stamp as a compare-and-swap guard, so only the first
+ * racer can replace a given reservation. An unparseable/unreadable stamp is
+ * never treated as stale.
  */
 export function reserveHarnessProbe(
   runId: string,
@@ -364,19 +383,40 @@ export function reserveHarnessProbe(
   const wallMs = opts?.wallMs ?? getHarnessProbeWallMs();
   const nowMs = opts?.nowMs ?? Date.now();
   const nowIso = new Date(nowMs).toISOString();
-  const staleBeforeIso = new Date(nowMs - wallMs).toISOString();
-  const result = db
+
+  // Fast path: an unprobed run is claimed by a single atomic UPDATE, exactly
+  // as before (no read, no race window).
+  const freshClaim = db
     .prepare(
       `UPDATE runs
        SET harness_probe_status = 'probing', harness_probe_at = ?
-       WHERE id = ?
-         AND (
-           harness_probe_status IS NULL
-           OR (harness_probe_status = 'probing' AND harness_probe_at IS NOT NULL AND harness_probe_at < ?)
-         )`,
+       WHERE id = ? AND harness_probe_status IS NULL`,
     )
-    .run(nowIso, runId, staleBeforeIso);
-  return result.changes > 0;
+    .run(nowIso, runId);
+  if (freshClaim.changes > 0) return true;
+
+  // Slow path: a 'probing' reservation may be stale. Read the stamp, decide
+  // its age in JS, then CAS on the exact value read so a racing caller cannot
+  // double-claim the same reservation.
+  const row = db
+    .prepare("SELECT harness_probe_status, harness_probe_at FROM runs WHERE id = ?")
+    .get(runId) as { harness_probe_status: string | null; harness_probe_at: string | null } | undefined;
+  if (!row || row.harness_probe_status !== "probing" || row.harness_probe_at == null) {
+    // Row absent, or already 'ok'/'failed' — never re-probe.
+    return false;
+  }
+  if (!isOlderThan(row.harness_probe_at, wallMs, nowMs, HARNESS_PROBE_STALENESS_TOLERANCE_MS)) {
+    return false;
+  }
+
+  const staleClaim = db
+    .prepare(
+      `UPDATE runs
+       SET harness_probe_status = 'probing', harness_probe_at = ?
+       WHERE id = ? AND harness_probe_status = 'probing' AND harness_probe_at = ?`,
+    )
+    .run(nowIso, runId, row.harness_probe_at);
+  return staleClaim.changes > 0;
 }
 
 export interface HarnessProbeRecordOptions {

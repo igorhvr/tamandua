@@ -10,6 +10,7 @@ import { sanitizeStderrTail } from "./step-ops.js";
 import { classifyHarnessStderr } from "./harness-stderr.js";
 import { resolveHermesBinary } from "./hermes-resolver.js";
 import { resolveDshBinary } from "./dsh-resolver.js";
+import { monotonicNow, Stopwatch } from "../lib/instant.js";
 import {
   launchHarnessExecution,
   type HarnessLaunchMode,
@@ -213,8 +214,13 @@ async function launchRoundProcess(params: {
   execution?: HarnessRoundIdentity;
   seams?: HarnessLaunchSeams;
   signal?: AbortSignal;
-  startedAt: number;
-  /** Overall round wall budget in ms (startedAt + timeoutMs). */
+  /**
+   * The round's monotonic Stopwatch, started by the adapter when the round
+   * began. It is the SAME time base used to derive the whole-round deadline
+   * below — never mixed with an epoch instant (TIME-CLOCKS rule 1).
+   */
+  roundWatch: Stopwatch;
+  /** Overall round wall budget in ms, measured on the round's monotonic watch. */
   timeoutMs: number;
 }): Promise<
   | { status: "launched"; process: LaunchedRoundProcess }
@@ -230,8 +236,12 @@ async function launchRoundProcess(params: {
     signal: params.signal,
     // The whole launch (native setup + any fallback) runs INSIDE the
     // adapter's overall wall budget: once it expires, no fresh harness
-    // work may begin.
-    wallDeadlineMs: params.startedAt + params.timeoutMs,
+    // work may begin. The deadline is derived on the monotonic clock from
+    // the round stopwatch's elapsed time (monotonicNow() + remaining), so
+    // it shares the adapters' time base and a wall-clock jump cannot shift
+    // it. A budget that is already exhausted yields a deadline in the past
+    // and aborts at entry (see harness-launch.ts expiredAtEntry).
+    wallDeadlineMs: monotonicNow() + (params.timeoutMs - params.roundWatch.elapsedMs()),
     onSpawn: params.onSpawn
       ? ({ pid, pgid }: { pid: number; pgid: number }) => {
           try {
@@ -249,6 +259,8 @@ async function launchRoundProcess(params: {
     // setup-child exit/signal forensics — the same shape a signal-killed
     // round produces, so the scheduler handles it through the normal path.
     // A budget-exhausted abort reports the round's timedOut convention.
+    // Duration is the round watch's monotonic elapsed time (rule 1).
+    const durationMs = params.roundWatch.elapsedMs();
     logger.warn(`${params.harness} launch aborted before harness start (native setup)`, {
       pid: outcome.pid ?? null,
       pgid: outcome.pgid,
@@ -256,7 +268,7 @@ async function launchRoundProcess(params: {
       exitCode: outcome.exitCode,
       signal: outcome.signal,
       timedOut: outcome.timedOut === true,
-      durationMs: Date.now() - params.startedAt,
+      durationMs,
     });
     return {
       status: "aborted",
@@ -266,7 +278,7 @@ async function launchRoundProcess(params: {
         signal: outcome.signal ?? undefined,
         stderrTail: outcome.stderrTail,
         timedOut: outcome.timedOut === true ? true : undefined,
-        durationMs: Date.now() - params.startedAt,
+        durationMs,
       },
     };
   }
@@ -336,7 +348,11 @@ class PiHarnessAdapter implements HarnessAdapter {
     };
 
     const preview = formatPiCommandPreview(piPath, args);
-    const startedAt = Date.now();
+    // US-003: the round's start and elapsed budget are monotonic (rule 1):
+    // remainingWallMs and durationMs come from this watch, never a
+    // Date.now() difference, so an NTP step / suspend-resume cannot abort a
+    // healthy round early or inflate/shrink its duration.
+    const roundWatch = new Stopwatch();
 
     logger.info("pi pre-launch", {
       commandPreview: preview.commandPreview,
@@ -365,7 +381,7 @@ class PiHarnessAdapter implements HarnessAdapter {
       execution: options?.execution,
       seams: options?.launch,
       signal: options?.signal,
-      startedAt,
+      roundWatch,
       timeoutMs,
     });
     if (launched.status === "aborted") return launched.result;
@@ -417,7 +433,7 @@ class PiHarnessAdapter implements HarnessAdapter {
     // (child.on("error")) still reject. The timer uses the REMAINING wall
     // budget (native setup already consumed some of it): the overall round
     // budget, including setup/fallback, stays as requested.
-    const remainingWallMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+    const remainingWallMs = Math.max(1, timeoutMs - roundWatch.elapsedMs());
     const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -463,7 +479,7 @@ class PiHarnessAdapter implements HarnessAdapter {
 
     // Log non-zero exit failures (but don't reject — resolve like hermes)
     if (exitCode !== null && exitCode !== 0) {
-      const failureDurationMs = Date.now() - startedAt;
+      const failureDurationMs = roundWatch.elapsedMs();
       const failureStderr = stderrPieces.join("");
       const failureStderrMeta = buildStreamLogMetadata(failureStderr);
       logger.error("pi execution failed", {
@@ -481,14 +497,14 @@ class PiHarnessAdapter implements HarnessAdapter {
         pid: childPid ?? null,
         pgid,
         signal: exitSignal,
-        durationMs: Date.now() - startedAt,
+        durationMs: roundWatch.elapsedMs(),
       });
     }
 
     // Wait for stdout parsing to finish (it will complete once stdout closes)
     const parseResult = await parseResultPromise;
 
-    const durationMs = Date.now() - startedAt;
+    const durationMs = roundWatch.elapsedMs();
     const stderrOut = stderrPieces.join("");
     const stderrMeta = buildStreamLogMetadata(stderrOut);
 
@@ -582,7 +598,9 @@ class HermesHarnessAdapter implements HarnessAdapter {
       ...(options?.env ?? {}),
     };
 
-    const startedAt = Date.now();
+    // US-003: monotonic round watch (rule 1) — elapsed/remaining and
+    // durationMs are all derived from it, never from Date.now() differences.
+    const roundWatch = new Stopwatch();
 
     // Hermes single-shot invocation:
     // -q <prompt> delivers the task in single message mode.
@@ -632,7 +650,7 @@ class HermesHarnessAdapter implements HarnessAdapter {
       execution: options?.execution,
       seams: options?.launch,
       signal: options?.signal,
-      startedAt,
+      roundWatch,
       timeoutMs,
     });
     if (launched.status === "aborted") return launched.result;
@@ -769,8 +787,10 @@ class HermesHarnessAdapter implements HarnessAdapter {
     // block which can attempt stderr-based sessionRef extraction.
     let timeoutTimerFired = false;
     // The timer uses the REMAINING wall budget (native setup already
-    // consumed part of it), keeping the overall round budget intact.
-    const remainingWallMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+    // consumed part of it), keeping the overall round budget intact. The
+    // remaining budget is monotonic (rule 1): a wall-clock jump cannot
+    // shorten it (premature abort) or lengthen it (budget overrun).
+    const remainingWallMs = Math.max(1, timeoutMs - roundWatch.elapsedMs());
     const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -810,7 +830,7 @@ class HermesHarnessAdapter implements HarnessAdapter {
       });
     });
 
-    const durationMs = Date.now() - startedAt;
+    const durationMs = roundWatch.elapsedMs();
     const exitCode = exitInfo.code;
     const exitSignal = exitInfo.signal;
 
@@ -1011,7 +1031,9 @@ class DshHarnessAdapter implements HarnessAdapter {
     // probes for exactly that condition.)
     childEnv.DSH_PERMISSION_MODE = "danger-full-access";
 
-    const startedAt = Date.now();
+    // US-003: monotonic round watch (rule 1) — elapsed/remaining and
+    // durationMs are all derived from it, never from Date.now() differences.
+    const roundWatch = new Stopwatch();
 
     // dsh headless invocation: `dsh --profile headless <prompt>`.
     // The headless app accepts ONLY the task positional (plus --help) —
@@ -1065,7 +1087,7 @@ class DshHarnessAdapter implements HarnessAdapter {
       execution: options?.execution,
       seams: options?.launch,
       signal: options?.signal,
-      startedAt,
+      roundWatch,
       timeoutMs,
     });
     if (launched.status === "aborted") return launched.result;
@@ -1195,7 +1217,9 @@ class DshHarnessAdapter implements HarnessAdapter {
     // still reject. The timer uses the REMAINING wall budget (native setup
     // already consumed part of it), keeping the overall round budget intact.
     let timeoutTimerFired = false;
-    const remainingWallMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+    // The remaining budget is monotonic (rule 1): a wall-clock jump cannot
+    // shorten it (premature abort) or lengthen it (budget overrun).
+    const remainingWallMs = Math.max(1, timeoutMs - roundWatch.elapsedMs());
     const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -1236,7 +1260,7 @@ class DshHarnessAdapter implements HarnessAdapter {
       });
     });
 
-    const durationMs = Date.now() - startedAt;
+    const durationMs = roundWatch.elapsedMs();
     const exitCode = exitInfo.code;
     const exitSignal = exitInfo.signal;
 
