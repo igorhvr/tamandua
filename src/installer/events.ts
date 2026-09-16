@@ -3,6 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { resolvePiStateDir } from "./paths.js";
 import { logger } from "../lib/logger.js";
+import { formatInstant, nowIso } from "../lib/instant.js";
 import { assertStatePathIsolation } from "../lib/test-guard.js";
 
 // ── Rotation constants (global events file) ────────────────────────
@@ -546,7 +547,15 @@ function emitEventCore(evt: TamanduaEvent): void {
   if (NOISE_EVENTS.has(evt.event) && !isEnvFlagEnabled(process.env.TAMANDUA_DEBUG_EVENTS)) {
     return;
   }
-  const line = JSON.stringify(evt) + "\n";
+  // TIME-OUTPUT (US-007): every persisted event carries a canonical ISO-8601
+  // UTC `ts` with an explicit Z. A legacy naive or offset-carrying value is
+  // normalized through the shared serializer; a missing/unparseable one falls
+  // back to a fresh canonical now — never raw, never a garbage string.
+  const normalized: TamanduaEvent = {
+    ...evt,
+    ts: formatInstant(evt.ts, { style: "iso" }) ?? nowIso(),
+  };
+  const line = JSON.stringify(normalized) + "\n";
 
   // Test-isolation guard: refuse to write events into the real production
   // state dir. Guarded test processes must never pollute production event
@@ -601,7 +610,7 @@ function emitEventCore(evt: TamanduaEvent): void {
   }
 
   // Fire-and-forget webhook if applicable
-  fireWebhook(evt).catch((err) => {
+  fireWebhook(normalized).catch((err) => {
     logger.warn("Webhook delivery failed", {
       runId: evt.runId,
       event: evt.event,

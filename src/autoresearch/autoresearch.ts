@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { nowIso } from "../lib/instant.js";
 import { parsePiOutputStream } from "../installer/pi-stream-parser.js";
 
 export type AutoresearchDirection = "lower" | "higher";
@@ -383,7 +384,7 @@ export function initExperiment(options: InitExperimentOptions): AutoresearchSess
 
   const entry: AutoresearchSessionEntry = {
     type: "session",
-    created_at: new Date().toISOString(),
+    created_at: nowIso(),
     goal: options.goal,
     metric_name: options.metricName,
     metric_unit: options.metricUnit,
@@ -436,7 +437,7 @@ export async function runExperiment(options: RunExperimentOptions = {}): Promise
   const entry: AutoresearchRunResultEntry = {
     type: "run_result",
     run,
-    created_at: new Date().toISOString(),
+    created_at: nowIso(),
     status,
     metric,
     metric_name: config.metricName,
@@ -485,7 +486,7 @@ export async function logExperiment(options: LogExperimentOptions): Promise<Auto
   const entry: AutoresearchRunEntry = {
     type: "run",
     run,
-    created_at: new Date().toISOString(),
+    created_at: nowIso(),
     status,
     metric,
     metric_name: config.metricName,

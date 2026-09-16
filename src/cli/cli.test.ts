@@ -2171,6 +2171,32 @@ describe("formatRunsSummary", () => {
     assert.match(result, /No workflow runs/);
   });
 
+  // TIME-OUTPUT US-005: the red-ledger landing instant in the status summary is
+  // serialized as ISO-8601 UTC with Z, normalizing a legacy naive stored value.
+  it("renders the red-ledger landing instant as ISO-Z", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const result = formatRunsSummary({
+      listRuns: () => [
+        {
+          id: "a1010101-0101-0101-0101-010101010101",
+          workflowId: "feature-dev-merge",
+          task: "task",
+          status: "completed",
+          createdAt: "2026-09-15 22:00:00",
+          updatedAt: "2026-09-15 22:00:00",
+          tokensSpent: 0,
+          workerLostCount: 0,
+          ceilingExpiryCount: 0,
+          instantFailCount: 0,
+          redLedgerLanding: { ledgerRowId: 42, exitCode: 7, ledgerCreatedAt: "2026-09-15 22:00:00" },
+        },
+      ],
+      isDaemonRunning: () => true,
+    });
+    assert.match(result, /RED LEDGER row 42, exit 7 @ 2026-09-15T22:00:00\.000Z/);
+    assert.doesNotMatch(result, /@ 2026-09-15 22:00:00/);
+  });
+
   it("shows normal [running] for recent run even when daemon is down", async () => {
     const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
     const now = new Date().toISOString();

@@ -14,11 +14,19 @@ import { DEFAULT_MCP_PORT } from "../../dist/server/mcp-server.js";
 import { getDb, incrementSystemTokenSpend, getSystemTokenSpend } from "../../dist/db.js";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
 
+interface LogsTailItem {
+  ts: string;
+  body: string;
+}
+
 interface LogsTailResponse {
-  lines: string[];
+  items: LogsTailItem[];
   nextOffset: number;
   generation: number;
 }
+
+/** The explicit UTC ISO-8601 shape every logs-tail item ts must carry. */
+const ISO_Z_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 function appendGlobalEvent(stateDir: string, evt: TamanduaEvent): void {
   const filePath = path.join(stateDir, "events", "all.jsonl");
@@ -104,15 +112,23 @@ describe("dashboard logs-tail API", () => {
       assert.equal(response.status, 200);
 
       const payload = await response.json() as LogsTailResponse;
-      assert.equal(payload.lines.length, 2);
+      assert.equal(payload.items.length, 2);
       assert.ok(payload.nextOffset > 0);
 
-      assert.match(payload.lines[0], /\[run-runalpha\]/);
-      assert.match(payload.lines[0], /developer/);
-      assert.match(payload.lines[0], /Step pending/);
-      assert.match(payload.lines[0], /— Expose logs-tail API/);
-      assert.match(payload.lines[0], /\(initial poll\)/);
-      assert.match(payload.lines[1], /Story done/);
+      // TIME-OUTPUT US-006: every item carries the raw ISO-Z instant plus the
+      // time-less body, so the browser localizes for the viewer.
+      assert.match(payload.items[0].ts, ISO_Z_RE);
+      assert.equal(payload.items[0].ts, "2026-05-01T10:15:00.000Z");
+      assert.match(payload.items[0].body, /\[run-runalpha\]/);
+      assert.match(payload.items[0].body, /developer/);
+      assert.match(payload.items[0].body, /Step pending/);
+      assert.match(payload.items[0].body, /— Expose logs-tail API/);
+      assert.match(payload.items[0].body, /\(initial poll\)/);
+      // The body must NOT carry a leading (host-local or UTC) time token.
+      assert.doesNotMatch(payload.items[0].body, /^\d{4}-\d{2}-\d{2}/);
+      assert.match(payload.items[1].ts, ISO_Z_RE);
+      assert.equal(payload.items[1].ts, "2026-05-01T10:16:00.000Z");
+      assert.match(payload.items[1].body, /Story done/);
     } finally {
       await stopDashboard(server);
       restore();
@@ -136,8 +152,8 @@ describe("dashboard logs-tail API", () => {
       const initialResponse = await fetch(`${baseUrl}/api/logs-tail?offset=0`);
       assert.equal(initialResponse.status, 200);
       const initialPayload = await initialResponse.json() as LogsTailResponse;
-      assert.equal(initialPayload.lines.length, 1);
-      assert.match(initialPayload.lines[0], /\(first\)/);
+      assert.equal(initialPayload.items.length, 1);
+      assert.match(initialPayload.items[0].body, /\(first\)/);
 
       appendGlobalEvent(stateDir, {
         ts: "2026-05-01T11:01:00.000Z",
@@ -156,13 +172,15 @@ describe("dashboard logs-tail API", () => {
       assert.equal(nextResponse.status, 200);
       const nextPayload = await nextResponse.json() as LogsTailResponse;
 
-      assert.equal(nextPayload.lines.length, 2);
+      assert.equal(nextPayload.items.length, 2);
       assert.ok(nextPayload.nextOffset > initialPayload.nextOffset);
-      assert.equal(nextPayload.lines.some((line) => line.includes("(first)")), false);
-      assert.match(nextPayload.lines[0], /Claimed step/);
-      assert.match(nextPayload.lines[0], /\(second\)/);
-      assert.match(nextPayload.lines[1], /Step completed/);
-      assert.match(nextPayload.lines[1], /\(third\)/);
+      assert.equal(nextPayload.items.some((item) => item.body.includes("(first)")), false);
+      assert.match(nextPayload.items[0].body, /Claimed step/);
+      assert.match(nextPayload.items[0].body, /\(second\)/);
+      assert.match(nextPayload.items[1].body, /Step completed/);
+      assert.match(nextPayload.items[1].body, /\(third\)/);
+      assert.match(nextPayload.items[0].ts, ISO_Z_RE);
+      assert.match(nextPayload.items[1].ts, ISO_Z_RE);
     } finally {
       await stopDashboard(server);
       restore();
@@ -184,9 +202,35 @@ describe("dashboard logs-tail UI", () => {
       assert.match(html, /<section class="section" id="logs-tail-section">/);
       assert.match(html, /<textarea[\s\S]*id="logs-tail-output"[\s\S]*readonly/);
       assert.match(html, /fetch\(`\/api\/logs-tail\?offset=\$\{logsTailOffset\}&generation=\$\{logsTailGeneration\}`\)/);
-      assert.match(html, /appendLogsTailLines\(data\.lines \|\| \[\]\)/);
+      assert.match(html, /appendLogsTailLines\(data\.items \|\| \[\]\)/);
       assert.match(html, /logsTailOffset = data\.nextOffset/);
       assert.match(html, /output\.scrollTop = output\.scrollHeight/);
+      // TIME-OUTPUT US-006: the renderer localizes the fed ISO-Z ts in the
+      // browser via the shared parseStoredInstant rules, never a server-
+      // rendered host-local string.
+      assert.match(html, /function appendLogsTailLines\(items\)/);
+      assert.match(html, /parseStoredInstant\(item\.ts\)/);
+      assert.match(html, /toLocaleTimeString\(\)/);
+    } finally {
+      await stopDashboard(server);
+      restore();
+    }
+  });
+
+  it("keeps the shared instant-parser blocks in index.html and kanban.html (TIME-OUTPUT US-006)", async () => {
+    const { restore } = isolateDashboardState("tamandua-dashboard-logs-tail-ui-");
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const indexHtml = await (await fetch(`${baseUrl}/`)).text();
+      assert.match(indexHtml, /BEGIN instant-parser/);
+      assert.match(indexHtml, /END instant-parser/);
+      assert.match(indexHtml, /function parseStoredInstant\(value\)/);
+
+      const kanbanHtml = await (await fetch(`${baseUrl}/runs/abc123/kanban`)).text();
+      assert.match(kanbanHtml, /BEGIN instant-parser/);
+      assert.match(kanbanHtml, /END instant-parser/);
+      assert.match(kanbanHtml, /function parseTimestamp\(ts\)/);
     } finally {
       await stopDashboard(server);
       restore();

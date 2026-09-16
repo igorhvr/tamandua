@@ -23,3 +23,31 @@ describe("SPL2 status and doctor command module", () => {
     assert.equal(await handleStatus("workflow", ["workflow", "status"]), false);
   });
 });
+
+describe("TIME-OUTPUT US-005: tamandua status red-ledger instant is ISO-Z", () => {
+  it("normalizes a legacy naive ledgerCreatedAt to an ISO-Z instant", async () => {
+    const { formatRunsSummary } = await import("../../../dist/cli/status-format.js");
+    const output = formatRunsSummary({
+      listRuns: () => [{
+        id: "a1010101-0101-0101-0101-010101010101",
+        workflowId: "feature-dev-merge",
+        task: "task",
+        status: "completed",
+        createdAt: "2026-09-15 22:00:00",
+        updatedAt: "2026-09-15 22:00:00",
+        tokensSpent: 0,
+        workerLostCount: 0,
+        ceilingExpiryCount: 0,
+        instantFailCount: 0,
+        redLedgerLanding: {
+          ledgerRowId: 42,
+          exitCode: 7,
+          ledgerCreatedAt: "2026-09-15 22:00:00",
+        },
+      }],
+      isDaemonRunning: () => true,
+    });
+    assert.match(output, /RED LEDGER row 42, exit 7 @ 2026-09-15T22:00:00\.000Z/);
+    assert.doesNotMatch(output, /@ 2026-09-15 22:00:00/);
+  });
+});

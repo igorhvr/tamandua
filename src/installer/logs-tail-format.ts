@@ -1,3 +1,4 @@
+import { formatInstant } from "../lib/instant.js";
 import { type TamanduaEvent } from "./events.js";
 
 const EVENT_LABELS: Record<string, string> = {
@@ -27,12 +28,18 @@ const EVENT_LABELS: Record<string, string> = {
   "pipeline.advanced": "Pipeline advanced",
 };
 
-export function formatLogsTailTime(ts: string): string {
-  return new Date(ts).toLocaleTimeString("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: true,
-  });
+/**
+ * The leading time token of a logs-tail line.
+ *
+ * TIME-OUTPUT US-003: serialize via the shared `formatInstant(..., 'log')`
+ * helper so every human log line carries a full date and an explicit `Z`
+ * (`YYYY-MM-DD HH:MM:SSZ`, always UTC). The old `toLocaleTimeString` form was
+ * host-local and date-less, so two instants in different zones were
+ * indistinguishable. A missing/unparseable `ts` renders the stable `?`
+ * placeholder and never throws.
+ */
+export function formatLogsTailTime(ts: string | null | undefined): string {
+  return formatInstant(ts, { style: "log" }) ?? "?";
 }
 
 export function formatLogsTailLabel(evt: TamanduaEvent): string {
@@ -79,15 +86,26 @@ function formatTokenSpend(evt: TamanduaEvent): string {
   return ` [tokens: ${parts.join(", ")}]`;
 }
 
-export function formatLogsTailLine(evt: TamanduaEvent): string {
-  const time = formatLogsTailTime(evt.ts);
+/**
+ * The run/agent/label/story/detail/token portion of a logs-tail line, with NO
+ * leading time token.
+ *
+ * TIME-OUTPUT US-006: the dashboard feeds the browser a raw ISO-Z `ts` plus
+ * this body, so the browser (not the server) localizes the instant for the
+ * viewer. `formatLogsTailLine` composes the CLI form with the UTC time token.
+ */
+export function formatLogsTailBody(evt: TamanduaEvent): string {
   const agent = evt.agentId ? `  ${evt.agentId.split("_").slice(-1)[0]}` : "";
   const label = formatLogsTailLabel(evt);
   const story = evt.storyTitle ? ` — ${evt.storyTitle}` : "";
   const detail = evt.detail ? ` (${evt.detail})` : "";
   const tokenSpend = formatTokenSpend(evt);
   const run = evt.runId ? `  [run-${evt.runId.slice(0, 8)}]` : "";
-  return `${time}${run}${agent}  ${label}${story}${detail}${tokenSpend}`;
+  return `${run}${agent}  ${label}${story}${detail}${tokenSpend}`;
+}
+
+export function formatLogsTailLine(evt: TamanduaEvent): string {
+  return `${formatLogsTailTime(evt.ts)}${formatLogsTailBody(evt)}`;
 }
 
 export function formatLogsTailLines(events: TamanduaEvent[]): string[] {

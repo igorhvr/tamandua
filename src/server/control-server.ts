@@ -23,7 +23,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { logger } from "../lib/logger.js";
-import { SQL_NOW_ISO } from "../lib/instant.js";
+import { SQL_NOW_ISO, formatInstant } from "../lib/instant.js";
 import {
   compareProcessStartIdentities,
   getProcessStartIdentity,
@@ -714,7 +714,14 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
   const runId = typeof body.run_id === "string" ? body.run_id : null;
   const stepId = typeof body.step_id === "string" ? body.step_id : null;
   const force = body.force === true;
-  const startedAt = typeof body.started_at === "string" ? body.started_at : undefined;
+  // TIME-OUTPUT (US-007): the suite's started_at is normalized to canonical
+  // ISO-8601 UTC with Z before it is emitted on suite.executed. A legacy
+  // naive/offset value is converted; an unparseable one is omitted rather
+  // than serialized raw.
+  const startedAt = formatInstant(
+    typeof body.started_at === "string" ? body.started_at : undefined,
+    { style: "iso" },
+  );
 
   if (!originRepo || !treeHash || !cmdHash || !cmdDisplay || exitCode === null || durationMs === null) {
     return { status: 400, body: { error: "Missing required fields: origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms" } };
@@ -884,7 +891,13 @@ async function handleSuiteEvent(body: Record<string, unknown>): Promise<JsonResp
   if (typeof body.post_tree_hash === "string") evt.postTreeHash = body.post_tree_hash;
   if (typeof body.force === "boolean") evt.force = body.force;
   if (typeof body.origin_repo === "string") evt.originRepo = body.origin_repo;
-  if (typeof body.started_at === "string") evt.startedAt = body.started_at;
+  // TIME-OUTPUT (US-007): normalize the suite started_at before serialization;
+  // omit it when it is missing/unparseable rather than emitting a raw value.
+  const suiteStartedAt = formatInstant(
+    typeof body.started_at === "string" ? body.started_at : undefined,
+    { style: "iso" },
+  );
+  if (suiteStartedAt) evt.startedAt = suiteStartedAt;
   if (typeof body.shim_exit_code === "number") evt.shimExitCode = body.shim_exit_code;
   if (typeof body.command_exit_code === "number" || body.command_exit_code === null) evt.commandExitCode = body.command_exit_code;
   if (typeof body.ledger_row_id === "number" || body.ledger_row_id === null) evt.ledgerRowId = body.ledger_row_id;

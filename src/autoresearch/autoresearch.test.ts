@@ -222,6 +222,31 @@ describe("autoresearch state model", () => {
     assert.match(fs.readFileSync(path.join(cwd, "autoresearch.md"), "utf-8"), /ratchet/i);
   });
 
+  it("stamps session, result, and run created_at as canonical ISO-Z (TIME-OUTPUT US-007)", async () => {
+    const isoZ = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+    const cwd = makeTempDir();
+
+    const session = initExperiment({
+      cwd,
+      goal: "reduce validation loss",
+      metricName: "val_bpb",
+      direction: "lower",
+      command: nodeMetricCommand("val_bpb", 1.5),
+    });
+    assert.match(session.created_at, isoZ);
+
+    const result = await runExperiment({ cwd });
+    assert.match(result.created_at, isoZ);
+
+    const log = await logExperiment({
+      cwd,
+      status: "baseline",
+      metric: 1.5,
+      description: "baseline",
+    });
+    assert.match(log.created_at, isoZ);
+  });
+
   it("runs experiments, parses metrics, and logs baseline then discard", async () => {
     const cwd = makeTempDir();
     initExperiment({

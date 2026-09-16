@@ -25,6 +25,7 @@ import { printWorkflowAutoresearch } from "./autoresearch.js";
 import { handleWait, getWaitHelp } from "./wait.js";
 import { detectWrongPrefix, stripIdPrefix, prefixRunId, prefixStepId } from "../../lib/id-prefix.js";
 import { displayStoryStatus } from "../../lib/step-display.js";
+import { formatInstant } from "../../lib/instant.js";
 import { getInstantFailBackoffThreshold, getInstantFailWallThresholdMs } from "../../installer/instant-fail.js";
 
 export function getWorkflowListHelp(): string {
@@ -478,16 +479,24 @@ export async function handleWorkflow(
     const jsonFlag = args.includes("--json");
     const runs = listRuns();
     if (jsonFlag) {
-      const jsonRuns = runs.map((r) => ({
-        runId: prefixRunId(r.id),
-        runNumber: r.runNumber,
-        workflowId: r.workflowId,
-        status: r.status,
-        tokensSpent: r.tokensSpent,
-        task: r.task.slice(0, 120),
-        createdAt: r.createdAt,
-        updatedAt: r.updatedAt,
-      }));
+      const jsonRuns = runs.map((r) => {
+        const entry: Record<string, unknown> = {
+          runId: prefixRunId(r.id),
+          runNumber: r.runNumber,
+          workflowId: r.workflowId,
+          status: r.status,
+          tokensSpent: r.tokensSpent,
+          task: r.task.slice(0, 120),
+        };
+        // TIME-OUTPUT US-005: serialize every instant as ISO-8601 UTC with Z,
+        // normalizing legacy naive stored values. A missing/unparseable value is
+        // omitted rather than passed through raw or fabricated.
+        const createdAt = formatInstant(r.createdAt, { style: "iso" });
+        if (createdAt !== undefined) entry.createdAt = createdAt;
+        const updatedAt = formatInstant(r.updatedAt, { style: "iso" });
+        if (updatedAt !== undefined) entry.updatedAt = updatedAt;
+        return entry;
+      });
       console.log(JSON.stringify({ runs: jsonRuns }));
       return true;
     }
@@ -850,8 +859,12 @@ export async function handleWorkflow(
           if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
           if (s.rerouteCount !== undefined) entry.rerouteCount = s.rerouteCount;
           if (s.claimPid !== undefined) entry.claimPid = s.claimPid;
-          if (s.claimUpdatedAt !== undefined) entry.claimUpdatedAt = s.claimUpdatedAt;
-          if (s.updatedAt !== undefined) entry.updatedAt = s.updatedAt;
+          // TIME-OUTPUT US-005: instants serialize as ISO-8601 UTC with Z
+          // (legacy naive normalized); a missing/unparseable value is omitted.
+          const claimUpdatedAt = formatInstant(s.claimUpdatedAt, { style: "iso" });
+          if (claimUpdatedAt !== undefined) entry.claimUpdatedAt = claimUpdatedAt;
+          const updatedAt = formatInstant(s.updatedAt, { style: "iso" });
+          if (updatedAt !== undefined) entry.updatedAt = updatedAt;
           return entry;
         });
         const jsonStories = result.stories ? result.stories.map((s) => {
@@ -867,7 +880,8 @@ export async function handleWorkflow(
           };
           if (s.resumeResetCount > 0) entry.priorFailureCount = s.resumeResetCount;
           if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
-          if (s.updatedAt !== undefined) entry.updatedAt = s.updatedAt;
+          const updatedAt = formatInstant(s.updatedAt, { style: "iso" });
+          if (updatedAt !== undefined) entry.updatedAt = updatedAt;
           return entry;
         }) : undefined;
         const jsonOutput: Record<string, unknown> = {
@@ -878,10 +892,14 @@ export async function handleWorkflow(
           harnessType: result.harnessType,
           task: result.task.slice(0, 200),
           tokensSpent: result.tokensSpent,
-          createdAt: result.createdAt,
-          updatedAt: result.updatedAt,
-          steps: jsonSteps,
         };
+        // TIME-OUTPUT US-005: run-level instants are ISO-8601 UTC with Z
+        // (legacy naive normalized); a missing/unparseable value is omitted.
+        const createdAt = formatInstant(result.createdAt, { style: "iso" });
+        if (createdAt !== undefined) jsonOutput.createdAt = createdAt;
+        const updatedAt = formatInstant(result.updatedAt, { style: "iso" });
+        if (updatedAt !== undefined) jsonOutput.updatedAt = updatedAt;
+        jsonOutput.steps = jsonSteps;
         // PAUS US-004: surface the daemon-side scheduling state (e.g.
         // draining_pause) machine-readably when it is set.
         if (result.schedulingStatus) jsonOutput.schedulingStatus = result.schedulingStatus;
@@ -890,7 +908,18 @@ export async function handleWorkflow(
         // dead without reconstructing it.
         if (result.schedulingError) jsonOutput.schedulingError = result.schedulingError;
         if (jsonStories) jsonOutput.stories = jsonStories;
-        if (result.redLedgerLanding) jsonOutput.redLedgerLanding = result.redLedgerLanding;
+        if (result.redLedgerLanding) {
+          // TIME-OUTPUT US-005: the landing instant serializes as ISO-Z; when it
+          // is missing/unparseable only that field is omitted (the row id and
+          // exit code remain).
+          const landing: Record<string, unknown> = {
+            ledgerRowId: result.redLedgerLanding.ledgerRowId,
+            exitCode: result.redLedgerLanding.exitCode,
+          };
+          const ledgerCreatedAt = formatInstant(result.redLedgerLanding.ledgerCreatedAt, { style: "iso" });
+          if (ledgerCreatedAt !== undefined) landing.ledgerCreatedAt = ledgerCreatedAt;
+          jsonOutput.redLedgerLanding = landing;
+        }
         if (result.workspace_mode === "worktree") {
           jsonOutput.workspaceMode = result.workspace_mode;
           if (result.worktree_path) jsonOutput.worktreePath = result.worktree_path;
@@ -913,7 +942,10 @@ export async function handleWorkflow(
       }
       console.log(`Tokens: ${result.tokensSpent.toLocaleString()}`);
       if (result.redLedgerLanding) {
-        console.log(`Red-ledger landing: row ${result.redLedgerLanding.ledgerRowId}, exit ${result.redLedgerLanding.exitCode}, suite recorded ${result.redLedgerLanding.ledgerCreatedAt}`);
+        // TIME-OUTPUT US-005: the human red-ledger line renders an ISO-Z
+        // instant, never the raw stored value.
+        const ledgerCreatedAt = formatInstant(result.redLedgerLanding.ledgerCreatedAt, { style: "iso" }) ?? "?";
+        console.log(`Red-ledger landing: row ${result.redLedgerLanding.ledgerRowId}, exit ${result.redLedgerLanding.exitCode}, suite recorded ${ledgerCreatedAt}`);
       }
       if (result.ceilingExpiryCount > 0) console.log(`Rounds expired at ceiling: ${result.ceilingExpiryCount}`);
       if (result.workerLostCount > 0) console.log(`Worker lost: ${result.workerLostCount}`);

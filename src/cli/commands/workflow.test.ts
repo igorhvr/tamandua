@@ -977,4 +977,169 @@ Examples:
       assert.ok(!String(reset.status).includes("reset on resume"));
     });
   });
+
+  // ══════════════════════════════════════════════════════════════════
+  // TIME-OUTPUT US-005: workflow status serializes instants as ISO-Z
+  // ══════════════════════════════════════════════════════════════════
+  // Every instant that leaves `workflow status` (JSON and the human
+  // red-ledger line) must be ISO-8601 UTC with an explicit Z. Legacy naive
+  // stored values are normalized rather than passed through, and a
+  // missing/unparseable value is omitted instead of emitted raw.
+
+  describe("TIME-OUTPUT US-005: workflow status instants as ISO-Z (in-process with temp DB)", () => {
+    let tempDir: string;
+    let dbPath: string;
+    let db: DatabaseSync;
+    let originalDbPath: string | undefined;
+    let originalHome: string | undefined;
+    let originalStateDir: string | undefined;
+
+    const ISO_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+    const NAIVE = "2026-09-15 22:00:00";
+    const ISO = "2026-09-15T22:00:00.000Z";
+
+    beforeEach(() => {
+      originalDbPath = process.env.TAMANDUA_DB_PATH;
+      originalHome = process.env.HOME;
+      originalStateDir = process.env.TAMANDUA_STATE_DIR;
+
+      const setup = setupTempDb();
+      tempDir = setup.tempDir;
+      dbPath = setup.dbPath;
+      db = setup.db;
+
+      process.env.TAMANDUA_DB_PATH = dbPath;
+      process.env.HOME = tempDir;
+      process.env.TAMANDUA_STATE_DIR = join(tempDir, ".tamandua");
+    });
+
+    afterEach(() => {
+      if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+      else delete process.env.TAMANDUA_DB_PATH;
+      if (originalHome) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+      else delete process.env.TAMANDUA_STATE_DIR;
+
+      db.close();
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    function seedRun(runId: string, createdAt: string, updatedAt: string): void {
+      db.prepare(
+        `INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, run_number, created_at, updated_at)
+         VALUES (?, 'feature-dev-merge', 'task', 'completed', '{}', 0, 1, ?, ?)`,
+      ).run(runId, createdAt, updatedAt);
+    }
+
+    function seedStep(runId: string, claimUpdatedAt: string, updatedAt: string): void {
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status, claim_updated_at, updated_at)
+         VALUES (?, ?, 'dev', 'test_developer', 0, 'running', ?, ?)`,
+      ).run(crypto.randomUUID(), runId, claimUpdatedAt, updatedAt);
+    }
+
+    function seedStory(runId: string, updatedAt: string): void {
+      db.prepare(
+        `INSERT INTO stories (id, run_id, story_index, story_id, title, status, updated_at)
+         VALUES (?, ?, 0, 'US-001', 'Story', 'running', ?)`,
+      ).run(crypto.randomUUID(), runId, updatedAt);
+    }
+
+    function seedRedLedger(runId: string, ledgerCreatedAt: string): void {
+      const eventsDir = join(tempDir, ".tamandua", "events");
+      mkdirSync(eventsDir, { recursive: true });
+      writeFileSync(
+        join(eventsDir, `${runId}.jsonl`),
+        JSON.stringify({
+          ts: "2026-09-15T22:00:01.000Z",
+          event: "merge.landed_over_red_suite",
+          runId,
+          ledgerRowId: 42,
+          exitCode: 7,
+          ledgerCreatedAt,
+        }) + "\n",
+      );
+    }
+
+    async function captureStatusOutput(runId: string, extraArgs: string[] = []): Promise<string> {
+      let output = "";
+      const origLog = console.log;
+      console.log = (...chunks: unknown[]) => {
+        output += chunks.map((c) => String(c)).join(" ") + "\n";
+      };
+      try {
+        await handleWorkflow("workflow", ["workflow", "status", runId, ...extraArgs], () => {});
+      } finally {
+        console.log = origLog;
+      }
+      return output;
+    }
+
+    it("--json normalizes legacy naive run/step/story/red-ledger instants to ISO-Z", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, NAIVE, NAIVE);
+      seedStep(runId, NAIVE, NAIVE);
+      seedStory(runId, NAIVE);
+      seedRedLedger(runId, NAIVE);
+
+      const output = await captureStatusOutput(runId, ["--json"]);
+      const parsed = JSON.parse(output.trim());
+
+      // Run-level
+      assert.equal(parsed.createdAt, ISO);
+      assert.equal(parsed.updatedAt, ISO);
+      assert.match(parsed.createdAt, ISO_Z);
+      assert.match(parsed.updatedAt, ISO_Z);
+
+      // Step-level
+      assert.equal(parsed.steps[0].claimUpdatedAt, ISO);
+      assert.equal(parsed.steps[0].updatedAt, ISO);
+      assert.match(parsed.steps[0].claimUpdatedAt, ISO_Z);
+      assert.match(parsed.steps[0].updatedAt, ISO_Z);
+
+      // Story-level
+      assert.equal(parsed.stories[0].updatedAt, ISO);
+      assert.match(parsed.stories[0].updatedAt, ISO_Z);
+
+      // Red-ledger landing
+      assert.equal(parsed.redLedgerLanding.ledgerCreatedAt, ISO);
+      assert.match(parsed.redLedgerLanding.ledgerCreatedAt, ISO_Z);
+      assert.equal(parsed.redLedgerLanding.ledgerRowId, 42);
+      assert.equal(parsed.redLedgerLanding.exitCode, 7);
+    });
+
+    it("human red-ledger line renders the ISO-Z instant", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, NAIVE, NAIVE);
+      seedRedLedger(runId, NAIVE);
+
+      const output = await captureStatusOutput(runId);
+      assert.match(output, /Red-ledger landing: row 42, exit 7, suite recorded 2026-09-15T22:00:00\.000Z/);
+      assert.doesNotMatch(output, /suite recorded 2026-09-15 22:00:00/);
+    });
+
+    it("omits missing/unparseable instants instead of emitting them raw", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "", "not-an-instant");
+      seedStep(runId, "not-an-instant", "");
+      seedStory(runId, "");
+      seedRedLedger(runId, "not-an-instant");
+
+      const output = await captureStatusOutput(runId, ["--json"]);
+      const parsed = JSON.parse(output.trim());
+
+      assert.equal("createdAt" in parsed, false, "unparseable createdAt must be omitted");
+      assert.equal("updatedAt" in parsed, false, "unparseable updatedAt must be omitted");
+      assert.equal("claimUpdatedAt" in parsed.steps[0], false, "unparseable claimUpdatedAt must be omitted");
+      assert.equal("updatedAt" in parsed.steps[0], false, "unparseable step updatedAt must be omitted");
+      assert.equal("updatedAt" in parsed.stories[0], false, "unparseable story updatedAt must be omitted");
+      // The landing object keeps its non-instant evidence; only the bad instant is dropped.
+      assert.equal(parsed.redLedgerLanding.ledgerRowId, 42);
+      assert.equal(parsed.redLedgerLanding.exitCode, 7);
+      assert.equal("ledgerCreatedAt" in parsed.redLedgerLanding, false);
+      // Never a raw/naive or fabricated value anywhere in the serialized JSON.
+      assert.doesNotMatch(output, /not-an-instant/);
+    });
+  });
 });

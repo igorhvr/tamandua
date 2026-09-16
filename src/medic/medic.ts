@@ -5,7 +5,7 @@
  * and takes corrective action where safe. Logs all findings to the medic_checks table.
  */
 import { getDb } from "../db.js";
-import { SQL_NOW_ISO } from "../lib/instant.js";
+import { SQL_NOW_ISO, nowIso } from "../lib/instant.js";
 import { emitEvent } from "../installer/events.js";
 import { teardownWorkflowCronsIfIdle } from "../installer/agent-scheduler.js";
 import crypto from "node:crypto";
@@ -175,7 +175,7 @@ export async function runMedicCheck(): Promise<MedicCheckResult> {
 
   // Log to DB
   const checkId = crypto.randomUUID();
-  const checkedAt = new Date().toISOString();
+  const checkedAt = nowIso();
   const db = getDb();
   db.prepare(
     "INSERT INTO medic_checks (id, checked_at, issues_found, actions_taken, summary, details) VALUES (?, ?, ?, ?, ?, ?)"

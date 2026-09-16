@@ -1,12 +1,17 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import {
+  formatLogsTailBody,
   formatLogsTailLabel,
   formatLogsTailLine,
   formatLogsTailLines,
+  formatLogsTailTime,
 } from "../../dist/installer/logs-tail-format.js";
 import type { TamanduaEvent } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
+
+/** The explicit UTC date+time+Z token every logs-tail line must lead with. */
+const LOG_TIME_TOKEN_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z$/;
 
 function makeEvent(event: string, overrides: Partial<TamanduaEvent> = {}): TamanduaEvent {
   return {
@@ -96,7 +101,115 @@ describe("formatLogsTailLabel", () => {
   });
 });
 
+describe("formatLogsTailTime (TIME-OUTPUT US-003)", () => {
+  it("renders a canonical ISO-Z instant as an explicit UTC date+time+Z token", () => {
+    assert.equal(formatLogsTailTime("2026-09-15T22:00:00.000Z"), "2026-09-15 22:00:00Z");
+    assert.match(formatLogsTailTime("2026-09-15T22:00:00.000Z"), LOG_TIME_TOKEN_RE);
+  });
+
+  it("normalizes a numeric offset to UTC with an explicit Z", () => {
+    assert.equal(formatLogsTailTime("2026-09-15T22:00:00+03:00"), "2026-09-15 19:00:00Z");
+  });
+
+  it("interprets a legacy naive timestamp as UTC, never host-local", () => {
+    assert.equal(formatLogsTailTime("2026-09-15 22:00:00"), "2026-09-15 22:00:00Z");
+  });
+
+  it("returns the stable '?' placeholder for missing/unparseable input without throwing", () => {
+    for (const bad of ["", "   ", "not-a-date", "2026-09-15", null, undefined]) {
+      assert.equal(formatLogsTailTime(bad as string | null | undefined), "?", `expected '?' for ${JSON.stringify(bad)}`);
+    }
+  });
+
+  it("never emits an AM/PM time-of-day marker", () => {
+    const token = formatLogsTailTime("2026-09-15T22:00:00.000Z");
+    assert.ok(!/AM|PM/i.test(token), `time token must be 24-hour UTC, got: ${token}`);
+  });
+});
+
+describe("formatLogsTailBody (TIME-OUTPUT US-006)", () => {
+  it("emits the run/agent/label/story/detail/token body with no leading time token", () => {
+    const evt = makeEvent("step.done", {
+      ts: "2026-09-15T22:00:00.000Z",
+      runId: "abcd1234",
+      agentId: "feature-dev-merge-worktree_developer",
+      storyTitle: "US-006 story",
+      detail: "did work",
+    });
+    const body = formatLogsTailBody(evt);
+    assert.ok(!/^\d{4}-\d{2}-\d{2}/.test(body), `body must not lead with a date: ${body}`);
+    assert.equal(body, "  [run-abcd1234]  developer  Step completed — US-006 story (did work)");
+  });
+
+  it("carries the token-spend annotation without a time prefix", () => {
+    const evt = makeEvent("run.tokens.final", {
+      ts: "2026-09-15T22:00:00.000Z",
+      runId: "abcd1234",
+      tokenDelta: 137,
+      tokensSpent: 137,
+    });
+    const body = formatLogsTailBody(evt);
+    assert.ok(!/^\d{4}-\d{2}-\d{2}/.test(body), `body must not lead with a date: ${body}`);
+    assert.match(body, /Token spend finalized/);
+    assert.match(body, /\[tokens: Δ \+137, total 137\]/);
+  });
+
+  it("composes formatLogsTailLine as the UTC time token plus the body", () => {
+    const evt = makeEvent("run.started", { ts: "2026-09-15T22:00:00.000Z", runId: "abcd1234" });
+    assert.equal(formatLogsTailLine(evt), `${formatLogsTailTime(evt.ts)}${formatLogsTailBody(evt)}`);
+    assert.ok(formatLogsTailLine(evt).startsWith("2026-09-15 22:00:00Z"));
+  });
+
+  it("does not mutate evt.ts", () => {
+    const evt = makeEvent("run.started", { ts: "2026-09-15T22:00:00.000Z" });
+    const before = JSON.stringify(evt);
+    formatLogsTailBody(evt);
+    assert.equal(JSON.stringify(evt), before, "formatLogsTailBody must not mutate the event");
+  });
+});
+
 describe("formatLogsTailLine", () => {
+  it("leads with the explicit UTC date+time+Z token (TIME-OUTPUT US-003)", () => {
+    const evt = makeEvent("step.done", {
+      ts: "2026-09-15T22:00:00.000Z",
+      runId: "abcd1234",
+      agentId: "feature-dev-merge-worktree_developer",
+    });
+    const line = formatLogsTailLine(evt);
+    assert.ok(line.startsWith("2026-09-15 22:00:00Z"), `Expected date+Z prefix in: ${line}`);
+    assert.match(line.split("  ")[0], LOG_TIME_TOKEN_RE);
+    // Shape preserved: label, run prefix, agent token.
+    assert.ok(line.includes("  [run-abcd1234]"), `Expected run prefix in: ${line}`);
+    assert.ok(line.includes("developer"), `Expected agent label in: ${line}`);
+    assert.ok(line.includes("Step completed"), `Expected label in: ${line}`);
+  });
+
+  it("renders a legacy naive evt.ts as UTC+Z, never host-local (TIME-OUTPUT US-003)", () => {
+    const evt = makeEvent("run.started", { ts: "2026-09-15 22:00:00" });
+    const line = formatLogsTailLine(evt);
+    assert.ok(line.startsWith("2026-09-15 22:00:00Z"), `Expected UTC+Z prefix in: ${line}`);
+  });
+
+  it("renders the stable '?' placeholder for an unparseable evt.ts", () => {
+    const evt = makeEvent("run.started", { ts: "not-a-date" });
+    const line = formatLogsTailLine(evt);
+    assert.ok(line.startsWith("?  [run-"), `Expected '?' placeholder prefix in: ${line}`);
+    assert.ok(line.includes("Run started"), `Expected label after placeholder in: ${line}`);
+  });
+
+  it("never emits an AM/PM time-of-day marker", () => {
+    const line = formatLogsTailLine(makeEvent("run.started", { ts: "2026-09-15T22:00:00.000Z" }));
+    assert.ok(!/AM|PM/i.test(line), `Expected no AM/PM marker in: ${line}`);
+  });
+
+  it("does not mutate evt.ts", () => {
+    const evt = makeEvent("run.started", { ts: "2026-09-15T22:00:00.000Z" });
+    const before = JSON.stringify(evt);
+    formatLogsTailLine(evt);
+    assert.equal(evt.ts, "2026-09-15T22:00:00.000Z");
+    assert.equal(JSON.stringify(evt), before, "formatLogsTailLine must not mutate the event");
+  });
+
   it("includes nudge event labels in formatted output", () => {
     const evt = makeEvent("run.nudged", {
       runId: "abcd1234",

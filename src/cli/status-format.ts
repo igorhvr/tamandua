@@ -9,7 +9,7 @@
 import { execSync } from "node:child_process";
 import { getDaemonStatus, getDashboardStatus, getMcpStatus, getControlPlaneStatus, getMcpStatusAsync, getControlPlaneStatusAsync, isRunning } from "../server/daemonctl.js";
 import { ABANDONED_THRESHOLD_MS } from "../installer/step-ops.js";
-import { parseInstant } from "../lib/instant.js";
+import { parseInstant, formatInstant } from "../lib/instant.js";
 import {
   acknowledgeDaemonDeath,
   getLastDaemonDeath,
@@ -360,7 +360,7 @@ export function formatRunsSummary(opts?: {
         displayStatus = `${r.status} (stale — daemon down?)`;
       }
       const redLedgerMarker = r.redLedgerLanding
-        ? `  RED LEDGER row ${r.redLedgerLanding.ledgerRowId}, exit ${r.redLedgerLanding.exitCode} @ ${r.redLedgerLanding.ledgerCreatedAt}`
+        ? `  RED LEDGER row ${r.redLedgerLanding.ledgerRowId}, exit ${r.redLedgerLanding.exitCode} @ ${formatInstant(r.redLedgerLanding.ledgerCreatedAt, { style: "iso" }) ?? "?"}`
         : "";
       // Instant-fail loop surfacing (DDTH): a run with K+ consecutive
       // instant-fail worker rounds is backing off toward force-fail

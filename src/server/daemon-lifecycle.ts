@@ -24,7 +24,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { assertStatePathIsolation } from "../lib/test-guard.js";
-import { parseInstant } from "../lib/instant.js";
+import { nowIso, parseInstant } from "../lib/instant.js";
 import { resolveStateDir } from "../lib/tamandua-config.js";
 import { recordLifecycleEvent } from "./daemonctl.js";
 
@@ -86,7 +86,7 @@ export function getHeartbeatPath(opts?: DaemonctlPathOptions): string {
 export function writeHeartbeatMarker(opts?: DaemonctlPathOptions): void {
   try {
     const file = getHeartbeatPath(opts);
-    const now = new Date().toISOString();
+    const now = nowIso();
     const marker: HeartbeatMarker = {
       pid: process.pid,
       startedAt: now,
@@ -134,7 +134,7 @@ export function touchHeartbeat(opts?: DaemonctlPathOptions): void {
   try {
     const existing = readHeartbeatMarker(opts);
     if (!existing) return;
-    existing.lastHeartbeatAt = new Date().toISOString();
+    existing.lastHeartbeatAt = nowIso();
     const file = getHeartbeatPath(opts);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(existing), "utf-8");

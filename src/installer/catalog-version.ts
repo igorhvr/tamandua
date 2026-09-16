@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveWorkflowRoot } from "./paths.js";
+import { nowIso } from "../lib/instant.js";
 import { getBuildVersion } from "../lib/version.js";
 
 /**
@@ -42,7 +43,7 @@ export function generateCatalogStamp(sourcePath: string): CatalogStamp {
   return {
     version: getBuildVersion(),
     sourcePath,
-    installedAt: new Date().toISOString(),
+    installedAt: nowIso(),
   };
 }
 

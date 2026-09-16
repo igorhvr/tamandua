@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { resolveTamanduaCli } from "../installer/paths.js";
+import { nowIso } from "../lib/instant.js";
 import {
   createAgentCronJob,
   removeAgentCrons,
@@ -86,7 +87,7 @@ export async function installMedicCron(): Promise<{ ok: boolean; error?: string 
 
   const config: MedicCronConfig = {
     installed: true,
-    installedAt: new Date().toISOString(),
+    installedAt: nowIso(),
     intervalMinutes: MEDIC_INTERVAL_MINUTES,
     agentId: MEDIC_AGENT_ID,
   };

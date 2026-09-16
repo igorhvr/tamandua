@@ -13,7 +13,7 @@
  *   GET /api/runs/:id/kanban     -> lane-grouped snapshot for the kanban view
  *   GET /api/events              -> recent events (global)
  *   DELETE /api/runs/:id         -> permanently delete a run and all associated data
- *   GET /api/logs-tail           -> logs-tail formatted event lines (cursor based)
+ *   GET /api/logs-tail           -> logs-tail items ({ts, body}) + cursor (ISO-Z ts)
  */
 import http from "node:http";
 import { assertPortIsolation } from "../lib/test-guard.js";
@@ -22,7 +22,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDb, getSystemTokenSpend, getAutoresearchSessions, getAutoresearchSessionById, upsertAutoresearchSession } from "../db.js";
 import { getRecentEvents, getRunEvents, readEventsFromCursor, countRunEvents, type EventCursorSource } from "../installer/events.js";
-import { formatLogsTailLines } from "../installer/logs-tail-format.js";
+import { formatLogsTailBody } from "../installer/logs-tail-format.js";
+import { formatInstant } from "../lib/instant.js";
 import { getMcpStatus } from "./daemonctl.js";
 import { getLastDaemonDeath, isUnseenDaemonDeath } from "./daemon-lifecycle.js";
 import { buildKanbanSnapshot, buildKanbanCardDetail } from "./kanban-data.js";
@@ -463,9 +464,16 @@ function handleLogsTail(req: http.IncomingMessage, res: http.ServerResponse): vo
       : { kind: "global" };
 
     const { events, nextOffset, generation: newGeneration } = readEventsFromCursor(source, offset, generation);
-    const lines = formatLogsTailLines(events);
+    // TIME-OUTPUT US-006: hand the browser the raw ISO-Z instant (normalized
+    // from any legacy naive stored value) and the time-less body, so the
+    // dashboard localizes for the viewer instead of relying on a
+    // server-rendered, host-local time string.
+    const items = events.map((evt) => ({
+      ts: formatInstant(evt.ts, { style: "iso" }) ?? "",
+      body: formatLogsTailBody(evt),
+    }));
 
-    jsonResponse(res, { lines, nextOffset, generation: newGeneration });
+    jsonResponse(res, { items, nextOffset, generation: newGeneration });
   } catch (err) {
     errorResponse(res, `Failed to get logs-tail events: ${(err as Error).message}`);
   }

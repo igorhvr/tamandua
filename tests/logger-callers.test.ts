@@ -74,5 +74,30 @@ describe("US-002: Logger caller integration", () => {
     assert.ok(formatted.includes("[INFO]"));
     assert.ok(formatted.includes("[12345678]"));
     assert.ok(formatted.includes("test message"));
+    assert.ok(
+      formatted.startsWith("[2026-01-01 00:00:00Z]"),
+      `formatEntry must emit a date + Z prefix, got: ${formatted}`,
+    );
+  });
+
+  it("formatEntry normalizes a legacy naive timestamp to UTC+Z", () => {
+    const formatted = formatEntry({
+      timestamp: "2026-01-01 00:00:00",
+      level: "warn",
+      message: "legacy",
+    });
+    assert.ok(
+      formatted.startsWith("[2026-01-01 00:00:00Z]"),
+      `legacy naive timestamp must render as UTC+Z, got: ${formatted}`,
+    );
+  });
+
+  it("written log lines carry a date + Z and no host-local AM/PM marker", async () => {
+    logger.info("logger-callers utc-shape probe");
+    const lines = await readRecentLogs(10);
+    const line = lines.find((l) => l.includes("logger-callers utc-shape probe"));
+    assert.ok(line, "probe line should be present");
+    assert.match(line!, /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z\] INFO  /);
+    assert.doesNotMatch(line!, /\b(AM|PM)\b/);
   });
 });

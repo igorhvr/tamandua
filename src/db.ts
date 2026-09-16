@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { assertStatePathIsolation } from "./lib/test-guard.js";
+import { nowIso } from "./lib/instant.js";
 import { LEDGER_RETENTION_MS } from "./suite/config.js";
 
 // Any change to migrate() MUST bump SCHEMA_VERSION. Missing a bump causes broken DBs.
@@ -760,7 +761,7 @@ export function upsertAutoresearchSession(cwd: string): AutoresearchSessionRow |
   const id = resolvedCwd;
 
   const { config, missing } = readSessionConfigFromFiles(resolvedCwd);
-  const now = new Date().toISOString();
+  const now = nowIso();
 
   let filesMissing = missing ? 1 : 0;
   if (!filesMissing) {

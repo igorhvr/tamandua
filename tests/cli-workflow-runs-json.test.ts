@@ -199,6 +199,33 @@ describe("tamandua workflow runs --json", () => {
     }
   });
 
+  // AC 1 (TIME-OUTPUT US-005): a legacy naive DB value is emitted as ISO-Z,
+  // never passed through raw.
+  it("--json normalizes a legacy naive stored instant to ISO-8601 UTC with Z", async () => {
+    const { homeDir, tamanduaDir } = createTempHome("tamandua-runs-naive-");
+    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    const db = getDb();
+    seedDb(dbPath, db);
+    // Simulate a row written by the old datetime('now') writer: naive UTC, no Z.
+    db.prepare(
+      "UPDATE runs SET created_at = '2026-09-15 22:00:00', updated_at = '2026-09-15 22:00:00'",
+    ).run();
+
+    const { stdout, stderr } = await runCli(["workflow", "runs", "--json"], homeDir, tamanduaDir, dbPath);
+    assert.equal(cleanStderr(stderr), "", `unexpected stderr: ${cleanStderr(stderr)}`);
+
+    const parsed = JSON.parse(stdout);
+    assert.equal(parsed.runs.length, 3);
+    for (const run of parsed.runs) {
+      assert.match(run.createdAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `createdAt ISO-Z: ${run.createdAt}`);
+      assert.match(run.updatedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `updatedAt ISO-Z: ${run.updatedAt}`);
+      assert.equal(run.createdAt, "2026-09-15T22:00:00.000Z");
+      assert.equal(run.updatedAt, "2026-09-15T22:00:00.000Z");
+    }
+    assert.doesNotMatch(stdout, /2026-09-15 22:00:00/);
+  });
+
   // AC 3: Without --json, output matches human-readable format
   it("without --json outputs human-readable format (snapshot)", async () => {
     const { homeDir, tamanduaDir } = createTempHome("tamandua-runs-nonjson-");

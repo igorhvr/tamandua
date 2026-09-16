@@ -21,7 +21,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { TamanduaEvent } from "../installer/events.js";
 import { displayStepStatus } from "../lib/step-display.js";
-import { parseInstant } from "../lib/instant.js";
+import { nowIso, parseInstant } from "../lib/instant.js";
 
 export type VisualStatus = "todo" | "running" | "done" | "failed" | "verifying";
 
@@ -496,6 +496,6 @@ export function buildKanbanSnapshot(
     },
     lanes,
     currentStoryId,
-    generatedAt: new Date().toISOString(),
+    generatedAt: nowIso(),
   };
 }

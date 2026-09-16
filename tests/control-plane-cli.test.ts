@@ -101,6 +101,13 @@ function runCli(args: string[], homeDir: string): Promise<CliResult> {
 /**
  * Filter harmless node warnings from stderr (e.g. SQLite experimental warning)
  * so they don't pollute test assertions.
+ *
+ * The daemon started by `control-plane start` runs a fire-and-forget version
+ * check against the checkout's `origin/main`. When the ambient checkout is
+ * behind origin/main (a normal state for a feature worktree), the check writes
+ * `updateAvailable: true` into the isolated state dir, so the follow-up CLI
+ * command legitimately prints the benign "new version available" notice. That
+ * notice is unrelated to the command under test, so it is filtered here.
  */
 function cleanStderr(stderr: string): string {
   return stderr

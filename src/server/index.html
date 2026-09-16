@@ -679,7 +679,7 @@
       try {
         const res = await fetch(`/api/logs-tail?offset=${logsTailOffset}&generation=${logsTailGeneration}`);
         const data = await res.json();
-        appendLogsTailLines(data.lines || []);
+        appendLogsTailLines(data.items || []);
         if (Number.isFinite(data.nextOffset)) {
           logsTailOffset = data.nextOffset;
         }
@@ -958,12 +958,19 @@
       </svg>`;
     }
 
-    function appendLogsTailLines(lines) {
-      if (!lines.length) return;
+    function appendLogsTailLines(items) {
+      if (!items.length) return;
       const output = document.getElementById("logs-tail-output");
       if (!output) return;
 
-      const chunk = lines.join("\n");
+      const chunk = items.map((item) => {
+        // TIME-OUTPUT US-006: the server hands us a raw ISO-Z instant plus the
+        // time-less body. Localize the instant here (viewer-local), never rely
+        // on a server-rendered host-local string.
+        const instant = parseStoredInstant(item.ts);
+        const time = instant ? instant.toLocaleTimeString() : "?";
+        return `${time}${item.body || ""}`;
+      }).join("\n");
       output.value = output.value ? `${output.value}\n${chunk}` : chunk;
       output.scrollTop = output.scrollHeight;
     }

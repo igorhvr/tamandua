@@ -173,6 +173,7 @@ tests/step-respawned.test.ts
 tests/stories-json-validation.test.ts
 tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
+tests/time-output-tz.test.ts
 tests/token-log-formatting.test.ts
 tests/token-usage-policy.test.ts
 tests/update-command.test.ts

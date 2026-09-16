@@ -10,6 +10,9 @@
  *   - `SQL_NOW_ISO` for instants produced inside SQL statements (replacing
  *     the old naive `datetime('now')`, which wrote `YYYY-MM-DD HH:MM:SS`
  *     with no `Z` and no milliseconds).
+ *   - `formatInstant()` for instants SERIALIZED out of the process (log
+ *     lines, events, reports, CLI/human output), always ISO-8601 UTC with an
+ *     explicit `Z` so any consumer can relocalize.
  *
  * Readers must use the shared `parseInstant()` (added with the reader half of
  * the contract) so legacy naive values are interpreted as UTC — never as
@@ -92,4 +95,55 @@ export function parseInstant(value: unknown): Date | undefined {
   }
 
   return undefined;
+}
+
+/** Output style for {@link formatInstant}. */
+export type InstantStyle = "iso" | "log";
+
+/**
+ * The ONE serializer for instants that leave the process (log prefixes,
+ * `tamandua logs`/`logs-tail`, workflow status/wait/run output, event/report
+ * and contract writers). Always emits ISO-8601 UTC with an explicit `Z`, so a
+ * serialized instant is unambiguous and can be relocalized by any consumer.
+ *
+ * Accepted input:
+ *   - a `Date` is used directly (an Invalid Date is rejected);
+ *   - a string is routed through {@link parseInstant}, so canonical ISO-Z,
+ *     real numeric offsets, and legacy naive UTC (pinned to UTC) all work.
+ *
+ * Everything else — missing/empty, unparseable strings, `null`, `undefined`,
+ * booleans, numbers — yields `undefined`, never `NaN`, an Invalid Date, or a
+ * fabricated "now". Callers that need a fallback must handle `undefined`
+ * explicitly.
+ *
+ * Styles:
+ *   - `"iso"` (default): `YYYY-MM-DDTHH:MM:SS.sssZ` (the Date#toISOString
+ *     shape), for JSON and machine consumers.
+ *   - `"log"`: `YYYY-MM-DD HH:MM:SSZ` (space separator, seconds precision,
+ *     explicit `Z`), the compact shape for human log lines.
+ */
+export function formatInstant(
+  value: Date | string | null | undefined,
+  opts?: { style?: InstantStyle },
+): string | undefined {
+  const date = toValidInstant(value);
+  if (date === undefined) return undefined;
+
+  if (opts?.style === "log") {
+    const iso = date.toISOString();
+    return `${iso.slice(0, 10)} ${iso.slice(11, 19)}Z`;
+  }
+  return date.toISOString();
+}
+
+/**
+ * Coerce an already-acquired value into a valid `Date`, or `undefined`.
+ * `parseInstant` deliberately rejects `Date`, so `Date` inputs (the live
+ * `nowIso()` case) are handled here before delegating.
+ */
+function toValidInstant(value: unknown): Date | undefined {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? undefined : value;
+  }
+  return parseInstant(value);
 }

@@ -2873,6 +2873,68 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     assert.equal(evt.exitCode, 0);
   });
 
+  it("POST /suite/event normalizes a legacy naive started_at to ISO-Z (US-007)", async () => {
+    const runId = "evt-started-at-run";
+    const r = await suiteRequest("POST", "/suite/event", {
+      event: "suite.executed",
+      run_id: runId,
+      tree_hash: "started-at-hash",
+      cmd_display: "npm test",
+      duration_ms: 1000,
+      exit_code: 0,
+      started_at: "2026-09-15 22:00:00",
+    });
+    assert.equal(r.status, 200);
+
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    const evt = JSON.parse(fs.readFileSync(runEventsPath, "utf-8").trim());
+    assert.equal(evt.startedAt, "2026-09-15T22:00:00.000Z");
+    assert.match(evt.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  });
+
+  it("POST /suite/event omits an unparseable started_at (US-007)", async () => {
+    const runId = "evt-started-at-bad-run";
+    const r = await suiteRequest("POST", "/suite/event", {
+      event: "suite.executed",
+      run_id: runId,
+      tree_hash: "started-at-bad-hash",
+      cmd_display: "npm test",
+      duration_ms: 1000,
+      exit_code: 0,
+      started_at: "not-a-date",
+    });
+    assert.equal(r.status, 200);
+
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    const evt = JSON.parse(fs.readFileSync(runEventsPath, "utf-8").trim());
+    assert.ok(!("startedAt" in evt), "unparseable started_at must be omitted, not serialized raw");
+  });
+
+  it("POST /suite/record normalizes a legacy naive started_at before emission (US-007)", async () => {
+    const runId = "record-started-at-run";
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/record-started-at",
+      tree_hash: "record-started-at-tree",
+      cmd_hash: "record-started-at-cmd",
+      cmd_display: "npm test",
+      exit_code: 0,
+      duration_ms: 1000,
+      run_id: runId,
+      started_at: "2026-09-15 22:00:00",
+    });
+    assert.equal(r.status, 200);
+
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    const events = fs
+      .readFileSync(runEventsPath, "utf-8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { event: string; startedAt?: string });
+    const executed = events.find((e) => e.event === "suite.executed");
+    assert.ok(executed, "suite.executed event should be emitted");
+    assert.equal(executed!.startedAt, "2026-09-15T22:00:00.000Z");
+  });
+
   it("POST /suite/event emits suite.flaky_detected event", async () => {
     const runId = "evt-flaky-run";
     const r = await suiteRequest("POST", "/suite/event", {

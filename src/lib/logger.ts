@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { assertStatePathIsolation } from "./test-guard.js";
+import { formatInstant } from "./instant.js";
 
 const MAX_LOG_SIZE = 5 * 1024 * 1024; // 5MB
 const MAX_ROTATED_FILES = 5;
@@ -49,8 +50,13 @@ function debugLoggingEnabled(): boolean {
   return v !== undefined && v !== "" && v !== "0" && v !== "false";
 }
 
+/**
+ * Log-line timestamp in the canonical compact UTC shape
+ * (`YYYY-MM-DD HH:MM:SSZ`, explicit `Z`) via the shared serializer. A freshly
+ * created `Date` is always valid, so the fallback is unreachable.
+ */
 function formatTimestamp(): string {
-  return new Date().toISOString().replace("T", " ").slice(0, 19);
+  return formatInstant(new Date(), { style: "log" }) ?? "";
 }
 
 let isolationViolationReported = false;
@@ -114,7 +120,11 @@ export function formatEntry(entry: {
   runId?: string;
 }): string {
   const runPart = entry.runId ? `[${entry.runId.slice(0, 8)}] ` : "";
-  return `[${entry.timestamp.replace("T", " ").slice(0, 19)}] [${entry.level.toUpperCase()}] ${runPart}${entry.message}`;
+  // Normalize through the shared serializers: canonical ISO-Z and legacy naive
+  // values both render as UTC+Z, and an unparseable timestamp degrades to a
+  // stable placeholder instead of throwing.
+  const ts = formatInstant(entry.timestamp, { style: "log" }) ?? "?";
+  return `[${ts}] [${entry.level.toUpperCase()}] ${runPart}${entry.message}`;
 }
 
 export async function readRecentLogs(lines = 50): Promise<string[]> {

@@ -379,6 +379,39 @@ describe("wait command", () => {
     }
   });
 
+  // ── Unit: TIME-OUTPUT US-005 serialized instants ───────────────────
+
+  it("formatJsonOutput/formatHumanOutput serialize no raw stored instant", async () => {
+    const { formatJsonOutput, formatHumanOutput } = await import("../../../dist/cli/commands/wait.js");
+    const naive = "2026-09-15 22:00:00";
+    const runs = [{
+      runId: "aaa-bbb-ccc",
+      runNumber: 1,
+      workflowId: "test-wf",
+      status: "running",
+      tokensSpent: 0,
+      createdAt: naive,
+      updatedAt: naive,
+      steps: { done: 0, failed: 0, pending: 1, running: 0, waiting: 0, canceled: 0 },
+    }];
+
+    // wait derives durations via parseInstant; it never serializes the stored
+    // createdAt/updatedAt, so no raw or naive instant can leak.
+    const parsed = JSON.parse(formatJsonOutput({ runs, timedOut: false }));
+    const jsonRun = parsed.runs[0];
+    assert.equal("createdAt" in jsonRun, false, "wait JSON must not carry createdAt");
+    assert.equal("updatedAt" in jsonRun, false, "wait JSON must not carry updatedAt");
+    assert.equal(typeof jsonRun.durationMs, "number", "durationMs stays a number");
+
+    const human = formatHumanOutput({ runs, timedOut: false });
+    assert.doesNotMatch(human, /2026-09-15 22:00:00/, `human output must not carry the naive instant: ${human}`);
+    // The only time token is the human-sized duration ('XmXXs'); any
+    // date-shaped token that appears must be canonical ISO-Z.
+    for (const token of human.split(/\s+/).filter((t) => /^\d{4}-\d{2}-\d{2}/.test(t))) {
+      assert.match(token, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    }
+  });
+
   // ── Unit: formatElapsed ────────────────────────────────────────────
   it("formatElapsed formats seconds only", async () => {
     const { formatElapsed } = await import("../../../dist/cli/commands/wait.js");

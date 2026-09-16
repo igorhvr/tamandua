@@ -39,6 +39,22 @@ describe("logger", () => {
     const line = lines.find((l: string) => l.includes("warning test"));
     assert.ok(line, "should find the warning line");
     assert.ok(line!.includes("WARN"), "should contain WARN level");
+    // Explicit UTC Z, date + time, no host-local time-of-day.
+    assert.match(line!, /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z\] WARN /);
+  });
+
+  it("every written line carries a date + Z and no host-local AM/PM marker", async () => {
+    logger.info("utc-shape probe info");
+    logger.error("utc-shape probe error");
+    const content = fs.readFileSync(logPath, "utf-8");
+    const lines = content.split("\n").filter((l) => l.includes("utc-shape probe"));
+    assert.equal(lines.length, 2, "both probe lines should be written");
+    for (const line of lines) {
+      assert.match(line, /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z\] (INFO |ERROR) /);
+      assert.doesNotMatch(line, /\b(AM|PM)\b/);
+      // A bare time-only token (no date, no zone) must never appear.
+      assert.doesNotMatch(line, /^\[\d{1,2}:\d{2}:\d{2}/);
+    }
   });
 
   it("readRecentLogs returns limited lines", async () => {
@@ -109,9 +125,46 @@ describe("logger", () => {
     assert.ok(result.includes("test message"));
     assert.ok(result.includes("abcdef12"));
     assert.ok(result.includes("INFO"));
+    assert.equal(result, "[2024-01-15 10:30:00Z] [INFO] [abcdef12] test message");
   });
 
-  it("formatEntry formats a log entry without runId", () => {
+  it("formatEntry formats a canonical ISO-Z timestamp as UTC+Z", () => {
+    const result = formatEntry({
+      timestamp: "2026-09-15T22:00:00.000Z",
+      level: "INFO",
+      message: "m",
+    });
+    assert.ok(
+      result.startsWith("[2026-09-15 22:00:00Z]"),
+      `expected date+Z prefix, got: ${result}`,
+    );
+  });
+
+  it("formatEntry normalizes a legacy naive timestamp to UTC+Z", () => {
+    const result = formatEntry({
+      timestamp: "2026-09-15 22:00:00",
+      level: "WARN",
+      message: "m",
+    });
+    assert.ok(
+      result.startsWith("[2026-09-15 22:00:00Z]"),
+      `legacy naive timestamp must render as UTC+Z, got: ${result}`,
+    );
+  });
+
+  it("formatEntry renders an unparseable timestamp as '?' without throwing", () => {
+    let result = "";
+    assert.doesNotThrow(() => {
+      result = formatEntry({
+        timestamp: "not-an-instant",
+        level: "ERROR",
+        message: "m",
+      });
+    });
+    assert.ok(result.startsWith("[?] [ERROR]"), `got: ${result}`);
+  });
+
+  it("formatEntry output contains no host-local AM/PM marker", () => {
     const result = formatEntry({
       timestamp: "2024-01-15T10:30:00Z",
       level: "WARN",
@@ -119,6 +172,8 @@ describe("logger", () => {
     });
     assert.ok(result.includes("no run"));
     assert.ok(result.includes("WARN"));
+    assert.doesNotMatch(result, /\b(AM|PM)\b/);
+    assert.match(result, /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z\] \[WARN\] /);
   });
 
   it("log function writes to log file", () => {
