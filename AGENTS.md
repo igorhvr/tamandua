@@ -311,6 +311,45 @@ waiting → pending → running → done/failed
   Use `tamandua workflow resume <run-id>` to reattempt a permanently
   failed run; fix the underlying issue before resuming.
 
+### Bounded process introspection (`lsof`)
+
+`lsof` walks kernel process/file tables and can block **forever** inside the
+kernel on a host with a stale FUSE or network mount (a 2026 incident left 24
+`lsof` processes wedged for five days). Every `lsof` invocation must be
+bounded:
+
+- Product code goes through `src/lib/lsof-probe.ts` `runLsof(args)`: it always
+  prepends `-b` (no blocking kernel calls) and `-w` (suppress warnings) and
+  runs under a hard `spawnSync(..., { timeout, killSignal: "SIGKILL" })`
+  (default 5 s, `TAMANDUA_LSOF_TIMEOUT_MS`). A timed-out probe returns
+  `kind: "timeout"` — never an empty `ok` — and callers must treat anything
+  but `ok` as unknown and **fail closed** (e.g. `processHasOpenFileUnder`
+  returns `"unknown"`, `daemonctl` refuses to signal).
+- Any remaining direct Node call site (test helpers, the torture-test Node
+  tools) must pass `-b -w`, a finite `timeout` and `killSignal: "SIGKILL"`.
+  `tests/lsof-bounded-lint.test.ts` scans `src/`, `tests/` and
+  `torture-test/bin` and fails otherwise.
+- POSIX shell call sites (torture `bin/daemon-control`, `tt-recorder`) use a
+  portable background+poll+`kill -KILL`+`wait` wrapper (macOS has no GNU
+  `timeout`), never a bare `lsof`. `bin/daemon-control` defines
+  `lsof_bounded` (bound `TT_LSOF_TIMEOUT_S`, default 5, integer-validated):
+  it backgrounds `lsof -b -w <args>` with stdout in a temp file, SIGKILLs
+  and `wait`s on expiry, and returns NO evidence (fail-closed) on
+  timeout/unavailable so a wedged probe can never be read as "no open
+  file"/"no listener". All three of its lsof sites (the Darwin cwd
+  ownership evidence and both port-listener pid extractions) go through it;
+  `tt-recorder` carries the same pattern for its `-iTCP -sTCP:LISTEN` arm.
+- Structural self-test gotcha (`torture-test/bin/daemon-control.test.sh`):
+  its `cmd_start`/`cmd_stop` assertions are written as
+  `grep -A 300 '^cmd_stop()' "$TOOL" | grep -q PATTERN`. Under
+  `set -o pipefail`, once the extracted body window exceeds macOS's 16 KiB
+  pipe buffer and the downstream `grep -q` exits on its first match, the
+  upstream grep is killed by SIGPIPE (rc=141) and every such assertion
+  flips to failure even though the pattern matched. Keep new comment/body
+  bytes out of the first 301 lines of `cmd_stop` (put the rationale in the
+  doc block BEFORE the function) and prefer a capture-then-grep helper for
+  new assertions on bodies larger than the pipe buffer.
+
 ### Merge-branch run identity (TATR)
 
 `tamandua merge-branch` (src/cli/commands/merge-branch.ts →
@@ -334,6 +373,65 @@ id resolved as `params.runId ?? process.env.TAMANDUA_RUN_ID ?? ''`:
   contention-marker advance simulating an external actor) are
   run-attributed and appear in `events/<runId>.jsonl` — index-based
   merge-event assertions must account for them.
+
+### Event log atomic appends (EVTA)
+
+Every event is written by `appendEventLine(filePath, line)` in
+`src/installer/events.ts`: the line is serialized to ONE Buffer ending in
+`'\n'` and appended with ONE `fs.writeSync` on an `O_APPEND` descriptor
+(`fs.openSync(filePath, "a")`); only a short write retries the remainder
+(each retry still appends at EOF). Never append an event with
+`fs.appendFileSync` — a multi-write append can be interleaved by another
+writer, which is exactly how the vaivm `step.worker_lost` line ended up
+truncated at column 1333 with the next event concatenated onto it (beads
+`tamandua-6sy.64`).
+
+Writer contract:
+
+- **Run-scoped files (`events/<runId>.jsonl`) have exactly ONE writer
+  process** — the process that owns the run. They need no cross-process lock;
+  only the in-process per-file queue (below) serializes reentrant appends.
+- **`events/all.jsonl` is shared by every event-emitting process** and is
+  therefore guarded by a per-file advisory lock: exclusive-create
+  `all.jsonl.lock` (`fs.openSync(lockPath, "wx")`) with bounded retry
+  (`TAMANDUA_EVENT_LOCK_TIMEOUT_MS`, default 5000, clamped 1..60000) and
+  stale-lock takeover after `EVENT_LOCK_STALE_MS` (30 s, mtime-based). The
+  lock covers the append AND the rotation check and is released in `finally`.
+  If the lock cannot be acquired the global append is SKIPPED (the run-scoped
+  line is still durable) and a warning is logged — fail-closed for
+  integrity. The lock file is intentionally empty; existence + mtime are the
+  whole protocol.
+- The per-file in-process queue (`withEventFileQueue`) drains reentrant
+  appends FIFO before the active writer returns. Because Node runs JS on one
+  thread, a synchronous append cannot be preempted mid-call, so the queue’s
+  only job is to make reentrancy and future async callers safe.
+- `rotateGlobalEventsFile` behaviour is unchanged (archive shifting,
+  `.1`/`.2`/`.3`, generation counter) and runs inside the lock.
+
+Reader contract (EVTA US-009): every reader classifies raw JSONL through the
+pure exported `parseJsonlEventBuffer(buf, baseOffset)` — complete
+newline-terminated lines that parse to a JSON object are events; complete
+lines that fail `JSON.parse` or are not objects are `corrupt` entries (with an
+absolute byte offset, length and bounded preview); the final unterminated
+segment is `trailingPartial` (never corrupt, never returned), and empty /
+CR-only lines are skipped silently.
+
+- `readEventsFromCursor` reports every interior corrupt line through
+  `logger.warn("Corrupt event line", { file, offset, length })` and keeps
+  `nextOffset` at the start of a `trailingPartial` line so a torn write is
+  re-read once the writer completes it.
+- `getRunEvents` (both the full path and the `tailRunEvents` window),
+  `getRecentEvents` use the same parser; `getRecentEvents` additionally skips
+  the pre-window partial (its read window starts mid-line) without reporting
+  it. Reporting never throws and never drops a valid line, so the existing
+  “malformed lines are skipped from the result” tests stay green.
+
+Cross-process writer integrity is covered by
+`tests/events-multiwriter.test.ts` (registered in `tests/serial-files.txt`):
+two processes emit > 4 KiB lines into `all.jsonl` concurrently and every
+line must parse. Single-write / O_APPEND / short-write / lock behaviour and
+the torn-last-line / corrupt-line reporting behaviour are covered in
+`src/installer/events.test.ts`.
 
 ### CLI Help Convention
 

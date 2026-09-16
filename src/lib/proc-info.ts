@@ -14,12 +14,42 @@
  * environ block for same-user processes, so the native helper's `env`
  * subcommand supplies it and environ-based evidence
  * (getEnvironText/environHasEntry) works on macOS exactly as on Linux.
+ *
+ * Every macOS `lsof` probe here is routed through the bounded
+ * `src/lib/lsof-probe.ts` primitive, so no probe can block forever on a
+ * stale FUSE mount. Because a timed-out or unavailable probe is NOT the same
+ * as "the process has nothing open", the open-file probe is explicitly
+ * tri-state (`boolean | "unknown"`) and destructive callers must fail closed
+ * on "unknown".
  */
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolveClockTicksPerSecond } from "./process-start-identity.js";
+import { logger } from "./logger.js";
+import { runLsof, type LsofProbeResult } from "./lsof-probe.js";
+
+/** Definite open-file evidence, or "unknown" when the probe could not tell. */
+export type OpenFileEvidence = boolean | "unknown";
+
+/** Tri-state result of a process cwd probe. */
+export type ProcessCwdProbe =
+  | { status: "ok"; cwd: string }
+  | { status: "missing" }
+  | { status: "unknown"; reason: string };
+
+/** Human-readable reason for a non-ok lsof probe result. */
+function lsofFailureReason(result: Exclude<LsofProbeResult, { kind: "ok" }>): string {
+  switch (result.kind) {
+    case "timeout":
+      return `lsof timed out after ${result.timeoutMs}ms`;
+    case "unavailable":
+      return `lsof unavailable: ${result.error}`;
+    case "error":
+      return `lsof exited with status ${result.status === null ? "null" : result.status}`;
+  }
+}
 
 let procfsChecked = false;
 let procfsAvailable = false;
@@ -314,31 +344,47 @@ export function getPgid(pid: number): number | null {
   return Number.isInteger(pgid) && pgid > 0 ? pgid : null;
 }
 
-/** Current working directory of a pid. Null when gone or unreadable. */
-export function getProcessCwd(pid: number): string | null {
+/**
+ * Probe a pid's current working directory.
+ *
+ * - `ok`      — the cwd is known (procfs readlink, or a bounded lsof answer).
+ * - `missing` — the probe definitively answered and there is no cwd (the
+ *               process is gone, or lsof listed no cwd record).
+ * - `unknown` — the probe could not tell: it timed out, lsof is unavailable,
+ *               or procfs/lsof failed for a reason other than "gone".
+ *
+ * `unknown` is never collapsed into `missing`.
+ */
+export function probeProcessCwd(pid: number): ProcessCwdProbe {
   if (hasProcfs()) {
     try {
       const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
-      if (typeof cwd === "string" && cwd.length > 0) return cwd;
-    } catch {
-      // ENOENT/EACCES/ESRCH — treat as not found.
+      if (typeof cwd === "string" && cwd.length > 0) return { status: "ok", cwd };
+      return { status: "missing" };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH") return { status: "missing" };
+      return {
+        status: "unknown",
+        reason: `procfs cwd read failed: ${code ?? String(err)}`,
+      };
     }
-    return null;
   }
-  try {
-    const r = spawnSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    if (typeof r.stdout === "string") {
-      for (const line of r.stdout.split("\n")) {
-        if (line.startsWith("n") && line.length > 1) return line.slice(1);
-      }
-    }
-  } catch {
-    // lsof unavailable.
+  // macOS/BSD: bounded, pid-scoped lsof probe (see src/lib/lsof-probe.ts).
+  const result = runLsof(["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+  if (result.kind !== "ok") {
+    return { status: "unknown", reason: lsofFailureReason(result) };
   }
-  return null;
+  for (const line of result.stdout.split("\n")) {
+    if (line.startsWith("n") && line.length > 1) return { status: "ok", cwd: line.slice(1) };
+  }
+  return { status: "missing" };
+}
+
+/** Current working directory of a pid. Null when gone, unreadable, or unknown. */
+export function getProcessCwd(pid: number): string | null {
+  const probe = probeProcessCwd(pid);
+  return probe.status === "ok" ? probe.cwd : null;
 }
 
 /**
@@ -392,32 +438,43 @@ export function getCmdline(pid: number): string {
 
 /**
  * Whether a process has any file open under `dirPath` (cwd counts too).
- * Kernel-verified via lsof; realpaths the dir first (macOS tempdirs live
- * behind the /var → /private/var symlink and lsof reports canonical paths).
- * Same-user processes only. False on any failure.
+ * Kernel-verified via a BOUNDED, pid-scoped lsof probe; realpaths the dir
+ * first (macOS tempdirs live behind the /var → /private/var symlink and lsof
+ * reports canonical paths). Same-user processes only.
+ *
+ * Tri-state: `true`/`false` only when lsof answered OK. `"unknown"` when the
+ * probe timed out, lsof is unavailable, or the directory could not be
+ * resolved — a timeout is NEVER reported as "no open files". Destructive
+ * callers (daemon signal guards, cleanup sweeps) must treat `"unknown"` as
+ * a refusal.
  */
-export function processHasOpenFileUnder(pid: number, dirPath: string): boolean {
+export function processHasOpenFileUnder(pid: number, dirPath: string): OpenFileEvidence {
   let realDir: string;
   try {
     realDir = fs.realpathSync(dirPath);
-  } catch {
-    return false;
-  }
-  try {
-    const r = spawnSync("lsof", ["-p", String(pid), "-Fn"], {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      maxBuffer: 16 * 1024 * 1024,
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    logger.warn("processHasOpenFileUnder: cannot resolve directory; evidence unknown", {
+      pid,
+      dirPath,
+      reason: code ?? String(err),
     });
-    if (typeof r.stdout === "string") {
-      for (const line of r.stdout.split("\n")) {
-        if (!line.startsWith("n")) continue;
-        const p = line.slice(1);
-        if (p === realDir || p.startsWith(realDir + "/")) return true;
-      }
-    }
-  } catch {
-    // lsof unavailable.
+    return "unknown";
+  }
+  const result = runLsof(["-p", String(pid), "-Fn"]);
+  if (result.kind !== "ok") {
+    // Never silently treat a failed probe as "no open files".
+    logger.warn("processHasOpenFileUnder: lsof evidence unknown", {
+      pid,
+      dirPath,
+      reason: lsofFailureReason(result),
+    });
+    return "unknown";
+  }
+  for (const line of result.stdout.split("\n")) {
+    if (!line.startsWith("n")) continue;
+    const p = line.slice(1);
+    if (p === realDir || p.startsWith(realDir + "/")) return true;
   }
   return false;
 }

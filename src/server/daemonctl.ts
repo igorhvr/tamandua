@@ -30,7 +30,13 @@ import {
   type ServiceKind,
 } from "../lib/service-holder.js";
 import { assertStatePathIsolation, spawnChildAttributionEnv, testGuardActive } from "../lib/test-guard.js";
-import { getCmdline, getElapsedSeconds, getEnvironText, processHasOpenFileUnder } from "../lib/proc-info.js";
+import { logger } from "../lib/logger.js";
+import {
+  getCmdline,
+  getElapsedSeconds,
+  getEnvironText,
+  processHasOpenFileUnder,
+} from "../lib/proc-info.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -285,6 +291,19 @@ export interface DaemonFamilyStopSummary {
   timedOut: DaemonFamilyStopEntry[];
 }
 
+/**
+ * Whether process-provenance evidence permits sending a signal.
+ *
+ * Pure and total: only a definitive `true` permits it. `false` (no evidence)
+ * and `"unknown"` (a bounded probe timed out / lsof was unavailable) both
+ * refuse — the guard only ever loosens into a signal, so a probe that could
+ * not answer must fail closed. Exported so the rule is unit-testable without
+ * spawning lsof.
+ */
+export function processEvidencePermitsSignal(evidence: boolean | "unknown"): boolean {
+  return evidence === true;
+}
+
 function processHomeMatches(pid: number, stateDir: string): boolean {
   // Provenance fallback used only when the candidate's environment cannot be
   // read (native helper not built, other user). Bind by provenance to the
@@ -296,7 +315,10 @@ function processHomeMatches(pid: number, stateDir: string): boolean {
   //      reused pid pointing at an unrelated (or production) process would
   //      have started AFTER the pidfile, i.e. be younger than it; or
   //  (b) the process holds a file open under this state dir (services keep
-  //      their log fd open for life) — kernel-verified via lsof, and covers healthy services whose pidfile was lost.
+  //      their log fd open for life) — kernel-verified via lsof, and covers
+  //      healthy services whose pidfile was lost.
+  // (b) is bounded and tri-state: a timed-out/unavailable lsof probe reports
+  // "unknown", which is refused (never treated as "no open files").
   const dir = path.resolve(stateDir);
   for (const name of DAEMON_FAMILY_PID_FILES) {
     try {
@@ -312,7 +334,17 @@ function processHomeMatches(pid: number, stateDir: string): boolean {
       // Missing/unreadable pidfile — try the next one.
     }
   }
-  return processHasOpenFileUnder(pid, dir);
+  const evidence = processHasOpenFileUnder(pid, dir);
+  if (!processEvidencePermitsSignal(evidence)) {
+    if (evidence === "unknown") {
+      logger.warn("processHomeMatches: provenance probe unknown; refusing to signal", {
+        pid,
+        dir,
+      });
+    }
+    return false;
+  }
+  return true;
 }
 
 /**

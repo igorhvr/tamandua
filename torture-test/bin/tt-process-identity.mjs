@@ -29,9 +29,10 @@
 // cwd/cmdline readers below are therefore PORTABLE: on linux they keep the
 // /proc read; on /proc-less hosts they use the mechanical ps/lsof evidence
 // (`ps -p <pid> -o pgid=`, `ps -p <pid> -o ppid=`, `ps -p <pid>
-// -o command=`, `lsof -a -p <pid> -d cwd -Fn` — BSD and procps both
-// support these), with a fail-closed null whenever the portable evidence
-// is unavailable. The platform branch is decided by the same
+// -o command=`, and the BOUNDED `lsof -b -w -a -p <pid> -d cwd -Fn` — BSD
+// and procps both support these), with a fail-closed null whenever the
+// portable evidence is unavailable (including a timed-out lsof probe). The
+// platform branch is decided by the same
 // TT_PROCESS_IDENTITY_PLATFORM seam the identity source uses, so Darwin is
 // hermetically simulatable on linux.
 //
@@ -60,6 +61,10 @@
 //     the null->refusal proof).
 //   TT_PROCESS_IDENTITY_LSOF = <lsof binary path> — shim the lsof
 //     invocation used by the Darwin cwd reader (default 'lsof').
+//   TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS = <ms> — the hard SIGKILL timeout
+//     for that cwd read (default 5000, clamped 1..60000). A stale FUSE mount
+//     can block lsof in the kernel, so the probe is ALWAYS bounded: on expiry
+//     the child is SIGKILLed/reaped and the reader returns null (fail-closed).
 //
 // Exports are safe to import from other torture-test modules; the CLI only
 // triggers on an explicit argv.
@@ -167,24 +172,58 @@ function runPsField(pid, field) {
   return out === '' ? null : out;
 }
 
-// runLsofCwd: the process cwd via `lsof -a -p <pid> -d cwd -Fn` — lsof
+// runLsofCwd: the process cwd via `lsof -b -w -a -p <pid> -d cwd -Fn` — lsof
 // prints the cwd as an `n<path>` name row (the p<pid> row and the fd-name
 // row, if any, are ignored); BSD/linux lsof both emit that shape. Returns
 // the path, or null when lsof is unavailable / the pid is dead or foreign
 // (fail-closed — a caller that cannot prove the cwd refuses).
+//
+// BOUNDED (LSOF-EVTA US-004): `-b` avoids blocking kernel calls, `-w`
+// suppresses warnings, and the read runs under a hard SIGKILL timeout
+// (TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS, default 5000, clamped 1..60000)
+// scoped to the pid of interest, so a stale FUSE mount cannot wedge the
+// kill-guard evidence gathering. A timed-out probe returns null — NEVER a
+// silent empty result a caller would read as "no cwd".
+const DEFAULT_LSOF_TIMEOUT_MS = 5000;
+const MIN_LSOF_TIMEOUT_MS = 1;
+const MAX_LSOF_TIMEOUT_MS = 60000;
+
+// ttLsofTimeoutMs: parse+clamp TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS at CALL
+// time (the same seam the platform/lsof-binary env overrides use). A blank
+// or non-numeric value falls back to the 5000 ms default; the value is
+// clamped to [1, 60000] so a typo cannot produce an unbounded probe.
+function ttLsofTimeoutMs() {
+  const raw = process.env.TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return DEFAULT_LSOF_TIMEOUT_MS;
+  }
+  const parsed = Number(String(raw).trim());
+  if (!Number.isFinite(parsed)) return DEFAULT_LSOF_TIMEOUT_MS;
+  const int = Math.trunc(parsed);
+  if (int < MIN_LSOF_TIMEOUT_MS) return MIN_LSOF_TIMEOUT_MS;
+  if (int > MAX_LSOF_TIMEOUT_MS) return MAX_LSOF_TIMEOUT_MS;
+  return int;
+}
+
 function runLsofCwd(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const lsofBin = process.env.TT_PROCESS_IDENTITY_LSOF ?? 'lsof';
   let res;
   try {
-    res = spawnSync(lsofBin, ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
+    res = spawnSync(lsofBin, ['-b', '-w', '-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
       encoding: 'utf8',
-      timeout: 10_000,
+      timeout: ttLsofTimeoutMs(),
+      // SIGTERM does not interrupt lsof wedged in the kernel; SIGKILL does.
+      killSignal: 'SIGKILL',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 8 * 1024 * 1024,
     });
   } catch {
     return null;
   }
-  if (res.status !== 0) return null;
+  // A timed-out probe (error ETIMEDOUT / signal SIGKILL) or a missing binary
+  // (ENOENT, also a non-zero status) is NOT "no cwd" — fail closed with null.
+  if (res.error || res.status !== 0) return null;
   const rows = String(res.stdout ?? '').split('\n');
   for (const row of rows) {
     if (row.startsWith('n') && row.length > 1) {
@@ -276,9 +315,10 @@ export function getProcessParent(pid) {
 }
 
 // getProcessCwd: the process working directory — /proc/<pid>/cwd on linux,
-// `lsof -a -p <pid> -d cwd -Fn` on /proc-less hosts (MCHA US-014; the same
-// portable evidence daemon-control verify_process_tt_owned uses), null when
-// unreadable. Never resolves a target — it verifies an ALREADY-RECORDED pid.
+// `lsof -b -w -a -p <pid> -d cwd -Fn` (bounded, SIGKILL on timeout) on
+// /proc-less hosts (MCHA US-014; the same portable evidence daemon-control
+// verify_process_tt_owned uses), null when unreadable. Never resolves a
+// target — it verifies an ALREADY-RECORDED pid.
 export function getProcessCwd(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   if (ttPlatform() === 'darwin') {

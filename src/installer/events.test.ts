@@ -22,6 +22,12 @@ import {
   MAX_EVENTS_FILE_SIZE,
   MAX_ROTATED_EVENTS_FILES,
   _refreshSizeEstimate,
+  appendEventLine,
+  parseEventLockTimeoutMs,
+  parseJsonlEventBuffer,
+  CORRUPT_EVENT_PREVIEW_MAX_CHARS,
+  EVENT_LOCK_STALE_MS,
+  DEFAULT_EVENT_LOCK_TIMEOUT_MS,
   type TamanduaEvent,
 } from "../../dist/installer/events.js";
 
@@ -2045,5 +2051,474 @@ describe("event buffering", () => {
     assert.ok(content.includes("should.be.kept"), "kept event must be written");
     assert.ok(!content.includes("should.be.dropped.1"), "dropped event must not be written");
     assert.equal(content.trim().split("\n").length, 1, "only one event written");
+  });
+});
+
+describe("atomic event appends (EVTA US-008)", () => {
+  let stateDir: string;
+  let originalStateDir: string | undefined;
+
+  beforeEach(() => {
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+    stateDir = tamanduaTempDir("tamandua-evta-");
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+  });
+
+  afterEach(() => {
+    if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  interface FsSpy {
+    opens: Array<{ path: string; flags: string }>;
+    writes: Array<{ path: string; bytes: number }>;
+    restore(): void;
+  }
+
+  /**
+   * Record every fs.openSync (path + flags) and fs.writeSync (fd → path,
+   * byte count) made through the shared `node:fs` default export — the same
+   * object dist/installer/events.js writes through.
+   */
+  function instrumentFsWrites(): FsSpy {
+    const realOpenSync = fs.openSync;
+    const realWriteSync = fs.writeSync;
+    const fdPaths = new Map<number, string>();
+    const opens: Array<{ path: string; flags: string }> = [];
+    const writes: Array<{ path: string; bytes: number }> = [];
+    (fs as any).openSync = function (p: any, flags: any, ...rest: any[]) {
+      const fd = (realOpenSync as any).call(fs, p, flags, ...rest);
+      fdPaths.set(fd, String(p));
+      opens.push({ path: String(p), flags: String(flags) });
+      return fd;
+    };
+    (fs as any).writeSync = function (fd: number, ...args: any[]) {
+      const data = args[0];
+      let bytes = 0;
+      if (typeof data === "string") bytes = Buffer.byteLength(data);
+      else if (Buffer.isBuffer(data)) bytes = typeof args[2] === "number" ? args[2] : data.length;
+      writes.push({ path: fdPaths.get(fd) ?? `fd:${fd}`, bytes });
+      return (realWriteSync as any).call(fs, fd, ...args);
+    };
+    return {
+      opens,
+      writes,
+      restore() {
+        (fs as any).openSync = realOpenSync;
+        (fs as any).writeSync = realWriteSync;
+      },
+    };
+  }
+
+  it("appendEventLine emits exactly one O_APPEND writeSync for a complete line", () => {
+    const file = path.join(stateDir, "append-single.jsonl");
+    const spy = instrumentFsWrites();
+    try {
+      appendEventLine(file, JSON.stringify({ event: "one.write", runId: "r" }));
+    } finally {
+      spy.restore();
+    }
+
+    const fileOpens = spy.opens.filter((o) => o.path === file);
+    assert.equal(fileOpens.length, 1, "file must be opened exactly once");
+    assert.equal(fileOpens[0]!.flags, "a", "descriptor must be O_APPEND ('a')");
+
+    const fileWrites = spy.writes.filter((w) => w.path === file);
+    assert.equal(fileWrites.length, 1, "line must be appended with exactly one writeSync");
+
+    const content = fs.readFileSync(file, "utf-8");
+    assert.ok(content.endsWith("\n"), "appended line must end with a newline");
+    assert.equal(JSON.parse(content.trim()).event, "one.write");
+  });
+
+  it("emitEvent writes each event to the run file and all.jsonl with one O_APPEND write each", () => {
+    const runFile = path.join(stateDir, "events", "run-atomic.jsonl");
+    const globalFile = path.join(stateDir, "events", "all.jsonl");
+
+    const spy = instrumentFsWrites();
+    try {
+      emitEvent(makeEvent("run-atomic", "step.running"));
+    } finally {
+      spy.restore();
+    }
+
+    const runWrites = spy.writes.filter((w) => w.path === runFile);
+    const globalWrites = spy.writes.filter((w) => w.path === globalFile);
+    assert.equal(runWrites.length, 1, "run file must receive exactly one writeSync");
+    assert.equal(globalWrites.length, 1, "all.jsonl must receive exactly one writeSync");
+
+    const runOpen = spy.opens.find((o) => o.path === runFile);
+    const globalOpen = spy.opens.find((o) => o.path === globalFile);
+    assert.equal(runOpen?.flags, "a", "run file descriptor must be O_APPEND");
+    assert.equal(globalOpen?.flags, "a", "global file descriptor must be O_APPEND");
+
+    // The lock file is created exclusively, never written (no stray syscalls).
+    const lockPath = `${globalFile}.lock`;
+    assert.equal(spy.writes.filter((w) => w.path === lockPath).length, 0);
+    assert.ok(!fs.existsSync(lockPath), "lock must be released after the append");
+
+    assert.ok(fs.readFileSync(runFile, "utf-8").endsWith("\n"));
+    assert.ok(fs.readFileSync(globalFile, "utf-8").endsWith("\n"));
+  });
+
+  it("appendEventLine retries only the unwritten remainder after a short write", () => {
+    const file = path.join(stateDir, "append-short.jsonl");
+    const line = JSON.stringify({ event: "short.write", detail: "y".repeat(500) });
+    const realWriteSync = fs.writeSync;
+    let calls = 0;
+    try {
+      (fs as any).writeSync = function (fd: number, buf: Buffer, offset: number, length: number) {
+        calls++;
+        return (realWriteSync as any).call(fs, fd, buf, offset, Math.min(3, length));
+      };
+      appendEventLine(file, line);
+    } finally {
+      (fs as any).writeSync = realWriteSync;
+    }
+
+    assert.ok(calls > 1, "short writes must be retried");
+    const content = fs.readFileSync(file, "utf-8");
+    assert.equal(content, `${line}\n`, "every byte must be appended exactly once, in order");
+  });
+
+  it("parseEventLockTimeoutMs defaults and clamps defensively", () => {
+    assert.equal(parseEventLockTimeoutMs({} as NodeJS.ProcessEnv), DEFAULT_EVENT_LOCK_TIMEOUT_MS);
+    assert.equal(parseEventLockTimeoutMs({ TAMANDUA_EVENT_LOCK_TIMEOUT_MS: "" } as any), DEFAULT_EVENT_LOCK_TIMEOUT_MS);
+    assert.equal(parseEventLockTimeoutMs({ TAMANDUA_EVENT_LOCK_TIMEOUT_MS: "nope" } as any), DEFAULT_EVENT_LOCK_TIMEOUT_MS);
+    assert.equal(parseEventLockTimeoutMs({ TAMANDUA_EVENT_LOCK_TIMEOUT_MS: "0" } as any), DEFAULT_EVENT_LOCK_TIMEOUT_MS);
+    assert.equal(parseEventLockTimeoutMs({ TAMANDUA_EVENT_LOCK_TIMEOUT_MS: "-5" } as any), DEFAULT_EVENT_LOCK_TIMEOUT_MS);
+    assert.equal(parseEventLockTimeoutMs({ TAMANDUA_EVENT_LOCK_TIMEOUT_MS: "250" } as any), 250);
+    assert.equal(parseEventLockTimeoutMs({ TAMANDUA_EVENT_LOCK_TIMEOUT_MS: "999999" } as any), 60000);
+  });
+
+  it("takes over a stale lock file so the global append still lands", () => {
+    const globalFile = path.join(stateDir, "events", "all.jsonl");
+    const lockPath = `${globalFile}.lock`;
+    fs.mkdirSync(path.dirname(globalFile), { recursive: true });
+    fs.writeFileSync(lockPath, "", "utf-8");
+    const stale = new Date(Date.now() - (EVENT_LOCK_STALE_MS + 60_000));
+    fs.utimesSync(lockPath, stale, stale);
+
+    emitEvent(makeEvent("run-stale-lock", "step.running"));
+
+    assert.ok(!fs.existsSync(lockPath), "stale lock must be removed after takeover");
+    const content = fs.readFileSync(globalFile, "utf-8");
+    assert.ok(content.includes("run-stale-lock"), "global append must succeed after stale takeover");
+  });
+
+  it("skips only the global append (run file stays durable) when the lock is held", () => {
+    const globalFile = path.join(stateDir, "events", "all.jsonl");
+    const lockPath = `${globalFile}.lock`;
+    fs.mkdirSync(path.dirname(globalFile), { recursive: true });
+    fs.writeFileSync(lockPath, "", "utf-8"); // fresh lock — not stale
+
+    const prevTimeout = process.env.TAMANDUA_EVENT_LOCK_TIMEOUT_MS;
+    process.env.TAMANDUA_EVENT_LOCK_TIMEOUT_MS = "30";
+    try {
+      emitEvent(makeEvent("run-lock-held", "step.running"));
+    } finally {
+      if (prevTimeout === undefined) delete process.env.TAMANDUA_EVENT_LOCK_TIMEOUT_MS;
+      else process.env.TAMANDUA_EVENT_LOCK_TIMEOUT_MS = prevTimeout;
+    }
+
+    const runFile = path.join(stateDir, "events", "run-lock-held.jsonl");
+    assert.ok(fs.readFileSync(runFile, "utf-8").includes("run-lock-held"), "run file must still be written");
+    assert.ok(!fs.existsSync(globalFile), "global append must be skipped while the lock is held");
+    assert.ok(fs.existsSync(lockPath), "a lock we failed to acquire must be left in place");
+  });
+});
+
+describe("torn/corrupt event line tolerance (EVTA US-009)", () => {
+  let stateDir: string;
+  let originalStateDir: string | undefined;
+
+  beforeEach(() => {
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+    stateDir = tamanduaTempDir("tamandua-evta-read-");
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+  });
+
+  afterEach(() => {
+    if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function getEventsDir(): string {
+    return path.join(stateDir, "events");
+  }
+
+  function readLog(): string {
+    try {
+      return fs.readFileSync(path.join(stateDir, "tamandua.log"), "utf-8");
+    } catch {
+      return "";
+    }
+  }
+
+  describe("parseJsonlEventBuffer", () => {
+    it("classifies valid events, interior corrupt lines, and a torn trailing line", () => {
+      const first = makeEvent("run-p", "run.started");
+      const second = makeEvent("run-p", "run.completed");
+      const good1 = JSON.stringify(first);
+      const bad = "not json at all";
+      const good2 = JSON.stringify(second);
+      const torn = '{"ts":"2026-01-01","event":"run.star';
+      const buf = Buffer.from(`${good1}\n${bad}\n${good2}\n${torn}`, "utf-8");
+
+      const parsed = parseJsonlEventBuffer(buf, 0);
+      assert.deepEqual(parsed.events, [first, second]);
+      assert.equal(parsed.corrupt.length, 1);
+      assert.equal(parsed.corrupt[0]!.offset, Buffer.byteLength(`${good1}\n`));
+      assert.equal(parsed.corrupt[0]!.length, Buffer.byteLength(bad));
+      assert.equal(parsed.corrupt[0]!.preview, bad);
+      assert.deepEqual(parsed.trailingPartial, {
+        offset: Buffer.byteLength(`${good1}\n${bad}\n${good2}\n`),
+        length: Buffer.byteLength(torn),
+      });
+    });
+
+    it("adds baseOffset to every reported offset", () => {
+      const good = JSON.stringify(makeEvent("run-b", "run.started"));
+      const buf = Buffer.from(`bad\n${good}\n`, "utf-8");
+      const parsed = parseJsonlEventBuffer(buf, 5000);
+      assert.equal(parsed.corrupt.length, 1);
+      assert.equal(parsed.corrupt[0]!.offset, 5000);
+      assert.equal(parsed.events.length, 1);
+      assert.equal(parsed.trailingPartial, null);
+    });
+
+    it("treats newline-terminated non-object JSON as corrupt", () => {
+      const good = JSON.stringify(makeEvent("run-o", "run.started"));
+      const buf = Buffer.from(`"string"\n42\ntrue\nfalse\nnull\n${good}\n`, "utf-8");
+      const parsed = parseJsonlEventBuffer(buf, 0);
+      assert.equal(parsed.events.length, 1);
+      assert.equal(parsed.corrupt.length, 5);
+      assert.deepEqual(
+        parsed.corrupt.map((c) => c.preview),
+        ['"string"', "42", "true", "false", "null"],
+      );
+    });
+
+    it("skips empty and CR-only lines without reporting them as corrupt", () => {
+      const good = makeEvent("run-e", "run.started");
+      const buf = Buffer.from(`\n\r\n${JSON.stringify(good)}\r\n\n`, "utf-8");
+      const parsed = parseJsonlEventBuffer(buf, 0);
+      assert.deepEqual(parsed.events, [good]);
+      assert.equal(parsed.corrupt.length, 0);
+      assert.equal(parsed.trailingPartial, null);
+    });
+
+    it("caps the corrupt-line preview", () => {
+      const buf = Buffer.from(`${"x".repeat(1000)}\n`, "utf-8");
+      const parsed = parseJsonlEventBuffer(buf, 0);
+      assert.equal(parsed.corrupt.length, 1);
+      assert.equal(parsed.corrupt[0]!.length, 1000);
+      assert.equal(parsed.corrupt[0]!.preview.length, CORRUPT_EVENT_PREVIEW_MAX_CHARS + 1);
+    });
+
+    it("does not return a valid JSON line that lacks a trailing newline", () => {
+      const good = JSON.stringify(makeEvent("run-nonl", "run.started"));
+      const parsed = parseJsonlEventBuffer(Buffer.from(good, "utf-8"), 0);
+      assert.deepEqual(parsed.events, []);
+      assert.deepEqual(parsed.corrupt, []);
+      assert.deepEqual(parsed.trailingPartial, { offset: 0, length: Buffer.byteLength(good) });
+    });
+  });
+
+  describe("readEventsFromCursor", () => {
+    it("ignores a torn final line, keeps the cursor at its start, and returns it once completed", () => {
+      const runId = "run-torn-cursor";
+      const runFile = path.join(getEventsDir(), `${runId}.jsonl`);
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      const first = makeEvent(runId, "run.started");
+      const firstLine = JSON.stringify(first);
+      fs.writeFileSync(runFile, `${firstLine}\n`, "utf-8");
+
+      const initial = readEventsFromCursor({ kind: "run", runId }, 0);
+      assert.deepEqual(initial.events, [first]);
+      const partialStart = Buffer.byteLength(`${firstLine}\n`);
+      assert.equal(initial.nextOffset, partialStart);
+
+      // Writer starts the next line and dies mid-write (no trailing newline).
+      const second = makeEvent(runId, "step.running");
+      const secondLine = JSON.stringify(second);
+      fs.appendFileSync(runFile, secondLine.slice(0, 10), "utf-8");
+
+      const midWrite = readEventsFromCursor({ kind: "run", runId }, initial.nextOffset);
+      assert.deepEqual(midWrite.events, []);
+      assert.equal(midWrite.nextOffset, partialStart, "cursor must not advance past the torn line start");
+      assert.ok(!readLog().includes("Corrupt event line"), "a torn line is not a corrupt line");
+
+      // Writer completes the line — the next read returns it.
+      fs.appendFileSync(runFile, secondLine.slice(10) + "\n", "utf-8");
+      const completed = readEventsFromCursor({ kind: "run", runId }, midWrite.nextOffset);
+      assert.deepEqual(completed.events, [second]);
+      assert.equal(completed.nextOffset, Buffer.byteLength(`${firstLine}\n${secondLine}\n`));
+    });
+
+    it("reports an interior corrupt line with the file and byte offset, keeping valid events", () => {
+      const runId = "run-corrupt-cursor";
+      const runFile = path.join(getEventsDir(), `${runId}.jsonl`);
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      const first = makeEvent(runId, "run.started");
+      const second = makeEvent(runId, "run.completed");
+      const firstLine = JSON.stringify(first);
+      const corrupt = "this is not json";
+      fs.writeFileSync(runFile, `${firstLine}\n${corrupt}\n${JSON.stringify(second)}\n`, "utf-8");
+
+      const result = readEventsFromCursor({ kind: "run", runId }, 0);
+      assert.deepEqual(result.events, [first, second]);
+
+      const expectedOffset = Buffer.byteLength(`${firstLine}\n`);
+      const log = readLog();
+      assert.ok(log.includes("Corrupt event line"), "corrupt line must be reported");
+      assert.ok(log.includes(runFile), "report must name the file");
+      assert.ok(log.includes(`"offset":${expectedOffset}`), `report must carry offset ${expectedOffset}`);
+      assert.ok(log.includes(`"length":${corrupt.length}`), "report must carry the line length");
+    });
+  });
+
+  describe("getRunEvents full path", () => {
+    it("reports interior corrupt lines and returns every valid event", () => {
+      const runId = "run-corrupt-full";
+      const runFile = path.join(getEventsDir(), `${runId}.jsonl`);
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      const first = makeEvent(runId, "run.started");
+      const second = makeEvent(runId, "run.completed");
+      const firstLine = JSON.stringify(first);
+      const corrupt = "garbage line";
+      fs.writeFileSync(runFile, `${firstLine}\n${corrupt}\n${JSON.stringify(second)}\n`, "utf-8");
+
+      const events = getRunEvents(runId);
+      assert.deepEqual(events, [first, second]);
+
+      const log = readLog();
+      const expectedOffset = Buffer.byteLength(`${firstLine}\n`);
+      assert.ok(log.includes("Corrupt event line"), "full-path reader must report the corrupt line");
+      assert.ok(log.includes(runFile), "report must name the file");
+      assert.ok(log.includes(`"offset":${expectedOffset}`), `report must carry offset ${expectedOffset}`);
+    });
+
+    it("skips a torn final line until the writer completes it", () => {
+      const runId = "run-torn-full";
+      const runFile = path.join(getEventsDir(), `${runId}.jsonl`);
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      const first = makeEvent(runId, "run.started");
+      const second = makeEvent(runId, "run.completed");
+      const firstLine = JSON.stringify(first);
+      const secondLine = JSON.stringify(second);
+      fs.writeFileSync(runFile, `${firstLine}\n${secondLine.slice(0, 12)}`, "utf-8");
+
+      assert.deepEqual(getRunEvents(runId), [first], "torn line must not be returned");
+      assert.ok(!readLog().includes("Corrupt event line"), "a torn line is not a corrupt line");
+
+      fs.appendFileSync(runFile, secondLine.slice(12) + "\n", "utf-8");
+      assert.deepEqual(getRunEvents(runId), [first, second], "completed line must be returned");
+    });
+  });
+
+  describe("getRunEvents tail window", () => {
+    it("reports interior corrupt lines in the window and returns valid events", () => {
+      const runId = "run-corrupt-tail";
+      const runFile = path.join(getEventsDir(), `${runId}.jsonl`);
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      const good1 = makeEvent(runId, "event.good");
+      const good2 = makeEvent(runId, "event.also-good");
+      const g1 = JSON.stringify(good1);
+      const bad = "more garbage";
+      fs.writeFileSync(runFile, `garbage line\n${g1}\n${bad}\n${JSON.stringify(good2)}\n`, "utf-8");
+
+      const events = getRunEvents(runId, 5);
+      assert.deepEqual(events, [good1, good2]);
+
+      const log = readLog();
+      assert.ok(log.includes("Corrupt event line"), "tail reader must report corrupt lines");
+      assert.ok(log.includes(`"offset":0`), "first corrupt line sits at offset 0");
+      assert.ok(
+        log.includes(`"offset":${Buffer.byteLength(`garbage line\n${g1}\n`)}`),
+        "second corrupt line carries its absolute offset",
+      );
+    });
+
+    it("skips a torn final line without reporting it as corrupt", () => {
+      const runId = "run-torn-tail";
+      const runFile = path.join(getEventsDir(), `${runId}.jsonl`);
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      const good1 = makeEvent(runId, "event.one");
+      const good2 = makeEvent(runId, "event.two");
+      const torn = '{"ts":"2026-01-01","event":"ev';
+      fs.writeFileSync(runFile, `${JSON.stringify(good1)}\n${JSON.stringify(good2)}\n${torn}`, "utf-8");
+
+      const events = getRunEvents(runId, 2);
+      assert.deepEqual(events, [good1, good2]);
+      assert.ok(!readLog().includes("Corrupt event line"), "torn tail line is not corrupt");
+    });
+  });
+
+  describe("getRecentEvents", () => {
+    it("reports interior corrupt lines and returns valid events", () => {
+      const globalFile = path.join(getEventsDir(), "all.jsonl");
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      const first = makeEvent("run-recent", "event.one");
+      const second = makeEvent("run-recent", "event.two");
+      const firstLine = JSON.stringify(first);
+      const corrupt = "not valid json";
+      fs.writeFileSync(globalFile, `${firstLine}\n${corrupt}\n${JSON.stringify(second)}\n`, "utf-8");
+
+      const events = getRecentEvents(10);
+      assert.deepEqual(events, [first, second]);
+
+      const log = readLog();
+      const expectedOffset = Buffer.byteLength(`${firstLine}\n`);
+      assert.ok(log.includes("Corrupt event line"), "recent reader must report corrupt lines");
+      assert.ok(log.includes(`"offset":${expectedOffset}`), `report must carry offset ${expectedOffset}`);
+    });
+
+    it("skips a torn final line without reporting it as corrupt", () => {
+      const globalFile = path.join(getEventsDir(), "all.jsonl");
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      const first = makeEvent("run-recent-torn", "event.one");
+      const second = makeEvent("run-recent-torn", "event.two");
+      const torn = '{"ts":"2026-01-01","event":"ev';
+      fs.writeFileSync(globalFile, `${JSON.stringify(first)}\n${JSON.stringify(second)}\n${torn}`, "utf-8");
+
+      const events = getRecentEvents(10);
+      assert.deepEqual(events, [first, second]);
+      assert.ok(!readLog().includes("Corrupt event line"), "torn tail line is not corrupt");
+    });
+
+    it("does not report a pre-window partial line as corrupt", () => {
+      const globalFile = path.join(getEventsDir(), "all.jsonl");
+      fs.mkdirSync(getEventsDir(), { recursive: true });
+
+      // A single line larger than the 256 KB tail chunk, followed by a few
+      // small complete lines, forces the read window to start mid-line.
+      const big = makeEvent("run-big", "run.started");
+      big.detail = "x".repeat(300_000);
+      const bigLine = JSON.stringify(big);
+      const small: TamanduaEvent[] = [];
+      for (let i = 0; i < 5; i++) small.push(makeEvent("run-big", `small.${i}`));
+      fs.writeFileSync(globalFile, `${bigLine}\n${small.map((e) => JSON.stringify(e)).join("\n")}\n`, "utf-8");
+
+      const events = getRecentEvents(3);
+      assert.deepEqual(
+        events.map((e) => e.event),
+        ["small.2", "small.3", "small.4"],
+      );
+      assert.ok(
+        !readLog().includes("Corrupt event line"),
+        "a pre-window partial must never be reported as corrupt",
+      );
+    });
   });
 });

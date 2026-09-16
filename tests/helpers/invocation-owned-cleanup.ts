@@ -18,9 +18,9 @@
  *   ownedTempRoots() in ./test-env.ts) or at a descendant below it — never a
  *   loose prefix/substring match. Ownership evidence is platform-observed:
  *   on linux the HOME entry from the process environ pseudo-file (procfs);
- *   on darwin the open file paths reported by `lsof -p <pid> -Fn` (the
- *   services keep their log fd open under the temp home, which lsof
- *   reports).
+ *   on darwin the open file paths reported by the bounded
+ *   `lsof -b -w -p <pid> -Fn` (the services keep their log fd open under the
+ *   temp home, which lsof reports).
  * - Process identity is re-verified immediately before EACH signal. When the
  *   invocation recorded (pid, getProcessStartIdentity(pid)) at spawn or
  *   PID-file-read time, the recorded and current values are compared with
@@ -44,12 +44,34 @@
 
 import { execFileSync } from "node:child_process";
 import path from "node:path";
+// Imported from dist (not src): proc-info.ts now has internal `.js` imports
+// (the bounded lsof probe + logger), which Node 22 native type stripping
+// cannot resolve when the module is loaded directly as `.ts`. The lanes build
+// dist/ before running, so the compiled module is always current.
 import { getEnvironText } from "../../dist/lib/proc-info.js";
 import {
   compareProcessStartIdentities,
   getProcessStartIdentity,
 } from "../../src/lib/process-start-identity.ts";
 import { ownedTempRoots } from "./test-env.ts";
+
+/** Default hard timeout for the bounded Darwin `lsof` observation (ms). */
+export const DARWIN_LSOF_TIMEOUT_MS_DEFAULT = 5000;
+
+/**
+ * Effective hard timeout for the Darwin `lsof -b -w -p <pid> -Fn` observation.
+ * `TAMANDUA_DARWIN_LSOF_TIMEOUT_MS` overrides the default (test seam);
+ * blank/non-numeric/non-positive values fall back to the default, and the
+ * value is clamped to 1..60000 ms. The probe is NEVER unbounded.
+ */
+export function darwinLsofTimeoutMs(): number {
+  const raw = process.env.TAMANDUA_DARWIN_LSOF_TIMEOUT_MS;
+  const parsed = raw === undefined || raw.trim() === "" ? NaN : Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DARWIN_LSOF_TIMEOUT_MS_DEFAULT;
+  }
+  return Math.min(Math.max(Math.trunc(parsed), 1), 60000);
+}
 
 /**
  * Current ownership evidence for one candidate pid.
@@ -123,7 +145,7 @@ export function parseLinuxEnvironHome(rawEnviron: string): string | null {
 }
 
 /**
- * Parse `lsof -p <pid> -Fn` output into the list of open file name paths
+ * Parse `lsof -b -w -p <pid> -Fn` output into the list of open file name paths
  * (the lines prefixed with "n"). Non-name lines and empty names are
  * ignored. lsof marks unlinked files with a trailing " (deleted)" — the
  * suffix is stripped because the fd still proves the process held that path.
@@ -302,15 +324,20 @@ function pidIsGone(pid: number): boolean {
 }
 
 /**
- * Darwin observation: read the open file paths via `lsof -p <pid> -Fn`.
- * When lsof fails the process liveness decides "gone" vs "unreadable".
+ * Darwin observation: read the open file paths via the BOUNDED
+ * `lsof -b -w -p <pid> -Fn`. `-b` avoids blocking kernel calls and `-w`
+ * suppresses warnings; the hard SIGKILL timeout means a stale FUSE/network
+ * mount cannot wedge the sweep (SIGTERM does not interrupt an lsof blocked
+ * inside the kernel). When lsof fails the process liveness decides
+ * "gone" vs "unreadable".
  */
 export function observeDarwinPid(pid: number): OwnershipObservation {
   let raw: string;
   try {
-    raw = execFileSync("lsof", ["-p", String(pid), "-Fn"], {
+    raw = execFileSync("lsof", ["-b", "-w", "-p", String(pid), "-Fn"], {
       encoding: "utf-8",
-      timeout: 5000,
+      timeout: darwinLsofTimeoutMs(),
+      killSignal: "SIGKILL",
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch {

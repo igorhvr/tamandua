@@ -253,8 +253,8 @@ describe("MCHA (US-014) — tt-chaos darwin kill guard uses portable pgid/owners
       "getProcessGroup must read `ps -o pgid=` on darwin (the portable pgid arm)");
     assert.match(identityText, /ps -p <pid> -o ppid=|'-p', String\(pid\), '-o', `ppid=`/,
       "getProcessParent must read `ps -o ppid=` on darwin (the portable ppid arm)");
-    assert.match(identityText, /lsof -a -p <pid> -d cwd -Fn|lsofBin, \['-a', '-p', String\(pid\), '-d', 'cwd', '-Fn'\]/,
-      "getProcessCwd must read `lsof -a -p <pid> -d cwd -Fn` on darwin (the portable cwd arm)");
+    assert.match(identityText, /lsof -b -w -a -p <pid> -d cwd -Fn|lsofBin, \['-b', '-w', '-a', '-p', String\(pid\), '-d', 'cwd', '-Fn'\]/,
+      "getProcessCwd must read a BOUNDED `lsof -b -w -a -p <pid> -d cwd -Fn` on darwin (the portable cwd arm)");
     assert.match(identityText, /ps -p <pid> -o command=|'-p', String\(pid\), '-o', `command=`/,
       "getProcessCmdline must read `ps -o command=` on darwin (the portable cmdline arm)");
     assert.match(identityText, /export function getProcessCwd/,

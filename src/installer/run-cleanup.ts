@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { logger } from "../lib/logger.js";
+import { runLsof } from "../lib/lsof-probe.js";
 import { emitEvent } from "./events.js";
 import {
   getCmdline,
@@ -176,11 +177,41 @@ export function getProcPids(): number[] {
 }
 
 /**
+ * Parse the `-Fpn` field output of `lsof -d cwd` into a pid→cwd map.
+ *
+ * Each `p<pid>` line opens a process record; the following `n<path>` line is
+ * that process's cwd. Lines outside a record (or with a non-positive pid) are
+ * ignored. Pure and exported so both platforms can pin the record parsing.
+ */
+export function parseLsofCwdRecords(stdout: string): Map<number, string> {
+  const cwdByPid = new Map<number, string>();
+  let currentPid: number | null = null;
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("p")) {
+      const pid = Number(line.slice(1));
+      currentPid = Number.isInteger(pid) && pid > 0 ? pid : null;
+    } else if (line.startsWith("n") && currentPid !== null) {
+      cwdByPid.set(currentPid, line.slice(1));
+    }
+  }
+  return cwdByPid;
+}
+
+/**
  * One observation per visible process. On Linux this walks procfs per pid.
  * On macOS per-pid reads would spawn one subprocess per process, so the whole
  * command-line table is captured with ONE sandbox-safe `listProcessDetails()`
  * call (the native sysctl helper, or ps where the helper is absent) and ONE
- * `lsof -d cwd` call; environ stays null there (unreadable).
+ * `lsof -d cwd` call; the bulk snapshot keeps environ null there to avoid one
+ * native-helper spawn per pid (per-pid callers such as `processBelongsToRun`
+ * still read environ through the KERN_PROCARGS2 helper on macOS).
+ *
+ * The bulk lsof call goes through the bounded `runLsof` primitive: it always
+ * carries `-b -w` and a hard SIGKILL timeout, so the survivor sweep cannot
+ * hang on a stale FUSE mount. When the probe cannot answer (timeout,
+ * unavailable, error) the cwd channel stays EMPTY and a warning is logged —
+ * absent cwd evidence matches nothing, so the sweep fails closed and never
+ * kills on a false cwd match.
  */
 export function collectProcessSnapshot(): ProcessSnapshotEntry[] {
   if (hasProcfs()) {
@@ -201,24 +232,20 @@ export function collectProcessSnapshot(): ProcessSnapshotEntry[] {
     // process metadata unavailable — snapshot stays empty for cmdline.
   }
 
-  const cwdByPid = new Map<number, string>();
-  try {
-    const r = spawnSync("lsof", ["-d", "cwd", "-Fpn"], {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      maxBuffer: 64 * 1024 * 1024,
+  let cwdByPid = new Map<number, string>();
+  // This is the one bulk, non-pid-scoped probe; runLsof keeps it bounded
+  // (`-b -w` plus a SIGKILL timeout) so it can never wedge on a stale mount.
+  const lsofResult = runLsof(["-d", "cwd", "-Fpn"]);
+  if (lsofResult.kind === "ok") {
+    cwdByPid = parseLsofCwdRecords(lsofResult.stdout);
+  } else {
+    // No cwd evidence: log and leave the channel empty. The sweep's cwd
+    // matcher then cannot fire, so a probe that could not answer kills
+    // nothing for that channel (fail-closed, never a false match).
+    logger.warn("run-cleanup: bulk lsof cwd snapshot unavailable; cwd evidence empty", {
+      kind: lsofResult.kind,
+      ...(lsofResult.kind === "timeout" ? { timeoutMs: lsofResult.timeoutMs } : {}),
     });
-    if (typeof r.stdout === "string") {
-      let currentPid: number | null = null;
-      for (const line of r.stdout.split("\n")) {
-        if (line.startsWith("p")) currentPid = Number(line.slice(1)) || null;
-        else if (line.startsWith("n") && currentPid !== null) {
-          cwdByPid.set(currentPid, line.slice(1));
-        }
-      }
-    }
-  } catch {
-    // lsof unavailable — cwd evidence channel stays empty.
   }
 
   const pids = new Set<number>([...cmdlineByPid.keys(), ...cwdByPid.keys()]);

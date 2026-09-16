@@ -265,8 +265,11 @@ describe("tier0 macp5 gnu-ism sweep (US-004)", () => {
     }
     // Structural pin: the lingering-listener pid extraction is the portable
     // lsof `-iTCP:<port> -sTCP:LISTEN -t` form (first-pid semantics preserved
-    // via head -1) with a netstat fallback for hosts without lsof.
-    assert.match(source, /lsof -nP -iTCP:"\$port" -sTCP:LISTEN -t/);
+    // via head -1) with a netstat fallback for hosts without lsof. LSOF-EVTA
+    // US-006 routes every lsof probe through the bounded lsof_bounded helper
+    // (background + poll + kill -KILL + wait), so the pin is on the bounded
+    // call site.
+    assert.match(source, /lsof_bounded -nP -iTCP:"\$port" -sTCP:LISTEN -t/);
     assert.match(source, /grep -Eo '\[0-9\]\+' \| head -1 \|\| true\)/);
   });
 

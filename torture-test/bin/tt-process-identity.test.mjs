@@ -24,6 +24,7 @@ import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   getDarwinStartIdentity,
+  getProcessCwd,
   getProcessGroup,
   getProcessStartIdentity,
   getProcessState,
@@ -290,6 +291,98 @@ describe('tt-process-identity.mjs', () => {
         }
       } finally {
         fs.rmSync(deadShim.dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── LSOF-EVTA US-004 — bounded Darwin cwd reader ─────────────────────
+  // A stale FUSE mount can block lsof inside the kernel, so the Darwin cwd
+  // reader must bound the probe (`-b -w`, a hard SIGKILL timeout) and return
+  // null when it cannot answer — fail-closed, never a silent empty result a
+  // caller would read as "no cwd". A hanging lsof shim proves the child is
+  // killed and reaped within the bound.
+  describe('bounded Darwin cwd reader (LSOF-EVTA US-004)', () => {
+    /** Run fn with the Darwin platform seam + an lsof shim + timeout seam. */
+    function withCwdSeam(lsofBin, timeoutMs, fn) {
+      const prevPlatform = process.env.TT_PROCESS_IDENTITY_PLATFORM;
+      const prevLsof = process.env.TT_PROCESS_IDENTITY_LSOF;
+      const prevTimeout = process.env.TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS;
+      try {
+        process.env.TT_PROCESS_IDENTITY_PLATFORM = 'darwin';
+        if (lsofBin === undefined) delete process.env.TT_PROCESS_IDENTITY_LSOF;
+        else process.env.TT_PROCESS_IDENTITY_LSOF = lsofBin;
+        if (timeoutMs === undefined) delete process.env.TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS;
+        else process.env.TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS = String(timeoutMs);
+        return fn();
+      } finally {
+        if (prevPlatform === undefined) delete process.env.TT_PROCESS_IDENTITY_PLATFORM;
+        else process.env.TT_PROCESS_IDENTITY_PLATFORM = prevPlatform;
+        if (prevLsof === undefined) delete process.env.TT_PROCESS_IDENTITY_LSOF;
+        else process.env.TT_PROCESS_IDENTITY_LSOF = prevLsof;
+        if (prevTimeout === undefined) delete process.env.TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS;
+        else process.env.TT_PROCESS_IDENTITY_LSOF_TIMEOUT_MS = prevTimeout;
+      }
+    }
+
+    it('reads the `n<path>` row of a bounded probe and passes -b -w -a -p <pid> -d cwd -Fn to the child', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tti-lsof-ok-'));
+      const argsFile = path.join(dir, 'argv');
+      const shim = path.join(dir, 'lsof');
+      fs.writeFileSync(shim, [
+        '#!/bin/sh',
+        `printf '%s\\n' "$*" > ${JSON.stringify(argsFile)}`,
+        `printf 'p%s\\nn%s\\n' "$$" '/tt/var/work'`,
+      ].join('\n'));
+      fs.chmodSync(shim, 0o755);
+      try {
+        const cwd = withCwdSeam(shim, 5000, () => getProcessCwd(process.pid));
+        assert.equal(cwd, '/tt/var/work', 'the reader must parse the lsof n<path> row');
+        const argv = fs.readFileSync(argsFile, 'utf8').trim();
+        assert.match(argv, /^-b -w -a -p \d+ -d cwd -Fn$/,
+          `the probe must be bounded (-b -w) and cwd-scoped, got: ${argv}`);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('a hanging lsof shim makes getProcessCwd return null and the shim is SIGKILLed/reaped within the bound', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tti-lsof-hang-'));
+      const pidFile = path.join(dir, 'shim.pid');
+      const shim = path.join(dir, 'lsof');
+      fs.writeFileSync(shim, [
+        '#!/bin/sh',
+        `printf '%s\\n' "$$" > ${JSON.stringify(pidFile)}`,
+        'exec sleep 60',
+      ].join('\n'));
+      fs.chmodSync(shim, 0o755);
+      const TIMEOUT_MS = 300;
+      let shimPid = null;
+      try {
+        const started = Date.now();
+        const cwd = withCwdSeam(shim, TIMEOUT_MS, () => getProcessCwd(process.pid));
+        const elapsed = Date.now() - started;
+        assert.equal(cwd, null,
+          'a timed-out lsof probe must fail closed (null), never a silent empty cwd');
+        assert.ok(elapsed < TIMEOUT_MS + 1000,
+          `the bounded probe must return within timeout+1000ms, took ${elapsed}ms`);
+        shimPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+        assert.ok(Number.isInteger(shimPid) && shimPid > 0,
+          'the shim must have recorded its pid before hanging');
+        let gone = false;
+        const deadline = Date.now() + 1000;
+        do {
+          try {
+            process.kill(shimPid, 0);
+          } catch (err) {
+            if (err && err.code === 'ESRCH') { gone = true; break; }
+          }
+        } while (Date.now() < deadline);
+        assert.equal(gone, true, `the hanging shim (pid ${shimPid}) must be SIGKILLed and reaped`);
+      } finally {
+        if (Number.isInteger(shimPid) && shimPid > 0) {
+          try { process.kill(shimPid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+        fs.rmSync(dir, { recursive: true, force: true });
       }
     });
   });

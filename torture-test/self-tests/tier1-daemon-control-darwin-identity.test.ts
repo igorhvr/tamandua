@@ -49,6 +49,12 @@ const identityTool = path.join(ttRoot, "bin", "tt-process-identity.mjs");
 const dcText = fs.readFileSync(dcTool, "utf8");
 const identityText = fs.readFileSync(identityTool, "utf8");
 
+// LSOF-EVTA US-006: verify_process_tt_owned now delegates its Darwin lsof
+// read to lsof_bounded, so the extracted-function harnesses must include the
+// bounded-probe helper pair alongside the function under test.
+const ttLsofTimeoutFn = extractFunction(dcText, "tt_lsof_timeout_s");
+const lsofBoundedFn = extractFunction(dcText, "lsof_bounded");
+
 // ── helpers ────────────────────────────────────────────────────────────
 
 /** Env for everything this test spawns: strip NODE_TEST_CONTEXT (node:test
@@ -258,8 +264,8 @@ describe("MACP4 US-002 — daemon-control + tt-process-identity Darwin identity/
     );
     assert.match(
       fn,
-      /lsof -a -p "\$pid" -d cwd -Fn/,
-      "the Darwin branch must use lsof -a -p <pid> -d cwd -Fn for the cwd (portable)",
+      /lsof_bounded -a -p "\$pid" -d cwd -Fn/,
+      "the Darwin branch must use the bounded lsof_bounded -a -p <pid> -d cwd -Fn for the cwd (portable, LSOF-EVTA US-006)",
     );
     assert.match(
       fn,
@@ -276,6 +282,8 @@ describe("MACP4 US-002 — daemon-control + tt-process-identity Darwin identity/
   it("verify_process_tt_owned proves TT-ownership via the portable Darwin branch and REFUSES when evidence is unavailable", () => {
     const fn = extractFunction(dcText, "verify_process_tt_owned");
     assert.ok(fn, "verify_process_tt_owned must exist");
+    assert.ok(ttLsofTimeoutFn, "daemon-control must define tt_lsof_timeout_s() (LSOF-EVTA US-006)");
+    assert.ok(lsofBoundedFn, "daemon-control must define lsof_bounded() (LSOF-EVTA US-006)");
     const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "dc-darwin-own-"));
     try {
       const lsof = makeShim(shimDir, "lsof", `if [ -n "\${TT_FAKE_LSOF_CWD:-}" ]; then printf 'p%s\\nn%s\\n' "$$" "\$TT_FAKE_LSOF_CWD"; exit 0; fi\nexit 1`);
@@ -290,7 +298,7 @@ describe("MACP4 US-002 — daemon-control + tt-process-identity Darwin identity/
 
       const runOwned = (env: NodeJS.ProcessEnv): CmdResult =>
         runExtracted(
-          [fn],
+          [ttLsofTimeoutFn, lsofBoundedFn, fn],
           prologue,
           `if verify_process_tt_owned 12345 /ignored; then echo "rc=0"; else echo "rc=$?"; fi`,
           env,
@@ -565,6 +573,8 @@ describe("MACP5 US-001 — daemon-control identity-verified fallback pid recordi
     const ttOwned = extractFunction(dcText, "verify_process_tt_owned");
     assert.ok(helper, "verify_launched_daemon_pid must exist");
     assert.ok(ttOwned, "verify_process_tt_owned must exist");
+    assert.ok(ttLsofTimeoutFn, "daemon-control must define tt_lsof_timeout_s() (LSOF-EVTA US-006)");
+    assert.ok(lsofBoundedFn, "daemon-control must define lsof_bounded() (LSOF-EVTA US-006)");
 
     const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "dc-macp5-gate-"));
     try {
@@ -588,14 +598,14 @@ describe("MACP5 US-001 — daemon-control identity-verified fallback pid recordi
 
       const runGate = (env: NodeJS.ProcessEnv): CmdResult =>
         runExtracted(
-          [ttOwned, helper],
+          [ttLsofTimeoutFn, lsofBoundedFn, ttOwned, helper],
           prologue,
           `if verify_launched_daemon_pid "$$" /ignored; then echo "rc=0"; else echo "rc=$?"; fi`,
           env,
         );
       const runGateDead = (env: NodeJS.ProcessEnv): CmdResult =>
         runExtracted(
-          [ttOwned, helper],
+          [ttLsofTimeoutFn, lsofBoundedFn, ttOwned, helper],
           prologue,
           `bash -c 'exit 0' & dead=$!; wait "$dead" 2>/dev/null || true; if verify_launched_daemon_pid "$dead" /ignored; then echo "rc=0"; else echo "rc=$?"; fi`,
           env,

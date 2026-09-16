@@ -391,7 +391,10 @@ function incrementGeneration(): void {
  *   4. Increment the rotation generation counter
  *
  * The live file (all.jsonl) is NOT re-created here — the next
- * emitEvent appendFileSync call will implicitly create it.
+ * emitEvent appendEventLine (O_APPEND open) will implicitly create it.
+ *
+ * Callers on the shared all.jsonl path hold the per-file advisory lock
+ * (see emitEventCore); direct callers must respect that themselves.
  *
  * This function is idempotent: if the global file doesn't exist or
  * is below the cap, it returns without side effects.
@@ -437,6 +440,193 @@ export function rotateGlobalEventsFile(): void {
 
   // No live file remains after rotation — reset the size estimate
   globalFileSizeEstimate = 0;
+}
+
+// ── Atomic event-line appends (EVTA US-008) ─────────────────────────
+//
+// The vaivm incident (beads tamandua-6sy.64): a `step.worker_lost` line was
+// written truncated at column 1333 with the following event concatenated onto
+// it, in BOTH the run-scoped file and all.jsonl. The cause was a multi-write
+// append (fs.appendFileSync) racing across writer processes: a JS string append
+// is not guaranteed to reach the kernel as one write, and separate processes
+// can interleave their write(2) calls. Readers then saw one corrupt line.
+//
+// The fix below writes every event line as ONE buffer containing its own
+// trailing '\n', through ONE fs.writeSync on an O_APPEND descriptor. POSIX
+// only guarantees that appends are atomic for a single write at or below
+// PIPE_BUF, so for a file that may have several writer processes (all.jsonl)
+// writers additionally serialize through a per-file advisory lock. Run-scoped
+// files have exactly ONE writer process by contract (the process that owns the
+// run emits that run's events), so they need only the in-process queue.
+
+/**
+ * Upper bound (ms) for acquiring the cross-process append lock on a shared
+ * event file. Overridable with `TAMANDUA_EVENT_LOCK_TIMEOUT_MS` (defensive
+ * parse + clamp; invalid/blank/non-positive falls back to the default).
+ */
+export const DEFAULT_EVENT_LOCK_TIMEOUT_MS = 5000;
+
+/**
+ * A lock file whose mtime is older than this is presumed abandoned (the
+ * holder crashed without unlinking it) and is taken over. Appends take
+ * microseconds, so a lock held this long can only be a corpse. Tests can
+ * simulate staleness by back-dating the lock file's mtime with utimesSync.
+ */
+export const EVENT_LOCK_STALE_MS = 30_000;
+
+/** Retry cadence (ms) while another process holds the lock. */
+const EVENT_LOCK_RETRY_MS = 5;
+
+/** Parse + clamp `TAMANDUA_EVENT_LOCK_TIMEOUT_MS`, defaulting to 5000. */
+export function parseEventLockTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.TAMANDUA_EVENT_LOCK_TIMEOUT_MS;
+  if (raw === undefined) return DEFAULT_EVENT_LOCK_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_EVENT_LOCK_TIMEOUT_MS;
+  return Math.min(Math.max(1, Math.floor(n)), 60_000);
+}
+
+/** Synchronous sleep without busy-spinning (Atomics.wait blocks the thread). */
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Append `line` to `filePath` as exactly one O_APPEND write.
+ *
+ * The input is serialized to a single Buffer whose last byte is '\n' — never
+ * a JS string handed to a multi-call append helper — and planted with
+ * `fs.writeSync` on an `fs.openSync(filePath, "a")` (O_APPEND) descriptor.
+ * On the (exceptional) short write only the unwritten remainder is retried;
+ * because the descriptor is O_APPEND every retry still lands at EOF, so no
+ * retry can overwrite or interleave with another writer's bytes. The fd is
+ * always closed in `finally`.
+ *
+ * Returns the number of bytes appended (includes the trailing newline).
+ */
+export function appendEventLine(filePath: string, line: string): number {
+  const buf = Buffer.from(line.endsWith("\n") ? line : `${line}\n`, "utf-8");
+  const fd = fs.openSync(filePath, "a");
+  try {
+    let written = 0;
+    while (written < buf.length) {
+      // No position argument: an O_APPEND fd always writes at current EOF,
+      // which is what makes each write atomic with respect to other appenders.
+      const n = fs.writeSync(fd, buf, written, buf.length - written);
+      if (n <= 0) {
+        throw new Error(`short write appending event line to ${filePath}`);
+      }
+      written += n;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return buf.length;
+}
+
+interface EventFileQueueState {
+  active: boolean;
+  pending: Array<() => void>;
+}
+
+/**
+ * Per-file in-process serializers. Node's JS execution is single-threaded, so
+ * a synchronous append cannot be preempted mid-call; the queue's `active`
+ * state can therefore only be observed through REENTRANCY (an append invoked
+ * from inside another operation on the same file). Reentrant calls are parked
+ * on a FIFO and drained by the active writer before it returns, so two
+ * in-process appends to one file can never interleave their buffers and the
+ * FIFO order is preserved.
+ */
+const eventFileQueues = new Map<string, EventFileQueueState>();
+
+function withEventFileQueue(filePath: string, operation: () => void): void {
+  const key = path.resolve(filePath);
+  let state = eventFileQueues.get(key);
+  if (!state) {
+    state = { active: false, pending: [] };
+    eventFileQueues.set(key, state);
+  }
+  if (state.active) {
+    // Reentrant append: defer until the in-flight writer drains the queue.
+    state.pending.push(operation);
+    return;
+  }
+  state.active = true;
+  try {
+    operation();
+  } finally {
+    try {
+      while (state.pending.length > 0) {
+        const next = state.pending.shift()!;
+        try {
+          next();
+        } catch (err) {
+          logger.warn("Deferred event append failed", { file: key, error: String(err) });
+        }
+      }
+    } finally {
+      state.active = false;
+      if (state.pending.length === 0) eventFileQueues.delete(key);
+    }
+  }
+}
+
+/**
+ * Acquire the per-file advisory lock for a shared event file by exclusively
+ * creating `<file>.lock` (O_CREAT|O_EXCL). Retries with a bounded deadline
+ * (`TAMANDUA_EVENT_LOCK_TIMEOUT_MS`) and takes over a lock older than
+ * `EVENT_LOCK_STALE_MS`. Returns the lock fd, or null when the lock could not
+ * be acquired within the deadline. The lock file is intentionally left empty:
+ * its existence plus mtime are the whole protocol state.
+ */
+function acquireEventFileLock(lockPath: string, timeoutMs: number): number | null {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return fs.openSync(lockPath, "wx"); // O_CREAT | O_EXCL
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        logger.warn("Failed to create event lock file", { lockPath, error: String(err) });
+        return null;
+      }
+    }
+
+    // Lock exists — take it over if it looks abandoned, otherwise wait.
+    try {
+      const st = fs.statSync(lockPath);
+      if (Date.now() - st.mtimeMs > EVENT_LOCK_STALE_MS) {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          // Another waiter took it over first — fall through to retry.
+        }
+        continue;
+      }
+    } catch {
+      // Lock vanished between open and stat — retry immediately.
+      continue;
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    sleepSync(Math.min(EVENT_LOCK_RETRY_MS, remaining));
+  }
+}
+
+/** Release a lock acquired by acquireEventFileLock (close fd, unlink file). */
+function releaseEventFileLock(lockPath: string, fd: number): void {
+  try {
+    fs.closeSync(fd);
+  } catch {
+    // already closed
+  }
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // already removed (stale takeover / external cleanup)
+  }
 }
 
 // ── Event Emission ───────────────────────────────────────────────────
@@ -584,10 +774,15 @@ function emitEventCore(evt: TamanduaEvent): void {
   const eventsDir = getEventsDir();
   fs.mkdirSync(eventsDir, { recursive: true });
 
-  // Write to run-specific events file
+  // Write to the run-specific events file. CONTRACT: a run's events file has
+  // exactly ONE writer process — the process that owns the run. No
+  // cross-process lock is needed; the in-process queue still serializes
+  // reentrant appends so the file cannot interleave buffers.
   const runFile = getEventsFile(evt.runId);
   try {
-    fs.appendFileSync(runFile, line, "utf-8");
+    withEventFileQueue(runFile, () => {
+      appendEventLine(runFile, line);
+    });
   } catch (err) {
     logger.warn("Failed to write run event", {
       runId: evt.runId,
@@ -596,17 +791,37 @@ function emitEventCore(evt: TamanduaEvent): void {
     });
   }
 
-  // Write to global events file — rotate after if the file now exceeds the cap
+  // Write to global events file — rotate after if the file now exceeds the cap.
+  // CONTRACT: all.jsonl MAY have several writer processes (every process that
+  // emits any event appends here), so the append+rotation critical section is
+  // serialized with the per-file advisory lock. If the lock cannot be
+  // acquired within the deadline the global append is SKIPPED (the run-scoped
+  // line is still durable) — dropping one global copy is preferable to
+  // corrupting the shared log for every reader.
   const globalFile = getGlobalEventsFile();
   try {
-    fs.appendFileSync(globalFile, line, "utf-8");
-    globalFileSizeEstimate += Buffer.byteLength(line);
-    if (globalFileSizeEstimate > MAX_EVENTS_FILE_SIZE) {
-      rotateGlobalEventsFile();
-      // rotateGlobalEventsFile now correctly updates the estimate on
-      // all branches (no-op: sets to actual stat size; rotated: 0;
-      // ENOENT: 0). No need to reset here.
-    }
+    withEventFileQueue(globalFile, () => {
+      const lockPath = `${globalFile}.lock`;
+      const lockFd = acquireEventFileLock(lockPath, parseEventLockTimeoutMs());
+      if (lockFd === null) {
+        logger.warn("Failed to acquire global event lock; skipping global append", {
+          event: evt.event,
+          file: globalFile,
+        });
+        return;
+      }
+      try {
+        globalFileSizeEstimate += appendEventLine(globalFile, line);
+        if (globalFileSizeEstimate > MAX_EVENTS_FILE_SIZE) {
+          rotateGlobalEventsFile();
+          // rotateGlobalEventsFile now correctly updates the estimate on
+          // all branches (no-op: sets to actual stat size; rotated: 0;
+          // ENOENT: 0). No need to reset here.
+        }
+      } finally {
+        releaseEventFileLock(lockPath, lockFd);
+      }
+    });
   } catch (err) {
     logger.warn("Failed to write global event", {
       event: evt.event,
@@ -653,6 +868,131 @@ const TAIL_CHUNK_SIZE = 256 * 1024; // 256 KB
 const MAX_TAIL_READ = 4 * 1024 * 1024; // 4 MB
 
 // ── Event Reading ────────────────────────────────────────────────────
+//
+// Reader-side counterpart to the atomic-append contract above (EVTA US-009).
+// Even with single-write O_APPEND appends, a writer can die mid-write and
+// leave a TORN final line (no trailing newline), and an older/corrupt writer
+// can leave a newline-terminated garbage line. The shared parser below
+// classifies both without ever throwing, so every reader (cursor, run, tail,
+// recent) behaves identically:
+//
+//   - complete newline-terminated lines that parse to a JSON object → events
+//   - complete newline-terminated lines that fail JSON.parse or are not
+//     objects → `corrupt` entries (reported with an absolute byte offset)
+//   - the final unterminated segment → `trailingPartial` (never corrupt,
+//     never returned as an event; a cursor must stay at its start so the
+//     line is re-read once the writer completes it)
+//   - empty / CR-only lines are silently skipped (they carry no event)
+
+/** A newline-terminated event line that could not be parsed as a JSON object. */
+export interface CorruptEventLine {
+  /** Absolute byte offset (from the start of the underlying file) of the line. */
+  offset: number;
+  /** Byte length of the corrupt line, excluding its terminating newline. */
+  length: number;
+  /** Bounded UTF-8 preview of the line, for operator diagnostics. */
+  preview: string;
+}
+
+/** The final, newline-less segment of a buffer — an in-progress/torn write. */
+export interface TrailingPartialEventLine {
+  /** Absolute byte offset of the segment's first byte. */
+  offset: number;
+  /** Byte length of the segment. */
+  length: number;
+}
+
+/** Result of classifying one raw JSONL buffer. */
+export interface ParsedJsonlEventBuffer {
+  /** Every valid event, in file order. */
+  events: TamanduaEvent[];
+  /** Every interior corrupt line, in file order, with its byte offset. */
+  corrupt: CorruptEventLine[];
+  /** The trailing unterminated segment, or null when the buffer ends with '\n'. */
+  trailingPartial: TrailingPartialEventLine | null;
+}
+
+/** Cap on the `preview` string carried by a corrupt-line entry. */
+export const CORRUPT_EVENT_PREVIEW_MAX_CHARS = 200;
+
+function corruptLinePreview(line: string): string {
+  if (line.length <= CORRUPT_EVENT_PREVIEW_MAX_CHARS) return line;
+  return `${line.slice(0, CORRUPT_EVENT_PREVIEW_MAX_CHARS)}…`;
+}
+
+/**
+ * Classify a raw JSONL buffer into valid events, interior corrupt lines, and a
+ * potentially-torn trailing partial. Pure and total: it never throws, never
+ * drops a valid line, and never returns the final unterminated segment as an
+ * event (a torn write must be re-read once complete).
+ *
+ * `baseOffset` is added to every reported offset so callers reading a slice of
+ * a file (a tail window, or a cursor read starting past byte 0) can report
+ * offsets relative to the real file.
+ */
+export function parseJsonlEventBuffer(buf: Buffer, baseOffset = 0): ParsedJsonlEventBuffer {
+  const events: TamanduaEvent[] = [];
+  const corrupt: CorruptEventLine[] = [];
+  let cursor = 0;
+
+  while (cursor < buf.length) {
+    const newlineIndex = buf.indexOf(0x0A, cursor);
+    if (newlineIndex === -1) break; // trailing partial line — classified below
+
+    const lineStart = cursor;
+    const lineBuffer = buf.subarray(cursor, newlineIndex);
+    cursor = newlineIndex + 1;
+
+    // Skip empty lines and CR-only lines silently — they carry no event.
+    let contentEnd = lineBuffer.length;
+    if (contentEnd > 0 && lineBuffer[contentEnd - 1] === 0x0D) contentEnd -= 1;
+    if (contentEnd === 0) continue;
+
+    const line = lineBuffer.toString("utf-8", 0, contentEnd);
+    let parsed: unknown;
+    let parseFailed = false;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      parseFailed = true;
+    }
+
+    if (!parseFailed && parsed !== null && typeof parsed === "object") {
+      events.push(parsed as TamanduaEvent);
+    } else {
+      corrupt.push({
+        offset: baseOffset + lineStart,
+        length: lineBuffer.length,
+        preview: corruptLinePreview(line),
+      });
+    }
+  }
+
+  const trailingPartial = cursor < buf.length
+    ? { offset: baseOffset + cursor, length: buf.length - cursor }
+    : null;
+
+  return { events, corrupt, trailingPartial };
+}
+
+/**
+ * Report interior corrupt event lines without ever throwing. Reporting is
+ * best-effort diagnostics: the valid events surrounding a corrupt line are
+ * still returned to the caller.
+ */
+function reportCorruptEventLines(file: string, corrupt: CorruptEventLine[]): void {
+  for (const line of corrupt) {
+    try {
+      logger.warn("Corrupt event line", {
+        file,
+        offset: line.offset,
+        length: line.length,
+      });
+    } catch {
+      // Reporting must never take down a reader.
+    }
+  }
+}
 
 /**
  * Read events appended after a byte offset from either:
@@ -660,7 +1000,11 @@ const MAX_TAIL_READ = 4 * 1024 * 1024; // 4 MB
  * - ~/.tamandua/events/<runId>.jsonl (per-run)
  *
  * Returns only complete newline-terminated records and the next cursor offset.
- * Malformed JSON lines are skipped safely.
+ * A torn final line (no trailing newline) is ignored and the returned
+ * nextOffset stays at its start so the line is re-read once the writer
+ * completes it. Interior corrupt lines are reported through logger.warn with
+ * the file path and byte offset, and never prevent valid events from being
+ * returned.
  */
 export function readEventsFromCursor(
   source: EventCursorSource,
@@ -697,32 +1041,14 @@ export function readEventsFromCursor(
     const fileBuffer = Buffer.alloc(readLength);
     fs.readSync(fd, fileBuffer, 0, readLength, effectiveOffset);
 
-    let cursor = 0;
-    const events: TamanduaEvent[] = [];
+    const parsed = parseJsonlEventBuffer(fileBuffer, effectiveOffset);
+    reportCorruptEventLines(eventsFile, parsed.corrupt);
 
-    while (cursor < fileBuffer.length) {
-      const newlineIndex = fileBuffer.indexOf(0x0A, cursor);
-      if (newlineIndex === -1) break; // trailing partial line
+    const nextOffset = parsed.trailingPartial
+      ? parsed.trailingPartial.offset
+      : effectiveOffset + fileBuffer.length;
 
-      const lineBuffer = fileBuffer.subarray(cursor, newlineIndex);
-      cursor = newlineIndex + 1;
-
-      if (lineBuffer.length === 0) continue;
-
-      const line = lineBuffer.toString("utf-8").replace(/\r$/, "");
-      if (!line) continue;
-
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed && typeof parsed === "object") {
-          events.push(parsed as TamanduaEvent);
-        }
-      } catch {
-        // Ignore malformed JSONL rows so later valid events still stream.
-      }
-    }
-
-    return { events, nextOffset: effectiveOffset + cursor, generation: currentGeneration };
+    return { events: parsed.events, nextOffset, generation: currentGeneration };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT") return { events: [], nextOffset: 0, generation: currentGeneration };
@@ -744,7 +1070,12 @@ export function readEventsFromCursor(
  * Uses fd-based tail-window reading instead of readFileSync so that
  * reading the last ~40 events from a 92 MB file takes constant time.
  * Reads chunks backward from EOF (256 KB at a time) up to a 4 MB cap,
- * stopping early once enough complete JSONL records have been found.
+ * stopping early once enough valid JSONL records have been found.
+ *
+ * Classification matches every other reader (parseJsonlEventBuffer): a torn
+ * final line is skipped, a pre-window partial (the window started mid-line)
+ * is skipped without being reported, and interior corrupt lines are reported
+ * with their absolute file offset while all valid events are still returned.
  */
 export function getRecentEvents(limit = 50): TamanduaEvent[] {
   const globalFile = getGlobalEventsFile();
@@ -757,68 +1088,48 @@ export function getRecentEvents(limit = 50): TamanduaEvent[] {
     if (fileSize === 0) return [];
 
     let windowStart = fileSize;
-    let buffer = "";
+    const chunks: Buffer[] = [];
     let totalRead = 0;
 
+    // Parse the accumulated window. When the window does not begin at byte 0
+    // it starts mid-line; the bytes before the first newline are a
+    // pre-window partial, never a corrupt line, so the parse is aligned to
+    // the first complete line.
+    const evaluate = (): ParsedJsonlEventBuffer | null => {
+      const buffer = Buffer.concat(chunks);
+      let regionStart = 0;
+      if (windowStart > 0) {
+        const firstNewline = buffer.indexOf(0x0A);
+        if (firstNewline === -1) return null; // no complete line yet
+        regionStart = firstNewline + 1;
+      }
+      return parseJsonlEventBuffer(buffer.subarray(regionStart), windowStart + regionStart);
+    };
+
+    let parsed: ParsedJsonlEventBuffer | null = null;
     // Read backwards in TAIL_CHUNK_SIZE chunks until we have at least
     // `limit` valid JSONL events, we hit the file start, or we reach
     // the MAX_TAIL_READ cap.
     while (totalRead < MAX_TAIL_READ && windowStart > 0) {
       const readSize = Math.min(TAIL_CHUNK_SIZE, windowStart);
-      windowStart -= readSize;
+      const readStart = windowStart - readSize;
 
       const buf = Buffer.alloc(readSize);
-      fs.readSync(fd, buf, 0, readSize, windowStart);
-      buffer = buf.toString("utf-8") + buffer;
+      fs.readSync(fd, buf, 0, readSize, readStart);
+      chunks.unshift(buf);
+      windowStart = readStart;
       totalRead += readSize;
 
-      // If the window starts after byte 0 the first line in `buffer`
-      // may be a partial line (we read starting mid-line).  Skip it.
-      let parseStart = 0;
-      if (windowStart > 0) {
-        const firstNewline = buffer.indexOf("\n");
-        if (firstNewline === -1) continue; // still no complete line
-        parseStart = firstNewline + 1;
-      }
-
-      const parseable = buffer.slice(parseStart);
-      const lines = parseable.split("\n").filter((l) => l.length > 0);
-
-      let validCount = 0;
-      for (const line of lines) {
-        try {
-          const parsed = JSON.parse(line);
-          if (parsed && typeof parsed === "object") validCount++;
-        } catch {
-          // skip malformed lines
-        }
-      }
-
-      if (validCount >= limit) break;
+      parsed = evaluate();
+      if (parsed && parsed.events.length >= limit) break;
     }
 
-    // Final parse: skip initial partial line, extract valid events,
-    // and return the last `limit`.
-    let parseStart = 0;
-    if (windowStart > 0) {
-      const firstNewline = buffer.indexOf("\n");
-      if (firstNewline !== -1) parseStart = firstNewline + 1;
-    }
+    // Final classification of the complete window.
+    parsed = evaluate();
+    if (!parsed) return [];
+    reportCorruptEventLines(globalFile, parsed.corrupt);
 
-    const eventLines = buffer.slice(parseStart).split("\n").filter((l) => l.length > 0);
-    const events: TamanduaEvent[] = [];
-    for (const line of eventLines) {
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed && typeof parsed === "object") {
-          events.push(parsed as TamanduaEvent);
-        }
-      } catch {
-        // skip malformed lines
-      }
-    }
-
-    return events.slice(-limit);
+    return parsed.events.slice(-limit);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT") return [];
@@ -843,6 +1154,11 @@ export function getRecentEvents(limit = 50): TamanduaEvent[] {
  * without reading and parsing the entire file.
  *
  * When limit is omitted, reads all events (unchanged behaviour).
+ *
+ * Both paths classify through parseJsonlEventBuffer: a torn final line is
+ * ignored (an in-progress write is re-read once complete) and interior
+ * corrupt lines are reported with their file offset while every valid event
+ * is still returned.
  */
 export function getRunEvents(runId: string, limit?: number): TamanduaEvent[] {
   const runFile = getEventsFile(runId);
@@ -854,15 +1170,10 @@ export function getRunEvents(runId: string, limit?: number): TamanduaEvent[] {
 
   // Unbounded full-read path — existing behaviour
   try {
-    const content = fs.readFileSync(runFile, "utf-8");
-    const lines = content.trim().split("\n").filter(Boolean);
-    return lines.map((line) => {
-      try {
-        return JSON.parse(line) as TamanduaEvent;
-      } catch {
-        return null;
-      }
-    }).filter((e): e is TamanduaEvent => e !== null);
+    const fileBuffer = fs.readFileSync(runFile);
+    const parsed = parseJsonlEventBuffer(fileBuffer, 0);
+    reportCorruptEventLines(runFile, parsed.corrupt);
+    return parsed.events;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT") return [];
@@ -874,6 +1185,12 @@ export function getRunEvents(runId: string, limit?: number): TamanduaEvent[] {
 /**
  * Read the last `limit` valid JSON events from a JSONL file using a
  * byte-offset tail scan.  This avoids parsing the entire file.
+ *
+ * The window is line-aligned (it starts just after a newline), so the only
+ * segments the parser can classify are real complete lines plus — when the
+ * writer died mid-write — the torn final line, which is skipped and reported
+ * as a trailing partial rather than a corrupt line. Interior corrupt lines
+ * inside the window are reported with their absolute file offset.
  */
 function tailRunEvents(filePath: string, limit: number): TamanduaEvent[] {
   let fileBuffer: Buffer;
@@ -888,48 +1205,25 @@ function tailRunEvents(filePath: string, limit: number): TamanduaEvent[] {
 
   if (fileBuffer.length === 0) return [];
 
-  // Scan backwards from EOF to collect at most `limit` complete lines.
-  const lines: string[] = [];
-  let end = fileBuffer.length;
-
-  while (lines.length < limit && end > 0) {
-    // Find the start of the next newline-terminated segment going backwards.
-    let nl = end - 1;
-    while (nl >= 0 && fileBuffer[nl] !== 0x0A) nl--;
-
-    let line: string;
-    if (nl < 0) {
-      // Reached beginning of file — extract the first (non-\n-prefixed) line.
-      line = fileBuffer.toString("utf-8", 0, end).replace(/\r$/, "");
-    } else if (nl + 1 < end) {
-      line = fileBuffer.toString("utf-8", nl + 1, end).replace(/\r$/, "");
-    } else {
-      // Empty line (consecutive newlines) — skip.
-      end = nl;
-      continue;
-    }
-
-    if (line) lines.unshift(line);
-
-    if (nl < 0) break; // exhausted the file
-
-    end = nl;
-  }
-
-  // Parse and filter out malformed lines.
-  const result: TamanduaEvent[] = [];
-  for (const line of lines) {
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed && typeof parsed === "object") {
-        result.push(parsed as TamanduaEvent);
+  // Find the byte offset at which a window holding at least `limit` complete
+  // lines begins by counting newlines backwards from EOF. Landing just after
+  // a newline keeps the window line-aligned, so no correct line is ever
+  // sliced in half and mistaken for a corrupt one.
+  let windowStart = 0;
+  let newlines = 0;
+  for (let i = fileBuffer.length - 1; i >= 0; i--) {
+    if (fileBuffer[i] === 0x0A) {
+      newlines++;
+      if (newlines > limit) {
+        windowStart = i + 1;
+        break;
       }
-    } catch {
-      // Skip malformed lines.
     }
   }
 
-  return result;
+  const parsed = parseJsonlEventBuffer(fileBuffer.subarray(windowStart), windowStart);
+  reportCorruptEventLines(filePath, parsed.corrupt);
+  return parsed.events.slice(-limit);
 }
 
 /**

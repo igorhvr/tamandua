@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
-import { spawn, execSync } from "node:child_process";
+import { spawn, execSync, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { describe, it, after } from "node:test";
 import { cleanChildEnv, createTempHome, reservePortHandle } from "./helpers/test-env.ts";
@@ -76,9 +76,15 @@ describe("tamandua dashboard status MCP visibility", () => {
             );
             belongsToTest = env.includes("tamandua-dashboard-status");
           } else {
-            const fds = execSync(`lsof -p ${pid} -Fn 2>/dev/null || true`, {
-              encoding: "utf8",
-            });
+            // Bounded, shell-free lsof: `-b` avoids blocking kernel calls,
+            // `-w` suppresses warnings, and the hard SIGKILL timeout keeps a
+            // stale FUSE mount from wedging the sweep. A failed probe throws
+            // and is caught below (no ownership proof => never kill).
+            const fds = execFileSync(
+              "lsof",
+              ["-b", "-w", "-p", String(pid), "-Fn"],
+              { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL" },
+            );
             belongsToTest = fds.includes("tamandua-dashboard-status");
           }
           if (belongsToTest) {

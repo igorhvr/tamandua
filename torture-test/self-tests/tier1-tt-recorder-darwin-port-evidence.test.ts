@@ -6,10 +6,18 @@
 // macOS there is no /proc, so that arm could never produce evidence and the
 // function could only ever answer "not production" (a harmless-but-useless
 // degradation). The fix adds a darwin arm: when /proc is absent, fall back to
-// `lsof -nP -iTCP -sTCP:LISTEN` and match the pid + ports directly; when lsof
+// lsof's numeric LISTEN table and match the pid + ports directly; when lsof
 // is unavailable or yields no usable evidence, print ONE explicit stderr line
 // and return 1 (not production) without ever failing the start path. The
 // linux /proc inode-matching arm is preserved unchanged.
+//
+// LSOF-EVTA US-007: that darwin lsof probe was UNBOUNDED — lsof can block
+// forever in the kernel on a stale FUSE/network mount. It now goes through
+// the portable `lsof_bounded` helper (mirrors bin/daemon-control): `lsof -b
+// -w <args>` runs in the background with stdout in a temp file, is polled up
+// to TT_LSOF_TIMEOUT_S seconds (default 5), and is SIGKILLed AND reaped on
+// expiry; a timeout/absent-lsof yields NO evidence (the existing degradation
+// line) and never fails the recorder. macOS ships no GNU `timeout`.
 //
 // Hermetic red-then-green guard (no campaign, zero tokens, no 33xx daemon):
 //   1. STRUCTURAL: the function carries the lsof arm (numeric LISTEN query +
@@ -225,6 +233,28 @@ function makeFakeLsofShim(pid: string): { dir: string; path: string } {
   return { dir, path: `${dir}:${process.env.PATH ?? ""}` };
 }
 
+/** A PATH shim dir whose `lsof` records its own pid (%TT_LSOF_HANG_PIDFILE%)
+ *  then hangs forever (LSOF-EVTA US-007 hang-proof case). The `exec sleep 60`
+ *  keeps the recorded pid equal to the live process, so the test can prove
+ *  the bounded helper SIGKILLed and reaped it. */
+function makeHangingLsofShim(): { dir: string; path: string; pidFile: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-recorder-hang-lsof-"));
+  const pidFile = path.join(dir, "hang.pid");
+  const lsof = ["#!/bin/sh", 'echo "$$" > "$TT_LSOF_HANG_PIDFILE"', "exec sleep 60", ""].join("\n");
+  fs.writeFileSync(path.join(dir, "lsof"), lsof, { mode: 0o755 });
+  return { dir, path: `${dir}:${process.env.PATH ?? ""}`, pidFile };
+}
+
+/** Whether `pid` is still a live process (ESRCH => dead/reaped). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Source the repo tt-recorder and invoke `_is_production_ports <pid>` in a
  *  fresh bash. The `$0` sentinel differs from BASH_SOURCE so the tool's
  *  `[[ "${BASH_SOURCE[0]}" == "${0}" ]]` guard does not run main(). The
@@ -301,11 +331,45 @@ describe("MACP5 US-005 (story US-005) — tt-recorder darwin port/fd evidence", 
     const fn = extractFunction(recorderText, "_is_production_ports");
     assert.ok(fn, "_is_production_ports must exist");
 
-    // darwin lsof arm: numeric LISTEN query + pid/port matching.
-    assert.match(fn, /lsof -nP -iTCP -sTCP:LISTEN/, "the darwin arm must query lsof's numeric LISTEN table");
+    // darwin lsof arm: numeric LISTEN query, now routed through the BOUNDED
+    // helper (LSOF-EVTA US-007) + pid/port matching.
+    assert.match(
+      fn,
+      /lsof_bounded -nP -iTCP -sTCP:LISTEN/,
+      "the darwin arm must query lsof's numeric LISTEN table through the bounded helper",
+    );
     assert.match(fn, /-v pid="\$pid"/, "the lsof arm must match on the pid column");
     assert.match(fn, /3334\|3338\|3339/, "the lsof arm must match production ports 3334/3338/3339");
-    assert.match(fn, /2>\/dev\/null \|\| true/, "the lsof query must be bounded and never hard-fail on absence");
+    assert.match(fn, /\|\| true/, "the lsof query must never hard-fail on absence");
+
+    // the bounded helper pair: `lsof -b -w` backgrounded + polled + SIGKILL +
+    // wait, bound from TT_LSOF_TIMEOUT_S (default 5), and no GNU `timeout`.
+    const timeoutFn = extractFunction(recorderText, "tt_lsof_timeout_s");
+    const boundedFn = extractFunction(recorderText, "lsof_bounded");
+    assert.ok(timeoutFn, "tt-recorder must define tt_lsof_timeout_s()");
+    assert.ok(boundedFn, "tt-recorder must define lsof_bounded()");
+    assert.match(boundedFn, /lsof -b -w "\$@" > "\$out_file" 2>\/dev\/null &/, "lsof_bounded must background `lsof -b -w` with stdout captured");
+    assert.match(boundedFn, /kill -KILL "\$child_pid"/, "lsof_bounded must SIGKILL a timed-out child");
+    assert.match(boundedFn, /wait "\$child_pid"/, "lsof_bounded must reap the child with wait");
+    assert.match(boundedFn, /tt_lsof_timeout_s/, "lsof_bounded must derive its bound from tt_lsof_timeout_s");
+    assert.match(timeoutFn, /TT_LSOF_TIMEOUT_S/, "tt_lsof_timeout_s must read TT_LSOF_TIMEOUT_S");
+    assert.match(timeoutFn, /default_s=5/, "the default lsof bound must be 5 seconds");
+    assert.doesNotMatch(
+      recorderText,
+      /(^|[;&|(\s])timeout\s+[0-9]/m,
+      "tt-recorder must not invoke the GNU timeout command",
+    );
+
+    // exactly one raw lsof invocation in the whole tool — inside lsof_bounded.
+    const rawCalls = recorderText
+      .split(/\r?\n/)
+      .filter((line) => /lsof -/.test(line) && !/^\s*#/.test(line) && !/lsof_bounded/.test(line));
+    assert.equal(
+      rawCalls.length,
+      1,
+      `expected exactly one raw lsof invocation (inside lsof_bounded), got:\n${rawCalls.join("\n")}`,
+    );
+    assert.match(rawCalls[0], /lsof -b -w/, "the sole raw lsof invocation must carry -b -w");
 
     // explicit logged degradation.
     assert.match(
@@ -344,6 +408,46 @@ describe("MACP5 US-005 (story US-005) — tt-recorder darwin port/fd evidence", 
       /tt-recorder: port evidence unavailable on this platform \(lsof missing or no matches\)/,
       `the degradation line must be printed to stderr. stderr: ${res.stderr}`,
     );
+  });
+
+  it("a hanging lsof is bounded: returns 1 with the degradation line within the bound and the shim is SIGKILLed and reaped", () => {
+    const pid = "987654321";
+    const shim = makeHangingLsofShim();
+    try {
+      const env = cleanEnv({
+        PATH: shim.path,
+        TT_LSOF_TIMEOUT_S: "1",
+        TT_LSOF_HANG_PIDFILE: shim.pidFile,
+      });
+      const started = Date.now();
+      const res = callProductionPorts(pid, env);
+      const elapsed = Date.now() - started;
+
+      assert.equal(
+        res.status,
+        1,
+        `a timed-out lsof must make _is_production_ports return 1 (not production). rc=${res.status} stderr: ${res.stderr}`,
+      );
+      assert.match(
+        res.stderr,
+        /tt-recorder: port evidence unavailable on this platform \(lsof missing or no matches\)/,
+        `the degradation line must be printed on timeout. stderr: ${res.stderr}`,
+      );
+      assert.ok(
+        elapsed < 15_000,
+        `the probe must return within the 1s bound (elapsed ${elapsed}ms) — an unbounded lsof would hang ~60s`,
+      );
+
+      const hangPid = Number(fs.readFileSync(shim.pidFile, "utf8").trim());
+      assert.ok(Number.isInteger(hangPid) && hangPid > 0, "the shim must record its pid");
+      assert.equal(
+        pidAlive(hangPid),
+        false,
+        `the timed-out lsof child must be SIGKILLed and reaped (pid ${hangPid} still alive)`,
+      );
+    } finally {
+      fs.rmSync(shim.dir, { recursive: true, force: true });
+    }
   });
 
   it("tt-recorder start exits 0 with lsof absent (never fails because of missing /proc or lsof)", async () => {

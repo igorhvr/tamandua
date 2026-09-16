@@ -6,12 +6,65 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { matchRunEvidence, sweepRunProcesses } from "../../dist/installer/run-cleanup.js";
+import {
+  collectProcessSnapshot,
+  matchRunEvidence,
+  parseLsofCwdRecords,
+  sweepRunProcesses,
+} from "../../dist/installer/run-cleanup.js";
 import type { RunCleanupResult } from "../../dist/installer/run-cleanup.js";
 import { readEventsFromCursor, emitEvent, type TamanduaEvent } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
+import { hasProcfs } from "../../dist/lib/proc-info.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/** True on Linux/BSD hosts where procfs (not the bulk lsof table) is the cwd source. */
+const procfs = hasProcfs();
+
+/** Quote an absolute path for safe interpolation inside a single-quoted shell string. */
+function shQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/** Write an executable fake-lsof shim. */
+function writeShim(file: string, body: string): string {
+  fs.writeFileSync(file, body, "utf-8");
+  fs.chmodSync(file, 0o755);
+  return file;
+}
+
+/** Write a fake lsof that prints the given lines (one per line) and exits 0. */
+function writeLsofShim(file: string, lines: string[], argvFile?: string): string {
+  const body = [
+    "#!/bin/sh",
+    ...(argvFile ? [`printf '%s\\n' "$@" > ${shQuote(argvFile)}`] : []),
+    ...lines.map((line) => `printf '%s\\n' ${shQuote(line)}`),
+    "exit 0",
+  ].join("\n");
+  return writeShim(file, `${body}\n`);
+}
+
+/** Restore a string env var to its previous value (or unset it). */
+function restoreEnv(key: string, previous: string | undefined): void {
+  if (previous === undefined) delete process.env[key];
+  else process.env[key] = previous;
+}
+
+/** Run `fn` with TAMANDUA_LSOF_BIN/_TIMEOUT_MS pointed at a fake lsof. */
+function withLsofEnv<T>(shim: string, timeoutMs: string | undefined, fn: () => T): T {
+  const prevBin = process.env.TAMANDUA_LSOF_BIN;
+  const prevTimeout = process.env.TAMANDUA_LSOF_TIMEOUT_MS;
+  process.env.TAMANDUA_LSOF_BIN = shim;
+  if (timeoutMs === undefined) delete process.env.TAMANDUA_LSOF_TIMEOUT_MS;
+  else process.env.TAMANDUA_LSOF_TIMEOUT_MS = timeoutMs;
+  try {
+    return fn();
+  } finally {
+    restoreEnv("TAMANDUA_LSOF_BIN", prevBin);
+    restoreEnv("TAMANDUA_LSOF_TIMEOUT_MS", prevTimeout);
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -585,6 +638,129 @@ describe("run-cleanup", () => {
       ]);
       assert.ok(bothExited[0], "child1 should have exited");
       assert.ok(bothExited[1], "child2 should have exited");
+    });
+  });
+
+  // ── Bounded bulk cwd snapshot (US-003) ───────────────────────────
+
+  it("parseLsofCwdRecords maps p/n records and ignores malformed output", () => {
+    const records = parseLsofCwdRecords(
+      ["p10", "fcwd", "n/a", "p0", "n/ignored", "p20", "fcwd", "/not-a-path", "n/c", ""].join(
+        "\n",
+      ),
+    );
+    assert.deepEqual(
+      [...records.entries()],
+      [
+        [10, "/a"],
+        [20, "/c"],
+      ],
+    );
+  });
+
+  it("routes the bulk cwd probe through the bounded -b -w primitive (macOS)", { skip: procfs }, () => {
+    const argvFile = path.join(stateDir, "bulk-argv.txt");
+    const shim = writeLsofShim(
+      path.join(stateDir, "bulk-ok.sh"),
+      ["p4242", "fcwd", `n${fakeWorktreePath}`],
+      argvFile,
+    );
+
+    const entries = withLsofEnv(shim, "3000", () => collectProcessSnapshot());
+
+    const argv = fs.readFileSync(argvFile, "utf-8").trim().split("\n");
+    assert.deepEqual(
+      argv,
+      ["-b", "-w", "-d", "cwd", "-Fpn"],
+      "the bulk snapshot must always carry -b -w (and a timeout) so it cannot wedge",
+    );
+
+    const entry = entries.find((e) => e.pid === 4242);
+    assert.ok(entry, "the fake pid from the lsof table should be in the snapshot");
+    assert.equal(entry.cwd, fakeWorktreePath);
+  });
+
+  it("stays bounded and fails closed when the bulk lsof hangs (macOS)", { skip: procfs }, () => {
+    const pidFile = path.join(stateDir, "bulk-hang.pid");
+    const shim = writeShim(
+      path.join(stateDir, "bulk-hang.sh"),
+      `#!/bin/sh\nprintf '%s\\n' "$$" > ${shQuote(pidFile)}\nexec sleep 60\n`,
+    );
+    const logFile = path.join(stateDir, "tamandua.log");
+    const logBefore = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf-8") : "";
+
+    const startedAt = Date.now();
+    const entries = withLsofEnv(shim, "800", () => collectProcessSnapshot());
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.ok(
+      elapsedMs < 800 + 1000,
+      `bulk snapshot must return within timeout+1000ms, took ${elapsedMs}ms`,
+    );
+    for (const entry of entries) {
+      assert.equal(
+        entry.cwd,
+        null,
+        `cwd evidence must be absent (null), not fabricated, for pid ${entry.pid}`,
+      );
+    }
+
+    const logAfter = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf-8") : "";
+    assert.match(
+      logAfter.slice(logBefore.length),
+      /bulk lsof cwd snapshot unavailable|timed out/,
+      "an unanswered bulk probe must be reported through logger.warn",
+    );
+
+    const pid = Number(fs.readFileSync(pidFile, "utf-8").trim());
+    assert.ok(Number.isInteger(pid) && pid > 0, "shim must have recorded its pid");
+    try {
+      assert.throws(
+        () => process.kill(pid, 0),
+        (err: NodeJS.ErrnoException) => err.code === "ESRCH",
+        "hung bulk lsof shim must be killed and reaped",
+      );
+    } finally {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  });
+
+  it("does not kill an unmarked survivor when cwd evidence is unknown (macOS hang)", { skip: procfs }, () => {
+    const unrelatedCwd = path.join(stateDir, "unknown-cwd-survivor");
+    fs.mkdirSync(unrelatedCwd, { recursive: true });
+
+    const child = spawn("sleep", ["30"], {
+      cwd: unrelatedCwd,
+      env: { PATH: process.env.PATH || "/usr/bin" },
+      stdio: "ignore",
+    });
+    children.push(child);
+
+    const pidFile = path.join(stateDir, "sweep-hang.pid");
+    const shim = writeShim(
+      path.join(stateDir, "sweep-hang.sh"),
+      `#!/bin/sh\nprintf '%s\\n' "$$" > ${shQuote(pidFile)}\nexec sleep 60\n`,
+    );
+
+    return sleep(200).then(async () => {
+      const pid = child.pid!;
+      assert.ok(isAlive(pid), "unmarked child should be alive before sweep");
+
+      const result = withLsofEnv(shim, "800", () =>
+        sweepRunProcesses("test-run-001", fakeWorktreePath),
+      );
+
+      assert.ok(
+        !result.killedPids.includes(pid),
+        `unmarked pid ${pid} must not be killed when cwd evidence is unknown: ${JSON.stringify(
+          result.killedPids,
+        )}`,
+      );
+      assert.ok(isAlive(pid), "unmarked process should still be alive after sweep");
     });
   });
 });

@@ -572,6 +572,27 @@ describe("daemonctl stopControlPlane guard", { concurrency: 1 }, () => {
   });
 });
 
+// ── Signal-evidence gate (US-002) ──────────────────────────────────
+//
+// The macOS provenance guard decides whether it may signal a pid from
+// process-open-file evidence. That evidence is tri-state — a bounded lsof
+// probe that timed out reports "unknown", which must fail closed (refuse)
+// exactly like "no evidence", never like a match.
+
+describe("daemonctl processEvidencePermitsSignal", { concurrency: 1 }, () => {
+  it("permits only a definitive true; false and 'unknown' both refuse", async () => {
+    const { processEvidencePermitsSignal } = await importDaemonctl();
+
+    assert.equal(processEvidencePermitsSignal(true), true);
+    assert.equal(processEvidencePermitsSignal(false), false);
+    assert.equal(
+      processEvidencePermitsSignal("unknown"),
+      false,
+      "a probe that could not answer must never permit a signal",
+    );
+  });
+});
+
 // ── HOME-isolation regression (ISFO) ──────────────────────────────
 //
 // These tests verify that daemonctl path-resolution functions work
