@@ -141,6 +141,33 @@ describe("SPL2 workflow command module", () => {
     assert.match(getWorkflowFailHelp(), /--force/);
   });
 
+  it("documents the workdir-collision flags, env form and exit code in run/resume help", () => {
+    const runHelp = getWorkflowRunHelp();
+    assert.match(runHelp, /--queue-behind-holder/);
+    assert.match(runHelp, /--allow-multiple-runs-in-one-working-directory/);
+    assert.match(runHelp, /TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1/);
+    assert.match(runHelp, /exit code 75/);
+    assert.match(runHelp, /refused by default/);
+    assert.match(runHelp, /-worktree/);
+    assert.match(runHelp, /never collide/);
+
+    const resumeHelp = getWorkflowResumeHelp();
+    assert.match(resumeHelp, /--queue-behind-holder/);
+    assert.match(resumeHelp, /--allow-multiple-runs-in-one-working-directory/);
+    assert.match(resumeHelp, /exit code 75/);
+    assert.match(resumeHelp, /TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1/);
+    assert.match(resumeHelp, /-worktree/);
+    assert.match(resumeHelp, /never collide/);
+  });
+
+  it("advertises the workdir-collision flags in the top-level workflow usage", () => {
+    const dispatcher = readFileSync(join(process.cwd(), "src/cli/cli.ts"), "utf8");
+    assert.match(
+      dispatcher,
+      /--queue-behind-holder \| --allow-multiple-runs-in-one-working-directory/,
+    );
+  });
+
   it("preserves the exact workflow group help text", () => {
     assert.equal(getWorkflowGroupHelp(), `tamandua workflow — Manage workflows and runs
 

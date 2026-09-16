@@ -323,7 +323,18 @@ flowchart LR
     DB --> MCP["Remote MCP :3338<br/>14 tools"]
 ```
 
-**Busy harness workdirs queue, they don't refuse.** The control plane admits at most one direct (non-worktree) run per harness working directory. A second `workflow run` aimed at a directory a live run already holds is not refused: it is registered in a `waiting` state naming the holder, and `workflow run` exits **0** with a queued-behind explanation. `tamandua status` shows `WAITING: waiting for harness workdir held by run <id>: <dir>` so an operator can tell a waiting run from a dead one, and the daemon's reconciler admits the run automatically once the holder releases the directory. The `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1` escape hatch still admits immediately; every other registration validation failure stays fatal.
+**Busy harness workdirs are refused by default.** The control plane admits at most one direct (non-worktree) run per harness working directory. When a second `workflow run` targets a directory that a live run already holds, it is **refused** with exit code 75 and an actionable message naming the holder (run number, workflow, status, since). The refusal text is:
+
+```
+Cannot start run: harness working directory {dir} is already held by run #{runNumber} ({workflowId}, status {status}, since {since}).
+Retry later once the holder finishes, or:
+  --queue-behind-holder  queue this run and admit it when the holder releases the directory
+  --allow-multiple-runs-in-one-working-directory  run concurrently now; concurrent git writes in one checkout are your responsibility
+  TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1  environment form of the allow flag
+Worktree workflow variants (-worktree) never collide: each run gets its own worktree.
+```
+
+There are three ways out. Retry later once the holder finishes. Pass `--queue-behind-holder` to restore the previous waiting behavior: the run registers in the `waiting` state naming the holder, `workflow run` exits **0** with a queued-behind explanation, `tamandua status` shows `WAITING: waiting for harness workdir held by run <id>: <dir>`, and the daemon's reconciler admits the run automatically once the holder releases the directory. Or pass `--allow-multiple-runs-in-one-working-directory` (equivalently `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1`) to run concurrently immediately, with one uniform warning. **Worktree-mode runs are untouched: `-worktree` variants never collide, because each run gets its own worktree.** Every other registration validation failure stays fatal.
 
 The motor's invariants are pinned by an engineering contract with acceptance tests and real-model baselines: [tests/MOTOR-CONTRACT.md](tests/MOTOR-CONTRACT.md).
 

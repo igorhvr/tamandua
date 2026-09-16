@@ -17,7 +17,7 @@ import os from "node:os";
 import { pauseRunWithDaemon, resumeRunWithDaemon } from "../../server/control-client.js";
 import { buildAbandonReasonAggregate } from "../../installer/step-ops.js";
 import { checkCatalogStalenessWarning } from "../../installer/catalog-version.js";
-import { parseWorkflowRunArgs } from "../workflow-run-args.js";
+import { parseWorkflowRunArgs, parseWorkdirCollisionPolicyFlags } from "../workflow-run-args.js";
 import { reportUnknownCommand } from "../shared.js";
 import { logger } from "../../lib/logger.js";
 import type { HarnessType } from "../../installer/types.js";
@@ -27,6 +27,11 @@ import { detectWrongPrefix, stripIdPrefix, prefixRunId, prefixStepId } from "../
 import { displayStoryStatus } from "../../lib/step-display.js";
 import { formatInstant } from "../../lib/instant.js";
 import { getInstantFailBackoffThreshold, getInstantFailWallThresholdMs } from "../../installer/instant-fail.js";
+import {
+  WORKDIR_REFUSAL_EXIT_CODE,
+  formatSharedWorkdirWarning,
+  type WorkdirCollisionPolicy,
+} from "../../installer/workdir-collision.js";
 
 export function getWorkflowListHelp(): string {
   return `tamandua workflow list — List available bundled workflows with descriptions
@@ -125,6 +130,13 @@ The task is passed to the workflow's agents as their objective.
 On success, prints the run ID in prefixed format: run-<uuid>. Both prefixed
 and bare UUID forms are accepted when passing the run ID to other commands.
 
+A direct run whose harness working directory is already held by a live run
+is refused by default with exit code 75 and a message naming the holder and
+the three ways out (retry later, --queue-behind-holder, or
+--allow-multiple-runs-in-one-working-directory / TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1).
+Worktree workflow variants (-worktree) never collide: each run gets its own
+worktree.
+
 Options:
   --no-hurry-please-save-tokens-mode
       Prefer a token-saver wrapper for this run's work: whenever a step
@@ -142,6 +154,19 @@ Options:
   --working-directory-for-harness <dir>
       Set the working directory for the agent harness during this run.
       Agents will operate within this directory.
+  --queue-behind-holder
+      Queue this run behind the live run holding the harness working
+      directory, admitting it automatically when the holder releases the
+      directory.
+      Mutually exclusive with
+      --allow-multiple-runs-in-one-working-directory.
+  --allow-multiple-runs-in-one-working-directory
+      Run concurrently even though the harness working directory is held by
+      another live run; concurrent git writes in one checkout are the
+      caller's responsibility. Mutually exclusive with
+      --queue-behind-holder.
+      TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1 is the environment form of
+      this flag.
   --worktree-origin-repository <dir>
       Repository to clone when creating a worktree for this run.
       Defaults to the current repository.
@@ -190,7 +215,11 @@ Examples:
   tamandua workflow run feature-dev-merge "Add dark mode" --wait
   tamandua workflow run feature-dev-merge "Add dark mode" --wait --timeout 5m
   tamandua workflow run feature-dev-merge "Add dark mode" --wait --json
-  tamandua workflow run feature-dev-merge --task-file task.md --wait`;
+  tamandua workflow run feature-dev-merge --task-file task.md --wait
+  tamandua workflow run feature-dev-merge "Add dark mode" \\
+      --working-directory-for-harness /path/to/project --queue-behind-holder
+  tamandua workflow run feature-dev-merge "Add dark mode" \\
+      --allow-multiple-runs-in-one-working-directory`;
 }
 
 export function getWorkflowStatusHelp(): string {
@@ -302,10 +331,15 @@ Examples:
 export function getWorkflowResumeHelp(): string {
   return `tamandua workflow resume — Resume a paused or failed workflow run
 
-Usage: tamandua workflow resume <run-id>
+Usage: tamandua workflow resume <run-id> [options]
 
 Resumes a workflow run that is paused, mid-drain, or has failed. The run-id
 accepts prefix matching.
+
+A failed-run resume is a fresh launch for collision purposes: when the
+harness working directory is already held by a live run it is refused by
+default with exit code 75 and the same message as 'workflow run', naming
+the holder and the three ways out.
 
 Behavior by status:
   paused    Connects to the daemon and resumes agent polling.
@@ -320,11 +354,32 @@ Behavior by status:
             For loop-over-stories runs, every FAILED story is re-queued
             to pending with a fresh verification retry budget so the
             loop can pick it up again and the run can complete.
+            A refused collision exits 75; pass --queue-behind-holder or
+            --allow-multiple-runs-in-one-working-directory to proceed.
   Other     Terminal runs (completed, canceled) cannot be resumed.
+
+Options:
+  --queue-behind-holder
+      Queue the resumed failed run behind the live run holding the harness
+      working directory, admitting it when the holder releases it.
+      Mutually exclusive with
+      --allow-multiple-runs-in-one-working-directory.
+  --allow-multiple-runs-in-one-working-directory
+      Resume the failed run concurrently even though the harness working
+      directory is held by another live run; concurrent git writes in one
+      checkout are the caller's responsibility. Mutually exclusive with
+      --queue-behind-holder.
+      TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1 is the environment form of
+      this flag.
+      Worktree workflow variants (-worktree) never collide: each run gets
+      its own worktree.
 
 Examples:
   tamandua workflow resume run-abc12345   # Resume a paused run
-  tamandua workflow resume run-abc12345   # Cancel a pending drain / re-start a failed run`;
+  tamandua workflow resume run-abc12345   # Cancel a pending drain / re-start a failed run
+  tamandua workflow resume run-abc12345 --queue-behind-holder
+  tamandua workflow resume run-abc12345 \\
+      --allow-multiple-runs-in-one-working-directory`;
 }
 
 export function getWorkflowPauseAllHelp(): string {
@@ -631,6 +686,17 @@ export async function handleWorkflow(
       return true;
     }
     if (runStatus === "failed") {
+      // WORKDIR-FLAGS US-005: a failed-run resume accepts the same workdir
+      // collision flags as a fresh launch, with the same precedence and env
+      // fallback. A bad flag combination is a usage error.
+      let workdirCollisionPolicy: WorkdirCollisionPolicy;
+      try {
+        workdirCollisionPolicy = parseWorkdirCollisionPolicyFlags(args);
+      } catch (err) {
+        process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+        process.exit(1);
+      }
+
       // resumeWorkflow throws on registration failure (e.g. the daemon is
       // mid-teardown for a just-force-failed run and returns the retriable
       // "run teardown in progress" error). Render those cleanly — stderr
@@ -638,14 +704,32 @@ export async function handleWorkflow(
       // the throw escape to the top-level handler.
       let result: ResumeResult;
       try {
-        result = await resumeWorkflow(fullId);
+        result = await resumeWorkflow(fullId, { workdirCollisionPolicy });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         process.stderr.write(`Failed to resume run: ${message}\n`);
         process.exit(1);
       }
       if (result.status === "not_found") { console.log(`No failed run found matching "${target}".`); return true; }
-      console.log(`Resumed run run-${result.runId!.slice(0, 8)} (${result.workflowId}), restarting from step: ${result.stepId}`);
+      // WORKDIR-FLAGS US-005: a refused harness-workdir collision is a typed,
+      // distinct outcome. Write the daemon's actionable message (it already
+      // names the holder and the three ways out) to stderr and exit with the
+      // dedicated refusal code — never the generic failure path.
+      if (result.status === "refused" && result.workdirRefused) {
+        process.stderr.write(result.workdirRefused.message + "\n");
+        process.exit(WORKDIR_REFUSAL_EXIT_CODE);
+      }
+      if (result.queuedBehindRunId) {
+        // US-005: the explicit queue policy parked the resume behind a live
+        // holder; the run is registered and the reconciler admits it later.
+        console.log(
+          `Queued behind run ${result.queuedBehindRunId}: the harness working directory is held by that run. ` +
+          `The resumed run run-${result.runId!.slice(0, 8)} (${result.workflowId}) will be admitted automatically when the holder releases it.`,
+        );
+        console.log(`Check: tamandua workflow status run-${result.runId!.slice(0, 8)}`);
+      } else {
+        console.log(`Resumed run run-${result.runId!.slice(0, 8)} (${result.workflowId}), restarting from step: ${result.stepId}`);
+      }
       // YSE US-002: re-queue confirmation when resume reset FAILED stories.
       if (result.resetCount !== undefined && result.resetCount > 0) {
         console.log(`Reset ${result.resetCount} failed ${result.resetCount === 1 ? "story" : "stories"} to pending for resume.`);
@@ -784,9 +868,21 @@ export async function handleWorkflow(
       noHurrySaveTokensMode: runArgs.noHurrySaveTokensMode,
       noRelaunchUponRugpull: runArgs.noRelaunchUponRugpull,
       harnessType,
+      workdirCollisionPolicy: runArgs.workdirCollisionPolicy,
       context: runArgs.context,
       parentRunId,
     });
+
+    // WORKDIR-FLAGS US-004: a refused harness-workdir collision is a distinct,
+    // typed outcome. Render the daemon's actionable message (it already names
+    // the holder and the three ways out) to stderr and exit with the dedicated
+    // code — never the generic failure/status output. A refused run exits
+    // before any --wait loop; a queued run still enters it.
+    if (result.workdirRefused) {
+      process.stderr.write(result.workdirRefused.message + "\n");
+      process.exit(WORKDIR_REFUSAL_EXIT_CODE);
+    }
+
     const stalenessWarning = checkCatalogStalenessWarning();
     if (stalenessWarning) {
       process.stderr.write(stalenessWarning + "\n");
@@ -828,6 +924,15 @@ export async function handleWorkflow(
       console.log(`Check: tamandua workflow status run-${result.runId.slice(0, 8)}`);
     } else {
       console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nStatus: ${result.status}\nHarness CWD: ${result.workingDirectoryForHarness}`);
+    }
+
+    // WORKDIR-FLAGS US-004: when the caller explicitly allowed sharing (via the
+    // flag or the TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1 env form), surface
+    // exactly one uniform warning on stderr. A launch that never reached the
+    // control plane (daemonWarning) did not actually share anything, so it is
+    // skipped.
+    if (runArgs.workdirCollisionPolicy === "allow" && !result.daemonWarning) {
+      process.stderr.write(formatSharedWorkdirWarning(result.workingDirectoryForHarness) + "\n");
     }
 
     // If --wait, enter the wait loop for the newly created run

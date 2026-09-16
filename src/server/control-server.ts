@@ -36,6 +36,14 @@ import { emitEvent } from "../installer/events.js";
 import type { TamanduaEvent } from "../installer/events.js";
 import { validateRunHarnessForScheduling } from "../installer/run-harness.js";
 import { parseRunContext, setRunContextKey, removeRunContextKey } from "../installer/step-ops.js";
+import {
+  resolveWorkdirCollisionPolicy,
+  formatWorkdirRefusalMessage,
+  formatSharedWorkdirWarning,
+  WORKDIR_SHARED_WARNING_MARKER,
+  WORKDIR_REFUSAL_STATE,
+  type WorkdirCollisionHolder,
+} from "../installer/workdir-collision.js";
 
 export const DEFAULT_CONTROL_PORT = 3339;
 const DEFAULT_MAX_ACTIVE_TIMERS = 50;
@@ -214,6 +222,23 @@ const workdirWaitWarnState = new Map<string, number>();
 /** Default cadence for repeated workdir-wait WARN lines. */
 export const DEFAULT_WORKDIR_WAIT_WARN_INTERVAL_MS = 60_000;
 
+/**
+ * Daemon WARN marker for a launch REFUSED under the default `refuse` policy
+ * because a live run already holds the harness workdir. Deliberately distinct
+ * from both the retriable queue WARN and the allow-policy shared-workdir WARN;
+ * it is a WARN (never ERROR) because the refusal is expected behavior.
+ */
+export const WORKDIR_REFUSED_WARNING_MARKER =
+  "control-server: register-run workdir collision refused";
+
+/**
+ * Shared-workdir allow-policy warn guard: runId -> holder runId already
+ * warned about. An admitted collision must log exactly ONE uniform WARN per
+ * (run, holder) pair even if admission is retried (e.g. a resumed run with
+ * pre-existing crons).
+ */
+const sharedWorkdirWarnState = new Map<string, string>();
+
 function getWorkdirWaitWarnIntervalMs(): number {
   const raw = process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS;
   if (!raw) return DEFAULT_WORKDIR_WAIT_WARN_INTERVAL_MS;
@@ -223,11 +248,12 @@ function getWorkdirWaitWarnIntervalMs(): number {
 }
 
 /**
- * @internal — test hook: clear the workdir-wait warn-throttle state so a
- * refusal after a reset is treated as a first refusal.
+ * @internal — test hook: clear the workdir-wait and shared-workdir
+ * warn-throttle state so a refusal after a reset is treated as a first one.
  */
 export function _resetWorkdirWaitWarnState(): void {
   workdirWaitWarnState.clear();
+  sharedWorkdirWarnState.clear();
 }
 
 /** @internal — test hook: the current warn-throttle map size. */
@@ -273,6 +299,54 @@ function markActiveAfterAdmission(runId: string, requiredTimers: number, wasWait
   }
 }
 
+/**
+ * Load the identity of the live run currently holding a harness working
+ * directory, for the refusal message. Falls back to the raw id with unknown
+ * metadata when the row is missing (the holder came from in-memory job
+ * metadata, so a deleted row must not crash the refusal). `run_number` is
+ * nullable and surfaces as `null`, which the formatter renders as the run id.
+ */
+function buildWorkdirCollisionHolder(runId: string): WorkdirCollisionHolder {
+  try {
+    const row = getDb()
+      .prepare("SELECT run_number, workflow_id, status, created_at FROM runs WHERE id = ?")
+      .get(runId) as
+      | { run_number: number | null; workflow_id: string; status: string; created_at: string }
+      | undefined;
+    if (row) {
+      return {
+        runId,
+        runNumber: typeof row.run_number === "number" ? row.run_number : null,
+        workflowId: row.workflow_id,
+        status: row.status,
+        since: row.created_at,
+      };
+    }
+  } catch (err) {
+    logger.warn("control-server: workdir collision holder lookup failed", {
+      runId,
+      error: String(err),
+    });
+  }
+  return { runId, runNumber: null, workflowId: "unknown", status: "unknown", since: "unknown" };
+}
+
+/**
+ * Emit the single uniform shared-workdir WARN for an admitted collision under
+ * the `allow` policy (no stronger warning for merge workflows). Guarded per
+ * (run, holder) so repeat admissions of the same pair log at most once.
+ */
+function warnSharedWorkdirOnce(runId: string, heldByRunId: string, dir: string): void {
+  if (sharedWorkdirWarnState.get(runId) === heldByRunId) return;
+  sharedWorkdirWarnState.set(runId, heldByRunId);
+  logger.warn(WORKDIR_SHARED_WARNING_MARKER, {
+    runId,
+    heldByRunId,
+    workingDirectoryForHarness: dir,
+    warning: formatSharedWorkdirWarning(dir),
+  });
+}
+
 async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
   const requiredTimers = requiredTimersForRun(run.id);
   const maxActiveTimers = getMaxActiveTimers();
@@ -289,43 +363,95 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
 
   const contextParsed = parseRunContext(run.id, run.context);
   const isSaveTokensMode = contextParsed.no_hurry_save_tokens_mode === 'true';
+  // WORKDIR-FLAGS: the persisted context (the run's explicit choice) wins;
+  // only when it is absent/invalid does TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1
+  // select `allow`. Everything else is the default `refuse`.
+  const collisionPolicy = resolveWorkdirCollisionPolicy(contextParsed, process.env);
 
   const duplicateRunId = _runIdForScheduledHarnessWorkdir(
     harness.workingDirectoryForHarness,
     run.id,
   );
-  if (duplicateRunId && process.env.TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR !== "1") {
-    // Retriable admission condition, not a validation failure: a live
-    // scheduled run already holds this harness working directory. Keep the
-    // run status 'running' and record a 'waiting' scheduling state so the
-    // reconciler admits it once the holder releases the directory. Never
-    // 'error' — the wait is expected behavior, not a failure.
-    const reason = `waiting for harness workdir held by run ${duplicateRunId}: ${harness.workingDirectoryForHarness}`;
-    getDb()
-      .prepare(
-        `UPDATE runs
-         SET scheduling_status = 'waiting',
-             scheduling_error = ?,
-             scheduling_requested_at = COALESCE(scheduling_requested_at, ?),
-             updated_at = ${SQL_NOW_ISO}
-         WHERE id = ?`,
-      )
-      .run(reason, new Date().toISOString(), run.id);
-    if (shouldWarnWorkdirWait(run.id)) {
-      logger.warn("control-server: register-run waiting for harness workdir", {
+  // Set when a collision exists and the `allow` policy admits it; drives both
+  // the response's sharedWorkdir flag and the single uniform WARN.
+  let sharedWorkdirAdmitted = false;
+  if (duplicateRunId) {
+    if (collisionPolicy === "refuse") {
+      // Default policy: a live scheduled run already holds this harness
+      // working directory. This is a terminal refusal for the launch (the CLI
+      // exits WORKDIR_REFUSAL_EXIT_CODE), NOT a validation failure and NOT a
+      // retriable wait: record the error state, warn (never ERROR) with a
+      // distinct marker, and hand the caller the actionable message naming the
+      // holder and the three ways out.
+      const holder = buildWorkdirCollisionHolder(duplicateRunId);
+      const message = formatWorkdirRefusalMessage(holder, harness.workingDirectoryForHarness);
+      try {
+        getDb()
+          .prepare(
+            `UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+          )
+          .run(message, run.id);
+      } catch (err) {
+        logger.warn("control-server: workdir refusal db update failed", {
+          runId: run.id,
+          error: String(err),
+        });
+      }
+      logger.warn(WORKDIR_REFUSED_WARNING_MARKER, {
         runId: run.id,
         heldByRunId: duplicateRunId,
         workingDirectoryForHarness: harness.workingDirectoryForHarness,
       });
+      return {
+        status: 409,
+        body: {
+          state: WORKDIR_REFUSAL_STATE,
+          error: message,
+          message,
+          heldByRunId: duplicateRunId,
+          holder,
+          workingDirectoryForHarness: harness.workingDirectoryForHarness,
+        },
+      };
     }
-    return ok(
-      {
-        state: "waiting",
-        heldByRunId: duplicateRunId,
-        workingDirectoryForHarness: harness.workingDirectoryForHarness,
-      },
-      202,
-    );
+
+    if (collisionPolicy === "queue") {
+      // Retriable admission condition, not a validation failure: a live
+      // scheduled run already holds this harness working directory. Keep the
+      // run status 'running' and record a 'waiting' scheduling state so the
+      // reconciler admits it once the holder releases the directory. Never
+      // 'error' — the wait is expected behavior, not a failure.
+      const reason = `waiting for harness workdir held by run ${duplicateRunId}: ${harness.workingDirectoryForHarness}`;
+      getDb()
+        .prepare(
+          `UPDATE runs
+           SET scheduling_status = 'waiting',
+               scheduling_error = ?,
+               scheduling_requested_at = COALESCE(scheduling_requested_at, ?),
+               updated_at = ${SQL_NOW_ISO}
+           WHERE id = ?`,
+        )
+        .run(reason, new Date().toISOString(), run.id);
+      if (shouldWarnWorkdirWait(run.id)) {
+        logger.warn("control-server: register-run waiting for harness workdir", {
+          runId: run.id,
+          heldByRunId: duplicateRunId,
+          workingDirectoryForHarness: harness.workingDirectoryForHarness,
+        });
+      }
+      return ok(
+        {
+          state: "waiting",
+          heldByRunId: duplicateRunId,
+          workingDirectoryForHarness: harness.workingDirectoryForHarness,
+        },
+        202,
+      );
+    }
+
+    // `allow`: run concurrently now; concurrent git writes are the caller's
+    // responsibility. Admit as usual and warn once below.
+    sharedWorkdirAdmitted = true;
   }
 
   const wasWaiting = run.scheduling_status === "waiting";
@@ -338,7 +464,15 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
       )
       .run(run.id);
     markActiveAfterAdmission(run.id, requiredTimers, wasWaiting);
-    return ok({ state: "active", requiredTimers, maxActiveTimers });
+    if (sharedWorkdirAdmitted) {
+      warnSharedWorkdirOnce(run.id, duplicateRunId!, harness.workingDirectoryForHarness);
+    }
+    return ok({
+      state: "active",
+      requiredTimers,
+      maxActiveTimers,
+      ...(sharedWorkdirAdmitted ? { sharedWorkdir: true } : {}),
+    });
   }
 
   if (existingForRun > 0 && existingForRun < requiredTimers) {
@@ -410,8 +544,16 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
     .run(run.id);
 
   markActiveAfterAdmission(run.id, requiredTimers, wasWaiting);
+  if (sharedWorkdirAdmitted) {
+    warnSharedWorkdirOnce(run.id, duplicateRunId!, harness.workingDirectoryForHarness);
+  }
   logger.info("control-server: register-run admitted", { runId: run.id, requiredTimers });
-  return ok({ state: "active", requiredTimers, maxActiveTimers }, 202);
+  return ok({
+    state: "active",
+    requiredTimers,
+    maxActiveTimers,
+    ...(sharedWorkdirAdmitted ? { sharedWorkdir: true } : {}),
+  }, 202);
 }
 
 async function admitQueuedRuns(): Promise<void> {

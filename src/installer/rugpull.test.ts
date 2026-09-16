@@ -1330,6 +1330,109 @@ describe("relaunchRunAfterRugpull", () => {
     }
   });
 
+  it("treats a 409 workdir refusal as a failed relaunch (no phantom replacement run)", async () => {
+    // WORKDIR-FLAGS US-006: when runWorkflow reports workdirRefused (the daemon
+    // refused registration because another live run holds the harness working
+    // directory and the collision policy is the default `refuse`), the rugpull
+    // path must emit run.rugpull_relaunch_failed with the refusal message and
+    // must NOT emit run.rugpull_relaunched or surface the refused run id.
+    const workflowId = "test-relaunch-refused";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+
+    const { relaunchRunAfterRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const runId = "run-workdir-refused-01";
+    insertRun(db, runId, workflowId, {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      workspace_mode: "direct",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+
+    const refusalMessage =
+      `Cannot start run: harness working directory ${repoDir} is already held by ` +
+      "run #12 (other-workflow, status running, since 2026-09-16T00:00:00.000Z).";
+
+    // Per-test mock: health probes succeed, registration is refused with the
+    // WORKDIR-FLAGS 409 contract.
+    const refusingServer = http.createServer((req, res) => {
+      if (req.url?.includes("register-run")) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          state: "refused",
+          error: refusalMessage,
+          message: refusalMessage,
+          heldByRunId: "run-holder-12",
+          holder: {
+            runId: "run-holder-12",
+            runNumber: 12,
+            workflowId: "other-workflow",
+            status: "running",
+            since: "2026-09-16T00:00:00.000Z",
+          },
+          workingDirectoryForHarness: repoDir,
+        }));
+      } else {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      }
+    });
+    const refusingPort = await new Promise<number>((resolve) => {
+      refusingServer.listen(0, "127.0.0.1", () => {
+        const addr = refusingServer.address();
+        assert.ok(addr && typeof addr !== "string");
+        resolve(addr.port);
+      });
+    });
+
+    const savedPort = process.env.TAMANDUA_CONTROL_PORT;
+    process.env.TAMANDUA_CONTROL_PORT = String(refusingPort);
+    try {
+      const result = await relaunchRunAfterRugpull(runId);
+      assert.equal(
+        result.relaunched,
+        false,
+        "a refused replacement must not report a relaunch",
+      );
+      assert.equal(
+        result.newRunId,
+        undefined,
+        "no refused replacement run id should be surfaced",
+      );
+
+      const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, runId);
+      const failedEvents = events.filter(
+        (e) => e.event === "run.rugpull_relaunch_failed",
+      );
+      assert.equal(failedEvents.length, 1, "should emit one relaunch_failed event");
+      assert.ok(
+        String(failedEvents[0].detail).includes(refusalMessage),
+        "relaunch_failed detail should contain the refusal message",
+      );
+
+      const relaunchedEvents = events.filter(
+        (e) => e.event === "run.rugpull_relaunched",
+      );
+      assert.equal(
+        relaunchedEvents.length,
+        0,
+        "must not emit run.rugpull_relaunched for a refused replacement",
+      );
+    } finally {
+      if (savedPort === undefined) {
+        delete process.env.TAMANDUA_CONTROL_PORT;
+      } else {
+        process.env.TAMANDUA_CONTROL_PORT = savedPort;
+      }
+      await new Promise<void>((resolve) => refusingServer.close(() => resolve()));
+    }
+  });
+
   it("relaunches with pending_register when the control plane is unreachable (LNCH semantics)", async () => {
     // Post-LNCH contract: once the replacement run row exists, control-plane
     // unreachability must NOT fail the relaunch — the run is created,

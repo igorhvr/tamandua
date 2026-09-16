@@ -13,6 +13,10 @@ import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { stopDaemon } from "../dist/server/daemonctl.js";
+import {
+  formatSharedWorkdirWarning,
+  formatWorkdirRefusalMessage,
+} from "../dist/installer/workdir-collision.js";
 
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
@@ -424,6 +428,8 @@ describe("CLI workflow run working-directory-for-harness", () => {
           "Queued run",
           "--working-directory-for-harness",
           harnessDir,
+          // WORKDIR-FLAGS: queueing is explicit; an unflagged launch refuses.
+          "--queue-behind-holder",
         ],
         { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
       );
@@ -492,6 +498,8 @@ describe("CLI workflow run working-directory-for-harness", () => {
           "Queued wait run",
           "--working-directory-for-harness",
           harnessDir,
+          // WORKDIR-FLAGS: queueing is explicit; an unflagged launch refuses.
+          "--queue-behind-holder",
           "--wait",
           "--timeout",
           "1s",
@@ -515,6 +523,197 @@ describe("CLI workflow run working-directory-for-harness", () => {
         `--wait must enter the wait loop (heartbeat on stderr):\n${result.stderr}`,
       );
       assert.match(result.stdout, /running/, "wait output must describe the queued run");
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try {
+        fs.rmSync(env.root, { recursive: true, force: true });
+      } catch {
+        /* cleanup */
+      }
+    }
+  });
+
+  // US-004: a refused harness-workdir collision is a typed outcome — the CLI
+  // writes the daemon's message (naming the holder and the three ways out) to
+  // stderr and exits 75, never printing the generic Status line.
+  it("refuses a held harness workdir: stderr message and exit 75", async () => {
+    const env = await createTempEnv();
+    const holderRunId = crypto.randomUUID();
+    const harnessDir = path.join(env.root, "refused-workdir");
+    fs.mkdirSync(harnessDir, { recursive: true });
+    const holder = {
+      runId: holderRunId,
+      runNumber: 41,
+      workflowId: "holder-workflow",
+      status: "running",
+      since: "2026-09-16T00:00:00.000Z",
+    };
+    const refusalMessage = formatWorkdirRefusalMessage(holder, path.resolve(harnessDir));
+    const fake = await startFakeControlPlane({
+      status: 409,
+      body: {
+        state: "refused",
+        error: refusalMessage,
+        message: refusalMessage,
+        heldByRunId: holderRunId,
+        holder,
+        workingDirectoryForHarness: path.resolve(harnessDir),
+      },
+    });
+
+    try {
+      const workflowId = "cli-run-refused";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Refused run",
+          "--working-directory-for-harness",
+          harnessDir,
+        ],
+        { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+
+      assert.equal(
+        result.code,
+        75,
+        `expected refusal exit code 75, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.ok(
+        result.stderr.includes(refusalMessage),
+        `stderr must contain the full refusal message:\n${result.stderr}`,
+      );
+      assert.match(result.stderr, /--queue-behind-holder/);
+      assert.match(result.stderr, /--allow-multiple-runs-in-one-working-directory/);
+      assert.match(result.stderr, /TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1/);
+      assert.ok(
+        !result.stdout.includes("Status: running"),
+        `the generic status line must not be printed on refusal:\n${result.stdout}`,
+      );
+      assert.ok(
+        !result.stdout.includes("Run: run-"),
+        `no run summary should be printed on refusal:\n${result.stdout}`,
+      );
+      assert.ok(
+        !result.stderr.includes("Failed to register run"),
+        `a refusal must not be reported as a registration failure:\n${result.stderr}`,
+      );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try {
+        fs.rmSync(env.root, { recursive: true, force: true });
+      } catch {
+        /* cleanup */
+      }
+    }
+  });
+
+  // US-004: choosing the allow policy surfaces exactly one uniform sharing
+  // warning on stderr (no stronger warning for merge workflows).
+  it("warns once on stderr with --allow-multiple-runs-in-one-working-directory", async () => {
+    const env = await createTempEnv();
+    const harnessDir = path.join(env.root, "shared-workdir-flag");
+    fs.mkdirSync(harnessDir, { recursive: true });
+    const fake = await startFakeControlPlane({
+      status: 200,
+      body: { state: "active", requiredTimers: 1, sharedWorkdir: true },
+    });
+
+    try {
+      const workflowId = "cli-run-allow-flag";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Allowed run",
+          "--working-directory-for-harness",
+          harnessDir,
+          "--allow-multiple-runs-in-one-working-directory",
+        ],
+        { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+
+      assert.equal(
+        result.code,
+        0,
+        `expected exit code 0, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      const warning = formatSharedWorkdirWarning(path.resolve(harnessDir));
+      const occurrences = result.stderr.split(warning).length - 1;
+      assert.equal(
+        occurrences,
+        1,
+        `expected exactly one sharing warning, got ${occurrences}:\n${result.stderr}`,
+      );
+      assert.match(result.stdout, /Status: running/);
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try {
+        fs.rmSync(env.root, { recursive: true, force: true });
+      } catch {
+        /* cleanup */
+      }
+    }
+  });
+
+  // US-004: TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1 is exactly the environment
+  // form of the allow flag and emits the same single warning.
+  it("warns once on stderr with TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1", async () => {
+    const env = await createTempEnv();
+    const harnessDir = path.join(env.root, "shared-workdir-env");
+    fs.mkdirSync(harnessDir, { recursive: true });
+    const fake = await startFakeControlPlane({
+      status: 200,
+      body: { state: "active", requiredTimers: 1, sharedWorkdir: true },
+    });
+
+    try {
+      const workflowId = "cli-run-allow-env";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Allowed env run",
+          "--working-directory-for-harness",
+          harnessDir,
+        ],
+        {
+          HOME: env.homeDir,
+          TAMANDUA_CONTROL_PORT: String(fake.port),
+          TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR: "1",
+        },
+      );
+
+      assert.equal(
+        result.code,
+        0,
+        `expected exit code 0, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      const warning = formatSharedWorkdirWarning(path.resolve(harnessDir));
+      const occurrences = result.stderr.split(warning).length - 1;
+      assert.equal(
+        occurrences,
+        1,
+        `expected exactly one sharing warning, got ${occurrences}:\n${result.stderr}`,
+      );
     } finally {
       try { await fake.close(); } catch {}
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}

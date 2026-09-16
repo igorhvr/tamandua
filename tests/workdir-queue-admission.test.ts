@@ -31,7 +31,9 @@ import {
   createControlServer,
   _resetWorkdirWaitWarnState,
   _reconcileOnce,
+  WORKDIR_REFUSED_WARNING_MARKER,
 } from "../dist/server/control-server.js";
+import { WORKDIR_SHARED_WARNING_MARKER } from "../dist/installer/workdir-collision.js";
 import { shutdownAllCrons, removeRunCrons } from "../dist/installer/agent-scheduler.js";
 import { getDb } from "../dist/db.js";
 
@@ -239,7 +241,11 @@ describe("workdir-queue admission regression (US-005)", () => {
     const runA = crypto.randomUUID();
     const runB = crypto.randomUUID();
     seedRun(dbPath, runA, { working_directory_for_harness: shared });
-    seedRun(dbPath, runB, { working_directory_for_harness: shared });
+    // US-003: waiting is now the explicit `queue` policy, not the default.
+    seedRun(dbPath, runB, {
+      working_directory_for_harness: shared,
+      workdir_collision_policy: "queue",
+    });
 
     process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS = "60000";
     _resetWorkdirWaitWarnState();
@@ -408,6 +414,124 @@ describe("workdir-queue admission regression (US-005)", () => {
       assert.equal(row.scheduling_status, "error");
       assert.notEqual(row.scheduling_status, "waiting");
       assert.notEqual(row.status, "failed");
+    } finally {
+      await close(server);
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// US-003: default REFUSE (409, exit 75 in the CLI) and the explicit/env
+// `allow` path. Queue stays the retriable 'waiting' behavior above.
+// ══════════════════════════════════════════════════════════════════════
+
+describe("workdir collision policy: refuse/allow (US-003)", () => {
+  it("default REFUSE: held workdir gets 409 + holder details, never an ERROR", async () => {
+    const { root, stateDir, dbPath } = setupState();
+    const shared = path.join(root, "shared-workdir");
+    fs.mkdirSync(shared, { recursive: true });
+
+    const runA = crypto.randomUUID();
+    const runB = crypto.randomUUID();
+    seedRun(dbPath, runA, { working_directory_for_harness: shared });
+    seedRun(dbPath, runB, { working_directory_for_harness: shared });
+
+    const server = createControlServer({ secret: SECRET, listen: false });
+    const port = await listen(server);
+    try {
+      const registerA = await jsonRequest(port, "POST", "/control/register-run", { runId: runA });
+      assert.equal(registerA.body.state, "active", JSON.stringify(registerA.body));
+
+      const registerB = await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
+      assert.equal(registerB.status, 409, JSON.stringify(registerB.body));
+      assert.equal(registerB.body.state, "refused");
+      assert.equal(registerB.body.heldByRunId, runA);
+      assert.equal(registerB.body.workingDirectoryForHarness, shared);
+      assert.equal(registerB.body.error, registerB.body.message);
+
+      const holder = registerB.body.holder as Record<string, unknown>;
+      assert.equal(holder.runId, runA);
+      assert.equal(holder.workflowId, "wf-harness");
+      assert.equal(holder.status, "running");
+      assert.ok(typeof holder.since === "string" && holder.since.length > 0);
+      assert.match(String(registerB.body.message), /--queue-behind-holder/);
+      assert.match(String(registerB.body.message), /-worktree/);
+
+      const rowB = readRunRow(dbPath, runB);
+      assert.equal(rowB.scheduling_status, "error");
+      assert.equal(rowB.scheduling_error, registerB.body.message);
+
+      const log = readLog(stateDir);
+      assert.equal(
+        log.split("\n").some((line) => line.includes("ERROR") && line.includes("register-run failed")),
+        false,
+        "refusal must not take the register-run failed ERROR path",
+      );
+      const refuses = log
+        .split("\n")
+        .filter((line) => line.includes(WORKDIR_REFUSED_WARNING_MARKER));
+      assert.equal(refuses.length, 1, `expected one refusal WARN:\n${log}`);
+      assert.ok(refuses[0].includes(runA), "refusal WARN must name the holder");
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("env allow: held workdir is admitted with exactly one uniform WARN", async () => {
+    const { root, stateDir, dbPath } = setupState();
+    const shared = path.join(root, "shared-workdir");
+    fs.mkdirSync(shared, { recursive: true });
+
+    const runA = crypto.randomUUID();
+    const runB = crypto.randomUUID();
+    seedRun(dbPath, runA, { working_directory_for_harness: shared });
+    seedRun(dbPath, runB, { working_directory_for_harness: shared });
+
+    process.env.TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR = "1";
+    _resetWorkdirWaitWarnState();
+
+    const server = createControlServer({ secret: SECRET, listen: false });
+    const port = await listen(server);
+    try {
+      await jsonRequest(port, "POST", "/control/register-run", { runId: runA });
+      const registerB = await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
+      assert.equal(registerB.status, 202, JSON.stringify(registerB.body));
+      assert.equal(registerB.body.state, "active");
+      assert.equal(registerB.body.sharedWorkdir, true);
+      assert.equal(readRunRow(dbPath, runB).scheduling_status, "active");
+
+      const warns = readLog(stateDir)
+        .split("\n")
+        .filter((line) => line.includes(WORKDIR_SHARED_WARNING_MARKER));
+      assert.equal(warns.length, 1, `expected one shared WARN:\n${readLog(stateDir)}`);
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("distinct harness directories are never refused (worktree-mode regression)", async () => {
+    const { root, dbPath } = setupState();
+    const dirA = path.join(root, "worktree-a");
+    const dirB = path.join(root, "worktree-b");
+    fs.mkdirSync(dirA, { recursive: true });
+    fs.mkdirSync(dirB, { recursive: true });
+
+    const runA = crypto.randomUUID();
+    const runB = crypto.randomUUID();
+    seedRun(dbPath, runA, { working_directory_for_harness: dirA });
+    seedRun(dbPath, runB, { working_directory_for_harness: dirB });
+
+    const server = createControlServer({ secret: SECRET, listen: false });
+    const port = await listen(server);
+    try {
+      const registerA = await jsonRequest(port, "POST", "/control/register-run", { runId: runA });
+      assert.equal(registerA.body.state, "active", JSON.stringify(registerA.body));
+      const registerB = await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
+      assert.equal(registerB.status, 202, JSON.stringify(registerB.body));
+      assert.equal(registerB.body.state, "active");
+      assert.notEqual(registerB.body.state, "refused");
+      assert.notEqual(registerB.body.sharedWorkdir, true);
+      assert.equal(readRunRow(dbPath, runB).scheduling_status, "active");
     } finally {
       await close(server);
     }

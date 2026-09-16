@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { parseWorkflowRunArgs } from "../../dist/cli/workflow-run-args.js";
+import { parseWorkflowRunArgs, parseWorkdirCollisionPolicyFlags } from "../../dist/cli/workflow-run-args.js";
 import { writeFileSync, unlinkSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -355,6 +355,158 @@ describe("parseWorkflowRunArgs", () => {
       } finally {
         unlinkSync(taskPath);
       }
+    });
+  });
+
+  // WORKDIR-FLAGS US-002: queue/allow flag parsing + env mapping.
+  describe("workdir collision policy", () => {
+    const ENV_VAR = "TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR";
+
+    function withEnv<T>(value: string | undefined, fn: () => T): T {
+      const previous = process.env[ENV_VAR];
+      if (value === undefined) delete process.env[ENV_VAR];
+      else process.env[ENV_VAR] = value;
+      try {
+        return fn();
+      } finally {
+        if (previous === undefined) delete process.env[ENV_VAR];
+        else process.env[ENV_VAR] = previous;
+      }
+    }
+
+    it("defaults to refuse with no flag and no env", () => {
+      withEnv(undefined, () => {
+        const result = parseWorkflowRunArgs(["Do something"]);
+        assert.equal(result.workdirCollisionPolicy, "refuse");
+      });
+    });
+
+    it("parses --queue-behind-holder as queue", () => {
+      withEnv(undefined, () => {
+        const result = parseWorkflowRunArgs(["Do something", "--queue-behind-holder"]);
+        assert.equal(result.workdirCollisionPolicy, "queue");
+        assert.equal(result.taskTitle, "Do something");
+      });
+    });
+
+    it("parses --allow-multiple-runs-in-one-working-directory as allow", () => {
+      withEnv(undefined, () => {
+        const result = parseWorkflowRunArgs([
+          "Do something",
+          "--allow-multiple-runs-in-one-working-directory",
+        ]);
+        assert.equal(result.workdirCollisionPolicy, "allow");
+      });
+    });
+
+    it("rejects both flags together, naming both", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task",
+              "--queue-behind-holder",
+              "--allow-multiple-runs-in-one-working-directory",
+            ]),
+          (err: unknown) => {
+            const message = (err as Error).message;
+            return (
+              message.includes("--queue-behind-holder") &&
+              message.includes("--allow-multiple-runs-in-one-working-directory")
+            );
+          },
+        );
+      });
+    });
+
+    it("rejects both flags together in reverse order, naming both", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task",
+              "--allow-multiple-runs-in-one-working-directory",
+              "--queue-behind-holder",
+            ]),
+          (err: unknown) => {
+            const message = (err as Error).message;
+            return (
+              message.includes("--queue-behind-holder") &&
+              message.includes("--allow-multiple-runs-in-one-working-directory")
+            );
+          },
+        );
+      });
+    });
+
+    it("env TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1 alone resolves to allow", () => {
+      withEnv("1", () => {
+        const result = parseWorkflowRunArgs(["Do something"]);
+        assert.equal(result.workdirCollisionPolicy, "allow");
+      });
+    });
+
+    it("explicit queue flag overrides the env allow form", () => {
+      withEnv("1", () => {
+        const result = parseWorkflowRunArgs(["Do something", "--queue-behind-holder"]);
+        assert.equal(result.workdirCollisionPolicy, "queue");
+      });
+    });
+
+    it("env values other than 1 do not enable allow", () => {
+      withEnv("true", () => {
+        const result = parseWorkflowRunArgs(["Do something"]);
+        assert.equal(result.workdirCollisionPolicy, "refuse");
+      });
+    });
+
+    // WORKDIR-FLAGS US-005: `workflow resume` reuses the same parser, so the
+    // shared helper must resolve identically to parseWorkflowRunArgs.
+    it("parseWorkdirCollisionPolicyFlags resolves queue/allow/refuse like parseWorkflowRunArgs", () => {
+      withEnv(undefined, () => {
+        assert.equal(parseWorkdirCollisionPolicyFlags(["--queue-behind-holder"]), "queue");
+        assert.equal(
+          parseWorkdirCollisionPolicyFlags([
+            "--allow-multiple-runs-in-one-working-directory",
+          ]),
+          "allow",
+        );
+        assert.equal(parseWorkdirCollisionPolicyFlags(["resume", "run-abc"]), "refuse");
+      });
+    });
+
+    it("parseWorkdirCollisionPolicyFlags honors the env allow form", () => {
+      withEnv("1", () => {
+        assert.equal(parseWorkdirCollisionPolicyFlags(["run-abc"]), "allow");
+      });
+      withEnv("1", () => {
+        assert.equal(
+          parseWorkdirCollisionPolicyFlags(["run-abc", "--queue-behind-holder"]),
+          "queue",
+        );
+      });
+    });
+
+    it("parseWorkdirCollisionPolicyFlags rejects both flags together", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () =>
+            parseWorkdirCollisionPolicyFlags([
+              "--queue-behind-holder",
+              "--allow-multiple-runs-in-one-working-directory",
+            ]),
+          /--queue-behind-holder/,
+        );
+      });
+    });
+
+    it("parseWorkdirCollisionPolicyFlags ignores flags after --", () => {
+      withEnv(undefined, () => {
+        assert.equal(
+          parseWorkdirCollisionPolicyFlags(["run-abc", "--", "--queue-behind-holder"]),
+          "refuse",
+        );
+      });
     });
   });
 });

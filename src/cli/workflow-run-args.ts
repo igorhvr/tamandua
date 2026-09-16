@@ -1,5 +1,9 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  resolveWorkdirCollisionPolicy,
+  type WorkdirCollisionPolicy,
+} from "../installer/workdir-collision.js";
 
 export interface WorkflowRunArgs {
   taskTitle: string;
@@ -9,6 +13,14 @@ export interface WorkflowRunArgs {
   noHurrySaveTokensMode?: boolean;
   noRelaunchUponRugpull?: boolean;
   harnessAs?: "pi" | "hermes" | "dsh";
+  /**
+   * WORKDIR-FLAGS: what to do when the harness working directory is already
+   * held by a live direct run. `refuse` (default) rejects the launch;
+   * `queue` (`--queue-behind-holder`) waits for the holder to release;
+   * `allow` (`--allow-multiple-runs-in-one-working-directory` or
+   * `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1`) runs concurrently.
+   */
+  workdirCollisionPolicy: WorkdirCollisionPolicy;
   /** Key-value pairs injected as run template context */
   context: Record<string, string>;
   /** Block until the run reaches a terminal status */
@@ -33,6 +45,8 @@ const KNOWN_FLAGS = new Set([
   "--worktree-origin-ref",
   "--context",
   "--task-file",
+  "--queue-behind-holder",
+  "--allow-multiple-runs-in-one-working-directory",
 ]);
 
 const HARNESS_FLAG_TO_TYPE: Record<string, "pi" | "hermes" | "dsh"> = {
@@ -40,6 +54,50 @@ const HARNESS_FLAG_TO_TYPE: Record<string, "pi" | "hermes" | "dsh"> = {
   "--hermes-as-harness": "hermes",
   "--dsh-as-harness": "dsh",
 };
+
+/**
+ * WORKDIR-FLAGS US-005: parse just the two workdir-collision flags out of an
+ * arbitrary argv slice and resolve the policy. Shared by `workflow run` (via
+ * parseWorkflowRunArgs) and `workflow resume`, so both commands accept exactly
+ * the same flags with the same precedence and env fallback: an explicit
+ * --queue-behind-holder wins, then an explicit
+ * --allow-multiple-runs-in-one-working-directory, then the environment form of
+ * allow (TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1); everything else refuses.
+ * Specifying both flags is a usage error. Tokens after an end-of-options `--`
+ * are never treated as flags.
+ */
+export function parseWorkdirCollisionPolicyFlags(
+  args: string[],
+): WorkdirCollisionPolicy {
+  const dashDashIdx = args.indexOf("--");
+  const flagArgs = dashDashIdx === -1 ? args : args.slice(0, dashDashIdx);
+  let queueBehindHolder = false;
+  let allowMultipleRunsInOneWorkingDirectory = false;
+
+  for (const token of flagArgs) {
+    if (token === "--queue-behind-holder") {
+      if (allowMultipleRunsInOneWorkingDirectory) {
+        throw new Error(
+          `Cannot specify both --allow-multiple-runs-in-one-working-directory and ${token}. Choose one workdir collision policy.`,
+        );
+      }
+      queueBehindHolder = true;
+      continue;
+    }
+    if (token === "--allow-multiple-runs-in-one-working-directory") {
+      if (queueBehindHolder) {
+        throw new Error(
+          `Cannot specify both --queue-behind-holder and ${token}. Choose one workdir collision policy.`,
+        );
+      }
+      allowMultipleRunsInOneWorkingDirectory = true;
+    }
+  }
+
+  if (queueBehindHolder) return "queue";
+  if (allowMultipleRunsInOneWorkingDirectory) return "allow";
+  return resolveWorkdirCollisionPolicy({}, process.env);
+}
 
 export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   let taskFileName: string | undefined;
@@ -51,6 +109,8 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   let noRelaunchUponRugpull: boolean | undefined;
   let harnessAs: "pi" | "hermes" | "dsh" | undefined;
   let harnessFlagName: string | undefined;
+  let queueBehindHolder = false;
+  let allowMultipleRunsInOneWorkingDirectory = false;
   const context: Record<string, string> = {};
 
   let afterDashDash = false;
@@ -76,6 +136,26 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
 
     if (token === "--no-relaunch-upon-rugpull") {
       noRelaunchUponRugpull = true;
+      continue;
+    }
+
+    if (token === "--queue-behind-holder") {
+      if (allowMultipleRunsInOneWorkingDirectory) {
+        throw new Error(
+          `Cannot specify both --allow-multiple-runs-in-one-working-directory and ${token}. Choose one workdir collision policy.`,
+        );
+      }
+      queueBehindHolder = true;
+      continue;
+    }
+
+    if (token === "--allow-multiple-runs-in-one-working-directory") {
+      if (queueBehindHolder) {
+        throw new Error(
+          `Cannot specify both --queue-behind-holder and ${token}. Choose one workdir collision policy.`,
+        );
+      }
+      allowMultipleRunsInOneWorkingDirectory = true;
       continue;
     }
 
@@ -282,6 +362,12 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     }
   }
 
+  // WORKDIR-FLAGS: resolve the collision policy for a fresh launch through the
+  // shared parser so `workflow resume` accepts exactly the same flags with the
+  // same precedence and env fallback. There is no persisted context to consult
+  // at CLI-parse time.
+  const workdirCollisionPolicy = parseWorkdirCollisionPolicyFlags(flagArgs);
+
   return {
     taskTitle,
     workingDirectoryForHarness,
@@ -290,6 +376,7 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     noHurrySaveTokensMode,
     noRelaunchUponRugpull,
     harnessAs,
+    workdirCollisionPolicy,
     context,
     wait,
     timeout,

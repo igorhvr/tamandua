@@ -159,60 +159,84 @@ dispatch round id. dead-owner detection (`recoverStepsWithDeadWorkers`, C18)
 and `step.respawned.priorPid` therefore refer to real harness processes. This
 was a semantics change only — no new column, no `SCHEMA_VERSION` bump.
 
-### Control plane / run registration (busy harness workdir queueing)
+### Control plane / run registration (busy harness workdir refuse/queue/allow)
 
 The daemon control plane (`src/server/control-server.ts`) admits at most one
 **direct (non-worktree) run** per harness working directory. Admission runs
 through `admitOrQueueRun()`, reached from the synchronous `POST
-/control/register-run` path and from the reconciler's periodic pass.
+/control/register-run` path and from the reconciler's periodic pass. The
+collision policy is resolved by `resolveWorkdirCollisionPolicy()` from the pure
+US-001 module `src/installer/workdir-collision.ts`: the run's persisted context
+key `workdir_collision_policy` (`refuse` | `queue` | `allow`) wins; when it is
+absent/invalid, `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1` means `allow`;
+otherwise the default is `refuse`.
 
 A second direct run pointed at a directory that a live scheduled run already
-holds is **queued, not refused**. `_runIdForScheduledHarnessWorkdir()`
-(realpath comparison against the daemon's in-memory job metadata) names the
-holder, and `admitOrQueueRun()` keeps `runs.status = 'running'` while setting:
+holds is **refused by default**. `_runIdForScheduledHarnessWorkdir()` (realpath
+comparison against the daemon's in-memory job metadata) names the holder, and
+`admitOrQueueRun()` returns HTTP **409**
+`{ state: 'refused', error, message, heldByRunId, holder: { runId, runNumber,
+workflowId, status, since }, workingDirectoryForHarness }`, sets
+`scheduling_status = 'error'` plus `scheduling_error = <message>`, and logs WARN
+`control-server: register-run workdir collision refused`. The message is built
+by `formatWorkdirRefusalMessage()` from the shared constants; it is quoted here
+verbatim:
+
+```
+Cannot start run: harness working directory {dir} is already held by run #{runNumber} ({workflowId}, status {status}, since {since}).
+Retry later once the holder finishes, or:
+  --queue-behind-holder  queue this run and admit it when the holder releases the directory
+  --allow-multiple-runs-in-one-working-directory  run concurrently now; concurrent git writes in one checkout are your responsibility
+  TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1  environment form of the allow flag
+Worktree workflow variants (-worktree) never collide: each run gets its own worktree.
+```
+
+The CLI surfaces the refusal as a typed, non-throwing
+`RunWorkflowResult.workdirRefused` (the run row ends `status='failed'`,
+`scheduling_status='error'`) and exits with the distinct exit code 75 —
+different from 1 (general failure) and 2 (wait timeout). Resume
+(`resumeWorkflow`) and replacement/rugpull runs (`relaunchRunAfterRugpull`)
+apply the **same** rule: a resumed or replacement run that would collide is
+refused with the same message unless a queue/allow flag is given.
+
+`--queue-behind-holder` selects the `queue` policy and keeps the existing
+`waiting` machinery. `admitOrQueueRun()` keeps `runs.status = 'running'` while
+setting:
 
 - `scheduling_status = 'waiting'`
 - `scheduling_error = 'waiting for harness workdir held by run <holderId>: <dir>'`
 - `scheduling_requested_at = COALESCE(scheduling_requested_at, <now ISO>)`
 
 and returns HTTP **202** `{ state: 'waiting', heldByRunId, workingDirectoryForHarness }`.
-Both the synchronous CLI register path and the deferred launch-probe path get
-this same 202/`waiting` outcome — timing no longer selects between "queued" and
-"permanently failed".
-
-Release and admission: `reconcileOnce()` re-selects
+Release and admission are unchanged: `reconcileOnce()` re-selects
 `scheduling_status IN ('pending_register', 'active', 'error', 'waiting')` on
 each 30s tick, and `admitQueuedRuns()` (run on terminate) selects
 `scheduling_status IN ('queued', 'waiting')`. Once the holder's scheduled jobs
 are gone, admission sets `scheduling_status = 'active'`, clears
 `scheduling_error`, and the run dispatches normally.
 
-Logging — this condition is never ERROR, and the register-run error is never
-double-prefixed (the control plane returns the raw message; `run.ts` adds the
-single outer `Failed to register run with daemon: ` prefix):
+`--allow-multiple-runs-in-one-working-directory` /
+`TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1` selects the `allow` policy: the
+collision is admitted now, the response adds `sharedWorkdir: true` when a
+collision was actually admitted, and exactly one uniform WARN
+(`control-server: register-run shared harness workdir allowed`) is logged per
+(run, holder). That warning is the same single line for every workflow, merge or
+not. Queue logging is unchanged: WARN
+`control-server: register-run waiting for harness workdir` (first refusal, then
+at most once per 60s, `TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS` override) while
+the wait persists, and INFO
+`control-server: register-run admitted after workdir wait`.
 
-- first refusal, then at most once per 60s
-  (`TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS` override) while the wait persists:
-  WARN `control-server: register-run waiting for harness workdir`
-  `{runId, heldByRunId, workingDirectoryForHarness}`.
-- admission of a previously-waiting run: INFO
-  `control-server: register-run admitted after workdir wait`
-  `{runId, requiredTimers}`.
-
-Operator surfaces: `workflow run` exits **0** and prints
-`Queued behind run <holder>: harness workdir <dir> is held by that run. It will
-be admitted automatically when the holder releases it.` (`--wait` still waits);
-`tamandua status` run summaries append
-`  WAITING: waiting for harness workdir held by run <id>: <dir>` and `workflow
-status` prints `Scheduling: <reason>` (also in `--json`), so a waiting run is
-distinguishable from a dead one.
+Operator surfaces: a refused `workflow run` prints the message to stderr and
+exits 75; a queued run exits **0** and prints `Queued behind run <holder>:
+harness workdir <dir> is held by that run. It will be admitted automatically
+when the holder releases it.` (`--wait` still waits); `tamandua status` run
+summaries append `  WAITING: waiting for harness workdir held by run <id>:
+<dir>` and `workflow status` prints `Scheduling: <reason>` (also in `--json`),
+so a waiting run is distinguishable from a dead one.
 
 `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1` still bypasses the queue and admits
-immediately; the one-live-run-per-workdir rule itself is **not** lifted. Every
-other register-run failure remains fatal: missing/relative/nonexistent harness
-workdir, branch mismatch, unsupported harness, and malformed input still throw,
-are marked `scheduling_status = 'error'`, and return **422** — they never enter
-`waiting`.
+immediately; the one-live-run-per-workdir rule itself is **not** lifted.
 **Post-grace process sweep (DSWP).** The terminal-run sweep
 (`sweepRunProcesses` / `matchRunEvidence` in `src/installer/run-cleanup.ts`)
 identifies run-owned processes from several evidence channels: cwd under the
@@ -238,6 +262,12 @@ runs with a null path (marker channel). This is why direct-mode runs (no
 `run_worktrees` row) are now swept too — the old "Sweep timer: no worktree
 found" early return is gone.
 
+**Worktree-mode runs are untouched.** `-worktree` variants never collide: each
+run registers its own per-run worktree, so the one-direct-run-per-workdir rule
+does not apply to them. Every other register-run failure remains fatal:
+missing/relative/nonexistent harness workdir, branch mismatch, unsupported
+harness, and malformed input still throw, are marked `scheduling_status =
+'error'`, and return **422** — they never enter `waiting`.
 **Round-outcome classification (PRAW).** Each dispatch round's *assistant*
 text is classified by `classifyWorkRoundOutcome` (via
 `parseWorkRoundMetadata` → `summarizeWorkRoundOutput`), and there is **no

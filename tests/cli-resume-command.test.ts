@@ -21,6 +21,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import crypto from "node:crypto";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
+import { formatWorkdirRefusalMessage } from "../dist/installer/workdir-collision.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_SCRIPT = path.resolve(__dirname, "..", "dist", "cli", "cli.js");
@@ -132,6 +133,43 @@ function seedRunDb(dbPath: string, runs: Array<{
   db.close();
 }
 
+/** Seed a FAILED run plus one FAILED step for the resume path (US-005). */
+function seedFailedResumeRun(params: {
+  dbPath: string;
+  runId: string;
+  harnessDir: string;
+  workflowId?: string;
+}): void {
+  seedRunDb(params.dbPath, [
+    {
+      id: params.runId,
+      workflowId: params.workflowId ?? "feature-dev-merge",
+      task: "US-005 resume collision",
+      status: "failed",
+      context: { working_directory_for_harness: params.harnessDir },
+    },
+  ]);
+  const db = new DatabaseSync(params.dbPath);
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, type, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    crypto.randomUUID(),
+    "implement",
+    params.runId,
+    "feature-dev-merge_developer",
+    0,
+    "input",
+    "STATUS, CHANGES, TESTS",
+    "failed",
+    "single",
+    now,
+    now,
+  );
+  db.close();
+}
+
 async function getAvailablePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = http.createServer();
@@ -156,6 +194,48 @@ async function waitForControlUp(port: number, timeoutMs = 5000): Promise<void> {
     }
   }
   throw new Error(`control plane did not come up on port ${port}`);
+}
+
+/**
+ * WORKDIR-FLAGS US-005: a minimal stand-in for the daemon control plane. It
+ * answers the liveness probe (/control/health) so resumeWorkflow never spawns a
+ * real daemon, and replies to register-run with a canned response. Everything
+ * else (e.g. /control/nudge) gets a benign 200.
+ */
+async function startFakeControlPlane(response: {
+  status: number;
+  body: Record<string, unknown>;
+}): Promise<{ port: number; close: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    req.on("data", () => {});
+    req.on("end", () => {
+      if (req.method === "GET" && req.url === "/control/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/control/register-run") {
+        res.writeHead(response.status, { "content-type": "application/json" });
+        res.end(JSON.stringify(response.body));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    port: address.port,
+    close: async () => {
+      server.closeAllConnections?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -722,5 +802,173 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
       stderr.includes("Missing run-id"),
       `Expected "Missing run-id" error, got stderr: "${cleanStderr(stderr)}"`,
     );
+  });
+
+  // WORKDIR-FLAGS US-005: a failed-run resume applies the same collision rule
+  // as a fresh launch. Against a refusing control plane it writes the refusal
+  // message to stderr and exits 75.
+  it("resume failed run against a refusing control plane exits 75 with the message", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const th = createTempHome("tamandua-resume-refused-");
+    const harnessDir = path.join(th.root, "held-workdir");
+    fs.mkdirSync(harnessDir, { recursive: true });
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+    const failedRunId = crypto.randomUUID();
+    seedFailedResumeRun({ dbPath, runId: failedRunId, harnessDir: path.resolve(harnessDir) });
+
+    const holderRunId = crypto.randomUUID();
+    const holder = {
+      runId: holderRunId,
+      runNumber: 41,
+      workflowId: "holder-workflow",
+      status: "running",
+      since: "2026-09-16T00:00:00.000Z",
+    };
+    const message = formatWorkdirRefusalMessage(holder, path.resolve(harnessDir));
+    const fake = await startFakeControlPlane({
+      status: 409,
+      body: {
+        state: "refused",
+        error: message,
+        message,
+        heldByRunId: holderRunId,
+        holder,
+        workingDirectoryForHarness: path.resolve(harnessDir),
+      },
+    });
+
+    try {
+      const { stdout, stderr, exitCode } = await runCli(
+        ["workflow", "resume", failedRunId],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+
+      assert.equal(
+        exitCode,
+        75,
+        `expected refusal exit code 75, got ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+      );
+      assert.ok(
+        stderr.includes(message),
+        `stderr must contain the full refusal message:\n${stderr}`,
+      );
+      assert.match(stderr, /--queue-behind-holder/);
+      assert.match(stderr, /--allow-multiple-runs-in-one-working-directory/);
+      assert.match(stderr, /TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1/);
+      assert.ok(
+        !stdout.includes("Resumed run"),
+        `a refusal must not report a successful resume:\n${stdout}`,
+      );
+    } finally {
+      await fake.close();
+    }
+  });
+
+  // WORKDIR-FLAGS US-005: the explicit queue flag persists the policy into the
+  // run context and surfaces the queued-behind outcome with exit 0.
+  it("resume failed run --queue-behind-holder persists the policy and exits 0", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const th = createTempHome("tamandua-resume-queue-");
+    const harnessDir = path.join(th.root, "held-workdir");
+    fs.mkdirSync(harnessDir, { recursive: true });
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+    const failedRunId = crypto.randomUUID();
+    seedFailedResumeRun({ dbPath, runId: failedRunId, harnessDir: path.resolve(harnessDir) });
+
+    const holderRunId = crypto.randomUUID();
+    const fake = await startFakeControlPlane({
+      status: 202,
+      body: {
+        state: "waiting",
+        heldByRunId: holderRunId,
+        workingDirectoryForHarness: path.resolve(harnessDir),
+      },
+    });
+
+    try {
+      const { stdout, stderr, exitCode } = await runCli(
+        ["workflow", "resume", failedRunId, "--queue-behind-holder"],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+
+      assert.equal(
+        exitCode,
+        0,
+        `expected exit code 0, got ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+      );
+      assert.match(
+        stdout,
+        new RegExp(`Queued behind run ${holderRunId}`),
+        `stdout must report the queued-behind outcome:\n${stdout}`,
+      );
+
+      const db = new DatabaseSync(dbPath);
+      const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(failedRunId) as
+        | { context: string }
+        | undefined;
+      db.close();
+      assert.ok(row, "run row should exist");
+      const context = JSON.parse(row!.context) as Record<string, string>;
+      assert.equal(
+        context.workdir_collision_policy,
+        "queue",
+        "the queue policy must be persisted before registering",
+      );
+    } finally {
+      await fake.close();
+    }
+  });
+
+  // WORKDIR-FLAGS US-005: the allow flag persists the policy and admits.
+  it("resume failed run --allow-multiple-runs-in-one-working-directory persists allow and exits 0", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const th = createTempHome("tamandua-resume-allow-");
+    const harnessDir = path.join(th.root, "shared-workdir");
+    fs.mkdirSync(harnessDir, { recursive: true });
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+    const failedRunId = crypto.randomUUID();
+    seedFailedResumeRun({ dbPath, runId: failedRunId, harnessDir: path.resolve(harnessDir) });
+
+    const fake = await startFakeControlPlane({
+      status: 200,
+      body: { state: "active", requiredTimers: 1, sharedWorkdir: true },
+    });
+
+    try {
+      const { stdout, stderr, exitCode } = await runCli(
+        ["workflow", "resume", failedRunId, "--allow-multiple-runs-in-one-working-directory"],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+
+      assert.equal(
+        exitCode,
+        0,
+        `expected exit code 0, got ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+      );
+      assert.match(stdout, /Resumed run/);
+
+      const db = new DatabaseSync(dbPath);
+      const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(failedRunId) as
+        | { context: string }
+        | undefined;
+      db.close();
+      assert.ok(row, "run row should exist");
+      const context = JSON.parse(row!.context) as Record<string, string>;
+      assert.equal(context.workdir_collision_policy, "allow");
+    } finally {
+      await fake.close();
+    }
   });
 });

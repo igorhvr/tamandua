@@ -401,6 +401,24 @@ export async function relaunchRunAfterRugpull(
     return { relaunched: false };
   }
 
+  // WORKDIR-FLAGS US-006: the replacement run's registration can be refused
+  // when its harness working directory is held by another live run and the
+  // collision policy is the default `refuse`. `runWorkflow` reports that as a
+  // typed, non-throwing `workdirRefused` outcome; it is a FAILED relaunch, not
+  // a phantom replacement — do not emit `run.rugpull_relaunched` and do not
+  // surface the refused run id. Worktree replacement runs get their own
+  // worktree and so never collide; this only bites direct-mode replacements.
+  if (result.workdirRefused) {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.rugpull_relaunch_failed",
+      runId: failedRunId,
+      workflowId: run.workflow_id,
+      detail: `Rugpull relaunch refused: ${result.workdirRefused.message}`,
+    });
+    return { relaunched: false };
+  }
+
   // Emit relaunch event with both run IDs
   emitEvent({
     ts: new Date().toISOString(),

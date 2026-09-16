@@ -6,7 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
 
-import { runWorkflow, isGitRepositoryForHarness } from "../../dist/installer/run.js";
+import { runWorkflow, resumeWorkflow, isGitRepositoryForHarness } from "../../dist/installer/run.js";
 import { getPidFile, getPortFile, stopDaemon, stopDaemonFamily } from "../../dist/server/daemonctl.js";
 import {
   reservePortHandles,
@@ -17,6 +17,7 @@ import {
 } from "../../tests/helpers/test-env.ts";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { getRunEvents } from "../../dist/installer/events.js";
+import { formatWorkdirRefusalMessage } from "../../dist/installer/workdir-collision.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 
 // ── Helpers ──
@@ -484,6 +485,109 @@ describe("runWorkflow", () => {
       assert.equal(ctx.no_hurry_save_tokens_mode, "true");
       assert.equal(ctx.task, "Test combined context");
       assert.equal(ctx.workspace_mode, "direct");
+    });
+
+    // ── WORKDIR-FLAGS collision policy context tests ──
+
+    it("persists workdir_collision_policy=queue on a queue-policy fresh launch", async () => {
+      const workflowId = "test-ctx-workdir-queue";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test queue workdir collision policy context",
+          workdirCollisionPolicy: "queue",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the assertion below only needs the stored context.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.workdir_collision_policy, "queue");
+    });
+
+    it("persists workdir_collision_policy=allow on an allow-policy fresh launch", async () => {
+      const workflowId = "test-ctx-workdir-allow";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test allow workdir collision policy context",
+          workdirCollisionPolicy: "allow",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the assertion below only needs the stored context.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.workdir_collision_policy, "allow");
+    });
+
+    it("does not persist workdir_collision_policy on a default (refuse) fresh launch", async () => {
+      const workflowId = "test-ctx-workdir-default";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test default workdir collision policy context",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the assertion below only needs the stored context.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.ok(
+        !("workdir_collision_policy" in ctx),
+        "default refuse policy must not add the context key",
+      );
+    });
+
+    it("does not persist workdir_collision_policy when policy is explicitly refuse", async () => {
+      const workflowId = "test-ctx-workdir-explicit-refuse";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test explicit refuse workdir collision policy context",
+          workdirCollisionPolicy: "refuse",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the assertion below only needs the stored context.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.ok(
+        !("workdir_collision_policy" in ctx),
+        "explicit refuse policy must not add the context key",
+      );
     });
 
     // ── Harness type context tests ──
@@ -1191,6 +1295,8 @@ describe("runWorkflow", () => {
           workflowId,
           taskTitle: "US-003 busy workdir is queued, not refused",
           workingDirectoryForHarness: harnessDir,
+          // WORKDIR-FLAGS: queueing is now explicit; the default is refuse.
+          workdirCollisionPolicy: "queue",
         });
 
         assert.equal(result.status, "running", "a waiting admission must not fail the run");
@@ -1261,6 +1367,481 @@ describe("runWorkflow", () => {
         .get(workflowId) as { status: string } | undefined;
       assert.ok(row, "the run row should have been created before the fatal registration error");
       assert.equal(row!.status, "failed", "genuine registration failures still fail the run");
+    });
+  });
+
+  // WORKDIR-FLAGS US-004: a 409 `{state:"refused"}` is a typed, non-throwing
+  // outcome. runWorkflow fails the persisted run (status 'failed',
+  // scheduling_status 'error') and returns workdirRefused; every other
+  // non-2xx registration response keeps the historical throwing path.
+  describe("US-004: sync register path surfaces a typed workdir refusal", () => {
+    async function startFakeControlPlane(response: {
+      status: number;
+      body: Record<string, unknown>;
+    }): Promise<{ port: number; close: () => Promise<void> }> {
+      const server = http.createServer((req, res) => {
+        // Drain the request body before replying so the client socket can close.
+        req.on("data", () => {});
+        req.on("end", () => {
+          if (req.method === "GET" && req.url === "/control/health") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+          if (req.method === "POST" && req.url === "/control/register-run") {
+            res.writeHead(response.status, { "content-type": "application/json" });
+            res.end(JSON.stringify(response.body));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      return {
+        port: address.port,
+        close: async () => {
+          server.closeAllConnections?.();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    function buildRefusalBody(harnessDir: string, holderRunId: string) {
+      const holder = {
+        runId: holderRunId,
+        runNumber: 77,
+        workflowId: "holder-workflow",
+        status: "running",
+        since: "2026-09-16T00:00:00.000Z",
+      };
+      const message = formatWorkdirRefusalMessage(holder, path.resolve(harnessDir));
+      return {
+        holder,
+        message,
+        body: {
+          state: "refused",
+          error: message,
+          message,
+          heldByRunId: holderRunId,
+          holder,
+          workingDirectoryForHarness: path.resolve(harnessDir),
+        },
+      };
+    }
+
+    it("returns workdirRefused and fails the run on a 409 refused", async () => {
+      const workflowId = "test-us004-refused";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const harnessDir = path.join(tempHome, "us004-refused-workdir");
+      initGitRepo(harnessDir);
+      const holderRunId = crypto.randomUUID();
+      const { holder, message, body } = buildRefusalBody(harnessDir, holderRunId);
+
+      const fake = await startFakeControlPlane({ status: 409, body });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof runWorkflow>>;
+      try {
+        result = await runWorkflow({
+          workflowId,
+          taskTitle: "US-004 refused collision",
+          workingDirectoryForHarness: harnessDir,
+        });
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+
+      assert.equal(result.status, "failed", "a refusal is a terminal failure, not a running run");
+      assert.equal(result.daemonWarning, undefined);
+      assert.ok(result.workdirRefused, "a 409 refused must surface workdirRefused");
+      assert.equal(result.workdirRefused!.message, message);
+      assert.equal(result.workdirRefused!.heldByRunId, holderRunId);
+      assert.deepEqual(result.workdirRefused!.holder, holder);
+      assert.equal(result.workdirRefused!.workingDirectoryForHarness, path.resolve(harnessDir));
+
+      const { getDb } = await import("../../dist/db.js");
+      const row = getDb()
+        .prepare("SELECT status, scheduling_status, scheduling_error FROM runs WHERE id = ?")
+        .get(result.runId) as {
+          status: string;
+          scheduling_status: string | null;
+          scheduling_error: string | null;
+        };
+      assert.equal(row.status, "failed");
+      assert.equal(row.scheduling_status, "error");
+      assert.equal(row.scheduling_error, message);
+
+      const events = getRunEvents(result.runId);
+      const failedEvents = events.filter((e) => e.event === "run.failed");
+      assert.equal(failedEvents.length, 1, "exactly one run.failed event for the refusal");
+      assert.match(String(failedEvents[0].detail), /Workdir collision refused/);
+    });
+
+    it("still throws when a 409 is not a workdir refusal", async () => {
+      const workflowId = "test-us004-other-409";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const harnessDir = path.join(tempHome, "us004-other-409-workdir");
+      initGitRepo(harnessDir);
+
+      const fake = await startFakeControlPlane({
+        status: 409,
+        body: { state: "busy", error: "some other conflict" },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        await assert.rejects(
+          runWorkflow({
+            workflowId,
+            taskTitle: "US-004 non-refusal 409 stays fatal",
+            workingDirectoryForHarness: harnessDir,
+          }),
+          (err: unknown) => {
+            assert.equal(
+              (err as Error).message,
+              "Failed to register run with daemon: some other conflict",
+            );
+            return true;
+          },
+        );
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+    });
+
+    it("tolerates a refusal body without holder/heldByRunId/workingDirectoryForHarness", async () => {
+      const workflowId = "test-us004-bare-refused";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const harnessDir = path.join(tempHome, "us004-bare-refused-workdir");
+      initGitRepo(harnessDir);
+      const message = "Cannot start run: harness working directory is already held.";
+
+      const fake = await startFakeControlPlane({
+        status: 409,
+        body: { state: "refused", error: message, message },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof runWorkflow>>;
+      try {
+        result = await runWorkflow({
+          workflowId,
+          taskTitle: "US-004 bare refusal body",
+          workingDirectoryForHarness: harnessDir,
+        });
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+
+      assert.ok(result.workdirRefused);
+      assert.equal(result.workdirRefused!.message, message);
+      assert.equal(result.workdirRefused!.heldByRunId, undefined);
+      assert.equal(result.workdirRefused!.holder, undefined);
+      assert.equal(
+        result.workdirRefused!.workingDirectoryForHarness,
+        path.resolve(harnessDir),
+        "missing body dir falls back to the locally resolved harness dir",
+      );
+    });
+  });
+
+  // WORKDIR-FLAGS US-005: `workflow resume` applies the same collision rule as
+  // a fresh launch. A 409 `{state:"refused"}` is a typed, non-throwing outcome
+  // (the run returns to failed/error; no second run.failed is emitted), the
+  // default clears any persisted policy, and the queue/allow flags persist the
+  // policy BEFORE registering.
+  describe("US-005: resume applies the same workdir collision refusal", () => {
+    async function startFakeControlPlane(response: {
+      status: number;
+      body: Record<string, unknown>;
+    }): Promise<{ port: number; close: () => Promise<void> }> {
+      const server = http.createServer((req, res) => {
+        // Drain the request body before replying so the client socket can close.
+        req.on("data", () => {});
+        req.on("end", () => {
+          if (req.method === "GET" && req.url === "/control/health") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+          if (req.method === "POST" && req.url === "/control/register-run") {
+            res.writeHead(response.status, { "content-type": "application/json" });
+            res.end(JSON.stringify(response.body));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      return {
+        port: address.port,
+        close: async () => {
+          server.closeAllConnections?.();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    async function seedFailedRun(
+      harnessDir: string,
+      extraContext?: Record<string, string>,
+    ): Promise<{ runId: string }> {
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      fs.mkdirSync(harnessDir, { recursive: true });
+      db.prepare(
+        `INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'failed', ?, ?, ?)`,
+      ).run(
+        runId,
+        555,
+        "test-us005-resume",
+        "US-005 resume collision",
+        JSON.stringify({
+          working_directory_for_harness: path.resolve(harnessDir),
+          ...(extraContext ?? {}),
+        }),
+        now,
+        now,
+      );
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, type, created_at, updated_at)
+         VALUES (?, ?, 'implement', 'dev', 0, 'input', 'STATUS, CHANGES, TESTS', 'failed', 'single', ?, ?)`,
+      ).run(stepId, runId, now, now);
+      return { runId };
+    }
+
+    it("returns the refused result and does not emit a fresh run.failed on 409", async () => {
+      const harnessDir = path.join(tempHome, "us005-refused-workdir");
+      const { runId } = await seedFailedRun(harnessDir);
+      const holderRunId = crypto.randomUUID();
+      const holder = {
+        runId: holderRunId,
+        runNumber: 41,
+        workflowId: "holder-workflow",
+        status: "running",
+        since: "2026-09-16T00:00:00.000Z",
+      };
+      const message = formatWorkdirRefusalMessage(holder, path.resolve(harnessDir));
+
+      const fake = await startFakeControlPlane({
+        status: 409,
+        body: {
+          state: "refused",
+          error: message,
+          message,
+          heldByRunId: holderRunId,
+          holder,
+          workingDirectoryForHarness: path.resolve(harnessDir),
+        },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId);
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+
+      assert.equal(result.status, "refused", "a 409 refusal must be a typed outcome");
+      assert.ok(result.workdirRefused, "a 409 refused must surface workdirRefused");
+      assert.equal(result.workdirRefused!.message, message);
+      assert.equal(result.workdirRefused!.heldByRunId, holderRunId);
+      assert.deepEqual(result.workdirRefused!.holder, holder);
+      assert.equal(result.workdirRefused!.workingDirectoryForHarness, path.resolve(harnessDir));
+
+      const { getDb } = await import("../../dist/db.js");
+      const row = getDb()
+        .prepare("SELECT status, scheduling_status, scheduling_error FROM runs WHERE id = ?")
+        .get(runId) as {
+          status: string;
+          scheduling_status: string | null;
+          scheduling_error: string | null;
+        };
+      assert.equal(row.status, "failed", "a refused resume returns the run to failed");
+      assert.equal(row.scheduling_status, "error");
+      assert.equal(row.scheduling_error, message);
+
+      const failedEvents = getRunEvents(runId).filter((e) => e.event === "run.failed");
+      assert.equal(
+        failedEvents.length,
+        0,
+        "a refusal must not emit a fresh run.failed for a run that already had one",
+      );
+    });
+
+    it("clears a persisted policy on a default (refuse) resume", async () => {
+      const harnessDir = path.join(tempHome, "us005-default-workdir");
+      const { runId } = await seedFailedRun(harnessDir, {
+        workdir_collision_policy: "queue",
+      });
+
+      const fake = await startFakeControlPlane({
+        status: 200,
+        body: { state: "active", requiredTimers: 1 },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId);
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+
+      assert.equal(result.status, "resumed");
+      const { getDb } = await import("../../dist/db.js");
+      const row = getDb().prepare("SELECT context FROM runs WHERE id = ?").get(runId) as {
+        context: string;
+      };
+      const context = JSON.parse(row.context) as Record<string, string>;
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(context, "workdir_collision_policy"),
+        false,
+        "a default resume must clear the persisted collision policy",
+      );
+    });
+
+    it("persists workdir_collision_policy=queue and reports the queued-behind outcome", async () => {
+      const harnessDir = path.join(tempHome, "us005-queue-workdir");
+      const { runId } = await seedFailedRun(harnessDir);
+      const holderRunId = crypto.randomUUID();
+
+      const fake = await startFakeControlPlane({
+        status: 202,
+        body: {
+          state: "waiting",
+          heldByRunId: holderRunId,
+          workingDirectoryForHarness: path.resolve(harnessDir),
+        },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId, { workdirCollisionPolicy: "queue" });
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+
+      assert.equal(result.status, "resumed");
+      assert.equal(result.queuedBehindRunId, holderRunId);
+      assert.equal(result.schedulingState, "waiting");
+
+      const { getDb } = await import("../../dist/db.js");
+      const row = getDb().prepare("SELECT context FROM runs WHERE id = ?").get(runId) as {
+        context: string;
+      };
+      const context = JSON.parse(row.context) as Record<string, string>;
+      assert.equal(context.workdir_collision_policy, "queue");
+    });
+
+    it("persists workdir_collision_policy=allow on an explicit allow resume", async () => {
+      const harnessDir = path.join(tempHome, "us005-allow-workdir");
+      const { runId } = await seedFailedRun(harnessDir);
+
+      const fake = await startFakeControlPlane({
+        status: 200,
+        body: { state: "active", requiredTimers: 1, sharedWorkdir: true },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId, { workdirCollisionPolicy: "allow" });
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+
+      assert.equal(result.status, "resumed");
+      const { getDb } = await import("../../dist/db.js");
+      const row = getDb().prepare("SELECT context FROM runs WHERE id = ?").get(runId) as {
+        context: string;
+      };
+      const context = JSON.parse(row.context) as Record<string, string>;
+      assert.equal(context.workdir_collision_policy, "allow");
+    });
+
+    it("still throws on a non-refusal 409 resume response", async () => {
+      const harnessDir = path.join(tempHome, "us005-other-409-workdir");
+      const { runId } = await seedFailedRun(harnessDir);
+
+      const fake = await startFakeControlPlane({
+        status: 409,
+        body: { state: "busy", error: "some other conflict" },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        await assert.rejects(
+          resumeWorkflow(runId),
+          (err: unknown) => {
+            assert.equal(
+              (err as Error).message,
+              "Failed to register resumed run with daemon: some other conflict",
+            );
+            return true;
+          },
+        );
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
     });
   });
 

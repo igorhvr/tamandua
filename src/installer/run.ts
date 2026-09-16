@@ -13,7 +13,7 @@ import {
   nudgeWithDaemon,
 } from "../server/control-client.js";
 import { emitEvent } from "./events.js";
-import { advancePipeline, resetFailedStoriesForResume, scheduleRunCronTeardown } from "./step-ops.js";
+import { advancePipeline, resetFailedStoriesForResume, scheduleRunCronTeardown, setRunContextKey, removeRunContextKey } from "./step-ops.js";
 import {
   RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY,
   validateRunHarnessForScheduling,
@@ -24,6 +24,12 @@ import {
   resolveGitIdentity,
   type ResolvedGitIdentity,
 } from "./git-identity.js";
+import {
+  WORKDIR_COLLISION_POLICY_KEY,
+  WORKDIR_REFUSAL_STATE,
+  type WorkdirCollisionHolder,
+  type WorkdirCollisionPolicy,
+} from "./workdir-collision.js";
 import type { HarnessType } from "./types.js";
 
 export interface RunWorkflowParams {
@@ -42,6 +48,14 @@ export interface RunWorkflowParams {
   noHurrySaveTokensMode?: boolean;
   /** Harness binary to use for agent invocations (default "pi") */
   harnessType?: HarnessType;
+  /**
+   * WORKDIR-FLAGS: what to do when the harness working directory is already
+   * held by a live direct run. Persisted into the run context for every
+   * policy except the default `refuse`, so daemon admission can honor the
+   * caller's explicit choice on this fresh launch. Resume/replacement runs
+   * set the policy separately.
+   */
+  workdirCollisionPolicy?: WorkdirCollisionPolicy;
   /** When true, suppresses automatic replacement-run launch after a rugpull is detected */
   noRelaunchUponRugpull?: boolean;
   /**
@@ -80,6 +94,20 @@ export interface RunWorkflowResult {
   schedulingState?: string;
   /** Warnings collected during run creation (e.g. base capture failures degrading rugpull detection). */
   captureWarnings?: string[];
+  /**
+   * WORKDIR-FLAGS US-004: set when the daemon REFUSED the launch because the
+   * harness working directory is already held by a live run and the run's
+   * collision policy is the default `refuse`. This is a typed, non-throwing
+   * outcome: the run row is left `failed`/`error` and the CLI renders
+   * `message` (which already names the holder and the three ways out) to
+   * stderr and exits WORKDIR_REFUSAL_EXIT_CODE.
+   */
+  workdirRefused?: {
+    message: string;
+    heldByRunId?: string;
+    holder?: WorkdirCollisionHolder;
+    workingDirectoryForHarness: string;
+  };
 }
 
 function failPersistedRunLaunch(params: {
@@ -142,6 +170,67 @@ export function isGitRepositoryForHarness(workingDirectory: string): boolean {
 }
 
 /**
+ * Parse the daemon's `holder` object off a 409 refusal body. Tolerant of a
+ * missing/partial object (a stale or older daemon) so the CLI still gets a
+ * usable typed result instead of crashing; returns undefined when there is no
+ * usable holder identity at all.
+ */
+function parseWorkdirCollisionHolder(raw: unknown): WorkdirCollisionHolder | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const record = raw as Record<string, unknown>;
+  if (typeof record.runId !== "string" || record.runId.length === 0) return undefined;
+  return {
+    runId: record.runId,
+    runNumber: typeof record.runNumber === "number" ? record.runNumber : null,
+    workflowId: typeof record.workflowId === "string" ? record.workflowId : "unknown",
+    status: typeof record.status === "string" ? record.status : "unknown",
+    since: typeof record.since === "string" ? record.since : "unknown",
+  };
+}
+
+/**
+ * WORKDIR-FLAGS US-004: bookkeeping for a launch the daemon refused because the
+ * harness working directory is held. Mirrors `failPersistedRunLaunch` (context
+ * `launch_error`, a truthful `run.failed` event) but keeps the distinct
+ * `scheduling_status = 'error'` marker the daemon set, and NEVER reports the
+ * refusal as a generic registration failure. Best-effort: the caller returns
+ * the typed refusal even if this bookkeeping cannot be written.
+ */
+function failRefusedRunLaunch(params: {
+  runId: string;
+  workflowId: string;
+  context: Record<string, string>;
+  message: string;
+}): void {
+  const db = getDb();
+  params.context.launch_error = params.message;
+
+  try {
+    db.prepare(
+      `UPDATE runs
+       SET status = 'failed', context = ?, scheduling_status = 'error',
+           scheduling_requested_at = NULL, scheduling_error = ?,
+           updated_at = ${SQL_NOW_ISO}
+       WHERE id = ?`,
+    ).run(JSON.stringify(params.context), params.message, params.runId);
+  } catch {
+    // Best effort only; the caller still returns the typed refusal.
+  }
+
+  try {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.failed",
+      runId: params.runId,
+      workflowId: params.workflowId,
+      detail: `Workdir collision refused: ${params.message}`,
+    });
+  } catch {
+    // Best effort only; the caller still returns the typed refusal.
+  }
+}
+
+/**
  * Start a new workflow run.
  *
  * 1. Loads the workflow spec
@@ -165,6 +254,7 @@ export async function runWorkflow(
     harnessType,
     noRelaunchUponRugpull,
     parentRunId,
+    workdirCollisionPolicy,
   } = params;
 
   // Load the workflow spec from the installed workflow directory
@@ -204,6 +294,14 @@ export async function runWorkflow(
     harness_type: harnessType ?? "pi",
     no_relaunch_upon_rugpull: String(noRelaunchUponRugpull ?? false),
   };
+
+  // WORKDIR-FLAGS: persist an explicit non-default collision policy so daemon
+  // admission can honor it. `refuse` (the default) is intentionally NOT
+  // written, so an unflagged launch keeps the persisted context unchanged.
+  // Fresh launches only — resume/replacement set the policy separately.
+  if (workdirCollisionPolicy && workdirCollisionPolicy !== "refuse") {
+    seededContext[WORKDIR_COLLISION_POLICY_KEY] = workdirCollisionPolicy;
+  }
 
   try {
   if (workspaceMode === "direct") {
@@ -634,6 +732,57 @@ export async function runWorkflow(
         typeof registration?.body.error === "string"
           ? registration.body.error
           : "daemon registration failed";
+
+      // WORKDIR-FLAGS US-004: a 409 `{state:"refused"}` is a typed, terminal
+      // outcome, not a generic registration failure. The daemon has already
+      // recorded the refusal; fail the persisted run (status 'failed',
+      // scheduling_status 'error') and hand the CLI the actionable message +
+      // holder so it can exit with the dedicated refusal code. Every other
+      // non-2xx response keeps the historical throwing path below.
+      if (
+        registration &&
+        registration.status === 409 &&
+        registration.body.state === WORKDIR_REFUSAL_STATE
+      ) {
+        const refusalMessage =
+          typeof registration.body.message === "string"
+            ? registration.body.message
+            : message;
+        failRefusedRunLaunch({
+          runId,
+          workflowId,
+          context: seededContext,
+          message: refusalMessage,
+        });
+
+        const heldByRunId =
+          typeof registration.body.heldByRunId === "string" &&
+          registration.body.heldByRunId.length > 0
+            ? registration.body.heldByRunId
+            : undefined;
+        const holder = parseWorkdirCollisionHolder(registration.body.holder);
+        const refusedDir =
+          typeof registration.body.workingDirectoryForHarness === "string"
+            ? registration.body.workingDirectoryForHarness
+            : workingDirectoryForHarness;
+
+        return {
+          runId,
+          runNumber,
+          workflowId,
+          taskTitle,
+          status: "failed",
+          stepCount: workflow.steps.length,
+          workingDirectoryForHarness,
+          workdirRefused: {
+            message: refusalMessage,
+            ...(heldByRunId ? { heldByRunId } : {}),
+            ...(holder ? { holder } : {}),
+            workingDirectoryForHarness: refusedDir,
+          },
+        };
+      }
+
       db.prepare(
         `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
       ).run(message, runId);
@@ -689,15 +838,40 @@ export async function runWorkflow(
 }
 
 export interface ResumeResult {
-  status: "not_found" | "resumed";
+  status: "not_found" | "resumed" | "refused";
   runId?: string;
   workflowId?: string;
   stepId?: string;
   /** YSE US-002: number of FAILED stories re-queued to pending on this resume (0/absent when none). */
   resetCount?: number;
+  /**
+   * WORKDIR-FLAGS US-005: set when the daemon parked the resumed run as
+   * 'waiting' because another live run holds its harness working directory
+   * (the explicit queue policy). The run is registered and the reconciler
+   * admits it once the holder releases the directory.
+   */
+  queuedBehindRunId?: string;
+  /** The daemon admission state that queuedBehindRunId corresponds to ('waiting'). */
+  schedulingState?: string;
+  /**
+   * WORKDIR-FLAGS US-005: set when the daemon REFUSED the resume because the
+   * harness working directory is held by a live run and the collision policy
+   * is the default `refuse`. Typed, non-throwing: the CLI renders `message`
+   * (which already names the holder and the three ways out) to stderr and
+   * exits WORKDIR_REFUSAL_EXIT_CODE.
+   */
+  workdirRefused?: {
+    message: string;
+    heldByRunId?: string;
+    holder?: WorkdirCollisionHolder;
+    workingDirectoryForHarness: string;
+  };
 }
 
-export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
+export async function resumeWorkflow(
+  runId: string,
+  opts?: { workdirCollisionPolicy?: WorkdirCollisionPolicy },
+): Promise<ResumeResult> {
   const db = getDb();
   const run = db.prepare(
     "SELECT id, workflow_id, status, context FROM runs WHERE id = ? AND status = 'failed'",
@@ -706,7 +880,20 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
   if (!run) return { status: "not_found" };
 
   await ensureDaemonControlAvailable();
-  await validateRunHarnessForScheduling(run.id, run.context);
+  const harnessValidation = await validateRunHarnessForScheduling(run.id, run.context);
+
+  // WORKDIR-FLAGS US-005: resume/replacement runs apply the same collision rule
+  // as a fresh launch. The default (`refuse`) CLEARS any persisted policy so a
+  // resume that would collide is refused; an explicit queue/allow choice is
+  // persisted into the run context BEFORE registration so daemon admission
+  // honors it. setRunContextKey/removeRunContextKey are synchronous, so the
+  // context is settled before the async register call below.
+  const collisionPolicy = opts?.workdirCollisionPolicy ?? "refuse";
+  if (collisionPolicy === "refuse") {
+    removeRunContextKey(run.id, WORKDIR_COLLISION_POLICY_KEY);
+  } else {
+    setRunContextKey(run.id, WORKDIR_COLLISION_POLICY_KEY, collisionPolicy);
+  }
 
   // Reset the run to running and request fresh scheduling admission.
   const resumeNow = new Date().toISOString();
@@ -772,6 +959,58 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
       typeof registration?.body.error === "string"
         ? registration.body.error
         : "daemon registration failed";
+
+    // WORKDIR-FLAGS US-005: a resume/replacement run applies the same rule as a
+    // fresh launch. A 409 `{state:"refused"}` is a typed outcome: restore the
+    // run's terminal (failed) shape with the refusal recorded, but do NOT emit
+    // a second run.failed — the run's truthful terminal event was already
+    // emitted when it originally failed. Every other non-2xx keeps the
+    // historical throwing path below.
+    if (
+      registration &&
+      registration.status === 409 &&
+      registration.body.state === WORKDIR_REFUSAL_STATE
+    ) {
+      const refusalMessage =
+        typeof registration.body.message === "string"
+          ? registration.body.message
+          : message;
+      try {
+        db.prepare(
+          `UPDATE runs
+           SET status = 'failed', scheduling_status = 'error',
+               scheduling_requested_at = NULL, scheduling_error = ?,
+               updated_at = ${SQL_NOW_ISO}
+           WHERE id = ?`,
+        ).run(refusalMessage, run.id);
+      } catch {
+        // Best effort only; the typed refusal is returned regardless.
+      }
+
+      const heldByRunId =
+        typeof registration.body.heldByRunId === "string" &&
+        registration.body.heldByRunId.length > 0
+          ? registration.body.heldByRunId
+          : undefined;
+      const holder = parseWorkdirCollisionHolder(registration.body.holder);
+      const refusedDir =
+        typeof registration.body.workingDirectoryForHarness === "string"
+          ? registration.body.workingDirectoryForHarness
+          : harnessValidation.workingDirectoryForHarness;
+
+      return {
+        status: "refused",
+        runId: run.id,
+        workflowId: run.workflow_id,
+        workdirRefused: {
+          message: refusalMessage,
+          ...(heldByRunId ? { heldByRunId } : {}),
+          ...(holder ? { holder } : {}),
+          workingDirectoryForHarness: refusedDir,
+        },
+      };
+    }
+
     db.prepare(
       `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
     ).run(message, run.id);
@@ -795,8 +1034,31 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
     throw new Error(`Failed to register resumed run with daemon: ${message}`);
   }
 
+  // US-005: a 2xx `waiting` admission means the explicit queue policy parked
+  // the resume behind a live holder. Surface it so the CLI can explain the
+  // queue position; the reconciler admits the run when the holder releases.
+  let queuedBehindRunId: string | undefined;
+  let schedulingState: string | undefined;
+  if (registration.body.state === "waiting") {
+    schedulingState = "waiting";
+    if (
+      typeof registration.body.heldByRunId === "string" &&
+      registration.body.heldByRunId.length > 0
+    ) {
+      queuedBehindRunId = registration.body.heldByRunId;
+    }
+  }
+
   // Same as runWorkflow: dispatch the re-pended step now, not on the sweep.
   nudgeWithDaemon().catch(() => {});
 
-  return { status: "resumed", runId: run.id, workflowId: run.workflow_id, stepId: restartStepId, resetCount: storyReset.resetCount };
+  return {
+    status: "resumed",
+    runId: run.id,
+    workflowId: run.workflow_id,
+    stepId: restartStepId,
+    resetCount: storyReset.resetCount,
+    queuedBehindRunId,
+    schedulingState,
+  };
 }

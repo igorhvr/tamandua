@@ -567,6 +567,27 @@ Worktree guidance:
   SHA in the worktree. Defaults to the current branch.
 - Worktree runs never modify the origin repository — all changes stay in
   the isolated worktree.
+
+Busy harness working directory (direct runs): a second direct launch aimed at a
+directory a live run already holds is refused with exit code 75. Pass
+`--queue-behind-holder` to queue it and let the daemon admit it when the holder
+releases the directory, or `--allow-multiple-runs-in-one-working-directory`
+(equivalently `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1`) to run concurrently
+now. Use the allow flag only when the runs touch independent files or the task
+is read-only/read-mostly; when two runs write git state (commits, branches,
+merges) in one checkout, that is the caller's responsibility. Worktree workflow
+variants (`-worktree`) never collide — each run gets its own worktree. The
+refusal message is:
+
+```
+Cannot start run: harness working directory {dir} is already held by run #{runNumber} ({workflowId}, status {status}, since {since}).
+Retry later once the holder finishes, or:
+  --queue-behind-holder  queue this run and admit it when the holder releases the directory
+  --allow-multiple-runs-in-one-working-directory  run concurrently now; concurrent git writes in one checkout are your responsibility
+  TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1  environment form of the allow flag
+Worktree workflow variants (-worktree) never collide: each run gets its own worktree.
+```
+
 `--no-hurry-please-save-tokens-mode` makes the run prefer the
 `pi-token-saver` harness: every work spawn looks for a `pi-token-saver`
 command on PATH first (per invocation, so installing it mid-run takes

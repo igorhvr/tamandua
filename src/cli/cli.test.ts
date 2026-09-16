@@ -40,6 +40,7 @@ describe("parseWorkflowRunArgs", () => {
       noHurrySaveTokensMode: undefined,
       noRelaunchUponRugpull: undefined,
       harnessAs: undefined,
+      workdirCollisionPolicy: "refuse",
       context: {},
       wait: false,
       timeout: undefined,
