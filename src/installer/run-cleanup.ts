@@ -51,8 +51,11 @@ export function readProcCwd(pid: number): string | null {
 }
 
 /**
- * Environment text of a process (procfs on Linux — NUL-separated).
- * Always null on macOS: the kernel hides other processes' environments.
+ * Environment text of a process (NUL-separated entries, or null).
+ *
+ * procfs on Linux; on macOS the native `proc-info env` helper reads the
+ * same-user environ block via sysctl KERN_PROCARGS2 (the kernel hands it out
+ * even though `ps -E` cannot — see src/lib/proc-info.ts).
  */
 export function readProcEnviron(pid: number): string | null {
   return getEnvironText(pid);
@@ -75,10 +78,11 @@ function safeRealpath(p: string): string {
  * Evidence matcher over already-collected process observations.
  * Returns the evidence string (which check matched), or null if no match.
  *
- * Channels (a)–(c) are exact on Linux. On macOS environ is unreadable, so
- * (b)/(c) never fire there; (a) cwd and (d) cmdline carry the sweep —
- * harness argv contains the run/agent ids, and run children get their cwd
- * set inside the worktree.
+ * Channels (a)–(d) are exact when the underlying reader is available. On
+ * macOS environ is read through the native KERN_PROCARGS2 helper (never
+ * `ps -E`), so (b)/(c) fire there too when a same-user process is inspected;
+ * (a) cwd and (d) cmdline remain the broadest evidence — harness argv contains
+ * the run/agent ids, and run children get their cwd set inside the worktree.
  */
 export function matchRunEvidence(
   entry: Pick<ProcessSnapshotEntry, "cwd" | "environ" | "cmdline">,

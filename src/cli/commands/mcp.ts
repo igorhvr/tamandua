@@ -8,7 +8,7 @@ import {
   getMcpStatus,
   restartMcp,
   startMcp,
-  stopMcp,
+  stopMcpTakeover,
 } from "../../server/daemonctl.js";
 import { DEFAULT_MCP_PORT, MCP_ENDPOINT_PATH } from "../../server/mcp-server.js";
 
@@ -114,7 +114,13 @@ export async function handleMcp(group: string, args: string[]): Promise<boolean>
 
   const sub = args[1];
   if (sub === "stop") {
-    console.log(stopMcp() ? "MCP server stopped." : "MCP server is not running.");
+    // Takeover-aware: resolve by identity socket → verified port holder →
+    // pidfile, so a server whose mcp.pid/mcp-port files vanished (or that
+    // ignores SIGTERM long enough to need SIGKILL) is still stopped. On
+    // success the stale pidfile/port file are removed so the next start is
+    // not misled.
+    const result = await stopMcpTakeover();
+    console.log(result.stopped ? "MCP server stopped." : "MCP server is not running.");
     return true;
   }
   if (sub === "restart") {

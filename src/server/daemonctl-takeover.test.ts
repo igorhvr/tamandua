@@ -15,6 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
+import { resolveProcInfoHelperPath } from "../../dist/lib/proc-info.js";
 import {
   DEFAULT_TAKEOVER_GRACE_MS,
   canSignalPid,
@@ -257,10 +258,12 @@ describe("daemonctl DPID takeover resolution", () => {
 // (opts.homeDir, else HOME / TAMANDUA_STATE_DIR) on every platform.
 //
 // The "ours" / "foreign" candidates are real long-lived child processes: the
-// binding evidence is read from procfs on Linux and from pidfile provenance
-// on macOS, so a long-lived child with a matching HOME (and, on macOS, a
-// pidfile it owns) is the portable way to exercise the real guard rather than
-// an injected `canSignal` stub.
+// binding evidence is their exact environ membership (procfs on Linux, the
+// native KERN_PROCARGS2 `env` helper on macOS — so a child's HOME /
+// TAMANDUA_STATE_DIR is enough), with pidfile/open-file provenance as the
+// fallback only when the environment cannot be read. A long-lived child with a
+// matching HOME/state-dir env is the portable way to exercise the real guard
+// rather than an injected `canSignal` stub.
 
 describe("daemonctl effective-state-dir scoping", () => {
   let homeDir: string;
@@ -322,6 +325,26 @@ describe("daemonctl effective-state-dir scoping", () => {
     return last;
   }
 
+  /**
+   * A helper wrapper that fails only the `env` subcommand, so on darwin the
+   * candidate's environment is unreadable (forcing the provenance fallback)
+   * while `pid`/elapsed-time reads keep working through the real helper.
+   * Returns null when no native helper exists (Linux uses procfs instead, so
+   * the fallback is not reachable and the env path already decides the test).
+   */
+  function writeEnvBlindHelper(): string | null {
+    const realHelper = resolveProcInfoHelperPath();
+    if (realHelper === null) return null;
+    const wrapper = path.join(homeDir, "proc-info-env-blind.sh");
+    fs.writeFileSync(
+      wrapper,
+      `#!/bin/sh\nif [ "$1" = "env" ]; then exit 1; fi\nexec ${JSON.stringify(realHelper)} "$@"\n`,
+      "utf-8",
+    );
+    fs.chmodSync(wrapper, 0o755);
+    return wrapper;
+  }
+
   it("canSignalPid rejects a foreign-HOME pid and accepts an effective-home pid with opts.homeDir", async () => {
     const foreignPid = spawnLongLived({ HOME: otherHome });
     const ourPid = spawnLongLived({ HOME: homeDir });
@@ -355,10 +378,93 @@ describe("daemonctl effective-state-dir scoping", () => {
       HOME: otherHome,
       TAMANDUA_STATE_DIR: path.join(homeDir, ".tamandua"),
     });
-    // macOS has no environ evidence: record the pid for provenance binding.
+    // Also record the pid as provenance evidence (non-essential now that
+    // environ membership is read on darwin too).
     fs.writeFileSync(path.join(homeDir, ".tamandua", "tamandua.pid"), String(stateOnlyPid), "utf-8");
 
     assert.equal(await waitForCanSignal(stateOnlyPid, true), true);
+  });
+
+  it("binds a pid via HOME + TAMANDUA_STATE_DIR env alone, with no pidfile/open file", async () => {
+    // The macOS regression: the guard must read a same-user process's environ
+    // block (KERN_PROCARGS2 via the native helper) and accept it on the
+    // strength of TAMANDUA_STATE_DIR/HOME alone — exactly as Linux does —
+    // without depending on a pidfile or an open file under the state dir.
+    const ourPid = spawnLongLived({
+      HOME: homeDir,
+      TAMANDUA_STATE_DIR: path.join(homeDir, ".tamandua"),
+    });
+
+    assert.equal(
+      await waitForCanSignal(ourPid, true, { homeDir }),
+      true,
+      "env membership alone must bind the pid to the effective state dir",
+    );
+  });
+
+  it("rejects a pid whose HOME matches but TAMANDUA_STATE_DIR names another state dir", () => {
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_STATE_DIR = path.join(homeDir, ".tamandua");
+
+    const foreignStatePid = spawnLongLived({
+      HOME: homeDir,
+      TAMANDUA_STATE_DIR: path.join(otherHome, ".tamandua"),
+    });
+
+    assert.equal(
+      canSignalPid(foreignStatePid),
+      false,
+      "a different TAMANDUA_STATE_DIR must be rejected even when HOME matches",
+    );
+  });
+
+  it("provenance fallback binds to resolveStateDir(opts), not <home>/.tamandua", async () => {
+    // Force the env-unreadable path on darwin (the native helper is the only
+    // environ source there) with a wrapper that fails just `env`. On Linux
+    // procfs still supplies the env, so the child also names the same state
+    // dir and both paths agree.
+    const customDir = path.join(homeDir, "custom-state");
+    fs.mkdirSync(customDir, { recursive: true });
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_STATE_DIR = customDir;
+    const savedHelper = process.env.TAMANDUA_PROC_INFO_HELPER;
+    const envBlindHelper = writeEnvBlindHelper();
+    if (envBlindHelper !== null) process.env.TAMANDUA_PROC_INFO_HELPER = envBlindHelper;
+    try {
+      const ourPid = spawnLongLived({ HOME: homeDir, TAMANDUA_STATE_DIR: customDir });
+      // Provenance evidence lives ONLY in the effective (custom) state dir.
+      fs.writeFileSync(path.join(customDir, "tamandua.pid"), String(ourPid), "utf-8");
+
+      assert.equal(await waitForCanSignal(ourPid, true), true);
+    } finally {
+      if (savedHelper === undefined) delete process.env.TAMANDUA_PROC_INFO_HELPER;
+      else process.env.TAMANDUA_PROC_INFO_HELPER = savedHelper;
+    }
+  });
+
+  it("provenance fallback refuses a pid whose evidence is only under <home>/.tamandua", async () => {
+    const customDir = path.join(homeDir, "custom-state");
+    fs.mkdirSync(customDir, { recursive: true });
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_STATE_DIR = customDir;
+    const savedHelper = process.env.TAMANDUA_PROC_INFO_HELPER;
+    const envBlindHelper = writeEnvBlindHelper();
+    if (envBlindHelper !== null) process.env.TAMANDUA_PROC_INFO_HELPER = envBlindHelper;
+    try {
+      // HOME-derived pidfile only, in the default .tamandua dir: the effective
+      // state dir is `customDir`, so this evidence must NOT bind.
+      const misleadingPid = spawnLongLived({ HOME: homeDir });
+      fs.writeFileSync(
+        path.join(homeDir, ".tamandua", "tamandua.pid"),
+        String(misleadingPid),
+        "utf-8",
+      );
+
+      assert.equal(canSignalPid(misleadingPid), false);
+    } finally {
+      if (savedHelper === undefined) delete process.env.TAMANDUA_PROC_INFO_HELPER;
+      else process.env.TAMANDUA_PROC_INFO_HELPER = savedHelper;
+    }
   });
 
   it("rejects a foreign port holder on the default port instead of returning a port-holder service", async () => {

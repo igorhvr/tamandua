@@ -107,6 +107,21 @@ Tamandua is an agent team orchestrator built on top of pi (the coding agent CLI)
 - Agent config lives in `~/.tamandua/agents.json`
 - Permissions are expressed as role descriptions
 
+### Service identity sockets (DPID)
+
+Each long-lived service advertises its identity over a state-dir Unix socket —
+`daemon.sock`, `dashboard.sock`, `mcp.sock` (see `src/server/daemon-identity.ts`,
+`getServiceSocketPath`/`bindIdentitySocket`/`probeIdentitySocket`). The socket is
+the authoritative liveness primitive on every platform (no lsof/pidfile parsing
+needed on macOS); the pidfile is only an informational hint. The standalone
+`dashboard-standalone.ts` / `mcp-standalone.ts` servers bind their socket
+before writing any pidfile (bind-first, so a losing bind race leaves no trace),
+and `startDashboardStandalone` / `startMcp` adopt a live socket instead of
+spawning a duplicate. An identity whose `stateDir` differs from the effective
+one is never adopted. `stop*Takeover` resolves socket-first, then the verified
+port holder, then the pidfile, and unlinks the socket only after the owner pid
+is gone.
+
 ### Agent Scheduler (deterministic dispatch motor)
 
 The scheduler decides "is there work?" itself and spawns a model ONLY when
@@ -399,13 +414,19 @@ nothing in a sandboxed worker round. `native/proc-info.c` (compiled by
 exposes the needed metadata through `sysctl(2)`:
 
 ```
-proc-info list | pid <pid> | dump      # pid/ppid/pgid/state/start/cmdline, TAB-separated
+proc-info list | pid <pid> | dump | env <pid>   # pid/ppid/pgid/state/start/cmdline, TAB-separated; env is raw NUL-separated
 ```
 
 `src/lib/proc-info.ts` prefers it for `listPids`/`getPgid`/`getCmdline`/
 `getProcessState`/`getElapsedSeconds` and the bulk `listProcessDetails()`,
 falling back to ps only when the helper was not built; procfs stays the
-primary Linux source. `scripts/update-protocol.mjs` also derives its mac
+primary Linux source. The `env <pid>` subcommand walks KERN_PROCARGS2 past
+argv and returns the environ block: macOS `ps -E` cannot read another
+process's environment, but sysctl(2) returns it for same-user processes, so
+`getEnvironText`/`environHasEntry` are NOT procfs-only — the state-dir
+scoping guard (`processBelongsToEffectiveConfig`) binds a port holder to its
+effective `TAMANDUA_STATE_DIR`/`HOME` on darwin exactly as on Linux.
+`scripts/update-protocol.mjs` also derives its mac
 process identity from the `proc-starttime` helper (formatted as a
 deterministic UTC `Lstart` string via `formatUtcLstart`) and its parent chain
 from `proc-info pid <pid>`, so identity capture and ancestry validation work

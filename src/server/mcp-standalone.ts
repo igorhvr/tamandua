@@ -11,19 +11,27 @@
  *   2. TAMANDUA_MCP_PORT env var
  *   3. Default: 3338 (DEFAULT_MCP_PORT)
  *
+ * - Binds the identity socket on start (~/.tamandua/mcp.sock)
  * - Writes PID file on start (~/.tamandua/mcp.pid)
  * - Writes port file on start (~/.tamandua/mcp-port)
- * - Cleans up PID file on exit
+ * - Cleans up PID file + identity socket on exit
  */
 import fs from "node:fs";
 import path from "node:path";
 import { resolveStateDir } from "../lib/tamandua-config.js";
+import { getBuildVersion } from "../lib/version.js";
 import {
   DEFAULT_MCP_PORT,
   startTamanduaMcpServer,
   stopTamanduaMcpServer,
   type TamanduaMcpServer,
 } from "./mcp-server.js";
+import {
+  bindIdentitySocket,
+  getServiceSocketPath,
+  IdentitySocketInUseError,
+  type BoundIdentitySocket,
+} from "./daemon-identity.js";
 
 const MCP_PID_FILE = path.join(resolveStateDir(), "mcp.pid");
 const MCP_PORT_FILE = path.join(resolveStateDir(), "mcp-port");
@@ -81,7 +89,47 @@ function cleanupPortFile(): void {
 }
 
 let mcpServer: TamanduaMcpServer | undefined;
+let identitySocket: BoundIdentitySocket | undefined;
 let isShuttingDown = false;
+
+/**
+ * Close and unlink the identity socket this process bound.
+ *
+ * `BoundIdentitySocket.close()` unlinks ONLY the socket file this process
+ * created, so a losing bind-race process can never remove the live owner's
+ * socket. Idempotent: the reference is cleared first.
+ */
+async function closeIdentitySocket(): Promise<void> {
+  const current = identitySocket;
+  identitySocket = undefined;
+  if (!current) return;
+  try {
+    await current.close();
+  } catch {
+    // Best-effort teardown.
+  }
+}
+
+/**
+ * Synchronous identity-socket teardown for the `process.on("exit")` handler,
+ * which cannot await. Safe to call after {@link closeIdentitySocket}: the
+ * reference is cleared, so this is a no-op then.
+ */
+function closeIdentitySocketSync(): void {
+  const current = identitySocket;
+  identitySocket = undefined;
+  if (!current) return;
+  try {
+    current.server.close();
+  } catch {
+    // Best-effort teardown.
+  }
+  try {
+    fs.unlinkSync(current.socketPath);
+  } catch {
+    // Already gone or never created.
+  }
+}
 
 async function shutdown(signal: string, exitCode: number): Promise<void> {
   if (isShuttingDown) return;
@@ -95,6 +143,7 @@ async function shutdown(signal: string, exitCode: number): Promise<void> {
     await stopTamanduaMcpServer(current).catch(() => {});
   }
 
+  await closeIdentitySocket();
   cleanupPidFile();
   cleanupPortFile();
   process.exit(exitCode);
@@ -121,12 +170,43 @@ process.on("uncaughtException", (err) => {
 });
 
 process.on("exit", () => {
+  closeIdentitySocketSync();
   cleanupPidFile();
   cleanupPortFile();
 });
 
 async function bootstrap(): Promise<void> {
   const port = resolvePort();
+
+  // Bind-first (DPID): claim the identity socket BEFORE writing any pidfile so
+  // a losing bind race leaves no trace and can never unlink the live owner's
+  // files. The socket is the authoritative liveness primitive on every
+  // platform (no lsof/pidfile parsing needed on macOS).
+  try {
+    identitySocket = await bindIdentitySocket(getServiceSocketPath("mcp"), {
+      pid: process.pid,
+      buildVersion: getBuildVersion(),
+      controlPort: port,
+      startedAt: new Date().toISOString(),
+      stateDir: resolveStateDir(),
+    });
+  } catch (err) {
+    if (err instanceof IdentitySocketInUseError) {
+      console.error(
+        `Failed to start MCP server: another MCP server is already live (pid ${err.pid}, ` +
+          `control port ${err.identity.controlPort}). Refusing to start.`,
+      );
+      process.exit(1);
+      return;
+    }
+    console.error(
+      `Failed to start MCP server: could not bind identity socket: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    process.exit(1);
+    return;
+  }
 
   writePidFile();
   writePortFile(port);
@@ -136,6 +216,7 @@ async function bootstrap(): Promise<void> {
   } catch (err) {
     console.error(`Failed to start MCP server on port ${port}: ${err instanceof Error ? err.message : String(err)}`);
     cleanupPidFile();
+    await closeIdentitySocket();
     process.exit(1);
   }
 

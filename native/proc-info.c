@@ -10,6 +10,7 @@
  *   proc-info list          one pid per line
  *   proc-info pid <pid>     one TAB-separated record for <pid>
  *   proc-info dump          one TAB-separated record per visible process
+ *   proc-info env <pid>     raw NUL-separated environ block for <pid>
  *
  * A record is:
  *   <pid>\t<ppid>\t<pgid>\t<state>\t<startSec>\t<startUsec>\t<cmdline>
@@ -19,9 +20,15 @@
  * user's process). The record's cmdline is LAST so a tab inside an argument
  * cannot confuse field splitting.
  *
+ * The `env` subcommand walks the SAME KERN_PROCARGS2 buffer past argv and
+ * emits the environ block verbatim. sysctl(2) returns the environ block for
+ * same-user processes even though `/bin/ps -E` cannot; it exits 1 when the
+ * kernel refuses. It is the source of the state-dir scoping evidence in
+ * src/lib/proc-info.ts `getEnvironText`/`environHasEntry`.
+ *
  * This tool never calls /bin/ps and never shells out to any external binary.
  *
- * Exit codes: 0 success; 64 usage error; 1 lookup failure (pid mode only).
+ * Exit codes: 0 success; 64 usage error; 1 lookup failure (pid/env mode).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +97,77 @@ static int read_cmdline(int pid, char *out, size_t outsz) {
     cp += l + 1;
   }
   out[used] = '\0';
+  free(buf);
+  return 0;
+}
+
+/*
+ * Write a process's environ block, read from the same KERN_PROCARGS2 buffer
+ * as read_cmdline(), to stdout as NUL-separated NAME=value entries.
+ *
+ * KERN_PROCARGS2 returns the raw stack strings area: argc (int), the
+ * executable path, NUL padding, argc NUL-terminated argv strings, then the
+ * environ entries. The kernel's own private apple string vector
+ * (pfz/stack_guard/executable_cdhash/...) is stored contiguously AFTER the
+ * environ with no reliable delimiter, so it may be included when populated;
+ * consumers do exact `NAME=value` membership tests, which is unaffected.
+ * When the private vector is still zero-filled the first empty entry ends
+ * the block.
+ *
+ * Returns 0 on success (the block may be empty), -1 when the kernel refuses
+ * KERN_PROCARGS2 (typically another user's process).
+ */
+static int write_environ(int pid) {
+  int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
+  size_t size = 0;
+  if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0) return -1;
+  if (size < sizeof(int) || size > (size_t)(8 * 1024 * 1024)) return -1;
+
+  char *buf = malloc(size);
+  if (buf == NULL) return -1;
+  if (sysctl(mib, 3, buf, &size, NULL, 0) != 0) {
+    free(buf);
+    return -1;
+  }
+
+  int argc = 0;
+  memcpy(&argc, buf, sizeof(int));
+  char *cp = buf + sizeof(int);
+  char *end = buf + size;
+
+  /* skip the executable path, then NUL padding before argv[0] */
+  cp += strnlen(cp, (size_t)(end - cp));
+  while (cp < end && *cp == '\0') cp++;
+
+  /* skip argc NUL-terminated argv strings */
+  for (int i = 0; i < argc && cp < end; i++) {
+    size_t max = (size_t)(end - cp);
+    size_t l = strnlen(cp, max);
+    if (l >= max) {  /* truncated buffer: no terminator before the end */
+      cp = end;
+      break;
+    }
+    cp += l + 1;
+  }
+
+  /* environ starts after the NUL padding that follows argv */
+  while (cp < end && *cp == '\0') cp++;
+
+  /*
+   * Emit each NUL-terminated NAME=value entry (NUL-separated in the output).
+   * The kernel's private apple string vector may follow the environ without a
+   * separator when populated; it is harmless for exact membership tests. The
+   * first empty entry (the zero-filled tail before the vector is populated)
+   * ends the block.
+   */
+  while (cp < end) {
+    size_t max = (size_t)(end - cp);
+    size_t l = strnlen(cp, max);
+    if (l == 0 || l >= max) break;
+    fwrite(cp, 1, l, stdout);
+    fputc('\0', stdout);
+    cp += l + 1;
+  }
   free(buf);
   return 0;
 }
@@ -187,25 +265,38 @@ static int cmd_list(void) {
   return 0;
 }
 
+/* Parse a decimal pid argv value; returns 0 and stores it, or -1. */
+static int parse_pid_arg(const char *text, int *out) {
+  char *endp = NULL;
+  long pid = strtol(text, &endp, 10);
+  if (endp == text || *endp != '\0' || pid <= 0 || pid > 9999999) return -1;
+  *out = (int)pid;
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: proc-info list | pid <pid> | dump\n");
+    fprintf(stderr, "usage: proc-info list | pid <pid> | dump | env <pid>\n");
     return 64;
   }
   if (strcmp(argv[1], "list") == 0) return cmd_list();
   if (strcmp(argv[1], "dump") == 0) return cmd_dump();
-  if (strcmp(argv[1], "pid") == 0) {
+  if (strcmp(argv[1], "pid") == 0 || strcmp(argv[1], "env") == 0) {
     if (argc < 3) {
-      fprintf(stderr, "usage: proc-info pid <pid>\n");
+      fprintf(stderr, "usage: proc-info %s <pid>\n", argv[1]);
       return 64;
     }
-    char *endp = NULL;
-    long pid = strtol(argv[2], &endp, 10);
-    if (endp == argv[2] || *endp != '\0' || pid <= 0 || pid > 9999999) {
+    int pid = 0;
+    if (parse_pid_arg(argv[2], &pid) != 0) {
       fprintf(stderr, "proc-info: invalid pid: %s\n", argv[2]);
       return 64;
     }
-    return cmd_pid((int)pid);
+    if (strcmp(argv[1], "pid") == 0) return cmd_pid(pid);
+    if (write_environ(pid) != 0) {
+      fprintf(stderr, "proc-info: no environment for pid: %d\n", pid);
+      return 1;
+    }
+    return 0;
   }
   fprintf(stderr, "proc-info: unknown command: %s\n", argv[1]);
   return 64;

@@ -433,4 +433,61 @@ describe("tamandua dashboard status MCP visibility", () => {
       fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
+
+  // AC (US-004): a pidfile-less live dashboard is reported/stopped via its socket
+  it("dashboard status and stop use dashboard.sock when pid and port files are deleted", async () => {
+    const dashboardPortHandle = await reservePortHandle();
+    const controlPortHandle = await reservePortHandle();
+    const dashboardPort = dashboardPortHandle.port;
+    const controlPort = controlPortHandle.port;
+    const tempEnv = createTempEnv();
+    const cliEnv = {
+      HOME: tempEnv.homeDir,
+      TAMANDUA_STATE_DIR: tempEnv.stateDir,
+      TAMANDUA_CONTROL_PORT: String(controlPort),
+    };
+
+    const pidFile = path.join(tempEnv.stateDir, "dashboard.pid");
+    const portFile = path.join(tempEnv.stateDir, "port");
+    const socketFile = path.join(tempEnv.stateDir, "dashboard.sock");
+
+    try {
+      await dashboardPortHandle.close();
+      await controlPortHandle.close();
+
+      const start = await runCliOnce(["dashboard", "start", "--port", String(dashboardPort)], cliEnv);
+      assert.equal(start.code, 0, start.stderr || start.stdout);
+
+      // The identity socket is the ONLY liveness evidence we leave behind.
+      const socketDeadline = Date.now() + 10_000;
+      while (!fs.existsSync(socketFile) && Date.now() < socketDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
+      assert.ok(fs.existsSync(socketFile), "dashboard.sock must be bound after start");
+
+      fs.unlinkSync(pidFile);
+      fs.unlinkSync(portFile);
+
+      // status must report the pidfile-less dashboard via its identity socket,
+      // including the custom port the socket advertises.
+      const status = await runCliOnce(["dashboard", "status"], cliEnv);
+      assert.equal(status.code, 0, status.stderr || status.stdout);
+      assert.match(status.stdout, /Dashboard running \(PID \d+\)/);
+      assert.match(status.stdout, new RegExp(`Dashboard endpoint: http://localhost:${dashboardPort}`));
+
+      // stop must resolve and signal that same socket-resolved process.
+      const stop = await runCliOnce(["dashboard", "stop"], cliEnv);
+      assert.equal(stop.code, 0, stop.stderr || stop.stdout);
+      assert.match(stop.stdout, /Dashboard stopped\./);
+      assert.equal(fs.existsSync(pidFile), false, "stop must remove the pidfile");
+      assert.equal(fs.existsSync(portFile), false, "stop must remove the port file");
+      assert.equal(fs.existsSync(socketFile), false, "stop must remove dashboard.sock");
+    } finally {
+      await safeClose(dashboardPortHandle);
+      await safeClose(controlPortHandle);
+      await runCliOnce(["dashboard", "stop"], cliEnv);
+      await runCliOnce(["mcp", "stop"], cliEnv);
+      fs.rmSync(tempEnv.root, { recursive: true, force: true });
+    }
+  });
 });

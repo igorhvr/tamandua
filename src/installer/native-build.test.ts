@@ -584,6 +584,10 @@ describe("native build integration (US-001)", () => {
     assert.match(src, /KERN_PROC_PID/);
     assert.match(src, /KERN_PROCARGS2/);
     assert.match(src, /sysctl\s*\(/);
+    // The env subcommand must exist and be driven by the same KERN_PROCARGS2
+    // read, not by ps or any environment dumper.
+    assert.match(src, /write_environ\s*\(/);
+    assert.match(src, /strcmp\s*\(\s*argv\[1\]\s*,\s*"env"\s*\)/);
     // Strip C comments so documentation that NAMES ps(1) as the rejected
     // approach is not mistaken for a code invocation; then assert the
     // executable code never shells out to ps or any other binary.
@@ -664,6 +668,36 @@ describe("native build integration (US-001)", () => {
     // Lookup failure for a pid that is not running -> 1.
     const missing = spawnSync(helper, ["pid", "999999"], { encoding: "utf8" });
     assert.equal(missing.status, 1, `a nonexistent pid must exit 1; got ${missing.status}`);
+  });
+
+  it("darwin proc-info reads a same-user process environment (env subcommand)", { timeout: 120000 }, (t) => {
+    if (process.platform !== "darwin") {
+      return t.skip("honest capability skip: the sysctl proc-info helper requires a darwin host");
+    }
+    const run = buildDarwinProcStarttimeOnce();
+    assert.equal(run.status, 0, `stderr: ${run.stderr}`);
+    const helper = path.join(run.outDir, "proc-info");
+    assert.ok(fs.existsSync(helper));
+
+    // sysctl KERN_PROCARGS2 returns the environ block for same-user processes
+    // even though ps -E cannot see it. The test process is same-user/live.
+    const selfEnv = spawnSync(helper, ["env", String(process.pid)], { encoding: "utf8" });
+    assert.equal(selfEnv.status, 0, `env must exit 0 for a live same-user pid; stderr: ${selfEnv.stderr}`);
+    const entries = selfEnv.stdout.split("\0").filter((e) => e.length > 0);
+    assert.ok(entries.length > 0, "the environ block must not be empty");
+    assert.ok(
+      entries.includes(`HOME=${process.env.HOME ?? ""}`),
+      "the environ block must contain the caller's HOME",
+    );
+
+    // Missing pid -> lookup failure (1); malformed / missing argv -> usage (64).
+    const missing = spawnSync(helper, ["env", "999999"], { encoding: "utf8" });
+    assert.equal(missing.status, 1, `a nonexistent pid must exit 1; got ${missing.status}`);
+    assert.ok(missing.stderr.trim().length > 0, "a lookup failure must print a diagnostic");
+    const noArg = spawnSync(helper, ["env"], { encoding: "utf8" });
+    assert.equal(noArg.status, 64, `missing pid must exit 64; got ${noArg.status}`);
+    const badPid = spawnSync(helper, ["env", "abc"], { encoding: "utf8" });
+    assert.equal(badPid.status, 64, `a malformed pid must exit 64; got ${badPid.status}`);
   });
 
   it("no-op guard: only the repo's own C source is compiled (no downloads/addons)", () => {

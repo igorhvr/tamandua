@@ -6,10 +6,11 @@
 
 import {
   getDashboardStatus,
+  getDashboardStatusAsync,
   isDashboardRunning,
   restartDashboardStandalone,
   startDashboardStandalone,
-  stopDashboardStandalone,
+  stopDashboardTakeover,
 } from "../../server/daemonctl.js";
 
 export function getDashboardHelp(): string {
@@ -125,7 +126,11 @@ export async function handleDashboard(group: string, args: string[]): Promise<bo
 
   const sub = args[1];
   if (sub === "stop") {
-    console.log(stopDashboardStandalone() ? "Dashboard stopped." : "Dashboard is not running.");
+    // Takeover-aware: resolve by identity socket → verified port holder →
+    // pidfile, so a dashboard whose dashboard.pid/port files vanished is still
+    // stopped. On success the stale pidfile/port file/socket are removed.
+    const result = await stopDashboardTakeover();
+    console.log(result.stopped ? "Dashboard stopped." : "Dashboard is not running.");
     return true;
   }
   if (sub === "restart") {
@@ -151,7 +156,9 @@ export async function handleDashboard(group: string, args: string[]): Promise<bo
     return true;
   }
   if (sub === "status") {
-    const st = getDashboardStatus();
+    // Socket-first: a live dashboard that lost its pidfile/port file is still
+    // reported running via dashboard.sock.
+    const st = await getDashboardStatusAsync();
     if (!st.running) {
       console.log("Dashboard is not running.");
     } else {

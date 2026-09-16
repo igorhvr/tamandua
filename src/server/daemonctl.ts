@@ -30,7 +30,7 @@ import {
   type ServiceKind,
 } from "../lib/service-holder.js";
 import { assertStatePathIsolation, spawnChildAttributionEnv, testGuardActive } from "../lib/test-guard.js";
-import { environHasEntry, getCmdline, getElapsedSeconds, hasProcfs, processHasOpenFileUnder } from "../lib/proc-info.js";
+import { getCmdline, getElapsedSeconds, getEnvironText, processHasOpenFileUnder } from "../lib/proc-info.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -258,9 +258,10 @@ const PIDFILE_AGE_SLACK_SECONDS = 120;
 
 /**
  * The complete set of daemon-family pid files written under a tamandua
- * state dir. Both `processHomeMatches` (macOS provenance binding) and
- * `stopDaemonFamily` (test teardown) iterate this single source of truth,
- * so family membership can never drift between the guard and the teardown.
+ * state dir. Both `processHomeMatches` (the env-unavailable provenance
+ * fallback) and `stopDaemonFamily` (test teardown) iterate this single source
+ * of truth, so family membership can never drift between the guard and the
+ * teardown.
  */
 export const DAEMON_FAMILY_PID_FILES: readonly string[] = [
   "tamandua.pid",
@@ -284,25 +285,19 @@ export interface DaemonFamilyStopSummary {
   timedOut: DaemonFamilyStopEntry[];
 }
 
-function processHomeMatches(pid: number, homeDir: string): boolean {
-  // Linux: exact HOME= entry match via procfs — the strongest binding.
-  if (hasProcfs()) {
-    return environHasEntry(pid, "HOME", homeDir);
-  }
-
-  // macOS: the kernel hides other processes' environments, so bind the pid
-  // to this homeDir by provenance instead. Refusing on any lookup failure
-  // is intentional — this guard only ever loosens into a signal. Evidence,
-  // either of:
-  //  (a) the pid is recorded in one of this homeDir's service pidfiles AND
+function processHomeMatches(pid: number, stateDir: string): boolean {
+  // Provenance fallback used only when the candidate's environment cannot be
+  // read (native helper not built, other user). Bind by provenance to the
+  // EFFECTIVE state dir. Refusing on any lookup failure is intentional — this
+  // guard only ever loosens into a signal. Evidence, either of:
+  //  (a) the pid is recorded in one of this state dir's service pidfiles AND
   //      the process is not younger than its pidfile (minus slack) — the
   //      pidfile is written while the recorded process is alive, so a
   //      reused pid pointing at an unrelated (or production) process would
   //      have started AFTER the pidfile, i.e. be younger than it; or
-  //  (b) the process holds a file open under this homeDir's .tamandua dir
-  //      (services keep their log fd open for life) — kernel-verified via
-  //      lsof, and covers healthy services whose pidfile was lost.
-  const dir = path.join(homeDir, ".tamandua");
+  //  (b) the process holds a file open under this state dir (services keep
+  //      their log fd open for life) — kernel-verified via lsof, and covers healthy services whose pidfile was lost.
+  const dir = path.resolve(stateDir);
   for (const name of DAEMON_FAMILY_PID_FILES) {
     try {
       const pidFile = path.join(dir, name);
@@ -324,14 +319,23 @@ function processHomeMatches(pid: number, homeDir: string): boolean {
  * Whether `pid` provably belongs to the effective Tamandua configuration.
  *
  * A process is OURS when its environment's effective state dir equals ours:
- *  - its `TAMANDUA_STATE_DIR` names the effective state dir exactly, or
- *  - it names our `HOME` and the effective state dir IS that home's default
- *    `.tamandua` (no separate state-dir override in force).
+ *  - an explicit `TAMANDUA_STATE_DIR` names the effective state dir exactly
+ *    (an explicit non-match is foreign even when `HOME` matches), or
+ *  - with no state-dir override, it names our `HOME` and the effective state
+ *    dir IS that home's default `.tamandua`.
  *
- * Both values are read exactly from procfs on Linux. On macOS the kernel
- * hides other processes' environments, so the existing pidfile-age /
- * open-file-under-the-state-dir provenance check is used instead, applied to
- * the effective home dir.
+ * Environ evidence is tested FIRST on every platform: procfs on Linux, and on
+ * macOS the native `proc-info env` helper (sysctl KERN_PROCARGS2), which reads
+ * a same-user process's environ block even though `ps -E` cannot (US-001).
+ * When that evidence is available but does not match, the candidate is foreign
+ * and rejected immediately — it is never re-admitted through the weaker
+ * provenance path.
+ *
+ * Only when the environment cannot be read at all (helper not built, other
+ * user) do we fall back to pidfile/open-file provenance, bound to the
+ * EFFECTIVE STATE DIR returned by `resolveStateDir(opts)` — never a hardcoded
+ * `<home>/.tamandua`, so a `TAMANDUA_STATE_DIR` override is honored on darwin
+ * exactly as the env check honors it on Linux.
  *
  * This is deliberately NOT conditioned on `opts.homeDir`: a CLI configured
  * only through `HOME` / `TAMANDUA_STATE_DIR` must still reject a daemon that
@@ -343,22 +347,29 @@ function processBelongsToEffectiveConfig(pid: number, opts?: DaemonctlPathOption
   const effectiveHome = resolveEffectiveHomeDir(opts);
   const effectiveStateDir = path.resolve(resolveStateDir(opts));
 
-  // Linux: exact environ membership — the strongest binding.
-  if (hasProcfs()) {
-    if (environHasEntry(pid, "TAMANDUA_STATE_DIR", effectiveStateDir)) return true;
-    // A process that only names our HOME owns <effectiveHome>/.tamandua; that
-    // is our state dir exactly when no separate state-dir override is set.
+  // Exact environ membership is the strongest binding and is available on
+  // every platform (procfs on Linux, KERN_PROCARGS2 on macOS) — test it first.
+  const environ = getEnvironText(pid);
+  if (environ !== null) {
+    const entries = new Set(environ.split("\0"));
+    // An explicit TAMANDUA_STATE_DIR is authoritative: match it exactly, and
+    // an explicit NON-match is foreign even when HOME happens to match.
+    const declaredStateDir = [...entries].find((e) => e.startsWith("TAMANDUA_STATE_DIR="));
+    if (declaredStateDir !== undefined) return declaredStateDir === `TAMANDUA_STATE_DIR=${effectiveStateDir}`;
+    // No state-dir override in the candidate: it owns <effectiveHome>/.tamandua
+    // when it names our HOME and that IS the effective state dir.
     if (
       effectiveStateDir === path.resolve(path.join(effectiveHome, ".tamandua")) &&
-      environHasEntry(pid, "HOME", effectiveHome)
+      entries.has(`HOME=${effectiveHome}`)
     ) {
       return true;
     }
     return false;
   }
 
-  // macOS: provenance binding against the effective home dir.
-  return processHomeMatches(pid, effectiveHome);
+  // Environment unavailable (helper not built, other user): provenance
+  // binding against the effective state dir.
+  return processHomeMatches(pid, effectiveStateDir);
 }
 
 /**
@@ -388,6 +399,31 @@ function identityBelongsToEffectiveStateDir(
 ): boolean {
   if (identity.stateDir === undefined) return true;
   return path.resolve(identity.stateDir) === path.resolve(resolveStateDir(opts));
+}
+
+/**
+ * Probe a service's identity socket for a live process belonging to the
+ * effective state dir.
+ *
+ * Returns the live identity, or `null` when nothing answers, when the answer
+ * advertises a DIFFERENT state dir (foreign socket, never adopted), or when the
+ * test-isolation guard blocks production path resolution (mirrors the
+ * `resolveLiveDaemonForStart` guard handling). Never throws for an expected
+ * probe failure.
+ */
+async function probeLiveServiceIdentity(
+  service: ServiceKind,
+  opts?: DaemonctlPathOptions,
+): Promise<DaemonIdentity | null> {
+  let identity: DaemonIdentity | null;
+  try {
+    identity = await probeIdentitySocket(getServiceSocketPath(service, opts));
+  } catch (err) {
+    if (isIsolationViolation(err)) return null;
+    throw err;
+  }
+  if (!identity) return null;
+  return identityBelongsToEffectiveStateDir(identity, opts) ? identity : null;
 }
 
 /**
@@ -530,9 +566,10 @@ function resolveDaemonPortHolder(opts?: ResolveLiveDaemonOptions): number | null
 }
 
 /**
- * Dashboard-specific shim over {@link resolveServicePortHolder}. The
- * standalone dashboard has no identity socket (yet), so a lost pidfile is
- * recovered from the verified holder of `readPort(opts)` (3334 by default).
+ * Dashboard-specific shim over {@link resolveServicePortHolder}, used by the
+ * synchronous status fast path (pidfile first, then the verified port holder).
+ * The async resolver prefers `dashboard.sock`; this sync fallback still
+ * recovers a pidfile-less dashboard on older builds without a socket.
  */
 function resolveDashboardPortHolder(opts?: ResolveLiveDaemonOptions): number | null {
   return resolveServicePortHolder("dashboard", readPort, opts);
@@ -1265,15 +1302,19 @@ async function resolveLiveService(
 /**
  * Resolve a live standalone dashboard without trusting the pidfile.
  *
- * The dashboard has no identity socket yet, so the practical path is the
- * verified holder of `readPort(opts)` (default 3334); the pidfile remains a
- * fallback hint. Under the test guard without an explicit `homeDir` resolution
- * is skipped entirely (never adopt a production dashboard).
+ * Resolution is socket-first (the dashboard binds `dashboard.sock`, DPID), then
+ * the verified holder of `readPort(opts)` (default 3334), then the pidfile as a
+ * fallback hint for older builds.
+ *
+ * The test-isolation guard is enforced by the path helpers (socket/port/pidfile
+ * resolution throws for the real state dir and is mapped to `null`), NOT by an
+ * early return: a CLI configured only through `HOME` / `TAMANDUA_STATE_DIR`
+ * (e.g. a test-spawned `tamandua dashboard stop`) must still resolve its own
+ * isolated service, mirroring `resolveLiveDaemon`.
  */
 export async function resolveLiveDashboard(
   opts?: ResolveLiveDaemonOptions,
 ): Promise<LiveService | null> {
-  if (!opts?.homeDir && testGuardActive()) return null;
   try {
     const port = readPort(opts);
     return await resolveLiveService("dashboard", port, getDashboardPidFile(opts), opts);
@@ -1286,15 +1327,20 @@ export async function resolveLiveDashboard(
 /**
  * Resolve a live MCP server without trusting the pidfile.
  *
- * A `daemon.js` holder is accepted (the daemon hosts MCP in-process with
- * `--with-mcp`), which is exactly what `isTamanduaServiceCmdline(_, "mcp")`
- * already permits. Under the test guard without an explicit `homeDir`
- * resolution is skipped entirely.
+ * Resolution is socket-first (`mcp.sock`, DPID), then the verified holder of
+ * the MCP port — a `daemon.js` holder is accepted because the daemon hosts MCP
+ * in-process with `--with-mcp`, which is exactly what
+ * `isTamanduaServiceCmdline(_, "mcp")` already permits — then the pidfile as a
+ * fallback hint for older builds.
+ *
+ * Like {@link resolveLiveDashboard}, the test-isolation guard lives in the path
+ * helpers rather than an early return, so an env-scoped CLI can still resolve
+ * its own service while a bare in-process call against the real state dir is
+ * mapped to `null`.
  */
 export async function resolveLiveMcp(
   opts?: ResolveLiveDaemonOptions,
 ): Promise<LiveService | null> {
-  if (!opts?.homeDir && testGuardActive()) return null;
   try {
     const port = readMcpPort(opts);
     return await resolveLiveService("mcp", port, getMcpPidFile(opts), opts);
@@ -1414,6 +1460,12 @@ interface TakeoverServiceSpec {
   socketPath: (opts?: DaemonctlPathOptions) => string;
   /** Informational pidfile path (lazy). */
   pidFile: (opts?: DaemonctlPathOptions) => string;
+  /**
+   * Optional configured-port file (lazy). After a successful stop it is
+   * unlinked alongside the socket/pidfile so the next start is not misled into
+   * reusing a stale port — but only AFTER the owning pid is gone.
+   */
+  portFile?: (opts?: DaemonctlPathOptions) => string;
 }
 
 /**
@@ -1506,10 +1558,12 @@ async function stopServiceTakeover(
 
   const stopped = !isAlive(live.pid);
   if (stopped) {
-    // Only after the owner pid is gone: unlink the now-stale socket + pidfile.
+    // Only after the owner pid is gone: unlink the now-stale socket, pidfile
+    // and configured-port file so the next start is not misled.
     try {
       unlink(spec.socketPath(opts));
       unlink(spec.pidFile(opts));
+      if (spec.portFile) unlink(spec.portFile(opts));
     } catch {
       // Path resolution must never turn a successful stop into a failure.
     }
@@ -1545,7 +1599,9 @@ export async function stopDaemonTakeover(
  * Stop the live standalone dashboard by identity (identity socket if present,
  * else the verified holder of the dashboard port), escalating SIGTERM →
  * SIGKILL → port-free verification. This lets update/restart replace a
- * dashboard whose pidfile is gone or that ignores HTTP.
+ * dashboard whose pidfile is gone or that ignores HTTP. On success the stale
+ * `dashboard.sock`, `dashboard.pid` and `port` files are unlinked (only after
+ * the owner pid is gone) so the next start is not misled.
  */
 export async function stopDashboardTakeover(
   opts?: ResolveLiveDaemonOptions,
@@ -1558,6 +1614,7 @@ export async function stopDashboardTakeover(
       resolve: deps?.resolve ?? resolveLiveDashboard,
       socketPath: (o) => getServiceSocketPath("dashboard", o),
       pidFile: (o) => getDashboardPidFile(o),
+      portFile: (o) => getDashboardPortFile(o),
     },
     opts,
     deps,
@@ -1567,7 +1624,9 @@ export async function stopDashboardTakeover(
 /**
  * Stop the live MCP server by identity (identity socket if present, else the
  * verified holder of the MCP port — a daemon.js holder counts because the
- * daemon hosts MCP in-process), escalating SIGTERM → SIGKILL → port-free.
+ * daemon hosts MCP in-process), escalating SIGTERM → SIGKILL → port-free. On
+ * success the stale `mcp.sock`, `mcp.pid` and `mcp-port` files are unlinked
+ * (only after the owner pid is gone) so the next start is not misled.
  */
 export async function stopMcpTakeover(
   opts?: ResolveLiveDaemonOptions,
@@ -1580,6 +1639,7 @@ export async function stopMcpTakeover(
       resolve: deps?.resolve ?? resolveLiveMcp,
       socketPath: (o) => getServiceSocketPath("mcp", o),
       pidFile: (o) => getMcpPidFile(o),
+      portFile: (o) => getMcpPortFile(o),
     },
     opts,
     deps,
@@ -1733,6 +1793,14 @@ export async function startMcp(port?: number, opts?: StartOptions): Promise<{ pi
       // File missing or unreadable — use default
     }
     return { pid: status.pid, port: existingPort };
+  }
+
+  // Refuse to spawn a duplicate when a live MCP server lost its pidfile: the
+  // identity socket (DPID) is authoritative, so darwin no longer depends on
+  // pidfile/lsof parsing. A socket advertising another state dir is not ours.
+  const liveBySocket = await probeLiveServiceIdentity("mcp", opts);
+  if (liveBySocket) {
+    return { pid: liveBySocket.pid, port: liveBySocket.controlPort };
   }
 
   const mcpPort = port ?? DEFAULT_MCP_PORT;
@@ -2453,6 +2521,28 @@ export function getDashboardStatus(opts?: DaemonctlPathOptions): {
 }
 
 /**
+ * Async dashboard status resolved socket-first (identity socket → verified
+ * port holder → pidfile), mirroring {@link getMcpStatusAsync}.
+ *
+ * This is what `tamandua dashboard status` uses so a live dashboard that lost
+ * its `dashboard.pid` (and/or `port`) file is still reported through
+ * `dashboard.sock` by pid and — when the socket advertises it — its port. The
+ * synchronous {@link getDashboardStatus} remains for API callers.
+ */
+export async function getDashboardStatusAsync(opts?: ResolveLiveDaemonOptions): Promise<{
+  running: boolean;
+  pid: number | null;
+  port: number;
+}> {
+  const port = readPort(opts);
+  const live = await resolveLiveDashboard(opts);
+  if (live) {
+    return { running: true, pid: live.pid, port: live.port };
+  }
+  return { running: false, pid: null, port };
+}
+
+/**
  * Start the standalone dashboard server.
  *
  * Spawns a detached node process running dist/server/dashboard-standalone.js.
@@ -2481,6 +2571,14 @@ export async function startDashboardStandalone(port?: number, opts?: StartOption
       // File missing or unreadable — use default
     }
     return { pid: status.pid, port: existingPort };
+  }
+
+  // Refuse to spawn a duplicate when a live dashboard lost its pidfile: the
+  // identity socket (DPID) is authoritative, so darwin no longer depends on
+  // pidfile/lsof parsing. A socket advertising another state dir is not ours.
+  const liveBySocket = await probeLiveServiceIdentity("dashboard", opts);
+  if (liveBySocket) {
+    return { pid: liveBySocket.pid, port: liveBySocket.controlPort };
   }
 
   const dashPort = port ?? DEFAULT_DASHBOARD_PORT;

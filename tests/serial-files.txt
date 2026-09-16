@@ -89,6 +89,7 @@ src/server/daemonctl-takeover-lifecycle.test.ts
 src/server/daemonctl-takeover.test.ts
 src/server/daemonctl.test.ts
 src/server/dashboard.test.ts
+src/server/service-identity-socket.test.ts
 src/server/suite-claim-liveness.test.ts
 src/suite/shim-acceptance.test.ts
 src/suite/shim.test.ts

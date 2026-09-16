@@ -32,6 +32,35 @@ node    304091 igorhvr   23u     IPv6 0xfedcba0987654321      0t0  TCP *:3339 (L
 node      555 igorhvr   18u     IPv4 0xabcdef0123456789      0t0  TCP *:3334 (LISTEN)
 `;
 
+/**
+ * Verbatim `lsof -nP -iTCP:3339 -sTCP:LISTEN` output captured on this Mac
+ * (darwin arm64) while the production daemon held 127.0.0.1:3339 — the
+ * loopback-bind form, which is what darwin actually emits here (not the
+ * synthetic `*:port` form above). Kept byte-for-byte, column spacing
+ * included, so a darwin lsof format drift fails a unit test instead of only
+ * the daemonctl lifecycle tests.
+ */
+const DARWIN_LSOF_LOOPBACK_OUTPUT = `COMMAND   PID    USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+node    26551 igorhvr   14u  IPv4 0x17223f1ada37c0c7      0t0  TCP 127.0.0.1:3339 (LISTEN)
+`;
+
+/**
+ * The darwin dual-stack/wildcard shape: loopback, IPv4 wildcard (`*:3339`)
+ * and IPv6 loopback (`[::1]:3339`) fd rows for the same process, plus a
+ * foreign-port row that must be ignored. All three same-pid rows must dedupe
+ * to one pid.
+ */
+const DARWIN_LSOF_DUAL_STACK_OUTPUT = `COMMAND   PID    USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+node    26551 igorhvr   14u  IPv4 0x17223f1ada37c0c7      0t0  TCP 127.0.0.1:3339 (LISTEN)
+node    26551 igorhvr   15u  IPv4 0x17223f1ada37c0c7      0t0  TCP *:3339 (LISTEN)
+node    26551 igorhvr   16u  IPv6 0x17223f1ada37c0c8      0t0  TCP [::1]:3339 (LISTEN)
+node      555 igorhvr   17u  IPv4 0x17223f1ada37c0c9      0t0  TCP 127.0.0.1:3334 (LISTEN)
+`;
+
+/** Verbatim macOS `ps -o command=` cmdline of the live production daemon. */
+const DARWIN_DAEMON_CMDLINE =
+  "/Users/igorhvr/.local/share/pi-node/node-v22.23.1-darwin-arm64/bin/node --disable-warning=ExperimentalWarning /Users/igorhvr/idm/tamandua/dist/server/daemon.js";
+
 /** RunCommand that always answers with one fixed stdout/status pair. */
 function fixedRunner(result: RunCommandResult): {
   run: (command: string, args: string[]) => RunCommandResult;
@@ -117,6 +146,41 @@ short line
   });
 });
 
+// ── darwin real-host fixtures (captured on this Mac) ────────────────
+
+describe("parseLsofListenPids — real darwin output (this host)", () => {
+  it("extracts pid 26551 from the verbatim loopback-only row", () => {
+    assert.deepEqual(parseLsofListenPids(DARWIN_LSOF_LOOPBACK_OUTPUT, 3339), [26551]);
+  });
+
+  it("dedupes loopback, wildcard and IPv6 rows to the same pid", () => {
+    assert.deepEqual(parseLsofListenPids(DARWIN_LSOF_DUAL_STACK_OUTPUT, 3339), [26551]);
+  });
+
+  it("skips the real darwin header and ignores other ports", () => {
+    // 3334 is present in the dual-stack fixture but was never requested.
+    assert.deepEqual(parseLsofListenPids(DARWIN_LSOF_DUAL_STACK_OUTPUT, 3334), [555]);
+    assert.deepEqual(parseLsofListenPids(DARWIN_LSOF_DUAL_STACK_OUTPUT, 4444), []);
+    // A bare header (no data rows) resolves to no pids.
+    assert.deepEqual(
+      parseLsofListenPids("COMMAND   PID    USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\n", 3339),
+      [],
+    );
+  });
+
+  it("resolves the real darwin holder end-to-end via resolvePortHolder", () => {
+    const { run, calls } = fixedRunner({ stdout: DARWIN_LSOF_LOOPBACK_OUTPUT, status: 0 });
+    const holder = resolvePortHolder(3339, "daemon", {
+      platform: "darwin",
+      runCommand: run,
+      getCmdline: (pid) => (pid === 26551 ? DARWIN_DAEMON_CMDLINE : ""),
+    });
+    assert.equal(holder?.pid, 26551);
+    assert.equal(holder?.cmdline, DARWIN_DAEMON_CMDLINE);
+    assert.deepEqual(calls, [{ command: "lsof", args: ["-nP", "-iTCP:3339", "-sTCP:LISTEN"] }]);
+  });
+});
+
 // ── isTamanduaServiceCmdline ────────────────────────────────────────
 
 describe("isTamanduaServiceCmdline", () => {
@@ -126,6 +190,13 @@ describe("isTamanduaServiceCmdline", () => {
       true,
     );
     assert.equal(isTamanduaServiceCmdline("node dist/server/daemon.js", "daemon"), true);
+  });
+
+  it("accepts the verbatim darwin node .../server/daemon.js cmdline", () => {
+    assert.equal(isTamanduaServiceCmdline(DARWIN_DAEMON_CMDLINE, "daemon"), true);
+    // The node binary path is pi-node's, not a tamandua path — only the
+    // process entry point proves the service, and that is the last token.
+    assert.equal(isTamanduaServiceCmdline(DARWIN_DAEMON_CMDLINE, "dashboard"), false);
   });
 
   it("accepts dashboard/mcp standalone entry points", () => {

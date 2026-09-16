@@ -3,16 +3,17 @@
  *
  * Linux exposes everything through procfs, which is cheap and exact, so it
  * is always tried first. macOS/BSD have no /proc; there the helpers fall
- * back to `ps` (pgid, cmdline, elapsed time) and `lsof` (cwd). The fallbacks
- * only see same-user processes — sufficient for every process tamandua
- * manages, since the daemon, harnesses, and CLI all run as the same user.
+ * back to the native `proc-info` sysctl helper (`ps`/`lsof` only when it was
+ * not built). The fallbacks only see same-user processes — sufficient for
+ * every process tamandua manages, since the daemon, harnesses, and CLI all
+ * run as the same user.
  *
- * IMPORTANT macOS limitation: the kernel does not let unprivileged callers
- * read another process's ENVIRONMENT (KERN_PROCARGS2 only yields argv;
- * `ps -E`/`ps e` print nothing for processes they didn't inherit). So
- * environ-based evidence (getEnvironText/environHasEntry) is procfs-only
- * and returns null/false on macOS — callers must rely on cwd and cmdline
- * evidence there instead.
+ * macOS environment note: `/bin/ps -E` prints nothing for processes it did
+ * not inherit, which is why this used to treat other processes' environments
+ * as kernel-hidden. That is wrong: sysctl KERN_PROCARGS2 DOES return the
+ * environ block for same-user processes, so the native helper's `env`
+ * subcommand supplies it and environ-based evidence
+ * (getEnvironText/environHasEntry) works on macOS exactly as on Linux.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -342,23 +343,28 @@ export function getProcessCwd(pid: number): string | null {
 
 /**
  * Raw environment text of a pid (NUL-separated entries), or null.
- * Procfs-only: macOS does not expose other processes' environments to
- * unprivileged callers, so this returns null there — use cwd/cmdline
- * evidence instead.
+ *
+ * procfs on Linux; the native helper's `env` subcommand (sysctl
+ * KERN_PROCARGS2) on macOS, where the kernel hands the environ block to
+ * same-user callers even though `ps -E` cannot. Never throws: any failure
+ * (helper absent, pid gone, other user) degrades to null.
  */
 export function getEnvironText(pid: number): string | null {
-  if (!hasProcfs()) return null;
-  try {
-    const buf = fs.readFileSync(`/proc/${pid}/environ`);
-    return buf.toString("utf-8");
-  } catch {
-    return null;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (hasProcfs()) {
+    try {
+      const buf = fs.readFileSync(`/proc/${pid}/environ`);
+      return buf.toString("utf-8");
+    } catch {
+      return null;
+    }
   }
+  return runProcInfo(["env", String(pid)]);
 }
 
 /**
  * Exact `NAME=value` membership test against a pid's environment.
- * Procfs-only (see getEnvironText); always false on macOS.
+ * Works on Linux (procfs) and macOS (native helper); false on any failure.
  */
 export function environHasEntry(pid: number, name: string, value: string): boolean {
   const environ = getEnvironText(pid);

@@ -7,6 +7,9 @@
  *    packaged dist layout is discovered on macOS;
  *  - live self introspection through the public API (state / pgid / cmdline /
  *    elapsed / bulk table) without ever needing /bin/ps;
+ *  - same-user environment reading (procfs on Linux; KERN_PROCARGS2 via the
+ *    native helper's `env` subcommand on macOS) including the NUL-entry
+ *    membership test;
  *  - absent pids degrade to null/empty (never throw);
  *  - a source-contract check that the module never shells out to ps for the
  *    data the native helper supplies.
@@ -16,19 +19,23 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { uptime } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   PROC_INFO_HELPER_BASENAME,
+  environHasEntry,
   getCmdline,
   getElapsedSeconds,
+  getEnvironText,
   getPgid,
   getProcessState,
   listProcessDetails,
   resolveProcInfoHelperPath,
 } from "../../dist/lib/proc-info.js";
+import { tamanduaTempDir, tamanduaTempRoot } from "../../dist/lib/temp-dir.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -109,5 +116,70 @@ describe("proc-info — live self introspection (no ps required)", () => {
     assert.equal(getPgid(ABSENT_PID), null);
     assert.equal(getCmdline(ABSENT_PID), "");
     assert.equal(getElapsedSeconds(ABSENT_PID), null);
+  });
+});
+
+/**
+ * Environment reading: procfs on Linux, the native helper's `env` subcommand
+ * (sysctl KERN_PROCARGS2) on macOS. The helper must be preferred over ps,
+ * which cannot see another process's environment at all.
+ */
+describe("proc-info — same-user environment reading", () => {
+  const helperAvailable = resolveProcInfoHelperPath() !== null;
+  // Without procfs the env reader depends on the compiled helper; skip
+  // honestly when a source checkout was never built.
+  const canReadEnv = process.platform !== "darwin" || helperAvailable;
+
+  it("reads HOME / TAMANDUA_STATE_DIR from a same-user child", async (t) => {
+    if (!canReadEnv) {
+      return t.skip("honest capability skip: proc-info helper not built on darwin");
+    }
+    const home = tamanduaTempDir("proc-info-home-");
+    const stateDir = `${home}/.tamandua`;
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: home,
+        TAMANDUA_STATE_DIR: stateDir,
+      },
+      stdio: "ignore",
+    });
+    const pid = child.pid;
+    assert.ok(typeof pid === "number" && pid > 0, "child must have a pid");
+    try {
+      // The kernel only exposes KERN_PROCARGS2 once the child has exec'd.
+      const deadline = Date.now() + 3000;
+      let environ = getEnvironText(pid);
+      while ((environ === null || !environ.includes(`HOME=${home}`)) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        environ = getEnvironText(pid);
+      }
+      assert.ok(environ !== null, "the child environ must be readable");
+      const entries = environ!.split("\0");
+      assert.ok(entries.includes(`HOME=${home}`), `HOME=${home} must be present`);
+      assert.ok(entries.includes(`TAMANDUA_STATE_DIR=${stateDir}`), "state dir entry must be present");
+      assert.equal(environHasEntry(pid, "HOME", home), true);
+      assert.equal(environHasEntry(pid, "TAMANDUA_STATE_DIR", stateDir), true);
+      assert.equal(environHasEntry(pid, "HOME", `${home}-other`), false);
+      // KERN_PROCARGS2 may append the kernel's private apple string vector
+      // after the environ (no reliable delimiter), but exact NAME=value
+      // membership is unaffected. Assert a couple of real entries survive.
+      assert.ok(
+        entries.some((entry) => entry.startsWith("HOME=")),
+        "the HOME entry must be a clean NUL-separated entry",
+      );
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("degrades to null/false for an absent pid instead of throwing", () => {
+    assert.equal(getEnvironText(ABSENT_PID), null);
+    assert.equal(
+      environHasEntry(ABSENT_PID, "HOME", path.join(tamanduaTempRoot(), "whatever")),
+      false,
+    );
+    assert.equal(getEnvironText(-1), null);
+    assert.equal(getEnvironText(0), null);
   });
 });

@@ -981,4 +981,60 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       try { await portHandle.close(); } catch {}
     }
   });
+
+  // ────────────────────────────────────────────────────────────────
+  // US-004: stop resolves by identity socket when pid+port files vanish
+  // ────────────────────────────────────────────────────────────────
+  it("mcp stop uses mcp.sock when mcp.pid and mcp-port are deleted", async (t) => {
+    if (!fs.existsSync(cliPath)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
+
+    const tempEnv = await createTempEnv();
+    const cliEnv = {
+      HOME: tempEnv.homeDir,
+      TAMANDUA_STATE_DIR: tempEnv.stateDir,
+      TAMANDUA_CONTROL_PORT: String(tempEnv.controlPort),
+    };
+
+    const isolatedPidFile = path.join(tempEnv.stateDir, "mcp.pid");
+    const isolatedPortFile = path.join(tempEnv.stateDir, "mcp-port");
+    const isolatedSocket = path.join(tempEnv.stateDir, "mcp.sock");
+
+    try {
+      await portHandle.close();
+
+      const start = await runCli(["mcp", "start", "--port", String(mcpPort)], cliEnv);
+      assert.equal(start.code, 0, `MCP start failed: ${cleanStderr(start.stderr) || start.stdout}`);
+
+      // The identity socket is the ONLY liveness evidence we leave behind.
+      const socketDeadline = Date.now() + 10_000;
+      while (!fs.existsSync(isolatedSocket) && Date.now() < socketDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
+      assert.ok(fs.existsSync(isolatedSocket), "mcp.sock must be bound after start");
+
+      fs.unlinkSync(isolatedPidFile);
+      fs.unlinkSync(isolatedPortFile);
+
+      const stop = await runCli(["mcp", "stop"], cliEnv);
+      assert.equal(stop.code, 0, `MCP stop failed: ${cleanStderr(stop.stderr) || stop.stdout}`);
+      assert.match(stop.stdout, /MCP server stopped/);
+
+      await waitForHttpDown(`http://127.0.0.1:${mcpPort}/mcp`);
+      assert.equal(fs.existsSync(isolatedPidFile), false, "stop must remove the pidfile");
+      assert.equal(fs.existsSync(isolatedPortFile), false, "stop must remove the port file");
+      assert.equal(fs.existsSync(isolatedSocket), false, "stop must remove mcp.sock");
+    } finally {
+      try { fs.unlinkSync(isolatedPidFile); } catch {}
+      try { fs.unlinkSync(isolatedPortFile); } catch {}
+      await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      try { await portHandle.close(); } catch {}
+    }
+  });
 });
