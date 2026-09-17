@@ -41,6 +41,7 @@ These are non-negotiable — a security failure is always a rejection, regardles
 - Required tests are missing or test the wrong thing
 - Acceptance criteria are not met
 - Build/typecheck fails
+- A story whose test evidence shows a gate exited 0 without exercising the behavior (zero cases, skipped, or setup failure reported as a rejection) is not verified; return it with `STATUS: retry` and name the gate.
 
 ## CRITICAL — STATUS Line Requirement
 

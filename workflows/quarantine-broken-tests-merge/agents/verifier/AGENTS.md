@@ -50,6 +50,7 @@ Prefer launching the suite in the background (nohup/detached, output to a file) 
 - Tests were deleted instead of disabled
 - Quarantine comments are missing
 - Test suite is unstable (passes one run, fails the next)
+- A story whose test evidence shows a gate exited 0 without exercising the behavior (zero cases, skipped, or setup failure reported as a rejection) is not verified; return it with `STATUS: retry` and name the gate.
 
 ## CRITICAL — STATUS Line Requirement
 

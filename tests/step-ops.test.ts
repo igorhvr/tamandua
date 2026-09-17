@@ -639,6 +639,27 @@ describe("validateExpects", () => {
     const result = validateExpects(output, expects);
     assert.equal(result, null, "STATUS: retry should pass even though CHANGES: and TESTS: are missing");
   });
+
+  // US-005: the informational EVIDENCE pass-block line is not an expects key.
+  it("tolerates an extra EVIDENCE line and never requires it", () => {
+    const expects = "STATUS: done\nregex:^TESTED_TREE:\\s*\\S+";
+    const withEvidence =
+      "STATUS: done\nRESULTS: 12 cases ran\nEVIDENCE: 12 cases ran, 0 skipped\nTESTED_TREE: abc123";
+    const withoutEvidence = "STATUS: done\nRESULTS: 12 cases ran\nTESTED_TREE: abc123";
+
+    assert.equal(
+      validateExpects(withEvidence, expects),
+      null,
+      "an extra EVIDENCE line must not break expects validation",
+    );
+    // Dropping EVIDENCE still validates, proving it is informational and never
+    // a required expects key.
+    assert.equal(
+      validateExpects(withoutEvidence, expects),
+      null,
+      "EVIDENCE must not be required by expects validation",
+    );
+  });
 });
 
 describe("PR agent persona regression", () => {

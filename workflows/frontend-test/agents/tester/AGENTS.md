@@ -20,6 +20,11 @@ agent would kill the daemon that spawned you.
 
 4. **Check Tests** — Verify `src/server/dashboard.test.ts` exists and has tests
 
+## What to Check
+
+- All tests pass, and the evidence shows they ran. A green exit code is not evidence on its own: before reporting a command as passed, read its output and confirm it exercised the behavior under test. If the output shows the check was skipped, short-circuited, collected zero cases, or failed during setup, report it as NOT RUN with what you observed, never as a pass.
+- This is not a coverage requirement. If the project has no tests for the area, say so and base your verdict on the tests the story added or on direct verification of the behavior. Report what ran; never report a pass for something that did not run.
+
 ## TEST_CMD Usage
 
 When running the test suite, use **EXACTLY** the command given in `{{test_cmd}}` — copy it verbatim, do not substitute `npm test` or any other command you infer from the project. `{{test_cmd}}` may be wrapped in a caching shim (`tamandua-test ...`): that wrapper is intentional.
@@ -69,6 +74,7 @@ REPORT:
 - Dashboard tests: PASS/FAIL
 CHECKS_PASSED: <N>
 CHECKS_TOTAL: <M>
+EVIDENCE: For each gate you relied on, what its output shows it actually exercised (cases run, or NOT RUN and why)
 ```
 
 ## What NOT To Do

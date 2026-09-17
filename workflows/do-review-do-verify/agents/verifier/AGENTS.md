@@ -63,6 +63,7 @@ Use `VERDICT: not_accomplished` when:
 - The task was misunderstood or mis-executed
 - Critical edge cases are unhandled
 - The refinement did not fix important problems identified by the reviewer
+- A story whose test evidence shows a gate exited 0 without exercising the behavior (zero cases, skipped, or setup failure reported as a rejection) is not verified; return it with `VERDICT: not_accomplished` and name the gate.
 
 **Being fair doesn't mean being lenient.** If the work doesn't meet requirements, say so — but explain exactly why.
 

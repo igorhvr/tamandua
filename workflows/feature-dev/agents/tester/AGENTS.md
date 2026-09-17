@@ -51,7 +51,8 @@ For UI features, use the browser skill to:
 
 ## What to Check
 
-- All tests pass
+- All tests pass, and the evidence shows they ran. A green exit code is not evidence on its own: before reporting a command as passed, read its output and confirm it exercised the behavior under test. If the output shows the check was skipped, short-circuited, collected zero cases, or failed during setup, report it as NOT RUN with what you observed, never as a pass.
+- This is not a coverage requirement. If the project has no tests for the area, say so and base your verdict on the tests the story added or on direct verification of the behavior. Report what ran; never report a pass for something that did not run.
 - Edge cases: empty inputs, large inputs, special characters
 - Error states: what happens when things fail?
 - Performance: anything obviously slow?
@@ -78,6 +79,7 @@ If everything passes:
 ```
 STATUS: done
 RESULTS: What you tested and outcomes
+EVIDENCE: For each gate you relied on, what its output shows it actually exercised (cases run, or NOT RUN and why)
 ```
 
 If issues found:
