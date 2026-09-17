@@ -155,6 +155,19 @@ export interface TamanduaEvent {
   /** Consecutive instant-fail worker rounds at the time a run.instant_fail_loop alert fires. */
   consecutiveInstantFails?: number;
   /**
+   * OUTAGE-ROUNDS (SCLS US-004): whole-round wall time (ms) for a
+   * step.preclaim_round_died record. `harnessWallMs` is the harness process
+   * time the pre-claim predicate classified on (VM setup excluded);
+   * `vmSetupMs` is the separate VM setup time (0 native); `wallMs` is the
+   * whole-round fallback. `consecutivePreclaimDeaths` is the per-job streak
+   * after this death.
+   */
+  harnessWallMs?: number;
+  vmSetupMs?: number;
+  wallMs?: number;
+  /** Consecutive pre-claim death rounds at the time step.preclaim_round_died fires. */
+  consecutivePreclaimDeaths?: number;
+  /**
    * IFLB launch-time harness probe fields. `harness` names the run's
    * harness (pi | hermes | dsh); `probeCmd` the exact command the probe
    * asked the harness to run (`<launcher> skill-path`); `expected` the
@@ -312,11 +325,19 @@ export const RUN_LIFECYCLE_EVENTS: readonly string[] = Object.freeze([
  * `run.instant_fail_loop` fires when the dispatch motor escalates a
  * worker instant-fail loop (K+ consecutive sub-threshold zero-output
  * nonzero-exit rounds) toward run failure; the terminal run.force_failed
- * event follows immediately after with the precise reason. Pinned by
- * src/installer/events-vocabulary.test.ts.
+ * event follows immediately after with the precise reason.
+ *
+ * `run.preclaim_death_loop` (OUTAGE-ROUNDS SCLS US-005) fires when the
+ * motor escalates a PRE-CLAIM DEATH loop — K+ consecutive rounds that ran at
+ * least the wall threshold and exited nonzero / died by signal WITHOUT
+ * claiming a step — using the same K/N backoff policy but a distinct
+ * counter (`consecutivePreclaimDeaths`) and reason, so a slow claim-less
+ * death loop is distinguishable from the fast instant-fail loop.
+ * Pinned by src/installer/events-vocabulary.test.ts.
  */
 export const RUN_ALERT_EVENTS: readonly string[] = Object.freeze([
   "run.instant_fail_loop",
+  "run.preclaim_death_loop",
 ]);
 
 /**

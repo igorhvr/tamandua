@@ -61,6 +61,10 @@ import {
   isInstantFailBackoffActive,
   _instantFailStreakFor,
   _resetInstantFailStreaks,
+  armPreclaimDeathBackoff,
+  isPreclaimDeathBackoffActive,
+  _preclaimDeathStreakFor,
+  _resetPreclaimDeathStreaks,
 } from "../dist/installer/agent-scheduler.js";
 import {
   createDashboardServer,
@@ -256,6 +260,53 @@ describe("US-013 dispatch instant-fail backoff gate is monotonic", () => {
     withWallJump(-30 * DAY_MS, () => {
       assert.equal(
         isInstantFailBackoffActive(streak),
+        false,
+        "after 30ms of real time the gate must open; a backward wall jump must not extend it",
+      );
+    });
+  });
+});
+
+// ── (b) Dispatch pre-claim-death backoff gate (OUTAGE-ROUNDS SCLS US-005) ──
+
+describe("US-013 dispatch pre-claim-death backoff gate is monotonic", () => {
+  after(() => {
+    _resetPreclaimDeathStreaks();
+  });
+
+  it("a forward wall jump cannot release the armed pre-claim-death backoff gate", () => {
+    const deadline = armPreclaimDeathBackoff("us013-preclaim-forward-job", 6, 60_000);
+    const streak = _preclaimDeathStreakFor("us013-preclaim-forward-job");
+    assert.ok(streak, "arming must record a streak");
+    assert.ok(
+      deadline < 1e12,
+      `the armed deadline ${deadline} must be a monotonic reading, not an epoch instant`,
+    );
+
+    withWallJump(30 * DAY_MS, () => {
+      assert.equal(
+        isPreclaimDeathBackoffActive(streak),
+        true,
+        "a forward wall jump must not open the monotonic pre-claim-death backoff gate",
+      );
+      assert.equal(
+        isPreclaimDeathBackoffActive(streak, monotonicNow()),
+        true,
+        "the production gate (explicit monotonicNow) must stay closed",
+      );
+    });
+  });
+
+  it("a backward wall jump cannot extend the pre-claim-death backoff gate", async () => {
+    armPreclaimDeathBackoff("us013-preclaim-backward-job", 6, 30);
+    const streak = _preclaimDeathStreakFor("us013-preclaim-backward-job");
+    assert.ok(streak);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    withWallJump(-30 * DAY_MS, () => {
+      assert.equal(
+        isPreclaimDeathBackoffActive(streak),
         false,
         "after 30ms of real time the gate must open; a backward wall jump must not extend it",
       );

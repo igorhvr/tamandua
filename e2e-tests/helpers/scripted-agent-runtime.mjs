@@ -28,7 +28,8 @@
  * what each round observed.
  *
  * Chaos modes (behavior.mode): "work" (default), "hang", "hang-after-claim",
- * "die-before-claim", "die-after-claim", "no-status", "garbage".
+ * "die-before-claim", "stream-die-before-claim", "die-after-claim",
+ * "no-status", "garbage".
  */
 
 import { spawnSync } from "node:child_process";
@@ -66,6 +67,15 @@ function logInvocation(entry) {
 
 function fatal(note) {
   sharedFatal(stateDir, "scripted-agent", note);
+}
+
+// Sleep synchronously for `ms` milliseconds (the same spawnSync("sleep", …)
+// pattern used by the reportBeforeEmit path below). A non-positive/absent
+// value is a no-op, so existing die-* behaviors are unchanged.
+function sleepFor(ms) {
+  const n = Number(ms);
+  if (!(n > 0)) return;
+  spawnSync("sleep", [(n / 1000).toFixed(3)]);
 }
 
 // ── pi-shaped JSON event emission ───────────────────────────────────
@@ -215,7 +225,18 @@ if (mode === "hang") {
   setInterval(() => {}, 1 << 30); // hold the event loop; scheduler timeout kills us
 } else if (mode === "die-before-claim") {
   logInvocation({ ...work, note: "exiting before claim" });
+  sleepFor(behavior.sleepMs);
   process.exit(behavior.exitCode ?? 3);
+} else if (mode === "stream-die-before-claim") {
+  // Slow streaming pre-claim death: emit non-empty stdout, wait past the
+  // instant-fail wall threshold, then exit non-zero WITHOUT ever claiming a
+  // step (no claimStep / completeStep call). Modelled for OUTAGE-ROUNDS so
+  // the pre-claim death backoff/cap can be exercised end-to-end.
+  logInvocation({ ...work, note: "streaming then dying before claim" });
+  const streamText = behavior.streamOutput ?? "working...\n";
+  process.stdout.write(streamText.endsWith("\n") ? streamText : `${streamText}\n`);
+  sleepFor(behavior.sleepMs);
+  process.exit(behavior.exitCode ?? 1);
 } else if (mode === "garbage") {
   logInvocation({ ...work, note: "emitting garbage output" });
   process.stdout.write("%%% not json — scripted garbage output %%%\n{truncated\n");

@@ -1,30 +1,33 @@
 /**
- * Mid-Run Instant-Fail Loop E2E (IFLB-mid US-004) — fast, ZERO model tokens
+ * Instant-Fail Wall-Threshold E2E (OUTAGE-ROUNDS US-008) — fast, ZERO tokens
  *
- * This tier drives the MID-RUN instant-fail loop through the REAL daemon →
- * scheduler → harness path (the same real-pipeline plumbing as
- * workflows-scripted.test.ts / workflows-harness-probe.test.ts, but focused
- * on the IFLB-mid regression US-001 fixed):
+ * The OUTAGE-ROUNDS change raises the instant-fail wall threshold default from
+ * 2000 ms to 6000 ms so provider refusals that die after a network round trip
+ * (e.g. a dsh `QUOTA:` refusal at ~3 s) join the existing escalating backoff
+ * and run cap instead of being respawned invisibly.
  *
- * A run launched with a shim harness that ANSWERS the launch-time probe
- * correctly (the probe-aware canned runtime — so the run passes the probe
- * and only breaks MID-RUN) but then exits 1 instantly with zero output on
- * EVERY work round. With low thresholds via daemon env (K=2, N=4, base 3s)
- * the run must:
+ * This tier proves that exact boundary through the REAL daemon → scheduler →
+ * harness path with a shim harness that:
  *
- *   (a) relaunch after each escalating backoff window — never strand as
- *       `previous_round_in_flight` after a backoff-gated tick (the leaked
- *       in-flight mark: pre-fix, the first tick inside the backoff window
- *       leaked the job's in-flight mark and every later tick was skipped
- *       as previous_round_in_flight, so no relaunch ever happened and N
- *       was unreachable), and
- *   (b) force-fail within about a minute with exactly one
- *       run.instant_fail_loop event carrying the RSPN reason, zero steps
- *       completed (no claim ever happens — the shim dies before claiming).
+ *   1. ANSWERS the launch-time probe correctly (TAMANDUA_HARNESS_PROBE=1), so
+ *      the run passes the probe and only breaks MID-RUN, and
+ *   2. on every work round runs `die-before-claim` with `sleepMs: 3000` and
+ *      `exitCode: 1` — it lives ~3 s, writes ZERO stdout, and exits non-zero
+ *      WITHOUT ever claiming a step.
  *
- * The probe is ENABLED (TAMANDUA_HARNESS_PROBE=1 pinned in the daemon env):
- * the run must pass the launch-time probe and only break mid-run. No
- * models are invoked — zero tokens.
+ * With `TAMANDUA_INSTANT_FAIL_WALL_MS=6000` pinned (the new default), a ~3 s
+ * empty-stdout nonzero-exit round is SUB-threshold and must classify as an
+ * instant fail (not a slow pre-claim death). With low thresholds via daemon
+ * env (K=2, N=4, base 3 s) the run must:
+ *
+ *   (a) engage the escalating backoff after K rounds and relaunch after the
+ *       window (a gated `instant_fail_backoff` tick is the regression
+ *       evidence), and
+ *   (b) force-fail with exactly one `run.instant_fail_loop` carrying the RSPN
+ *       `sub-6s` reason, with `runs.instant_fail_count === N` and zero steps
+ *       completed (no claim ever happens).
+ *
+ * No models are invoked — zero tokens.
  *
  * Run via: ./run-all-scripted-e2e-tests (or ./run-all-e2e-tests)
  */
@@ -56,8 +59,8 @@ import {
 
 const WORKFLOW_ID = "do-now"; // single agent (`doer`), single step (`execute`)
 const TASK =
-  "Instant-fail-loop e2e: do not modify files or run commands other than the " +
-  "tamandua step commands. Reply with STATUS: done and REPORT: instant-fail ok.";
+  "Instant-fail threshold e2e: do not modify files or run commands other than " +
+  "the tamandua step commands. Reply with STATUS: done and REPORT: threshold ok.";
 
 // Low thresholds via daemon env (per the story): K=2 backoff threshold,
 // N=4 escalation threshold. The backoff base is 3s (not 1s) so a poll
@@ -66,25 +69,29 @@ const TASK =
 const K = 2;
 const N = 4;
 const BACKOFF_BASE_MS = 3_000;
-// Pin the NEW 6000 ms default (OUTAGE-ROUNDS US-008) explicitly: the bare
-// die-before-claim shim round is near-instant (node startup + `step peek`
-// child spawn, well under 6s), so it must still classify as an instant fail
-// (sub-threshold at the 6s default), never as a slow pre-claim death round.
+// The new 6000 ms default is pinned explicitly for determinism under host
+// load. A die-before-claim round that sleeps 3s and emits empty stdout must
+// still be SUB-threshold at 6s (US-008 acceptance criterion 1).
 const WALL_MS = 6_000;
-const POLL_TIMEOUT_MS = 60_000; // the run must fail within about a minute
+// The shim itself lives ~3s per round (sleepMs), so an empty-stdout nonzero
+// exit at ~3s < 6s classifies as an INSTANT fail (the provider-refusal
+// shape), never as a slow pre-claim death.
+const ROUND_SLEEP_MS = 3_000;
+const POLL_TIMEOUT_MS = 90_000; // the run must fail within about 90s
+const TEST_TIMEOUT_MS = 150_000;
 
 // ── Shared plumbing ─────────────────────────────────────────────────
 
-interface InstantFailRunContext {
+interface ThresholdRunContext {
   env: Awaited<ReturnType<typeof createTempHome>>;
   daemon: ChildProcess;
 }
 
 /** Install the workflow and launch the daemon (probe ON, low IFLB thresholds, debug log). */
-async function startInstantFailEnvironment(
+async function startThresholdEnvironment(
   env: Awaited<ReturnType<typeof createTempHome>>,
   daemonEnv: Record<string, string>,
-): Promise<InstantFailRunContext> {
+): Promise<ThresholdRunContext> {
   cliMustSucceed(
     ["workflow", "install", WORKFLOW_ID],
     baseEnv(env.homeDir, env.controlPort),
@@ -93,23 +100,23 @@ async function startInstantFailEnvironment(
   await releasePortReservations(env);
   const daemon = await startIsolatedDaemon(env.homeDir, env.controlPort, {
     // Pin the probe ON: the harness must pass the launch-time probe and
-    // only break mid-run (the exact IFLB-mid scenario).
+    // only break mid-run.
     TAMANDUA_HARNESS_PROBE: "1",
     // Debug lines carry the dispatch skip reasons (instant_fail_backoff /
-    // previous_round_in_flight) — the leaked-mark regression evidence.
+    // previous_round_in_flight).
     TAMANDUA_DEBUG: "1",
-    // Low thresholds so the loop escalates within about a minute.
+    // Low thresholds so the loop escalates within about 90s.
     TAMANDUA_INSTANT_FAIL_BACKOFF_K: String(K),
     TAMANDUA_INSTANT_FAIL_ESCALATION_N: String(N),
     TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS: String(BACKOFF_BASE_MS),
-    // Pin the new 6000 ms default (see WALL_MS note above).
+    // Pin the NEW 6000 ms default explicitly.
     TAMANDUA_INSTANT_FAIL_WALL_MS: String(WALL_MS),
     ...daemonEnv,
   });
   return { env, daemon };
 }
 
-async function teardown(ctx: InstantFailRunContext | undefined): Promise<void> {
+async function teardown(ctx: ThresholdRunContext | undefined): Promise<void> {
   if (!ctx) return;
   try {
     await stopIsolatedDaemon(ctx.daemon);
@@ -120,7 +127,7 @@ async function teardown(ctx: InstantFailRunContext | undefined): Promise<void> {
 }
 
 /** Append daemon log + run event diagnostics to a failure. */
-function diagnostics(ctx: InstantFailRunContext, runId?: string): string {
+function diagnostics(ctx: ThresholdRunContext, runId?: string): string {
   let daemonLogTail = "(no daemon log)";
   try {
     const logPath = path.join(ctx.env.tamanduaDir, "tamandua.log");
@@ -147,7 +154,7 @@ function diagnostics(ctx: InstantFailRunContext, runId?: string): string {
 }
 
 async function waitForTerminalStatus(
-  ctx: InstantFailRunContext,
+  ctx: ThresholdRunContext,
   runId: string,
   timeoutMs: number,
 ): Promise<string> {
@@ -165,7 +172,7 @@ async function waitForTerminalStatus(
 }
 
 function readRunEvents(
-  ctx: InstantFailRunContext,
+  ctx: ThresholdRunContext,
   runId: string,
 ): Array<Record<string, unknown>> {
   const eventsPath = path.join(ctx.env.tamanduaDir, "events", `${runId}.jsonl`);
@@ -177,7 +184,7 @@ function readRunEvents(
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-function dbRows<T>(ctx: InstantFailRunContext, sql: string, ...params: string[]): T[] {
+function dbRows<T>(ctx: ThresholdRunContext, sql: string, ...params: string[]): T[] {
   const db = openE2eDatabase(path.join(ctx.env.tamanduaDir, "tamandua.db"));
   try {
     return db.prepare(sql).all(...params) as T[];
@@ -192,7 +199,7 @@ function dbRows<T>(ctx: InstantFailRunContext, sql: string, ...params: string[])
  * structured fields), in file order. Skip-reason lines are DEBUG-level, so
  * TAMANDUA_DEBUG=1 is set on the daemon env above.
  */
-function readRunScopedLogLines(ctx: InstantFailRunContext, runId: string): string[] {
+function readRunScopedLogLines(ctx: ThresholdRunContext, runId: string): string[] {
   const logPath = path.join(ctx.env.tamanduaDir, "tamandua.log");
   if (!fs.existsSync(logPath)) return [];
   const needle = `"runId":"${runId}"`;
@@ -204,12 +211,12 @@ function readRunScopedLogLines(ctx: InstantFailRunContext, runId: string): strin
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
+describe("instant-fail wall-threshold e2e (OUTAGE-ROUNDS US-008)", () => {
   it(
-    "a probe-passing harness that exit-1s with zero output on every work round relaunches after each backoff window and force-fails with run.instant_fail_loop (K=2, N=4)",
-    { timeout: 120_000 },
+    "a probe-passing harness that sleeps 3s and exit-1s with zero output classifies at the 6000 ms threshold, backs off, and force-fails with run.instant_fail_loop (K=2, N=4)",
+    { timeout: TEST_TIMEOUT_MS },
     async () => {
-      let ctx: InstantFailRunContext | undefined;
+      let ctx: ThresholdRunContext | undefined;
       const startedAt = Date.now();
       try {
         const env = await createTempHome();
@@ -217,22 +224,23 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
         // Probe-aware shim harness: the scripted-agent runtime ANSWERS the
         // launch-time probe prompt (runs the quoted `<launcher> skill-path`
         // for real, replies with the PATH, never journaled), then applies
-        // per-work-round behaviors. `die-before-claim` + exitCode 1 = the
-        // mid-run breakage: peek confirms HAS_WORK, then exit 1 instantly
-        // with ZERO stdout — never claiming the step.
+        // per-work-round behaviors. `die-before-claim` with sleepMs 3000 and
+        // exitCode 1 = a ~3s harness round that emits ZERO stdout and dies
+        // before claiming — the provider-refusal shape that must classify as
+        // an instant fail at the 6000 ms threshold.
         const behaviors: ScriptedAgentConfig = {
           agents: {
-            doer: { mode: "die-before-claim", exitCode: 1 },
+            doer: { mode: "die-before-claim", sleepMs: ROUND_SLEEP_MS, exitCode: 1 },
           },
         };
         const scripted = createScriptedAgent(env.root, behaviors);
 
-        ctx = await startInstantFailEnvironment(env, {
+        ctx = await startThresholdEnvironment(env, {
           ...scripted.env,
           TAMANDUA_PI_BINARY: scripted.binPath,
         });
 
-        const workdir = path.join(env.root, "instant-fail-workdir");
+        const workdir = path.join(env.root, "instant-fail-threshold-workdir");
         fs.mkdirSync(workdir, { recursive: true });
         const runIdPrefix = await spawnWorkflowRun(
           [
@@ -247,14 +255,14 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
         );
         const runId = resolveFullRunId(runIdPrefix, env.tamanduaDir);
 
-        // The run must FAIL within about a minute (the poll deadline is the
-        // "about a minute" bound; diagnostics are attached on timeout).
+        // The run must FAIL within about 90s (the poll deadline is the bound;
+        // diagnostics are attached on timeout).
         const status = await waitForTerminalStatus(ctx, runId, POLL_TIMEOUT_MS);
         const elapsedMs = Date.now() - startedAt;
         assert.equal(
           status,
           "failed",
-          `a mid-run instant-fail loop must force-fail the run, got "${status}" after ${elapsedMs}ms\n${diagnostics(ctx, runId)}`,
+          `an instant-fail threshold loop must force-fail the run, got "${status}" after ${elapsedMs}ms\n${diagnostics(ctx, runId)}`,
         );
 
         // ── Scenario check: the launch-time probe PASSED (the harness only
@@ -272,7 +280,8 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
           "a probe-passing shim must never produce a probe-failure event",
         );
 
-        // ── Exactly one run.instant_fail_loop with the consecutive count ──
+        // ── Exactly one run.instant_fail_loop with the consecutive count and
+        // the sub-6s reason (proves classification at the 6 s threshold) ──
         const loops = events.filter((e) => e.event === "run.instant_fail_loop");
         assert.equal(
           loops.length,
@@ -288,11 +297,11 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
         assert.match(
           loopReason,
           /^worker instant-fail loop: \d+ consecutive sub-6s exit-1 rounds; last command: /,
-          "run.instant_fail_loop reason must match the RSPN shape",
+          "run.instant_fail_loop reason must render sub-6s (the pinned 6000 ms threshold)",
         );
 
         // ── The run is force-failed through the sanctioned path with the
-        // same RSPN reason, and the alert precedes the terminal event ──
+        // same reason, and the alert precedes the terminal event ──
         const forceFailures = events.filter((e) => e.event === "run.force_failed");
         assert.equal(
           forceFailures.length,
@@ -303,13 +312,26 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
         assert.match(
           ffReason,
           /^worker instant-fail loop: \d+ consecutive sub-6s exit-1 rounds; last command: /,
-          "run.force_failed reason must match the RSPN shape",
+          "run.force_failed reason must render sub-6s (the pinned 6000 ms threshold)",
         );
         const loopIdx = events.findIndex((e) => e.event === "run.instant_fail_loop");
         const forceIdx = events.findIndex((e) => e.event === "run.force_failed");
         assert.ok(
           loopIdx >= 0 && forceIdx > loopIdx,
           "run.instant_fail_loop must precede the run.force_failed terminal event",
+        );
+
+        // ── The slow shape must NOT be misclassified as a pre-claim death:
+        // the ~3s rounds stay SUB-threshold, so no preclaim event/counter. ──
+        assert.equal(
+          events.filter((e) => e.event === "step.preclaim_round_died").length,
+          0,
+          "a sub-threshold exit-1 round must classify as an instant fail, never as a pre-claim death",
+        );
+        assert.equal(
+          events.filter((e) => e.event === "run.preclaim_death_loop").length,
+          0,
+          "a sub-threshold instant-fail loop must not emit the preclaim death cap",
         );
 
         // ── Zero steps completed: no claim ever happened (the shim dies
@@ -327,9 +349,14 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
             .map((e) => String(e.event))
             .join(", ")}`,
         );
-        const steps = dbRows<{ step_id: string; status: string; claim_pid: number | null }>(
+        const steps = dbRows<{
+          step_id: string;
+          status: string;
+          claim_pid: number | null;
+          preclaim_death_count: number;
+        }>(
           ctx,
-          "SELECT step_id, status, claim_pid FROM steps WHERE run_id = ?",
+          "SELECT step_id, status, claim_pid, preclaim_death_count FROM steps WHERE run_id = ?",
           runId,
         );
         assert.ok(steps.length >= 1, "the run should have seeded its workflow steps");
@@ -341,10 +368,19 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
             step.claim_pid === null,
             `step ${step.step_id} must never have been claimed (claim_pid set)`,
           );
+          assert.equal(
+            step.preclaim_death_count,
+            0,
+            `step ${step.step_id} must never accrue pre-claim deaths (sub-threshold rounds)`,
+          );
         }
 
         // ── DB: run failed with the counter at N and the probe 'ok' ──
-        const runs = dbRows<{ status: string; instant_fail_count: number; harness_probe_status: string | null }>(
+        const runs = dbRows<{
+          status: string;
+          instant_fail_count: number;
+          harness_probe_status: string | null;
+        }>(
           ctx,
           "SELECT status, instant_fail_count, harness_probe_status FROM runs WHERE id = ?",
           runId,
@@ -372,16 +408,12 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
           `doer must run exactly ${N} die-before-claim work rounds, got ${workRounds.length}\n${scripted.describe()}`,
         );
 
-        // ── Daemon log: the leaked-mark regression ──
+        // ── Daemon log: the backoff/relaunch evidence ──
         // The run-scoped log must show (1) at least one backoff-gated tick
-        // (`instant_fail_backoff` — the backoff window engaged and a tick
-        // landed inside it), (2) real relaunches AFTER that gated tick
-        // (work-round starts + instant-fail classifications for the
-        // relaunched rounds — pre-fix, nothing ever relaunched after the
-        // first gated tick), and (3) NO `previous_round_in_flight` skip
-        // after the first backoff-gated tick (the leaked in-flight mark:
-        // pre-fix the gated tick leaked the mark and every later tick was
-        // skipped as previous_round_in_flight).
+        // (`instant_fail_backoff`), (2) real relaunches AFTER that gated tick
+        // (work-round starts + instant-fail classifications for the relaunched
+        // rounds), and (3) NO `previous_round_in_flight` skip after the first
+        // backoff-gated tick (the leaked in-flight mark regression).
         const logLines = readRunScopedLogLines(ctx, runId);
         const indexesOf = (substr: string): number[] =>
           logLines
@@ -403,7 +435,7 @@ describe("mid-run instant-fail loop e2e (IFLB-mid US-004)", () => {
         );
         assert.ok(
           roundStarts.some((i) => i > backoffSkips[0]),
-          "a work round must relaunch AFTER the first backoff-gated tick (pre-fix, no relaunch ever happened)",
+          "a work round must relaunch AFTER the first backoff-gated tick",
         );
         assert.ok(
           classifications.some((i) => i > backoffSkips[0]),

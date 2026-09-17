@@ -19,8 +19,11 @@ import { describe, it, afterEach } from "node:test";
 
 import {
   isInstantFailRound,
+  isPreclaimDeathRound,
+  resolveHarnessWallMs,
   instantFailBackoffDelayMs,
   formatInstantFailReason,
+  formatPreclaimDeathReason,
   getInstantFailWallThresholdMs,
   getInstantFailBackoffThreshold,
   getInstantFailEscalationThreshold,
@@ -45,6 +48,27 @@ interface RoundResultLike {
   exitCode?: number | null;
   signal?: string;
   timedOut?: boolean;
+  harnessWallMs?: number;
+  vmSetupMs?: number;
+}
+
+/**
+ * A fake in-VM runner round (Matchlock seam): reports the harness PROCESS
+ * time (`harnessWallMs`, guest exec→exit) and the VM setup time
+ * (`vmSetupMs`) separately. The whole-round wall used as the fallback is the
+ * sum — VM setup is folded into the fallback ONLY, never into harnessWallMs.
+ */
+function fakeRunner(
+  signals: { harnessWallMs?: number; vmSetupMs?: number },
+  resultOverrides: Partial<RoundResultLike> = {},
+): { wallMs: number; harnessWallMs?: number; result: RoundResultLike } {
+  const vmSetupMs = signals.vmSetupMs ?? 0;
+  const harnessWallMs = signals.harnessWallMs;
+  return {
+    wallMs: (harnessWallMs ?? 0) + vmSetupMs,
+    harnessWallMs,
+    result: roundResult({ harnessWallMs, vmSetupMs, ...resultOverrides }),
+  };
 }
 
 const saved = new Map<string, string | undefined>();
@@ -217,11 +241,38 @@ describe("instant-fail classification boundaries (RSPN)", () => {
     );
   });
 
-  it("default thresholds are conservative (2s wall, K=6 backoff, N=20 escalation)", () => {
-    assert.equal(DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS, 2_000);
+  it("default thresholds are conservative (6s wall, K=6 backoff, N=20 escalation)", () => {
+    assert.equal(DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS, 6_000);
     assert.equal(DEFAULT_INSTANT_FAIL_BACKOFF_THRESHOLD, 6);
     assert.equal(DEFAULT_INSTANT_FAIL_ESCALATION_THRESHOLD, 20);
     assert.equal(DEFAULT_INSTANT_FAIL_BACKOFF_BASE_MS, 30_000);
+  });
+
+  it("returns the 6s default when the wall override is unset", () => {
+    delete process.env.TAMANDUA_INSTANT_FAIL_WALL_MS;
+    assert.equal(getInstantFailWallThresholdMs(), 6_000);
+  });
+
+  it("classifies a 3000ms zero-output nonzero-exit round by default, not a 7000ms one", () => {
+    // The outage-rounds boundary: a provider refusal that dies after a
+    // network round trip (~3s) must join the instant-fail backoff, while a
+    // slow 7s round must not be classified as instant.
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 3_000,
+        result: roundResult({ output: "", exitCode: 1 }),
+      }),
+      true,
+      "a 3000ms zero-output exit-1 round must classify under the 6000ms default",
+    );
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 7_000,
+        result: roundResult({ output: "", exitCode: 1 }),
+      }),
+      false,
+      "a 7000ms round is at/above the 6000ms default and must NOT classify",
+    );
   });
 
   it("env overrides adjust the thresholds", () => {
@@ -243,6 +294,105 @@ describe("instant-fail classification boundaries (RSPN)", () => {
     process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "-3";
     assert.equal(getInstantFailWallThresholdMs(), DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS);
     assert.equal(getInstantFailBackoffThreshold(), DEFAULT_INSTANT_FAIL_BACKOFF_THRESHOLD);
+  });
+});
+
+describe("harness-wall-time classification seam (harnessWallMs / vmSetupMs)", () => {
+  afterEach(() => {
+    restoreEnv();
+  });
+
+  it("resolveHarnessWallMs prefers harnessWallMs, falls back to roundWallMs, else undefined", () => {
+    assert.equal(
+      resolveHarnessWallMs({ harnessWallMs: 1_000, roundWallMs: 61_000 }),
+      1_000,
+      "the harness PROCESS time must win over whole-round wall time",
+    );
+    assert.equal(
+      resolveHarnessWallMs({ roundWallMs: 5_000 }),
+      5_000,
+      "no harnessWallMs must fall back to the round wall time",
+    );
+    assert.equal(
+      resolveHarnessWallMs({}),
+      undefined,
+      "no duration signal at all must stay undefined (no fabricated 0)",
+    );
+  });
+
+  it("classifies an in-VM round on harnessWallMs, EXCLUDING a long VM setup", () => {
+    // A Matchlock runner whose VM boot took 60s but whose in-guest harness
+    // round was a 1s zero-output exit-1 refusal. The whole-round wall (61s)
+    // would never classify; the harness wall (1s) must.
+    const runner = fakeRunner(
+      { vmSetupMs: 60_000, harnessWallMs: 1_000 },
+      { output: "", exitCode: 1 },
+    );
+    assert.equal(runner.wallMs, 61_000, "sanity: whole-round wall includes VM setup");
+    assert.equal(
+      isInstantFailRound({
+        wallMs: runner.wallMs,
+        harnessWallMs: runner.harnessWallMs,
+        result: runner.result,
+      }),
+      true,
+      "VM setup must be excluded — a 1s in-guest refusal classifies even after 60s of setup",
+    );
+  });
+
+  it("does NOT classify when the harness itself ran past the threshold", () => {
+    // Same fake-runner shape, but the harness process ran 7s: slow in-guest
+    // work is not an instant fail even though the VM setup (0 here) is small.
+    const runner = fakeRunner(
+      { harnessWallMs: 7_000 },
+      { output: "", exitCode: 1 },
+    );
+    assert.equal(
+      isInstantFailRound({
+        wallMs: runner.wallMs,
+        harnessWallMs: runner.harnessWallMs,
+        result: runner.result,
+      }),
+      false,
+      "a harness round at/above the wall threshold must NOT classify",
+    );
+  });
+
+  it("keeps the old whole-round behavior when no harnessWallMs is reported", () => {
+    // No runner seam available: the fallback round wall governs, so a round
+    // that only looks fast because VM setup is absent still classifies, and
+    // one dominated by setup does not.
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 100,
+        result: roundResult({ output: "", exitCode: 1 }),
+      }),
+      true,
+    );
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 61_000,
+        result: roundResult({ output: "", exitCode: 1, harnessWallMs: undefined, vmSetupMs: 60_000 }),
+      }),
+      false,
+      "without a harnessWallMs signal the whole-round wall (61s) is used",
+    );
+  });
+
+  it("adapter-throw rounds fall back to the monotonic round elapsed time", () => {
+    // Adapter throws never produce a HarnessRoundResult, hence no
+    // harnessWallMs: the caller passes the monotonic round elapsed as wallMs
+    // and the predicate must still classify fast launch failures.
+    assert.equal(
+      isInstantFailRound({ wallMs: 100, harnessWallMs: undefined, adapterThrew: true }),
+      true,
+      "a fast adapter throw with no harnessWallMs must fall back to wallMs",
+    );
+    assert.equal(
+      isInstantFailRound({ wallMs: 61_000, harnessWallMs: undefined, adapterThrew: true }),
+      false,
+      "a slow adapter throw with no harnessWallMs must fall back to wallMs",
+    );
   });
 });
 
@@ -355,10 +505,187 @@ describe("instant-fail backoff delays and reason (RSPN)", () => {
 
   it("formats the precise force-fail reason with the wall threshold and last command", () => {
     const reason = formatInstantFailReason(20, "pi --print --mode json <prompt>");
-    assert.match(reason, /^worker instant-fail loop: 20 consecutive sub-2s exit-1 rounds; last command: pi --print/);
+    assert.match(reason, /^worker instant-fail loop: 20 consecutive sub-6s exit-1 rounds; last command: pi --print/);
   });
 
   it("falls back to 'unknown' when no last command is available", () => {
     assert.match(formatInstantFailReason(20), /last command: unknown$/);
+  });
+});
+
+describe("pre-claim death loop reason (OUTAGE-ROUNDS SCLS US-005)", () => {
+  afterEach(() => {
+    restoreEnv();
+  });
+
+  it("formats a distinct reason naming the slow claim-less shape and the wall threshold", () => {
+    const reason = formatPreclaimDeathReason(20, "pi --print --mode json <prompt>");
+    assert.match(
+      reason,
+      /^worker pre-claim death loop: 20 consecutive >=6s rounds that exited\/died without claiming a step; last command: pi --print/,
+    );
+    // Must be DISTINCT from the instant-fail reason so operators can tell the
+    // slow claim-less death loop from the fast zero-output one.
+    assert.notEqual(reason, formatInstantFailReason(20, "pi --print --mode json <prompt>"));
+  });
+
+  it("falls back to 'unknown' when no last command is available", () => {
+    assert.match(formatPreclaimDeathReason(20), /last command: unknown$/);
+  });
+
+  it("derives the >=Ns label from the wall-threshold override", () => {
+    saveEnv("TAMANDUA_INSTANT_FAIL_WALL_MS");
+    process.env.TAMANDUA_INSTANT_FAIL_WALL_MS = "12000";
+    assert.match(formatPreclaimDeathReason(7), /^worker pre-claim death loop: 7 consecutive >=12s rounds/);
+  });
+});
+
+describe("pre-claim death classification (OUTAGE-ROUNDS SCLS US-004)", () => {
+  afterEach(() => {
+    restoreEnv();
+  });
+
+  it("classifies a long nonzero-exit round with a pending unclaimed step", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs(),
+        hasPendingStep: true,
+        exitCode: 1,
+      }),
+      true,
+      "at/above the threshold with a pending step and a nonzero exit is a pre-claim death",
+    );
+  });
+
+  it("classifies a long signal-death round (no exit code, signal present)", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs() + 5_000,
+        hasPendingStep: true,
+        exitCode: null,
+        signal: "SIGKILL",
+      }),
+      true,
+      "a long signal-death with a pending unclaimed step is a pre-claim death",
+    );
+  });
+
+  it("classifies on harness wall time, excluding VM setup", () => {
+    // 61s whole round, 60s of which was VM boot: the in-guest harness ran
+    // 1s (above a 500ms threshold) → pre-claim death. Folding setup into the
+    // classified time would hide it.
+    process.env.TAMANDUA_INSTANT_FAIL_WALL_MS = "500";
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: 61_000,
+        harnessWallMs: 1_000,
+        hasPendingStep: true,
+        exitCode: 1,
+      }),
+      true,
+      "harnessWallMs (VM setup excluded) is the classification signal",
+    );
+    // Converse: a fast in-guest harness below the threshold cannot be a
+    // pre-claim death even when the whole round (VM boot) was long.
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: 61_000,
+        harnessWallMs: 100,
+        hasPendingStep: true,
+        exitCode: 1,
+      }),
+      false,
+      "a sub-threshold harness round is the instant-fail class, not pre-claim",
+    );
+  });
+
+  it("does NOT classify sub-threshold rounds (instant-fail class)", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs() - 1,
+        hasPendingStep: true,
+        exitCode: 1,
+      }),
+      false,
+    );
+  });
+
+  it("does NOT classify timed-out rounds (ceiling-expiry class)", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs() + 5_000,
+        hasPendingStep: true,
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: true,
+      }),
+      false,
+    );
+  });
+
+  it("does NOT classify operator-paused rounds", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs() + 5_000,
+        hasPendingStep: true,
+        exitCode: null,
+        signal: "SIGTERM",
+        operatorPaused: true,
+      }),
+      false,
+    );
+  });
+
+  it("does NOT classify claimed-then-died rounds (worker_lost class)", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs() + 5_000,
+        hasPendingStep: true,
+        exitCode: 1,
+        recoveredOrphans: true,
+      }),
+      false,
+    );
+  });
+
+  it("does NOT classify long rounds with no pending unclaimed step", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs() + 5_000,
+        hasPendingStep: false,
+        exitCode: 1,
+      }),
+      false,
+    );
+  });
+
+  it("does NOT classify clean long exits (exit 0)", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs() + 5_000,
+        hasPendingStep: true,
+        exitCode: 0,
+      }),
+      false,
+    );
+  });
+
+  it("does NOT classify rounds with no exit code and no signal (adapter-throw shape)", () => {
+    assert.equal(
+      isPreclaimDeathRound({
+        wallMs: getInstantFailWallThresholdMs() + 5_000,
+        hasPendingStep: true,
+        exitCode: undefined,
+        signal: undefined,
+      }),
+      false,
+    );
+  });
+
+  it("does NOT classify rounds with no duration signal", () => {
+    assert.equal(
+      isPreclaimDeathRound({ hasPendingStep: true, exitCode: 1 }),
+      false,
+    );
   });
 });

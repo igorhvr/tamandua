@@ -33,6 +33,9 @@ import {
   getRunTeardownGraceMs,
   _instantFailStreakFor,
   _resetInstantFailStreaks,
+  _preclaimDeathStreakFor,
+  _resetPreclaimDeathStreaks,
+  isPreclaimDeathBackoffActive,
   _operatorPausedRoundIds,
   _scheduledJobGitIdentity,
 } from "../../dist/installer/agent-scheduler.js";
@@ -2248,6 +2251,443 @@ process.exit(1);
         `the monotonic round duration must stay sub-threshold under a wall jump (got ${wallMs})`,
       );
     }
+  });
+});
+
+// ── OUTAGE-ROUNDS SCLS US-004: pre-claim deaths ─────────────────────
+// A round that passed the launch probe, ran LONGER than the instant-fail
+// wall threshold, and exited/died WITHOUT claiming a pending step is a
+// pre-claim death: the slow complement of the fast instant-fail shape
+// (vaivm evidence: a verifier dying 8 times with STREAM_CLOSED before
+// claiming, invisible for two hours). It must increment the per-step
+// preclaim_death_count and emit step.preclaim_round_died with NO retry
+// charge and NO step status transition; any successful claim resets the
+// counter (pinned in tests/step-ops.test.ts). Detection is exit code /
+// signal / timing / claim state only — never provider-error text.
+
+describe("executeDispatchRound pre-claim death detection (OUTAGE-ROUNDS SCLS US-004)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-preclaim-death-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_INSTANT_FAIL_WALL_MS: process.env.TAMANDUA_INSTANT_FAIL_WALL_MS,
+      TAMANDUA_INSTANT_FAIL_BACKOFF_K: process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K,
+      TAMANDUA_INSTANT_FAIL_ESCALATION_N: process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N,
+      TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS: process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS,
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+      TAMANDUA_DEBUG: process.env.TAMANDUA_DEBUG,
+      FAKE_PI_MODE: process.env.FAKE_PI_MODE,
+      FAKE_PI_SLEEP_MS: process.env.FAKE_PI_SLEEP_MS,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // The canned fake-pi shims never answer a launch-time harness probe.
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+    // Small threshold so a ~400ms fake harness round lands ABOVE it: a
+    // pre-claim death is the SLOW complement of a fast instant fail.
+    process.env.TAMANDUA_INSTANT_FAIL_WALL_MS = "50";
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-preclaim-death"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    _resetInstantFailStreaks();
+    _resetPreclaimDeathStreaks();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /**
+   * Seed a running run with one pending unclaimed step and a fake pi that
+   * busy-waits FAKE_PI_SLEEP_MS, then:
+   *  - "long-exit": exits 1 with empty stdout (the pre-claim death shape);
+   *  - "long-clean": prints STATUS: done and exits 0 (a legitimate round);
+   *  - "claim": runs the REAL step-ops claimStep for this agent/run, then
+   *    prints STATUS: done and exits 0 — a SUCCESSFUL claim that must reset
+   *    both the persisted counter (step-ops claim UPDATE) and the in-memory
+   *    consecutive streak / armed backoff deadline (non-matching round).
+   */
+  function setupPreclaimRound(mode: "long-exit" | "long-clean" | "claim"): {
+    runId: string;
+    jobId: string;
+    workdir: string;
+    stepRowId: string;
+  } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'pre-claim death task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    const stepRowId = `${runId}-step`;
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', 0, ?, ?)",
+    ).run(stepRowId, runId, now, now);
+
+    // Absolute URL of the compiled step-ops module, so the fake harness can
+    // perform a REAL successful claim (persisted counter reset via claimStep).
+    const stepOpsUrl = new URL("../../dist/installer/step-ops.js", import.meta.url).href;
+
+    const fakePi = path.join(tempHome, "pi-preclaim-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+const mode = process.env.FAKE_PI_MODE;
+const sleepMs = Number(process.env.FAKE_PI_SLEEP_MS || "0");
+const start = Date.now();
+while (Date.now() - start < sleepMs) { /* busy-wait above the wall threshold */ }
+if (mode === "long-clean") {
+  process.stdout.write("STATUS: done\\n");
+  process.exit(0);
+}
+if (mode === "claim") {
+  // A REAL successful claim (not a simulation): the step-ops claim UPDATE
+  // resets steps.preclaim_death_count, and the resulting non-matching round
+  // resets the in-memory streak + deadline.
+  const { claimStep } = await import(${JSON.stringify(stepOpsUrl)});
+  claimStep("test-wf_test-agent", process.env.TAMANDUA_RUN_ID);
+  process.stdout.write("STATUS: done\\n");
+  process.exit(0);
+}
+process.exit(1);
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    process.env.FAKE_PI_MODE = mode;
+    process.env.FAKE_PI_SLEEP_MS = "400";
+
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    return { runId, jobId, workdir, stepRowId };
+  }
+
+  function jobFor(runId: string, jobId: string, workdir: string) {
+    return { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi" as const, workingDirectoryForHarness: workdir, createdAt: "" };
+  }
+
+  /** Read this test's isolated scheduler log (skip reasons are debug lines). */
+  function readStateLog(): string {
+    const logPath = path.join(tempHome, ".tamandua", "tamandua.log");
+    return fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf-8") : "";
+  }
+
+  /**
+   * Real-tick driver: advance real time until any armed pre-claim-death
+   * backoff window for `jobId` has elapsed (past `nextAllowedDispatchAt`), so
+   * the next executeDispatchRound tick relaunches instead of being gated. No-op
+   * when no window is armed. Reads the MONOTONIC deadline with the same clock
+   * it was armed on (TIME-CLOCKS rule 1).
+   */
+  async function waitPastPreclaimBackoff(jobId: string): Promise<void> {
+    const streak = _preclaimDeathStreakFor(jobId);
+    const untilMs = streak?.nextAllowedDispatchAt ?? 0;
+    const waitMs = Math.max(0, untilMs - monotonicNow()) + 150;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+
+  const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+
+  it("increments the per-step counter and emits one step.preclaim_round_died with no retry charge", async () => {
+    const { runId, jobId, workdir, stepRowId } = setupPreclaimRound("long-exit");
+
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agent);
+
+    const db = getDb();
+    const step = db.prepare("SELECT status, retry_count, preclaim_death_count FROM steps WHERE id = ?").get(stepRowId) as {
+      status: string;
+      retry_count: number;
+      preclaim_death_count: number;
+    };
+    assert.equal(step.preclaim_death_count, 1, "a pre-claim death must increment steps.preclaim_death_count");
+    assert.equal(step.status, "pending", "a pre-claim death must not transition the step");
+    assert.equal(step.retry_count, 0, "a pre-claim death must not charge a retry");
+
+    const run = db.prepare("SELECT instant_fail_count, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as {
+      instant_fail_count: number;
+      worker_lost_count: number;
+      ceiling_expiry_count: number;
+    };
+    assert.equal(run.instant_fail_count, 0, "a slow (>= threshold) round is NOT an instant fail");
+    assert.equal(run.worker_lost_count, 0, "an unclaimed death must not tick worker_lost_count");
+    assert.equal(run.ceiling_expiry_count, 0, "a pre-claim death must not tick ceiling_expiry_count");
+
+    assert.equal(_preclaimDeathStreakFor(jobId)?.consecutive, 1, "the pre-claim death streak must be 1");
+    assert.equal(_instantFailStreakFor(jobId), undefined, "the instant-fail streak must be untouched");
+
+    const deaths = getRunEvents(runId).filter((e) => e.event === "step.preclaim_round_died");
+    assert.equal(deaths.length, 1, "exactly one step.preclaim_round_died per pre-claim death");
+    assert.equal(deaths[0].stepId, "step-1", "the event must carry the pending step's stepId");
+    assert.equal(deaths[0].stepRowId, stepRowId, "the event must carry the pending step's row id");
+    assert.equal(deaths[0].exitCode, 1, "the event must carry the nonzero exit code");
+    assert.equal(deaths[0].consecutivePreclaimDeaths, 1, "the event must carry the consecutive count");
+    assert.ok(
+      typeof deaths[0].harnessWallMs === "number" && deaths[0].harnessWallMs >= 50,
+      `the event must carry the harness wall time above the threshold (got ${deaths[0].harnessWallMs})`,
+    );
+    assert.equal(typeof deaths[0].stderrTail, "string", "the event must carry a bounded stderr tail");
+  });
+
+  it("does NOT emit or increment on a long clean (exit 0) round", async () => {
+    const { runId, jobId, workdir, stepRowId } = setupPreclaimRound("long-clean");
+
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agent);
+
+    const db = getDb();
+    const step = db.prepare("SELECT status, preclaim_death_count FROM steps WHERE id = ?").get(stepRowId) as {
+      status: string;
+      preclaim_death_count: number;
+    };
+    assert.equal(step.preclaim_death_count, 0, "a clean exit is not a pre-claim death");
+    assert.equal(
+      getRunEvents(runId).filter((e) => e.event === "step.preclaim_round_died").length,
+      0,
+      "a clean exit must not emit step.preclaim_round_died",
+    );
+    assert.equal(_preclaimDeathStreakFor(jobId), undefined, "a non-matching round resets the streak");
+  });
+
+  it("resets the in-memory streak on a non-matching round but keeps the persisted counter until a claim", async () => {
+    const { runId, jobId, workdir, stepRowId } = setupPreclaimRound("long-exit");
+
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agent);
+    assert.equal(_preclaimDeathStreakFor(jobId)?.consecutive, 1);
+
+    // A long clean round breaks the streak but does NOT reset the persisted
+    // counter (only a successful claim does that — pinned in step-ops tests).
+    process.env.FAKE_PI_MODE = "long-clean";
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agent);
+    assert.equal(_preclaimDeathStreakFor(jobId), undefined, "a clean round resets the consecutive streak");
+
+    // Back to the death shape: the streak restarts at 1 (consecutive) while
+    // the persisted counter advances to 2.
+    process.env.FAKE_PI_MODE = "long-exit";
+    await executeDispatchRound(jobFor(runId, jobId, workdir), agent);
+    const db = getDb();
+    const step = db.prepare("SELECT preclaim_death_count FROM steps WHERE id = ?").get(stepRowId) as {
+      preclaim_death_count: number;
+    };
+    assert.equal(step.preclaim_death_count, 2, "the persisted counter accumulates across non-consecutive deaths");
+    assert.equal(_preclaimDeathStreakFor(jobId)?.consecutive, 1, "the in-memory streak restarted after the reset");
+  });
+
+  // ── OUTAGE-ROUNDS SCLS US-005: escalating backoff and run cap ──────
+
+  it("arms a monotonic preclaim-death backoff after K consecutive deaths and gates the tick", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "60000"; // window far in the future
+    process.env.TAMANDUA_DEBUG = "1"; // the skip reasons are debug-level log lines
+    const { runId, jobId, workdir, stepRowId } = setupPreclaimRound("long-exit");
+    const job = jobFor(runId, jobId, workdir);
+    const db = getDb();
+    const stepCounter = () =>
+      (db.prepare("SELECT preclaim_death_count FROM steps WHERE id = ?").get(stepRowId) as {
+        preclaim_death_count: number;
+      }).preclaim_death_count;
+
+    // Rounds 1-2: pre-claim deaths; the K-th arms the escalating window.
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+    let streak = _preclaimDeathStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "streak must reach K after K pre-claim deaths");
+    assert.ok(
+      (streak?.nextAllowedDispatchAt ?? 0) > monotonicNow(),
+      "after K consecutive pre-claim deaths the next relaunch must be delayed (backoff armed)",
+    );
+    assert.equal(
+      isPreclaimDeathBackoffActive(streak, monotonicNow()),
+      true,
+      "the exported gate must report the armed window as active",
+    );
+
+    // Tick 3 inside the window: gated — no spawn, no event, no counter bump,
+    // and (the IFLB-mid regression) no leaked in-flight mark.
+    await executeDispatchRound(job, agent);
+    streak = _preclaimDeathStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "an in-window tick must not increment the streak");
+    assert.equal(stepCounter(), 2, "an in-window tick must not spawn a harness / emit a death record");
+    assert.equal(
+      getRunEvents(runId).filter((e) => e.event === "step.preclaim_round_died").length,
+      2,
+      "an in-window tick must not emit another step.preclaim_round_died",
+    );
+    assert.equal(
+      getRunEvents(runId).filter((e) => e.event === "run.preclaim_death_loop").length,
+      0,
+      "no escalation below N",
+    );
+
+    const log = readStateLog();
+    assert.match(log, /Dispatch round skipped — preclaim-death backoff/, "the in-window tick must log the preclaim-death skip");
+    assert.match(log, /preclaim_death_backoff/, "the skip record must carry reason preclaim_death_backoff");
+    assert.equal(tryMarkJobInFlight(jobId), true, "a backoff-gated tick must leave the job absent from the in-flight set");
+  });
+
+  it("relaunches after the preclaim-death backoff window elapses", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    // Short window so the test can cross it in real time; the round takes
+    // ~400ms, so the immediately-following tick deterministically lands inside.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "900";
+    process.env.TAMANDUA_DEBUG = "1";
+    const { runId, jobId, workdir, stepRowId } = setupPreclaimRound("long-exit");
+    const job = jobFor(runId, jobId, workdir);
+    const db = getDb();
+    const stepCounter = () =>
+      (db.prepare("SELECT preclaim_death_count FROM steps WHERE id = ?").get(stepRowId) as {
+        preclaim_death_count: number;
+      }).preclaim_death_count;
+
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+    let streak = _preclaimDeathStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "streak must reach K after K pre-claim deaths");
+    const backoffUntilMs = streak?.nextAllowedDispatchAt ?? 0;
+    assert.ok(backoffUntilMs > monotonicNow(), "the backoff window must be armed");
+
+    // In-window tick: gated, no new death.
+    await executeDispatchRound(job, agent);
+    assert.equal(stepCounter(), 2, "an in-window tick must not relaunch");
+
+    // Past the window: the relaunch MUST happen — a gated tick never leaked the
+    // in-flight mark (the IFLB-mid regression).
+    await waitPastPreclaimBackoff(jobId);
+    await executeDispatchRound(job, agent);
+    assert.equal(stepCounter(), 3, "once the window elapses the next tick must relaunch the harness");
+    streak = _preclaimDeathStreakFor(jobId);
+    assert.equal(streak?.consecutive, 3, "the relaunched round is another pre-claim death — the streak advances");
+    assert.equal(
+      (db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string }).status,
+      "running",
+      "the run must not be force-failed below the escalation threshold",
+    );
+  });
+
+  it("force-fails at N consecutive pre-claim deaths with exactly one run.preclaim_death_loop before run.force_failed", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "3";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "3";
+    const { runId, jobId, workdir, stepRowId } = setupPreclaimRound("long-exit");
+    const job = jobFor(runId, jobId, workdir);
+
+    for (let i = 0; i < 3; i++) {
+      await executeDispatchRound(job, agent);
+    }
+
+    const db = getDb();
+    const row = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(row.status, "failed", "the N-th consecutive pre-claim death must force-fail the run");
+
+    const step = db.prepare("SELECT status, retry_count, preclaim_death_count, claim_pid FROM steps WHERE id = ?").get(stepRowId) as {
+      status: string;
+      retry_count: number;
+      preclaim_death_count: number;
+      claim_pid: number | null;
+    };
+    assert.equal(step.preclaim_death_count, 3, "the persisted per-step counter must equal the consecutive count");
+    assert.equal(step.retry_count, 0, "the cap must consume no retry budget");
+    assert.equal(step.claim_pid, null, "no pre-claim death round may claim the step");
+    // The step is never advanced by the deaths themselves; the only status
+    // change is the run-terminal teardown's cancellation of pending steps.
+    assert.equal(step.status, "canceled", "force-fail teardown cancels the still-pending step");
+
+    const events = getRunEvents(runId);
+    const alerts = events.filter((e) => e.event === "run.preclaim_death_loop");
+    assert.equal(alerts.length, 1, "escalation must emit exactly one run.preclaim_death_loop alert");
+    assert.equal(alerts[0].consecutivePreclaimDeaths, 3, "the alert must carry the consecutive count");
+    assert.match(
+      alerts[0].reason ?? "",
+      /^worker pre-claim death loop: 3 consecutive >=\d+s rounds that exited\/died without claiming a step; last command: /,
+      "the alert reason must be the distinct pre-claim shape",
+    );
+
+    const forceFailures = events.filter((e) => e.event === "run.force_failed");
+    assert.equal(forceFailures.length, 1, "escalation must force-fail through the sanctioned path");
+    assert.match(
+      forceFailures[0].reason ?? "",
+      /^worker pre-claim death loop: 3 consecutive >=\d+s rounds that exited\/died without claiming a step/,
+      "the terminal reason must name the pre-claim death loop",
+    );
+    // The alert must precede the terminal event.
+    assert.ok(
+      events.findIndex((e) => e.event === "run.preclaim_death_loop") <
+        events.findIndex((e) => e.event === "run.force_failed"),
+      "run.preclaim_death_loop must be emitted immediately before run.force_failed",
+    );
+    assert.equal(
+      events.filter((e) => e.event === "run.instant_fail_loop").length,
+      0,
+      "the fast instant-fail alert must not fire for a slow pre-claim death loop",
+    );
+    assert.equal(_preclaimDeathStreakFor(jobId)?.consecutive, 3, "the streak must persist at N for surfacing");
+  });
+
+  it("a successful claim resets the streak and clears the armed backoff deadline", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "400";
+    const { runId, jobId, workdir, stepRowId } = setupPreclaimRound("long-exit");
+    const job = jobFor(runId, jobId, workdir);
+    const db = getDb();
+
+    // K consecutive deaths arm the window.
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+    const armed = _preclaimDeathStreakFor(jobId);
+    assert.equal(armed?.consecutive, 2);
+    assert.equal(isPreclaimDeathBackoffActive(armed, monotonicNow()), true);
+    assert.equal(
+      (db.prepare("SELECT preclaim_death_count FROM steps WHERE id = ?").get(stepRowId) as {
+        preclaim_death_count: number;
+      }).preclaim_death_count,
+      2,
+      "the persisted counter reflects the two deaths before the claim",
+    );
+
+    // Wait past the window so the harness actually runs, then have it perform a
+    // REAL successful claim (step-ops claimStep) and exit cleanly.
+    await waitPastPreclaimBackoff(jobId);
+    process.env.FAKE_PI_MODE = "claim";
+    await executeDispatchRound(job, agent);
+
+    assert.equal(
+      _preclaimDeathStreakFor(jobId),
+      undefined,
+      "a successful claim round must reset the streak and drop the deadline",
+    );
+    assert.equal(
+      isPreclaimDeathBackoffActive(_preclaimDeathStreakFor(jobId), monotonicNow()),
+      false,
+      "the armed backoff gate must be open after a successful claim",
+    );
+    const step = db.prepare("SELECT status, preclaim_death_count FROM steps WHERE id = ?").get(stepRowId) as {
+      status: string;
+      preclaim_death_count: number;
+    };
+    assert.equal(step.preclaim_death_count, 0, "the real claim UPDATE must reset the persisted counter");
+    assert.notEqual(step.status, "pending", "the real claimStep must have claimed the step");
+    assert.equal(
+      getRunEvents(runId).filter((e) => e.event === "step.preclaim_round_died").length,
+      2,
+      "the successful claim round must not emit another pre-claim death record",
+    );
   });
 });
 

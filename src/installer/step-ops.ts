@@ -2481,6 +2481,61 @@ export function peekStep(agentId: string, runId: string): PeekResult {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Pre-claim death counter (OUTAGE-ROUNDS / SCLS)
+// ══════════════════════════════════════════════════════════════════════
+
+/** Row + human step id of the first pending step an agent can claim. */
+export interface PendingStepRef {
+  /** steps.id (the row id used by the counter UPDATE). */
+  id: string;
+  /** steps.step_id (the human/workflow-level id, e.g. "execute"). */
+  stepId: string;
+}
+
+/**
+ * OUTAGE-ROUNDS (SCLS US-004): return the first pending step this
+ * (agentId, runId) would claim, ordered by step_index then step_id —
+ * mirroring `peekStep`/`claimStep` ordering. Returns null when no unclaimed
+ * step exists. Used by the scheduler's pre-claim death tracker to decide
+ * whether a long nonzero-exit round died BEFORE doing any work.
+ *
+ * Read-only: it neither claims nor mutates the step.
+ */
+export function findPendingStepForAgent(agentId: string, runId: string): PendingStepRef | null {
+  // Defense-in-depth: strip run- prefix (US-013)
+  runId = stripIdPrefix(runId);
+  const db = getDb();
+  const row = db.prepare(
+    `SELECT id, step_id FROM steps
+     WHERE agent_id = ? AND run_id = ? AND status = 'pending'
+     ORDER BY step_index ASC, step_id ASC
+     LIMIT 1`,
+  ).get(agentId, runId) as { id: string; step_id: string } | undefined;
+  return row ? { id: row.id, stepId: row.step_id } : null;
+}
+
+/**
+ * OUTAGE-ROUNDS (SCLS US-004): increment one step's durable
+ * `preclaim_death_count` and return the new value.
+ *
+ * Deliberately additive: it touches ONLY the counter. No retry_count
+ * increment, no status transition, no claim timestamp — a pre-claim death
+ * consumes no retry budget (the caller owns any backoff/escalation, which
+ * uses its own counter). Returns the post-increment value so the caller can
+ * log/surface it; returns 0 when the step row is missing.
+ */
+export function incrementPreclaimDeathCount(stepId: string): number {
+  const db = getDb();
+  db.prepare(
+    "UPDATE steps SET preclaim_death_count = preclaim_death_count + 1 WHERE id = ?",
+  ).run(stepId);
+  const row = db.prepare("SELECT preclaim_death_count FROM steps WHERE id = ?").get(stepId) as
+    | { preclaim_death_count: number }
+    | undefined;
+  return row?.preclaim_death_count ?? 0;
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Conditional Auto-Complete (Zero-Token Dispatch Primitive)
 // ══════════════════════════════════════════════════════════════════════
 
@@ -3036,8 +3091,8 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
     if (loopConfig?.over === "stories") {
       const claim = db.prepare(
         workerOwnership
-          ? `UPDATE steps SET status = 'running', claim_job_id = ?, claim_pid = ?, claim_pgid = ?, claim_invalidated_by = NULL, claim_updated_at = ${SQL_NOW_ISO}, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'`
-          : `UPDATE steps SET status = 'running', claim_invalidated_by = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'`
+          ? `UPDATE steps SET status = 'running', preclaim_death_count = 0, claim_job_id = ?, claim_pid = ?, claim_pgid = ?, claim_invalidated_by = NULL, claim_updated_at = ${SQL_NOW_ISO}, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'`
+          : `UPDATE steps SET status = 'running', preclaim_death_count = 0, claim_invalidated_by = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'`
       ).run(
         ...(workerOwnership ? [workerOwnership.jobId, workerOwnership.pid, workerOwnership.pgid ?? null, step.id] : [step.id])
       );
@@ -3128,8 +3183,8 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       }
       db.prepare(
         workerOwnership
-          ? `UPDATE steps SET status = 'running', current_story_id = ?, claim_job_id = ?, claim_pid = ?, claim_pgid = ?, claim_invalidated_by = NULL, claim_updated_at = ${SQL_NOW_ISO}, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
-          : `UPDATE steps SET status = 'running', current_story_id = ?, claim_invalidated_by = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
+          ? `UPDATE steps SET status = 'running', preclaim_death_count = 0, current_story_id = ?, claim_job_id = ?, claim_pid = ?, claim_pgid = ?, claim_invalidated_by = NULL, claim_updated_at = ${SQL_NOW_ISO}, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
+          : `UPDATE steps SET status = 'running', preclaim_death_count = 0, current_story_id = ?, claim_invalidated_by = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`
       ).run(
         ...(workerOwnership ? [nextStory.id, workerOwnership.jobId, workerOwnership.pid, workerOwnership.pgid ?? null, step.id] : [nextStory.id, step.id])
       );
@@ -3236,8 +3291,8 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   // Single step: existing logic
   const claim = db.prepare(
     workerOwnership
-      ? `UPDATE steps SET status = 'running', claim_job_id = ?, claim_pid = ?, claim_pgid = ?, claim_invalidated_by = NULL, claim_updated_at = ${SQL_NOW_ISO}, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'`
-      : `UPDATE steps SET status = 'running', claim_invalidated_by = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'`
+      ? `UPDATE steps SET status = 'running', preclaim_death_count = 0, claim_job_id = ?, claim_pid = ?, claim_pgid = ?, claim_invalidated_by = NULL, claim_updated_at = ${SQL_NOW_ISO}, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'`
+      : `UPDATE steps SET status = 'running', preclaim_death_count = 0, claim_invalidated_by = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'`
   ).run(
     ...(workerOwnership ? [workerOwnership.jobId, workerOwnership.pid, workerOwnership.pgid ?? null, step.id] : [step.id])
   );

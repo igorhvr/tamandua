@@ -2189,6 +2189,7 @@ describe("formatRunsSummary", () => {
           workerLostCount: 0,
           ceilingExpiryCount: 0,
           instantFailCount: 0,
+          preclaimDeathCount: 0,
           redLedgerLanding: { ledgerRowId: 42, exitCode: 7, ledgerCreatedAt: "2026-09-15 22:00:00" },
         },
       ],
@@ -2349,9 +2350,9 @@ describe("formatRunsSummary", () => {
     const result = formatRunsSummary({
       listRuns: () => [
         // At/above the backoff threshold K (default 6) → annotated.
-        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Looping run", status: "running", createdAt: now, updatedAt: now, tokensSpent: 100, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 6 },
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Looping run", status: "running", createdAt: now, updatedAt: now, tokensSpent: 100, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 6, preclaimDeathCount: 0 },
         // Below the threshold → NOT annotated (a lone instant fail is not a loop).
-        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "One-off", status: "running", createdAt: now, updatedAt: now, tokensSpent: 50, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 2 },
+        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "One-off", status: "running", createdAt: now, updatedAt: now, tokensSpent: 50, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 2, preclaimDeathCount: 0 },
       ],
       isDaemonRunning: () => true,
     });
@@ -2360,12 +2361,42 @@ describe("formatRunsSummary", () => {
     assert.doesNotMatch(result, /INSTANT-FAIL LOOP \(2 consecutive\)/);
   });
 
+  it("annotates active runs in a pre-claim death loop (OUTAGE-ROUNDS SCLS surfacing)", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const now = new Date().toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        // At/above the backoff threshold K (default 6) → annotated.
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Dying verifier", status: "running", createdAt: now, updatedAt: now, tokensSpent: 100, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 0, preclaimDeathCount: 7 },
+        // Below the threshold → NOT annotated (one pre-claim death is not a loop).
+        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "One-off", status: "running", createdAt: now, updatedAt: now, tokensSpent: 50, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 0, preclaimDeathCount: 1 },
+      ],
+      isDaemonRunning: () => true,
+    });
+    assert.match(result, /PRE-CLAIM DEATH LOOP \(7\)/);
+    assert.match(result, /aaaaaaa/);
+    assert.doesNotMatch(result, /PRE-CLAIM DEATH LOOP \(1\)/);
+  });
+
+  it("does not annotate a pre-claim death loop for terminal runs", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const staleDate = new Date(0).toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Failed death loop", status: "failed", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 0, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 0, preclaimDeathCount: 20 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    assert.doesNotMatch(result, /PRE-CLAIM DEATH LOOP/);
+    assert.match(result, /\(1 failed runs not shown\)/);
+  });
+
   it("does not annotate terminal runs even with a high instant-fail count", async () => {
     const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
     const staleDate = new Date(0).toISOString();
     const result = formatRunsSummary({
       listRuns: () => [
-        { id: "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Failed loop", status: "failed", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 0, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 12 },
+        { id: "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Failed loop", status: "failed", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 0, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 12, preclaimDeathCount: 0 },
       ],
       isDaemonRunning: () => false,
     });

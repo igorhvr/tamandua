@@ -40,13 +40,30 @@ export interface ScriptedBehavior {
    * "hang": never respond (exercises the scheduler timeout-kill path).
    * "hang-after-claim": claim, then hang — the step sits 'running' with
    *   recorded WorkerOwnership (exercises daemon-crash recovery, C18).
-   * "die-before-claim": exit non-zero before claiming.
+   * "die-before-claim": exit non-zero before claiming (optionally after
+   *   sleeping `sleepMs`, stdout stays empty).
+   * "stream-die-before-claim": write `streamOutput` to stdout, sleep
+   *   `sleepMs`, then exit non-zero WITHOUT ever claiming a step — the slow
+   *   streaming pre-claim death that distinguishes itself from an instant
+   *   fail by both non-empty stdout and a long harness wall time.
    * "die-after-claim": claim (and apply edits) then exit without reporting.
    * "no-status": claim, apply behavior, emit output WITHOUT step complete
    *   and without a STATUS marker (the lost/abandoned step case).
    * "garbage": emit non-JSON garbage and exit 0.
    */
-  mode?: "work" | "hang" | "hang-after-claim" | "die-before-claim" | "die-after-claim" | "no-status" | "garbage";
+  mode?: "work" | "hang" | "hang-after-claim" | "die-before-claim" | "stream-die-before-claim" | "die-after-claim" | "no-status" | "garbage";
+  /**
+   * Milliseconds to sleep in the die-* modes BEFORE the process exits.
+   * "die-before-claim" sleeps and still emits empty stdout; "stream-die-
+   * before-claim" streams `streamOutput` first, then sleeps. Used to push a
+   * round's harness wall time past the instant-fail wall threshold.
+   */
+  sleepMs?: number;
+  /**
+   * Text written to stdout by "stream-die-before-claim" before sleeping.
+   * Defaults to a short non-empty marker; never used by other modes.
+   */
+  streamOutput?: string;
   /** Find/replace edits applied in the harness workdir before reporting. */
   edits?: ScriptedEdit[];
   /** Files written (created/overwritten) in the harness workdir. */

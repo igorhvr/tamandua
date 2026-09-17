@@ -31,10 +31,15 @@ import type { HarnessRoundResult } from "./harness-adapter.js";
 
 /**
  * Wall-clock threshold (ms) below which a round may be classified as an
- * instant fail. Default 2s. A round that produced output or exited 0
- * never matches regardless of duration.
+ * instant fail. Default 6s. The earlier 2s default was too tight: a
+ * provider refusal (e.g. a dsh QUOTA round) dies after a network round
+ * trip of ~3s, so it never matched and the 15s tick respawned the refused
+ * harness invisibly. 6s keeps legitimate short rounds out (they exit 0
+ * and/or produce output) while admitting those refusal rounds.
+ * Override: TAMANDUA_INSTANT_FAIL_WALL_MS. A round that produced output
+ * or exited 0 never matches regardless of duration.
  */
-export const DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS = 2_000;
+export const DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS = 6_000;
 
 /**
  * Consecutive instant-fail rounds (K) after which the motor applies an
@@ -97,8 +102,29 @@ export interface InstantFailRoundSignals {
    * (TIME-CLOCKS rule 1 — never a `Date.now()` difference). Absent when
    * there is no duration signal — classification is impossible and the
    * round is left alone.
+   *
+   * This is the WHOLE-ROUND wall time (native setup + harness exec). It is
+   * the fallback when `harnessWallMs` is absent — e.g. adapter-throw rounds,
+   * which never produced a HarnessRoundResult — but on a resolved round the
+   * classification prefers `harnessWallMs`, so VM setup time is excluded.
    */
   wallMs?: number;
+  /**
+   * Time the harness PROCESS ITSELF ran (guest exec start → exit), EXCLUDING
+   * any VM setup (HarnessRoundResult.harnessWallMs). Native adapters set it
+   * equal to the whole-round wall time; a Matchlock/in-VM runner reports the
+   * in-guest interval here and its setup time separately. When absent the
+   * classifier resolves the wall time from `wallMs` (see
+   * {@link resolveHarnessWallMs}).
+   */
+  harnessWallMs?: number;
+  /**
+   * VM setup time (ms) that preceded the harness exec
+   * (HarnessRoundResult.vmSetupMs), carried through only for round
+   * metadata/diagnostics — classification uses `harnessWallMs`, never this.
+   * 0 for native rounds (no VM); absent when the runner reported none.
+   */
+  vmSetupMs?: number;
   /** Resolved harness round result. Absent when the adapter threw (spawn/findBinary failure). */
   result?: HarnessRoundResult;
   /**
@@ -120,6 +146,27 @@ export interface InstantFailRoundSignals {
 }
 
 /**
+ * Resolve the wall time the instant-fail predicate classifies on: the
+ * harness PROCESS time (`harnessWallMs`) when the runner reported it,
+ * otherwise the whole-round wall time (`roundWallMs`).
+ *
+ * The precedence deliberately EXCLUDES VM setup time on in-VM rounds: a
+ * Matchlock runner reports the guest exec→exit interval as `harnessWallMs`
+ * and VM boot separately, so a provider refusal that dies after a ~3s
+ * in-guest round is classified even when the VM took a minute to boot. A
+ * native round reports `harnessWallMs === roundWallMs` so its behavior is
+ * unchanged; an adapter-throw round has no `harnessWallMs` and falls back
+ * to the monotonic round elapsed time. `undefined` stays `undefined` —
+ * classification is impossible without any duration signal.
+ */
+export function resolveHarnessWallMs(signals: {
+  harnessWallMs?: number;
+  roundWallMs?: number;
+}): number | undefined {
+  return signals.harnessWallMs ?? signals.roundWallMs;
+}
+
+/**
  * Conservatively classify a round as an instant fail:
  * wall time below the threshold AND zero TRIMMED output bytes AND
  * (nonzero exit code OR signal-death). Rounds that exit 0 (idle/no-op
@@ -127,9 +174,16 @@ export interface InstantFailRoundSignals {
  * (ceiling-expiry class) never match; and rounds whose worker had
  * claimed a step before dying (recoveredOrphans) never match — those are
  * worker_lost, not instant-fail.
+ *
+ * The wall time is resolved via {@link resolveHarnessWallMs}: the harness
+ * process time when reported (excluding VM setup), else the whole-round
+ * fallback.
  */
 export function isInstantFailRound(signals: InstantFailRoundSignals): boolean {
-  const { wallMs } = signals;
+  const wallMs = resolveHarnessWallMs({
+    harnessWallMs: signals.harnessWallMs,
+    roundWallMs: signals.wallMs,
+  });
   if (wallMs === undefined) return false; // no duration signal — cannot classify
   if (wallMs >= getInstantFailWallThresholdMs()) return false; // slow round — not instant
   if (signals.result?.timedOut) return false; // ceiling-expiry class — never instant-fail
@@ -154,6 +208,82 @@ export function isInstantFailRound(signals: InstantFailRoundSignals): boolean {
   return false;
 }
 
+// ── Pre-claim death classification (OUTAGE-ROUNDS / SCLS) ────────────
+
+/**
+ * Signals for the pre-claim death predicate (OUTAGE-ROUNDS SCLS US-004).
+ *
+ * A pre-claim death is the COMPLEMENT of an instant fail: the harness got
+ * far enough to run past the wall threshold (so it is not the fast
+ * zero-output refusal shape) but then exited nonzero or was killed by a
+ * signal WITHOUT ever claiming a pending step. Detection is deliberately
+ * TIMING AND CLAIM STATE ONLY — exit code, signal, harness wall time, and
+ * whether an unclaimed pending step exists. No provider-error taxonomy is
+ * ever parsed from stdout/stderr, so the behavior is identical for pi,
+ * hermes and dsh.
+ */
+export interface PreclaimDeathSignals {
+  /**
+   * Whole-round wall time (ms); fallback when `harnessWallMs` is absent.
+   * Same monotonic-vs-epoch discipline as {@link InstantFailRoundSignals}.
+   */
+  wallMs?: number;
+  /**
+   * Harness process time (guest exec start → exit), excluding VM setup.
+   * The predicate resolves the classification time as
+   * `harnessWallMs ?? wallMs` (see {@link resolveHarnessWallMs}).
+   */
+  harnessWallMs?: number;
+  /** True when the round was terminated by the ceiling/timeout guard — never a pre-claim death. */
+  timedOut?: boolean;
+  /** True when a non-drain operator pause tore this round down — never a pre-claim death. */
+  operatorPaused?: boolean;
+  /**
+   * True when this round's orphan recovery recovered a claimed step — that
+   * is the worker_lost class (the worker DID claim), never a pre-claim death.
+   */
+  recoveredOrphans?: boolean;
+  /** True when an unclaimed pending step exists for (runId, agentId). */
+  hasPendingStep: boolean;
+  /** Harness exit code (null/undefined when the process was killed by a signal). */
+  exitCode?: number | null;
+  /** Killing signal, when the harness died by signal rather than exiting. */
+  signal?: string | null;
+}
+
+/**
+ * Classify a long, failed, claim-less round as a pre-claim death: the
+ * resolved harness wall time is at least the instant-fail wall threshold AND
+ * a pending step exists for the agent AND the round exited nonzero OR died by
+ * signal. Every other shape returns false:
+ *
+ *  - operator-paused rounds (paused_by_operator recovery class),
+ *  - timed-out rounds (ceiling-expiry / WLST5 class),
+ *  - claimed-then-died rounds (`recoveredOrphans` — the worker_lost class),
+ *  - sub-threshold rounds (the fast instant-fail class),
+ *  - clean exits (exit 0) and rounds whose harness never resolved an exit
+ *    code or signal (e.g. adapter-throw launch failures).
+ *
+ * `hasPendingStep` is supplied by the caller from a DB lookup, so this stays a
+ * pure, cheap predicate.
+ */
+export function isPreclaimDeathRound(signals: PreclaimDeathSignals): boolean {
+  if (signals.operatorPaused) return false; // operator pause — not a worker death
+  if (signals.timedOut) return false; // ceiling-expiry class — WLST5 handles it
+  if (signals.recoveredOrphans) return false; // claimed step — worker_lost class
+  const wallMs = resolveHarnessWallMs({
+    harnessWallMs: signals.harnessWallMs,
+    roundWallMs: signals.wallMs,
+  });
+  if (wallMs === undefined) return false; // no duration signal — cannot classify
+  if (wallMs < getInstantFailWallThresholdMs()) return false; // fast round — instant-fail class
+  if (!signals.hasPendingStep) return false; // no unclaimed work to die before
+  const exitCode = signals.exitCode;
+  if (exitCode !== null && exitCode !== undefined && exitCode !== 0) return true;
+  if ((exitCode === null || exitCode === undefined) && signals.signal) return true;
+  return false;
+}
+
 // ── Backoff ───────────────────────────────────────────────────────────
 
 /**
@@ -172,9 +302,22 @@ export function instantFailBackoffDelayMs(consecutive: number): number {
 /**
  * The precise force-fail reason for an escalated instant-fail loop.
  * Shape matches the RSPN evidence: "worker instant-fail loop: N
- * consecutive sub-2s exit-1 rounds; last command: …".
+ * consecutive sub-6s exit-1 rounds; last command: …".
  */
 export function formatInstantFailReason(consecutive: number, lastCommand?: string): string {
   const seconds = Math.round(getInstantFailWallThresholdMs() / 1000);
   return `worker instant-fail loop: ${consecutive} consecutive sub-${seconds}s exit-1 rounds; last command: ${lastCommand ?? "unknown"}`;
+}
+
+/**
+ * The precise force-fail reason for an escalated pre-claim death loop
+ * (OUTAGE-ROUNDS SCLS US-005). Distinct from {@link formatInstantFailReason}:
+ * a pre-claim death is the SLOW complement of an instant fail — the harness
+ * ran at least the wall threshold and then exited nonzero / died by signal
+ * WITHOUT claiming a step — so the reason names that shape explicitly. The
+ * `>=Ns` label derives from the same wall threshold as the predicate.
+ */
+export function formatPreclaimDeathReason(consecutive: number, lastCommand?: string): string {
+  const seconds = Math.round(getInstantFailWallThresholdMs() / 1000);
+  return `worker pre-claim death loop: ${consecutive} consecutive >=${seconds}s rounds that exited/died without claiming a step; last command: ${lastCommand ?? "unknown"}`;
 }

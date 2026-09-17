@@ -158,13 +158,15 @@ const TAMANDUA_EVENT_GIT_IDENTITY_PAYLOAD_FIELDS: TamanduaEvent = {
 void TAMANDUA_EVENT_GIT_IDENTITY_PAYLOAD_FIELDS;
 
 /**
- * The run-level alert vocabulary (RSPN). These are NON-terminal diagnostic
- * events emitted while a run is still active — they surface a pathology
- * (e.g. a worker instant-fail loop heading toward force-fail escalation)
- * before it becomes fatal. Pinned alongside the lifecycle vocabulary.
+ * The run-level alert vocabulary (RSPN + OUTAGE-ROUNDS SCLS US-005). These
+ * are NON-terminal diagnostic events emitted while a run is still active —
+ * they surface a pathology (a worker instant-fail loop or a slow pre-claim
+ * death loop heading toward force-fail escalation) before it becomes fatal.
+ * Pinned alongside the lifecycle vocabulary.
  */
 const PINNED_RUN_ALERT_VOCABULARY = [
   "run.instant_fail_loop",
+  "run.preclaim_death_loop",
 ];
 
 /**
@@ -305,7 +307,7 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     }
   });
 
-  it("pins the run-alert vocabulary: {run.instant_fail_loop} (RSPN)", () => {
+  it("pins the run-alert vocabulary: {run.instant_fail_loop, run.preclaim_death_loop} (RSPN + SCLS US-005)", () => {
     assert.ok(Array.isArray(RUN_ALERT_EVENTS), "RUN_ALERT_EVENTS must be exported");
     assert.deepEqual(
       [...RUN_ALERT_EVENTS].sort(),

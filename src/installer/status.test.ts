@@ -1387,6 +1387,140 @@ describe("RSPN instant-fail loop surfacing", () => {
   });
 });
 
+// ── OUTAGE-ROUNDS US-006: pre-claim death surfacing ──────────────────
+// A run whose steps accumulated K+ pre-claim deaths (rounds PAST the wall
+// threshold that exited/died WITHOUT claiming a step) is looping toward the
+// N-cap force-fail. The per-step counters must be summed into a run-level
+// preclaimDeathCount and shown in `workflow status` and `workflow runs`
+// exactly where the instant-fail loop is shown. Below K the count stays
+// silent — a single pre-claim death is not a loop.
+
+describe("OUTAGE-ROUNDS US-006 preclaim death surfacing", () => {
+  const RUNS_DDL = `
+    CREATE TABLE IF NOT EXISTS runs (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `;
+  const STEPS_DDL = `
+    CREATE TABLE IF NOT EXISTS steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      input_template TEXT NOT NULL DEFAULT '',
+      expects TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      preclaim_death_count INTEGER NOT NULL DEFAULT 0
+    )
+  `;
+
+  function seedPreclaimRun(
+    env: { tamanduaDir: string },
+    runId: string,
+    counts: number[],
+    task = "preclaim death loop",
+  ): string {
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const db = new DatabaseSync(dbPath);
+    db.exec(RUNS_DDL);
+    db.exec(STEPS_DDL);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, instant_fail_count) VALUES (?, 'feature-dev', ?, 'running', '{}', 0, 0)",
+    ).run(runId, task);
+    const ins = db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, type, created_at, updated_at, preclaim_death_count) VALUES (?, ?, ?, 'feature-dev_verifier', ?, '', '', 'pending', 'single', datetime('now'), datetime('now'), ?)",
+    );
+    counts.forEach((count, i) => ins.run(`${runId}-step-${i}`, runId, `step-${i}`, i, count));
+    db.close();
+    return dbPath;
+  }
+
+  it("RunInfo.preclaimDeathCount sums steps.preclaim_death_count for the run", async () => {
+    const env = createTempEnv();
+    const runId = "pc010101-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const dbPath = seedPreclaimRun(env, runId, [3, 4]);
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, listRuns } = await import("../../dist/installer/status.js");
+      assert.equal(getWorkflowStatus(runId).preclaimDeathCount, 7);
+      const listed = listRuns().find((r) => r.id === runId);
+      assert.ok(listed, "run should be listed");
+      assert.equal(listed!.preclaimDeathCount, 7);
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("workflow status shows the pre-claim line and --json carries the field at/above K", async () => {
+    const env = createTempEnv();
+    const runId = "pc020202-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    seedPreclaimRun(env, runId, [6]);
+
+    const textRun = spawnCli(["workflow", "status", runId], { HOME: env.homeDir });
+    await new Promise<void>((resolve) => textRun.child.on("close", () => resolve()));
+    assert.match(textRun.getStdout(), /Pre-claim deaths: 6/);
+
+    const jsonRun = spawnCli(["workflow", "status", runId, "--json"], { HOME: env.homeDir });
+    await new Promise<void>((resolve) => jsonRun.child.on("close", () => resolve()));
+    const parsed = JSON.parse(jsonRun.getStdout()) as { preclaimDeathCount?: number };
+    assert.equal(parsed.preclaimDeathCount, 6);
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+
+  it("workflow status stays silent below the backoff threshold", async () => {
+    const env = createTempEnv();
+    const runId = "pc030303-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    seedPreclaimRun(env, runId, [1]);
+
+    const { child, getStdout } = spawnCli(["workflow", "status", runId], { HOME: env.homeDir });
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    assert.doesNotMatch(getStdout(), /Pre-claim deaths:/, "a sub-threshold count is not a loop yet");
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+
+  it("compact workflow runs list prints pc:N at/above K and omits it below", async () => {
+    const env = createTempEnv();
+    const loopRunId = "pc040404-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const loneRunId = "pc050505-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    seedPreclaimRun(env, loopRunId, [6], "preclaim death loop");
+    seedPreclaimRun(env, loneRunId, [1], "one-off preclaim death");
+
+    const { child, getStdout } = spawnCli(["workflow", "runs"], { HOME: env.homeDir });
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    const stdout = getStdout();
+    assert.match(stdout, /pc:6/);
+    assert.doesNotMatch(stdout, /pc:1\b/, "a sub-threshold count must not render the pc marker");
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+});
+
 // ── WORKDIR-QUEUE US-004: scheduling state surfacing ─────────────────
 // A run queued behind a busy harness workdir keeps status 'running' with
 // scheduling_status='waiting' and scheduling_error naming the holder + dir.

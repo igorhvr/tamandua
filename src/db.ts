@@ -48,7 +48,13 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // (WLST5.1 failure mode): without it existing DBs (user_version === 10)
 // early-return from migrate() and skip the guarded ALTER, so any SQL touching
 // the new column crashes with "no such column: target_moved_reroute_count".
-export const SCHEMA_VERSION = 11;
+// v12 (OUTAGE-ROUNDS): steps.preclaim_death_count (consecutive rounds that ran
+// past the wall threshold and exited/died WITHOUT claiming the step). Bumping
+// is REQUIRED (WLST5.1 failure mode): without it existing DBs
+// (user_version === 11) early-return from migrate() and skip the guarded ALTER,
+// so any SQL touching the new column crashes with
+// "no such column: preclaim_death_count".
+export const SCHEMA_VERSION = 12;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -362,6 +368,19 @@ function applySchema(db: DatabaseSync): void {
   // unrelated terminal failures cannot consume the missing-evidence allowance.
   if (!stepColNames.has("ledger_concession_count")) {
     db.exec("ALTER TABLE steps ADD COLUMN ledger_concession_count INTEGER DEFAULT 0");
+  }
+
+  // ── OUTAGE-ROUNDS preclaim_death_count ──
+  // Durable per-step count of consecutive dispatch rounds that passed the
+  // launch probe, ran at least the instant-fail wall threshold, and exited or
+  // died by signal WITHOUT claiming the step (a "pre-claim death"). Detection
+  // is timing + claim state only — never provider-error message parsing. The
+  // counter drives the same K=6/N=20 escalating backoff/cap as instant-fail
+  // rounds (distinct step.preclaim_round_died / run.preclaim_death_loop
+  // events) and every successful claim resets it to 0. NOT NULL DEFAULT 0
+  // (unlike the other counter columns) so readers never have to coalesce.
+  if (!stepColNames.has("preclaim_death_count")) {
+    db.exec("ALTER TABLE steps ADD COLUMN preclaim_death_count INTEGER NOT NULL DEFAULT 0");
   }
 
   // ── RETR claim invalidation marker ──

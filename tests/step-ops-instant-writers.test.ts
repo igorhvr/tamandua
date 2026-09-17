@@ -79,9 +79,13 @@ describe("US-004 step-ops writers: comment-blind source scan", () => {
     const code = stripComments(readStepOps());
     // Claim records ownership + both instants; complete stamps updated_at;
     // fail flips run status. Columns, placeholders and WHERE clauses unchanged.
+    // OUTAGE-ROUNDS SCLS (US-004) deliberately added `preclaim_death_count = 0`
+    // to every successful claim SET list (a successful claim resets the
+    // streak); the ownership/instant columns and the WHERE clauses are
+    // otherwise unchanged.
     assert.ok(
       code.includes(
-        "SET status = 'running', claim_job_id = ?, claim_pid = ?, claim_pgid = ?, claim_invalidated_by = NULL, claim_updated_at = ${SQL_NOW_ISO}, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'",
+        "SET status = 'running', preclaim_death_count = 0, claim_job_id = ?, claim_pid = ?, claim_pgid = ?, claim_invalidated_by = NULL, claim_updated_at = ${SQL_NOW_ISO}, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = 'pending'",
       ),
       "claim statement shape must be preserved",
     );

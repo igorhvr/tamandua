@@ -724,7 +724,13 @@ exits fast with zero output without claiming a step) now RELAUNCH after
 the backoff window: after K consecutive instant-fail rounds the scheduler
 skips ticks inside an escalating backoff window but spawns again once it
 elapses, and after N consecutive rounds it force-fails the run with a
-`run.instant_fail_loop` event. Defaults are K = 6 / N = 20
+`run.instant_fail_loop` event. The wall threshold is 6 s by default
+(`DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS = 6000`) so provider refusals
+that die after a network round trip (e.g. a dsh QUOTA refusal at ~3 s)
+are classified rather than respawned invisibly; the classification uses
+the harness process wall time (`harnessWallMs`, VM setup excluded) and
+`TAMANDUA_INSTANT_FAIL_WALL_MS` overrides the threshold for tests/ops.
+Defaults are K = 6 / N = 20
 (`TAMANDUA_INSTANT_FAIL_BACKOFF_K` / `TAMANDUA_INSTANT_FAIL_ESCALATION_N`
 override them); a non-instant-fail round between failures resets the
 consecutive count. Do not pin the old 3/10 defaults anywhere. The fast e2e
@@ -734,6 +740,24 @@ relaunch end-to-end: a probe-passing shim that exit-1s on every work round,
 with env K=2 / N=4 / base 3s, must force-fail with `run.instant_fail_loop`
 within about a minute and show no `previous_round_in_flight` skip after a
 backoff-gated tick.
+
+Pre-claim deaths (a harness that passed the launch probe but then ran at
+least the 6 s wall threshold and exited or died WITHOUT claiming a pending
+step) are the SLOW complement of an instant fail and join the SAME
+K = 6 / N = 20 escalating backoff and cap with a distinct vocabulary: each
+death emits `step.preclaim_round_died` (exit code, signal, harness wall ms,
+bounded stderr tail) and increments `steps.preclaim_death_count`
+(SCHEMA_VERSION 12), the dispatch gate is `preclaim_death_backoff`, and the
+N-th death emits `run.preclaim_death_loop` then force-fails the run
+(`formatPreclaimDeathReason`). Any successful claim resets the counter and
+the in-memory streak; detection is timing + claim state ONLY (no
+provider-error parsing, identical for pi/hermes/dsh) and neither instant
+fails nor pre-claim deaths charge step/story retry budget or touch the
+WLST5 counters. Surfaced as `pc:N`, `Pre-claim deaths: N` and
+`PRE-CLAIM DEATH LOOP (N)` next to the instant-fail markers. Pinned by
+`e2e-tests/workflows-preclaim-death-loop.test.ts`,
+`e2e-tests/workflows-instant-fail-threshold.test.ts` and
+`tests/outage-rounds-contract-docs.test.ts`.
 
 The torture-test scripted tiers have their own FORK of these runtimes
 (`torture-test/scripted-runtimes/` — runtime-pi.mjs / runtime-hermes.mjs /

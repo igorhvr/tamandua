@@ -8,16 +8,19 @@ import { SQL_NOW_ISO, monotonicNow, Stopwatch } from "../lib/instant.js";
 import { getRoleTimeoutSeconds, inferRole } from "./install.js";
 import { formatPiCommandPreview } from "./pi-command-preview.js";
 import { emitEvent, getRunEvents, type TamanduaEvent } from "./events.js";
-import { parseRunContext } from "./step-ops.js";
+import { parseRunContext, sanitizeStderrTail, type PendingStepRef } from "./step-ops.js";
 import { gitIdentityEnv, readGitIdentityFromContext } from "./git-identity.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
 import {
   isInstantFailRound,
+  isPreclaimDeathRound,
   instantFailBackoffDelayMs,
   formatInstantFailReason,
+  formatPreclaimDeathReason,
   getInstantFailBackoffThreshold,
   getInstantFailEscalationThreshold,
+  resolveHarnessWallMs,
   type InstantFailRoundSignals,
 } from "./instant-fail.js";
 import {
@@ -121,6 +124,43 @@ interface InstantFailStreak {
   nextAllowedDispatchAt: number;
 }
 const instantFailStreaks = new Map<string, InstantFailStreak>();
+
+/**
+ * OUTAGE-ROUNDS (SCLS) pre-claim death streak, per (run, agent) dispatch job.
+ *
+ * An instant fail is a FAST zero-output nonzero-exit round (below the wall
+ * threshold) that claims nothing; a pre-claim death is its slow complement:
+ * the harness ran at least the wall threshold and then exited nonzero or was
+ * killed by a signal WITHOUT claiming a pending step (vaivm evidence: a
+ * verifier dying 8 times with STREAM_CLOSED before claiming, invisible for
+ * two hours). The counter is per-step in the DB (`steps.preclaim_death_count`,
+ * reset by any successful claim) and this in-memory streak drives the US-005
+ * backoff/cap — it is reset by every non-matching round.
+ *
+ * Like {@link InstantFailStreak}, the streak carries its own MONOTONIC
+ * relaunch deadline (`nextAllowedDispatchAt`): at K consecutive deaths the
+ * motor arms an escalating delay (see {@link instantFailBackoffDelayMs}) and
+ * at N it force-fails the run with a distinct `run.preclaim_death_loop` alert.
+ * No retry budget is charged — a pre-claim death is not a step failure.
+ *
+ * Entries are cleared by `removeRunCrons` (run teardown) and
+ * `shutdownAllCrons`.
+ *
+ * @internal — exposed for test introspection via `_preclaimDeathStreakFor`.
+ */
+interface PreclaimDeathStreak {
+  /** Consecutive pre-claim death rounds for this job. */
+  consecutive: number;
+  /**
+   * Monotonic ms (TIME-CLOCKS rule 1) before which the job's next dispatch
+   * round is skipped (pre-claim-death backoff). 0 when no backoff is active.
+   * This is an in-process deadline — it never survives a restart and must
+   * never be mixed with `Date.now()`/epoch instants, so a wall-clock jump
+   * cannot release or extend the backoff.
+   */
+  nextAllowedDispatchAt: number;
+}
+const preclaimDeathStreaks = new Map<string, PreclaimDeathStreak>();
 
 /**
  * Set of job ids whose dispatch round is currently running. Used to skip a
@@ -1325,6 +1365,44 @@ export function isInstantFailBackoffActive(
 }
 
 /**
+ * Arm the PRE-CLAIM-DEATH relaunch backoff as a MONOTONIC deadline
+ * (TIME-CLOCKS rule 1), the exact discipline of
+ * {@link armInstantFailBackoff}: `nextAllowedDispatchAt` is an opaque
+ * `monotonicNow()` reading plus the backoff delay, never an epoch instant, so
+ * a wall-clock jump can neither release the gate early nor extend the
+ * backoff. `now` is injectable for the cross-cutting wall-jump suite.
+ *
+ * @returns the armed monotonic deadline.
+ */
+export function armPreclaimDeathBackoff(
+  jobId: string,
+  consecutive: number,
+  delayMs: number,
+  now: number = monotonicNow(),
+): number {
+  const nextAllowedDispatchAt = now + delayMs;
+  preclaimDeathStreaks.set(jobId, { consecutive, nextAllowedDispatchAt });
+  return nextAllowedDispatchAt;
+}
+
+/**
+ * True while a job's pre-claim-death backoff deadline has not yet passed.
+ *
+ * TIME-CLOCKS rule 1: `now` defaults to `monotonicNow()` and the stored
+ * `nextAllowedDispatchAt` is monotonic, so the gate cannot be released (or
+ * extended) by a forward/backward wall-clock jump. Exported so the
+ * cross-cutting wall-jump suite can exercise the gate without a live
+ * harness; `executeDispatchRound` passes its own `monotonicNow()` reading
+ * explicitly.
+ */
+export function isPreclaimDeathBackoffActive(
+  streak: { nextAllowedDispatchAt: number } | undefined,
+  now: number = monotonicNow(),
+): boolean {
+  return streak !== undefined && streak.nextAllowedDispatchAt > now;
+}
+
+/**
  * Classify a completed dispatch round as an instant fail (conservatively:
  * wall time below the threshold AND zero TRIMMED output bytes AND nonzero
  * exit or signal-death) and update the per-job consecutive streak:
@@ -1344,8 +1422,16 @@ async function trackInstantFailRound(
   context: Record<string, unknown>,
   signals: InstantFailRoundSignals,
 ): Promise<void> {
-  const { wallMs } = signals;
-  if (wallMs === undefined) return; // no duration signal — cannot classify
+  // Classification resolves on the harness-wall-time seam: the harness
+  // process time when the runner reported it (excluding VM setup), else the
+  // whole-round fallback. Native rounds set harnessWallMs === wallMs, so
+  // their behavior is unchanged; adapter-throw rounds have no harnessWallMs
+  // and fall back to the monotonic round elapsed time.
+  const resolvedWallMs = resolveHarnessWallMs({
+    harnessWallMs: signals.harnessWallMs,
+    roundWallMs: signals.wallMs,
+  });
+  if (resolvedWallMs === undefined) return; // no duration signal — cannot classify
   if (signals.result?.timedOut) return; // ceiling-expiry class — never an instant fail
 
   const isInstantFail = isInstantFailRound(signals);
@@ -1380,7 +1466,12 @@ async function trackInstantFailRound(
   logger.warn("Worker round classified as instant fail", {
     ...context,
     consecutiveInstantFails: consecutive,
-    wallMs,
+    // wallMs is the whole-round wall time; harnessWallMs is the harness
+    // process time the predicate classified on; vmSetupMs is the separate
+    // VM setup time (0 native, null when the runner reported none).
+    wallMs: signals.wallMs,
+    harnessWallMs: signals.harnessWallMs ?? resolvedWallMs,
+    vmSetupMs: signals.vmSetupMs ?? null,
     outputBytes: signals.result ? Buffer.byteLength(signals.result.output, "utf-8") : 0,
     exitCode: signals.result?.exitCode ?? null,
     backoffThreshold: k,
@@ -1467,11 +1558,234 @@ async function escalateInstantFailLoop(
 }
 
 /**
+ * OUTAGE-ROUNDS (SCLS US-004): detect a pre-claim death round and increment
+ * the step's durable counter.
+ *
+ * A pre-claim death is the slow complement of an instant fail: the harness
+ * PASSED the launch-time harness probe (work rounds only spawn after the
+ * probe passed — or the probe was explicitly disabled — so no separate probe
+ * gate is needed here), then ran at least the instant-fail wall threshold and
+ * exited nonzero or died by signal WITHOUT claiming a pending step.
+ *
+ * Detection is TIMING AND CLAIM STATE ONLY — exit code, signal, resolved
+ * harness wall time, operator-pause/timeout/orphan-recovery exclusions, and
+ * whether an unclaimed pending step exists. It NEVER parses provider-error
+ * taxonomy out of stdout/stderr, so the behavior is identical for pi, hermes
+ * and dsh.
+ *
+ * The counter increment is strictly additive: no retry_count change and no
+ * step status transition — a pre-claim death consumes no retry budget (the
+ * US-005 backoff/cap uses its own counter). Any successful claim resets the
+ * persisted counter (see the claimStep UPDATEs in step-ops.ts). Every
+ * non-matching round resets the in-memory streak, so only CONSECUTIVE
+ * pre-claim deaths accumulate.
+ *
+ * At the backoff threshold K the next relaunch is delayed by an escalating
+ * amount (see {@link instantFailBackoffDelayMs}); at the escalation threshold
+ * N the run is force-failed through the sanctioned forceFailRun path with a
+ * precise reason, preceded by exactly one distinct `run.preclaim_death_loop`
+ * alert event (emitted AFTER the N-th `step.preclaim_round_died` record so the
+ * alert immediately precedes the terminal event).
+ */
+async function trackPreclaimDeathRound(
+  job: CronJobInfo,
+  context: Record<string, unknown>,
+  signals: {
+    wallMs?: number;
+    harnessWallMs?: number;
+    vmSetupMs?: number;
+    result?: HarnessRoundResult;
+    recoveredOrphans?: boolean;
+    operatorPaused?: boolean;
+  },
+): Promise<void> {
+  let pending: PendingStepRef | null = null;
+  try {
+    const { findPendingStepForAgent } = await import("./step-ops.js");
+    pending = findPendingStepForAgent(job.agentId, job.runId);
+  } catch (err) {
+    logger.warn("Pre-claim death pending-step lookup failed", {
+      ...context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const isPreclaimDeath = isPreclaimDeathRound({
+    wallMs: signals.wallMs,
+    harnessWallMs: signals.harnessWallMs,
+    timedOut: signals.result?.timedOut,
+    operatorPaused: signals.operatorPaused,
+    recoveredOrphans: signals.recoveredOrphans,
+    hasPendingStep: pending !== null,
+    exitCode: signals.result?.exitCode,
+    signal: signals.result?.signal,
+  });
+
+  if (!isPreclaimDeath || pending === null) {
+    // Any other round (fast instant fail, clean exit, claimed-then-died,
+    // timed out, operator-paused, no pending step) breaks the streak.
+    if (preclaimDeathStreaks.has(job.id)) preclaimDeathStreaks.delete(job.id);
+    return;
+  }
+
+  const previous = preclaimDeathStreaks.get(job.id);
+  const consecutive = (previous?.consecutive ?? 0) + 1;
+  preclaimDeathStreaks.set(job.id, { consecutive, nextAllowedDispatchAt: 0 });
+
+  // Persist the additive per-step counter (surfaced by workflow status).
+  let preclaimDeathCount: number | null = null;
+  try {
+    const { incrementPreclaimDeathCount } = await import("./step-ops.js");
+    preclaimDeathCount = incrementPreclaimDeathCount(pending.id);
+  } catch (err) {
+    logger.warn("Failed to increment steps.preclaim_death_count", {
+      ...context,
+      stepId: pending.stepId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const resolvedHarnessWallMs = resolveHarnessWallMs({
+    harnessWallMs: signals.harnessWallMs,
+    roundWallMs: signals.wallMs,
+  });
+  const stderrTail = sanitizeStderrTail(signals.result?.stderrTail ?? "");
+
+  logger.warn("Worker round died before claiming a step (pre-claim death)", {
+    ...context,
+    consecutivePreclaimDeaths: consecutive,
+    stepId: pending.stepId,
+    stepRowId: pending.id,
+    preclaimDeathCount,
+    // wallMs is the whole-round wall time; harnessWallMs is the harness
+    // process time the predicate classified on; vmSetupMs is the separate
+    // VM setup time (0 native, null when the runner reported none).
+    wallMs: signals.wallMs,
+    harnessWallMs: resolvedHarnessWallMs,
+    vmSetupMs: signals.vmSetupMs ?? null,
+    exitCode: signals.result?.exitCode ?? null,
+    signal: signals.result?.signal ?? null,
+  });
+
+  try {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "step.preclaim_round_died",
+      runId: job.runId,
+      workflowId: job.workflowId,
+      stepId: pending.stepId,
+      stepRowId: pending.id,
+      agentId: job.agentId,
+      exitCode: signals.result?.exitCode ?? undefined,
+      signal: signals.result?.signal ?? undefined,
+      harnessWallMs: resolvedHarnessWallMs,
+      vmSetupMs: signals.vmSetupMs,
+      wallMs: signals.wallMs,
+      stderrTail,
+      consecutivePreclaimDeaths: consecutive,
+    });
+  } catch (err) {
+    logger.warn("Failed to emit step.preclaim_round_died event", {
+      ...context,
+      stepId: pending.stepId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // ── Escalating backoff (K) and run cap (N) ──────────────────────
+  // The pre-claim death streak uses the SAME K/N policy as instant fails
+  // (shared getters + shared delay curve), with its own monotonic deadline
+  // and its own distinct alert/reason so operators can tell the slow
+  // claim-less death loop apart from the fast one.
+  const k = getInstantFailBackoffThreshold();
+  const n = getInstantFailEscalationThreshold();
+
+  if (consecutive >= n) {
+    await escalatePreclaimDeathLoop(job, context, consecutive, signals.result?.commandPreview);
+    return;
+  }
+
+  if (consecutive >= k) {
+    const delayMs = instantFailBackoffDelayMs(consecutive);
+    // TIME-CLOCKS rule 1: the backoff window is an in-process deadline, so
+    // it is armed and gated on the monotonic clock — a wall-clock jump
+    // (NTP step, suspend/resume) can neither release the gate early nor
+    // extend the backoff.
+    const nextAllowedDispatchAt = armPreclaimDeathBackoff(job.id, consecutive, delayMs);
+    logger.warn("Pre-claim death loop detected — backing off relaunch", {
+      ...context,
+      consecutivePreclaimDeaths: consecutive,
+      backoffDelayMs: delayMs,
+      nextAllowedDispatchAt,
+    });
+  }
+}
+
+/**
+ * Escalate a pre-claim death loop at the N-round threshold: emit the
+ * distinct `run.preclaim_death_loop` alert event, then force-fail the run
+ * through the existing forceFailRun path with the pre-claim reason. This
+ * mirrors {@link escalateInstantFailLoop} exactly — alert FIRST, then the
+ * sanctioned terminal path — and charges NO retry budget (pre-claim deaths
+ * are not step failures). force=true guarantees escalation even when another
+ * agent's worker is mid-flight: one broken agent fails the run.
+ */
+async function escalatePreclaimDeathLoop(
+  job: CronJobInfo,
+  context: Record<string, unknown>,
+  consecutive: number,
+  commandPreview?: string,
+): Promise<void> {
+  const reason = formatPreclaimDeathReason(consecutive, commandPreview ?? job.agentId);
+  logger.error("Escalating pre-claim death loop — force-failing run", {
+    ...context,
+    consecutivePreclaimDeaths: consecutive,
+    reason,
+  });
+
+  // Alert event FIRST, before the terminal force-fail event, so consumers
+  // see the loop diagnosis before the run goes terminal.
+  try {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.preclaim_death_loop",
+      runId: job.runId,
+      workflowId: job.workflowId,
+      consecutivePreclaimDeaths: consecutive,
+      detail: reason,
+      reason,
+    });
+  } catch (err) {
+    logger.warn("Failed to emit run.preclaim_death_loop event", {
+      ...context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  try {
+    const { forceFailRun } = await import("./status.js");
+    const result = await forceFailRun(job.runId, reason, true);
+    if (!result.ok) {
+      logger.warn("Pre-claim death escalation force-fail refused", {
+        ...context,
+        reason: result.reason,
+      });
+    }
+  } catch (err) {
+    logger.error("Pre-claim death escalation force-fail failed", {
+      ...context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * One dispatch round for a (runId, agentId) job:
  *
- *   1. instant-fail backoff gate (skip the tick while the backoff window is
- *      open — evaluated BEFORE the in-flight mark so a gated tick leaks
- *      nothing; see the gate comment for the race-safety argument)
+ *   1. backoff gate (pre-claim-death then instant-fail): skip the tick while
+ *      either backoff window is open — evaluated BEFORE the in-flight mark so
+ *      a gated tick leaks nothing; see the gate comment for the race-safety
+ *      argument
  *   2. in-flight guard (one round per job at a time)
  *   3. run-status check (terminal → graceful teardown; paused/draining → skip)
  *   4. stale-claim sweep (recover steps whose worker silently died)
@@ -1481,7 +1795,8 @@ async function escalateInstantFailLoop(
  *      (claim → execute → report)
  *   7. post-round processing — token attribution to the run, STATUS
  *      classification, auto-complete fallback, orphaned-step recovery
- *   8. instant-fail classification — streak/backoff/escalation (RSPN)
+ *   8. instant-fail + pre-claim-death classification — streak/backoff/
+ *      escalation (RSPN + OUTAGE-ROUNDS SCLS)
  */
 export async function executeDispatchRound(
   job: CronJobInfo,
@@ -1510,28 +1825,42 @@ export async function executeDispatchRound(
     return;
   }
 
-  // ── Instant-fail backoff gate (RSPN) ────────────────────────────
-  // After K consecutive instant-fail rounds the motor backs off the
-  // broken harness's relaunch: subsequent ticks are skipped until
-  // nextAllowedDispatchAt passes, instead of respawning every 15s
+  // ── Instant-fail / pre-claim-death backoff gate (RSPN + SCLS) ───
+  // After K consecutive instant-fail (or pre-claim death) rounds the motor
+  // backs off the broken harness's relaunch: subsequent ticks are skipped
+  // until nextAllowedDispatchAt passes, instead of respawning every 15s
   // forever. Idle peeks are never delayed by this — a streak is only
-  // recorded for rounds that actually spawned a harness and instant-failed.
+  // recorded for rounds that actually spawned a harness and failed.
   //
   // The gate runs BEFORE the in-flight mark on purpose: it reads only the
-  // synchronous instantFailStreaks map and awaits nothing, so the
-  // race-safety invariant below (the mark must happen synchronously before
-  // any awaited async work) still holds. Marking first would leak the mark
-  // on this early return — the round try's `finally` (the only place the
-  // mark is released) never runs for a gated tick, so every later tick
-  // would be skipped as previous_round_in_flight: no relaunch after the
-  // window elapses, N unreachable, run idle with a pending step (IFLB-mid
-  // regression).
-  const backoff = instantFailStreaks.get(job.id);
-  // TIME-CLOCKS rule 1: `nextAllowedDispatchAt` is a monotonic deadline, so
-  // the gate and its remaining-time readout must use `monotonicNow()` —
-  // comparing it to `Date.now()` would mix clocks and let a wall jump
-  // release the backoff (or report a nonsensical remaining time).
+  // synchronous streak maps and awaits nothing, so the race-safety invariant
+  // below (the mark must happen synchronously before any awaited async work)
+  // still holds. Marking first would leak the mark on this early return —
+  // the round try's `finally` (the only place the mark is released) never
+  // runs for a gated tick, so every later tick would be skipped as
+  // previous_round_in_flight: no relaunch after the window elapses, N
+  // unreachable, run idle with a pending step (IFLB-mid regression).
+  //
+  // TIME-CLOCKS rule 1: both `nextAllowedDispatchAt` values are monotonic
+  // deadlines, so the gate and its remaining-time readout must use
+  // `monotonicNow()` — comparing them to `Date.now()` would mix clocks and
+  // let a wall jump release the backoff (or report a nonsensical remaining
+  // time).
   const nowMonotonic = monotonicNow();
+  // Pre-claim-death gate first so a slow claim-less death loop reports its own
+  // skip reason; otherwise fall through to the fast instant-fail gate.
+  const preclaimBackoff = preclaimDeathStreaks.get(job.id);
+  if (preclaimBackoff && isPreclaimDeathBackoffActive(preclaimBackoff, nowMonotonic)) {
+    logger.debug("Dispatch round skipped — preclaim-death backoff", {
+      ...context,
+      reason: "preclaim_death_backoff",
+      consecutivePreclaimDeaths: preclaimBackoff.consecutive,
+      backoffUntilMs: preclaimBackoff.nextAllowedDispatchAt,
+      backoffRemainingMs: preclaimBackoff.nextAllowedDispatchAt - nowMonotonic,
+    });
+    return;
+  }
+  const backoff = instantFailStreaks.get(job.id);
   if (backoff && isInstantFailBackoffActive(backoff, nowMonotonic)) {
     logger.debug("Dispatch round skipped — instant-fail backoff", {
       ...context,
@@ -2196,8 +2525,21 @@ export async function executeDispatchRound(
     // returned one.
     await trackInstantFailRound(job, context, {
       wallMs: result?.durationMs ?? roundElapsedMs(roundStartWatch),
+      harnessWallMs: result?.harnessWallMs,
+      vmSetupMs: result?.vmSetupMs,
       result,
       recoveredOrphans: roundRecoveredOrphans,
+    });
+    // OUTAGE-ROUNDS (SCLS US-004): a long nonzero-exit/signal round that
+    // never claimed a pending step is a pre-claim death. Detection is timing
+    // + claim state only (never provider-error text).
+    await trackPreclaimDeathRound(job, context, {
+      wallMs: result?.durationMs ?? roundElapsedMs(roundStartWatch),
+      harnessWallMs: result?.harnessWallMs,
+      vmSetupMs: result?.vmSetupMs,
+      result,
+      recoveredOrphans: roundRecoveredOrphans,
+      operatorPaused,
     });
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2335,8 +2677,25 @@ export async function executeDispatchRound(
       // steps); this adds the streak/backoff/escalation handling.
       await trackInstantFailRound(job, context, {
         wallMs: roundElapsedMs(roundStartWatch),
+        // No resolved HarnessRoundResult on an adapter throw, so there is no
+        // harness-wall-time signal: the predicate falls back to the monotonic
+        // round elapsed time (native semantics — the launch attempt IS the
+        // whole round).
+        harnessWallMs: undefined,
+        vmSetupMs: undefined,
         adapterThrew: true,
         recoveredOrphans: roundRecoveredOrphans,
+      });
+      // OUTAGE-ROUNDS (SCLS US-004): an adapter throw has no exit code and no
+      // signal, so it can never be a pre-claim death; the call still runs so
+      // any prior streak is reset (a launch failure breaks consecutiveness).
+      await trackPreclaimDeathRound(job, context, {
+        wallMs: roundElapsedMs(roundStartWatch),
+        harnessWallMs: undefined,
+        vmSetupMs: undefined,
+        result: undefined,
+        recoveredOrphans: roundRecoveredOrphans,
+        operatorPaused,
       });
     } catch (recoveryErr) {
       logger.error("Orphaned step recovery failed", {
@@ -3280,6 +3639,8 @@ export async function removeRunCrons(
     // Drop the run's instant-fail streaks with the jobs — a torn-down run
     // must not leave stale backoff/escalation state behind.
     instantFailStreaks.delete(id);
+    // OUTAGE-ROUNDS (SCLS): drop the run's pre-claim death streaks too.
+    preclaimDeathStreaks.delete(id);
     removed.push(id);
   }
 
@@ -3543,6 +3904,9 @@ export function shutdownAllCrons(): void {
   inFlightJobs.clear();
   jobMetadata.clear();
   instantFailStreaks.clear();
+  // OUTAGE-ROUNDS (SCLS): a full shutdown leaves no round to classify — drop
+  // the pre-claim death streaks too.
+  preclaimDeathStreaks.clear();
   // PKIL (US-005): a full shutdown leaves no round to classify — drop the
   // operator-pause marks so they cannot survive into a later test/run.
   operatorPausedRounds.clear();
@@ -3748,9 +4112,20 @@ export function _instantFailStreakFor(jobId: string): { consecutive: number; nex
   return streak ? { ...streak } : undefined;
 }
 
+/** @internal — exposed for tests to introspect the pre-claim death streak for a job. */
+export function _preclaimDeathStreakFor(jobId: string): { consecutive: number; nextAllowedDispatchAt: number } | undefined {
+  const streak = preclaimDeathStreaks.get(jobId);
+  return streak ? { ...streak } : undefined;
+}
+
 /** @internal — exposed for tests to clear all instant-fail streaks between cases. */
 export function _resetInstantFailStreaks(): void {
   instantFailStreaks.clear();
+}
+
+/** @internal — exposed for tests to clear all pre-claim death streaks between cases. */
+export function _resetPreclaimDeathStreaks(): void {
+  preclaimDeathStreaks.clear();
 }
 
 /** @internal — exposed for tests to introspect scheduled job metadata. */

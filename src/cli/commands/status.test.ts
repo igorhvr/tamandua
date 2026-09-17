@@ -39,6 +39,7 @@ describe("TIME-OUTPUT US-005: tamandua status red-ledger instant is ISO-Z", () =
         workerLostCount: 0,
         ceilingExpiryCount: 0,
         instantFailCount: 0,
+        preclaimDeathCount: 0,
         redLedgerLanding: {
           ledgerRowId: 42,
           exitCode: 7,

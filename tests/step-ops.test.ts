@@ -1,7 +1,7 @@
 import { describe, it, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createTempHome } from "./helpers/test-env.ts";
-import { parseRunContext, parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, stepCurrent, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail, formatRetryFeedback } from "../dist/installer/step-ops.js";
+import { parseRunContext, parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, stepCurrent, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail, formatRetryFeedback, findPendingStepForAgent, incrementPreclaimDeathCount } from "../dist/installer/step-ops.js";
 import { getRunEvents } from "../dist/installer/events.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -8065,5 +8065,184 @@ describe("US-003: recovery hint in Step not found errors", () => {
       assert.match(lines[0], /^Step not found:/, "first line should be the error line");
       assert.match(lines[1], /^If you lost your step id, run:/, "second line should be the recovery hint");
     }
+  });
+});
+
+// ── OUTAGE-ROUNDS SCLS US-004: pre-claim death counter helpers ──────────
+// The scheduler's pre-claim death tracker needs a read-only lookup of the
+// pending step an agent will claim, an additive per-step counter increment,
+// and a durable reset of that counter on EVERY successful claim (single and
+// loop paths) so a successful claim clears the streak.
+
+describe("OUTAGE-ROUNDS SCLS US-004: pre-claim death counter and claim reset", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-preclaim-ops-test-");
+
+  before(() => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts(): string {
+    return new Date().toISOString();
+  }
+
+  function seedRun(db: any, runId: string, now: string): void {
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'scls-test', 'task', 'running', '{}', ?, ?)",
+    ).run(runId, now, now);
+  }
+
+  function seedStep(
+    db: any,
+    opts: {
+      id: string;
+      runId: string;
+      stepId: string;
+      agentId: string;
+      stepIndex: number;
+      status: string;
+      now: string;
+      retryCount?: number;
+      preclaimCount?: number;
+      type?: string;
+      loopConfig?: string | null;
+    },
+  ): void {
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, preclaim_death_count, type, loop_config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'do work', 'STATUS', ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      opts.id,
+      opts.runId,
+      opts.stepId,
+      opts.agentId,
+      opts.stepIndex,
+      opts.status,
+      opts.retryCount ?? 0,
+      opts.preclaimCount ?? 0,
+      opts.type ?? "single",
+      opts.loopConfig ?? null,
+      opts.now,
+      opts.now,
+    );
+  }
+
+  it("findPendingStepForAgent returns the lowest-step_index pending step for that agent", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+    seedRun(db, runId, now);
+    seedStep(db, { id: "scls-running", runId, stepId: "setup", agentId: "scls_agent", stepIndex: 0, status: "running", now });
+    seedStep(db, { id: "scls-later", runId, stepId: "later", agentId: "scls_agent", stepIndex: 2, status: "pending", now });
+    const eagerId = "scls-eager";
+    seedStep(db, { id: eagerId, runId, stepId: "eager", agentId: "scls_agent", stepIndex: 1, status: "pending", now });
+    // A pending step for a DIFFERENT agent must never be returned.
+    seedStep(db, { id: "scls-other", runId, stepId: "other", agentId: "other_agent", stepIndex: 0, status: "pending", now });
+
+    assert.deepEqual(findPendingStepForAgent("scls_agent", runId), { id: eagerId, stepId: "eager" });
+  });
+
+  it("findPendingStepForAgent returns null when no pending step exists", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+    seedRun(db, runId, now);
+    seedStep(db, { id: "scls-only-running", runId, stepId: "setup", agentId: "scls_agent", stepIndex: 0, status: "running", now });
+
+    assert.equal(findPendingStepForAgent("scls_agent", runId), null);
+    assert.equal(findPendingStepForAgent("scls_agent", crypto.randomUUID()), null);
+  });
+
+  it("incrementPreclaimDeathCount is additive and returns the new value", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+    seedRun(db, runId, now);
+    const stepId = "scls-count";
+    seedStep(db, { id: stepId, runId, stepId: "execute", agentId: "scls_agent", stepIndex: 0, status: "pending", now });
+
+    assert.equal(incrementPreclaimDeathCount(stepId), 1, "first increment returns 1");
+    assert.equal(incrementPreclaimDeathCount(stepId), 2, "second increment returns 2");
+    const row = db.prepare("SELECT preclaim_death_count FROM steps WHERE id = ?").get(stepId) as {
+      preclaim_death_count: number;
+    };
+    assert.equal(row.preclaim_death_count, 2, "the counter must persist");
+
+    // Additive only: no status transition and no retry charge.
+    const shape = db.prepare("SELECT status, retry_count FROM steps WHERE id = ?").get(stepId) as {
+      status: string;
+      retry_count: number;
+    };
+    assert.equal(shape.status, "pending", "incrementing the counter must not transition the step");
+    assert.equal(shape.retry_count, 0, "incrementing the counter must not charge a retry");
+  });
+
+  it("a successful single-step claim resets preclaim_death_count to 0 and keeps retry_count", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+    seedRun(db, runId, now);
+    const stepId = "scls-single-reset";
+    seedStep(db, { id: stepId, runId, stepId: "execute", agentId: "scls_agent", stepIndex: 0, status: "pending", now, retryCount: 1, preclaimCount: 4 });
+
+    const result = claimStep("scls_agent", runId);
+    assert.ok(result.found, "the pending step must be claimable");
+
+    const row = db.prepare("SELECT status, retry_count, preclaim_death_count FROM steps WHERE id = ?").get(stepId) as {
+      status: string;
+      retry_count: number;
+      preclaim_death_count: number;
+    };
+    assert.equal(row.status, "running", "a successful claim transitions the step to running");
+    assert.equal(row.preclaim_death_count, 0, "a successful claim must reset the pre-claim death counter");
+    assert.equal(row.retry_count, 1, "a successful claim must not change retry_count");
+  });
+
+  it("a successful loop claim resets preclaim_death_count to 0", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+    seedRun(db, runId, now);
+    const stepId = "scls-loop-reset";
+    seedStep(db, {
+      id: stepId,
+      runId,
+      stepId: "implement",
+      agentId: "scls_agent",
+      stepIndex: 0,
+      status: "pending",
+      now,
+      preclaimCount: 3,
+      type: "loop",
+      loopConfig: JSON.stringify({ over: "stories" }),
+    });
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, 0, 'US-001', 'Add feature', 'Implement the feature', '[]', 'pending', 0, 4, ?, ?)",
+    ).run("scls-story", runId, now, now);
+
+    const result = claimStep("scls_agent", runId);
+    assert.ok(result.found, "the loop step must be claimable with a pending story");
+
+    const row = db.prepare("SELECT status, current_story_id, preclaim_death_count FROM steps WHERE id = ?").get(stepId) as {
+      status: string;
+      current_story_id: string | null;
+      preclaim_death_count: number;
+    };
+    assert.equal(row.status, "running");
+    assert.ok(row.current_story_id, "the loop claim must bind the next story");
+    assert.equal(row.preclaim_death_count, 0, "a successful loop claim must reset the pre-claim death counter");
   });
 });

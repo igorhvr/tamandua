@@ -56,6 +56,26 @@ export interface HarnessRoundResult {
    */
   durationMs?: number;
   /**
+   * Time the harness PROCESS ITSELF ran, from guest exec start to process
+   * exit, EXCLUDING any VM setup. Native adapters (pi/hermes/dsh) run the
+   * harness directly, so they set this to `durationMs` and `vmSetupMs` to 0
+   * — for them round time == harness time. A Matchlock/in-VM runner MUST
+   * report the guest exec→exit interval here and the VM setup time
+   * separately in `vmSetupMs`, and must NEVER fold setup into this value:
+   * the instant-fail predicate classifies on harness wall time (not
+   * whole-round wall time), so a refusal that dies after a short in-VM
+   * round must still be counted even when VM boot took tens of seconds.
+   * The Matchlock branch adopts this contract in its union follow-up.
+   */
+  harnessWallMs?: number;
+  /**
+   * VM setup time (ms) that elapsed BEFORE the harness exec, kept separate
+   * from `harnessWallMs`. Always 0 for native rounds (no VM); a
+   * Matchlock/in-VM runner reports its real setup time here. Never add it
+   * into `harnessWallMs` — see that field's contract.
+   */
+  vmSetupMs?: number;
+  /**
    * KHYG US-002: the effective native signal-isolation mode of this
    * launch ('landlock' | 'seatbelt' | 'unprotected-fallback'), as decided
    * by the shared launch mechanism (src/installer/harness-launch.ts).
@@ -279,6 +299,12 @@ async function launchRoundProcess(params: {
         stderrTail: outcome.stderrTail,
         timedOut: outcome.timedOut === true ? true : undefined,
         durationMs,
+        // No harness ever exec'd (the abort happened during native setup), so
+        // the harness-process wall time equals the round watch's elapsed time
+        // and there was no VM setup layer. Native semantics: round time ==
+        // harness time, vmSetupMs 0.
+        harnessWallMs: durationMs,
+        vmSetupMs: 0,
       },
     };
   }
@@ -563,6 +589,9 @@ class PiHarnessAdapter implements HarnessAdapter {
       stderrTail,
       timedOut: timedOut || undefined,
       durationMs,
+      // Native pi: the harness ran directly, so round time == harness time.
+      harnessWallMs: durationMs,
+      vmSetupMs: 0,
       launchMode,
       ...(launchReason !== undefined ? { launchReason } : {}),
     };
@@ -981,6 +1010,9 @@ class HermesHarnessAdapter implements HarnessAdapter {
       stderrTail,
       timedOut: timeoutTimerFired || undefined,
       durationMs,
+      // Native hermes: the harness ran directly, so round time == harness time.
+      harnessWallMs: durationMs,
+      vmSetupMs: 0,
       launchMode,
       ...(launchReason !== undefined ? { launchReason } : {}),
     };
@@ -1377,6 +1409,9 @@ class DshHarnessAdapter implements HarnessAdapter {
       stderrTail,
       timedOut: timedOut || undefined,
       durationMs,
+      // Native dsh: the harness ran directly, so round time == harness time.
+      harnessWallMs: durationMs,
+      vmSetupMs: 0,
       launchMode,
       ...(launchReason !== undefined ? { launchReason } : {}),
     };

@@ -566,7 +566,13 @@ export async function handleWorkflow(
       const ifMarker = r.instantFailCount >= getInstantFailBackoffThreshold()
         ? ` if:${r.instantFailCount}`.padEnd(6)
         : "";
-      console.log(`  [${r.status.padEnd(9)}] run-${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${wl}${ce}${ifMarker}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
+      // OUTAGE-ROUNDS (SCLS) US-006: mirror the instant-fail loop marker for
+      // consecutive slow pre-claim deaths so a silent verifier death loop is
+      // visible in the compact list before it is fatal.
+      const pcMarker = r.preclaimDeathCount >= getInstantFailBackoffThreshold()
+        ? ` pc:${r.preclaimDeathCount}`.padEnd(6)
+        : "";
+      console.log(`  [${r.status.padEnd(9)}] run-${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${wl}${ce}${ifMarker}${pcMarker}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
     }
     return true;
   }
@@ -997,6 +1003,9 @@ export async function handleWorkflow(
           harnessType: result.harnessType,
           task: result.task.slice(0, 200),
           tokensSpent: result.tokensSpent,
+          // OUTAGE-ROUNDS (SCLS) US-006: machine-readable per-run pre-claim
+          // death total (SUM of the per-step counters).
+          preclaimDeathCount: result.preclaimDeathCount,
         };
         // TIME-OUTPUT US-005: run-level instants are ISO-8601 UTC with Z
         // (legacy naive normalized); a missing/unparseable value is omitted.
@@ -1060,6 +1069,12 @@ export async function handleWorkflow(
       // force-fail escalation.
       if (result.instantFailCount >= getInstantFailBackoffThreshold()) {
         console.log(`Worker instant-fail loop: ${result.instantFailCount} consecutive sub-${Math.round(getInstantFailWallThresholdMs() / 1000)}s exit-1 rounds`);
+      }
+      // OUTAGE-ROUNDS (SCLS) US-006: mirror the instant-fail line for the slow
+      // pre-claim death loop (rounds past the wall threshold that exit/die
+      // without claiming), so the operator sees the escalation before the N cap.
+      if (result.preclaimDeathCount >= getInstantFailBackoffThreshold()) {
+        console.log(`Pre-claim deaths: ${result.preclaimDeathCount}`);
       }
       if (result.workspace_mode === "worktree") {
         console.log(`Workspace: ${result.workspace_mode}`);

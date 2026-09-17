@@ -464,6 +464,84 @@ every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
   without reporting (no STATUS output, crash, non-zero exit, timeout kill)
   leaves a `running` step that must be requeued and retried — not stuck
   forever.
+
+  **Instant-fail and pre-claim death backoff (OUTAGE-ROUNDS / QFAIL + SCLS).**
+  Two claim-less worker-death shapes — the FAST instant fail and the SLOW
+  pre-claim death — share one classification seam and one escalation policy.
+
+  *Harness-wall-time classification seam (`harnessWallMs` / `vmSetupMs`).*
+  The predicate classifies on the time the harness PROCESS itself ran — from
+  guest exec start to exit — never on whole-round wall time that includes VM
+  setup. `HarnessRoundResult.harnessWallMs` is that harness-process time and
+  `vmSetupMs` is the setup that preceded exec. Native pi/hermes/dsh rounds
+  run the harness directly, so each adapter sets
+  `harnessWallMs === durationMs` and `vmSetupMs === 0` (round time ==
+  harness time), and a launch aborted during native setup reports the same
+  shape. A Matchlock/in-VM runner MUST report the in-guest exec→exit
+  interval as `harnessWallMs` plus a SEPARATE `vmSetupMs` and must never
+  fold setup into `harnessWallMs`; `isInstantFailRound` and
+  `isPreclaimDeathRound` resolve their wall time via
+  `resolveHarnessWallMs({ harnessWallMs, roundWallMs })`
+  (`harnessWallMs ?? wallMs`), so an in-VM refusal that dies after a short
+  guest round is classified even when VM boot took a minute, while
+  adapter-throw rounds fall back to the monotonic round elapsed time. Pinned
+  by `src/installer/instant-fail.test.ts` and
+  `src/installer/harness-adapter.test.ts`.
+
+  *Wall threshold (QFAIL).* The single wall threshold defaults to 6000 ms
+  (`DEFAULT_INSTANT_FAIL_WALL_THRESHOLD_MS`, raised from the old 2000 ms)
+  and is overridden by `TAMANDUA_INSTANT_FAIL_WALL_MS`. The instant-fail
+  predicate stays conservative: wall time UNDER the threshold, not timed
+  out, no step claimed (`recoveredOrphans` false), empty TRIMMED stdout, and
+  a nonzero exit code or a signal death. A provider refusal that dies after
+  a network round trip (the vaivm audit's `dsh: QUOTA:` rounds at ~3 s) now
+  falls inside the threshold and joins the loop instead of being respawned
+  invisibly on every tick.
+
+  *Pre-claim death (SCLS).* The SLOW complement of an instant fail: a round
+  that PASSED the launch probe, ran AT LEAST the wall threshold
+  (harness-process time), and then exited nonzero or died by signal WITHOUT
+  ever claiming the pending step. The definition is TIMING AND CLAIM STATE
+  ONLY — passed probe + resolved wall time + an unclaimed pending step +
+  nonzero exit/signal — and NO provider-error taxonomy is ever parsed from
+  stdout/stderr, so the behavior is identical for pi, hermes and dsh. It
+  never fires for operator-paused rounds (the paused recovery class),
+  timed-out rounds (ceiling expiry / WLST5), or rounds whose worker claimed
+  a step before dying (`recoveredOrphans` is the worker_lost class). Each
+  pre-claim death emits `step.preclaim_round_died` (exit code, signal,
+  harness wall ms, separate `vmSetupMs`, whole-round `wallMs`, and a
+  bounded sanitized stderr tail) and increments the per-step counter
+  `steps.preclaim_death_count` (schema v12, added by a guarded idempotent
+  `ALTER` in `migrate()`); a successful claim resets the counter to 0 and
+  clears the in-memory streak.
+
+  *Shared escalating backoff and cap.* Pre-claim deaths use the SAME K/N
+  policy and delay curve as instant fails — `getInstantFailBackoffThreshold()`
+  (K = 6 by default, `TAMANDUA_INSTANT_FAIL_BACKOFF_K`) and
+  `getInstantFailEscalationThreshold()` (N = 20,
+  `TAMANDUA_INSTANT_FAIL_ESCALATION_N`) with `instantFailBackoffDelayMs`
+  (base 30 s, doubling, capped). After K consecutive deaths the dispatch
+  gate skips ticks inside an escalating MONOTONIC backoff window
+  (`armPreclaimDeathBackoff` / `isPreclaimDeathBackoffActive`, the exact
+  discipline of the instant-fail gate and checked before the in-flight
+  mark); after N it emits exactly one distinct `run.preclaim_death_loop`
+  alert event and force-fails the run through the sanctioned `forceFailRun`
+  path with `formatPreclaimDeathReason`, the alert immediately preceding the
+  terminal event. Neither class charges story/step retry budget: they keep
+  their own additive counters (`runs.instant_fail_count`,
+  `steps.preclaim_death_count`) and never touch `retry_count`, WLST5
+  `worker_lost_count`, or `ceiling_expiry_count`. Any non-matching round
+  resets the streak. The counters surface next to the instant-fail markers
+  in `workflow runs` (`pc:N`), `workflow status` (`Pre-claim deaths: N` and
+  the `preclaimDeathCount` JSON field) and `tamandua status`
+  (`PRE-CLAIM DEATH LOOP (N)`), gated on K. Pinned by
+  `src/installer/instant-fail.test.ts`,
+  `src/installer/agent-scheduler.test.ts`, `tests/step-ops.test.ts`,
+  `src/db.test.ts`, `src/installer/status.test.ts`, and the scripted
+  `e2e-tests/workflows-instant-fail-loop.test.ts`,
+  `e2e-tests/workflows-instant-fail-threshold.test.ts` and
+  `e2e-tests/workflows-preclaim-death-loop.test.ts`; the documentation
+  contract itself is pinned by `tests/outage-rounds-contract-docs.test.ts`.
 - **C10** **Expects-must-accept-all-reply-variants invariant:** every STATUS
   variant (`STATUS: done`, `STATUS: retry`, `STATUS: failed`) that a step's
   `Reply with:` section instructs an agent to emit MUST satisfy that step's

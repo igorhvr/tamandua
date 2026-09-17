@@ -62,14 +62,22 @@ function writeBehaviors(behaviorsPath: string, config: Record<string, unknown>) 
  * Create a mock tamandua CLI that returns canned, deterministic responses:
  * step peek → HAS_WORK, step claim → a JSON stepId/runId/input, step
  * complete/fail → exit 0.
+ *
+ * When `logPath` is given every invocation appends its first two argv words
+ * (e.g. "step peek") to that file, so a test can prove a mode never issued a
+ * `step claim` / `step complete`.
  */
-function createMockCli(dir: string): string {
+function createMockCli(dir: string, logPath?: string): string {
   const mockPath = path.join(dir, "mock-tamandua");
   fs.writeFileSync(
     mockPath,
     [
       "#!/usr/bin/env node",
+      "var fs = require('node:fs');",
       "var args = process.argv.slice(2);",
+      logPath
+        ? `fs.appendFileSync(${JSON.stringify(logPath)}, args.slice(0, 2).join(' ') + '\\n');`
+        : "",
       "if (args[0] === 'step' && args[1] === 'peek') { process.stdout.write('HAS_WORK'); process.exit(0); }",
       "if (args[0] === 'step' && args[1] === 'claim') {",
       "  process.stdout.write(JSON.stringify({ stepId: " + JSON.stringify(PREF_STEP_ID) + ", runId: " + JSON.stringify(PREF_RUN_ID) + ", input: 'MOCK_INPUT: canned\\n' }));",
@@ -82,6 +90,23 @@ function createMockCli(dir: string): string {
   );
   fs.chmodSync(mockPath, 0o755);
   return mockPath;
+}
+
+/** Read the scripted runtime's invocation journal (empty when absent). */
+function readInvocationJournal(stateDir: string): Array<Record<string, unknown>> {
+  const logPath = path.join(stateDir, "invocations.jsonl");
+  if (!fs.existsSync(logPath)) return [];
+  return fs
+    .readFileSync(logPath, "utf-8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+/** Read the mock-CLI call log (empty when absent). */
+function readCliCalls(logPath: string): string {
+  if (!fs.existsSync(logPath)) return "";
+  return fs.readFileSync(logPath, "utf-8");
 }
 
 /**
@@ -231,6 +256,124 @@ describe("scripted-agent-runtime (pi)", () => {
           work.stdout.includes("ROUND: first"),
           `first work round after a probe should use behavior index 0, got: "${work.stdout}", stderr: ${work.stderr}`,
         );
+      } finally {
+        cleanup(dirs.tmp);
+      }
+    });
+  });
+
+  // ── Pre-claim death chaos modes (OUTAGE-ROUNDS) ─────────────────────
+  //
+  // These modes model a harness round that runs past the instant-fail wall
+  // threshold and exits without ever claiming a step. US-009 drives the full
+  // backoff/cap pipeline from them; here we pin the runtime contract: the
+  // stream mode emits non-empty stdout, both modes wait at least sleepMs,
+  // exit non-zero, and never issue a `step claim` / `step complete`.
+
+  describe("pre-claim death chaos modes (OUTAGE-ROUNDS)", () => {
+    function spawnChaosMode(
+      dirs: TestDirs,
+      behavior: Record<string, unknown>,
+      logPath: string,
+    ): { result: SpawnSyncReturns<string>; elapsedMs: number } {
+      createMockCli(dirs.tmp, logPath);
+      writeBehaviors(dirs.behaviorsPath, { agents: { doer: behavior } });
+      const started = performance.now();
+      const result = spawnPi(
+        dirs,
+        {
+          TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
+          TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
+        },
+        { timeoutMs: 20_000 },
+      );
+      return { result, elapsedMs: performance.now() - started };
+    }
+
+    it("mode=stream-die-before-claim: streams non-empty stdout, sleeps, exits nonzero, never claims", () => {
+      const dirs = makeTempDirs();
+      try {
+        const callLog = path.join(dirs.tmp, "cli-calls.log");
+        const { result, elapsedMs } = spawnChaosMode(
+          dirs,
+          { mode: "stream-die-before-claim", sleepMs: 500, streamOutput: "working...", exitCode: 1 },
+          callLog,
+        );
+
+        assert.equal(
+          result.status,
+          1,
+          `stream-die-before-claim should exit 1, got status=${result.status} signal=${result.signal}, stderr: ${result.stderr}`,
+        );
+        assert.ok(
+          result.stdout.includes("working..."),
+          `stream-die-before-claim should write streamOutput, got stdout: "${result.stdout}"`,
+        );
+        assert.ok(
+          elapsedMs >= 500,
+          `stream-die-before-claim should wait >= 500ms, elapsed ${elapsedMs}ms`,
+        );
+
+        const calls = readCliCalls(callLog);
+        assert.ok(calls.includes("step peek"), `expected a peek call, got: ${calls}`);
+        assert.ok(!calls.includes("step claim"), `must never claim, got calls: ${calls}`);
+        assert.ok(!calls.includes("step complete"), `must never complete, got calls: ${calls}`);
+
+        const work = readInvocationJournal(dirs.stateDir).filter((e) => e.phase === "work");
+        assert.equal(work.length, 1, "exactly one work round should be journaled");
+        assert.equal(work[0].mode, "stream-die-before-claim");
+        assert.equal(work[0].stepId, undefined, "no stepId must be journaled (never claimed)");
+      } finally {
+        cleanup(dirs.tmp);
+      }
+    });
+
+    it("mode=stream-die-before-claim: defaults to non-empty stdout when streamOutput is absent", () => {
+      const dirs = makeTempDirs();
+      try {
+        const callLog = path.join(dirs.tmp, "cli-calls.log");
+        const { result } = spawnChaosMode(
+          dirs,
+          { mode: "stream-die-before-claim", sleepMs: 100 },
+          callLog,
+        );
+
+        assert.equal(result.status, 1, `expected exit 1, stderr: ${result.stderr}`);
+        assert.ok(
+          result.stdout.trim().length > 0,
+          `default streamOutput must be non-empty, got: "${result.stdout}"`,
+        );
+        assert.ok(!readCliCalls(callLog).includes("step claim"), "must never claim");
+      } finally {
+        cleanup(dirs.tmp);
+      }
+    });
+
+    it("mode=die-before-claim with sleepMs: sleeps, empty stdout, exits nonzero, never claims", () => {
+      const dirs = makeTempDirs();
+      try {
+        const callLog = path.join(dirs.tmp, "cli-calls.log");
+        const { result, elapsedMs } = spawnChaosMode(
+          dirs,
+          { mode: "die-before-claim", sleepMs: 400, exitCode: 3 },
+          callLog,
+        );
+
+        assert.equal(
+          result.status,
+          3,
+          `die-before-claim should exit 3, got status=${result.status} signal=${result.signal}, stderr: ${result.stderr}`,
+        );
+        assert.equal(
+          result.stdout,
+          "",
+          `die-before-claim with sleepMs must still emit empty stdout, got: "${result.stdout}"`,
+        );
+        assert.ok(
+          elapsedMs >= 400,
+          `die-before-claim should wait >= 400ms, elapsed ${elapsedMs}ms`,
+        );
+        assert.ok(!readCliCalls(callLog).includes("step claim"), "must never claim");
       } finally {
         cleanup(dirs.tmp);
       }

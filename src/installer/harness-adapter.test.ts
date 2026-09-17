@@ -2513,6 +2513,15 @@ describe("US-003 monotonic harness round budgets", () => {
         result.durationMs! < 10_000,
         `durationMs must stay the real ~250ms interval, got ${result.durationMs}`,
       );
+      // Harness-wall seam: native pi runs the harness directly, so the
+      // harness-process time equals the whole-round duration and there is no
+      // VM setup layer.
+      assert.equal(
+        result.harnessWallMs,
+        result.durationMs,
+        "native pi must report harnessWallMs === durationMs",
+      );
+      assert.equal(result.vmSetupMs, 0, "native pi must report vmSetupMs === 0");
     } finally {
       Date.now = realDateNow;
       if (savedPi === undefined) delete process.env.TAMANDUA_PI_BINARY;
@@ -2570,6 +2579,12 @@ describe("US-003 monotonic harness round budgets", () => {
         result.durationMs! >= 0 && result.durationMs! < 10_000,
         `durationMs must stay the real interval, got ${result.durationMs}`,
       );
+      assert.equal(
+        result.harnessWallMs,
+        result.durationMs,
+        "native hermes must report harnessWallMs === durationMs",
+      );
+      assert.equal(result.vmSetupMs, 0, "native hermes must report vmSetupMs === 0");
     } finally {
       Date.now = realDateNow;
     }
@@ -2593,6 +2608,12 @@ describe("US-003 monotonic harness round budgets", () => {
         result.durationMs! >= 0 && result.durationMs! < 10_000,
         `durationMs must stay the real interval, got ${result.durationMs}`,
       );
+      assert.equal(
+        result.harnessWallMs,
+        result.durationMs,
+        "native dsh must report harnessWallMs === durationMs",
+      );
+      assert.equal(result.vmSetupMs, 0, "native dsh must report vmSetupMs === 0");
     } finally {
       Date.now = realDateNow;
     }

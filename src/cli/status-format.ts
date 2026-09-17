@@ -381,6 +381,14 @@ export function formatRunsSummary(opts?: {
         r.instantFailCount >= getInstantFailBackoffThreshold()
           ? `  INSTANT-FAIL LOOP (${r.instantFailCount} consecutive)`
           : "";
+      // OUTAGE-ROUNDS (SCLS) US-006: a run with K+ slow pre-claim deaths
+      // (rounds past the wall threshold that exited/died without claiming) is
+      // backing off toward the N-cap force-fail — annotate it in the same
+      // place as the instant-fail loop so a silent death loop is visible.
+      const preclaimDeathMarker =
+        r.preclaimDeathCount >= getInstantFailBackoffThreshold()
+          ? `  PRE-CLAIM DEATH LOOP (${r.preclaimDeathCount})`
+          : "";
       // WORKDIR-QUEUE US-004: a run queued behind a busy harness workdir keeps
       // status 'running' with schedulingStatus 'waiting'. Render the stored
       // scheduling_error verbatim (e.g. "waiting for harness workdir held by
@@ -391,7 +399,7 @@ export function formatRunsSummary(opts?: {
           ? `  WAITING: ${r.schedulingError}`
           : "";
       lines.push(
-        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}${redLedgerMarker}${instantFailMarker}${waitingMarker}`,
+        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}${redLedgerMarker}${instantFailMarker}${preclaimDeathMarker}${waitingMarker}`,
       );
     }
   }
