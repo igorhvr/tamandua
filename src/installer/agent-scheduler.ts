@@ -41,6 +41,10 @@ import {
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
 import { lookupDshSessionTokens } from "./dsh-usage.js";
 import { extractPerCallTokenTotal } from "./token-usage-policy.js";
+import {
+  getDaemonInstanceToken,
+  SWEEP_DAEMON_INSTANCE_ENV,
+} from "./sweep-ownership.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // Run-Scoped Deterministic Dispatch
@@ -2751,6 +2755,23 @@ export async function executeDispatchRound(
  * `TAMANDUA_WORKER_PID`, so `step claim` records the actual harness process
  * (pid === pgid for the detached group leader) rather than the daemon pid.
  *
+ * MARKER HYGIENE (SWEEP-SCOPE US-002): a daemon started from INSIDE a harness
+ * round inherits that round's environment, so an outer `TAMANDUA_RUN_ID`,
+ * `TAMANDUA_WORKER_JOB_ID` or `TAMANDUA_DAEMON_INSTANCE` must never be read as
+ * this round's own. Each key the round owns is therefore FRESHLY written by
+ * this function — overriding, or explicitly dropping (`undefined`), any
+ * inherited value in the adapter's `{...process.env, ...env}` merge:
+ *   - `TAMANDUA_RUN_ID` and `TAMANDUA_WORKER_JOB_ID` are overwritten with the
+ *     job's values;
+ *   - `TAMANDUA_DAEMON_INSTANCE` is the CURRENT process's daemon-instance token
+ *     (state dir + kernel start identity, see sweep-ownership.ts) and is
+ *     omitted — never fabricated — when the token is unavailable, so the
+ *     exclusive sweep marker channel stays off rather than matching an
+ *     inherited outer instance;
+ *   - `TAMANDUA_WORKER_PID` is explicitly `undefined`, which drops any
+ *     inherited outer worker pid; the launch wrapper then re-exports its own
+ *     fresh `$$`.
+ *
  * The four identity variables are set AFTER the TAMANDUA_* vars so they
  * override any GIT_AUTHOR / GIT_COMMITTER values inherited from the daemon
  * process env (the adapter merges this object over `process.env`). When the
@@ -2765,9 +2786,12 @@ export async function executeDispatchRound(
  * guest. Mounting a gitconfig would reintroduce a second, divergent identity
  * source inside the VM.
  */
-function buildHarnessChildEnv(job: CronJobInfo, binaryPath: string): Record<string, string> {
+export function buildHarnessChildEnv(
+  job: CronJobInfo,
+  binaryPath: string,
+): Record<string, string | undefined> {
   const harnessType = job.harnessType ?? "pi";
-  const harnessEnv: Record<string, string> = {
+  const harnessEnv: Record<string, string | undefined> = {
     TAMANDUA_WORKER_JOB_ID: job.id,
     TAMANDUA_DAEMON_PID: String(process.pid),
     // Run identity for the worker subprocess: nested CLI invocations
@@ -2776,7 +2800,21 @@ function buildHarnessChildEnv(job: CronJobInfo, binaryPath: string): Record<stri
     // and 5). Mirrors the env-inheritance mechanism step claim/complete
     // already rely on.
     TAMANDUA_RUN_ID: job.runId,
+    // SWEEP-SCOPE US-002: drop any TAMANDUA_WORKER_PID inherited from an
+    // enclosing harness round. `undefined` overrides the key in the
+    // adapter's `{...process.env, ...env}` merge and Node's spawn omits
+    // undefined env values, so a spawned child never carries the outer
+    // round's worker pid; the launch wrapper re-exports its own fresh $$.
+    TAMANDUA_WORKER_PID: undefined,
   };
+  // SWEEP-SCOPE US-002: stamp THIS daemon instance's exclusive sweep
+  // ownership token so the post-grace sweep can prove a leaked process was
+  // spawned by this daemon for this run. Omitted (never fabricated) when the
+  // token is unavailable — the sweep marker channel is then disabled.
+  const daemonInstance = getDaemonInstanceToken();
+  if (daemonInstance !== null) {
+    harnessEnv[SWEEP_DAEMON_INSTANCE_ENV] = daemonInstance;
+  }
   // GIDN US-003: the run's resolved commit identity, so no agent commit can
   // fall back to an improvised identity or the daemon's ambient git config.
   if (job.gitIdentity) {
@@ -3394,12 +3432,25 @@ export async function runPostGraceSweep(
       );
     }
 
+    // SWEEP-SCOPE US-004: hand the sweep THIS daemon instance's exclusive
+    // ownership token. The marker channel is disabled when the token is
+    // unavailable (no state dir / unreadable start identity); the recorded
+    // pgid channel is then the only proof. Never fabricate a token.
+    const daemonInstance = getDaemonInstanceToken();
+    if (daemonInstance === null) {
+      logger.debug(
+        "Post-grace sweep: daemon-instance token unavailable; marker channel disabled, pgid channel only",
+        { runId },
+      );
+    }
+
     const { sweepRunProcesses } = await import("./run-cleanup.js");
     const result = sweepRunProcesses(runId, dir, {
       daemonPid: process.pid,
       // After grace, the leak guard already killed harness groups;
       // survivors ARE leaks — no exclusions.
       pgids: [...ownedPgids],
+      daemonInstance,
     });
 
     if (result.killedPids.length > 0) {

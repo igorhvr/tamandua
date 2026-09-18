@@ -974,19 +974,53 @@ wall-clock jump cannot release or extend it.
   resolves, it logs a debug line and still runs the marker/pgid sweep with a
   null path. `runPostGraceSweep` is exported so the sweep is unit-testable
   without waiting out the grace window.
-- **Ownership evidence channels (DSWP):** `matchRunEvidence` matches on
-  (a) cwd under the recorded path, (b) environ containing the path, (c)
-  `TAMANDUA_WORKER_JOB_ID` containing the runId, (d) an exact
-  `TAMANDUA_RUN_ID=<runId>` environ token (the marker the scheduler injects
-  into every harness round), (e) the run's process-group ids listed in
-  `options.pgids` (evidence `pgid owned by run: <pgid>`), and (f) cmdline
-  naming the path or the runId. The recorded path is OPTIONAL
-  (`worktreePath: string | null`): `null` skips channels (a), (b) and the
-  path half of (f), so a direct-mode run with no worktree is still covered
-  by the marker, cmdline and pgid channels. Every reaped pid is logged with
-  the evidence string that matched, and processes are killed only by pid
-  after a match — never by name or glob. The `run.process_cleanup` event
-  detail carries `worktreePath` (nullable) and `pgids`.
+- **Ownership evidence channels (SWEEP-SCOPE, bead tamandua-6sy.77):** the
+  sweep is EXCLUSIVE. `sweepRunProcesses` kills a pid only on proof that the
+  SWEEPING daemon instance spawned it for THIS run:
+  (a) the run's recorded process-group ids listed in `options.pgids`
+      (captured at spawn time by this daemon; evidence
+      `pgid owned by run: <pgid>`), or
+  (b) an environ marker this daemon itself injected: an exact
+      `TAMANDUA_RUN_ID=<runId>` AND an exact
+      `TAMANDUA_DAEMON_INSTANCE=<daemonInstance>` token (evidence
+      `daemon-scoped run marker: run=<runId>`).
+  `matchRunEvidence` is the ONLY kill matcher. `matchDiagnosticRunEvidence`
+  is the doctor-only, REPORT-ONLY matcher (`processBelongsToRun`) and NEVER
+  gates a kill. The `TAMANDUA_DAEMON_INSTANCE` token is derived from the
+  daemon's effective state dir plus its kernel process-start identity
+  (`computeDaemonInstanceToken` in `src/installer/sweep-ownership.ts`), so a
+  marker with the right run id but an inherited OUTER instance token never
+  matches; a null/omitted `options.daemonInstance` disables the marker
+  channel entirely, leaving only pgids as proof.
+  cwd under the recorded path, environ path mentions,
+  `TAMANDUA_WORKER_JOB_ID`, and cmdline naming the run id/path are NEVER
+  sufficient kill evidence and never create a match — they are inherited or
+  incidental. Treating "cwd under the working directory" as sufficient once
+  SIGKILLed 14 processes belonging to an ENCLOSING run: a nested test daemon
+  inherited the outer round's `TAMANDUA_RUN_ID` and used the enclosing
+  checkout as its own run's working directory, so its sweep matched the dsh
+  harness round running the test suite, the test runner's ancestors, and
+  rounds of a sibling run. cwd may only NARROW a marker match: when the bulk
+  snapshot could not read environ (macOS `lsof`-only snapshot, `environ`
+  field null) a pid whose cwd is under `worktreePath` triggers ONE lazy
+  per-pid `KERN_PROCARGS2` environ read, and only the exact daemon-scoped
+  marker then kills. The recorded path is OPTIONAL
+  (`worktreePath: string | null`): `null` skips the path-narrowing, so a
+  direct-mode run with no worktree is still covered by the pgid and marker
+  channels. Every reaped pid is logged with the evidence string that matched,
+  and processes are killed only by pid after a match — never by name or glob.
+  The `run.process_cleanup` event detail carries `worktreePath` (nullable),
+  `pgids`, and the sweeping `daemonInstance`.
+- **Marker hygiene (SWEEP-SCOPE US-002):** `buildHarnessChildEnv` in
+  `src/installer/agent-scheduler.ts` FRESHLY writes `TAMANDUA_RUN_ID` and
+  `TAMANDUA_WORKER_JOB_ID` for every round, stamps
+  `TAMANDUA_DAEMON_INSTANCE` from `getDaemonInstanceToken()` (omitted, never
+  fabricated, when the token is unavailable), and sets `TAMANDUA_WORKER_PID:
+  undefined` so an inherited outer worker pid is dropped. A test daemon
+  started from inside a harness round therefore never reads an outer run's
+  marker as its own; `cleanChildEnv` in `tests/helpers/test-env.ts`
+  allowlists the child env and drops `TAMANDUA_RUN_ID` /
+  `TAMANDUA_WORKER_JOB_ID` / `TAMANDUA_DAEMON_INSTANCE` for test daemons too.
 - **Deduplication:** At most one pending timer per run (module-level
   `Map<runId, Timeout>` in agent-scheduler.ts). Duplicate `removeRunCrons`
   calls (e.g., control-plane terminate + natural completion race) do not
@@ -1011,6 +1045,16 @@ wall-clock jump cannot release or extend it.
   evidence; an unrelated child (own pgid, no run marker, cwd outside the
   run directory) survives and is never listed; and every killed pid carries
   an evidence string.
+- **Cross-run canary regression (SWEEP-SCOPE US-005):** the same e2e file
+  starts a cross-run canary — its OWN process group, cwd UNDER the run's
+  working directory, an inherited `TAMANDUA_RUN_ID` naming an UNRELATED run,
+  and NO daemon-instance token — the exact shape of the tamandua-6sy.77
+  cross-run kill — and asserts it is alive before AND after the sweep and is
+  never in `killedPids`, while the run-owned leaked child (its recorded pgid
+  and/or daemon-scoped marker) is still reaped. The cleanup detail must carry
+  a non-empty `daemonInstance`, and the leaked-child evidence must be one of
+  the two exclusive channels (`pgid owned by run` / `daemon-scoped run
+  marker`).
 
 **Accepted-miss risks:**
 

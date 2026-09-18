@@ -66,6 +66,7 @@ src/installer/step-ops-pure.test.ts
 src/installer/step-ops-stories.test.ts
 src/installer/step-ops-verifier-verdict.test.ts
 src/installer/step-ops-verify-each-eligibility.test.ts
+src/installer/sweep-ownership.test.ts
 src/installer/worktree-manager.test.ts
 src/lib/lsof-probe.test.ts
 src/lib/proc-info.test.ts
@@ -127,6 +128,7 @@ tests/cli-workflow-status-json.test.ts
 tests/cli-worktree.test.ts
 tests/cli/install-partial-failure.test.ts
 tests/control-plane-cli.test.ts
+tests/daemon-survivor-guard.test.ts
 tests/dashboard-crash-isolation.test.ts
 tests/dashboard-kanban.test.ts
 tests/dashboard-mcp-pause-resume-integration.test.ts

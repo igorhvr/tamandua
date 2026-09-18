@@ -38,7 +38,9 @@ import {
   isPreclaimDeathBackoffActive,
   _operatorPausedRoundIds,
   _scheduledJobGitIdentity,
+  buildHarnessChildEnv,
 } from "../../dist/installer/agent-scheduler.js";
+import { getDaemonInstanceToken } from "../../dist/installer/sweep-ownership.js";
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 import { emitRunTerminalEvent } from "../../dist/installer/step-ops.js";
@@ -859,13 +861,30 @@ describe("runPostGraceSweep direct-mode runs", () => {
       stdio: "ignore",
       detached: true,
     });
-    children.push(owned, unrelated);
+    // Cross-run canary (SWEEP-SCOPE US-004): cwd UNDER the sweep directory
+    // (the old broad rule's strongest evidence) but carrying ANOTHER run's
+    // TAMANDUA_RUN_ID and no daemon-instance token, in its own pgid. The
+    // exclusive evidence model must leave it untouched.
+    const canaryCwd = path.join(sweepDir, "canary");
+    fs.mkdirSync(canaryCwd, { recursive: true });
+    const canary = spawn("sleep", ["30"], {
+      cwd: canaryCwd,
+      env: {
+        PATH: process.env.PATH || "/usr/bin",
+        TAMANDUA_RUN_ID: "run-other-canary",
+      },
+      stdio: "ignore",
+      detached: true,
+    });
+    children.push(owned, unrelated, canary);
 
     await sleep(300);
     const ownedPid = owned.pid!;
     const unrelatedPid = unrelated.pid!;
+    const canaryPid = canary.pid!;
     assert.ok(isAlive(ownedPid), "owned child should be alive before the sweep");
     assert.ok(isAlive(unrelatedPid), "unrelated child should be alive before the sweep");
+    assert.ok(isAlive(canaryPid), "cross-run canary should be alive before the sweep");
 
     // Direct-mode run: no run_worktrees row. The captured target names the
     // working directory (for the event detail) and the owned pgid.
@@ -888,11 +907,23 @@ describe("runPostGraceSweep direct-mode runs", () => {
       !detail.killedPids.includes(unrelatedPid),
       "unrelated pid must not be recorded as killed",
     );
+    assert.ok(
+      !detail.killedPids.includes(canaryPid),
+      "cross-run canary must not be recorded as killed",
+    );
+    assert.ok(
+      detail.daemonInstance === getDaemonInstanceToken(),
+      "event detail must carry this daemon's instance token",
+    );
 
     const ownedExited = await waitForExit(owned, 2000);
     assert.ok(ownedExited, "owned child should have exited after SIGKILL");
     assert.ok(!isAlive(ownedPid), "owned child should be gone");
     assert.ok(isAlive(unrelatedPid), "unrelated child must survive the sweep");
+    assert.ok(
+      isAlive(canaryPid),
+      "cross-run canary (cwd under the sweep dir) must survive the sweep",
+    );
   });
 
   it("resolves directory from run context and pgids from steps.claim_pgid (no worktree row)", async () => {
@@ -941,18 +972,48 @@ describe("runPostGraceSweep direct-mode runs", () => {
     const ownedCwd = path.join(outsideDir, "marker-only");
     fs.mkdirSync(ownedCwd, { recursive: true });
 
+    const daemonInstance = getDaemonInstanceToken();
+    assert.ok(
+      daemonInstance !== null,
+      "the current process must resolve a daemon-instance token in this environment",
+    );
+
+    // A run-owned child identified ONLY by the full daemon-scoped marker
+    // (exact run id plus THIS daemon's instance token): no recorded pgid.
     const owned = spawn("sleep", ["30"], {
       cwd: ownedCwd,
-      env: { PATH: process.env.PATH || "/usr/bin", TAMANDUA_RUN_ID: runId },
+      env: {
+        PATH: process.env.PATH || "/usr/bin",
+        TAMANDUA_RUN_ID: runId,
+        TAMANDUA_DAEMON_INSTANCE: daemonInstance,
+      },
       stdio: "ignore",
       detached: true,
     });
-    children.push(owned);
+    // Cross-run canary: cwd UNDER the sweep directory but carrying ANOTHER
+    // run's TAMANDUA_RUN_ID and no daemon-instance token, in its own pgid.
+    // Under the old "cwd under the working directory" rule this was killed;
+    // the exclusive evidence model must leave it alone.
+    const canaryCwd = path.join(sweepDir, "marker-canary");
+    fs.mkdirSync(canaryCwd, { recursive: true });
+    const canary = spawn("sleep", ["30"], {
+      cwd: canaryCwd,
+      env: {
+        PATH: process.env.PATH || "/usr/bin",
+        TAMANDUA_RUN_ID: "run-other-marker-canary",
+      },
+      stdio: "ignore",
+      detached: true,
+    });
+    children.push(owned, canary);
     await sleep(300);
     const ownedPid = owned.pid!;
+    const canaryPid = canary.pid!;
+    assert.ok(isAlive(canaryPid), "cross-run canary should be alive before the sweep");
 
     // Empty context, no worktree row, no pgids: the sweep must still run
-    // (no "no worktree found" early return) and match the run marker.
+    // (no "no worktree found" early return) and match the daemon-scoped
+    // marker with a null sweep path.
     seedDirectRun(runId, {});
     await runPostGraceSweep(runId);
 
@@ -962,16 +1023,25 @@ describe("runPostGraceSweep direct-mode runs", () => {
     assert.equal(detail.worktreePath, null);
     assert.ok(
       detail.killedPids.includes(ownedPid),
-      `TAMANDUA_RUN_ID child should be reaped with a null path: ${JSON.stringify(detail.killedPids)}`,
+      `daemon-scoped marker child should be reaped with a null path: ${JSON.stringify(detail.killedPids)}`,
+    );
+    assert.equal(
+      detail.evidence[ownedPid],
+      `daemon-scoped run marker: run=${runId}`,
+      "evidence should name the daemon-scoped run marker",
     );
     assert.ok(
-      String(detail.evidence[ownedPid]).includes(`TAMANDUA_RUN_ID=${runId}`),
-      `evidence should name the run marker: ${JSON.stringify(detail.evidence[ownedPid])}`,
+      !detail.killedPids.includes(canaryPid),
+      "cross-run canary must not be recorded as killed",
     );
 
     const ownedExited = await waitForExit(owned, 2000);
     assert.ok(ownedExited, "owned child should have exited after SIGKILL");
     assert.ok(!isAlive(ownedPid), "owned child should be gone");
+    assert.ok(
+      isAlive(canaryPid),
+      "cross-run canary (cwd under the sweep dir) must survive the sweep",
+    );
   });
 
   it("removeRunCrons captures the working directory and in-flight harness pgid", async () => {
@@ -2847,6 +2917,106 @@ process.exit(0);
     // The round completed cleanly: the claimed step was auto-completed.
     const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step`) as { status: string };
     assert.equal(step.status, "done", "a clean STATUS: done round must auto-complete the claimed step");
+  });
+});
+
+// ── SWEEP-SCOPE US-002: harness-round marker hygiene ────────────────
+// buildHarnessChildEnv stamps every harness round with THIS daemon
+// instance's exclusive sweep token and drops the worker pid inherited from
+// an enclosing round, so a daemon started from inside a round can never
+// inherit the outer round's owner identity.
+describe("buildHarnessChildEnv marker hygiene (SWEEP-SCOPE US-002)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-marker-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_RUN_ID: process.env.TAMANDUA_RUN_ID,
+      TAMANDUA_WORKER_JOB_ID: process.env.TAMANDUA_WORKER_JOB_ID,
+      TAMANDUA_DAEMON_INSTANCE: process.env.TAMANDUA_DAEMON_INSTANCE,
+      TAMANDUA_WORKER_PID: process.env.TAMANDUA_WORKER_PID,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it("stamps the current daemon token and drops inherited outer worker markers", () => {
+    // Inherited outer-round markers living in the daemon's own env.
+    process.env.TAMANDUA_RUN_ID = "outer-run";
+    process.env.TAMANDUA_WORKER_JOB_ID = "outer-job";
+    process.env.TAMANDUA_DAEMON_INSTANCE = "outer-daemon-instance";
+    process.env.TAMANDUA_WORKER_PID = "999999";
+
+    const job: CronJobInfo = {
+      id: "tamandua-test-wf-inner-run-test-agent",
+      workflowId: "test-wf",
+      runId: "inner-run",
+      agentId: "test-wf_test-agent",
+      harnessType: "pi",
+      createdAt: "",
+    };
+    const env = buildHarnessChildEnv(job, "/usr/local/bin/pi");
+
+    const expectedToken = getDaemonInstanceToken();
+    assert.ok(
+      expectedToken !== null,
+      "the current process must resolve a daemon-instance token in this environment",
+    );
+    assert.equal(
+      env.TAMANDUA_DAEMON_INSTANCE,
+      expectedToken,
+      "the round must carry THIS daemon instance's token, not the inherited one",
+    );
+    assert.notEqual(
+      env.TAMANDUA_DAEMON_INSTANCE,
+      "outer-daemon-instance",
+      "an inherited outer daemon-instance token must never be reused",
+    );
+    assert.equal(
+      env.TAMANDUA_RUN_ID,
+      "inner-run",
+      "the fresh run id must override the inherited outer run id",
+    );
+    assert.equal(
+      env.TAMANDUA_WORKER_JOB_ID,
+      job.id,
+      "the fresh worker job id must override the inherited outer job id",
+    );
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(env, "TAMANDUA_WORKER_PID"),
+      "buildHarnessChildEnv must define TAMANDUA_WORKER_PID explicitly",
+    );
+    assert.equal(
+      env.TAMANDUA_WORKER_PID,
+      undefined,
+      "an inherited outer worker pid must be dropped, not forwarded",
+    );
+
+    // The adapter merges the returned env OVER process.env; the undefined
+    // entry must shadow the inherited outer worker pid so a spawned child
+    // omits the key entirely. (Object.assign mirrors the adapter's merge
+    // without a literal process.env spread, which the isolation guard bans.)
+    const merged = Object.assign({}, process.env, env) as Record<string, string | undefined>;
+    assert.equal(
+      merged.TAMANDUA_WORKER_PID,
+      undefined,
+      "the inherited worker pid must not survive the process.env merge",
+    );
+    assert.equal(merged.TAMANDUA_RUN_ID, "inner-run");
+    assert.equal(merged.TAMANDUA_DAEMON_INSTANCE, expectedToken);
   });
 });
 

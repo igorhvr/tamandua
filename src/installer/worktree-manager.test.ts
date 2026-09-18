@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
@@ -17,6 +17,7 @@ import {
   listRunWorktrees,
   type ManagedRunWorktree,
 } from "../../dist/installer/worktree-manager.js";
+import { getDaemonInstanceToken } from "../../dist/installer/sweep-ownership.js";
 
 // ── Helpers ──
 
@@ -48,6 +49,36 @@ function getHeadSha(dir: string): string {
 
 function getGitCommonDir(dir: string): string {
   return runGit(["rev-parse", "--git-common-dir"], dir).stdout;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waitForExit(
+  child: ReturnType<typeof spawn>,
+  timeoutMs = 4000,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    child.on("exit", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
 }
 
 // ── Test suite ──
@@ -787,6 +818,58 @@ describe("worktree-manager", () => {
         assert.notEqual(stat.status, 0, "worktree directory should be gone");
       } catch {
         // ok
+      }
+    });
+
+    it("pre-removal sweep reaps a daemon-scoped marked leak (threads the daemon token)", async () => {
+      const runId = "run-remove-marked-leak";
+      const wt = createRunWorktree({
+        runId,
+        runNumber: 36,
+        workflowId: "test-workflow",
+        worktreeOriginRepository: originRepo,
+      });
+
+      const token = getDaemonInstanceToken();
+      assert.ok(
+        token !== null,
+        "the current process must resolve a daemon-instance token in this environment",
+      );
+
+      // A leaked child carrying ONLY the daemon-scoped marker (no recorded
+      // pgid), in its own process group, with cwd inside the worktree. It can
+      // only be reaped if removeRunWorktree threads its daemon token into the
+      // exclusive sweep — without it the marker channel is disabled.
+      const leakCwd = path.join(wt.worktreePath, "leak-dir");
+      mkdirSync(leakCwd, { recursive: true });
+      const leaked = spawn("sleep", ["30"], {
+        cwd: leakCwd,
+        env: {
+          PATH: process.env.PATH || "/usr/bin",
+          TAMANDUA_RUN_ID: runId,
+          TAMANDUA_DAEMON_INSTANCE: token,
+        },
+        stdio: "ignore",
+        detached: true,
+      });
+      const leakedPid = leaked.pid!;
+      try {
+        await sleep(300);
+        assert.ok(isAlive(leakedPid), "leaked child should be alive before removal");
+
+        removeRunWorktree({ runId, force: true });
+
+        const exited = await waitForExit(leaked);
+        assert.ok(
+          exited && !isAlive(leakedPid),
+          "daemon-scoped leak should be reaped by the pre-removal sweep",
+        );
+      } finally {
+        try {
+          if (isAlive(leakedPid)) process.kill(leakedPid, "SIGKILL");
+        } catch {
+          // already dead
+        }
       }
     });
   });

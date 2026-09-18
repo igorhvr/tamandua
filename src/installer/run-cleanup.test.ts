@@ -8,10 +8,12 @@ import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import {
   collectProcessSnapshot,
+  matchDiagnosticRunEvidence,
   matchRunEvidence,
   parseLsofCwdRecords,
   sweepRunProcesses,
 } from "../../dist/installer/run-cleanup.js";
+import { resolveDaemonInstanceToken } from "../../dist/installer/sweep-ownership.js";
 import type { RunCleanupResult } from "../../dist/installer/run-cleanup.js";
 import { readEventsFromCursor, emitEvent, type TamanduaEvent } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
@@ -64,6 +66,17 @@ function withLsofEnv<T>(shim: string, timeoutMs: string | undefined, fn: () => T
     restoreEnv("TAMANDUA_LSOF_BIN", prevBin);
     restoreEnv("TAMANDUA_LSOF_TIMEOUT_MS", prevTimeout);
   }
+}
+
+/**
+ * THIS test process's daemon-instance token. Resolved fresh on every call
+ * (beforeEach re-isolates TAMANDUA_STATE_DIR) so a child's injected token and
+ * the sweep's expectation always agree.
+ */
+function daemonInstanceToken(): string {
+  const token = resolveDaemonInstanceToken();
+  assert.ok(token, "the test process must resolve a daemon-instance token");
+  return token;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -211,15 +224,18 @@ describe("run-cleanup", () => {
   // ── Daemon PID exclusion ─────────────────────────────────────────
 
   it("never kills the daemonPid when provided", () => {
-    // Spawn a marker process inside the fake worktree with matching env
-    // then pass that pid as daemonPid — it should survive.
+    // Spawn a marker process that WOULD match the exclusive kill gate, then
+    // pass that pid as daemonPid — it must survive on the daemon exclusion
+    // alone.
     const markerCwd = path.join(fakeWorktreePath, "daemon-dir");
     fs.mkdirSync(markerCwd, { recursive: true });
+    const token = daemonInstanceToken();
 
     const child = spawn("sleep", ["30"], {
       cwd: markerCwd,
       env: {
-        TAMANDUA_WORKER_JOB_ID: "tamandua-test-workflow-test-run-001_developer",
+        TAMANDUA_RUN_ID: "test-run-001",
+        TAMANDUA_DAEMON_INSTANCE: token,
         PATH: process.env.PATH || "/usr/bin",
       },
       stdio: "ignore",
@@ -233,6 +249,7 @@ describe("run-cleanup", () => {
 
       const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
         daemonPid,
+        daemonInstance: token,
       });
 
       // The daemonPid should NOT be in killedPids
@@ -248,9 +265,9 @@ describe("run-cleanup", () => {
     });
   });
 
-  // ── Kill processes with cwd under worktree ───────────────────────
+  // ── cwd under worktree alone is NOT evidence (SWEEP-SCOPE) ───────
 
-  it("kills processes whose cwd is under the worktree path", () => {
+  it("spares a process whose cwd is under the worktree path (cwd is not evidence)", () => {
     const markerCwd = path.join(fakeWorktreePath, "subdir");
     fs.mkdirSync(markerCwd, { recursive: true });
 
@@ -266,31 +283,28 @@ describe("run-cleanup", () => {
       const pid = child.pid!;
       assert.ok(isAlive(pid), "child should be alive before sweep");
 
-      const result = sweepRunProcesses("test-run-001", fakeWorktreePath);
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+        daemonInstance: daemonInstanceToken(),
+      });
       assert.ok(
-        result.killedPids.includes(pid),
-        `pid ${pid} with cwd under worktree should be killed: killedPids=${JSON.stringify(result.killedPids)}`,
+        !result.killedPids.includes(pid),
+        `pid ${pid} with ONLY cwd under worktree must survive: killedPids=${JSON.stringify(result.killedPids)}`,
       );
-      assert.ok(
-        result.evidence[pid]?.includes("cwd under worktree"),
-        `evidence should indicate cwd match: ${JSON.stringify(result.evidence[pid])}`,
-      );
-
-      const exited = await waitForExit(child, 2000);
-      assert.ok(exited, "child should have exited after SIGKILL");
+      assert.equal(result.evidence[pid], undefined, "no evidence may be manufactured from cwd");
+      assert.ok(isAlive(pid), "cwd-only process must still be alive after sweep");
     });
   });
 
-  // ── Kill processes with TAMANDUA_WORKER_JOB_ID containing runId ──
+  // ── Environ markers that are NOT exclusive evidence (survival) ───
 
-  // Environ-based evidence is procfs-only: the macOS kernel does not let
-  // unprivileged callers read another process's environment, so the env
-  // channels can never fire there (cwd + cmdline evidence carry the sweep).
+  // Environ-based evidence is procfs-only in the BULK snapshot: the macOS
+  // kernel does not let unprivileged callers read another process's
+  // environment there, so the env channels can never fire on that path.
   const environUnreadable =
     process.platform === "darwin" ? "environ evidence is unreadable on macOS" : false;
 
-  it("kills processes with TAMANDUA_WORKER_JOB_ID containing runId", { skip: environUnreadable }, () => {
-    // Use a CWD that is NOT under the worktree to isolate the env check
+  it("spares a process with only TAMANDUA_WORKER_JOB_ID containing runId", () => {
+    // Use a CWD that is NOT under the worktree to isolate the env check.
     const unrelatedCwd = path.join(stateDir, "unrelated");
     fs.mkdirSync(unrelatedCwd, { recursive: true });
 
@@ -304,28 +318,23 @@ describe("run-cleanup", () => {
     });
     children.push(child);
 
-    return sleep(200).then(async () => {
+    return sleep(200).then(() => {
       const pid = child.pid!;
       assert.ok(isAlive(pid), "child should be alive before sweep");
 
-      const result = sweepRunProcesses("test-run-001", fakeWorktreePath);
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+        daemonInstance: daemonInstanceToken(),
+      });
       assert.ok(
-        result.killedPids.includes(pid),
-        `pid ${pid} with TAMANDUA_WORKER_JOB_ID should be killed: killedPids=${JSON.stringify(result.killedPids)}`,
+        !result.killedPids.includes(pid),
+        `pid ${pid} with ONLY TAMANDUA_WORKER_JOB_ID must survive: killedPids=${JSON.stringify(result.killedPids)}`,
       );
-      assert.ok(
-        result.evidence[pid]?.includes("TAMANDUA_WORKER_JOB_ID"),
-        `evidence should indicate TAMANDUA_WORKER_JOB_ID match: ${JSON.stringify(result.evidence[pid])}`,
-      );
-
-      const exited = await waitForExit(child, 2000);
-      assert.ok(exited, "child should have exited after SIGKILL");
+      assert.equal(result.evidence[pid], undefined, "worker job id is not kill evidence");
+      assert.ok(isAlive(pid), "worker-job-id-only process must still be alive after sweep");
     });
   });
 
-  // ── Kill processes with exact TAMANDUA_RUN_ID=<runId> (DSWP) ─────
-
-  it("kills processes whose environ has an exact TAMANDUA_RUN_ID token", { skip: environUnreadable }, () => {
+  it("spares a process with only an exact TAMANDUA_RUN_ID token (no daemon token)", () => {
     const unrelatedCwd = path.join(stateDir, "unrelated-run-marker");
     fs.mkdirSync(unrelatedCwd, { recursive: true });
 
@@ -339,19 +348,59 @@ describe("run-cleanup", () => {
     });
     children.push(child);
 
+    return sleep(200).then(() => {
+      const pid = child.pid!;
+      assert.ok(isAlive(pid), "child should be alive before sweep");
+
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+        daemonInstance: daemonInstanceToken(),
+      });
+      assert.ok(
+        !result.killedPids.includes(pid),
+        `pid ${pid} with the run id but no daemon token must survive: killedPids=${JSON.stringify(result.killedPids)}`,
+      );
+      assert.equal(result.evidence[pid], undefined, "the run marker alone is not kill evidence");
+      assert.ok(isAlive(pid), "run-marker-only process must still be alive after sweep");
+    });
+  });
+
+  // ── Exclusive daemon-scoped marker IS kill evidence ──────────────
+
+  it("kills a process carrying the exact daemon-scoped run marker", { skip: environUnreadable }, () => {
+    const unrelatedCwd = path.join(stateDir, "unrelated-daemon-marker");
+    fs.mkdirSync(unrelatedCwd, { recursive: true });
+    const token = daemonInstanceToken();
+
+    const child = spawn("sleep", ["30"], {
+      cwd: unrelatedCwd,
+      env: {
+        TAMANDUA_RUN_ID: "test-run-001",
+        TAMANDUA_DAEMON_INSTANCE: token,
+        PATH: process.env.PATH || "/usr/bin",
+      },
+      stdio: "ignore",
+    });
+    children.push(child);
+
     return sleep(200).then(async () => {
       const pid = child.pid!;
       assert.ok(isAlive(pid), "child should be alive before sweep");
 
-      const result = sweepRunProcesses("test-run-001", fakeWorktreePath);
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+        daemonInstance: token,
+      });
       assert.ok(
         result.killedPids.includes(pid),
-        `pid ${pid} with TAMANDUA_RUN_ID should be killed: killedPids=${JSON.stringify(result.killedPids)}`,
+        `pid ${pid} with the exact daemon-scoped marker should be killed: killedPids=${JSON.stringify(result.killedPids)}`,
       );
       assert.equal(
         result.evidence[pid],
-        "TAMANDUA_RUN_ID=test-run-001",
-        `evidence should name the exact run marker: ${JSON.stringify(result.evidence[pid])}`,
+        "daemon-scoped run marker: run=test-run-001",
+        `evidence should name the daemon-scoped marker: ${JSON.stringify(result.evidence[pid])}`,
+      );
+      assert.ok(
+        (result.evidence[pid] ?? "").length > 0,
+        "a kill must always carry a non-empty evidence string",
       );
 
       const exited = await waitForExit(child, 2000);
@@ -359,37 +408,126 @@ describe("run-cleanup", () => {
     });
   });
 
-  // ── matchRunEvidence with a null worktreePath (direct-mode) ───────
+  // ── Cross-run canary: path + another run's marker survives ───────
 
-  it("matchRunEvidence with null worktreePath skips path channels but keeps the run marker", { skip: environUnreadable }, () => {
+  it("spares cross-run canaries under the worktree with another run's marker", () => {
+    const token = daemonInstanceToken();
+
+    // (1) cwd under the worktree + ANOTHER run's TAMANDUA_RUN_ID, no daemon
+    //     token — the exact shape of the tamandua-6sy.77 cross-run kill.
+    const canaryOtherRun = spawn("sleep", ["30"], {
+      cwd: fakeWorktreePath,
+      env: {
+        TAMANDUA_RUN_ID: "some-other-run",
+        PATH: process.env.PATH || "/usr/bin",
+      },
+      stdio: "ignore",
+    });
+
+    // (2) cwd under the worktree + the CORRECT run id but an inherited OUTER
+    //     daemon-instance token.
+    const canaryOuterDaemon = spawn("sleep", ["30"], {
+      cwd: fakeWorktreePath,
+      env: {
+        TAMANDUA_RUN_ID: "test-run-001",
+        TAMANDUA_DAEMON_INSTANCE: "inherited-outer-daemon-instance",
+        PATH: process.env.PATH || "/usr/bin",
+      },
+      stdio: "ignore",
+    });
+    children.push(canaryOtherRun, canaryOuterDaemon);
+
+    return sleep(300).then(() => {
+      const otherRunPid = canaryOtherRun.pid!;
+      const outerDaemonPid = canaryOuterDaemon.pid!;
+      assert.ok(isAlive(otherRunPid), "other-run canary should be alive before sweep");
+      assert.ok(isAlive(outerDaemonPid), "outer-daemon canary should be alive before sweep");
+
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+        daemonInstance: token,
+      });
+
+      assert.ok(
+        !result.killedPids.includes(otherRunPid),
+        `other-run canary ${otherRunPid} must survive: killedPids=${JSON.stringify(result.killedPids)}`,
+      );
+      assert.ok(
+        !result.killedPids.includes(outerDaemonPid),
+        `outer-daemon canary ${outerDaemonPid} must survive: killedPids=${JSON.stringify(result.killedPids)}`,
+      );
+      assert.ok(isAlive(otherRunPid), "other-run canary must still be alive after sweep");
+      assert.ok(isAlive(outerDaemonPid), "outer-daemon canary must still be alive after sweep");
+    });
+  });
+
+  // ── matchRunEvidence (exclusive kill gate) ───────────────────────
+
+  it("matchRunEvidence requires the exact run id AND daemon token", () => {
+    const token = daemonInstanceToken();
     const entry = {
+      cwd: "/outside/the/run",
+      environ: `PATH=/usr/bin\0TAMANDUA_RUN_ID=test-run-001\0TAMANDUA_DAEMON_INSTANCE=${token}\0`,
+      cmdline: "sleep 30",
+    };
+    assert.equal(
+      matchRunEvidence(entry, "test-run-001", token),
+      "daemon-scoped run marker: run=test-run-001",
+    );
+    // A different run id does not match.
+    assert.equal(matchRunEvidence(entry, "other-run", token), null);
+    // A different (inherited outer) daemon token does not match.
+    assert.equal(matchRunEvidence(entry, "test-run-001", "outer-token"), null);
+    // No expected daemon token disables the channel entirely.
+    assert.equal(matchRunEvidence(entry, "test-run-001", null), null);
+    assert.equal(matchRunEvidence(entry, "test-run-001", ""), null);
+  });
+
+  it("matchRunEvidence ignores cwd, path and cmdline channels", () => {
+    const token = daemonInstanceToken();
+    // cwd under the worktree + cmdline naming the run — but no daemon token.
+    const entry = {
+      cwd: fakeWorktreePath,
+      environ: "PATH=/usr/bin\0TAMANDUA_RUN_ID=test-run-001\0",
+      cmdline: "node harness.js --run-id test-run-001",
+    };
+    assert.equal(matchRunEvidence(entry, "test-run-001", token), null);
+  });
+
+  // ── matchDiagnosticRunEvidence (report-only, broad channels) ─────
+
+  it("matchDiagnosticRunEvidence keeps the broad report-only channels", () => {
+    const runMarkerEntry = {
       cwd: "/outside/the/run",
       environ: "PATH=/usr/bin\0TAMANDUA_RUN_ID=test-run-001\0",
       cmdline: "sleep 30",
     };
-    assert.equal(matchRunEvidence(entry, "test-run-001", null), "TAMANDUA_RUN_ID=test-run-001");
-    // A different run id does not match.
-    assert.equal(matchRunEvidence(entry, "other-run", null), null);
-  });
+    assert.equal(
+      matchDiagnosticRunEvidence(runMarkerEntry, "test-run-001", null),
+      "TAMANDUA_RUN_ID=test-run-001",
+    );
+    assert.equal(matchDiagnosticRunEvidence(runMarkerEntry, "other-run", null), null);
 
-  it("matchRunEvidence with null worktreePath still matches the cmdline run id", () => {
-    const entry = {
+    const cmdlineEntry = {
       cwd: "/outside/the/run",
       environ: null,
       cmdline: "node harness.js --run-id test-run-001",
     };
-    assert.equal(matchRunEvidence(entry, "test-run-001", null), "cmdline contains runId: test-run-001");
-  });
+    assert.equal(
+      matchDiagnosticRunEvidence(cmdlineEntry, "test-run-001", null),
+      "cmdline contains runId: test-run-001",
+    );
 
-  it("matchRunEvidence with null worktreePath ignores a cwd that would match the old path", () => {
-    // Even a process sitting under the caller's former worktree path is not
-    // matched by the (skipped) path channel when worktreePath is null.
-    const entry = {
+    const cwdEntry = {
       cwd: fakeWorktreePath,
       environ: null,
       cmdline: "sleep 30",
     };
-    assert.equal(matchRunEvidence(entry, "test-run-001", null), null);
+    assert.ok(
+      (matchDiagnosticRunEvidence(cwdEntry, "test-run-001", fakeWorktreePath) ?? "").startsWith(
+        "cwd under worktree",
+      ),
+      "the diagnostic matcher still reports the cwd channel",
+    );
   });
 
   // ── Pgid ownership (DSWP): owned group reaped, unrelated spared ──
@@ -457,9 +595,9 @@ describe("run-cleanup", () => {
     });
   });
 
-  // ── Kill processes with environ containing worktreePath ──────────
+  // ── Environ worktree-path mentions are NOT evidence ──────────────
 
-  it("kills processes whose environ contains the worktree path string", { skip: environUnreadable }, () => {
+  it("spares a process whose environ merely contains the worktree path string", () => {
     const unrelatedCwd = path.join(stateDir, "unrelated-env");
     fs.mkdirSync(unrelatedCwd, { recursive: true });
 
@@ -473,33 +611,31 @@ describe("run-cleanup", () => {
     });
     children.push(child);
 
-    return sleep(200).then(async () => {
+    return sleep(200).then(() => {
       const pid = child.pid!;
       assert.ok(isAlive(pid), "child should be alive before sweep");
 
-      const result = sweepRunProcesses("test-run-001", fakeWorktreePath);
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+        daemonInstance: daemonInstanceToken(),
+      });
       assert.ok(
-        result.killedPids.includes(pid),
-        `pid ${pid} with environ containing worktree path should be killed: killedPids=${JSON.stringify(result.killedPids)}`,
+        !result.killedPids.includes(pid),
+        `pid ${pid} with only a worktree-path env mention must survive: killedPids=${JSON.stringify(result.killedPids)}`,
       );
-      assert.ok(
-        result.evidence[pid]?.includes("environ contains worktree path"),
-        `evidence should indicate environ match: ${JSON.stringify(result.evidence[pid])}`,
-      );
-
-      const exited = await waitForExit(child, 2000);
-      assert.ok(exited, "child should have exited after SIGKILL");
+      assert.equal(result.evidence[pid], undefined, "a path mention is not kill evidence");
+      assert.ok(isAlive(pid), "path-mention process must still be alive after sweep");
     });
   });
 
-  // ── Kill processes whose command line names the run ──────────────
+  // ── cmdline run-id mentions are NOT evidence ─────────────────────
 
-  it("kills processes whose command line contains the run id", () => {
+  it("spares a process whose command line contains the run id", () => {
     const unrelatedCwd = path.join(stateDir, "unrelated-cmdline");
     fs.mkdirSync(unrelatedCwd, { recursive: true });
 
     // The runId appears only in argv (harness children carry run/agent ids
-    // in their prompt argv) — the primary evidence channel on macOS.
+    // in their prompt argv) — formerly the primary macOS evidence channel,
+    // now report-only.
     const child = spawn(
       process.execPath,
       ["-e", "setTimeout(() => {}, 30000)", "marker-test-run-001"],
@@ -511,22 +647,19 @@ describe("run-cleanup", () => {
     );
     children.push(child);
 
-    return sleep(200).then(async () => {
+    return sleep(200).then(() => {
       const pid = child.pid!;
       assert.ok(isAlive(pid), "child should be alive before sweep");
 
-      const result = sweepRunProcesses("test-run-001", fakeWorktreePath);
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+        daemonInstance: daemonInstanceToken(),
+      });
       assert.ok(
-        result.killedPids.includes(pid),
-        `pid ${pid} with runId in argv should be killed: killedPids=${JSON.stringify(result.killedPids)}`,
+        !result.killedPids.includes(pid),
+        `pid ${pid} with the run id only in argv must survive: killedPids=${JSON.stringify(result.killedPids)}`,
       );
-      assert.ok(
-        result.evidence[pid]?.includes("cmdline contains runId"),
-        `evidence should indicate cmdline match: ${JSON.stringify(result.evidence[pid])}`,
-      );
-
-      const exited = await waitForExit(child, 2000);
-      assert.ok(exited, "child should have exited after SIGKILL");
+      assert.equal(result.evidence[pid], undefined, "a cmdline mention is not kill evidence");
+      assert.ok(isAlive(pid), "cmdline-only process must still be alive after sweep");
     });
   });
 
@@ -560,8 +693,12 @@ describe("run-cleanup", () => {
   // ── Event emission ───────────────────────────────────────────────
 
   it("emits a run.process_cleanup event after sweep", () => {
-    const result = sweepRunProcesses("test-run-001", fakeWorktreePath);
+    const token = daemonInstanceToken();
+    const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+      daemonInstance: token,
+    });
 
+    assert.equal(result.runId, "test-run-001");
     // Read the run-specific events file
     const runEventsFile = path.join(stateDir, "events", "test-run-001.jsonl");
     assert.ok(fs.existsSync(runEventsFile), "run events file should exist");
@@ -577,6 +714,7 @@ describe("run-cleanup", () => {
 
     const detail = JSON.parse(lastEvent.detail!);
     assert.equal(detail.worktreePath, fakeWorktreePath);
+    assert.equal(detail.daemonInstance, token, "event detail should carry the daemon instance");
     assert.ok(typeof detail.scannedPids === "number");
     assert.ok(Array.isArray(detail.killedPids));
   });
@@ -600,21 +738,24 @@ describe("run-cleanup", () => {
 
   // ── Multiple process sweep ───────────────────────────────────────
 
-  it("kills multiple marked processes in one sweep", () => {
+  it("kills multiple daemon-marked processes in one sweep", () => {
     const markerCwd = path.join(fakeWorktreePath, "multi");
     fs.mkdirSync(markerCwd, { recursive: true });
+    const token = daemonInstanceToken();
 
+    const markerEnv = {
+      TAMANDUA_RUN_ID: "test-run-001",
+      TAMANDUA_DAEMON_INSTANCE: token,
+      PATH: process.env.PATH || "/usr/bin",
+    };
     const child1 = spawn("sleep", ["30"], {
       cwd: markerCwd,
-      env: { PATH: process.env.PATH || "/usr/bin" },
+      env: markerEnv,
       stdio: "ignore",
     });
     const child2 = spawn("sleep", ["30"], {
       cwd: markerCwd,
-      env: {
-        TAMANDUA_WORKER_JOB_ID: "tamandua-test-wf-test-run-001_verifier",
-        PATH: process.env.PATH || "/usr/bin",
-      },
+      env: markerEnv,
       stdio: "ignore",
     });
     children.push(child1, child2);
@@ -623,7 +764,9 @@ describe("run-cleanup", () => {
       assert.ok(isAlive(child1.pid!), "child1 should be alive");
       assert.ok(isAlive(child2.pid!), "child2 should be alive");
 
-      const result = sweepRunProcesses("test-run-001", fakeWorktreePath);
+      const result = sweepRunProcesses("test-run-001", fakeWorktreePath, {
+        daemonInstance: token,
+      });
       assert.equal(
         result.killedPids.length,
         2,
@@ -631,6 +774,14 @@ describe("run-cleanup", () => {
       );
       assert.ok(result.killedPids.includes(child1.pid!));
       assert.ok(result.killedPids.includes(child2.pid!));
+      assert.equal(
+        result.evidence[child1.pid!],
+        "daemon-scoped run marker: run=test-run-001",
+      );
+      assert.equal(
+        result.evidence[child2.pid!],
+        "daemon-scoped run marker: run=test-run-001",
+      );
 
       const bothExited = await Promise.all([
         waitForExit(child1, 2000),

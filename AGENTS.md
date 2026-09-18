@@ -238,18 +238,55 @@ so a waiting run is distinguishable from a dead one.
 `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1` still bypasses the queue and admits
 immediately; the one-live-run-per-workdir rule itself is **not** lifted.
 **Post-grace process sweep (DSWP).** The terminal-run sweep
-(`sweepRunProcesses` / `matchRunEvidence` in `src/installer/run-cleanup.ts`)
-identifies run-owned processes from several evidence channels: cwd under the
-recorded working path, environ containing that path, environ containing
-`TAMANDUA_WORKER_JOB_ID` with the runId, an exact `TAMANDUA_RUN_ID=<runId>`
-environ token (injected by the scheduler into every harness round), the run's
-recorded process-group ids (`options.pgids`, evidence `pgid owned by run:
-<pgid>`), and cmdline naming the path or runId. The recorded path is optional
-(`string | null`): `null` skips the path channels so a direct-mode run without
-a worktree remains sweepable via the run marker and pgids. Processes are only
-killed by pid after evidence matches — never by name or glob — and every reaped
-pid is logged with its evidence string; the `run.process_cleanup` event detail
-carries the (nullable) path and the swept `pgids`.
+(`sweepRunProcesses` in `src/installer/run-cleanup.ts`) kills a surviving
+process only when it has EXCLUSIVE proof the process was spawned by THIS
+daemon instance for THIS run (bead tamandua-6sy.77). There are exactly two
+such channels:
+
+- the run's recorded process-group ids (`options.pgids`, captured by this
+  daemon at spawn time; evidence `pgid owned by run: <pgid>`), and
+- a marker the daemon itself injected into the child environment: an exact
+  `TAMANDUA_RUN_ID=<runId>` token AND an exact
+  `TAMANDUA_DAEMON_INSTANCE=<daemonInstance>` token (evidence
+  `daemon-scoped run marker: run=<runId>`). The opaque token
+  (`computeDaemonInstanceToken` in `src/installer/sweep-ownership.ts`) is the
+  sha256 of the daemon's effective state dir plus its kernel process-start
+  identity (pid + start epoch), so it is stable for one daemon and different
+  for every other instance — including a test daemon started from inside a
+  harness round that inherited the same `TAMANDUA_RUN_ID`.
+
+`matchRunEvidence` is the ONLY kill matcher. `matchDiagnosticRunEvidence`
+keeps the broad cwd / environ-path / `TAMANDUA_WORKER_JOB_ID` / cmdline
+channels for `tamandua doctor` and `processBelongsToRun`, which are
+REPORT-ONLY and never kill. cwd under the recorded working directory (and
+environ path mentions, `TAMANDUA_WORKER_JOB_ID`, cmdline naming the run
+id/path) is NEVER sufficient kill evidence: those channels are inherited or
+incidental, and "cwd under the working directory" once reaped 14 processes
+belonging to an enclosing run — the dsh harness round running the test suite,
+the test runner's ancestors, and rounds of a sibling run. cwd may only NARROW
+a marker match: when the bulk snapshot could not read environ (macOS
+`lsof`-only snapshot), a pid whose cwd is under the recorded path triggers ONE
+lazy per-pid `KERN_PROCARGS2` environ read, and only the exact daemon-scoped
+marker then kills. The recorded path is optional (`string | null`): `null`
+skips the path-narrowing, so a direct-mode run without a worktree is still
+sweepable via the pgid and marker channels. Processes are killed by pid only
+after evidence matches — never by name or glob — and every reaped pid is
+logged with its evidence string; the `run.process_cleanup` event detail
+carries the (nullable) path, the swept `pgids`, and the sweeping
+`daemonInstance`.
+
+Marker hygiene keeps an outer round's markers out of a nested daemon.
+`buildHarnessChildEnv` (`src/installer/agent-scheduler.ts`) FRESHLY writes
+`TAMANDUA_RUN_ID` and `TAMANDUA_WORKER_JOB_ID` for every round, stamps
+`TAMANDUA_DAEMON_INSTANCE` from `getDaemonInstanceToken()` (omitted, never
+fabricated, when unavailable), and sets `TAMANDUA_WORKER_PID: undefined` so an
+inherited outer worker pid is dropped. `cleanChildEnv` in
+`tests/helpers/test-env.ts` allowlists the child environment, so a test daemon
+never inherits an outer run's `TAMANDUA_RUN_ID` / `TAMANDUA_WORKER_JOB_ID` /
+`TAMANDUA_DAEMON_INSTANCE` either. Test daemons are stopped by exact pid in
+teardown: the runtime `tests/helpers/daemon-survivor-guard.ts` and the static
+`tests/test-daemon-teardown-guard.test.ts` both fail a file whose spawned
+daemon outlives its test.
 
 A worktree is NOT required (DSWP part 2). `removeRunCrons` captures the run's
 `workingDirectoryForHarness` and in-flight harness child pgids before wiping

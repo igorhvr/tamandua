@@ -90,7 +90,13 @@ export interface HarnessRoundResult {
 export interface RunHarnessOptions {
   timeout?: number; // seconds, default 10m (600s)
   workdir?: string;
-  env?: Record<string, string>;
+  /**
+   * Env entries merged OVER `process.env` for the harness child. A key whose
+   * value is `undefined` is explicitly DROPPED from the child environment
+   * (Node's spawn omits undefined values); this is how the scheduler strips
+   * an inherited `TAMANDUA_WORKER_PID` (SWEEP-SCOPE US-002).
+   */
+  env?: Record<string, string | undefined>;
   /**
    * Optional callback invoked once the child process is spawned.
    */

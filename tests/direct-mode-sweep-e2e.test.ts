@@ -15,14 +15,23 @@
  *      cannot reap it and only the post-grace sweep can.
  *   3. It also leaves an unrelated control child: its own process group, no
  *      run marker, cwd outside the run directory.
- *   4. The scheduler tears the run down on the next dispatch round and
+ *   4. A separate CROSS-RUN CANARY (SWEEP-SCOPE US-005) is started with its own
+ *      process group, cwd UNDER the run's working directory, an inherited
+ *      TAMANDUA_RUN_ID naming an UNRELATED run, and no daemon-instance token.
+ *      This is the exact cross-run-kill shape from bead tamandua-6sy.77: "cwd
+ *      under the working directory" used to be sufficient evidence. It must
+ *      SURVIVE because the sweeping daemon has no exclusive proof it owns it.
+ *   5. The scheduler tears the run down on the next dispatch round and
  *      schedules the sweep at HARNESS_TEARDOWN_GRACE_MS + 2 s (~12 s).
  *
  * Asserts:
  *   - run.process_cleanup event exists and is run-scoped
- *   - the leaked child (run-owned via its pgid / TAMANDUA_RUN_ID marker) is
+ *   - the leaked child (run-owned via its pgid / daemon-scoped marker) is
  *     dead and appears in `killedPids` with a non-empty evidence string
  *   - the unrelated child survives and is NOT in `killedPids`
+ *   - the cross-run canary (cwd under the run dir, inherited other-run
+ *     TAMANDUA_RUN_ID, own pgid) survives and is NOT in `killedPids`
+ *   - the cleanup detail carries the sweeping daemon's `daemonInstance` token
  *   - every killed pid carries evidence (never killed by name/glob)
  *   - the run has no managed worktree row (genuinely direct-mode)
  *   - zero real model tokens
@@ -294,6 +303,12 @@ function readPidFile(file: string): number | null {
 interface CleanupDetail {
   worktreePath: string | null;
   pgids: number[];
+  /**
+   * The sweeping daemon's exclusive ownership token
+   * (`TAMANDUA_DAEMON_INSTANCE`), threaded by US-004. Null only when the
+   * daemon could not resolve its own state dir / start identity.
+   */
+  daemonInstance: string | null;
   scannedPids: number;
   killedPids: number[];
   evidence: Record<string, string>;
@@ -326,6 +341,7 @@ describe("direct-mode post-grace sweep e2e (DSWP)", { concurrency: 1 }, () => {
   let eventsPath: string;
   let leakedPidFile: string;
   let unrelatedPid: number;
+  let canaryPid: number;
 
   before(async () => {
     th = createTempHome("tamandua-direct-sweep-");
@@ -381,6 +397,25 @@ describe("direct-mode post-grace sweep e2e (DSWP)", { concurrency: 1 }, () => {
     assert.ok(unrelated.pid, "unrelated control child should have a pid");
     unrelatedPid = unrelated.pid;
 
+    // Cross-run canary (SWEEP-SCOPE US-005): own process group, cwd UNDER the
+    // run's working directory (`th.homeDir`, the seeded
+    // working_directory_for_harness), an inherited OTHER run's
+    // `TAMANDUA_RUN_ID`, and NO TAMANDUA_DAEMON_INSTANCE token. Before
+    // SWEEP-SCOPE this exact shape was SIGKILLed by "cwd under the working
+    // directory"; now the sweep has no exclusive ownership proof and must
+    // leave it alone. The explicit env object also guarantees no
+    // daemon-instance token leaks in from the test runner's environment.
+    const unrelatedRunId = crypto.randomUUID();
+    const canary = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30);"], {
+      cwd: th.homeDir,
+      detached: true,
+      stdio: "ignore",
+      env: { PATH: process.env.PATH ?? "", TAMANDUA_RUN_ID: unrelatedRunId },
+    });
+    canary.unref();
+    assert.ok(canary.pid, "cross-run canary should have a pid");
+    canaryPid = canary.pid;
+
     // Seed the direct-mode run BEFORE the daemon opens the DB. No worktree.
     seedRunAndStep(dbPath, runId, "feature-dev-merge", th.homeDir);
 
@@ -433,7 +468,7 @@ describe("direct-mode post-grace sweep e2e (DSWP)", { concurrency: 1 }, () => {
   });
 
   after(() => {
-    for (const pid of [readPidFile(leakedPidFile), unrelatedPid]) {
+    for (const pid of [readPidFile(leakedPidFile), unrelatedPid, canaryPid]) {
       if (!pid) continue;
       try {
         process.kill(pid, "SIGKILL");
@@ -450,7 +485,7 @@ describe("direct-mode post-grace sweep e2e (DSWP)", { concurrency: 1 }, () => {
     }
   });
 
-  it("reaps the run-owned leaked child and spares an unrelated process", async () => {
+  it("reaps the run-owned leaked child and spares unrelated processes (cross-run canary)", async () => {
     // ── Phase 1: the run completes (direct-mode, no worktree) ──────
     await waitForRunStatus(dbPath, runId, "completed", 60000);
     assert.equal(
@@ -470,6 +505,11 @@ describe("direct-mode post-grace sweep e2e (DSWP)", { concurrency: 1 }, () => {
       "the leaked child IGNORES SIGTERM, so it must still be alive before the sweep",
     );
     assert.equal(processIsAlive(unrelatedPid), true, "the unrelated child must be alive");
+    assert.equal(
+      processIsAlive(canaryPid),
+      true,
+      "the cross-run canary (own pgid, cwd under the run dir, other-run TAMANDUA_RUN_ID) must be alive before the sweep",
+    );
 
     // ── Phase 3: wait for the post-grace sweep ─────────────────────
     // The sweep is scheduled when the daemon observes the terminal run and
@@ -496,6 +536,11 @@ describe("direct-mode post-grace sweep e2e (DSWP)", { concurrency: 1 }, () => {
       true,
       "the unrelated child (own pgid, no run marker, cwd outside) must survive",
     );
+    assert.equal(
+      processIsAlive(canaryPid),
+      true,
+      "the cross-run canary (own pgid, cwd UNDER the run dir, inherited other-run TAMANDUA_RUN_ID, no daemon token) must survive the sweep",
+    );
 
     // ── Phase 5: every kill is evidence-backed; unrelated untouched ─
     assert.ok(
@@ -505,6 +550,10 @@ describe("direct-mode post-grace sweep e2e (DSWP)", { concurrency: 1 }, () => {
     assert.ok(
       !detail.killedPids.includes(unrelatedPid),
       "the unrelated child must never be in killedPids",
+    );
+    assert.ok(
+      !detail.killedPids.includes(canaryPid),
+      "the cross-run canary must never be in killedPids",
     );
     for (const pid of detail.killedPids) {
       assert.ok(
@@ -516,8 +565,15 @@ describe("direct-mode post-grace sweep e2e (DSWP)", { concurrency: 1 }, () => {
     const leakEvidence = detail.evidence[String(leakedPid)];
     assert.match(
       leakEvidence,
-      /pgid owned by run|TAMANDUA_RUN_ID|cwd under|environ contains/,
-      `leaked child evidence must name a run-ownership channel, got: ${leakEvidence}`,
+      /pgid owned by run|daemon-scoped run marker/,
+      `leaked child evidence must name an EXCLUSIVE run-ownership channel, got: ${leakEvidence}`,
+    );
+
+    // SWEEP-SCOPE US-005: the cleanup detail carries the sweeping daemon's own
+    // instance token (the marker channel's other half).
+    assert.ok(
+      typeof detail.daemonInstance === "string" && detail.daemonInstance.length > 0,
+      "the cleanup detail must carry the sweeping daemon's non-empty daemonInstance token",
     );
 
     // Direct-mode proof: the sweep resolved the recorded working directory

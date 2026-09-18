@@ -13,6 +13,7 @@ import {
   listPids,
   listProcessDetails,
 } from "../lib/proc-info.js";
+import { matchesSweepOwnership } from "./sweep-ownership.js";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -35,6 +36,12 @@ export interface SweepOptions {
    * pgid is in this set is run-owned regardless of cwd/environ/cmdline.
    */
   pgids?: number[];
+  /**
+   * THIS daemon instance's ownership token (`getDaemonInstanceToken()`). The
+   * daemon-scoped marker channel is enabled only when this is a non-empty
+   * string; null/undefined disables it so the pgid channel is the only proof.
+   */
+  daemonInstance?: string | null;
 }
 
 /** One process observation: pid plus the evidence channels we match on. */
@@ -82,7 +89,8 @@ function safeRealpath(p: string): string {
 }
 
 /**
- * Evidence matcher over already-collected process observations.
+ * DIAGNOSTIC matcher over already-collected process observations: the broad
+ * channels used by `tamandua doctor` to REPORT likely leaks. It never kills.
  * Returns the evidence string (which check matched), or null if no match.
  *
  * Channels (a)–(e) are exact when the underlying reader is available. On
@@ -97,8 +105,14 @@ function safeRealpath(p: string): string {
  * while the marker/cmdline channels (c), (e) and the runId half of (d) still
  * apply. Pgid ownership is evaluated by `sweepRunProcesses` (it needs the
  * live pgid per pid).
+ *
+ * NEVER use this to decide a kill. These channels are not exclusive: a nested
+ * daemon started from inside a run's worktree inherits the OUTER round's
+ * `TAMANDUA_RUN_ID`, and "cwd under the working directory" then matches the
+ * enclosing harness round itself (bead tamandua-6sy.77 — 14 processes from
+ * another run were SIGKILLed). The kill gate is {@link matchRunEvidence}.
  */
-export function matchRunEvidence(
+export function matchDiagnosticRunEvidence(
   entry: Pick<ProcessSnapshotEntry, "cwd" | "environ" | "cmdline">,
   runId: string,
   worktreePath: string | null,
@@ -153,16 +167,43 @@ export function matchRunEvidence(
 }
 
 /**
+ * EXCLUSIVE kill matcher (SWEEP-SCOPE): returns the evidence string only when
+ * the observed environ carries BOTH the exact `TAMANDUA_RUN_ID=<runId>` token
+ * AND the exact `TAMANDUA_DAEMON_INSTANCE=<daemonInstance>` token that THIS
+ * daemon instance injected when it spawned the process.
+ *
+ * cwd, environ mentions of the working directory, `TAMANDUA_WORKER_JOB_ID`
+ * and cmdline NEVER create a match here: those channels are inherited or
+ * incidental, so an outer run's marker or a process merely living under the
+ * run's working directory must survive this matcher. A marker with the right
+ * run id but a different (outer) daemon token, or with no token at all, does
+ * not match; a null/empty `daemonInstance` disables the channel (the pgid
+ * channel is then the only proof of ownership).
+ */
+export function matchRunEvidence(
+  entry: Pick<ProcessSnapshotEntry, "environ">,
+  runId: string,
+  daemonInstance: string | null | undefined,
+): string | null {
+  if (!matchesSweepOwnership(entry.environ, runId, daemonInstance)) return null;
+  return `daemon-scoped run marker: run=${runId}`;
+}
+
+/**
  * Check if a process belongs to the run by inspecting its cwd, environ,
  * and command line. Returns the evidence string, or null if no match.
  * `worktreePath` may be null for direct-mode runs (path channels skipped).
+ *
+ * This is the DIAGNOSTIC (report-only) question used by `tamandua doctor`;
+ * it is deliberately broad and must never gate a kill — see
+ * {@link matchDiagnosticRunEvidence}.
  */
 export function processBelongsToRun(
   pid: number,
   runId: string,
   worktreePath: string | null,
 ): string | null {
-  return matchRunEvidence(
+  return matchDiagnosticRunEvidence(
     { cwd: readProcCwd(pid), environ: readProcEnviron(pid), cmdline: getCmdline(pid) },
     runId,
     worktreePath,
@@ -262,19 +303,26 @@ export function collectProcessSnapshot(): ProcessSnapshotEntry[] {
 /**
  * Sweep for surviving processes that belong to a run and kill them with SIGKILL.
  *
- * A process belongs to the run when:
- *  - its cwd resolves to or under `worktreePath`, OR
- *  - its environ contains the string `worktreePath`, OR
- *  - its environ contains `TAMANDUA_WORKER_JOB_ID=...` where `runId` is a substring, OR
- *  - its environ contains an exact `TAMANDUA_RUN_ID=<runId>` token, OR
- *  - its process group is listed in `options.pgids` (provably owned harness
- *    groups recorded for the run), OR
- *  - its command line names `worktreePath` or `runId`.
+ * EXCLUSIVE ownership (SWEEP-SCOPE): a process is killed only when
+ *  - its live process group is listed in `options.pgids` (pgids the daemon
+ *    itself recorded at spawn time), OR
+ *  - its environ carries BOTH the exact `TAMANDUA_RUN_ID=<runId>` token AND
+ *    the exact `TAMANDUA_DAEMON_INSTANCE=<options.daemonInstance>` token
+ *    (evidence `daemon-scoped run marker: run=<runId>`).
  *
- * `worktreePath` may be null for direct-mode runs without a worktree; the
- * path channels are then skipped and the run-marker/pgid channels carry the
- * sweep. Processes are only killed by pid after evidence matched — never by
- * name or glob.
+ * `cwd under the working directory` (and environ path mentions,
+ * `TAMANDUA_WORKER_JOB_ID`, cmdline naming the run id/path) is NOT sufficient
+ * evidence and can never create a match — those channels are inherited or
+ * incidental, and using them reaped a nested daemon's enclosing harness round
+ * (bead tamandua-6sy.77). cwd may only NARROW a marker match: when the bulk
+ * snapshot could not read environ (macOS `lsof`-only snapshot) a pid whose cwd
+ * is under `worktreePath` triggers ONE lazy per-pid environ read
+ * (`KERN_PROCARGS2`); only an exact daemon-scoped marker then kills.
+ *
+ * `worktreePath` may be null for direct-mode runs without a worktree: the
+ * narrowing channel is then unavailable (macOS), while the pgid channel and
+ * Linux environ channel still carry the sweep. Processes are only killed by
+ * pid after evidence matched — never by name or glob.
  *
  * Never kills: pid 1 (init), our own process (process.pid), the daemonPid (if
  * provided), and any pid whose pgid is in `excludePgids`.
@@ -293,6 +341,7 @@ export function sweepRunProcesses(
   }
   const excludePgids = new Set<number>(options?.excludePgids ?? []);
   const ownedPgids = new Set<number>(options?.pgids ?? []);
+  const daemonInstance = options?.daemonInstance ?? null;
 
   const killedPids: number[] = [];
   const evidence: Record<number, string> = {};
@@ -317,9 +366,27 @@ export function sweepRunProcesses(
       // scheduler's leak guard kills those groups after the grace window.
       if (pgid !== null && excludePgids.has(pgid)) continue;
 
-      const matchReason =
-        matchRunEvidence(entry, runId, worktreePath) ??
-        (pgid !== null && ownedPgids.has(pgid) ? `pgid owned by run: ${pgid}` : null);
+      // Exclusive kill gate: a recorded owned pgid, or the daemon-scoped
+      // marker. cwd never creates a match — it may only NARROW a marker read
+      // when the snapshot could not read environ (macOS bulk snapshot).
+      let matchReason: string | null = null;
+      if (pgid !== null && ownedPgids.has(pgid)) {
+        matchReason = `pgid owned by run: ${pgid}`;
+      } else if (daemonInstance !== null) {
+        let environ = entry.environ;
+        if (environ === null && worktreePath !== null && entry.cwd !== null) {
+          const resolvedCwd = safeRealpath(entry.cwd);
+          const resolvedWorktree = safeRealpath(worktreePath);
+          if (
+            resolvedCwd === resolvedWorktree ||
+            resolvedCwd.startsWith(resolvedWorktree + path.sep)
+          ) {
+            environ = readProcEnviron(pid);
+          }
+        }
+        matchReason = matchRunEvidence({ environ }, runId, daemonInstance);
+      }
+
       if (matchReason) {
         process.kill(pid, "SIGKILL");
         killedPids.push(pid);
@@ -356,6 +423,7 @@ export function sweepRunProcesses(
     detail: JSON.stringify({
       worktreePath,
       pgids: [...ownedPgids],
+      daemonInstance,
       scannedPids,
       killedPids,
       evidence,

@@ -17,6 +17,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
+import {
+  trackDaemonPid,
+  untrackDaemonPid,
+} from "../../tests/helpers/daemon-survivor-guard.ts";
 import { baseEnv } from "./smoke-helpers.ts";
 import { openE2eDatabase } from "./e2e-database.mjs";
 import { extractPerCallTokenTotal, sumBillableTokens } from "../../dist/installer/token-usage-policy.js";
@@ -505,6 +509,7 @@ export function startIsolatedDaemon(
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
+    if (child.pid) trackDaemonPid(child.pid, "startIsolatedDaemon");
 
     let output = "";
     let resolved = false;
@@ -513,6 +518,7 @@ export function startIsolatedDaemon(
       if (resolved) return;
       resolved = true;
       child.kill("SIGKILL");
+      if (child.pid) untrackDaemonPid(child.pid);
       reject(
         new Error(
           `Daemon failed to start within ${DAEMON_START_TIMEOUT_MS}ms.\n` +
@@ -537,6 +543,7 @@ export function startIsolatedDaemon(
       if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
+      if (child.pid) untrackDaemonPid(child.pid);
       reject(err);
     });
 
@@ -544,6 +551,7 @@ export function startIsolatedDaemon(
       if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
+      if (child.pid) untrackDaemonPid(child.pid);
       reject(
         new Error(
           `Daemon exited with code ${code} before becoming ready.\n` +
@@ -561,21 +569,26 @@ export function startIsolatedDaemon(
  * SIGKILL after 5 s if the process does not exit gracefully.
  */
 export async function stopIsolatedDaemon(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null) return;
-  if (!child.pid) return;
+  const pid = child.pid;
+  if (child.exitCode !== null) {
+    if (pid) untrackDaemonPid(pid);
+    return;
+  }
+  if (!pid) return;
 
   // Check if the process is still alive
   try {
-    process.kill(child.pid, 0);
+    process.kill(pid, 0);
   } catch {
-    return; // already dead
+    untrackDaemonPid(pid); // already dead
+    return;
   }
 
   child.kill("SIGTERM");
 
   await new Promise<void>((resolve) => {
     const forceTimeout = setTimeout(() => {
-      if (child.exitCode === null && child.pid) {
+      if (child.exitCode === null && pid) {
         try {
           child.kill("SIGKILL");
         } catch {
@@ -590,6 +603,7 @@ export async function stopIsolatedDaemon(child: ChildProcess): Promise<void> {
       resolve();
     });
   });
+  untrackDaemonPid(pid);
 }
 
 /**
@@ -619,6 +633,7 @@ export function startIsolatedDashboard(
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
+    if (child.pid) trackDaemonPid(child.pid, "startIsolatedDashboard");
 
     let output = "";
     let resolved = false;
@@ -651,6 +666,7 @@ export function startIsolatedDashboard(
       if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
+      if (child.pid) untrackDaemonPid(child.pid);
       reject(err);
     });
 
@@ -658,6 +674,7 @@ export function startIsolatedDashboard(
       if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
+      if (child.pid) untrackDaemonPid(child.pid);
       reject(
         new Error(
           `Dashboard exited with code ${code} before becoming ready.\n` +
@@ -675,21 +692,26 @@ export function startIsolatedDashboard(
  * to SIGKILL after 5 s if the process does not exit gracefully.
  */
 export async function stopIsolatedDashboard(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null) return;
-  if (!child.pid) return;
+  const pid = child.pid;
+  if (child.exitCode !== null) {
+    if (pid) untrackDaemonPid(pid);
+    return;
+  }
+  if (!pid) return;
 
   // Check if the process is still alive
   try {
-    process.kill(child.pid, 0);
+    process.kill(pid, 0);
   } catch {
-    return; // already dead
+    untrackDaemonPid(pid); // already dead
+    return;
   }
 
   child.kill("SIGTERM");
 
   await new Promise<void>((resolve) => {
     const forceTimeout = setTimeout(() => {
-      if (child.exitCode === null && child.pid) {
+      if (child.exitCode === null && pid) {
         try {
           child.kill("SIGKILL");
         } catch {
@@ -704,6 +726,7 @@ export async function stopIsolatedDashboard(child: ChildProcess): Promise<void> 
       resolve();
     });
   });
+  untrackDaemonPid(pid);
 }
 
 /**

@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { getDb } from "../db.js";
 import { logger } from "../lib/logger.js";
 import { sweepRunProcesses } from "./run-cleanup.js";
+import { getDaemonInstanceToken } from "./sweep-ownership.js";
 import { gitIdentityEnv, resolveRunGitIdentity } from "./git-identity.js";
 
 // ── Types ──
@@ -419,7 +420,14 @@ export function removeRunWorktree(params: {
         .prepare("SELECT DISTINCT claim_pgid FROM steps WHERE run_id = ? AND claim_pgid IS NOT NULL")
         .all(params.runId)
         .map((r) => (r as { claim_pgid: number }).claim_pgid);
-      sweepRunProcesses(params.runId, wt.worktreePath, { excludePgids });
+      // SWEEP-SCOPE US-004: the pre-removal sweep must prove ownership by the
+      // same exclusive evidence as the post-grace sweep — a recorded pgid or a
+      // marker scoped to THIS daemon instance. Pass this process's token so the
+      // marker channel stays usable; an unavailable token disables it.
+      sweepRunProcesses(params.runId, wt.worktreePath, {
+        excludePgids,
+        daemonInstance: getDaemonInstanceToken(),
+      });
     } catch (err) {
       logger.warn(
         `Process cleanup sweep failed for run ${params.runId}, proceeding with worktree removal`,

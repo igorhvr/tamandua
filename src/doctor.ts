@@ -56,7 +56,7 @@ import { getDb } from "./db.js";
 import { runMedicCheck } from "./medic/medic.js";
 import type { MedicFinding } from "./medic/medic.js";
 import { getRunWorktree } from "./installer/worktree-manager.js";
-import { collectProcessSnapshot, matchRunEvidence } from "./installer/run-cleanup.js";
+import { collectProcessSnapshot, matchDiagnosticRunEvidence } from "./installer/run-cleanup.js";
 import { getRecentEvents } from "./installer/events.js";
 import type { TamanduaEvent } from "./installer/events.js";
 import { probeHermesStateContract } from "./installer/hermes-usage.js";
@@ -1659,7 +1659,7 @@ function runProcessLeakChecks(opts?: DoctorOpts): DoctorCheckResult[] {
         const pid = entry.pid;
         if (pid === process.pid) continue;
 
-        const evidence = matchRunEvidence(entry, runId, wt.worktreePath);
+        const evidence = matchDiagnosticRunEvidence(entry, runId, wt.worktreePath);
         if (evidence) {
           results.push({
             name: "Run-process leak",
