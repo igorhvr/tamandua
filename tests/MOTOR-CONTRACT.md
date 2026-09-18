@@ -1000,12 +1000,15 @@ wall-clock jump cannot release or extend it.
   inherited the outer round's `TAMANDUA_RUN_ID` and used the enclosing
   checkout as its own run's working directory, so its sweep matched the dsh
   harness round running the test suite, the test runner's ancestors, and
-  rounds of a sibling run. cwd may only NARROW a marker match: when the bulk
-  snapshot could not read environ (macOS `lsof`-only snapshot, `environ`
-  field null) a pid whose cwd is under `worktreePath` triggers ONE lazy
-  per-pid `KERN_PROCARGS2` environ read, and only the exact daemon-scoped
-  marker then kills. The recorded path is OPTIONAL
-  (`worktreePath: string | null`): `null` skips the path-narrowing, so a
+  rounds of a sibling run. cwd is NEVER consulted, not even to NARROW a match:
+  whenever the marker channel is enabled and the bulk snapshot could not read
+  environ (macOS `lsof`-only snapshot, `environ` field null), the
+  daemon-scoped marker environ is resolved through the platform-neutral reader
+  (`readProcEnviron` → `src/lib/proc-info.ts`
+  `getEnvironText`/`environHasEntry`; KERN_PROCARGS2 on darwin) for EVERY
+  candidate, so the channel works regardless of cwd and for direct-mode runs.
+  The recorded path is OPTIONAL
+  (`worktreePath: string | null`) and irrelevant to the marker channel, so a
   direct-mode run with no worktree is still covered by the pgid and marker
   channels. Every reaped pid is logged with the evidence string that matched,
   and processes are killed only by pid after a match — never by name or glob.

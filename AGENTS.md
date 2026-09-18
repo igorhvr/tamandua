@@ -263,13 +263,16 @@ environ path mentions, `TAMANDUA_WORKER_JOB_ID`, cmdline naming the run
 id/path) is NEVER sufficient kill evidence: those channels are inherited or
 incidental, and "cwd under the working directory" once reaped 14 processes
 belonging to an enclosing run — the dsh harness round running the test suite,
-the test runner's ancestors, and rounds of a sibling run. cwd may only NARROW
-a marker match: when the bulk snapshot could not read environ (macOS
-`lsof`-only snapshot), a pid whose cwd is under the recorded path triggers ONE
-lazy per-pid `KERN_PROCARGS2` environ read, and only the exact daemon-scoped
-marker then kills. The recorded path is optional (`string | null`): `null`
-skips the path-narrowing, so a direct-mode run without a worktree is still
-sweepable via the pgid and marker channels. Processes are killed by pid only
+the test runner's ancestors, and rounds of a sibling run. cwd is NEVER
+consulted, not even to NARROW a match: whenever the marker channel is enabled
+and the bulk snapshot could not read environ (macOS `lsof`-only snapshot), the
+daemon-scoped marker environ is resolved through the platform-neutral reader
+(`readProcEnviron` → `src/lib/proc-info.ts` `getEnvironText`/`environHasEntry`;
+KERN_PROCARGS2 on darwin) for EVERY candidate, so the channel works regardless
+of cwd and for direct-mode runs. The recorded path is optional
+(`string | null`); it is irrelevant to the marker channel, so a direct-mode run
+without a worktree is still sweepable via the pgid and marker channels.
+Processes are killed by pid only
 after evidence matches — never by name or glob — and every reaped pid is
 logged with its evidence string; the `run.process_cleanup` event detail
 carries the (nullable) path, the swept `pgids`, and the sweeping

@@ -796,6 +796,24 @@ describe("runPostGraceSweep direct-mode runs", () => {
     return new Promise((r) => setTimeout(r, ms));
   }
 
+  /**
+   * Spawn a long-lived same-user Node keepalive child.
+   *
+   * Marker fixtures MUST use this instead of `/bin/sleep`: on macOS
+   * `/bin/sleep` is an Apple platform binary whose environment KERN_PROCARGS2
+   * does not expose, so its environ is unreadable and the daemon-scoped marker
+   * channel correctly matches nothing. A Node child's environ is readable
+   * through the native `proc-info env` helper (and procfs on Linux).
+   */
+  function spawnKeepalive(env: NodeJS.ProcessEnv, cwd: string, detached = false): ChildProcess {
+    return spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30);"], {
+      cwd,
+      env,
+      stdio: "ignore",
+      detached,
+    });
+  }
+
   function isAlive(pid: number): boolean {
     try {
       process.kill(pid, 0);
@@ -965,9 +983,7 @@ describe("runPostGraceSweep direct-mode runs", () => {
     assert.ok(!isAlive(ownedPid), "owned child should be gone");
   });
 
-  it("runs the marker sweep with a null path when no directory or pgid resolves", {
-    skip: process.platform === "darwin" ? "environ evidence is unreadable on macOS" : false,
-  }, async () => {
+  it("runs the marker sweep with a null path when no directory or pgid resolves", async () => {
     const runId = "run-direct-marker-only";
     const ownedCwd = path.join(outsideDir, "marker-only");
     fs.mkdirSync(ownedCwd, { recursive: true });
@@ -980,33 +996,31 @@ describe("runPostGraceSweep direct-mode runs", () => {
 
     // A run-owned child identified ONLY by the full daemon-scoped marker
     // (exact run id plus THIS daemon's instance token): no recorded pgid.
-    const owned = spawn("sleep", ["30"], {
-      cwd: ownedCwd,
-      env: {
+    const owned = spawnKeepalive(
+      {
         PATH: process.env.PATH || "/usr/bin",
         TAMANDUA_RUN_ID: runId,
         TAMANDUA_DAEMON_INSTANCE: daemonInstance,
       },
-      stdio: "ignore",
-      detached: true,
-    });
+      ownedCwd,
+      true,
+    );
     // Cross-run canary: cwd UNDER the sweep directory but carrying ANOTHER
     // run's TAMANDUA_RUN_ID and no daemon-instance token, in its own pgid.
     // Under the old "cwd under the working directory" rule this was killed;
     // the exclusive evidence model must leave it alone.
     const canaryCwd = path.join(sweepDir, "marker-canary");
     fs.mkdirSync(canaryCwd, { recursive: true });
-    const canary = spawn("sleep", ["30"], {
-      cwd: canaryCwd,
-      env: {
+    const canary = spawnKeepalive(
+      {
         PATH: process.env.PATH || "/usr/bin",
         TAMANDUA_RUN_ID: "run-other-marker-canary",
       },
-      stdio: "ignore",
-      detached: true,
-    });
+      canaryCwd,
+      true,
+    );
     children.push(owned, canary);
-    await sleep(300);
+    await sleep(400);
     const ownedPid = owned.pid!;
     const canaryPid = canary.pid!;
     assert.ok(isAlive(canaryPid), "cross-run canary should be alive before the sweep");

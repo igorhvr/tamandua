@@ -142,12 +142,20 @@ describe("SWEEP-SCOPE docs: AGENTS.md exclusive ownership evidence", () => {
       "AGENTS.md must name cmdline as a non-sufficient channel",
     );
     assert.ok(
-      flat.includes("cwd may only NARROW a marker match"),
-      "AGENTS.md must state cwd only narrows a marker match",
+      flat.includes("cwd is NEVER consulted, not even to NARROW a match"),
+      "AGENTS.md must state cwd is never consulted, not even to narrow a marker match",
+    );
+    assert.ok(
+      flat.includes("platform-neutral reader"),
+      "AGENTS.md must state the marker environ is resolved through the platform-neutral reader",
+    );
+    assert.ok(
+      flat.includes("for EVERY candidate"),
+      "AGENTS.md must state the platform-neutral environ reader runs for every candidate",
     );
     assert.ok(
       flat.includes("KERN_PROCARGS2"),
-      "AGENTS.md must describe the lazy KERN_PROCARGS2 environ confirmation",
+      "AGENTS.md must describe the KERN_PROCARGS2 environ reader on darwin",
     );
   });
 
@@ -269,14 +277,22 @@ describe("SWEEP-SCOPE docs: MOTOR-CONTRACT.md ownership evidence channels", () =
     );
   });
 
-  it("states the non-exclusive channels are never sufficient and cwd only narrows", () => {
+  it("states the non-exclusive channels are never sufficient and cwd is never consulted", () => {
     assert.ok(
       flat.includes("are NEVER sufficient kill evidence and never create a match"),
       "MOTOR-CONTRACT.md must state the broad channels are never sufficient",
     );
     assert.ok(
-      flat.includes("cwd may only NARROW a marker match"),
-      "MOTOR-CONTRACT.md must state cwd only narrows a marker match",
+      flat.includes("cwd is NEVER consulted, not even to NARROW a match"),
+      "MOTOR-CONTRACT.md must state cwd is never consulted, not even to narrow a marker match",
+    );
+    assert.ok(
+      flat.includes("platform-neutral reader"),
+      "MOTOR-CONTRACT.md must state the marker environ is resolved through the platform-neutral reader",
+    );
+    assert.ok(
+      flat.includes("for EVERY candidate"),
+      "MOTOR-CONTRACT.md must state the platform-neutral environ reader runs for every candidate",
     );
     assert.ok(
       flat.includes("SIGKILLed 14 processes belonging to an ENCLOSING run"),

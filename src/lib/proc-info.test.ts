@@ -142,17 +142,24 @@ describe("proc-info — same-user environment reading", () => {
   // honestly when a source checkout was never built.
   const canReadEnv = process.platform !== "darwin" || helperAvailable;
 
-  it("reads HOME / TAMANDUA_STATE_DIR from a same-user child", async (t) => {
+  it("reads HOME / TAMANDUA_STATE_DIR and the sweep markers from a same-user child", async (t) => {
     if (!canReadEnv) {
       return t.skip("honest capability skip: proc-info helper not built on darwin");
     }
     const home = tamanduaTempDir("proc-info-home-");
     const stateDir = `${home}/.tamandua`;
+    // The sweep's exclusive marker channel relies on reading exactly these
+    // entries through this reader (darwin fixture: /bin/sleep's environ is not
+    // exposed, a same-user Node child's is).
+    const runId = "proc-info-marker-run";
+    const daemonInstance = "proc-info-marker-daemon-instance";
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
       env: {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: home,
         TAMANDUA_STATE_DIR: stateDir,
+        TAMANDUA_RUN_ID: runId,
+        TAMANDUA_DAEMON_INSTANCE: daemonInstance,
       },
       stdio: "ignore",
     });
@@ -170,9 +177,25 @@ describe("proc-info — same-user environment reading", () => {
       const entries = environ!.split("\0");
       assert.ok(entries.includes(`HOME=${home}`), `HOME=${home} must be present`);
       assert.ok(entries.includes(`TAMANDUA_STATE_DIR=${stateDir}`), "state dir entry must be present");
+      assert.ok(
+        entries.includes(`TAMANDUA_RUN_ID=${runId}`),
+        `TAMANDUA_RUN_ID=${runId} must be an exact NUL-separated entry`,
+      );
+      assert.ok(
+        entries.includes(`TAMANDUA_DAEMON_INSTANCE=${daemonInstance}`),
+        `TAMANDUA_DAEMON_INSTANCE=${daemonInstance} must be an exact NUL-separated entry`,
+      );
       assert.equal(environHasEntry(pid, "HOME", home), true);
       assert.equal(environHasEntry(pid, "TAMANDUA_STATE_DIR", stateDir), true);
+      assert.equal(environHasEntry(pid, "TAMANDUA_RUN_ID", runId), true);
+      assert.equal(environHasEntry(pid, "TAMANDUA_DAEMON_INSTANCE", daemonInstance), true);
+      // Only the exact value is a match: never a prefix, suffix or wrong token.
       assert.equal(environHasEntry(pid, "HOME", `${home}-other`), false);
+      assert.equal(environHasEntry(pid, "TAMANDUA_RUN_ID", `${runId}-other`), false);
+      assert.equal(
+        environHasEntry(pid, "TAMANDUA_DAEMON_INSTANCE", `${daemonInstance}-other`),
+        false,
+      );
       // KERN_PROCARGS2 may append the kernel's private apple string vector
       // after the environ (no reliable delimiter), but exact NAME=value
       // membership is unaffected. Assert a couple of real entries survive.

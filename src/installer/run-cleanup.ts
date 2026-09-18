@@ -48,7 +48,11 @@ export interface SweepOptions {
 export interface ProcessSnapshotEntry {
   pid: number;
   cwd: string | null;
-  /** NUL-separated env text (Linux only — unreadable on macOS). */
+  /**
+   * NUL-separated env text, or null when this snapshot did not read it (the
+   * macOS bulk snapshot leaves it null; the sweep resolves it lazily per
+   * candidate through the platform-neutral reader).
+   */
   environ: string | null;
   /** Full command line ("" unknown). Primary evidence channel on macOS. */
   cmdline: string;
@@ -314,15 +318,16 @@ export function collectProcessSnapshot(): ProcessSnapshotEntry[] {
  * `TAMANDUA_WORKER_JOB_ID`, cmdline naming the run id/path) is NOT sufficient
  * evidence and can never create a match — those channels are inherited or
  * incidental, and using them reaped a nested daemon's enclosing harness round
- * (bead tamandua-6sy.77). cwd may only NARROW a marker match: when the bulk
- * snapshot could not read environ (macOS `lsof`-only snapshot) a pid whose cwd
- * is under `worktreePath` triggers ONE lazy per-pid environ read
- * (`KERN_PROCARGS2`); only an exact daemon-scoped marker then kills.
+ * (bead tamandua-6sy.77). cwd is NEVER consulted here, not even to narrow a
+ * match: when the marker channel is enabled every candidate whose snapshot
+ * lacks environ is read through the platform-neutral environ reader
+ * (`readProcEnviron` → `src/lib/proc-info.ts`, KERN_PROCARGS2 on darwin), so
+ * the daemon-scoped marker is found regardless of cwd and for direct-mode runs.
  *
- * `worktreePath` may be null for direct-mode runs without a worktree: the
- * narrowing channel is then unavailable (macOS), while the pgid channel and
- * Linux environ channel still carry the sweep. Processes are only killed by
- * pid after evidence matched — never by name or glob.
+ * `worktreePath` may be null for direct-mode runs without a worktree: the pgid
+ * channel and the cwd-independent marker channel still carry the sweep.
+ * Processes are only killed by pid after evidence matched — never by name or
+ * glob.
  *
  * Never kills: pid 1 (init), our own process (process.pid), the daemonPid (if
  * provided), and any pid whose pgid is in `excludePgids`.
@@ -367,23 +372,15 @@ export function sweepRunProcesses(
       if (pgid !== null && excludePgids.has(pgid)) continue;
 
       // Exclusive kill gate: a recorded owned pgid, or the daemon-scoped
-      // marker. cwd never creates a match — it may only NARROW a marker read
-      // when the snapshot could not read environ (macOS bulk snapshot).
+      // marker. cwd is never consulted — when the snapshot left environ null
+      // (the macOS bulk snapshot) the platform-neutral environ reader resolves
+      // it for this candidate, so the marker channel is cwd-independent and
+      // usable for direct-mode runs too.
       let matchReason: string | null = null;
       if (pgid !== null && ownedPgids.has(pgid)) {
         matchReason = `pgid owned by run: ${pgid}`;
       } else if (daemonInstance !== null) {
-        let environ = entry.environ;
-        if (environ === null && worktreePath !== null && entry.cwd !== null) {
-          const resolvedCwd = safeRealpath(entry.cwd);
-          const resolvedWorktree = safeRealpath(worktreePath);
-          if (
-            resolvedCwd === resolvedWorktree ||
-            resolvedCwd.startsWith(resolvedWorktree + path.sep)
-          ) {
-            environ = readProcEnviron(pid);
-          }
-        }
+        const environ = entry.environ ?? readProcEnviron(pid);
         matchReason = matchRunEvidence({ environ }, runId, daemonInstance);
       }
 

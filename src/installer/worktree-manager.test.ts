@@ -18,6 +18,7 @@ import {
   type ManagedRunWorktree,
 } from "../../dist/installer/worktree-manager.js";
 import { getDaemonInstanceToken } from "../../dist/installer/sweep-ownership.js";
+import { getEnvironText } from "../../dist/lib/proc-info.js";
 
 // ── Helpers ──
 
@@ -53,6 +54,21 @@ function getGitCommonDir(dir: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Poll until a same-user child's environment is readable through the
+ * platform-neutral reader (procfs on Linux, KERN_PROCARGS2 on macOS), or the
+ * deadline expires. The kernel only exposes the child environ once it has
+ * exec'd, so a fixed sleep can race a slow start on darwin.
+ */
+async function waitForReadableEnviron(pid: number, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let environ = getEnvironText(pid);
+  while ((environ === null || !environ.includes("TAMANDUA_RUN_ID=")) && Date.now() < deadline) {
+    await sleep(25);
+    environ = getEnvironText(pid);
+  }
 }
 
 function isAlive(pid: number): boolean {
@@ -840,9 +856,14 @@ describe("worktree-manager", () => {
       // pgid), in its own process group, with cwd inside the worktree. It can
       // only be reaped if removeRunWorktree threads its daemon token into the
       // exclusive sweep — without it the marker channel is disabled.
+      //
+      // The leak is a Node keepalive, NOT /bin/sleep: the marker channel
+      // resolves the candidate's environ through the platform-neutral reader
+      // (procfs on Linux, KERN_PROCARGS2 on macOS), and on darwin /bin/sleep's
+      // environ is not exposed while a same-user Node child's is readable.
       const leakCwd = path.join(wt.worktreePath, "leak-dir");
       mkdirSync(leakCwd, { recursive: true });
-      const leaked = spawn("sleep", ["30"], {
+      const leaked = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30);"], {
         cwd: leakCwd,
         env: {
           PATH: process.env.PATH || "/usr/bin",
@@ -854,7 +875,7 @@ describe("worktree-manager", () => {
       });
       const leakedPid = leaked.pid!;
       try {
-        await sleep(300);
+        await waitForReadableEnviron(leakedPid);
         assert.ok(isAlive(leakedPid), "leaked child should be alive before removal");
 
         removeRunWorktree({ runId, force: true });
