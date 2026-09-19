@@ -32,6 +32,21 @@ function runGit(args: string[], cwd: string): string | null {
   return (result.stdout ?? "").trim();
 }
 
+function resolveRealGit(): string {
+  const result = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf-8" });
+  const resolved = (result.stdout ?? "").trim();
+  assert.ok(resolved, "git not found on PATH");
+  return resolved;
+}
+
+// The mock git shims below shadow `git` on PATH, so they must delegate through
+// an absolute path resolved from the *unmodified* PATH — a bare `git` would
+// re-enter the shim. Hardcoding /usr/bin/git is not portable: it is absent on
+// non-FHS systems, and where /usr/bin is an envfs mount (common on NixOS) it
+// resolves through the caller's PATH, which puts the shim back in front of
+// itself and the delegation recurses without bound.
+const REAL_GIT = resolveRealGit();
+
 function initGitRepo(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
   runGit(["init", "--initial-branch=main"], dir);
@@ -2096,7 +2111,7 @@ if [ "$1" = "rev-parse" ] && [ "$2" = "--abbrev-ref" ] && [ "$3" = "HEAD" ] && [
   echo "fatal: simulated original_branch capture failure" >&2
   exit 128
 fi
-/usr/bin/git "$@"
+"${REAL_GIT}" "$@"
 `;
         const fakeGitPath = path.join(mockBinDir, "git");
         fs.writeFileSync(fakeGitPath, fakeGitScript, { mode: 0o755 });
@@ -2168,7 +2183,7 @@ if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ] && [ "$#" = "2" ]; then
   echo "fatal: simulated base_branch_sha capture failure" >&2
   exit 128
 fi
-/usr/bin/git "$@"
+"${REAL_GIT}" "$@"
 `;
         const fakeGitPath = path.join(mockBinDir, "git");
         fs.writeFileSync(fakeGitPath, fakeGitScript, { mode: 0o755 });
