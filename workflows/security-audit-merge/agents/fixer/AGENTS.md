@@ -94,6 +94,8 @@ Examples:
 - `fix(security): add CSRF protection to form endpoints`
 - `fix(security): sanitize user input in comment display`
 
+This run's story commits are squashed at landing, so their ids do not survive. If a file you commit must identify a version (a pin, provenance or readiness record), use a content hash of the pinned files or a stable upstream id, never `git rev-parse HEAD` or a story commit id from this run.
+
 ## CRITICAL — STATUS Line Requirement
 
 Your output is parsed by an automated scheduler. It looks for **exact markers** to determine step outcome:

@@ -1,0 +1,77 @@
+{
+  "task": "SKILL-UX-2 (salvage of vaimetal #44)",
+  "bead": "tamandua-6sy.75",
+  "run": "run-246dcdcb-fab2-4d69-8727-c4574d388ba3",
+  "branch": "feature/skill-ux-launcher-ergonomics-salvage",
+  "landing_target": "integration/skill-ux",
+  "deliverable": "ONE squash on integration/skill-ux (author = repo identity; no session URLs)",
+
+  "files_changed": [
+    "README.md",
+    "skills/tamandua-agents/SKILL.md",
+    "src/cli/commands/wait.ts",
+    "src/cli/commands/workflow.ts",
+    "src/installer/workflow-run-resolution.ts",
+    "tests/cli-workflow-list-json.test.ts",
+    "tests/cli-workflow-run-resolution.test.ts",
+    "tests/coding-persona-commit-squash.test.ts",
+    "tests/serial-files.txt",
+    "tests/skill-review-artifacts.test.ts",
+    "workflows/bug-fix-merge/agents/fixer/AGENTS.md",
+    "workflows/feature-dev-merge/agents/developer/AGENTS.md",
+    "workflows/quarantine-broken-tests-merge/agents/quarantiner/AGENTS.md",
+    "workflows/security-audit-merge/agents/fixer/AGENTS.md"
+  ],
+
+  "inserted_sentences": {
+    "S4_coding_persona_commit_squash_warning": "This run's story commits are squashed at landing, so their ids do not survive. If a file you commit must identify a version (a pin, provenance or readiness record), use a content hash of the pinned files or a stable upstream id, never `git rev-parse HEAD` or a story commit id from this run.",
+    "S5_launch_notes_stdin_redirect": "When you launch runs from a scripted, non-interactive harness invocation (pi, dsh, hermes in one-shot mode), redirect stdin from /dev/null; a pipe left open makes one-shot mode wait for end-of-file before starting.",
+    "S2_workflow_list_skill_wording": "tamandua workflow list [--json] [--id <name>]  # Shows [worktree] or [direct] marker per workflow; --id prints one workflow's entry (exit 1 when missing)",
+    "S2_workflow_list_readme_wording": "| `tamandua workflow list [--id <name>] [--json]` | List available workflows. `--id <name>` prints a single workflow's entry and exits 1 when it is missing |"
+  },
+
+  "gate_commands": [
+    {
+      "command": "npm run build",
+      "exit_code": 0,
+      "note": "typecheck passes; landlock-helper 'backend: unavailable' note is benign on this host"
+    },
+    {
+      "command": "node --test tests/cli-workflow-list-json.test.ts tests/cli-workflow-run-resolution.test.ts",
+      "exit_code": 0,
+      "note": "17/17 pass"
+    },
+    {
+      "command": "node --test tests/coding-persona-commit-squash.test.ts",
+      "exit_code": 0,
+      "note": "2/2 pass"
+    },
+    {
+      "command": "node --test tests/skill-review-artifacts.test.ts",
+      "exit_code": 0,
+      "note": "14/14 pass (S5 stdin-redirect pin)"
+    },
+    {
+      "command": "/workspace/runtime/bin/tamandua-test --repo '/home/kaladin/.tamandua/worktrees/tamandua-origin-skill-ux-a6ae1e6a/50-246dcdcb' --run '246dcdcb-fab2-4d69-8727-c4574d388ba3' --step 'implement' -- 'npm test'",
+      "exit_code": 0,
+      "note": "both lanes green: SERIAL 4257 pass / 0 fail, PARALLEL 2876 pass / 0 fail"
+    },
+    {
+      "command": "./run-all-e2e-tests",
+      "exit_code": 1,
+      "note": "99 tests: 89 pass, 8 fail, 2 skipped. The 8 failures are pre-existing Matchlock-VM environment issues independent of the S2/S3/S4/S5 changes: 6 LGAT + 1 OREF landing-gate tests (tamandua-test TSTX shim records no suite_results evidence rows in this VM, host-attested namespace unavailable; reproduced deterministically alone) and 1 preclaim-death-loop timing test (2s backoff window elapses before the next dispatch tick; reproduced alone)."
+    },
+    {
+      "command": "run-real-e2e-canary / run-all-real-e2e-tests",
+      "exit_code": null,
+      "note": "NOT run, as required by the task"
+    }
+  ],
+
+  "landing_notes": {
+    "commit_author": "Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>",
+    "git_config_global": "never run",
+    "session_urls_in_commit_messages": "none",
+    "vm_paths": "host paths under /home/kaladin/matchlock-work are not visible inside the VM; this file uses VM paths (/home/kaladin/.tamandua/worktrees/...)"
+  }
+}

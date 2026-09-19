@@ -492,7 +492,7 @@ install worked by running `tamandua version`.
 Use these when managing workflow runs (outside individual step execution):
 
 ```bash
-tamandua workflow list [--json]          # Shows [worktree] or [direct] marker per workflow
+tamandua workflow list [--json] [--id <name>]  # Shows [worktree] or [direct] marker per workflow; --id prints one workflow's entry (exit 1 when missing)
 tamandua workflow install <workflow-id|--all>
 tamandua workflow uninstall <workflow-id|--all> [--force]
 tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness | --dsh-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]] [--task-file <path>]
@@ -567,6 +567,8 @@ Worktree guidance:
   SHA in the worktree. Defaults to the current branch.
 - Worktree runs never modify the origin repository — all changes stay in
   the isolated worktree.
+
+Scripted launches: When you launch runs from a scripted, non-interactive harness invocation (pi, dsh, hermes in one-shot mode), redirect stdin from /dev/null; a pipe left open makes one-shot mode wait for end-of-file before starting.
 
 Busy harness working directory (direct runs): a second direct launch aimed at a
 directory a live run already holds is refused with exit code 75. Pass

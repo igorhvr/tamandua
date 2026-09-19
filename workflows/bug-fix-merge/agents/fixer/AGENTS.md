@@ -64,6 +64,8 @@ Examples:
 - `fix: correct date comparison in expiry check`
 - `fix: prevent duplicate entries in batch import`
 
+This run's story commits are squashed at landing, so their ids do not survive. If a file you commit must identify a version (a pin, provenance or readiness record), use a content hash of the pinned files or a stable upstream id, never `git rev-parse HEAD` or a story commit id from this run.
+
 ## CRITICAL — STATUS Line Requirement
 
 Your output is parsed by an automated scheduler. It looks for **exact markers** to determine step outcome:

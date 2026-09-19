@@ -195,3 +195,32 @@ describe("US-003: Verify skill file consistency with AGENTS.md", () => {
     }
   });
 });
+
+describe("US-002: S5 scripted-launch stdin-redirect note", () => {
+  const S5_SENTENCE =
+    "When you launch runs from a scripted, non-interactive harness invocation " +
+    "(pi, dsh, hermes in one-shot mode), redirect stdin from /dev/null; a pipe " +
+    "left open makes one-shot mode wait for end-of-file before starting.";
+
+  it("contains the S5 scripted-launch stdin-redirect sentence verbatim", () => {
+    assert.ok(
+      skill.includes(S5_SENTENCE),
+      "skill must contain the exact S5 scripted-launch stdin-redirect sentence",
+    );
+  });
+
+  it("does not add a quick-launch section", () => {
+    assert.doesNotMatch(skill, /quick[ -]?launch/i, "S1 quick-launch section was rejected");
+  });
+
+  it("leaves the --task-file description unchanged", () => {
+    assert.ok(
+      skill.includes(
+        "`--task-file` reads the task description from a file (dereferenced once at\n" +
+          "CLI time; the path is never stored downstream). It is mutually exclusive with\n" +
+          'inline task words — passing both is an error. The legacy `"$(cat task.md)"`',
+      ),
+      "--task-file description must remain untouched (S6 dropped)",
+    );
+  });
+});

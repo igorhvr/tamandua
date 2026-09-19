@@ -660,7 +660,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 | `tamandua workflow stop <run-id>` | Stop/cancel a running workflow |
 | `tamandua workflow cancel <run-id>` | Alias for stop — cancels a running workflow |
 | `tamandua workflow delete <run-id> [--force]` | Permanently delete a workflow run and associated data |
-| `tamandua workflow list` | List available workflows |
+| `tamandua workflow list [--id <name>] [--json]` | List available workflows. `--id <name>` prints a single workflow's entry and exits 1 when it is missing |
 | `tamandua workflow install <id> [--all]` | Install one or all workflows. **Installed bundled definitions are refreshed on every install/update** — local edits are overwritten. To customize a workflow, copy it under a new workflow id. |
 | `tamandua workflow uninstall <id>` | Remove a single workflow |
 

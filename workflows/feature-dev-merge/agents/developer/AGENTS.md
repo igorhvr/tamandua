@@ -71,6 +71,8 @@ Before EVERY commit, verify:
 - Include all relevant files (except those excluded by .gitignore)
 - Every commit message MUST end with: `Co-Authored-By: Tamandua <tamandua@tetradactyla.org>`
 
+This run's story commits are squashed at landing, so their ids do not survive. If a file you commit must identify a version (a pin, provenance or readiness record), use a content hash of the pinned files or a stable upstream id, never `git rev-parse HEAD` or a story commit id from this run.
+
 ## Creating PRs
 
 When creating the PR:

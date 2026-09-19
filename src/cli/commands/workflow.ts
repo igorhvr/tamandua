@@ -8,7 +8,7 @@
 import { installWorkflow } from "../../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../../installer/uninstall.js";
 import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, forceFailRun, readHarnessProbeFailureBlock } from "../../installer/status.js";
-import { runWorkflow, resumeWorkflow, type ResumeResult } from "../../installer/run.js";
+import { runWorkflow, resumeWorkflow, type ResumeResult, type RunWorkflowResult } from "../../installer/run.js";
 import { listBundledWorkflows } from "../../installer/workflow-fetch.js";
 import { loadWorkflowSpec } from "../../installer/workflow-spec.js";
 import { resolveBundledWorkflowDir } from "../../installer/paths.js";
@@ -22,6 +22,12 @@ import { reportUnknownCommand } from "../shared.js";
 import { logger } from "../../lib/logger.js";
 import type { HarnessType } from "../../installer/types.js";
 import { printWorkflowAutoresearch } from "./autoresearch.js";
+import {
+  formatWorkflowRunLaunchLines,
+  resolveWorkflowRunLaunchInfo,
+  workflowRunLaunchInfoToJson,
+  type WorkflowRunLaunchInfo,
+} from "../../installer/workflow-run-resolution.js";
 import { handleWait, getWaitHelp } from "./wait.js";
 import { detectWrongPrefix, stripIdPrefix, prefixRunId, prefixStepId } from "../../lib/id-prefix.js";
 import { displayStoryStatus } from "../../lib/step-display.js";
@@ -36,7 +42,7 @@ import {
 export function getWorkflowListHelp(): string {
   return `tamandua workflow list — List available bundled workflows with descriptions
 
-Usage: tamandua workflow list [--json]
+Usage: tamandua workflow list [--json] [--id <name>]
 
 Lists all bundled workflows that are available for installation from the
 source checkout, showing a one-line description for each. These are the
@@ -47,10 +53,16 @@ workflows, [direct] for direct-mode workflows.
 
 Options:
   --json    Output a JSON array of {id, name, description, workspaceMode} for programmatic consumption
+  --id <name>
+            Print only the entry for the named workflow (exact directory
+            name) instead of the full list. Exits 0 when it exists, 1 with
+            a one-line message when it does not. Combines with --json.
 
 Examples:
   tamandua workflow list
-  tamandua workflow list --json`;
+  tamandua workflow list --json
+  tamandua workflow list --id feature-dev-merge
+  tamandua workflow list --id feature-dev-merge --json`;
 }
 
 export function getWorkflowRunsHelp(): string {
@@ -199,8 +211,11 @@ Options:
       Max wait duration (e.g. 30s, 10m, 2h). Only meaningful with --wait.
       Units: s, m, h, d.
   --json
-      When combined with --wait, print the wait result as a JSON object
-      to stdout after the run completes.
+      Print one JSON object to stdout with the resolved launch facts
+      (working directory/origin, clean, harness, daemon) and the created
+      run's fields (runId, workflowId, task, status, stepCount, harnessCwd).
+      With --wait, the wait result (runs/timedOut) is merged into the same
+      object after the run completes.
 
 Examples:
   tamandua workflow run feature-dev-merge "Add dark mode toggle"
@@ -517,6 +532,41 @@ function printNonDoneStepStates(runId: string): void {
   }
 }
 
+/**
+ * SKILL-UX S3 (US-003): build the single JSON document emitted by
+ * `tamandua workflow run --json`. It carries the run fields a caller already
+ * gets from the text Run: block (runId, workflowId, task, status, ...) plus
+ * the resolved launch facts, so scripts can consume the same values as the
+ * text-mode resolution lines. The wait result is merged into this same object
+ * by handleWait when --wait is also given.
+ */
+function buildWorkflowRunJsonOutput(
+  result: RunWorkflowResult,
+  launchInfo: WorkflowRunLaunchInfo | null,
+): Record<string, unknown> {
+  const jsonOutput: Record<string, unknown> = {
+    runId: prefixRunId(result.runId),
+    runNumber: result.runNumber,
+    workflowId: result.workflowId,
+    task: result.taskTitle,
+    status: result.status,
+    stepCount: result.stepCount,
+    harnessCwd: result.workingDirectoryForHarness,
+  };
+
+  if (launchInfo) {
+    jsonOutput.resolution = workflowRunLaunchInfoToJson(launchInfo);
+  }
+  if (result.daemonWarning) jsonOutput.daemonWarning = result.daemonWarning;
+  if (result.queuedBehindRunId) {
+    jsonOutput.queuedBehindRunId = result.queuedBehindRunId;
+    if (result.schedulingState) jsonOutput.schedulingState = result.schedulingState;
+  }
+  if (result.captureWarnings) jsonOutput.captureWarnings = result.captureWarnings;
+
+  return jsonOutput;
+}
+
 export async function handleWorkflow(
   group: string | undefined,
   args: string[],
@@ -579,8 +629,26 @@ export async function handleWorkflow(
 
   if (action === "list") {
     const jsonFlag = args.includes("--json");
+    // SKILL-UX S2: parse --id <name> and --id=<name> to filter the list to one workflow.
+    let idFilter: string | null = null;
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      if (arg === "--id") {
+        const value = args[i + 1];
+        if (value !== undefined) idFilter = value;
+        break;
+      }
+      if (arg.startsWith("--id=")) {
+        idFilter = arg.slice("--id=".length);
+        break;
+      }
+    }
     const workflows = await listBundledWorkflows();
     if (workflows.length === 0) {
+      if (idFilter !== null) {
+        process.stderr.write(`No bundled workflow named "${idFilter}".\n`);
+        process.exit(1);
+      }
       if (jsonFlag) console.log("[]");
       else console.log("No workflows available.");
       return true;
@@ -597,6 +665,23 @@ export async function handleWorkflow(
         }
       }),
     );
+    if (idFilter !== null) {
+      const idx = workflows.indexOf(idFilter);
+      if (idx === -1) {
+        process.stderr.write(`No bundled workflow named "${idFilter}".\n`);
+        process.exit(1);
+      }
+      const entry = specs[idx];
+      if (jsonFlag) {
+        console.log(JSON.stringify([entry]));
+      } else {
+        // SKILL-UX S2: collapse any multi-line description to keep the filtered
+        // entry a single line (the full list prints descriptions verbatim).
+        const description = entry.description.replace(/\s+/g, " ").trim();
+        console.log(`  ${entry.id} - ${description} [${entry.workspaceMode}]`);
+      }
+      return true;
+    }
     if (jsonFlag) {
       console.log(JSON.stringify(specs));
       return true;
@@ -865,6 +950,26 @@ export async function handleWorkflow(
     // and stay parentless (parent_run_id NULL).
     const parentRunId = process.env.TAMANDUA_RUN_ID?.trim() || undefined;
 
+    // SKILL-UX S3 (US-002/US-003): resolve the launch facts BEFORE
+    // runWorkflow emits its synchronous `run #N ... created` stderr line.
+    // Text mode prints them as the FIRST stdout lines; JSON mode folds them
+    // into the single JSON document printed after the run row is created.
+    // Resolution is best-effort (a fact that cannot be determined is
+    // omitted, never a launch failure); runWorkflow still owns validation
+    // errors and the existing exit codes.
+    const launchInfo = await resolveWorkflowRunLaunchInfo({
+      workflowId: workflowName,
+      harnessType,
+      workingDirectoryForHarness: runArgs.workingDirectoryForHarness,
+      worktreeOriginRepository: runArgs.worktreeOriginRepository,
+      worktreeOriginRef: runArgs.worktreeOriginRef,
+    });
+    if (launchInfo && !runArgs.jsonFlag) {
+      for (const line of formatWorkflowRunLaunchLines(launchInfo)) {
+        console.log(line);
+      }
+    }
+
     const result = await runWorkflow({
       workflowId: workflowName,
       taskTitle: runArgs.taskTitle,
@@ -906,30 +1011,40 @@ export async function handleWorkflow(
       if (runArgs.timeout) waitArgs.push("--timeout", runArgs.timeout);
     }
 
-    if (result.daemonWarning) {
-      let dashboardLine = "";
-      try {
-        const port = readPort();
-        dashboardLine = `\nDashboard: http://localhost:${port}/`;
+    // SKILL-UX S3 (US-003): --json emits ONE JSON document to stdout (the run
+    // fields below plus the resolved launch facts, and the wait result merged
+    // in when --wait is also given) instead of the human-readable Run: block.
+    // Text mode is byte-for-byte unchanged.
+    const runJson = runArgs.jsonFlag
+      ? buildWorkflowRunJsonOutput(result, launchInfo)
+      : undefined;
 
-      } catch {
-        // can't read dashboard port
+    if (!runJson) {
+      if (result.daemonWarning) {
+        let dashboardLine = "";
+        try {
+          const port = readPort();
+          dashboardLine = `\nDashboard: http://localhost:${port}/`;
+
+        } catch {
+          // can't read dashboard port
+        }
+        console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nRun created (pending admission); the reconciler will admit it when the control plane responds.`);
+        console.log(`Check: tamandua workflow status run-${result.runId.slice(0, 8)}${dashboardLine}`);
+      } else if (result.queuedBehindRunId) {
+        // US-003: the harness working directory is held by another live run, so
+        // registration returned a retriable 'waiting' admission (not a failure).
+        // The run is registered and the reconciler admits it once the holder
+        // releases the directory — exit 0 and explain the queue position.
+        console.log(
+          `Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\n` +
+          `Queued behind run ${result.queuedBehindRunId}: harness workdir ${result.workingDirectoryForHarness} is held by that run. ` +
+          `It will be admitted automatically when the holder releases it.`,
+        );
+        console.log(`Check: tamandua workflow status run-${result.runId.slice(0, 8)}`);
+      } else {
+        console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nStatus: ${result.status}\nHarness CWD: ${result.workingDirectoryForHarness}`);
       }
-      console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nRun created (pending admission); the reconciler will admit it when the control plane responds.`);
-      console.log(`Check: tamandua workflow status run-${result.runId.slice(0, 8)}${dashboardLine}`);
-    } else if (result.queuedBehindRunId) {
-      // US-003: the harness working directory is held by another live run, so
-      // registration returned a retriable 'waiting' admission (not a failure).
-      // The run is registered and the reconciler admits it once the holder
-      // releases the directory — exit 0 and explain the queue position.
-      console.log(
-        `Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\n` +
-        `Queued behind run ${result.queuedBehindRunId}: harness workdir ${result.workingDirectoryForHarness} is held by that run. ` +
-        `It will be admitted automatically when the holder releases it.`,
-      );
-      console.log(`Check: tamandua workflow status run-${result.runId.slice(0, 8)}`);
-    } else {
-      console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nStatus: ${result.status}\nHarness CWD: ${result.workingDirectoryForHarness}`);
     }
 
     // WORKDIR-FLAGS US-004: when the caller explicitly allowed sharing (via the
@@ -941,10 +1056,14 @@ export async function handleWorkflow(
       process.stderr.write(formatSharedWorkdirWarning(result.workingDirectoryForHarness) + "\n");
     }
 
-    // If --wait, enter the wait loop for the newly created run
+    // If --wait, enter the wait loop for the newly created run. In JSON mode
+    // the single stdout document is completed by the wait result (merged by
+    // handleWait) so no text is emitted before it.
     if (waitArgs) {
-      const exitCode = await handleWait(waitArgs);
+      const exitCode = await handleWait(waitArgs, runJson);
       process.exitCode = exitCode;
+    } else if (runJson) {
+      console.log(JSON.stringify(runJson));
     }
 
     return true;

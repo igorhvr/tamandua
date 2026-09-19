@@ -122,6 +122,7 @@ tests/cli-version-warning.test.ts
 tests/cli-workflow-install-all.test.ts
 tests/cli-workflow-list-json.test.ts
 tests/cli-workflow-run-parent-linkage.test.ts
+tests/cli-workflow-run-resolution.test.ts
 tests/cli-workflow-run-working-directory.test.ts
 tests/cli-workflow-runs-json.test.ts
 tests/cli-workflow-status-json.test.ts

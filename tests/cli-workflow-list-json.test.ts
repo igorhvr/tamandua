@@ -194,4 +194,123 @@ describe("tamandua workflow list --json", () => {
           `workspaceMode must be "worktree" or "direct", got "${entry.workspaceMode}" for ${entry.id}`);
       }
   });
+
+  // SKILL-UX S2: --help documents the new --id flag
+  it("--id documents the --id flag", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+      const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--help"], tempHome);
+
+      assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${stderr}`);
+      assert.equal(cleanStderr(stderr), "");
+
+      assert.ok(
+        stdout.includes("--id"),
+        `Help output should mention --id flag:\n${stdout}`,
+      );
+      assert.ok(
+        stdout.includes("--id <name>"),
+        `Help output should describe the --id <name> usage:\n${stdout}`,
+      );
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // SKILL-UX S2: workflow list --id filters to one workflow
+  // ═══════════════════════════════════════════════════════════════════
+  it("--id <name> prints exactly one entry line and exits 0", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+      const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--id", "feature-dev-merge"], tempHome);
+
+      assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${stderr}`);
+      assert.equal(cleanStderr(stderr), "");
+
+      const lines = stdout.trim().split("\n");
+      assert.equal(lines.length, 1, `Expected exactly one line, got:\n${stdout}`);
+      assert.ok(lines[0].includes("feature-dev-merge"), `Entry should name the workflow:\n${stdout}`);
+      assert.ok(lines[0].includes(" - "), `Entry should use the ' - ' description format:\n${stdout}`);
+      assert.ok(!lines[0].includes("Available workflows:"), `Entry line must not be a header:\n${stdout}`);
+  });
+
+  it("--id=<name> form also prints exactly one entry line", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+      const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--id=feature-dev-merge"], tempHome);
+
+      assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${stderr}`);
+      assert.equal(cleanStderr(stderr), "");
+
+      const lines = stdout.trim().split("\n");
+      assert.equal(lines.length, 1, `Expected exactly one line, got:\n${stdout}`);
+      assert.ok(lines[0].includes("feature-dev-merge"), `Entry should name the workflow:\n${stdout}`);
+  });
+
+  it("--id <name> for a missing workflow exits 1 with a one-line message", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+      const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--id", "does-not-exist"], tempHome);
+
+      assert.equal(exitCode, 1, `CLI should exit 1, got ${exitCode}`);
+      const err = cleanStderr(stderr);
+      const errLines = err.split("\n");
+      assert.equal(errLines.length, 1, `Expected one stderr line, got:\n${err}`);
+      assert.ok(errLines[0].includes("does-not-exist"), `Message should name the missing id:\n${err}`);
+      // No full workflow list must be printed to stdout.
+      assert.equal(stdout.trim(), "", `Expected no stdout for a missing id, got:\n${stdout}`);
+  });
+
+  it("--id <name> --json outputs a one-element array", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+      const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--id", "feature-dev-merge", "--json"], tempHome);
+
+      assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${stderr}`);
+      assert.equal(cleanStderr(stderr), "");
+
+      const parsed = JSON.parse(stdout.trim());
+      assert.ok(Array.isArray(parsed), "Output must be a JSON array");
+      assert.equal(parsed.length, 1, `Expected exactly one element, got ${parsed.length}`);
+      const entry = parsed[0];
+      assert.equal(entry.id, "feature-dev-merge");
+      assert.ok(typeof entry.name === "string" && entry.name.length > 0, "entry must have a non-empty name");
+      assert.ok(typeof entry.description === "string", "entry must have a description field");
+      assert.ok(entry.workspaceMode === "worktree" || entry.workspaceMode === "direct", "workspaceMode must be worktree or direct");
+  });
+
+  it("--id <name> --json for a missing workflow exits 1 with a one-line message", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+      const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--id", "does-not-exist", "--json"], tempHome);
+
+      assert.equal(exitCode, 1, `CLI should exit 1, got ${exitCode}`);
+      const err = cleanStderr(stderr);
+      const errLines = err.split("\n");
+      assert.equal(errLines.length, 1, `Expected one stderr line, got:\n${err}`);
+      assert.ok(errLines[0].includes("does-not-exist"), `Message should name the missing id:\n${err}`);
+      assert.equal(stdout.trim(), "", `Expected no stdout for a missing id, got:\n${stdout}`);
+  });
 });

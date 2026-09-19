@@ -140,8 +140,11 @@ export function computeExitCode(states: RunState[], timedOut: boolean): number {
   return 0;
 }
 
-export function formatJsonOutput(result: WaitResult): string {
-  return JSON.stringify({
+export function formatJsonOutput(
+  result: WaitResult,
+  extra?: Record<string, unknown>,
+): string {
+  const base = {
     runs: result.runs.map((r) => {
       // TIME-CLOCKS US-012 (rule 2): the durable stored createdAt is aged
       // NUMERICALLY through the shared helper (legacy naive UTC read as UTC,
@@ -164,7 +167,13 @@ export function formatJsonOutput(result: WaitResult): string {
       };
     }),
     timedOut: result.timedOut,
-  }) + "\n";
+  };
+  // SKILL-UX S3 (US-003): `workflow run --wait --json` folds the run's own
+  // fields + resolution facts into the SAME JSON document so stdout stays a
+  // single valid object. `runs`/`timedOut` always win over any same-named
+  // extra keys.
+  const output = extra ? { ...extra, ...base } : base;
+  return JSON.stringify(output) + "\n";
 }
 
 export function formatHumanOutput(result: WaitResult): string {
@@ -287,7 +296,10 @@ function setupEventWatchers(
 
 // ── Main wait handler ──────────────────────────────────────────────
 
-export async function handleWait(args: string[]): Promise<number> {
+export async function handleWait(
+  args: string[],
+  jsonExtra?: Record<string, unknown>,
+): Promise<number> {
   const jsonFlag = args.includes("--json");
   const quietFlag = args.includes("--quiet");
   const allFlag = args.includes("--all");
@@ -406,7 +418,7 @@ export async function handleWait(args: string[]): Promise<number> {
         if (!quietFlag || jsonFlag) {
           if (jsonFlag) {
             process.stdout.write(
-              formatJsonOutput({ runs: states, timedOut: !allDone }),
+              formatJsonOutput({ runs: states, timedOut: !allDone }, jsonExtra),
             );
           } else {
             process.stdout.write(
@@ -454,7 +466,7 @@ export async function handleWait(args: string[]): Promise<number> {
       if (allTerminal) {
         if (!quietFlag || jsonFlag) {
           if (jsonFlag) {
-            process.stdout.write(formatJsonOutput({ runs: states, timedOut: false }));
+            process.stdout.write(formatJsonOutput({ runs: states, timedOut: false }, jsonExtra));
           } else {
             process.stdout.write(
               appendHarnessProbeFailureBlocks(formatHumanOutput({ runs: states, timedOut: false }), states),
