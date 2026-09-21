@@ -1204,6 +1204,13 @@ leave it unset) and route only the log/evidence paths there. Always compare the
 observed failing-title set against the recorded #37 baseline before treating a
 red full-suite run as a regression.
 
+Fixtures that themselves build a Matchlock socket path should not depend on the
+ambient `TMPDIR` at all: use `tamanduaShortTempDir()` (`src/lib/temp-dir.ts`,
+`mkdtemp` under the literal `/tmp`, realpath'd) so the fixture `HOME` stays
+within the `sun_path` budget on every platform. `createIsolatedState()` already
+does this (`/tmp/tt-<slug>-XXXXXX`), which keeps the hermes/pi runner suites and
+the native-step-* consumers green regardless of the caller's `TMPDIR`.
+
 #### Launch-time harness probe in dispatch tests (IFLB)
 
 The dispatch motor probes a run's harness at its first real dispatch

@@ -64,3 +64,30 @@ export function tamanduaTempRoot(): string {
 export function tamanduaTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(tamanduaTempRoot(), prefix));
 }
+
+/**
+ * Short literal base for temp fixtures whose absolute paths must fit the unix
+ * `sun_path` limit (108 bytes including NUL on Linux, 104 on macOS) even after
+ * a deep fixed suffix such as Matchlock's
+ * `<HOME>/.matchlock/vms/vm-XXXXXXXX/vsock.sock_5001` is appended.
+ *
+ * Deliberately NOT `tamanduaTempRoot()`: the ambient root (or a deep
+ * `TAMANDUA_TEST_TMPDIR` evidence path) can be long enough that a fixture
+ * `HOME` derived from it trips the product's pre-flight socket-path refusal.
+ * `/tmp` is short on every platform — on macOS its realpath is
+ * `/private/tmp`, only 8 bytes longer.
+ */
+const SHORT_TEMP_BASE = "/tmp";
+
+/**
+ * Create a unique temp directory under the short literal `/tmp` base and
+ * return its canonical realpath.
+ *
+ * Use this ONLY for fixtures that must keep absolute unix-socket/document
+ * paths within the `sun_path` budget; ordinary temp assets use
+ * {@link tamanduaTempDir}. The caller owns cleanup (e.g. `fs.rmSync`).
+ */
+export function tamanduaShortTempDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(SHORT_TEMP_BASE, prefix));
+  return fs.realpathSync(dir);
+}

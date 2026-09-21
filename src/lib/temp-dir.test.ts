@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   tamanduaTempRoot,
   tamanduaTempDir,
+  tamanduaShortTempDir,
   _resetTempRoot,
 } from "../../dist/lib/temp-dir.js";
 
@@ -158,6 +159,31 @@ describe("temp-dir", () => {
       _resetTempRoot();
       const dir1 = tamanduaTempDir("tamandua-unique-");
       const dir2 = tamanduaTempDir("tamandua-unique-");
+      _cleanup.push(dir1, dir2);
+
+      assert.notEqual(dir1, dir2, "must produce unique directories");
+    });
+  });
+
+  describe("tamanduaShortTempDir", () => {
+    it("creates a short /tmp-rooted directory and returns its canonical realpath", () => {
+      const dir = tamanduaShortTempDir("tt-test-");
+      _cleanup.push(dir);
+
+      assert.ok(fs.existsSync(dir), "directory must exist");
+      assert.ok(fs.statSync(dir).isDirectory(), "must be a directory");
+      assert.equal(dir, fs.realpathSync(dir), "must already be a realpath (macOS /tmp -> /private/tmp)");
+      // Short enough that the longest Matchlock socket layout (43 bytes) stays
+      // within the macOS 104-byte sun_path budget.
+      assert.ok(
+        Buffer.byteLength(dir) + 43 <= 103,
+        `short temp dir ${dir} must leave room for the longest socket layout`,
+      );
+    });
+
+    it("produces distinct directories on repeated calls", () => {
+      const dir1 = tamanduaShortTempDir("tt-uniq-");
+      const dir2 = tamanduaShortTempDir("tt-uniq-");
       _cleanup.push(dir1, dir2);
 
       assert.notEqual(dir1, dir2, "must produce unique directories");

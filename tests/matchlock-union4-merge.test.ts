@@ -19,11 +19,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SCHEMA_VERSION } from "../dist/db.js";
+import { tamanduaShortTempDir } from "../dist/lib/temp-dir.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // UNION-PORT: the port merge parents are the integration base
@@ -36,35 +37,141 @@ function git(args: string[]): string {
   return execFileSync("git", args, { cwd: REPO, encoding: "utf8" }).trim();
 }
 
+/** True when `rev` names a commit object reachable in this clone. */
+function objectExists(rev: string): boolean {
+  try {
+    execFileSync("git", ["cat-file", "-e", `${rev}^{commit}`], {
+      cwd: REPO,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const LT = "<".repeat(7);
+const GT = ">".repeat(7);
+const BASE = "|".repeat(7);
+
+/**
+ * Extended-regex pattern matching the unambiguous conflict-marker prefixes.
+ *
+ * The base marker's seven `|` characters MUST be escaped. In ERE an unescaped
+ * `|` is an alternation, so interpolating a raw `|||||||` (the old bug) parsed
+ * as seven empty alternatives and `git grep -E` aborted with
+ * `empty (sub)expression` (exit 128), which the harness then misread as
+ * "markers found" (128 !== 1). A bare `=======` line stays excluded on purpose:
+ * it is also a legitimate Markdown/section separator, and a real conflict always
+ * carries a matching `<<<<<<<`/`>>>>>>>`.
+ */
+function conflictMarkerPattern(): string {
+  return `^(${LT} |${GT} |${BASE.replace(/\|/g, "\\|")} )`;
+}
+
+interface GrepResult {
+  status: number;
+  /** stdout + stderr, so a git failure is visible in the assertion message. */
+  output: string;
+}
+
+/**
+ * Scan tracked files under `cwd` for conflict markers.
+ *
+ * Mirrors the exit-code contract: 0 = matches found, 1 = no matches, anything
+ * else (notably 128) = git itself failed and the result must not be read as
+ * "clean".
+ */
+function grepConflictMarkers(cwd: string): GrepResult {
+  try {
+    const stdout = execFileSync(
+      "git",
+      ["grep", "-nE", conflictMarkerPattern(), "--", "."],
+      { cwd, encoding: "utf8" },
+    );
+    return { status: 0, output: stdout };
+  } catch (err) {
+    const e = err as { status?: number; stdout?: string; stderr?: string };
+    return {
+      status: e.status ?? 1,
+      output: `${e.stdout ?? ""}${e.stderr ?? ""}`,
+    };
+  }
+}
+
 describe("matchlock-union4 merge deliverable", () => {
   it("leaves no conflict markers in tracked files", () => {
-    // Only the unambiguous marker prefixes are matched: a bare `=======` line
-    // is also a legitimate Markdown/section separator, so it is intentionally
-    // excluded (a real conflict always has a matching `<<<<<<<`/`>>>>>>>`).
-    const lt = "<".repeat(7);
-    const gt = ">".repeat(7);
-    const base = "|".repeat(7);
-    const pattern = `^(${lt} |${gt} |${base} )`;
-    let stdout = "";
-    let status = 0;
-    try {
-      stdout = execFileSync("git", ["grep", "-nE", pattern, "--", "."], {
-        cwd: REPO,
-        encoding: "utf8",
-      });
-    } catch (err) {
-      const e = err as { status?: number; stdout?: string };
-      status = e.status ?? 1;
-      stdout = e.stdout ?? "";
-    }
-    assert.equal(status, 1, `conflict markers found:\n${stdout}`);
+    const { status, output } = grepConflictMarkers(REPO);
+    assert.equal(
+      status,
+      1,
+      status === 128
+        ? `git grep could not run (malformed pattern or repo error):\n${output}`
+        : `conflict markers found:\n${output}`,
+    );
   });
 
-  it("HEAD ancestry is the union merge (or its squashed descendant)", () => {
+  it("conflict-marker scan detects every marker prefix and stays clean otherwise", () => {
+    // Self-contained proof that the scan can actually detect markers (not just
+    // exit 1 for a pattern that never matches): build a throwaway repo, plant
+    // synthetic markers, and assert git grep finds them; then clean the file and
+    // assert the exit-code contract (1 = no matches).
+    const root = tamanduaShortTempDir("tt-u4-");
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: root });
+      const markerFile = path.join(root, "synthetic-markers.txt");
+      writeFileSync(
+        markerFile,
+        [`${LT} HEAD`, `${GT} other-branch`, `${BASE} merged common ancestors`].join("\n") + "\n",
+      );
+      execFileSync("git", ["add", "synthetic-markers.txt"], { cwd: root });
+
+      const found = grepConflictMarkers(root);
+      assert.equal(
+        found.status,
+        0,
+        `expected the scan to detect the synthetic markers, got status ${found.status}:\n${found.output}`,
+      );
+      for (const prefix of [LT, GT, BASE]) {
+        assert.ok(
+          found.output.includes(prefix),
+          `scan missed marker prefix ${JSON.stringify(prefix)}:\n${found.output}`,
+        );
+      }
+
+      // The deliberate `=======` exclusion and the anchor both hold.
+      const pattern = new RegExp(conflictMarkerPattern());
+      assert.equal(pattern.test("======="), false, "bare ======= must not match");
+      assert.equal(pattern.test("<<<<<<<no-space"), false, "prefix requires trailing space");
+      assert.equal(pattern.test("zzz <<<<<<< HEAD"), false, "match is anchored at line start");
+
+      writeFileSync(markerFile, "no conflict markers here\n");
+      const clean = grepConflictMarkers(root);
+      assert.equal(
+        clean.status,
+        1,
+        `expected exit 1 (no matches) on a clean tree, got ${clean.status}:\n${clean.output}`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("HEAD ancestry is the union merge (or its squashed descendant)", (t) => {
     const parents = git(["rev-list", "--parents", "-n", "1", "HEAD"])
       .split(/\s+/)
       .slice(1);
     if (parents.length === 2) {
+      // This assertion needs the recorded union parents to be present. A fresh
+      // clone only carries HEAD-reachable objects, so when they are absent the
+      // check is skipped with an explicit reason rather than failing.
+      const missing = [MAIN_TIP, UNION_TIP].filter((sha) => !objectExists(sha));
+      if (missing.length > 0) {
+        t.skip(
+          `union merge parents unreachable in this clone: ${missing.join(", ")}`,
+        );
+        return;
+      }
       assert.deepEqual(
         new Set(parents),
         new Set([MAIN_TIP, UNION_TIP]),

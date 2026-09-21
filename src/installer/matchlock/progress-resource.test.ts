@@ -18,10 +18,10 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { after, describe, it } from "node:test";
+import { tamanduaShortTempDir } from "../../../dist/lib/temp-dir.js";
 import {
   PROGRESS_DOC_FILE_NAME,
   ProgressResourceAccess,
@@ -37,11 +37,15 @@ const RUN = "11111111-1111-4111-8111-111111111111";
 const PREFIXED_RUN = `run-${RUN}`;
 
 function freshRoot(tag: string): string {
-  // Deliberately uses the SHORT os.tmpdir() base (not tamanduaTempRoot): the
-  // FIFO/socket case below binds an AF_UNIX socket at
-  // `<root>/<run-uuid>/progress-resource/progress.txt`, whose sun_path must
-  // stay under 108 bytes. See OS_TMPDIR_ALLOWLIST in temp-dir.guard.test.ts.
-  return fs.mkdtempSync(path.join(os.tmpdir(), "mtlk-pr-" + tag + "-"));
+  // The FIFO/socket case below binds an AF_UNIX socket at
+  // `<root>/<run-uuid>/progress-resource/progress.txt`, whose sun_path must fit
+  // the kernel budget (104 bytes incl. NUL on macOS, 108 on Linux). The ambient
+  // OS temp directory (deep under /private/var on macOS) would push the doc
+  // path to ~136 bytes, and `net.Server.listen()` would then report success
+  // WITHOUT creating the socket file, silently disabling the product refusal
+  // this case is meant to exercise. Use the short literal temp base provided by
+  // tamanduaShortTempDir() so the doc path stays well under budget.
+  return tamanduaShortTempDir("tt-pr-" + tag + "-");
 }
 
 /** HOST-FS SIMULATION of the guest writing through the directory mount. */
@@ -208,13 +212,21 @@ describe("progress resource host layer (host-fs simulation, NOT actualVM)", () =
     assert.ok(Date.now() - t0 < 2000, "read of a FIFO leaf must not hang");
 
     // Socket leaf (unix domain socket). Keep the listener OPEN while reading
-    // (Node removes the socket file when the server closes).
+    // (Node removes the socket file when the server closes). The doc path must
+    // fit the macOS sun_path budget (104 bytes incl. NUL); otherwise listen()
+    // silently succeeds without creating the socket and the refusal below would
+    // assert against an absent leaf.
+    assert.ok(
+      Buffer.byteLength(doc) <= 103,
+      `socket fixture doc path must fit the macOS sun_path budget (<=103 bytes), got ${Buffer.byteLength(doc)}: ${doc}`,
+    );
     fs.rmSync(doc, { force: true });
     await new Promise<void>((resolve, reject) => {
       const srv = net.createServer();
       srv.on("error", reject);
       srv.listen(doc, () => {
         try {
+          assert.ok(fs.lstatSync(doc).isSocket(), `net.listen must create a real AF_UNIX socket at ${doc}`);
           assert.throws(
             () => access.readText(),
             (e: unknown) => e instanceof ProgressResourceError && e.code === "progress_special_file",

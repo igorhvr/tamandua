@@ -59,6 +59,10 @@ import {
 } from "../../../dist/installer/matchlock/hermes-invocation-runner.js";
 import { resolveHermesAdapterPlan, buildHermesGuestLaunch } from "../../../dist/installer/matchlock/hermes-adapter.js";
 import { MatchlockRunnerError } from "../../../dist/installer/matchlock/pi-invocation-runner.js";
+import {
+  MATCHLOCK_SOCKET_PATH_ADDED_BYTES,
+  computeLongestMatchlockSocketPath,
+} from "../../../dist/installer/matchlock/home-alias.js";
 import { readOrphanVms } from "../../../dist/installer/matchlock/vm-orphans.js";
 import type { ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
 import { guestSuiteNamespaceId, type GuestSuiteNamespace } from "../../../dist/installer/matchlock/guest-suite-contract.js";
@@ -1055,6 +1059,37 @@ describe("hermes invocation runner — pure resolution/mount admission", () => {
     assert.equal(bad.status, "unavailable");
     assert.equal(bad.sessionId, "sess-recovered-0001");
     assert.equal(bad.tokens, undefined);
+  });
+
+  it("isolated fixture HOMEs keep the longest Matchlock socket path within the macOS sun_path budget", () => {
+    // The runner refuses (matchlock_home_socket_path_too_long) BEFORE any VM
+    // work when HOME + the longest Matchlock socket layout exceeds sun_path.
+    // The fixture HOMEs must stay short on EVERY platform so this suite
+    // exercises the runner, never its pre-flight refusal — and without any
+    // platform-conditional skip. 103 bytes is the macOS budget (104 incl. NUL).
+    for (const tag of [
+      "hermes-runner-sticky",
+      "hermes-store-recovery",
+      "hermes-store-populated",
+      "hermes-store-ambiguous",
+      "hermes-runner-us009-failclose",
+    ]) {
+      const st = createIsolatedState(tag);
+      try {
+        const longest = computeLongestMatchlockSocketPath(st.homeDir);
+        const bytes = Buffer.byteLength(longest);
+        assert.ok(
+          bytes <= 103,
+          `fixture HOME for tag ${tag} yields a ${bytes}-byte longest Matchlock socket path (${longest}); must be <= 103`,
+        );
+        assert.ok(
+          Buffer.byteLength(st.homeDir) + MATCHLOCK_SOCKET_PATH_ADDED_BYTES <= 103,
+          `fixture HOME ${st.homeDir} plus the ${MATCHLOCK_SOCKET_PATH_ADDED_BYTES}-byte socket layout must be <= 103 bytes`,
+        );
+      } finally {
+        fs.rmSync(st.root, { recursive: true, force: true });
+      }
+    }
   });
 });
 

@@ -52,6 +52,17 @@ const SOURCE_TIPS = [
 ] as const;
 
 /**
+ * The git objects the branch-delta checks need: the common base plus every source
+ * tip. They are reachable only in the clone where the integration was performed
+ * (and its descendants that still fetch those feature branches); a fresh clone of
+ * main/HEAD has none of them, so the delta checks are non-computable there.
+ */
+const HISTORICAL_OBJECT_REVS: readonly string[] = [COMMON_BASE, ...SOURCE_TIPS.map((source) => source.tip)];
+
+/** A syntactically valid object id that can never exist (the all-zero id). */
+const ABSENT_OBJECT_SHA = "0000000000000000000000000000000000000000";
+
+/**
  * Rewritten contradictory assertions. Each entry names the HEAD test title that
  * replaced the losing source assertion and the two source contracts whose
  * assertions disagreed; the file must carry a comment block naming BOTH.
@@ -184,6 +195,31 @@ function objectExists(rev: string): boolean {
   }
 }
 
+type ObjectProbe = (rev: string) => boolean;
+
+/**
+ * Reachability gate: the subset of `revs` the `probe` cannot resolve. Pure so it
+ * can be unit-tested against a fake probe; production passes `objectExists`.
+ */
+function unreachableObjects(revs: readonly string[], probe: ObjectProbe): string[] {
+  return revs.filter((rev) => !probe(rev));
+}
+
+const missingHistoricalObjects = unreachableObjects(HISTORICAL_OBJECT_REVS, objectExists);
+
+/**
+ * `false` when every historical object is reachable (the four delta checks must
+ * then execute); otherwise an explicit skip reason naming the missing objects.
+ * This is a conditional skip so the checks still run in the integration clone,
+ * and a fresh clone reports exactly why they cannot run there instead of failing.
+ */
+const historicalObjectsSkip: string | false =
+  missingHistoricalObjects.length === 0
+    ? false
+    : `historical source-tip object(s) not reachable in this clone: ` +
+      `${missingHistoricalObjects.join(", ")}; the common base and source tips exist only in the ` +
+      `one-time integration clone, so the branch-delta checks are not computable here`;
+
 function changedTestPaths(base: string, tip: string): string[] {
   return gitLines(["diff", "--name-only", base, tip, "--", "*.test.ts", "tests/", "e2e-tests/"]).filter(
     isTestPath,
@@ -248,59 +284,87 @@ function commentBlocks(text: string): string[] {
 }
 
 describe("MTLK-INTEGRATE test-file parity", () => {
-  it("has all four source tip objects available (distinct full SHAs reachable from this clone)", () => {
-    const seen = new Set<string>();
-    for (const source of SOURCE_TIPS) {
-      assert.ok(
-        objectExists(source.tip),
-        `${source.contract} tip ${source.tip} must be reachable for the delta enumeration`,
-      );
-      assert.ok(!seen.has(source.tip), `${source.contract} tip must be distinct`);
-      seen.add(source.tip);
-      assert.match(source.tip, /^[0-9a-f]{40}$/);
-      // The symbolic ref may have been deleted in a trimmed clone; the object
-      // is what the delta checks need, so a missing ref is not fatal.
-      if (objectExists(source.ref)) {
-        assert.equal(git(["rev-parse", source.ref]).trim(), source.tip);
-      }
-    }
-    assert.ok(objectExists(COMMON_BASE), `common base ${COMMON_BASE} must be reachable`);
-  });
-
-  it("every test path changed by any of the four source branches exists on the integrated tree", () => {
-    const missing: string[] = [];
-    let checked = 0;
-    for (const source of SOURCE_TIPS) {
-      const changed = changedTestPaths(COMMON_BASE, source.tip);
-      assert.ok(
-        changed.length > 0,
-        `${source.contract} must have changed at least one test path relative to ${COMMON_BASE.slice(0, 8)}`,
-      );
-      for (const changedPath of changed) {
-        checked += 1;
-        if (!objectExists(`HEAD:${changedPath}`)) {
-          missing.push(`${source.contract} -> ${changedPath}`);
+  it(
+    "has all four source tip objects available (distinct full SHAs reachable from this clone)",
+    { skip: historicalObjectsSkip },
+    () => {
+      const seen = new Set<string>();
+      for (const source of SOURCE_TIPS) {
+        assert.ok(
+          objectExists(source.tip),
+          `${source.contract} tip ${source.tip} must be reachable for the delta enumeration`,
+        );
+        assert.ok(!seen.has(source.tip), `${source.contract} tip must be distinct`);
+        seen.add(source.tip);
+        assert.match(source.tip, /^[0-9a-f]{40}$/);
+        // The symbolic ref may have been deleted in a trimmed clone; the object
+        // is what the delta checks need, so a missing ref is not fatal.
+        if (objectExists(source.ref)) {
+          assert.equal(git(["rev-parse", source.ref]).trim(), source.tip);
         }
       }
-    }
-    assert.equal(missing.length, 0, `test paths absent from the integrated tree:\n${missing.join("\n")}`);
-    assert.ok(checked > 0);
-  });
+      assert.ok(objectExists(COMMON_BASE), `common base ${COMMON_BASE} must be reachable`);
+    },
+  );
 
-  it("the integrated tree's test set is a superset of every source branch's test set", () => {
-    const headTestPaths = treeTestPaths("HEAD");
-    const missing: string[] = [];
-    for (const source of SOURCE_TIPS) {
-      const tipTestPaths = treeTestPaths(source.tip);
-      for (const tipPath of tipTestPaths) {
-        if (!headTestPaths.has(tipPath)) missing.push(`${source.contract} -> ${tipPath}`);
+  it(
+    "every test path changed by any of the four source branches exists on the integrated tree",
+    { skip: historicalObjectsSkip },
+    () => {
+      const missing: string[] = [];
+      let checked = 0;
+      for (const source of SOURCE_TIPS) {
+        const changed = changedTestPaths(COMMON_BASE, source.tip);
+        assert.ok(
+          changed.length > 0,
+          `${source.contract} must have changed at least one test path relative to ${COMMON_BASE.slice(0, 8)}`,
+        );
+        for (const changedPath of changed) {
+          checked += 1;
+          if (!objectExists(`HEAD:${changedPath}`)) {
+            missing.push(`${source.contract} -> ${changedPath}`);
+          }
+        }
       }
-    }
-    assert.equal(
-      missing.length,
-      0,
-      `test files present on a source branch but absent from HEAD:\n${missing.join("\n")}`,
-    );
+      assert.equal(missing.length, 0, `test paths absent from the integrated tree:\n${missing.join("\n")}`);
+      assert.ok(checked > 0);
+    },
+  );
+
+  it(
+    "the integrated tree's test set is a superset of every source branch's test set",
+    { skip: historicalObjectsSkip },
+    () => {
+      const headTestPaths = treeTestPaths("HEAD");
+      const missing: string[] = [];
+      for (const source of SOURCE_TIPS) {
+        const tipTestPaths = treeTestPaths(source.tip);
+        for (const tipPath of tipTestPaths) {
+          if (!headTestPaths.has(tipPath)) missing.push(`${source.contract} -> ${tipPath}`);
+        }
+      }
+      assert.equal(
+        missing.length,
+        0,
+        `test files present on a source branch but absent from HEAD:\n${missing.join("\n")}`,
+      );
+    },
+  );
+
+  it("reachability gate: HEAD is reachable, an absent SHA is unreachable", () => {
+    // The production probe: HEAD resolves in any real clone.
+    assert.equal(objectExists("HEAD"), true, "HEAD must resolve");
+    assert.deepEqual(unreachableObjects(["HEAD"], objectExists), []);
+
+    // A syntactically valid but absent object id must be reported unreachable.
+    assert.equal(objectExists(ABSENT_OBJECT_SHA), false, "the all-zero object id must not resolve");
+    assert.deepEqual(unreachableObjects([ABSENT_OBJECT_SHA], objectExists), [ABSENT_OBJECT_SHA]);
+
+    // The gate is a pure filter over the probe, so a missing required object
+    // (and only that object) selects the conditional skip path.
+    const fakeProbe: ObjectProbe = (rev) => rev === "HEAD";
+    assert.deepEqual(unreachableObjects(["HEAD", ABSENT_OBJECT_SHA], fakeProbe), [ABSENT_OBJECT_SHA]);
+    assert.deepEqual(unreachableObjects(HISTORICAL_OBJECT_REVS, () => true), []);
   });
 
   it("documents every rewritten contradictory assertion with both source contracts", () => {
@@ -322,30 +386,34 @@ describe("MTLK-INTEGRATE test-file parity", () => {
     }
   });
 
-  it("every branch-introduced test title absent from HEAD belongs to a documented rewrite", () => {
-    const documentedFiles = new Set(REWRITTEN_ASSERTIONS.map((entry) => entry.file));
-    const undocumented = new Set<string>();
-    for (const source of SOURCE_TIPS) {
-      for (const changedPath of changedTestPaths(COMMON_BASE, source.tip)) {
-        const baseTitles = testTitles(showFile(COMMON_BASE, changedPath));
-        const tipTitles = testTitles(showFile(source.tip, changedPath));
-        const headTitles = testTitles(showFile("HEAD", changedPath));
-        for (const title of tipTitles) {
-          if (baseTitles.has(title)) continue;
-          if (!headTitles.has(title) && !documentedFiles.has(changedPath)) {
-            undocumented.add(`${source.contract} -> ${changedPath} :: ${title}`);
+  it(
+    "every branch-introduced test title absent from HEAD belongs to a documented rewrite",
+    { skip: historicalObjectsSkip },
+    () => {
+      const documentedFiles = new Set(REWRITTEN_ASSERTIONS.map((entry) => entry.file));
+      const undocumented = new Set<string>();
+      for (const source of SOURCE_TIPS) {
+        for (const changedPath of changedTestPaths(COMMON_BASE, source.tip)) {
+          const baseTitles = testTitles(showFile(COMMON_BASE, changedPath));
+          const tipTitles = testTitles(showFile(source.tip, changedPath));
+          const headTitles = testTitles(showFile("HEAD", changedPath));
+          for (const title of tipTitles) {
+            if (baseTitles.has(title)) continue;
+            if (!headTitles.has(title) && !documentedFiles.has(changedPath)) {
+              undocumented.add(`${source.contract} -> ${changedPath} :: ${title}`);
+            }
           }
         }
       }
-    }
-    assert.equal(
-      undocumented.size,
-      0,
-      "branch-introduced test titles disappeared without a documented rewrite " +
-        "(add an entry to REWRITTEN_ASSERTIONS naming both contracts):\n" +
-        [...undocumented].join("\n"),
-    );
-  });
+      assert.equal(
+        undocumented.size,
+        0,
+        "branch-introduced test titles disappeared without a documented rewrite " +
+          "(add an entry to REWRITTEN_ASSERTIONS naming both contracts):\n" +
+          [...undocumented].join("\n"),
+      );
+    },
+  );
 
   it("this reconciliation test is classified in the serial lane", () => {
     const rel = path.relative(REPO_ROOT, fileURLToPath(import.meta.url));

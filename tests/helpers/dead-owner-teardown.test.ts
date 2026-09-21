@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { terminateOwnedProcessGroup, reapStaleOrphans, decideOwnershipByIdentity } from "./dead-owner-teardown.ts";
 import { getProcessStartIdentity } from "../../src/lib/process-start-identity.ts";
-import { getPgid, getProcessState } from "../../dist/lib/proc-info.js";
+import { getPgid, getProcessState, listProcessDetails } from "../../dist/lib/proc-info.js";
 
 // ── Pure ABA identity-gate decision (v2 matcher) ──────────────────────
 //
@@ -133,6 +133,10 @@ while :; do sleep 0.1; done
     const pgid = child.pid!;
     writeFileSync(pgidFile, String(pgid));
     writeFileSync(`${pgidFile}.pid`, String(pgid));
+    // Do NOT return until the kernel process table proves ownership: the
+    // spawn handle names the group immediately, but its argv still shows the
+    // parent until exec(), so an immediate teardown would (correctly) refuse.
+    waitForOwnedGroupReady(pgid, marker);
     return { pgid, child };
   }
 
@@ -173,6 +177,9 @@ while :; do sleep 0.1; done
     child.unref();
     ownedChildren.push(child);
     const leaderPgid = child.pid!;
+    // As in spawnDetachedSuite: wait until the marker is visible in the
+    // group's argv before any teardown can run (fork→exec race).
+    waitForOwnedGroupReady(leaderPgid, marker);
     const memberPid = readIntegerFileWhenReady(memberFile);
     // Record the MEMBER pid ON PURPOSE (the regression scenario).
     writeFileSync(pgidFile, String(memberPid));
@@ -205,6 +212,64 @@ while :; do sleep 0.1; done
    */
   function readPgidWhenReady(pgidFile: string, deadlineMs = 5000): number {
     return readIntegerFileWhenReady(pgidFile, deadlineMs);
+  }
+
+  /**
+   * True when the kernel process table shows a member of `pgid` whose command
+   * line carries `marker` — the exact evidence `terminateOwnedProcessGroup`
+   * requires before it will signal.
+   */
+  function processTableHasOwnedMember(pgid: number, marker: string): boolean {
+    try {
+      for (const detail of listProcessDetails()) {
+        if (detail.pgid !== pgid) continue;
+        if (detail.cmdline.includes(marker)) return true;
+      }
+    } catch {
+      // Process table temporarily unavailable — keep polling to the deadline.
+    }
+    return false;
+  }
+
+  /**
+   * Bounded wait until the freshly spawned group is actually OWNED by the
+   * marker: a member process (pgid match) whose argv contains the marker.
+   *
+   * `spawn()` returns as soon as the child is forked; between fork() and
+   * exec() the child still carries the PARENT's Node argv, which does not
+   * contain the per-test marker. A teardown issued in that window finds no
+   * owned member, refuses to signal (correctly — it must not kill unproven
+   * groups), and the "suite must be dead" assertion fails. Polling the
+   * process table until ownership is visible is deterministic and uses the
+   * same 5000 ms deadline as the pid-file readers instead of a fixed sleep.
+   *
+   * Throws (rather than silently proceeding) when the deadline passes: an
+   * unowned group is a broken fixture, not a teardown scenario to exercise.
+   */
+  function waitForOwnedGroupReady(pgid: number, marker: string, deadlineMs = 5000): void {
+    const deadline = Date.now() + deadlineMs;
+    for (;;) {
+      if (processTableHasOwnedMember(pgid, marker)) return;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `process group ${pgid} did not expose ownership marker ${marker} within ${deadlineMs}ms`,
+        );
+      }
+      spinWait(25);
+    }
+  }
+
+  /**
+   * Bounded wait for a pid to be truly dead (kernel state not Z/X and gone).
+   * SIGKILL delivery is not assumed synchronous; the teardown helper returns
+   * as soon as it has signalled, so assertions poll instead of racing.
+   */
+  function waitUntilDead(pid: number, deadlineMs = 5000): void {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline) {
+      if (!isAlive(pid)) return;
+      spinWait(25);
+    }
   }
 
   /**
@@ -318,6 +383,8 @@ while :; do sleep 0.1; done
 
     terminateOwnedProcessGroup({ pgidFile, ownershipMarker: marker, graceMs: 500 });
 
+    waitUntilDead(leaderPgid);
+    waitUntilDead(memberPid);
     assert.ok(!isAlive(leaderPgid), "whole group must be torn down from a recorded member pid");
     assert.ok(!isAlive(memberPid), "nested shell member must be torn down");
   });
@@ -351,6 +418,7 @@ while :; do sleep 0.1; done
     terminateOwnedProcessGroup({ pgidFile, ownershipMarker: marker, graceMs: 500 });
 
     // After teardown, the process group should be dead
+    waitUntilDead(pgid);
     assert.ok(!isAlive(pgid), "suite must be dead after ownership-scoped teardown");
   });
 
@@ -364,6 +432,9 @@ while :; do sleep 0.1; done
 
     // First teardown kills
     terminateOwnedProcessGroup({ pgidFile, ownershipMarker: marker, graceMs: 500 });
+    // SIGKILL delivery is not assumed synchronous: poll the kernel state
+    // (bounded) instead of racing the assertion against process reaping.
+    waitUntilDead(pgid);
     assert.ok(!isAlive(pgid), "suite must be dead after first teardown");
 
     // Second teardown must not throw (ESRCH tolerance)
@@ -422,6 +493,7 @@ while :; do sleep 0.1; done
 
     // Now prove ownership and tear down
     terminateOwnedProcessGroup({ pgidFile, ownershipMarker: marker, graceMs: 500 });
+    waitUntilDead(suitePgid);
     assert.ok(!isAlive(suitePgid), "suite must be dead");
     assert.ok(isAlive(unrelatedPid), "unrelated process must still be alive after suite teardown");
 
@@ -454,6 +526,7 @@ while :; do sleep 0.1; done
     });
 
     // Suite must be dead
+    waitUntilDead(pgid);
     assert.ok(!isAlive(pgid), "suite must be dead when ABA identity matches");
   });
 
@@ -528,6 +601,8 @@ while :; do sleep 0.1; done
     });
 
     // Both main suite AND stray must be dead
+    waitUntilDead(suitePgid);
+    waitUntilDead(strayPid);
     assert.ok(!isAlive(suitePgid), "main suite must be dead");
     assert.ok(!isAlive(strayPid), "stray process must be dead after marker-scan fallback");
   });
@@ -564,6 +639,7 @@ while :; do sleep 0.1; done
     reapStaleOrphans([pid]);
 
     // Must be dead
+    waitUntilDead(pid);
     assert.ok(!isAlive(pid), "process must be dead after reapStaleOrphans");
   });
 
@@ -606,6 +682,7 @@ while :; do sleep 0.1; done
     reapStaleOrphans([alivePid, 99999999]);
 
     // Alive one must be dead, call must not have thrown
+    waitUntilDead(alivePid);
     assert.ok(!isAlive(alivePid), "alive process must be dead after reapStaleOrphans");
   });
 });

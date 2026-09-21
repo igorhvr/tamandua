@@ -68,13 +68,6 @@ const OS_TMPDIR_ALLOWLIST: Record<string, string> = {
   // Tamandua-managed temp asset.
   "tests/e2e-infrastructure.test.ts":
     "TMPDIR fallback for a spawned gate subprocess env — not a temp asset",
-
-  // AF_UNIX sun_path limit: the FIFO/socket leaf case binds a unix socket at
-  // `<root>/<run-uuid>/progress-resource/progress.txt`; the tamanduaTempRoot
-  // base would push the path past 108 bytes (EINVAL), so this file needs the
-  // short os.tmpdir() base.
-  "src/installer/matchlock/progress-resource.test.ts":
-    "AF_UNIX socket fixture needs a short os.tmpdir() base to stay under sun_path",
 };
 
 /**

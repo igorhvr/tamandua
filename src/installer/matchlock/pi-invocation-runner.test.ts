@@ -56,6 +56,10 @@ import { stripGuestSuiteEnv, GUEST_SUITE_ENV_KEYS } from "../../../dist/installe
 import { committedTreeHash, computeCmdHash } from "../../../dist/installer/matchlock/guest-suite-git.js";
 import { PROGRESS_DOC_FILE_NAME } from "../../../dist/installer/matchlock/progress-resource.js";
 import { readOrphanVms } from "../../../dist/installer/matchlock/vm-orphans.js";
+import {
+  MATCHLOCK_SOCKET_PATH_ADDED_BYTES,
+  computeLongestMatchlockSocketPath,
+} from "../../../dist/installer/matchlock/home-alias.js";
 
 // ── shared identity ────────────────────────────────────────────────────
 
@@ -747,6 +751,45 @@ function invoke(opts: InvokeOptions): Promise<MatchlockInvocationResult> {
 // ── tests ──────────────────────────────────────────────────────────────
 
 describe("pi invocation runner (mock local-VM driver; real broker/services/pack)", () => {
+  it("isolated fixture HOMEs keep the longest Matchlock socket path within the macOS sun_path budget", () => {
+    // Group A (US-002): makeRig()/sticky take their HOME from
+    // createIsolatedState(), whose root MUST stay short on EVERY platform.
+    // The runner refuses (matchlock_home_socket_path_too_long) BEFORE any VM
+    // work when HOME + the longest Matchlock socket layout exceeds sun_path
+    // (macOS 104 bytes incl. NUL). This asserts the shared short temp-home
+    // fixture keeps every representative rig tag — and the module-level sticky
+    // state — inside that budget, so the suite never exercises the pre-flight
+    // refusal and no platform-conditional skip is needed.
+    const liveSticky = computeLongestMatchlockSocketPath(sticky.homeDir);
+    assert.ok(
+      Buffer.byteLength(liveSticky) <= 103,
+      `module-level sticky HOME ${sticky.homeDir} yields a ${Buffer.byteLength(liveSticky)}-byte longest Matchlock socket path (${liveSticky}); must be <= 103`,
+    );
+    for (const tag of [
+      "runner-us009-failclose",
+      "runner-cleanup-serialize",
+      "runner-preharness-fatal",
+      "runner-fresh",
+      "runner-vm-reap-unconfirmed",
+    ]) {
+      const st = createIsolatedState(tag);
+      try {
+        const longest = computeLongestMatchlockSocketPath(st.homeDir);
+        const bytes = Buffer.byteLength(longest);
+        assert.ok(
+          bytes <= 103,
+          `fixture HOME for tag ${tag} yields a ${bytes}-byte longest Matchlock socket path (${longest}); must be <= 103`,
+        );
+        assert.ok(
+          Buffer.byteLength(st.homeDir) + MATCHLOCK_SOCKET_PATH_ADDED_BYTES <= 103,
+          `fixture HOME ${st.homeDir} plus the ${MATCHLOCK_SOCKET_PATH_ADDED_BYTES}-byte socket layout must be <= 103 bytes`,
+        );
+      } finally {
+        fs.rmSync(st.root, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("probe and work each get their own FRESH VM (one create per driver journal); admission precedes create; shared registry", async () => {
     const rig = makeRig("runner-fresh");
     const registry = new HostInvocationRegistry();

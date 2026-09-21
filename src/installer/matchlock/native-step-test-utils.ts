@@ -9,7 +9,7 @@
  */
 
 import fs from "node:fs";
-import { tamanduaTempDir } from "../../lib/temp-dir.js";
+import { tamanduaShortTempDir } from "../../lib/temp-dir.js";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -98,13 +98,36 @@ export interface IsolatedState {
 }
 
 /**
+ * Short, filesystem-safe slug for a fixture tag. The isolated-state root must
+ * stay SHORT (see `createIsolatedState`), so long human tags are compressed to
+ * at most 8 characters; `mkdtemp` still guarantees collision-freedom.
+ */
+function shortTagSlug(tag: string): string {
+  const slug = tag
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 8);
+  return slug.length > 0 ? slug : "st";
+}
+
+/**
  * Create a fresh isolated state tree and point the module-level env at it.
  * `applySticky`/restore semantics are handled by the caller (see the
  * step-ops test sticky-env pattern) so late fire-and-forget continuations
  * never resolve against the operator's real state.
+ *
+ * The root is created with {@link tamanduaShortTempDir} ON PURPOSE: the
+ * Matchlock runner computes `<HOME>/.matchlock/vms/vm-XXXXXXXX/vsock.sock_5001`
+ * (43 bytes appended) and refuses with `matchlock_home_socket_path_too_long`
+ * BEFORE any VM work when that exceeds the `sun_path` budget (Linux 107 bytes,
+ * macOS 104). Building the fixture under the ambient `tamanduaTempRoot()`
+ * would blow that budget for long tags on macOS. The suffix layout here
+ * (`/home`, `/state`) keeps the longest computed socket path <= 103 bytes on
+ * every platform; see the assertion in hermes-invocation-runner.test.ts.
  */
 export function createIsolatedState(tag: string): IsolatedState {
-  const root = tamanduaTempDir(`mtlk-${tag}-`);
+  const root = tamanduaShortTempDir(`tt-${shortTagSlug(tag)}-`);
   const homeDir = path.join(root, "home");
   const stateDir = path.join(root, "state");
   const dbPath = path.join(stateDir, "tamandua.db");
