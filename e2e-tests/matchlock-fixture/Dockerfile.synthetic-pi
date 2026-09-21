@@ -1,0 +1,46 @@
+# MTLK-PI-EXEC US-003/US-004 — explicitly TEST-ONLY synthetic-pi fixture image.
+#
+# A DERIVED fixture image used ONLY by the on-demand whole-path synthetic gate
+# (run-matchlock-synthetic-e2e-test / e2e-tests/matchlock-synthetic-gate.test.ts).
+# It derives from a stock node LTS image and ADDS a deterministic synthetic pi
+# (e2e-tests/matchlock-fixture/synthetic-pi.mjs) plus git.
+#
+# It NEVER touches igorhvr/bedlam-ubuntu (the qualification image is not
+# referenced, overwritten or mutated here) and it contains NO provider
+# credentials and performs NO model calls. The synthetic pi is installed into
+# THIS fixture image only — no real user image harness is ever replaced and no
+# harness is auto-installed anywhere else.
+#
+# The image provides the guest runtime the RO helper pack needs (node >= 22,
+# /bin/sh, core utils) and the git the tamandua-test ledger path needs.
+#
+# image-PATH qualification (US-004 ROOT item 5): the fixture DECLARES a
+# NON-default effective PATH (ENV PATH) and installs `pi` ONLY under
+# /opt/tamandua-synthetic-bin — it is deliberately NOT in /usr/local/bin (a
+# default-PATH directory would mask ignoring the Dockerfile ENV PATH). The
+# production runner must therefore preserve the USER IMAGE's effective PATH
+# (captured at admission from the OCI config env and prepended ONLY with the
+# helper-pack bin); if it fell back to a conservative host default PATH, the
+# guest `pi` would not resolve and the launch probe / work rounds would refuse.
+
+FROM node:22-bookworm-slim
+
+# git (committed-tree/tracked-tree hashing for the suite ledger) + basic
+# utilities (mktemp/dirname are already in coreutils; ca-certificates keeps
+# git usable offline-free). No build toolchain is installed.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Deterministic TEST-ONLY non-default image PATH: pi is reachable ONLY through
+# the image's own ENV PATH (plus the standard runtime dirs the guest needs).
+ENV PATH="/opt/tamandua-synthetic-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+RUN mkdir -p /opt/tamandua-synthetic-bin
+
+# Deterministic test-only synthetic pi harness (see synthetic-pi.mjs).
+COPY synthetic-pi.mjs /opt/tamandua-synthetic-bin/pi
+RUN chmod 0755 /opt/tamandua-synthetic-bin/pi
+
+# Root runs the guest pack launchers; default shell is /bin/sh via node base.
+WORKDIR /root
+CMD ["/bin/sh"]

@@ -1,0 +1,37 @@
+# MTLK-HERMES-EXEC US-004 — TEST-ONLY NEGATIVE fixture: NONSTANDARD image PATH.
+#
+# A synthetic image that carries the IMAGE-PROVIDED fake hermes (copied from
+# the bedlam-based POSTIVE fixture stage, never mounted from the host) but keeps
+# it OFF every standard PATH location, exposing it ONLY through a NONSTANDARD
+# Dockerfile `ENV PATH` the image itself declares.
+#
+# The Hermes runner must never silently "default over" that nonstandard image
+# PATH (or mount/find a host-side hermes): with the conservative helper-pack
+# PATH the guest genuinely cannot resolve `hermes`, so the opt-in refuses with a
+# bounded diagnostic and never fakes a success. The gate records the image's
+# declared PATH so the "image PATH discovery/qualification is a later-stage
+# item" limitation is visible and precise.
+#
+# The FINAL stage is small (node:22-bookworm-slim + one file) so the negative
+# imports cheaply; the fake-hermes FILE is genuinely derived from the positive
+# fixture via a multi-stage COPY (no real host bind mount). igorhvr/bedlam-ubuntu
+# and the real user harness are never overwritten/retagged/mutated.
+
+FROM tamandua-synthetic-hermes:gate-fixture AS fixture
+
+FROM node:22-bookworm-slim
+
+LABEL org.tamandua.synthetic-hermes="TEST-ONLY-nonstandard-path"
+
+# The image-provided fake hermes, relocated off every standard PATH location.
+COPY --from=fixture /usr/local/bin/hermes /opt/hermes-custom/bin/hermes
+RUN chmod 0755 /opt/hermes-custom/bin/hermes
+
+# Nonstandard image PATH: /opt/hermes-custom/bin (where the image keeps hermes)
+# plus a tools dir. Deliberately EXCLUDES /usr/local/bin and every other
+# standard location, so a default-PATH substitution would be required to find
+# the image-provided hermes.
+ENV PATH=/opt/hermes-custom/bin:/opt/tools/bin
+
+WORKDIR /root
+CMD ["/bin/bash"]

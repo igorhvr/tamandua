@@ -320,6 +320,125 @@ describe("validateRunHarnessForScheduling", () => {
     }
   });
 
+  it("HRM2/MTLK-HERMES-EXEC US-003: accepts harness_type=hermes WITHOUT a host hermes binary when the run carries a harness-hermes Matchlock policy (the image supplies hermes in-VM)", async () => {
+    const originRepo = path.join(tempDir, "origin-wt-hermes-mtlk");
+    fs.mkdirSync(originRepo, { recursive: true });
+    spawnSync("git", ["init", "--initial-branch=main"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.email", "test@test"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: originRepo, encoding: "utf-8" });
+    fs.writeFileSync(path.join(originRepo, "README.md"), "# test\n", "utf-8");
+    spawnSync("git", ["add", "."], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["commit", "-m", "initial"], { cwd: originRepo, encoding: "utf-8" });
+
+    const worktree = createRunWorktree({
+      runId: "run-wt-hermes-mtlk",
+      runNumber: 1,
+      workflowId: "test-workflow",
+      worktreeOriginRepository: originRepo,
+    });
+
+    const savedPath = process.env.PATH;
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    try {
+      const gitWhich = spawnSync("which", ["git"], { encoding: "utf-8" });
+      const realGit = fs.realpathSync(gitWhich.stdout.trim());
+      const toolDir = path.join(tempDir, "tools-mtlk");
+      fs.mkdirSync(toolDir, { recursive: true });
+      fs.symlinkSync(realGit, path.join(toolDir, "git"));
+      assert.equal(fs.existsSync(path.join(toolDir, "hermes")), false,
+        "isolated tool dir must not contain hermes");
+
+      // No host hermes anywhere; a persisted harness:"hermes" Matchlock policy
+      // means the guest image supplies hermes — the host binary check is skipped.
+      delete process.env.TAMANDUA_HERMES_BINARY;
+      process.env.PATH = toolDir;
+
+      const hermesPolicy = JSON.stringify({
+        version: 2,
+        backend: "matchlock",
+        requestedImage: "vic/hermes:latest",
+        resolvedImageDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        resolvedImageConfigDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        harness: "hermes",
+        hermes: { homeDir: "/home/operator", cwd: worktree.worktreePath, hermesHomeEnv: null },
+        configurationRoot: "/home/operator/.hermes",
+        configurationProfile: "default",
+        guestConfigurationRoot: "/workspace/config/hermes",
+        workPathMode: "host-absolute",
+        workingDirectory: worktree.worktreePath,
+        workMounts: [
+          { hostPath: worktree.worktreePath, hostRealPath: worktree.worktreePath, guestPath: worktree.worktreePath },
+        ],
+        originalRepositoryRoot: originRepo,
+        gitMetadataRoots: [],
+        mountPolicyVersion: 1,
+        networkPolicyVersion: 1,
+        resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
+      });
+
+      const result = await validateRunHarnessForScheduling(
+        "run-wt-hermes-mtlk",
+        JSON.stringify({
+          workspace_mode: "worktree",
+          repo: worktree.worktreePath,
+          working_directory_for_harness: worktree.worktreePath,
+          harness_type: "hermes",
+        }),
+        { matchlockPolicy: hermesPolicy },
+      );
+      assert.ok(result.workingDirectoryForHarness, "validation must succeed without a host hermes binary");
+    } finally {
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
+      removeRunWorktree({ runId: "run-wt-hermes-mtlk", force: true });
+    }
+  });
+
+  it("HRM2/MTLK-HERMES-EXEC US-003: a NULL-policy hermes run still requires a host hermes binary (no-flag differential unchanged)", async () => {
+    const savedPath = process.env.PATH;
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    try {
+      const toolDir = path.join(tempDir, "tools-null");
+      fs.mkdirSync(toolDir, { recursive: true });
+      // PATH with no hermes; direct mode (no worktree needed).
+      const workdir = path.join(tempDir, "direct-work");
+      fs.mkdirSync(workdir, { recursive: true });
+      delete process.env.TAMANDUA_HERMES_BINARY;
+      process.env.PATH = toolDir;
+
+      await assert.rejects(
+        validateRunHarnessForScheduling(
+          "run-hermes-null",
+          JSON.stringify({
+            workspace_mode: "direct",
+            working_directory_for_harness: workdir,
+            harness_type: "hermes",
+          }),
+        ),
+        /hermes is not available/,
+      );
+    } finally {
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
+    }
+  });
+
   it("accepts worktree run with harness_type=hermes when hermes is found via env var", async () => {
     const originRepo = path.join(tempDir, "origin-wt-hermes-env");
     fs.mkdirSync(originRepo, { recursive: true });

@@ -1092,6 +1092,24 @@ verify_cgroup() {
 # never assumed; the 'tamandua' grep arm is unchanged and keeps every
 # pre-S54 acceptance intact.
 #
+# Cmdline acceptance (S54): the cmdline must NOT require the literal
+# 'tamandua'. The real daemon's argv is `node <TT_REPO_ROOT>/dist/server/
+# daemon.js` (daemonctl.ts startDaemon) — under a checkout whose directory
+# name does not contain 'tamandua' (e.g. a worktree named by run id) that
+# argv carries no 'tamandua' at all, yet the process IS this repo's daemon
+# (cwd already proven under TT_REPO_ROOT). Two arms, either proves the
+# cmdline:
+#   (a) the literal 'tamandua' (the CLI wrapper argv — `tamandua daemon
+#       start`, `node .../bin/tamandua daemon ...` — and the fake scripted
+#       CLI shims, which embed 'tamandua' in argv), OR
+#   (b) a script path under THIS repo's built product
+#       ($TT_REPO_ROOT/dist/server/ — daemon.js, dashboard-standalone.js,
+#       mcp-standalone.js, control-standalone.js — the real daemon family).
+# A foreign cmdline (`node /usr/bin/server.js`, a bare `bash -c ...` with
+# no repo path) is REFUSED exactly as before — TT-ownership must be PROVEN,
+# never assumed; the 'tamandua' grep arm is unchanged and keeps every
+# pre-S54 acceptance intact.
+#
 # TT_DC_PLATFORM (MACP4 US-002 test seam): forces the evidence branch on
 # any host ('Darwin' | anything else = linux /proc) so the Darwin branch
 # is hermetic-testable on linux (see

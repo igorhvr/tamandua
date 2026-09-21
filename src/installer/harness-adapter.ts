@@ -65,7 +65,10 @@ export interface HarnessRoundResult {
    * the instant-fail predicate classifies on harness wall time (not
    * whole-round wall time), so a refusal that dies after a short in-VM
    * round must still be counted even when VM boot took tens of seconds.
-   * The Matchlock branch adopts this contract in its union follow-up.
+   * The Matchlock in-VM runners (pi/hermes/dsh) adopt this contract through
+   * the shared `MatchlockRoundTiming` tracker (src/installer/matchlock/
+   * round-timing.ts): `harnessWallMs` is the harness exec→exit interval and
+   * `vmSetupMs` carries create/boot→exec-start, never folded together.
    */
   harnessWallMs?: number;
   /**
@@ -83,6 +86,14 @@ export interface HarnessRoundResult {
   launchMode?: HarnessLaunchMode;
   /** KHYG US-002: the fallback reason when launchMode === 'unprotected-fallback'. */
   launchReason?: string;
+  /**
+   * US-006 (H1/D1): bounded diagnostic for a harness round whose exec
+   * transport REJECTED (RPC/protocol/transport error) after the guest may
+   * already have completed its step through the host bridge. Surfaced instead
+   * of swallowing the rejection into a clean-looking empty round; never set by
+   * a round whose exec settled normally.
+   */
+  harnessExecError?: string;
 }
 
 // ── Run options shared across harnesses ────────────────────────────

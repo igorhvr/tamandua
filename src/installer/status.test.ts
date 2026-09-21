@@ -5,6 +5,10 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
+import {
+  buildMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../dist/installer/matchlock/policy.js";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -1909,5 +1913,196 @@ describe("harness-probe failure block durable read + status surfacing (IFLB US-0
     assert.doesNotMatch(stdout, /STDERR_TAIL:/, "no probe STDERR_TAIL key without a probe failure");
 
     try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// MTLK-VM-SIZE US-004: resolved Matchlock VM limits in workflow status
+// ══════════════════════════════════════════════════════════════════
+// `workflow status` (human and --json) must show the VM size a Matchlock run
+// is using, read from the persisted v2 runs.matchlock_policy. A native run
+// (NULL policy) and a legacy/malformed policy both omit the limits and never
+// throw.
+
+describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
+  const POLICY_IMAGE = "vic/matchlock-base:latest";
+  const POLICY_LIMITS = { cpus: 8, memoryMB: 16384, diskSizeMB: 20480 };
+
+  /** Build a valid, persisted-shape version-2 policy JSON string. */
+  function matchlockPolicyJson(
+    limits: { cpus: number; memoryMB: number; diskSizeMB: number } = POLICY_LIMITS,
+    image: string = POLICY_IMAGE,
+  ): string {
+    return serializeMatchlockPolicy(
+      buildMatchlockPolicy({
+        requestedImage: image,
+        identity: {
+          digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          config_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          tag: image,
+        },
+        harness: "pi",
+        workingDirectory: "/opt/project",
+        originalRepositoryRoot: "/opt/project",
+        workMounts: [
+          { hostPath: "/opt/project", hostRealPath: "/opt/project", guestPath: "/opt/project" },
+        ],
+        gitMetadataRoots: ["/opt/project/.git"],
+        resourceLimits: limits,
+      }),
+    );
+  }
+
+  /**
+   * Seed a run then set runs.matchlock_policy. seedDb's table predates the
+   * column, so add it (idempotently) before writing; getDb's migration then
+   * sees it already present and skips its guarded ALTER.
+   */
+  function seedRunWithPolicy(
+    env: { tamanduaDir: string },
+    runId: string,
+    policyJson: string | null,
+  ): string {
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    seedDb(dbPath, runId, { workspace_mode: "direct" });
+    const db = new DatabaseSync(dbPath);
+    const cols = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "matchlock_policy")) {
+      db.exec("ALTER TABLE runs ADD COLUMN matchlock_policy TEXT");
+    }
+    if (policyJson !== null) {
+      db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run(policyJson, runId);
+    }
+    db.close();
+    return dbPath;
+  }
+
+  it("getWorkflowStatus returns matchlockResources and JSON includes them for a v2 policy run", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(env, runId, matchlockPolicyJson());
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      assert.deepEqual(detail.matchlockResources, {
+        image: POLICY_IMAGE,
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+      });
+      const json = buildWorkflowStatusJson(detail);
+      assert.deepEqual(json.matchlockResources, {
+        image: POLICY_IMAGE,
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+      });
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("a legacy v2 runs.matchlock_policy row round-trips its resourceLimits through the DB column", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    // The pre-MTLK-VM-SIZE persisted shape: a version-2 policy carrying the
+    // then-default 2/2048/20480 limits. It must still surface after the union.
+    const dbPath = seedRunWithPolicy(
+      env,
+      runId,
+      matchlockPolicyJson({ cpus: 2, memoryMB: 2048, diskSizeMB: 20480 }),
+    );
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      assert.deepEqual(detail.matchlockResources, {
+        image: POLICY_IMAGE,
+        cpus: 2,
+        memoryMB: 2048,
+        diskSizeMB: 20480,
+      });
+      const json = buildWorkflowStatusJson(detail);
+      assert.deepEqual(json.matchlockResources, {
+        image: POLICY_IMAGE,
+        cpus: 2,
+        memoryMB: 2048,
+        diskSizeMB: 20480,
+      });
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("a native run returns matchlockResources undefined and JSON omits the key", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(env, runId, null);
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      assert.equal(detail.matchlockResources, undefined);
+      const json = buildWorkflowStatusJson(detail);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(json, "matchlockResources"),
+        false,
+        "native --json output must stay byte-identical (no matchlockResources key)",
+      );
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("a legacy version-1 or malformed policy never throws and omits the limits", async () => {
+    const env = createTempEnv();
+    const legacyRunId = crypto.randomUUID();
+    const malformedRunId = crypto.randomUUID();
+    // v1 unpinned legacy record and an outright malformed value.
+    seedRunWithPolicy(env, legacyRunId, JSON.stringify({ version: 1, backend: "matchlock" }));
+    seedRunWithPolicy(env, malformedRunId, "{this is not valid json");
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(env.tamanduaDir, "tamandua.db");
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      for (const runId of [legacyRunId, malformedRunId]) {
+        const detail = getWorkflowStatus(runId);
+        assert.equal(
+          detail.matchlockResources,
+          undefined,
+          `unreadable policy must omit limits (${runId})`,
+        );
+        // The rest of the run detail still renders (query did not fail closed).
+        assert.equal(detail.id, runId);
+        const json = buildWorkflowStatusJson(detail);
+        assert.equal(Object.prototype.hasOwnProperty.call(json, "matchlockResources"), false);
+      }
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
   });
 });

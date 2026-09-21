@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import http from "node:http";
+import net from "node:net";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createDashboardServer, invalidateRunsCache, _runsCacheTimestampForTest, flakyKeysWithinWindow } from "../../dist/server/dashboard.js";
@@ -13,6 +14,11 @@ import { type TamanduaEvent } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import { DEFAULT_MCP_PORT } from "../../dist/server/mcp-server.js";
 import { getDb, incrementSystemTokenSpend, getSystemTokenSpend } from "../../dist/db.js";
+import { stopDaemonFamily } from "../../dist/server/daemonctl.js";
+import {
+  buildMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../dist/installer/matchlock/policy.js";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 interface LogsTailItem {
@@ -1690,6 +1696,264 @@ describe("dashboard run relaunch API", () => {
       assert.match(body.error, /Failed to relaunch run/);
     } finally {
       await stopDashboard(server);
+      restore();
+    }
+  });
+});
+
+describe("dashboard run relaunch MATCHLOCK refusal (MTLK-ADMIT close)", () => {
+  const MTLK_WORKFLOW = "test-relaunch-mtlk";
+
+  /** Serialize a REAL version-2 pinned policy as admission would persist it. */
+  function persistedV2Policy(stateDir: string, workDir: string): string {
+    const configRoot = path.join(stateDir, ".pi", "agent");
+    fs.mkdirSync(configRoot, { recursive: true });
+    const policy = buildMatchlockPolicy({
+      requestedImage: "vic/ml:latest",
+      identity: {
+        digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        tag: "vic/ml:latest",
+      },
+      harness: "pi",
+      workingDirectory: workDir,
+      originalRepositoryRoot: workDir,
+      workMounts: [{ hostPath: workDir, hostRealPath: workDir, guestPath: workDir }],
+      gitMetadataRoots: [],
+      configurationRoot: configRoot,
+    });
+    return serializeMatchlockPolicy(policy);
+  }
+
+  function insertFailedDirectRun(db: { prepare(sql: string): { run(...p: unknown[]): unknown } }, runNumber: number, runId: string, workflowId: string, context: object): void {
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, ?, ?, 'Original task', 'failed', ?, 0, '2026-01-01', '2026-01-01')
+    `).run(runId, runNumber, workflowId, JSON.stringify(context));
+  }
+
+  function relaunchRows(db: { prepare(sql: string): { all(): Array<Record<string, unknown>> } }): Array<Record<string, unknown>> {
+    return db.prepare("SELECT id, status, scheduling_status, matchlock_policy FROM runs").all();
+  }
+
+  it("POST /api/runs/:id/relaunch refuses an opted-in MATCHLOCK run with a real persisted v2 policy (no replacement, no native scheduling)", async () => {
+    const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-relaunch-mtlk-valid-");
+    const db = getDb();
+    const runId = "run-failed-mtlk-valid";
+    const workDir = path.join(stateDir, "workdir");
+    fs.mkdirSync(workDir, { recursive: true });
+    insertFailedDirectRun(db, 31, runId, MTLK_WORKFLOW, {
+      workspace_mode: "direct",
+      working_directory_for_harness: workDir,
+      repo: workDir,
+    });
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run(persistedV2Policy(stateDir, workDir), runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/relaunch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      assert.equal(response.status, 409,
+        "dashboard relaunch of an opted-in Matchlock run must be refused (non-success)");
+
+      const body = await response.json() as { error: string };
+      // The refusal must EXPLAIN itself to the caller: the run is opted in,
+      // the dashboard has no opt-in surface, and relaunching would be native.
+      assert.match(body.error, /Matchlock/);
+      assert.match(body.error, /persisted Matchlock isolation policy/);
+      assert.match(body.error, /no Matchlock opt-in surface/);
+      assert.match(body.error, /native \(non-isolated\) work/);
+      assert.match(body.error, /--matchlock/);
+
+      // No replacement/new native scheduling: the ONLY row is the original,
+      // untouched, and the handler never reached runWorkflow (no daemon, no
+      // new registration, no run creation).
+      const rows = relaunchRows(db);
+      assert.equal(rows.length, 1, "refusal must create NO new run row");
+      assert.equal(rows[0].id, runId);
+      assert.equal(rows[0].status, "failed", "original run must remain failed");
+      assert.equal(rows[0].scheduling_status, null, "no scheduling admission/change on refusal");
+      assert.ok(rows[0].matchlock_policy, "the persisted isolation policy must remain intact");
+    } finally {
+      await stopDashboard(server);
+      restore();
+    }
+  });
+
+  it("POST /api/runs/:id/relaunch refuses an opted-in run whose persisted policy is MALFORMED (fail closed, no native relaunch)", async () => {
+    const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-relaunch-mtlk-malformed-");
+    const db = getDb();
+    const runId = "run-failed-mtlk-malformed";
+    const workDir = path.join(stateDir, "workdir");
+    fs.mkdirSync(workDir, { recursive: true });
+    insertFailedDirectRun(db, 31, runId, MTLK_WORKFLOW, {
+      workspace_mode: "direct",
+      working_directory_for_harness: workDir,
+      repo: workDir,
+    });
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run("{this is not valid json", runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/relaunch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      assert.equal(response.status, 409,
+        "a malformed persisted Matchlock policy must still be refused (never silently native)");
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Matchlock/);
+      assert.match(body.error, /cannot be used/);
+      assert.match(body.error, /--matchlock/);
+
+      const rows = relaunchRows(db);
+      assert.equal(rows.length, 1, "a malformed-policy refusal must create NO new run row");
+      assert.equal(rows[0].id, runId);
+      assert.equal(rows[0].status, "failed");
+    } finally {
+      await stopDashboard(server);
+      restore();
+    }
+  });
+
+  it("POST /api/runs/:id/relaunch refuses an opted-in run whose persisted policy is a LEGACY UNPINNED v1 record (never native)", async () => {
+    const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-relaunch-mtlk-legacy-");
+    const db = getDb();
+    const runId = "run-failed-mtlk-legacy";
+    const workDir = path.join(stateDir, "workdir");
+    fs.mkdirSync(workDir, { recursive: true });
+    insertFailedDirectRun(db, 31, runId, MTLK_WORKFLOW, {
+      workspace_mode: "direct",
+      working_directory_for_harness: workDir,
+      repo: workDir,
+    });
+    // Version-1 legacy record as US-001 wrote before MTLK-ADMIT: unpinned.
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?")
+      .run(JSON.stringify({ version: 1, backend: "matchlock", requestedImage: "vic/ml:latest" }), runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/relaunch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      assert.equal(response.status, 409,
+        "a legacy UNPINNED stored policy must refuse the dashboard relaunch (it must never look like a relaunchable native run)");
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Matchlock/);
+      assert.match(body.error, /cannot be used/);
+      assert.match(body.error, /version must be 2|legacy|version 1/);
+
+      const rows = relaunchRows(db);
+      assert.equal(rows.length, 1, "a legacy-policy refusal must create NO new run row");
+      assert.equal(rows[0].id, runId);
+      assert.equal(rows[0].status, "failed");
+    } finally {
+      await stopDashboard(server);
+      restore();
+    }
+  });
+
+  it("POST /api/runs/:id/relaunch native positive control: a NULL-policy run still relaunches through runWorkflow", async () => {
+    // Consistent isolated HOME: state lives at HOME/.tamandua, so any daemon
+    // the native relaunch path auto-starts writes its pid/port files under the
+    // SAME temp dir that stopDaemonFamily({ homeDir }) targets below.
+    const { homeDir } = createTempHome("tamandua-dashboard-relaunch-native-");
+    const stateDir = path.join(homeDir, ".tamandua");
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const saved = new Map<string, string | undefined>([
+      ["HOME", process.env.HOME],
+      ["TAMANDUA_STATE_DIR", process.env.TAMANDUA_STATE_DIR],
+      ["TAMANDUA_DB_PATH", process.env.TAMANDUA_DB_PATH],
+      ["TAMANDUA_CONTROL_PORT", process.env.TAMANDUA_CONTROL_PORT],
+    ]);
+    const restore = (): void => {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    };
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const workflowId = "test-relaunch-native";
+    const workflowDir = path.join(stateDir, "workflows", workflowId);
+    fs.mkdirSync(workflowDir, { recursive: true });
+    fs.writeFileSync(path.join(workflowDir, "workflow.yml"),
+      `id: ${workflowId}\nrun:\n  workspace: direct\nagents:\n  - id: dev\n    model: fake\n    workspace:\n      baseDir: .\nsteps:\n  - id: implement\n    agent: dev\n    input: Implement the task\n    expects: STATUS, CHANGES, TESTS\n`,
+      "utf-8");
+
+    const db = getDb();
+    const runId = "run-failed-native-relaunch";
+    const workDir = path.join(stateDir, "native-workdir");
+    fs.mkdirSync(workDir, { recursive: true });
+    insertFailedDirectRun(db, 41, runId, workflowId, {
+      workspace_mode: "direct",
+      working_directory_for_harness: workDir,
+      repo: workDir,
+    });
+    const originalPolicy = (db.prepare(
+      "SELECT matchlock_policy FROM runs WHERE id = ?",
+    ).get(runId) as { matchlock_policy: string | null }).matchlock_policy;
+    assert.equal(originalPolicy, null, "native control run must start with a NULL policy");
+
+    // Controlled unavailable control-plane premise (RUG-BIND): hold a real
+    // owned TCP blocker on an OS-assigned loopback port for the whole relaunch
+    // attempt. The auto-started daemon fails to bind it and exits instead of
+    // surviving as a live control plane; no daemon leaks past this test.
+    const blocker = net.createServer((socket) => {
+      socket.destroy();
+    });
+    const blockedPort = await new Promise<number>((resolve, reject) => {
+      blocker.once("error", reject);
+      blocker.listen({ host: "127.0.0.1", port: 0 }, () => {
+        const addr = blocker.address();
+        assert.ok(addr && typeof addr !== "string");
+        resolve(addr.port);
+      });
+    });
+    process.env.TAMANDUA_CONTROL_PORT = String(blockedPort);
+
+    const { server, baseUrl } = await startDashboard();
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/relaunch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      assert.equal(response.status, 200,
+        "native (NULL policy) relaunch must NOT be refused by the Matchlock gate");
+      const body = await response.json() as { relaunched: boolean; runId?: string; runNumber?: number };
+      assert.equal(body.relaunched, true);
+      assert.ok(body.runId, "native relaunch must produce a replacement run id");
+
+      const replacement = db.prepare(
+        "SELECT workflow_id, status, scheduling_status, matchlock_policy FROM runs WHERE id = ?",
+      ).get(body.runId!) as { workflow_id: string; status: string; scheduling_status: string | null; matchlock_policy: string | null } | undefined;
+      assert.ok(replacement, "native replacement run row must exist");
+      assert.equal(replacement!.workflow_id, workflowId);
+      assert.equal(replacement!.status, "running");
+      assert.equal(replacement!.scheduling_status, "pending_register",
+        "replacement awaits reconciler admission (control plane unavailable)");
+      assert.equal(replacement!.matchlock_policy, null,
+        "native replacement stays native (NULL policy) — native relaunch unchanged");
+    } finally {
+      await stopDashboard(server);
+      try {
+        await stopDaemonFamily({ homeDir });
+      } catch {
+        /* best-effort: the blocker normally prevents any daemon from starting */
+      }
+      await new Promise<void>((resolve, reject) => {
+        blocker.close((err) => (err ? reject(err) : resolve()));
+      });
       restore();
     }
   });

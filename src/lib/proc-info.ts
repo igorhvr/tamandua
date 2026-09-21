@@ -69,6 +69,18 @@ export function hasProcfs(): boolean {
   return procfsAvailable;
 }
 
+/**
+ * True when `candidate` IS the procfs root or a path beneath it. This is a
+ * pure path-shape check (no procfs read), used by host-source/mount
+ * admission to refuse `/proc` aliases portably: on a host without procfs the
+ * literal simply never matches a real path, so no platform branch is needed.
+ * Centralised here so Linux-only path literals stay inside the allow-listed
+ * process-introspection module (portability lint).
+ */
+export function isProcfsPath(candidate: string): boolean {
+  return candidate === "/proc" || candidate.startsWith("/proc/");
+}
+
 /** Run ps with the given args; null on any failure (including missing ps). */
 function ps(args: string[]): string | null {
   try {

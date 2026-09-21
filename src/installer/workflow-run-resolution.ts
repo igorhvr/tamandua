@@ -19,7 +19,26 @@ import { loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir } from "./paths.js";
 import { getControlPort } from "../server/control-server.js";
 import { isDaemonControlReachable } from "../server/control-client.js";
+import { formatMatchlockResourceSummary } from "./matchlock/resource-limits.js";
 import type { HarnessType } from "./types.js";
+
+/**
+ * MTLK-VM-SIZE US-005: the Matchlock launch facts the resolved-launch block
+ * carries for an opted-in `workflow run`. Deliberately the SAME shape as
+ * `workflow status --json`'s `matchlockResources`
+ * (src/installer/status.ts) so a script can read the admitted VM size the
+ * same way from a launch as from a status query.
+ */
+export interface WorkflowRunLaunchMatchlockResources {
+  /** Requested image reference (`--matchlock <image>`). */
+  image: string;
+  /** Resolved vCPU count. */
+  cpus: number;
+  /** Resolved guest memory in MB. */
+  memoryMB: number;
+  /** Resolved guest disk size in MB. */
+  diskSizeMB: number;
+}
 
 export interface WorkflowRunLaunchInfo {
   workspaceMode: "direct" | "worktree";
@@ -43,6 +62,12 @@ export interface WorkflowRunLaunchInfo {
   daemonEndpoint: string;
   /** whether /control/health answered ok at probe time */
   daemonOk: boolean;
+  /**
+   * MTLK-VM-SIZE US-005: resolved Matchlock VM facts, present only for an
+   * opted-in `--matchlock <image>` launch. A native run leaves this unset so
+   * it prints no matchlock line and its JSON stays byte-identical.
+   */
+  matchlockResources?: WorkflowRunLaunchMatchlockResources;
 }
 
 export interface ResolveWorkflowRunLaunchInfoParams {
@@ -175,8 +200,9 @@ export async function resolveWorkflowRunLaunchInfo(
 
 /**
  * Render the stable one-line launch facts. Order: working-directory/origin
- * first, then harness, then daemon — the same order they are printed before
- * the run-created lines.
+ * first, then harness, then daemon, then (for an opted-in Matchlock run) the
+ * resolved VM size — the same order they are printed before the run-created
+ * lines.
  */
 export function formatWorkflowRunLaunchLines(
   info: WorkflowRunLaunchInfo,
@@ -205,6 +231,19 @@ export function formatWorkflowRunLaunchLines(
     `daemon: ${info.daemonEndpoint} ${info.daemonOk ? "ok" : "unreachable"}`,
   );
 
+  // MTLK-VM-SIZE US-005: the opted-in Matchlock VM facts join this same
+  // resolved-launch block (same stable-prefix style as the lines above), so
+  // the operator sees the admitted image/limits BEFORE the synchronous
+  // `run #N ... created` line.
+  if (info.matchlockResources) {
+    lines.push(
+      formatMatchlockResourceSummary(
+        info.matchlockResources.image,
+        info.matchlockResources,
+      ),
+    );
+  }
+
   return lines;
 }
 
@@ -213,7 +252,7 @@ export function formatWorkflowRunLaunchLines(
  * Field names stay close to the text prefixes so scripts can correlate them:
  *   working-directory / origin.path / origin.ref / origin.sha / clean /
  *   harness.type / harness.path / harness.version / daemon.endpoint /
- *   daemon.ok.
+ *   daemon.ok / matchlockResources.{image,cpus,memoryMB,diskSizeMB}.
  *
  * US-003: this is emitted whenever `workflow run --json` is requested, so the
  * resolved values are machine-consumable; optional facts (a missing harness
@@ -240,6 +279,12 @@ export interface WorkflowRunLaunchJson {
     endpoint: string;
     ok: boolean;
   };
+  /**
+   * MTLK-VM-SIZE US-005: the resolved Matchlock VM facts for an opted-in run.
+   * Same shape as `workflow status --json`'s `matchlockResources`; omitted for
+   * a native run (whose JSON therefore stays byte-identical).
+   */
+  matchlockResources?: WorkflowRunLaunchMatchlockResources;
 }
 
 export function workflowRunLaunchInfoToJson(
@@ -254,6 +299,12 @@ export function workflowRunLaunchInfoToJson(
 
   if (info.harnessBinary) json.harness.path = info.harnessBinary;
   if (info.harnessVersion) json.harness.version = info.harnessVersion;
+
+  // MTLK-VM-SIZE US-005: mirror the matchlock launch line in the same JSON
+  // document (inside `resolution`, next to the other launch facts).
+  if (info.matchlockResources) {
+    json.matchlockResources = { ...info.matchlockResources };
+  }
 
   if (info.workspaceMode === "direct" && info.workingDirectory) {
     json.workingDirectory = info.workingDirectory;

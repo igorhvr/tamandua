@@ -815,6 +815,321 @@ found on `PATH` or via `TAMANDUA_HERMES_BINARY`. A temporary isolated Tamandua
 home is created for each run, but `~/.hermes` is symlinked in so the real
 Hermes binary can find its credentials and config.
 
+##### Matchlock Execution (`--matchlock`) and the Synthetic Whole-Path Gates
+
+`--matchlock <image>` executes every dispatched harness invocation (launch
+probe and work round) inside a **fresh Matchlock VM** instead of on the host.
+The image must already provide the selected harness (`pi`, `hermes` with
+`--hermes-as-harness`, or `dsh` with `--dsh-as-harness`) and its runtime;
+Tamandua mounts its version-matched RO guest helper pack at
+`/workspace/runtime` (guest reporting CLI at
+`/workspace/runtime/bin/tamandua`) and never installs a harness or falls back
+to host/native execution. Passing the flag is the **only** opt-in — no env
+var, workflow YAML, agent output, or MCP/API default activates Matchlock;
+without it the run uses the native path and performs zero Matchlock actions.
+
+**Launch-time probe cost (accepted by design).** Every opted-in run performs
+ONE launch-time harness probe before the first work round: **one real model
+round** in a fresh Matchlock VM, proving the image's guest harness can answer
+the `<launcher> skill-path` contract before real work starts. Measured probe
+cost is approximately `pi` ~1.7k, `dsh` ~6.8k and `hermes` ~9.2k tokens per
+probe, plus one VM boot; the probe tokens are attributed to the run. This cost
+is accepted by design (once per run, not per round) and is distinct from the
+zero-provider synthetic gates below, which spend no model tokens.
+
+Supported harnesses and workflows in this build:
+
+- `--pi-as-harness` (default), `--hermes-as-harness` and `--dsh-as-harness`
+  may all be combined with `--matchlock`, and all three are admitted for the
+  same workflow set: there is **no harness-by-workflow allow-list**.
+- Admission preflights each workflow's known later-role capabilities (guest
+  git, the packed `tamandua-test` suite evidence, the scoped `merge-branch` op
+  and the bounded run queries) and refuses a workflow whose explicit closure is
+  not provided before any VM/probe/native harness starts.
+- The admitted capability-closed set is `do-now` / `do-review-do-verify` (no
+  later-role tools); the non-merge story/worktree pipelines `feature-dev`,
+  `feature-dev-worktree`, `bug-fix`, `bug-fix-worktree`,
+  `quarantine-broken-tests`, `security-audit` and `security-audit-worktree`
+  (guest git + packed suite + bounded run queries); and every merge route
+  `feature-dev-merge`, `feature-dev-merge-worktree`, `bug-fix-merge`,
+  `bug-fix-merge-worktree`, `quarantine-broken-tests-merge`,
+  `quarantine-broken-tests-merge-worktree`, `security-audit-merge` and
+  `security-audit-merge-worktree` (the same closure plus `merge-branch`).
+- Shapes outside that closure are **refused before any VM/probe/native harness
+  starts** with a workflow-specific precise reason (`matchlock_workflow_unsupported`):
+  `*-github-pr` needs a guest `gh` CLI plus provisioned remote auth,
+  `just-do-it` needs bounded child workflow dispatch, `frontend-test` needs
+  browser/visual verification and `skills-normalize-audit` scans an
+  operator-specified directory outside the admitted original root; an
+  unknown/custom workflow id fails closed. These are *not* completed overall
+  workflow support; do not rely on `--matchlock` for workflows this build does
+  not support. `--matchlock` is refused with no image. See
+  `tamandua workflow run --help`.
+
+The exact harness × workflow matrix in this build is:
+
+| Harness | Accepted under `--matchlock` | Refused (before any VM/probe/native harness) |
+|---------|------------------------------|---------------------------------------------|
+| `pi` (default / `--pi-as-harness`) | the full capability-closed set listed below | the precise refusals listed below |
+| `hermes` (`--hermes-as-harness`) | the same admitted set (no harness-by-workflow allow-list) | the same precise refusals |
+| `dsh` (`--dsh-as-harness`) | the same admitted set (no harness-by-workflow allow-list) | the same precise refusals |
+
+Admitted for all three harnesses:
+`do-now`, `do-review-do-verify`, `feature-dev`, `feature-dev-worktree`,
+`bug-fix`, `bug-fix-worktree`, `quarantine-broken-tests`, `security-audit`,
+`security-audit-worktree`, `feature-dev-merge`, `feature-dev-merge-worktree`,
+`bug-fix-merge`, `bug-fix-merge-worktree`, `quarantine-broken-tests-merge`,
+`quarantine-broken-tests-merge-worktree`, `security-audit-merge` and
+`security-audit-merge-worktree`.
+
+Refused for all three harnesses with a precise reason:
+`*-github-pr` needs a guest `gh` CLI plus provisioned remote auth;
+`just-do-it` needs bounded child workflow dispatch; `frontend-test` needs
+browser/visual verification; `skills-normalize-audit` scans an
+operator-specified directory outside the admitted original root; an
+unknown/custom workflow id fails closed.
+
+###### Matchlock VM resources (`--matchlock-cpus` / `--matchlock-memory` / `--matchlock-disk`)
+
+Every Matchlock VM boots with an explicit resource policy. Three flags size it
+for an opted-in run: `--matchlock-cpus <n>` (a positive integer),
+`--matchlock-memory <MB|16g>` and `--matchlock-disk <MB|40g>` (a positive
+integer number of MB, or a `<n>g` suffix meaning `n*1024` MB). Any of the three
+requires `--matchlock <image>`. When a flag is absent the operator env var
+`TAMANDUA_MATCHLOCK_CPUS`, `TAMANDUA_MATCHLOCK_MEMORY_MB` or
+`TAMANDUA_MATCHLOCK_DISK_MB` supplies the value; when neither is set the
+built-in default applies: `cpus = min(8, host CPUs)`,
+`memory = min(16384 MB, 50% of host RAM)`, `disk = 20480 MB`. Explicit flags and
+env values are **always clamped by the standing caps**: `cpus <= 16` ALWAYS (a
+project rule) and `cpus <= host online CPUs`, `memory <= 75% of host MemTotal`,
+and `disk` must be finite positive. Precedence per field is flag > env >
+built-in default. The launch output prints the resolved limits
+(`matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB`), the limits are
+recorded in the run's Matchlock policy, and `tamandua workflow status <run>`
+shows them for a Matchlock run.
+
+###### Pi under Matchlock
+
+`--pi-as-harness` (the default) runs the image's pi inside fresh VMs; the pi
+invocation runner and its no-flag behavior are unchanged from earlier
+milestones. The runner builds first, resolves the runtime from PATH (the
+system `matchlock` CLI; `TAMANDUA_MATCHLOCK_RPC_BIN` / `MATCHLOCK_GUEST_INIT` /
+`MATCHLOCK_GUEST_FUSED` are optional overrides) and records the observed
+version/hashes as evidence — there are no runtime sha256 pins. It allocates a
+NEW unique evidence directory with mkdtemp
+(`/root/matchlock-work/evidence/pi-exec-<random>/`,
+outside the repo, never pre-cleaned, never reused) plus a private fresh
+`TMPDIR`, and drives both supported workflows to real completion through an
+isolated daemon → scheduler → fresh-VM path, then records an exact owned-VM
+cleanup ledger and propagates cleanup failures. The gate also asserts
+per-invocation FRESH-VM receipts (no reuse), strict suite-row binding to the
+exact run, the intended synthetic usage totals, and treats corrupt
+event/inventory JSON as an error. The synthetic fixture declares a NON-default
+image `ENV PATH` and installs its test `pi` only there, so the whole path
+proves the host runner preserves the USER IMAGE's effective PATH (helper-pack
+prepend only, no host default).
+
+###### Pi managed-worktree and merge workflows
+
+For the `pi` harness the worktree/merge routes also run in fresh VMs:
+`feature-dev-merge-worktree`, `bug-fix-merge-worktree` and the direct
+`feature-dev-merge` / `bug-fix-merge` routes. The merger role lands through
+the scoped guest `merge-branch` op (a typed host authorization check runs
+BEFORE any Git; the host independently verifies the authoritative target tip
+and emits the run-attributed landing), the tester's packed `tamandua-test`
+records real host-owned suite rows for the finalizer ledger seam, and the
+scheduler builds the host merge context from immutable run scope. The
+on-demand worktree/merge gate below drives a real target_moved → rebase →
+retest loop on a tiny owned origin. The `hermes` and `dsh` harnesses carry the
+same admitted workflow set: there is no harness-by-workflow allow-list, and
+every admitted workflow (including the merge shapes) is executable by each
+harness.
+
+###### Hermes under Matchlock (synthetic-fixture qualification)
+
+The Hermes opt-in recipe is:
+
+```bash
+tamandua workflow run <workflow-id> "<task>" --hermes-as-harness --matchlock <image>
+```
+
+The image must already provide a Linux Hermes executable and its runtime.
+Tamandua never installs Hermes on the host, never consults the host
+`TAMANDUA_HERMES_BINARY`/`PATH` resolution for an opted-in run, and never
+falls back to native/Hermes-on-host execution. Each launch probe **and** each
+work round runs in its own **fresh Matchlock VM** with the versioned guest
+helper pack mounted read-only; the invocation's broker/registry authority is
+revoked on cancel, EOF, timeout, or protocol refusal (even when idle), and the
+owned VM is positively closed when the round ends. A genuine product failure
+is not masked by reusing a VM or by swallowing a teardown error.
+
+**Configuration selection and mount.** The effective Hermes configuration is
+resolved from the **submission** environment (`HOME` / `HERMES_HOME` / cwd
+captured at run creation), never the daemon's later ambient state, and is
+frozen into the persisted policy so retry/resume can never re-pin a moved tag
+or re-read `HERMES_HOME`. The whole canonicalized effective configuration
+directory is mounted **read-write** at the native guest override location, and
+the guest `HERMES_HOME` is set to that exact mount:
+
+| Effective selection | Host source (mounted whole, RW) | Guest `HERMES_HOME` |
+|---------------------|---------------------------------|---------------------|
+| default | `$HERMES_HOME` (or `~/.hermes`) | `/workspace/config/hermes` |
+| named profile | `<root>/profiles/<name>` | `/workspace/config/hermes/profiles/<name>` |
+
+These are the **disclosed writable roots**: the entire selected configuration
+directory — including credentials, settings, `state.db`, sessions, logs and
+plugins — is read-write inside the VM, matching the accepted damage model for
+the mounted worktree and original repository. Broad host `HOME` or `.tamandua`
+administrative state is **never** exported, and a lexical prefix check alone is
+not accepted as confinement. A missing, malformed, unreadable, non-regular, or
+explicitly non-local (non-`local` terminal backend) configuration is refused
+**before** any VM create with bounded diagnostics; a genuine configuration root
+whose config file is empty/comment-only uses Hermes' built-in default.
+
+**Output, session, and token semantics.** Guest Hermes produces **plain-text**
+output (not pi JSON); the round's final assistant message is the plain-text
+stdout and is preserved separately from the raw stdout/stderr artifacts. The
+authoritative session id is the `session_id:` **stderr trailer**; the usage
+projection reads the selected mapped store **inside the still-owned VM** before
+the VM is confirmed closed and totals only `input + output + cache_write`
+(cache reads are excluded). Missing, unknown, ambiguous, or truncated token
+data is reported `unavailable` and is **never** fabricated as `0`.
+
+**Actual vs synthetic.** This build's Hermes-under-Matchlock qualification is
+**synthetic-fixture qualification**, not real-Hermes acceptance:
+
+| Layer | Status in this build |
+|-------|----------------------|
+| Hermes adapter / runner / policy / scheduler / CLI wiring | Implemented; deterministic and seam tests pass |
+| Fresh-VM whole-path gate (`do-now`, `do-review-do-verify`) | Synthetic fixture only — image-provided fake Hermes, **zero models**, no credentials/network |
+| Real Hermes model `deepseek-v4-flash-vision-exp` (DeepSeek provider, no Codex/MoA) with real credentials | **Not qualified here** — coordinator-owned remaining work |
+
+###### dsh under Matchlock (synthetic-fixture qualification, MTLK-DSH-EXEC)
+
+`--dsh-as-harness --matchlock <image>` (MTLK-DSH-EXEC) resolves the effective
+`DSH_HOME` once at **submission** time (default `<captured home>/.dsh`, or an
+explicit `DSH_HOME` with relative/tilde semantics captured from the submitting
+process — never rediscovered from the daemon HOME/env), pins the image
+content+config identity, and mounts the **whole frozen effective home
+directory read-write at the guest `/workspace/config/dsh` as one mount**
+(preserving `sessions/`, `profiles/`, `storages/`, credentials and unknown
+entries — never a copied or selective disposable subset). Each round runs the
+image's `dsh --profile headless <prompt>` with stdin EOF, plain-text stdout
+preserved and `DSH_PERMISSION_MODE` applied inside the isolation; the image's
+effective `PATH` is preserved with only the helper-pack bin prepended.
+Retry/resume reuse the persisted pin and never re-pin a moved tag. Usage is
+attributed from the mounted v2 session store with an integer single count
+(the `data.stream` usage mirror is never double counted); malformed,
+ambiguous or truncated usage is reported honestly and never fabricated as a
+zero. Like Hermes, the dsh-under-Matchlock path in this build is
+synthetic-fixture qualified, not real-model acceptance.
+
+###### Synthetic whole-path gates
+
+Several actual fresh-VM synthetic whole-path qualification gates live under
+`e2e-tests/`. All run on demand with an **authorized paired runtime** and an
+explicitly **test-only derived synthetic fixture image** (a stock node base for
+pi/dsh, an `igorhvr/bedlam-ubuntu`-derived fixture for hermes; the real
+`igorhvr/bedlam-ubuntu` image/tag is never overwritten or replaced):
+
+| Gate | Test file | On-demand runner |
+|------|-----------|------------------|
+| pi (gate B) | `e2e-tests/matchlock-synthetic-gate.test.ts` | `./run-matchlock-synthetic-e2e-test` |
+| hermes | `e2e-tests/matchlock-hermes-synthetic-gate.test.ts` | `./run-hermes-synthetic-e2e-test` |
+| dsh (MTLK-DSH-EXEC) | `e2e-tests/matchlock-dsh-gate.test.ts` | `./run-matchlock-dsh-gate-e2e-test` |
+| dsh profile overlay (DSH-PROFILE-OVERLAY) | `e2e-tests/matchlock-dsh-profile-overlay-gate.test.ts` | `./run-matchlock-dsh-profile-overlay-e2e-test` |
+| dsh real-boot (DSH-OVERLAY-LOCK-FIX, zero-provider) | `e2e-tests/matchlock-dsh-real-boot-gate.test.ts` | `./run-matchlock-dsh-real-boot-gate-e2e-test` |
+| worktree/merge (pi) | `e2e-tests/matchlock-worktree-merge-gate.test.ts` | `./run-matchlock-worktree-merge-e2e-test` |
+| long HOME (>= 90 chars) | `e2e-tests/matchlock-long-home-gate.test.ts` | `./run-matchlock-long-home-e2e-test` |
+| empty-output/completed-step (US-006) | `e2e-tests/matchlock-empty-output-gate.test.ts` | `./run-matchlock-empty-output-e2e-test` |
+
+```bash
+./run-matchlock-synthetic-e2e-test        # pi gate
+./run-hermes-synthetic-e2e-test           # hermes gate
+./run-matchlock-dsh-gate-e2e-test         # dsh gate
+./run-matchlock-dsh-profile-overlay-e2e-test  # dsh profile-overlay gate
+./run-matchlock-dsh-real-boot-gate-e2e-test   # dsh real-boot (contained) gate
+./run-matchlock-worktree-merge-e2e-test   # pi worktree/merge gate
+./run-matchlock-long-home-e2e-test        # long-HOME (>= 90 char) gate
+./run-matchlock-empty-output-e2e-test     # empty-output/completed-step gate (US-006)
+```
+
+The long-HOME gate is a focused regression for the short-HOME alias: a real
+HOME path of >= 90 characters, with the DEFAULT short-HOME alias (no
+`TAMANDUA_MATCHLOCK_HOME_ALIAS` override), must still drive one zero-provider
+`do-now` run to completion through a fresh VM whose exact-owned teardown is
+recorded. It retains evidence under
+`/root/matchlock-work/evidence/mtlk-fix-XXXXXX/`.
+
+The empty-output/completed-step gate is the US-006 (H1/D1) regression: a
+TEST-ONLY synthetic-pi variant completes every work step through the packed
+guest CLI but emits NOTHING on stdout, reproducing the real-model
+`outcome=empty_output` defect path inside a real VM. The gate asserts the run
+completes, the step row is `done`, and the scheduler's per-round record is
+`work_done` (never `empty_output`) via the authoritative step-completion
+fallback.
+
+The gates are **unpinned**: each runner resolves `matchlock` from PATH (the
+system `/usr/local/bin/matchlock`) and, when `MATCHLOCK_GUEST_INIT` /
+`MATCHLOCK_GUEST_FUSED` are unset, lets matchlock resolve its own guest-init;
+`TAMANDUA_MATCHLOCK_RPC_BIN` / `MATCHLOCK_GUEST_INIT` / `MATCHLOCK_GUEST_FUSED`
+remain optional overrides. Each runner records the observed `matchlock
+--version` and the sha256 of every resolved binary in the gate evidence
+(`runtime-observed.txt`) and never refuses on a hash mismatch. These gates are
+**never** part of
+`./run-all-e2e-tests`, `npm test`, the smoke lane or the scripted lane. Each
+runner builds first, records the observed runtime identity, creates a NEW
+evidence directory (`/root/matchlock-work/evidence/<harness>-exec-<UTC-Z ts>/`,
+outside the repo, never pre-cleaned) and drives the supported workflows to real
+completion through an isolated daemon → scheduler → fresh-VM path, then records
+an exact owned-VM cleanup ledger and propagates cleanup failures (failed or
+unknown teardown is never green). The hermes gate also exercises
+default/named/custom profiles across fresh VMs, SQLite/WAL persistence,
+simultaneous two-VM use of one admitted configuration directory, and the
+missing-harness / nonstandard-PATH refusal negatives.
+
+**Zero-round refusal (`observed_rounds`).** A green `node --test` is not
+enough for a real-VM gate: a gate whose VMs never boot (or whose launch probe
+fails before any work round) can exit 0 without exercising anything. Every
+`run-matchlock-*` / `run-hermes-synthetic-e2e-test` driver therefore writes an
+`observed-rounds.json` evidence file through
+`e2e-tests/helpers/matchlock-gate-rounds.ts` (the gate label, the number of
+observed VM rounds, and the distinct `vm-<8 hex>` ids), then invokes
+`scripts/observed-rounds-guard.mjs` after `node --test`. The guard reads the
+count strictly from that file — it never fabricates or infers a round — and:
+`observed_rounds > 0` prints
+`observed-rounds-guard: PASS gate=<label> observed_rounds=<n> observed_vm_ids=<ids>`
+and exits 0; a missing/malformed evidence file or `observed_rounds === 0`
+prints `no VM round observed (VM creation or probe failed before any round)`
+plus a bounded summary and exits **92**, so a hollow green can never be
+reported as a pass. The observed VM ids are the same ids the gate positively
+closes and removes (a failed or unknown teardown is never green).
+
+**Non-fatal post-harness VM cleanup (`docs/matchlock-cleanup-policy.md`).** A
+`close`/`dispose` failure **after** the harness process has exited is never an
+infrastructure failure of the round: the pi/Hermes runners log exactly one
+serialized WARN (`serializeMatchlockError` — the literal `[object Object]` is
+impossible), keep the round result with `cleanupConfirmed=false` and a bounded
+`vmCleanupFailure`, record an orphan VM under
+`<runRoot>/<bareRunId>/matchlock/orphans.json`, and hand it to the stopped-VM
+reaper. The reaper reads `<matchlockHome>/.matchlock/state.db` read-only, skips
+any VM whose recorded pid is a live `matchlock`/`firecracker` process, captures
+the VM's evidence and then removes it by **exact id** (`matchlock rm <vmId>`);
+it never uses `prune`/`gc` and never selects by name or glob.
+`create`/`probe`/`exec` and pre-harness cleanup failures stay fatal. The
+injected-failure regression lives in `e2e-tests/matchlock-cleanup-gate.test.ts`
+(`./run-matchlock-cleanup-e2e-test`). The full phase policy, the error
+serialization contract and the phase-by-phase decision table are in
+`docs/matchlock-cleanup-policy.md`.
+
+dsh test classification: the pure `src/installer/matchlock/dsh-*.ts` module
+graph is process-spawn-free and its tests stay in the parallel lane;
+`src/installer/matchlock/dsh-scheduler-seam.test.ts` exercises the production
+scheduler seam (which transitively reaches process-spawning modules) and is
+therefore listed in `tests/serial-files.txt`; the real-VM gate above is
+on-demand and classified in no lane. The production qualification recipe for
+the REAL dsh Matchlock path is `docs/matchlock-dsh-qualification.md`.
+
 ##### Doctor Contract Check
 
 `tamandua doctor` includes a Hermes `state.db` contract check in its

@@ -41,6 +41,10 @@ describe("parseWorkflowRunArgs", () => {
       noRelaunchUponRugpull: undefined,
       harnessAs: undefined,
       workdirCollisionPolicy: "refuse",
+      matchlockImage: undefined,
+      matchlockCpus: undefined,
+      matchlockMemory: undefined,
+      matchlockDisk: undefined,
       context: {},
       wait: false,
       timeout: undefined,
@@ -394,6 +398,46 @@ describe("--help infrastructure", () => {
     assert.match(result.stdout ?? "", /--dsh-as-harness/);
     assert.match(result.stdout ?? "", /DeepSeek Harness/);
     assert.match(result.stdout ?? "", /Alpha support/);
+  });
+
+  it("workflow run --matchlock <image> --hermes-as-harness --help is side-effect-free (help exits 0, no Matchlock discovery, no image resolution)", () => {
+    const result = cli(["workflow", "run", "--matchlock", "example.invalid/hermes:latest", "--hermes-as-harness", "--help"]);
+    assert.equal(result.status, 0);
+    const out = result.stdout ?? "";
+    assert.match(out, /--hermes-as-harness/);
+    assert.match(out, /hermes with --hermes-as-harness/);
+    // MTLK-HERMES-EXEC asserted only `do-now and do-review-do-verify` under
+    // --matchlock; MTLK-WORKFLOWS (workflow parity) admits the pi managed-
+    // worktree merge workflows and the direct merge routes as well. The union
+    // (MTLK-INTEGRATE US-004) decides and the losing assertion is rewritten to
+    // the full admitted workflow list. MTLK-ALL-WORKFLOWS US-003 lifts the
+    // harness-by-workflow allow-list, so the help must no longer scope
+    // hermes/dsh to the two shallow workflows; US-004 publishes the explicit
+    // per-shape closure and the precise refusals.
+    assert.match(
+      out,
+      /Supported workflows under --matchlock in this build are exactly the/,
+    );
+    for (const id of [
+      "do-now",
+      "do-review-do-verify",
+      "feature-dev",
+      "bug-fix",
+      "quarantine-broken-tests",
+      "security-audit",
+      "feature-dev-merge",
+      "bug-fix-merge",
+    ]) {
+      assert.ok(out.includes(id), `help must list the admitted workflow id ${id}`);
+    }
+    assert.match(out, /workflow-specific\s+exact reason/);
+    assert.match(out, /just-do-it needs bounded\s+child workflow dispatch/);
+    assert.match(out, /no harness-by-workflow allow-list/);
+    assert.doesNotMatch(out, /hermes and dsh\s+currently admit only do-now and do-review-do-verify/);
+    assert.doesNotMatch(out, /Admitted merge shapes are refused for hermes\/dsh/);
+    // Help dispatches BEFORE any command execution: no image parse error, no
+    // admission/discovery side effects, no missing-task error.
+    assert.doesNotMatch(result.stderr ?? "", /Missing value for --matchlock|Missing workflow name/i);
   });
 
   it("command with --help prints usage and exits 0", () => {

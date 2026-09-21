@@ -7,8 +7,12 @@
 
 import { installWorkflow } from "../../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../../installer/uninstall.js";
-import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, forceFailRun, readHarnessProbeFailureBlock } from "../../installer/status.js";
+import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, forceFailRun, readHarnessProbeFailureBlock, buildWorkflowStatusJson } from "../../installer/status.js";
 import { runWorkflow, resumeWorkflow, type ResumeResult, type RunWorkflowResult } from "../../installer/run.js";
+import {
+  resolveMatchlockResourceLimits,
+  formatMatchlockResourceSummary,
+} from "../../installer/matchlock/resource-limits.js";
 import { listBundledWorkflows } from "../../installer/workflow-fetch.js";
 import { loadWorkflowSpec } from "../../installer/workflow-spec.js";
 import { resolveBundledWorkflowDir } from "../../installer/paths.js";
@@ -191,10 +195,120 @@ Options:
   --hermes-as-harness
       Use hermes as the agent harness instead of pi.
       Mutually exclusive with --pi-as-harness and --dsh-as-harness.
+      With --matchlock <image>, the run executes the IMAGE's hermes inside a
+      fresh Matchlock VM. The effective Hermes config root/profile (default,
+      named or custom HERMES_HOME) is resolved from the SUBMISSION
+      environment (HOME / HERMES_HOME / cwd at run creation) — never the
+      daemon's. Without --matchlock, hermes runs natively on the host exactly
+      as before.
+      Under --matchlock the whole effective config directory is mounted
+      read-write at the native guest HERMES_HOME (default:
+      /workspace/config/hermes; named profile:
+      /workspace/config/hermes/profiles/<name>). Guest output is plain text
+      (not pi JSON); the session id comes from the stderr trailer and usage
+      is read from the mapped store inside the still-owned VM as
+      input+output+cache_write only (unknown/ambiguous/truncated is
+      unavailable, never a fabricated zero). This build's
+      Hermes-under-Matchlock path is synthetic-fixture qualified; real model
+      and credential qualification is coordinator-owned remaining work.
   --dsh-as-harness
       Use the DeepSeek Harness (dsh) as the agent harness instead of pi.
       Alpha support.
       Mutually exclusive with --pi-as-harness and --hermes-as-harness.
+      Supported with --matchlock (see below): an opted-in dsh Matchlock run
+      resolves the effective DSH_HOME once at submission (default
+      ~/.dsh, or the explicit DSH_HOME with relative/tilde semantics),
+      mounts the WHOLE frozen home read-write at /workspace/config/dsh and
+      runs the image's dsh headless in a fresh VM per probe/work round.
+  --matchlock <image>
+      Run the workflow inside a Matchlock VM using the given image
+      (also accepted as --matchlock=<image>). The image is MANDATORY and
+      operator-supplied: there is no default image, no host fallback, and
+      passing the flag is the ONLY way to opt in. No env var, workflow YAML,
+      agent output, or MCP/API default activates Matchlock; without
+      --matchlock the run uses the native path and performs zero Matchlock
+      actions.
+      Supported harnesses under --matchlock: pi-as-harness (default) and --dsh-as-harness,
+      and hermes with --hermes-as-harness; all three are admitted with --matchlock.
+      An opted-in run is admitted and pinned at submission: the selected
+      configuration source must exist (only the host harness executable may
+      be absent) and the image's immutable content+config identity is
+      resolved and persisted before the run can be scheduled. Retry/resume
+      reuses the persisted pin — a moved tag is never re-pinned. For a hermes
+      opt-in the effective Hermes config directory is resolved from the
+      submission environment and mounted read-write at the guest HERMES_HOME
+      (whole selected config directory, default or named profile). For dsh the
+      whole frozen effective DSH_HOME is mounted read-write at
+      /workspace/config/dsh (preserving sessions/, profiles/, storages/, credentials/ and
+      unknown entries as one mount) and the guest runs
+      'dsh --profile headless <prompt>'.
+      A hermes/dsh work round returns plain text (not pi JSON); the session id
+      comes from the stderr trailer and usage is projected from the mapped
+      store inside the still-owned VM (input+output+cache_write; unknown/
+      ambiguous/truncated is unavailable, never zero). The hermes and dsh
+      Matchlock paths in this build are synthetic-fixture qualified, not
+      real-model acceptance.
+      Supported workflows under --matchlock in this build are exactly the
+      shapes whose explicit later-role capability closure the backend serves:
+      do-now and do-review-do-verify (no later-role tools); the non-merge
+      story/worktree pipelines feature-dev, feature-dev-worktree, bug-fix,
+      bug-fix-worktree, quarantine-broken-tests, security-audit and
+      security-audit-worktree (guest git, packed tamandua-test suite evidence
+      and bounded run queries); and every merge route feature-dev-merge,
+      feature-dev-merge-worktree, bug-fix-merge, bug-fix-merge-worktree,
+      quarantine-broken-tests-merge, quarantine-broken-tests-merge-worktree,
+      security-audit-merge and security-audit-merge-worktree (the same closure
+      plus the scoped merge-branch capability). Admission preflights that
+      explicit closure and refuses every other shape with a workflow-specific
+      exact reason BEFORE any VM/probe/native harness: *-github-pr needs a
+      guest 'gh' CLI plus provisioned remote auth; just-do-it needs bounded
+      child workflow dispatch; frontend-test needs browser/visual verification;
+      skills-normalize-audit scans an operator-specified directory outside the
+      admitted original root; an unknown/custom workflow id fails closed.
+      All three harnesses (pi, hermes and dsh) carry the same admitted workflow
+      set: there is no harness-by-workflow allow-list, and every admitted
+      workflow (including the merge shapes) is executable by each harness.
+      Every dispatched
+      invocation (launch probe and work
+      round) of the selected harness (pi, hermes or dsh) runs in its own
+      FRESH Matchlock VM with the versioned guest helper pack mounted
+      read-only at /workspace/runtime (guest
+      reporting CLI at /workspace/runtime/bin/tamandua); the guest image must
+      already provide the selected harness, its runtime and the tools the
+      workflow needs. No harness is installed into the image and there is NO host/native fallback.
+      The guest environment preserves the USER IMAGE's own effective PATH
+      (captured at admission from the image config and prepended ONLY with
+      the helper-pack bin) — never a conservative host PATH that would hide
+      an image-declared executable location.
+      Shapes outside the admitted closure — just-do-it child dispatch,
+      PR/github-pr, browser verification and skills-normalize-audit — are
+      REFUSED before any VM/probe/native harness starts with the precise
+      missing capability or mechanism, never a blanket allow-list message;
+      custom/unknown workflow ids fail closed. There is no blanket allow-list.
+      This is not completed overall workflow support.
+  --matchlock-cpus <n>
+      VM vCPU count for an opted-in Matchlock run. A positive integer.
+      Requires --matchlock <image>; without it the flag is a usage error.
+      Built-in default: min(8, host online CPUs). Explicit values (flag or
+      env) are ALWAYS clamped to at most 16 vCPUs (a standing project rule)
+      and at most the host's online CPU count.
+  --matchlock-memory <MB|Ng>
+      VM memory for an opted-in Matchlock run. A positive integer number of
+      MB, or a '<n>g' suffix meaning n*1024 MB (e.g. 16g = 16384 MB).
+      Requires --matchlock <image>. Built-in default: min(16384 MB, 50% of
+      host MemTotal); explicit values are ALWAYS clamped to at most 75% of
+      host MemTotal.
+  --matchlock-disk <MB|Ng>
+      VM disk size for an opted-in Matchlock run. A positive integer number
+      of MB, or a '<n>g' suffix meaning n*1024 MB (e.g. 40g = 40960 MB).
+      Requires --matchlock <image>. Built-in default: 20480 MB; the value
+      must be a finite positive number.
+      Env defaults (read at launch, only when the flag is absent):
+      TAMANDUA_MATCHLOCK_CPUS, TAMANDUA_MATCHLOCK_MEMORY_MB and
+      TAMANDUA_MATCHLOCK_DISK_MB. Precedence per field is flag > env >
+      built-in default; env values are clamped by the same caps as flags.
+      The resolved limits are printed at launch and recorded in the run
+      policy.
   --task-file <path>
       Read the task description from a file instead of passing it inline.
       The file path is dereferenced exactly once at CLI time — the path
@@ -555,7 +669,27 @@ function buildWorkflowRunJsonOutput(
   };
 
   if (launchInfo) {
-    jsonOutput.resolution = workflowRunLaunchInfoToJson(launchInfo);
+    const resolution = workflowRunLaunchInfoToJson(launchInfo);
+    // MTLK-VM-SIZE US-005: the persisted admitted policy is authoritative when
+    // runWorkflow reports limits (e.g. a replacement that inherited them). A
+    // fresh CLI opt-in persists exactly the launch-resolved values, so this is
+    // normally a no-op; it just keeps --json honest if they ever diverge.
+    if (resolution.matchlockResources && result.matchlockResourceLimits) {
+      resolution.matchlockResources = {
+        ...resolution.matchlockResources,
+        cpus: result.matchlockResourceLimits.cpus,
+        memoryMB: result.matchlockResourceLimits.memoryMB,
+        diskSizeMB: result.matchlockResourceLimits.diskSizeMB,
+      };
+    }
+    jsonOutput.resolution = resolution;
+    // MTLK-VM-SIZE US-005: mirror the matchlock facts at the document's top
+    // level too, exactly where `workflow status --json` exposes
+    // `matchlockResources`, so the same object is readable from either
+    // command. Native runs carry neither key.
+    if (resolution.matchlockResources) {
+      jsonOutput.matchlockResources = resolution.matchlockResources;
+    }
   }
   if (result.daemonWarning) jsonOutput.daemonWarning = result.daemonWarning;
   if (result.queuedBehindRunId) {
@@ -950,6 +1084,43 @@ export async function handleWorkflow(
     // and stay parentless (parent_run_id NULL).
     const parentRunId = process.env.TAMANDUA_RUN_ID?.trim() || undefined;
 
+    // MTLK-DSH-EXEC US-002: for a harness "dsh" Matchlock opt-in, capture the
+    // FROZEN submission context (submitting HOME / DSH_HOME / cwd) HERE in the
+    // submitting CLI process — run creation persists the resolved effective
+    // DSH_HOME and never re-discovers it from the daemon HOME/env at dispatch.
+    const isDshMatchlock = runArgs.matchlockImage !== undefined && harnessType === "dsh";
+    const dshSubmission =
+      isDshMatchlock && runArgs.matchlockImage !== undefined
+        ? {
+            homeDir: process.env.HOME && process.env.HOME.trim() !== "" ? process.env.HOME : os.homedir(),
+            env: { DSH_HOME: process.env.DSH_HOME },
+            cwd: process.cwd(),
+          }
+        : undefined;
+
+    // MTLK-VM-SIZE US-003: resolve + validate the VM resource limits at LAUNCH
+    // (flag > TAMANDUA_MATCHLOCK_* env > host-derived default, all capped). An
+    // invalid value exits non-zero BEFORE runWorkflow creates any run row.
+    let matchlockResourceLimits: { cpus: number; memoryMB: number; diskSizeMB: number } | undefined;
+    if (runArgs.matchlockImage !== undefined) {
+      try {
+        const resolved = resolveMatchlockResourceLimits({
+          cpus: runArgs.matchlockCpus,
+          memoryMB: runArgs.matchlockMemory,
+          diskSizeMB: runArgs.matchlockDisk,
+          env: process.env,
+        });
+        matchlockResourceLimits = {
+          cpus: resolved.cpus,
+          memoryMB: resolved.memoryMB,
+          diskSizeMB: resolved.diskSizeMB,
+        };
+      } catch (err) {
+        process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+        process.exit(1);
+      }
+    }
+
     // SKILL-UX S3 (US-002/US-003): resolve the launch facts BEFORE
     // runWorkflow emits its synchronous `run #N ... created` stderr line.
     // Text mode prints them as the FIRST stdout lines; JSON mode folds them
@@ -964,6 +1135,21 @@ export async function handleWorkflow(
       worktreeOriginRepository: runArgs.worktreeOriginRepository,
       worktreeOriginRef: runArgs.worktreeOriginRef,
     });
+    // MTLK-VM-SIZE US-005: fuse the resolved Matchlock VM facts into the SAME
+    // resolved-launch block the SKILL-UX lines use, so the `matchlock: <image>
+    // cpus=… memory=…MB disk=…MB` line is printed exactly once, before the
+    // synchronous `run #N ... created` line, and the same facts reach
+    // `--json`. A fresh CLI opt-in persists exactly these launch-resolved
+    // limits, so they are authoritative here; a rugpull REPLACEMENT (which
+    // inherits the failed run's persisted policy) is launched by the daemon
+    // and never re-emits this CLI launch block. The JSON path additionally
+    // prefers the persisted admitted limits when runWorkflow reports them.
+    if (launchInfo && runArgs.matchlockImage !== undefined && matchlockResourceLimits) {
+      launchInfo.matchlockResources = {
+        image: runArgs.matchlockImage,
+        ...matchlockResourceLimits,
+      };
+    }
     if (launchInfo && !runArgs.jsonFlag) {
       for (const line of formatWorkflowRunLaunchLines(launchInfo)) {
         console.log(line);
@@ -980,6 +1166,10 @@ export async function handleWorkflow(
       noRelaunchUponRugpull: runArgs.noRelaunchUponRugpull,
       harnessType,
       workdirCollisionPolicy: runArgs.workdirCollisionPolicy,
+      matchlockImage: runArgs.matchlockImage,
+      matchlockHarness: runArgs.matchlockImage !== undefined && harnessType === "dsh" ? "dsh" : "pi",
+      dshSubmission,
+      matchlockResourceLimits,
       context: runArgs.context,
       parentRunId,
     });
@@ -1077,87 +1267,11 @@ export async function handleWorkflow(
     try {
       const result = getWorkflowStatus(target);
       if (jsonFlag) {
-        const jsonSteps = result.steps.map((s) => {
-          const entry: Record<string, unknown> = {
-            stepId: prefixStepId(s.stepId),
-            stepIndex: s.stepIndex,
-            agentRole: s.agentId.split("_").slice(-1)[0],
-            status: s.status,
-            displayStatus: s.displayStatus,
-            retryCount: s.retryCount,
-          };
-          if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
-          if (s.rerouteCount !== undefined) entry.rerouteCount = s.rerouteCount;
-          if (s.claimPid !== undefined) entry.claimPid = s.claimPid;
-          // TIME-OUTPUT US-005: instants serialize as ISO-8601 UTC with Z
-          // (legacy naive normalized); a missing/unparseable value is omitted.
-          const claimUpdatedAt = formatInstant(s.claimUpdatedAt, { style: "iso" });
-          if (claimUpdatedAt !== undefined) entry.claimUpdatedAt = claimUpdatedAt;
-          const updatedAt = formatInstant(s.updatedAt, { style: "iso" });
-          if (updatedAt !== undefined) entry.updatedAt = updatedAt;
-          return entry;
-        });
-        const jsonStories = result.stories ? result.stories.map((s) => {
-          const entry: Record<string, unknown> = {
-            storyId: s.storyId,
-            title: s.title,
-            status: s.status,
-            // YSE US-005: machine-readable reset-on-resume counters. status
-            // stays the RAW stored value; resumeResetCount (0 when the story
-            // was never reset) and priorFailureCount (only when > 0) expose
-            // the reset history.
-            resumeResetCount: s.resumeResetCount,
-          };
-          if (s.resumeResetCount > 0) entry.priorFailureCount = s.resumeResetCount;
-          if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
-          const updatedAt = formatInstant(s.updatedAt, { style: "iso" });
-          if (updatedAt !== undefined) entry.updatedAt = updatedAt;
-          return entry;
-        }) : undefined;
-        const jsonOutput: Record<string, unknown> = {
-          runId: prefixRunId(result.id),
-          runNumber: result.runNumber,
-          workflowId: result.workflowId,
-          status: result.status,
-          harnessType: result.harnessType,
-          task: result.task.slice(0, 200),
-          tokensSpent: result.tokensSpent,
-          // OUTAGE-ROUNDS (SCLS) US-006: machine-readable per-run pre-claim
-          // death total (SUM of the per-step counters).
-          preclaimDeathCount: result.preclaimDeathCount,
-        };
-        // TIME-OUTPUT US-005: run-level instants are ISO-8601 UTC with Z
-        // (legacy naive normalized); a missing/unparseable value is omitted.
-        const createdAt = formatInstant(result.createdAt, { style: "iso" });
-        if (createdAt !== undefined) jsonOutput.createdAt = createdAt;
-        const updatedAt = formatInstant(result.updatedAt, { style: "iso" });
-        if (updatedAt !== undefined) jsonOutput.updatedAt = updatedAt;
-        jsonOutput.steps = jsonSteps;
-        // PAUS US-004: surface the daemon-side scheduling state (e.g.
-        // draining_pause) machine-readably when it is set.
-        if (result.schedulingStatus) jsonOutput.schedulingStatus = result.schedulingStatus;
-        // WORKDIR-QUEUE US-004: expose the scheduling reason (e.g. the
-        // workdir-busy wait text) so JSON consumers can tell waiting from
-        // dead without reconstructing it.
-        if (result.schedulingError) jsonOutput.schedulingError = result.schedulingError;
-        if (jsonStories) jsonOutput.stories = jsonStories;
-        if (result.redLedgerLanding) {
-          // TIME-OUTPUT US-005: the landing instant serializes as ISO-Z; when it
-          // is missing/unparseable only that field is omitted (the row id and
-          // exit code remain).
-          const landing: Record<string, unknown> = {
-            ledgerRowId: result.redLedgerLanding.ledgerRowId,
-            exitCode: result.redLedgerLanding.exitCode,
-          };
-          const ledgerCreatedAt = formatInstant(result.redLedgerLanding.ledgerCreatedAt, { style: "iso" });
-          if (ledgerCreatedAt !== undefined) landing.ledgerCreatedAt = ledgerCreatedAt;
-          jsonOutput.redLedgerLanding = landing;
-        }
-        if (result.workspace_mode === "worktree") {
-          jsonOutput.workspaceMode = result.workspace_mode;
-          if (result.worktree_path) jsonOutput.worktreePath = result.worktree_path;
-          if (result.worktree_origin_ref) jsonOutput.worktreeOriginRef = result.worktree_origin_ref;
-        }
+        // The union extracted this construction into buildWorkflowStatusJson()
+        // (src/installer/status.ts) so the Matchlock host query service returns
+        // byte-identical JSON. It carries every field main's inline block had,
+        // including result.preclaimDeathCount (OUTAGE-ROUNDS SCLS US-006).
+        const jsonOutput = buildWorkflowStatusJson(result);
         console.log(JSON.stringify(jsonOutput));
         return true;
       }
@@ -1172,6 +1286,16 @@ export async function handleWorkflow(
       if (result.harnessType !== "pi") {
         const harnessLabel = result.harnessType === "dsh" ? "dsh (alpha)" : result.harnessType;
         console.log(`Harness: ${harnessLabel}`);
+      }
+      // MTLK-VM-SIZE US-004: show the resolved VM size for Matchlock runs using
+      // the SAME formatter as the launch line so the two can never drift.
+      if (result.matchlockResources) {
+        console.log(
+          formatMatchlockResourceSummary(
+            result.matchlockResources.image,
+            result.matchlockResources,
+          ),
+        );
       }
       console.log(`Tokens: ${result.tokensSpent.toLocaleString()}`);
       if (result.redLedgerLanding) {

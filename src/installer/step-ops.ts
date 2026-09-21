@@ -25,6 +25,7 @@ import {
   type LedgerGateMode,
   type LedgerGateRefusalDecision,
   type TestCmdReviewRefusal,
+  type FinalizeMergeEvidenceSource,
 } from "./ledger-gate.js";
 
 // ══════════════════════════════════════════════════════════════════════
@@ -664,12 +665,86 @@ export function getAgentWorkspacePath(agentId: string): string | null {
 // ══════════════════════════════════════════════════════════════════════
 
 /**
+ * Opt-in host progress-document access seam (MTLK-PROGRESS).
+ *
+ * Native callers (the worker CLI, the scheduler motor, plain tests) never
+ * pass a `RunProgressAccessLike`, so every existing unguarded entry point
+ * keeps its exact byte-level behavior (canonical `<state>/runs/<runId>/
+ * progress.txt` path + legacy fallbacks). A Matchlock host integration that
+ * attaches a scoped progress RESOURCE to a run passes an accessor whose
+ * `guestFile` is rendered into claimed/current input (instead of the host
+ * canonical path) and whose confined read/write/archive/update methods keep
+ * host story-plan IO pointing at the SAME document the guest sees — without
+ * following guest-controlled symlinks/FIFOs or falling back to legacy files.
+ *
+ * This is deliberately structural (methods only): step-ops never imports the
+ * matchlock implementation, so no-flag behavior cannot be changed by loading
+ * this module.
+ */
+export interface RunProgressAccessLike {
+  /** Guest-visible absolute progress file path (e.g. /workspace/runs/<id>/progress.txt). */
+  readonly guestFile: string;
+  /** Confined read of the committed document; null when absent. */
+  readText(): string | null;
+  /** Confined atomic replace of the document. */
+  commitText(content: string): void;
+  /** Confined compare-and-commit update; returns the committed text. */
+  updateText(merge: (current: string | null) => string): string;
+  /** Confined archive of the document into `archiveDir`; returns the archived text. */
+  archiveTo(archiveDir: string): string;
+}
+
+/** Optional opt-in progress view carried by claim/current rendering. */
+export interface StepProgressOptions {
+  /** Host progress-resource accessor (structural). */
+  progressAccess?: RunProgressAccessLike;
+  /**
+   * Opt-in host-attested Matchlock finalizer evidence source (US-006).
+   *
+   * Supplied ONLY by the controller-attested Matchlock runner/adapter path
+   * (`pi-invocation-runner` -> `NativeStepServices` -> step-ops). When present,
+   * a finalize_merge claim/acceptance decision consults this source instead of
+   * the native `suite_results` ledger. No run context, guest input or
+   * environment variable can activate it; native callers omit it and keep the
+   * byte-identical native behavior.
+   */
+  ledgerEvidenceSource?: FinalizeMergeEvidenceSource;
+}
+
+/**
  * Return the canonical progress file path for a run.
  * Location: <tamandua state>/runs/<runId>/progress.txt
  */
 export function getRunProgressPath(runId: string): string {
   return path.join(resolveRunRoot(), runId, "progress.txt");
 }
+
+/** Progress pointer rendered into claimed/current context (opt-in override). */
+function progressPointerFor(runId: string, access?: RunProgressAccessLike): string {
+  return access?.guestFile ?? getRunProgressPath(runId);
+}
+/**
+ * Opt-in render view (MTLK-PROGRESS): returns a SHALLOW COPY of the story
+ * context with `progress`/`progress_file` remapped to the guest-visible
+ * pointer when a progress accessor is attached. The persisted canonical
+ * context (host path) is never mutated, and no-flag callers receive the very
+ * same object (zero-copy, byte-identical behavior). Only used at claim/current
+ * RENDER time — never for host canonical reads/writes/archives.
+ */
+function renderWithProgressView(
+  base: Record<string, string>,
+  opts?: StepProgressOptions,
+): Record<string, string> {
+  if (!opts?.progressAccess) return base;
+  // Only remap when the structured keys are actually present (story context).
+  if (!("progress_file" in base)) return base;
+  const pointer = opts.progressAccess.guestFile;
+  const copy = { ...base };
+  copy["progress_file"] = pointer;
+  copy["progress"] = `stored in the file ${pointer} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
+  return copy;
+}
+
 
 /**
  * Read progress.txt for a run.
@@ -678,8 +753,14 @@ export function getRunProgressPath(runId: string): string {
  * 1. Canonical path: <tamandua state>/runs/<runId>/progress.txt
  * 2. Workspace-scoped: <agent workspace>/progress-<runId>.txt
  * 3. Workspace-legacy:  <agent workspace>/progress.txt
+ *
+ * With an opt-in `access`, host reads go through the confined accessor ONLY
+ * (no legacy/workspace fallback after an opted-in refusal).
  */
-export function readProgressFile(runId: string): string {
+export function readProgressFile(runId: string, access?: RunProgressAccessLike): string {
+  if (access) {
+    return access.readText() ?? "(no progress file)";
+  }
   // Canonical path takes priority
   const canonicalPath = getRunProgressPath(runId);
   try {
@@ -761,11 +842,23 @@ export function mergeStoryPlanIntoProgress(existingContent: string, storyPlanSec
 
 /**
  * Write the full story plan to the progress log after STORIES_JSON is parsed.
- * Writes to the canonical progress file at <tamandua state>/runs/<runId>/progress.txt,
- * preserving any existing Codebase Patterns or other sections.
- * Emits a 'stories.planned' event on success.
+ *
+ * Native behavior (no `access`): writes to the canonical progress file at
+ * <tamandua state>/runs/<runId>/progress.txt, preserving any existing
+ * Codebase Patterns or other sections. Emits a 'stories.planned' event.
+ *
+ * Opt-in resource behavior (MTLK-PROGRESS): when a `RunProgressAccessLike`
+ * is supplied, the host story-plan write goes through the CONFINED accessor to
+ * the SAME document the guest sees, using its compare-and-commit `updateText`
+ * so a guest append/rewrite committed between our initial read and the
+ * pre-commit identity re-check is never silently dropped (the bounded retry
+ * re-reads it). A guest commit landing after the final identity re-check but
+ * before the atomic replace is last-writer-wins — see the progress-resource
+ * contract's race_reasoning; live arbitrary simultaneous writers are not
+ * claimed. No legacy/workspace fallback is attempted after an opted-in
+ * refusal.
  */
-export function writeStoryPlanToProgress(runId: string): void {
+export function writeStoryPlanToProgress(runId: string, access?: RunProgressAccessLike): void {
   if (!runHasStories(runId)) return;
 
   try {
@@ -773,6 +866,21 @@ export function writeStoryPlanToProgress(runId: string): void {
     if (stories.length === 0) return;
 
     const storyPlanSection = buildStoryPlanSection(stories);
+
+    if (access) {
+      access.updateText((current) => mergeStoryPlanIntoProgress(current ?? "", storyPlanSection));
+      const wfId = getWorkflowId(runId);
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "stories.planned",
+        runId,
+        workflowId: wfId,
+        detail: `Wrote ${stories.length} stories to progress file`,
+      });
+      logger.info("Story plan written to progress file", { runId, storyCount: stories.length });
+      return;
+    }
+
     const progressPath = getRunProgressPath(runId);
 
     // Read existing content if any
@@ -2815,7 +2923,16 @@ function wrapTestCmdInContext(
  * Pure read-only query — no state mutation. Returns the step's claim JSON
  * ({ stepId, runId, input }) or null when the agent holds no in-flight step.
  */
-export function stepCurrent(agentId: string, runId: string): { stepId: string; runId: string; input: string } | null {
+export function stepCurrent(
+  agentId: string,
+  runId: string,
+  /**
+   * Opt-in progress options (MTLK-PROGRESS). `progressAccess` supplies the
+   * guest-visible progress pointer rendered into the current-step input.
+   * Native no-flag callers omit it (byte-identical behavior).
+   */
+  opts?: StepProgressOptions,
+): { stepId: string; runId: string; input: string } | null {
   // Defense-in-depth: strip run- prefix (US-013)
   runId = stripIdPrefix(runId);
   const db = getDb();
@@ -2866,7 +2983,13 @@ export function stepCurrent(agentId: string, runId: string): { stepId: string; r
   }
 
   const loopConfig: LoopConfig | undefined = step.loop_config ? JSON.parse(step.loop_config) : undefined;
-  const context = resolveStepContext(step.run_id, step.step_index, loopConfig, story);
+  const context = resolveStepContext(
+    step.run_id,
+    step.step_index,
+    loopConfig,
+    story,
+    opts?.progressAccess?.guestFile,
+  );
 
   if (!context["verify_feedback"]) context["verify_feedback"] = "";
   if (!context["timeout_retry"]) context["timeout_retry"] = "";
@@ -2876,7 +2999,10 @@ export function stepCurrent(agentId: string, runId: string): { stepId: string; r
     ? wrapTestCmdInContext(context, context["repo"], step.run_id, step.id)
     : context;
 
-  const resolvedInput = resolveTemplate(step.input_template, renderContext);
+  const resolvedInput = resolveTemplate(
+    step.input_template,
+    renderWithProgressView(renderContext, opts),
+  );
 
   return { stepId: step.id, runId: step.run_id, input: resolvedInput };
 }
@@ -2886,6 +3012,7 @@ export function stepCurrent(agentId: string, runId: string): { stepId: string; r
  */
 function enforceClaimLedgerGate(
   step: { id: string; run_id: string; step_id: string },
+  evidenceSource?: FinalizeMergeEvidenceSource,
 ): { eligible: boolean; decision: LedgerGateDecision | null } {
   const db = getDb();
   let decision: LedgerGateDecision | null = null;
@@ -2921,13 +3048,13 @@ function enforceClaimLedgerGate(
         emitTestCmdReviewRefusal(step, reviewRefusal);
         eligible = false;
       } else {
-        decision = alreadyLanded ? null : evaluateFinalizeMergeLedgerGate(step.id);
+        decision = alreadyLanded ? null : evaluateFinalizeMergeLedgerGate(step.id, evidenceSource);
         if (decision) {
           const refusal = getLedgerGateRefusal(step.id, decision);
           if (refusal) {
             const refusalStatus = applyLedgerGateRefusalSync(
               step,
-              formatLedgerGateRefusal(refusal),
+              formatLedgerGateRefusal(refusal, evidenceSource),
               refusal.status === "missing",
               usesLedgerConcessionAllowance(step.id, refusal),
             );
@@ -2947,7 +3074,17 @@ function enforceClaimLedgerGate(
   }
 }
 
-export function claimStep(agentId: string, runId: string, workerOwnership?: WorkerOwnership): ClaimResult {
+export function claimStep(
+  agentId: string,
+  runId: string,
+  workerOwnership?: WorkerOwnership,
+  /**
+   * Opt-in progress options (MTLK-PROGRESS). `progressAccess` supplies the
+   * guest-visible progress pointer rendered into the claimed input.
+   * Native no-flag callers omit it (byte-identical behavior).
+   */
+  opts?: StepProgressOptions,
+): ClaimResult {
   // Defense-in-depth: strip run- prefix (US-013)
   runId = stripIdPrefix(runId);
   // Throttle cleanup: run at most once every 5 minutes across all agents.
@@ -2961,7 +3098,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   // in-flight step in this run, re-return it instead of NO_WORK.
   // stepCurrent is a pure read-only query; it does not reset progress,
   // bump retry counts, or change claim timestamps.
-  const heldStep = stepCurrent(agentId, runId);
+  const heldStep = stepCurrent(agentId, runId, opts);
   if (heldStep) {
     return {
       found: true,
@@ -3049,7 +3186,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
 
   let ledgerGateDecision: LedgerGateDecision | null = null;
   if (step.step_id === "finalize_merge") {
-    const gateClaim = enforceClaimLedgerGate(step);
+    const gateClaim = enforceClaimLedgerGate(step, opts?.ledgerEvidenceSource);
     ledgerGateDecision = gateClaim.decision;
     if (!gateClaim.eligible) return { found: false };
   } else {
@@ -3217,8 +3354,9 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       context["current_story_title"] = story.title;
       context["completed_stories"] = formatCompletedStories(allStories);
       context["stories_remaining"] = String(pendingCount);
-      context["progress"] = `stored in the file ${getRunProgressPath(step.run_id)} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
-      context["progress_file"] = getRunProgressPath(step.run_id);
+      const claimProgressPointer = getRunProgressPath(step.run_id);
+      context["progress"] = `stored in the file ${claimProgressPointer} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
+      context["progress_file"] = claimProgressPointer;
 
       if (!context["verify_feedback"]) {
         context["verify_feedback"] = "";
@@ -3258,7 +3396,10 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       // Persist canonical context (test_cmd is raw, not wrapped)
       db.prepare(`UPDATE runs SET context = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`).run(JSON.stringify(context), step.run_id);
 
-      const resolvedInput = resolveTemplate(step.input_template, renderContext);
+      const resolvedInput = resolveTemplate(
+        step.input_template,
+        renderWithProgressView(renderContext, opts),
+      );
       emitDispatchRenderingValidation(step);
 
       if (hasTimeoutRetryLoop) {
@@ -3324,8 +3465,9 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       "SELECT COUNT(*) as cnt FROM stories WHERE run_id = ?"
     ).get(step.run_id) as { cnt: number };
     if (hasStories.cnt > 0) {
-      context["progress"] = `stored in the file ${getRunProgressPath(step.run_id)} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
-      context["progress_file"] = getRunProgressPath(step.run_id);
+      const claimProgressPointer = getRunProgressPath(step.run_id);
+      context["progress"] = `stored in the file ${claimProgressPointer} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
+      context["progress_file"] = claimProgressPointer;
     }
 
     // Clear one-shot timeout_retry after the template has captured it.
@@ -3360,7 +3502,10 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       return { found: false };
     }
 
-    const resolvedInput = resolveTemplate(step.input_template, renderContext);
+    const resolvedInput = resolveTemplate(
+      step.input_template,
+      renderWithProgressView(renderContext, opts),
+    );
     emitDispatchRenderingValidation(step);
 
     if (hasTimeoutRetry) {
@@ -3512,6 +3657,71 @@ export function finalizeDrainingPause(runId: string): void {
 // ══════════════════════════════════════════════════════════════════════
 
 /**
+ * Authoritative claim-row snapshot handed to an optional mutation authority
+ * guard. Carries exactly the fields the guard needs to bind a mutation to a
+ * host invocation/claim without re-opening the database.
+ */
+export interface StepClaimEvidence {
+  /** Steps table row id (bare uuid). */
+  stepRowId: string;
+  /** Public step id from the workflow (e.g. "plan"). */
+  stepId: string;
+  runId: string;
+  status: string;
+  claimJobId: string | null;
+  claimPid: number | null;
+  claimPgid: number | null;
+  claimUpdatedAt: string | null;
+  updatedAt: string;
+  claimInvalidatedBy: string | null;
+}
+
+/**
+ * Minimal explicit opt-in authority seam (MTLK-STEP).
+ *
+ * Native callers (the worker CLI, the scheduler motor, plain tests) never
+ * pass `options`, so every existing unguarded entry point keeps its exact
+ * behavior. A Matchlock broker integration that must bind a mutation to a
+ * specific host invocation passes `authority`:
+ *
+ *   - completeStep: the callback is evaluated INSIDE the existing
+ *     BEGIN IMMEDIATE mutation transaction, immediately after the row read
+ *     and before any state change or event, so refusal is atomic with the
+ *     serialized mutation boundary (an async precheck is NOT sufficient).
+ *   - failStep: the callback is evaluated synchronously at entry and again
+ *     AFTER the only await (getOnFailPolicy) on a FRESH row read, BEFORE any
+ *     mutation in the retry-exhausted branch — the on_fail.retry_step
+ *     reroute (rerouteWithPolicy) and the terminal run-failure transition
+ *     are each preceded by an authorization re-check, so authority loss
+ *     across the async boundary can never drive a reroute or run failure.
+ *     No shared database transaction is held across asynchronous work.
+ *
+ * Returning null authorizes; returning a detail string refuses WITHOUT any
+ * mutation and WITHOUT any event, and completeStep/failStep report the
+ * refusal as `{ status: "blocked" }` (claim retained, retry budget
+ * untouched). The guard must never throw.
+ */
+export interface StepMutationOptions {
+  authority?: (evidence: StepClaimEvidence) => string | null;
+  /**
+   * Opt-in host progress-resource accessor (MTLK-PROGRESS). When present,
+   * post-completion host story-plan writes (and the upstream completeStep
+   * mutation path that archives progress) go through this confined accessor
+   * to the SAME document the guest sees. Native callers pass no options ->
+   * canonical `<state>/runs/<runId>/progress.txt` behavior, byte-identical.
+   */
+  progressAccess?: RunProgressAccessLike;
+  /**
+   * Opt-in host-attested Matchlock finalizer evidence source (US-006). When
+   * present, the completion-time finalize_merge acceptance gate consults this
+   * source instead of the native `suite_results` ledger. Supplied ONLY by the
+   * controller-attested Matchlock runner/adapter path; native callers omit it
+   * and keep byte-identical native behavior.
+   */
+  ledgerEvidenceSource?: FinalizeMergeEvidenceSource;
+}
+
+/**
  * Options for {@link completeStep}.
  *
  * `rejectPausedRun` is the scheduler's output-derived auto-completion guard
@@ -3521,7 +3731,7 @@ export function finalizeDrainingPause(runId: string): void {
  * `tamandua step complete` path is untouched — a pause drain lets in-flight
  * work finish and report normally.
  */
-export interface CompleteStepOptions {
+export interface CompleteStepOptions extends StepMutationOptions {
   rejectPausedRun?: boolean;
 }
 
@@ -3544,7 +3754,11 @@ export function completeStep(
   if (result.status === "advanced" || result.status === "completed" || result.status === "rerouted") {
     const runIdRow = getDb().prepare("SELECT run_id FROM steps WHERE id = ?").get(stepId) as { run_id: string } | undefined;
     if (runIdRow) {
-      writeStoryPlanToProgress(runIdRow.run_id);
+      // Opt-in resource forwarding (MTLK-PROGRESS): when a host progress
+      // accessor is supplied, the host story-plan write goes through the
+      // confined resource accessor (same document the guest sees). Native
+      // callers pass no options -> canonical path, byte-identical.
+      writeStoryPlanToProgress(runIdRow.run_id, opts?.progressAccess);
     }
   }
 
@@ -3566,12 +3780,13 @@ function completeStepInternal(
 
   const body = (): { status: string; detail?: string } => {
     const step = db.prepare(
-    "SELECT id, run_id, step_id, step_index, type, loop_config, current_story_id, expects, input_template, status, claim_invalidated_by, claim_updated_at, updated_at FROM steps WHERE id = ?"
+    "SELECT id, run_id, step_id, step_index, type, loop_config, current_story_id, expects, input_template, status, agent_id, claim_job_id, claim_pid, claim_pgid, claim_updated_at, claim_invalidated_by, updated_at FROM steps WHERE id = ?"
   ).get(stepId) as {
     id: string; run_id: string; step_id: string; step_index: number; type: string;
     loop_config: string | null; current_story_id: string | null; expects: string;
-    input_template: string | null; status: string; claim_invalidated_by: string | null;
-    claim_updated_at: string | null; updated_at: string;
+    input_template: string | null; status: string; agent_id: string;
+    claim_job_id: string | null; claim_pid: number | null; claim_pgid: number | null;
+    claim_updated_at: string | null; claim_invalidated_by: string | null; updated_at: string;
   } | undefined;
 
   if (!step) {
@@ -3582,6 +3797,29 @@ function completeStepInternal(
       : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>\nIf this is a run id, step complete expects a step id — you may have passed the wrong identifier.`;
     logger.warn(`Rejected step complete: Step not found: ${stepId}`, { stepId });
     throw new Error(`Step not found: ${stepId}${hint}`);
+  }
+
+  // ── MTLK-STEP authority seam (opt-in) ──────────────────────────────
+  // Evaluated INSIDE the BEGIN IMMEDIATE transaction, before the run/status
+  // guards so a refused stale/foreign/revoked claim never emits a
+  // side-channel event and never mutates. The guard closure decides from the
+  // fresh authoritative row snapshot plus host-held invocation state.
+  if (opts?.authority) {
+    const refusal = opts.authority({
+      stepRowId: step.id,
+      stepId: step.step_id,
+      runId: step.run_id,
+      status: step.status,
+      claimJobId: step.claim_job_id,
+      claimPid: step.claim_pid,
+      claimPgid: step.claim_pgid,
+      claimUpdatedAt: step.claim_updated_at,
+      updatedAt: step.updated_at,
+      claimInvalidatedBy: step.claim_invalidated_by,
+    });
+    if (refusal !== null && refusal !== undefined) {
+      return { status: "blocked", detail: refusal };
+    }
   }
 
   // Guard: don't process completions for failed runs
@@ -3694,7 +3932,7 @@ function completeStepInternal(
   // C24 (already-landed guard): skip the acceptance-time refusal when the
   // target ref already advanced to the attested MERGED_COMMIT — refusing a
   // merge that already happened would waste a tester reroute.
-  const acceptanceGateDecision = evaluateFinalizeMergeLedgerGate(step.id);
+  const acceptanceGateDecision = evaluateFinalizeMergeLedgerGate(step.id, opts?.ledgerEvidenceSource);
   const acceptanceGateRefusal = getLedgerGateRefusal(step.id, acceptanceGateDecision);
   if (acceptanceGateRefusal) {
     if (isAlreadyLanded(step.id, output)) {
@@ -3713,7 +3951,7 @@ function completeStepInternal(
       });
       // Fall through to normal acceptance (expects validation, context merge, etc.)
     } else {
-      const refusal = formatLedgerGateRefusal(acceptanceGateRefusal);
+      const refusal = formatLedgerGateRefusal(acceptanceGateRefusal, opts?.ledgerEvidenceSource);
       const refusalStatus = applyLedgerGateRefusalSync(
         step,
         refusal,
@@ -4984,7 +5222,15 @@ export function advancePipeline(runId: string): { advanced: boolean; runComplete
  * Archive the run's progress file from the canonical location to the
  * workspace archive directory (backward-compatible with old workspace paths).
  */
-export function archiveRunProgress(runId: string): void {
+export function archiveRunProgress(runId: string, access?: RunProgressAccessLike): void {
+  // Opt-in resource route (MTLK-PROGRESS): archive the confined resource
+  // document into the host run archive dir and clear the resource doc. No
+  // legacy/workspace fallback after an opted-in refusal.
+  if (access) {
+    const archiveDir = path.join(resolveRunRoot(), runId, "archive");
+    access.archiveTo(archiveDir);
+    return;
+  }
   // Archive from canonical path first
   const canonicalPath = getRunProgressPath(runId);
   if (fs.existsSync(canonicalPath)) {
@@ -5576,10 +5822,18 @@ function applyLedgerGateRefusalSync(
 
 /**
  * Fail a step, with retry logic. For loop steps, applies per-story retry.
+ * `options.authority` is the opt-in MTLK-STEP authority seam (see
+ * StepMutationOptions): evaluated at entry and again after the only await,
+ * immediately before any mutation is applied (both the on_fail.retry_step
+ * reroute and the terminal run-failure transition are guarded).
  */
-export async function failStep(stepId: string, error: string): Promise<{ status: string }> {
+export async function failStep(
+  stepId: string,
+  error: string,
+  options?: StepMutationOptions,
+): Promise<{ status: string }> {
   stepId = stripIdPrefix(stepId);
-  const result = await failStepInternal(stepId, error);
+  const result = await failStepInternal(stepId, error, options);
   // A retry re-pends the step (or its story) — nudge the daemon so the
   // dispatch motor retries immediately instead of on the fallback sweep.
   if (result.status === "retrying") {
@@ -5588,21 +5842,34 @@ export async function failStep(stepId: string, error: string): Promise<{ status:
   return result;
 }
 
-async function failStepInternal(stepId: string, error: string): Promise<{ status: string }> {
+async function failStepInternal(
+  stepId: string,
+  error: string,
+  options?: StepMutationOptions,
+): Promise<{ status: string }> {
   stepId = stripIdPrefix(stepId);
   const db = getDb();
 
   const step = db.prepare(
-    "SELECT run_id, step_id, retry_count, max_retries, reroute_count, terminal_reroute_count, type, current_story_id FROM steps WHERE id = ?"
+    "SELECT id, run_id, step_id, agent_id, status, retry_count, max_retries, reroute_count, terminal_reroute_count, type, current_story_id, claim_job_id, claim_pid, claim_pgid, claim_updated_at, claim_invalidated_by, updated_at FROM steps WHERE id = ?"
   ).get(stepId) as {
+    id: string;
     run_id: string;
     step_id: string;
+    agent_id: string;
+    status: string;
     retry_count: number;
     max_retries: number;
     reroute_count: number | null;
     terminal_reroute_count: number | null;
     type: string;
     current_story_id: string | null;
+    claim_job_id: string | null;
+    claim_pid: number | null;
+    claim_pgid: number | null;
+    claim_updated_at: string | null;
+    claim_invalidated_by: string | null;
+    updated_at: string;
   } | undefined;
 
   if (!step) {
@@ -5613,6 +5880,28 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
       : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>\nIf this is a run id, step fail expects a step id — you may have passed the wrong identifier.`;
     logger.warn(`Rejected step fail: Step not found: ${stepId}`, { stepId });
     throw new Error(`Step not found: ${stepId}${hint}`);
+  }
+
+  // ── MTLK-STEP authority seam (opt-in): synchronous entry check ─────
+  // No await has happened yet, but refuse early with zero mutation/events so
+  // a foreign/revoked invocation never drives fail transitions. The seam is
+  // re-checked after the only await below.
+  const entryRefusal = options?.authority
+    ? options.authority({
+        stepRowId: step.id,
+        stepId: step.step_id,
+        runId: step.run_id,
+        status: step.status,
+        claimJobId: step.claim_job_id,
+        claimPid: step.claim_pid,
+        claimPgid: step.claim_pgid,
+        claimUpdatedAt: step.claim_updated_at,
+        updatedAt: step.updated_at,
+        claimInvalidatedBy: step.claim_invalidated_by,
+      })
+    : null;
+  if (entryRefusal !== null && entryRefusal !== undefined) {
+    return { status: "blocked" };
   }
 
   // Loop step failure — per-story retry
@@ -5650,6 +5939,43 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
   const newRetryCount = step.retry_count + 1;
 
   if (newRetryCount > step.max_retries) {
+    // ── MTLK-STEP authority seam (opt-in): fresh-row re-check helper ──
+    // getOnFailPolicy is awaited BEFORE the retry-exhausted branch's
+    // mutations. While that await is in flight the authoritative claim row
+    // may change (host revocation / supersession / reassignment / release),
+    // so the guard must be re-evaluated AFTER the await on a FRESH row read
+    // and immediately BEFORE the mutation it authorizes. This helper re-reads
+    // the step row synchronously and re-runs the guard; it returns a refusal
+    // detail string, or null when authorized (or when no guard was
+    // configured). It never throws and performs no mutation or event.
+    const authorityRefusalOnFreshRow = (): string | null => {
+      if (!options?.authority) return null;
+      const fresh = db.prepare(
+        "SELECT id, run_id, step_id, agent_id, status, claim_job_id, claim_pid, claim_pgid, claim_updated_at, claim_invalidated_by, updated_at FROM steps WHERE id = ?",
+      ).get(stepId) as {
+        id: string; run_id: string; step_id: string; agent_id: string; status: string;
+        claim_job_id: string | null; claim_pid: number | null; claim_pgid: number | null;
+        claim_updated_at: string | null; claim_invalidated_by: string | null; updated_at: string;
+      } | undefined;
+      if (!fresh) {
+        return `authoritative step row ${stepId} no longer exists at fail re-check`;
+      }
+      const refusal = options.authority({
+        stepRowId: fresh.id,
+        stepId: fresh.step_id,
+        runId: fresh.run_id,
+        status: fresh.status,
+        claimJobId: fresh.claim_job_id,
+        claimPid: fresh.claim_pid,
+        claimPgid: fresh.claim_pgid,
+        claimUpdatedAt: fresh.claim_updated_at,
+        updatedAt: fresh.updated_at,
+        claimInvalidatedBy: fresh.claim_invalidated_by,
+      });
+      // Seam contract: null (or undefined) authorizes; a detail string refuses.
+      return refusal === null || refusal === undefined ? null : refusal;
+    };
+
     // ── RETR: check on_fail.retry_step before failing the run ──
     // Rerouting to an upstream producer allows the run to recover when
     // a consumer's failure root cause lives in producer output.
@@ -5659,6 +5985,22 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
     let targetMovedBudgetExhausted = false;
     try {
       const policy = await getOnFailPolicy(step.run_id, step.step_id);
+
+      // ── MTLK-STEP authority seam (opt-in): re-check AFTER the await and
+      // BEFORE any retry-exhausted mutation ──
+      // rerouteWithPolicy below re-pends the producer with feedback, resets
+      // the consumer to waiting, updates the reroute counters and emits
+      // step.rerouted; the fall-through failure UPDATE terminates the run.
+      // A host revocation/supersession that happened while the policy lookup
+      // was in flight must not let this (revoked) invocation drive either
+      // mutation, so the guard is re-evaluated here on a fresh row read and
+      // the branch is refused with { status: "blocked" } — zero mutation,
+      // zero events, claim retained — when authority was lost.
+      const rerouteRefusal = authorityRefusalOnFreshRow();
+      if (rerouteRefusal !== null) {
+        return { status: "blocked" };
+      }
+
       const rerouteMode = getFailureRerouteMode(error, policy);
       terminalRerouteLimitExhausted =
         rerouteMode === "terminal" && (step.terminal_reroute_count ?? 0) >= 1;
@@ -5693,6 +6035,21 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
       const wfIdCatch = getWorkflowId(step.run_id);
       emitEvent({ ts: new Date().toISOString(), event: "step.reroute_error", runId: step.run_id, workflowId: wfIdCatch, stepId, detail: String(e) });
       // Best-effort: fall through to normal failure
+    }
+
+    // ── MTLK-STEP authority seam (opt-in): re-check BEFORE the terminal
+    // failure transition ──
+    // Only reached when no reroute was applied (policy lookup failure /
+    // budget exhaustion / invalid target / no retry_step declared): the
+    // failure UPDATE below still terminates the run, so authority lost
+    // across the await must refuse it too. The recheck above already ran
+    // after the await on the happy policy path; this second evaluation on
+    // the same fresh row state is the guard for the fall-through and
+    // policy-exception paths. No events are emitted and nothing mutates on
+    // refusal.
+    const failureRefusal = authorityRefusalOnFreshRow();
+    if (failureRefusal !== null) {
+      return { status: "blocked" };
     }
 
     db.prepare(
@@ -5967,7 +6324,14 @@ export function resolveStepContext(
   runId: string,
   stepIndex: number,
   loopConfig?: LoopConfig,
-  story?: Story
+  story?: Story,
+  /**
+   * Opt-in guest-visible progress pointer (MTLK-PROGRESS). When provided, the
+   * `progress`/`progress_file` context rendered for this step references this
+   * guest file instead of the host canonical `<state>/runs/<runId>/progress.txt`.
+   * Native no-flag callers omit it (byte-identical behavior).
+   */
+  progressFileOverride?: string
 ): Record<string, string> {
   const db = getDb();
 
@@ -6014,8 +6378,9 @@ export function resolveStepContext(
     context["completed_stories"] = formatCompletedStories(allStories);
     const pendingCount = allStories.filter((s) => s.status === "pending" || s.status === "running").length;
     context["stories_remaining"] = String(pendingCount);
-    context["progress"] = `stored in the file ${getRunProgressPath(runId)} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
-    context["progress_file"] = getRunProgressPath(runId);
+    const progressPointer = progressFileOverride ?? getRunProgressPath(runId);
+    context["progress"] = `stored in the file ${progressPointer} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
+    context["progress_file"] = progressPointer;
 
     if (!context["verify_feedback"]) {
       context["verify_feedback"] = "";

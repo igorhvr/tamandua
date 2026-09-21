@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Run the MTLK-ALL-WORKFLOWS US-009 fresh-VM synthetic WHOLE-PATH gate for the
+# genuine bundled `feature-dev-merge-worktree` workflow under the **hermes**
+# Matchlock route:
+#
+#   isolated daemon -> scheduler -> hermes Matchlock invocation runner -> fresh
+#   VMs -> real workflow completion, the per-story verify loop, real guest
+#   tests + host-suite evidence, a REAL final squash landing on the owned origin
+#   (target_moved -> rebase -> retest), and exact-owned VM teardown with
+#   retained evidence.
+#
+# This tier is a REAL-VM gate: it boots fresh Firecracker VMs with the matchlock
+# runtime and a TEST-ONLY synthetic-hermes derived fixture image
+# (e2e-tests/hermes-fixture/). It makes ZERO model/provider/credential calls. It
+# is deliberately NOT part of the default fast lanes (npm test / run-all-smoke /
+# run-all-scripted / run-all-e2e-tests). Run on demand UNDER THE SHARED GATE
+# LOCK:
+#
+#   flock --exclusive /home/kaladin/matchlock-work/vaivm-gate.lock \
+#     ./run-matchlock-hermes-merge-worktree-e2e-test
+#
+# The runner does NOT take the lock itself (the caller holds it; a nested flock
+# on the same file would deadlock).
+#
+# Runtime resolution: this host (vaimetal) runs the SYSTEM matchlock pair (no
+# hash pins; see /home/kaladin/matchlock-work/matchlock-runtime.env). The pair
+# is resolved from TAMANDUA_MATCHLOCK_RPC_BIN / MATCHLOCK_GUEST_INIT /
+# MATCHLOCK_GUEST_FUSED when set, else from TAMANDUA_MATCHLOCK_RUNTIME_DIR, else
+# from PATH. Set TAMANDUA_GATE_EXPECT_RUNTIME_PINS=1 to additionally enforce the
+# historical accepted-pin hashes (matching run-matchlock-worktree-merge-e2e-test).
+#
+# Optional dev/test-speed seam (NOT the clean acceptance path):
+#   TAMANDUA_GATE_FIXTURE_IMAGE_CACHE=<dir> — <dir>/images is a prior run's
+#   content-addressed matchlock image store; the gate HARDLINKS the multi-GB
+#   blobs into its fresh private home. When unset, the default persistent cache
+#   below is used when present; otherwise the committed fixture Dockerfile is
+#   rebuilt + imported into the fresh home.
+#
+# What it does:
+#   1. resolves + (optionally) validates the runtime binaries
+#   2. npm run build (compiled dist is what the isolated daemon runs)
+#   3. allocates a NEW evidence directory with mkdtemp under
+#      ${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}
+#      (outside the repo; NEVER pre-cleaned/reused) plus a private fresh TMPDIR
+#      inside it
+#   4. runs e2e-tests/matchlock-hermes-merge-worktree-gate.test.ts with all logs
+#      tee'd into the evidence dir; exit code propagates (cleanup failures
+#      included).
+#
+# Never touches the live worker daemon, live tamandua state, the operator's
+# matchlock store, or any live branch: the gate uses a private fresh HOME and a
+# tiny OWNED origin repository under the evidence dir.
+set -u
+
+cd "$(dirname "$0")"
+
+# Optional historical runtime pins (enforced only when explicitly requested).
+EXPECTED_MATCHLOCK="a278f9c153c91a76bcfca3abe2ff4146996e48ad4f3b36e47026e605e9232136"
+EXPECTED_GUEST_INIT="f76f00fbc089dea1f1e5eba536778da9bee9f20f547a6779f14b76a700d35c06"
+
+if [ -n "${TAMANDUA_MATCHLOCK_RUNTIME_DIR:-}" ]; then
+  RUNTIME_DIR="$TAMANDUA_MATCHLOCK_RUNTIME_DIR"
+else
+  RUNTIME_DIR=""
+fi
+MATCHLOCK_RPC_BIN="${TAMANDUA_MATCHLOCK_RPC_BIN:-${RUNTIME_DIR:+$RUNTIME_DIR/matchlock}}"
+MATCHLOCK_RPC_BIN="${MATCHLOCK_RPC_BIN:-$(command -v matchlock || true)}"
+GUEST_INIT="${MATCHLOCK_GUEST_INIT:-${RUNTIME_DIR:+$RUNTIME_DIR/guest-init}}"
+GUEST_INIT="${GUEST_INIT:-$(command -v guest-init || true)}"
+GUEST_FUSED="${MATCHLOCK_GUEST_FUSED:-$GUEST_INIT}"
+
+fail() { echo "run-matchlock-hermes-merge-worktree-e2e-test: FATAL: $*" >&2; exit 90; }
+
+for p in "$MATCHLOCK_RPC_BIN" "$GUEST_INIT" "$GUEST_FUSED"; do
+  [ -x "$p" ] || fail "runtime binary missing or not executable: $p"
+done
+
+if [ "${TAMANDUA_GATE_EXPECT_RUNTIME_PINS:-0}" = "1" ]; then
+  ACTUAL_MATCHLOCK=$(sha256sum "$MATCHLOCK_RPC_BIN" | awk '{print $1}')
+  ACTUAL_GUEST_INIT=$(sha256sum "$GUEST_INIT" | awk '{print $1}')
+  ACTUAL_GUEST_FUSED=$(sha256sum "$GUEST_FUSED" | awk '{print $1}')
+  [ "$ACTUAL_MATCHLOCK" = "$EXPECTED_MATCHLOCK" ] \
+    || fail "TAMANDUA_MATCHLOCK_RPC_BIN hash mismatch: got $ACTUAL_MATCHLOCK expected $EXPECTED_MATCHLOCK"
+  [ "$ACTUAL_GUEST_INIT" = "$EXPECTED_GUEST_INIT" ] \
+    || fail "MATCHLOCK_GUEST_INIT hash mismatch: got $ACTUAL_GUEST_INIT expected $EXPECTED_GUEST_INIT"
+  [ "$ACTUAL_GUEST_FUSED" = "$EXPECTED_GUEST_INIT" ] \
+    || fail "MATCHLOCK_GUEST_FUSED hash mismatch: got $ACTUAL_GUEST_FUSED expected $EXPECTED_GUEST_INIT (fused must equal guest-init)"
+  echo "paired runtime pins OK (matchlock $ACTUAL_MATCHLOCK, guest-init $ACTUAL_GUEST_INIT)"
+else
+  echo "runtime: $MATCHLOCK_RPC_BIN (guest-init $GUEST_INIT, guest-fused $GUEST_FUSED; system pair, no pins)"
+fi
+
+npm run build || fail "npm run build failed"
+
+EVIDENCE_ROOT="${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}"
+mkdir -p "$EVIDENCE_ROOT"
+EV="$(mktemp -d "$EVIDENCE_ROOT/hermes-merge-worktree-XXXXXX")" || fail "mktemp -d under $EVIDENCE_ROOT failed"
+echo "evidence dir: $EV"
+
+export TAMANDUA_MATCHLOCK_RPC_BIN="$MATCHLOCK_RPC_BIN"
+export MATCHLOCK_GUEST_INIT="$GUEST_INIT"
+export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"
+export TAMANDUA_GATE_EVIDENCE_DIR="$EV"
+export TAMANDUA_GATE_EVIDENCE_ROOT="$EVIDENCE_ROOT"
+
+# Fixture image cache: explicit wins; else the persistent default under the
+# evidence root when it already carries an images/ store.
+HERMES_FIXTURE_CACHE_DEFAULT="${TAMANDUA_HERMES_FIXTURE_CACHE:-$EVIDENCE_ROOT/hermes-fixture-image-cache}"
+if [ -n "${TAMANDUA_GATE_FIXTURE_IMAGE_CACHE:-}" ]; then
+  export TAMANDUA_GATE_FIXTURE_IMAGE_CACHE
+elif [ -d "$HERMES_FIXTURE_CACHE_DEFAULT/images" ]; then
+  export TAMANDUA_GATE_FIXTURE_IMAGE_CACHE="$HERMES_FIXTURE_CACHE_DEFAULT"
+  echo "fixture image cache: $HERMES_FIXTURE_CACHE_DEFAULT"
+fi
+
+# Private fresh TMPDIR inside the evidence dir (guest-pack builds and any gate
+# scratch stay under owned evidence).
+export TMPDIR="$EV/tmp"
+mkdir -p "$TMPDIR"
+
+LOG="$EV/gate-run.log"
+echo "=== MATCHLOCK HERMES MERGE-WORKTREE WHOLE-PATH GATE START $(date -u +%FT%TZ) EV=$EV ===" | tee "$LOG"
+echo "runtime: $MATCHLOCK_RPC_BIN" | tee -a "$LOG"
+node --test e2e-tests/matchlock-hermes-merge-worktree-gate.test.ts 2>&1 | tee -a "$LOG"
+RC=${PIPESTATUS[0]}
+echo "=== MATCHLOCK HERMES MERGE-WORKTREE WHOLE-PATH GATE END $(date -u +%FT%TZ) rc=$RC ===" | tee -a "$LOG"
+
+# ── no-fake-green: refuse PASS when no in-VM round was observed ──────────
+# The driver writes <EV>/observed-rounds.json (TESTER-HONESTY item 3). This
+# guard reads it and exits 92 — distinct from a test failure (1) and this
+# runner's FATAL (90) — when the count is zero or the evidence is
+# missing/malformed. A gate whose VM creation fails (or whose probe never
+# reached a round) must fail loudly, never report a vacuous round-rejection
+# assertion as a green run.
+GUARD_RC=0
+node scripts/observed-rounds-guard.mjs --dir "$EV" --gate hermes-merge-worktree 2>&1 | tee -a "$LOG"
+GUARD_RC=${PIPESTATUS[0]}
+if [ "$GUARD_RC" -eq 92 ]; then
+  echo "run-matchlock-hermes-merge-worktree-e2e-test: ZERO-ROUND REFUSAL: no VM round observed (VM creation or probe failed before any round)" >&2
+  exit 92
+fi
+exit "$RC"

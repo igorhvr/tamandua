@@ -80,6 +80,24 @@ const GUARDED_PROC_FILES = new Set([
   "tests/get-ready-dashboard-port.test.ts",
 ]);
 
+/**
+ * Files whose only procfs references are GUEST paths inside the Matchlock VM
+ * (the in-VM procfs mount table and the procfs self-fd Node interposer), never
+ * a host procfs read. The host-portability concern does not apply: the
+ * qualified guest is Linux by construction, so these literals are the guest
+ * contract the gate asserts on.
+ */
+const GUEST_PROC_FILES = new Set([
+  "e2e-tests/helpers/matchlock-dsh-fsync-trace.ts",
+  "e2e-tests/matchlock-dsh-fsync-diagnosis.test.ts",
+  // MTLK-VM-SIZE: the one-VM size gate reads the guest meminfo pseudo-file
+  // INSIDE the VM and the contract validator describes the guest MemTotal
+  // line; both are guest paths in the Linux-by-construction VM, never a host
+  // procfs read.
+  "e2e-tests/matchlock-vm-size-gate.test.ts",
+  "tests/matchlock-vm-size-contract.test.ts",
+]);
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 /**
@@ -139,6 +157,7 @@ export function scanFileContent(
     // ── procfs ────────────────────────────────────────────────────────
     if (line.includes(P)) {
       if (PROC_ALLOWED.has(relativePath)) continue;
+      if (GUEST_PROC_FILES.has(relativePath)) continue;
       if (isGuardedEnviron(relativePath, lines, i)) continue;
       violations.push({
         relativePath,

@@ -34,6 +34,12 @@ function setupTempDb(): {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode=WAL");
+  // NATIVE reconciliation: the CLI children spawned below open this same DB
+  // and run the version-13 migration chain on it; without a busy handler this
+  // raw connection raises SQLITE_BUSY ('database is locked', errcode 5) the
+  // moment a child holds the WAL writer lock. Match the product `getDb()`
+  // (which sets `PRAGMA busy_timeout = 5000`) and the other raw-DB tests.
+  db.exec("PRAGMA busy_timeout = 5000");
   db.exec(`
     CREATE TABLE IF NOT EXISTS runs (
       id TEXT PRIMARY KEY,

@@ -827,13 +827,18 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
         };
         const scripted = createScriptedDsh(env.root, behaviors);
 
-        // Create a separate read-only DSH_HOME with no sessions tree, so
-        // the session-file lookup fails and the worker cannot write its
-        // fake session log either (the runtime degrades gracefully).
+        // Create a separate DSH_HOME with no sessions tree that CANNOT grow
+        // one, so the session-file lookup fails and the worker cannot write
+        // its fake session log either (the runtime degrades gracefully).
+        //
+        // The home path is a REGULAR FILE, not a chmod-0555 directory: the
+        // integration gate runs as root, and root bypasses DAC mode bits, so
+        // an 0555 dir is still writable and the degraded precondition never
+        // holds. `$DSH_HOME/sessions/...` under a file fails with ENOTDIR for
+        // every euid, enforcing the intended degraded lookup with the
+        // assertion (`tokens_spent === 0`) unchanged.
         const brokenDshHome = path.join(env.root, "broken-dsh-home");
-        fs.mkdirSync(brokenDshHome, { recursive: true });
-        // Make it read-only: mkdir + chmod 0o555
-        fs.chmodSync(brokenDshHome, 0o555);
+        fs.writeFileSync(brokenDshHome, "");
 
         // Build daemon env with the broken DSH_HOME
         const daemonEnv = {
@@ -895,23 +900,11 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
         assert.equal(steps.length, 1, "do-now should have exactly 1 step");
         assert.equal(steps[0].status, "done", "step should complete normally");
 
-        // ── Restore writability so teardown can clean up ──────────
-        fs.chmodSync(brokenDshHome, 0o755);
-
         console.log(
-          `[scripted-dsh-e2e degradation] do-now with read-only DSH_HOME: ` +
+          `[scripted-dsh-e2e degradation] do-now with unusable DSH_HOME: ` +
             `run completed, tokens_spent=${tokens} (degraded gracefully)`,
         );
       } finally {
-        // Restore writability before cleanup in case the test failed mid-way
-        try {
-          const brokenDshHome = path.join(ctx?.env.root ?? "/tmp", "broken-dsh-home");
-          if (fs.existsSync(brokenDshHome)) {
-            fs.chmodSync(brokenDshHome, 0o755);
-          }
-        } catch {
-          // best-effort
-        }
         await teardown(ctx);
       }
     },

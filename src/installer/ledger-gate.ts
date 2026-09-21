@@ -23,6 +23,73 @@ export interface LedgerGateRow {
   createdAt: string;
 }
 
+/**
+ * Host-attested Matchlock suite evidence row (US-006 finalizer ledger seam).
+ * Structurally mirrors {@link LedgerGateRow}; it is produced from the explicit
+ * host-owned Matchlock evidence store (HostSuiteStore.queryMergeEvidence), NOT
+ * from native `suite_results`.
+ */
+export interface FinalizeMergeEvidenceRow {
+  id: number;
+  exitCode: number;
+  durationMs: number;
+  logTail: string | null;
+  runId: string | null;
+  stepId: string | null;
+  createdAt: string;
+}
+
+/**
+ * Exact evidence key for an opted-in Matchlock finalizer lookup. The canonical
+ * namespace is bound to the source (never supplied per query), so a caller
+ * cannot widen it.
+ */
+export interface FinalizeMergeEvidenceKey {
+  originRepo: string;
+  treeHash: string;
+  cmdHash: string;
+}
+
+/** Bounded nearest-evidence diagnostic row (same store, same namespace). */
+export interface FinalizeMergeNearestEvidenceRow {
+  treeHash: string;
+  exitCode: number;
+  createdAt: string;
+}
+
+/**
+ * Optional host-attested Matchlock finalizer evidence source (US-006).
+ *
+ * The source is bound to ONE host-admitted canonical suite namespace (image
+ * content id / guest platform / helper contract / nonsecret compatibility
+ * fingerprint) and NEVER reads native `suite_results`. It is supplied ONLY by
+ * the controller-attested Matchlock runner/adapter path
+ * (`pi-invocation-runner` -> `NativeStepServices` -> step-ops), which builds it
+ * from the same host-owned store + canonical namespace the suite bridge uses.
+ * No run context, guest input or environment variable can activate it. When the
+ * source is absent the gate queries the native ledger exactly as before.
+ */
+export interface FinalizeMergeEvidenceSource {
+  /** Canonical host-admitted namespace id this source is bound to. */
+  readonly namespaceId: string;
+  /**
+   * Latest evidence row for the EXACT bound namespace + origin/tree/cmd key.
+   * Returns null when no row exists. MUST NOT fall back to native evidence and
+   * MUST NOT return a row recorded under another namespace.
+   */
+  queryMergeEvidence(key: FinalizeMergeEvidenceKey): FinalizeMergeEvidenceRow | null;
+  /**
+   * Bounded nearest-evidence diagnostics for refusal text, scoped to the SAME
+   * bound namespace. Optional; when absent the diagnostics report unavailable
+   * rather than reading the native ledger.
+   */
+  nearestEvidence?(
+    originRepo: string,
+    cmdHash: string,
+    limit: number,
+  ): FinalizeMergeNearestEvidenceRow[];
+}
+
 export type LedgerGateDecision =
   | {
       status: "inert";
@@ -104,6 +171,34 @@ type LedgerGateContext = Record<string, unknown>;
 
 const MERGE_GATE_VALUES = new Set(["default", "green", "off"]);
 const FAIL_MISSING_VALUES = new Set(["0", "1", "false", "true", "off", "on"]);
+/** Bounded nearest-evidence diagnostic rows (matches the pre-seam native LIMIT 3). */
+const MAX_NEAREST_EVIDENCE_ROWS = 3;
+
+/**
+ * Append the NEAREST_EVIDENCE diagnostic lines (native wording unchanged).
+ * Shared by the native query and the opted-in Matchlock source so refusal text
+ * stays byte-identical on the native/no-flag path.
+ */
+function pushNearestEvidenceDiagnostics(
+  diag: string[],
+  rows: readonly FinalizeMergeNearestEvidenceRow[],
+): void {
+  if (rows.length === 0) {
+    diag.push("NEAREST_EVIDENCE: none for this test command");
+    diag.push(
+      "No recording was ever made — the suite must be executed through the tamandua suite shim (the provided test_cmd wrapper); a raw test command run is invisible to the merge gate.",
+    );
+    return;
+  }
+  const newest = rows[0];
+  const shortHash = newest.treeHash.slice(0, 7);
+  diag.push(
+    `NEAREST_EVIDENCE: tree ${shortHash} exit ${newest.exitCode} recorded ${newest.createdAt}`,
+  );
+  diag.push(
+    "Evidence exists for a DIFFERENT tree — the workspace changed after that suite run (new commits, or dirty workspace at recording time). Re-run the suite on the final committed tree.",
+  );
+}
 
 function parseContext(raw: string): LedgerGateContext {
   try {
@@ -215,7 +310,10 @@ export function getTestCmdReviewRefusal(runId: string): TestCmdReviewRefusal | n
  * command — the gate must verify evidence for THAT command, not the stale
  * pre-rewrite context value.
  */
-export function evaluateFinalizeMergeLedgerGate(stepId: string): LedgerGateDecision {
+export function evaluateFinalizeMergeLedgerGate(
+  stepId: string,
+  evidenceSource?: FinalizeMergeEvidenceSource,
+): LedgerGateDecision {
   const db = getDb();
   const step = db.prepare(
     "SELECT run_id, step_id, step_index FROM steps WHERE id = ?",
@@ -279,6 +377,46 @@ export function evaluateFinalizeMergeLedgerGate(stepId: string): LedgerGateDecis
     return { status: "overridden", gateMode, ...key };
   }
 
+  const row = evidenceSource
+    ? matchlockEvidenceRow(evidenceSource, key)
+    : nativeEvidenceRow(db, key);
+  if (!row) return { status: "missing", gateMode, ...key };
+
+  return {
+    status: row.exitCode === 0 ? "green" : "red",
+    gateMode,
+    ...key,
+    row,
+  };
+}
+
+/** Map a raw Matchlock evidence row into the native-shaped gate row. */
+function matchlockEvidenceRow(
+  source: FinalizeMergeEvidenceSource,
+  key: LedgerGateKey,
+): LedgerGateRow | null {
+  const row = source.queryMergeEvidence({
+    originRepo: key.originRepo,
+    treeHash: key.treeHash,
+    cmdHash: key.cmdHash,
+  });
+  if (!row) return null;
+  return {
+    id: row.id,
+    exitCode: row.exitCode,
+    durationMs: row.durationMs,
+    logTail: row.logTail,
+    runId: row.runId,
+    stepId: row.stepId,
+    createdAt: row.createdAt,
+  };
+}
+
+/** Native ledger query — byte-identical to the pre-seam behavior. */
+function nativeEvidenceRow(
+  db: ReturnType<typeof getDb>,
+  key: LedgerGateKey,
+): LedgerGateRow | null {
   const row = db.prepare(
     `SELECT id, exit_code, duration_ms, log_tail, run_id, step_id, created_at
      FROM suite_results
@@ -286,26 +424,23 @@ export function evaluateFinalizeMergeLedgerGate(stepId: string): LedgerGateDecis
      ORDER BY created_at DESC, id DESC
      LIMIT 1`,
   ).get(key.originRepo, key.treeHash, key.cmdHash) as SuiteResultRow | undefined;
-  if (!row) return { status: "missing", gateMode, ...key };
-
+  if (!row) return null;
   return {
-    status: row.exit_code === 0 ? "green" : "red",
-    gateMode,
-    ...key,
-    row: {
-      id: row.id,
-      exitCode: row.exit_code,
-      durationMs: row.duration_ms,
-      logTail: row.log_tail,
-      runId: row.run_id,
-      stepId: row.step_id,
-      createdAt: row.created_at,
-    },
+    id: row.id,
+    exitCode: row.exit_code,
+    durationMs: row.duration_ms,
+    logTail: row.log_tail,
+    runId: row.run_id,
+    stepId: row.step_id,
+    createdAt: row.created_at,
   };
 }
 
 /** Build the caller-owned failure text consumed by RAMP terminal routing. */
-export function formatLedgerGateRefusal(decision: LedgerGateRefusalDecision): string {
+export function formatLedgerGateRefusal(
+  decision: LedgerGateRefusalDecision,
+  evidenceSource?: FinalizeMergeEvidenceSource,
+): string {
   const lines = [
     "FAILURE_CLASS: refused_permanent",
     decision.status === "missing" ? "LEDGER_EVIDENCE: missing" : "LEDGER_EVIDENCE: red",
@@ -334,7 +469,7 @@ export function formatLedgerGateRefusal(decision: LedgerGateRefusalDecision): st
   // (git status + SELECT). Any failure must never prevent or alter the
   // refusal itself — fall back to the unenriched message.
   try {
-    lines.push(...buildRefusalDiagnostics(decision));
+    lines.push(...buildRefusalDiagnostics(decision, evidenceSource));
   } catch {
     // diagnostic failure — refuse with the unenriched message
   }
@@ -349,7 +484,10 @@ export function formatLedgerGateRefusal(decision: LedgerGateRefusalDecision): st
  * teams can understand why their suite evidence was rejected and what
  * corrective action to take.
  */
-function buildRefusalDiagnostics(decision: LedgerGateRefusalDecision): string[] {
+function buildRefusalDiagnostics(
+  decision: LedgerGateRefusalDecision,
+  evidenceSource?: FinalizeMergeEvidenceSource,
+): string[] {
   const diag: string[] = [];
 
   // ── WORKSPACE_STATE ──────────────────────────────────────────────────
@@ -382,34 +520,35 @@ function buildRefusalDiagnostics(decision: LedgerGateRefusalDecision): string[] 
 
   // ── NEAREST_EVIDENCE ─────────────────────────────────────────────────
   try {
-    const db = getDb();
-    const rows = db
-      .prepare(
-        `SELECT tree_hash, exit_code, created_at
-         FROM suite_results
-         WHERE origin_repo = ? AND cmd_hash = ?
-         ORDER BY created_at DESC
-         LIMIT 3`,
-      )
-      .all(decision.originRepo, decision.cmdHash) as Array<{
-      tree_hash: string;
-      exit_code: number;
-      created_at: string;
-    }>;
-
-    if (rows.length === 0) {
-      diag.push("NEAREST_EVIDENCE: none for this test command");
-      diag.push(
-        "No recording was ever made — the suite must be executed through the tamandua suite shim (the provided test_cmd wrapper); a raw test command run is invisible to the merge gate.",
-      );
+    if (evidenceSource) {
+      // Opted-in Matchlock run: diagnostics stay inside the SAME host-attested
+      // store + canonical namespace. The native ledger is NEVER read as a
+      // fallback, even for refusal enrichment.
+      const query = evidenceSource.nearestEvidence;
+      if (!query) {
+        diag.push("NEAREST_EVIDENCE: unavailable for the host-attested Matchlock evidence source");
+      } else {
+        const rows = query(decision.originRepo, decision.cmdHash, MAX_NEAREST_EVIDENCE_ROWS);
+        pushNearestEvidenceDiagnostics(diag, rows);
+      }
     } else {
-      const newest = rows[0];
-      const shortHash = newest.tree_hash.slice(0, 7);
-      diag.push(
-        `NEAREST_EVIDENCE: tree ${shortHash} exit ${newest.exit_code} recorded ${newest.created_at}`,
-      );
-      diag.push(
-        "Evidence exists for a DIFFERENT tree — the workspace changed after that suite run (new commits, or dirty workspace at recording time). Re-run the suite on the final committed tree.",
+      const db = getDb();
+      const rows = db
+        .prepare(
+          `SELECT tree_hash, exit_code, created_at
+           FROM suite_results
+           WHERE origin_repo = ? AND cmd_hash = ?
+           ORDER BY created_at DESC
+           LIMIT 3`,
+        )
+        .all(decision.originRepo, decision.cmdHash) as Array<{
+        tree_hash: string;
+        exit_code: number;
+        created_at: string;
+      }>;
+      pushNearestEvidenceDiagnostics(
+        diag,
+        rows.map((r) => ({ treeHash: r.tree_hash, exitCode: r.exit_code, createdAt: r.created_at })),
       );
     }
   } catch {

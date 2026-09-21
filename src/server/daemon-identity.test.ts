@@ -20,9 +20,13 @@ import {
   parseIdentityLine,
   probeIdentitySocket,
   DEFAULT_PROBE_TIMEOUT_MS,
+  IDENTITY_SOCKET_SUN_PATH_USABLE_LIMIT,
   type BoundIdentitySocket,
   type DaemonIdentity,
 } from "../../dist/server/daemon-identity.js";
+
+/** A synthetic absolute state dir long enough to blow the AF_UNIX limit. */
+const LONG_HOME = `/${"l".repeat(160)}`;
 
 function makeIdentity(overrides: Partial<DaemonIdentity> = {}): DaemonIdentity {
   return {
@@ -113,6 +117,53 @@ describe("daemon-identity", () => {
         if (prevStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
         else process.env.TAMANDUA_STATE_DIR = prevStateDir;
       }
+    });
+
+    it("aliases a state-dir socket path that would exceed the AF_UNIX sun_path limit", () => {
+      const root = path.join(home.root, "alias");
+      const aliased = getServiceSocketPath("daemon", {
+        homeDir: LONG_HOME,
+        socketAliasRoot: root,
+        uid: 4242,
+      });
+      assert.ok(!aliased.startsWith(LONG_HOME), `expected a short alias, got ${aliased}`);
+      assert.ok(aliased.startsWith(path.join(root, "4242", "s")), `alias under the short root: ${aliased}`);
+      assert.equal(path.basename(aliased), "daemon.sock");
+      assert.ok(
+        Buffer.byteLength(aliased, "utf8") <= IDENTITY_SOCKET_SUN_PATH_USABLE_LIMIT,
+        `alias must fit sun_path (${Buffer.byteLength(aliased, "utf8")} bytes): ${aliased}`,
+      );
+      // Deterministic for the same state dir, distinct for a different one.
+      assert.equal(
+        aliased,
+        getServiceSocketPath("daemon", { homeDir: LONG_HOME, socketAliasRoot: root, uid: 4242 }),
+      );
+      const sibling = getServiceSocketPath("daemon", {
+        homeDir: `${LONG_HOME}x`,
+        socketAliasRoot: root,
+        uid: 4242,
+      });
+      assert.notEqual(aliased, sibling);
+    });
+  });
+
+  describe("aliased identity socket", () => {
+    it("binds and probes a daemon identity through the short alias", async () => {
+      const root = path.join(home.root, "alias");
+      const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+      const p = getServiceSocketPath("daemon", {
+        homeDir: LONG_HOME,
+        socketAliasRoot: root,
+        uid,
+      });
+      assert.ok(p.startsWith(path.join(root, String(uid), "s")), `expected alias path, got ${p}`);
+      const identity = makeIdentity();
+      const bound = await bindIdentitySocket(p, identity);
+      openSockets.push(bound);
+      const probe = await probeIdentitySocket(p);
+      assert.ok(probe, `expected the aliased socket at ${p} to answer`);
+      assert.equal(probe.pid, identity.pid);
+      assert.equal(probe.controlPort, identity.controlPort);
     });
   });
 

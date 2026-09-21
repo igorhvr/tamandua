@@ -182,6 +182,7 @@ export interface RunRow {
   scheduling_status: string | null;
   context: string;
   created_at?: string;
+  matchlock_policy?: string | null;
 }
 
 function getRun(runId: string): RunRow | null {
@@ -189,7 +190,7 @@ function getRun(runId: string): RunRow | null {
     const db = getDb();
     const row = db
       .prepare(
-        "SELECT id, workflow_id, status, scheduling_status, context, created_at FROM runs WHERE id = ?",
+        "SELECT id, workflow_id, status, scheduling_status, context, created_at, matchlock_policy FROM runs WHERE id = ?",
       )
       .get(runId) as RunRow | undefined;
     return row ?? null;
@@ -380,7 +381,9 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
     setupAgentCrons,
   } = await import("../installer/agent-scheduler.js");
 
-  const harness = await validateRunHarnessForScheduling(run.id, run.context);
+  const harness = await validateRunHarnessForScheduling(run.id, run.context, {
+    matchlockPolicy: run.matchlock_policy ?? null,
+  });
 
   const contextParsed = parseRunContext(run.id, run.context);
   const isSaveTokensMode = contextParsed.no_hurry_save_tokens_mode === 'true';
@@ -1469,7 +1472,9 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
     detail: JSON.stringify({ requestedBy }),
   });
   try {
-    await validateRunHarnessForScheduling(run.id, run.context);
+    await validateRunHarnessForScheduling(run.id, run.context, {
+      matchlockPolicy: run.matchlock_policy ?? null,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     try {

@@ -1,0 +1,18 @@
+# MTLK-DSH-EXEC US-003 — TEST-ONLY NEGATIVE fixture: image WITHOUT dsh.
+#
+# DERIVED from the TEST-ONLY synthetic-dsh positive fixture image (which is
+# itself derived from igorhvr/bedlam-ubuntu) with the fake dsh REMOVED —
+# this image genuinely cannot supply a `dsh` guest executable anywhere on its
+# PATH. The opted-in invocation must therefore fail/refuse with a bounded
+# diagnostic (guest exec 127/not-found or an explicit refusal), positively
+# close its owned VM, fabricate no session and no usage — never a fake
+# success, never a host/native dsh fallback. igorhvr/bedlam-ubuntu and the
+# real user harness are never overwritten/retagged/mutated; this is a NEW
+# derived image used ONLY by the synthetic gate's missing-harness negative.
+
+FROM tamandua-synthetic-dsh:gate-fixture
+
+LABEL org.tamandua.synthetic-dsh="TEST-ONLY-missing-harness"
+
+RUN rm -f /usr/local/bin/dsh && \
+    rm -rf /opt/dsh-custom /opt/dsh

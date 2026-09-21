@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Run the MTLK-DSH-EXEC US-003 actual fresh-VM ZERO-PROVIDER whole-path dsh
+# gate: do-now AND do-review-do-verify through a real ISOLATED
+# daemon/scheduler → Matchlock dsh runner → fresh VMs to real completion,
+# with DSH_HOME persistence across fresh VMs, default/relative/custom
+# captured-home mapping, nonstandard image PATH positive, missing-harness
+# refusal, shared-home ambiguity, real-dsh boot/profile-link characterization,
+# exact-owned VM teardown and retained evidence.
+#
+# This tier is a REAL-VM gate: it boots fresh Firecracker VMs with the
+# runtime resolved from PATH (unpinned matchlock + its guest-init) and
+# TEST-ONLY derived synthetic-dsh fixture images (e2e-tests/dsh-fixture/,
+# derived FROM igorhvr/bedlam-ubuntu — never overwriting the real image). It
+# is deliberately NOT part of the default fast lanes (npm test /
+# run-all-smoke / run-all-scripted / run-all-e2e-tests). Run on demand:
+#
+#   ./run-matchlock-dsh-gate-e2e-test
+#
+# What it does:
+#   1. npm run build (compiled dist is what the isolated daemon runs)
+#   2. resolves matchlock from PATH (or the optional TAMANDUA_MATCHLOCK_RPC_BIN
+#      override), defaults guest-init next to that binary or on PATH (optional
+#      MATCHLOCK_GUEST_INIT / MATCHLOCK_GUEST_FUSED overrides) and records the
+#      observed matchlock version + sha256 hashes as evidence -- no runtime pins
+#   3. creates a NEW evidence directory
+#      <TAMANDUA_GATE_EVIDENCE_ROOT>/dsh-exec-<UTC-Z timestamp>/ (outside the
+#      repo; NEVER pre-cleaned/reused — a colliding name gets a fresh unique
+#      suffix instead of ever reusing an existing dir) and exports
+#      TAMANDUA_GATE_EVIDENCE_DIR
+#   4. runs e2e-tests/matchlock-dsh-gate.test.ts with all logs tee'd into the
+#      evidence dir; exit code propagates (cleanup failures included).
+#
+# Never touches the live worker daemon, live tamandua state, or the operator's
+# matchlock store: the gate uses a private fresh HOME under the evidence dir.
+set -u
+
+cd "$(dirname "$0")"
+
+# -- UNPINNED runtime resolution (MTLK-UNPIN, tamandua-6sy.33.10.36) ----------
+# No runtime sha256 pins: default to whatever `matchlock` resolves on PATH
+# (system /usr/local/bin/matchlock on vaimetal) and let matchlock resolve its
+# own guest-init. TAMANDUA_MATCHLOCK_RPC_BIN / MATCHLOCK_GUEST_INIT /
+# MATCHLOCK_GUEST_FUSED are OPTIONAL overrides. The observed version and
+# hashes are recorded as gate evidence instead of being checked against pins.
+fail() { echo "run-matchlock-dsh-gate-e2e-test: FATAL: $*" >&2; exit 90; }
+
+if [ -n "${TAMANDUA_MATCHLOCK_RPC_BIN:-}" ]; then
+  MATCHLOCK_RPC_BIN="$TAMANDUA_MATCHLOCK_RPC_BIN"
+else
+  MATCHLOCK_RPC_BIN="$(command -v matchlock 2>/dev/null || true)"
+fi
+[ -n "$MATCHLOCK_RPC_BIN" ] || fail "matchlock not found on PATH; set TAMANDUA_MATCHLOCK_RPC_BIN to the matchlock CLI"
+[ -f "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not found: $MATCHLOCK_RPC_BIN"
+[ -x "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not executable: $MATCHLOCK_RPC_BIN"
+
+# Default guest-init: `guest-init` next to the resolved matchlock binary, else
+# `guest-init` on PATH. An unresolved value stays UNSET so the matchlock CLI
+# resolves it itself.
+matchlock_default_guest_init() {
+  local dir candidate
+  dir="$(dirname -- "$1")"
+  candidate="$dir/guest-init"
+  if [ -f "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
+  command -v guest-init 2>/dev/null || true
+}
+if [ -n "${MATCHLOCK_GUEST_INIT:-}" ]; then
+  GUEST_INIT="$MATCHLOCK_GUEST_INIT"
+else
+  GUEST_INIT="$(matchlock_default_guest_init "$MATCHLOCK_RPC_BIN")"
+fi
+if [ -n "${MATCHLOCK_GUEST_FUSED:-}" ]; then
+  GUEST_FUSED="$MATCHLOCK_GUEST_FUSED"
+else
+  GUEST_FUSED="$GUEST_INIT"
+fi
+if [ -n "$GUEST_INIT" ]; then
+  [ -f "$GUEST_INIT" ] || fail "guest-init not found: $GUEST_INIT (unset MATCHLOCK_GUEST_INIT to let matchlock resolve it)"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  [ -f "$GUEST_FUSED" ] || fail "guest-fused not found: $GUEST_FUSED (unset MATCHLOCK_GUEST_FUSED to let matchlock resolve it)"
+fi
+
+# Observed (NOT pinned) runtime identity: recorded into the gate evidence dir.
+OBSERVED_MATCHLOCK_VERSION="$("$MATCHLOCK_RPC_BIN" --version 2>&1 | head -n 1 || true)"
+OBSERVED_MATCHLOCK_SHA="$(sha256sum "$MATCHLOCK_RPC_BIN" | awk '{print $1}')"
+if [ -n "$GUEST_INIT" ]; then
+  OBSERVED_GUEST_INIT_SHA="$(sha256sum "$GUEST_INIT" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_INIT_SHA="unset => resolved by matchlock"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  OBSERVED_GUEST_FUSED_SHA="$(sha256sum "$GUEST_FUSED" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_FUSED_SHA="unset => resolved by matchlock"
+fi
+echo "runtime observed (unpinned): matchlock ${OBSERVED_MATCHLOCK_VERSION:-no-version} sha256 $OBSERVED_MATCHLOCK_SHA"
+echo "runtime observed (unpinned): guest-init ${GUEST_INIT:-resolved-by-matchlock} sha256 $OBSERVED_GUEST_INIT_SHA"
+echo "runtime observed (unpinned): guest-fused ${GUEST_FUSED:-resolved-by-matchlock} sha256 $OBSERVED_GUEST_FUSED_SHA"
+
+npm run build || fail "npm run build failed"
+
+EVIDENCE_ROOT="${TAMANDUA_GATE_EVIDENCE_ROOT:-/root/matchlock-work/evidence}"
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+EV="$EVIDENCE_ROOT/dsh-exec-$TS"
+if [ -e "$EV" ]; then
+  # NEVER pre-clean or reuse an existing dir: append a fresh unique suffix.
+  EV="$EV-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+fi
+mkdir -p "$EV"
+echo "evidence dir: $EV"
+
+export TAMANDUA_MATCHLOCK_RPC_BIN="$MATCHLOCK_RPC_BIN"
+if [ -n "$GUEST_INIT" ]; then export MATCHLOCK_GUEST_INIT="$GUEST_INIT"; fi
+if [ -n "$GUEST_FUSED" ]; then export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"; fi
+
+# Observed-not-pinned runtime evidence (MTLK-UNPIN): the gate accepts whatever
+# `matchlock` resolves and records the observed version/hashes here.
+RUNTIME_OBSERVED="$EV/runtime-observed.txt"
+{
+  echo "matchlock.path=$MATCHLOCK_RPC_BIN"
+  echo "matchlock.version=${OBSERVED_MATCHLOCK_VERSION:-no-version}"
+  echo "matchlock.sha256=$OBSERVED_MATCHLOCK_SHA"
+  echo "guest_init.path=${GUEST_INIT:-unset => resolved by matchlock}"
+  echo "guest_init.sha256=$OBSERVED_GUEST_INIT_SHA"
+  echo "guest_fused.path=${GUEST_FUSED:-unset => resolved by matchlock}"
+  echo "guest_fused.sha256=$OBSERVED_GUEST_FUSED_SHA"
+} > "$RUNTIME_OBSERVED"
+echo "runtime evidence: $RUNTIME_OBSERVED"
+cat "$RUNTIME_OBSERVED"
+export TAMANDUA_GATE_EVIDENCE_DIR="$EV"
+export TAMANDUA_GATE_EVIDENCE_ROOT="$EVIDENCE_ROOT"
+
+LOG="$EV/gate-run.log"
+echo "=== MATCHLOCK DSH SYNTHETIC GATE START $(date -u +%FT%TZ) EV=$EV ===" | tee "$LOG"
+node --test e2e-tests/matchlock-dsh-gate.test.ts 2>&1 | tee -a "$LOG"
+RC=${PIPESTATUS[0]}
+echo "=== MATCHLOCK DSH SYNTHETIC GATE END $(date -u +%FT%TZ) rc=$RC ===" | tee -a "$LOG"
+
+# ── no-fake-green: refuse PASS when no in-VM round was observed ──────────
+# The driver writes <EV>/observed-rounds.json (TESTER-HONESTY item 3). This
+# guard reads it and exits 92 — distinct from a test failure (1) and this
+# runner's FATAL (90) — when the count is zero or the evidence is
+# missing/malformed. A gate whose VM creation fails (or whose probe never
+# reached a round) must fail loudly, never report a vacuous round-rejection
+# assertion as a green run.
+GUARD_RC=0
+node scripts/observed-rounds-guard.mjs --dir "$EV" --gate dsh 2>&1 | tee -a "$LOG"
+GUARD_RC=${PIPESTATUS[0]}
+if [ "$GUARD_RC" -eq 92 ]; then
+  echo "run-matchlock-dsh-gate-e2e-test: ZERO-ROUND REFUSAL: no VM round observed (VM creation or probe failed before any round)" >&2
+  exit 92
+fi
+exit "$RC"

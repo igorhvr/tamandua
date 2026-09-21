@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "hermes-matchlock-adapter-contract",
+  "description": "Real export and behavior scope of the standalone Matchlock Hermes adapter (src/installer/matchlock/), INCLUDING the MTLK-HERMES-GUARD config admission corrections (parse/read/check never turn a config problem into ok:true; the plan facade never yields a launch descriptor on refusal; diagnostics are bounded and never copy raw config content). Grounded in the compiled module dist/installer/matchlock/hermes-adapter.js — every value export listed here was verified present via runtime introspection, not asserted from source alone. Interface changes vs the previous delivery are coordinated in /root/matchlock-work/hermes-guard-contract.json (published at guard stage end); /root/matchlock-work/hermes-contract.json remains the untouched prior delivery contract.",
+  "surface": {
+    "entryModule": "src/installer/matchlock/hermes-adapter.ts",
+    "compiledModule": "dist/installer/matchlock/hermes-adapter.js",
+    "valueExportsVerified": {
+      "count": 15,
+      "names": [
+        "DEFAULT_GUEST_HERMES_ROOT",
+        "DEFAULT_GUEST_HOME",
+        "DEFAULT_HERMES_PROFILE",
+        "HERMES_PROFILES_DIR",
+        "assertLocalTerminalBackend",
+        "buildHermesGuestLaunch",
+        "computeHermesTokenTotal",
+        "extractSessionTrailer",
+        "parseHermesConfig",
+        "readHermesConfig",
+        "resolveHermesAdapterPlan",
+        "resolveHermesProfile",
+        "scanHermesStoreTokens",
+        "storeDirWithinScope",
+        "stripSessionTrailer"
+      ]
+    },
+    "typeExports": [
+      "FrozenHermesSubmissionInput",
+      "HermesProfilePlan",
+      "HermesExternalDependency",
+      "ParsedHermesConfig",
+      "HermesConfigReadResult",
+      "HermesConfigProblem",
+      "HermesConfigProblemCode",
+      "HermesConfigLocation",
+      "LocalBackendCheck",
+      "HermesGuestLaunch",
+      "HermesGuestLaunchInput",
+      "SessionTrailer",
+      "HermesStoreScan",
+      "HermesStoreScanInput",
+      "HermesStoreStatus",
+      "HermesStoreScanResult",
+      "ResolveHermesAdapterOptions",
+      "HermesLaunchAdmission",
+      "HermesAdapterPlan"
+    ],
+    "reservedProfileIds": ["hermes", "default", "test", "tmp", "root", "sudo"]
+  },
+  "behaviorScope": {
+    "profileResolution": {
+      "sourceGroundedIn": [
+        "hermes_cli/main.py _apply_profile_override (~line 495)",
+        "hermes_cli/profiles.py resolve_profile_env (~line 1680)",
+        "hermes_cli/profiles.py _RESERVED_NAMES (line 117)"
+      ],
+      "rules": [
+        "Explicit --profile flag always wins; resolved via the profile-env helper, missing/deleted/invalid -> native refusal.",
+        "No flag but HERMES_HOME set to a dir whose IMMEDIATE parent is 'profiles': trusted unconditionally (NO marker condition on the grandparent).",
+        "No flag and HERMES_HOME not a profiles/<name> dir (or unset): read the sticky active_profile FILE from the effective root; config.yaml active_profile is NOT consulted on this path (source-observed).",
+        "Missing/deleted/invalid/reserved selected profile -> refusal, mirroring native SystemExit(1).",
+        "Otherwise the default profile (the home root itself).",
+        "Reserved ids mirror native _RESERVED_NAMES {hermes, default, test, tmp, root, sudo}; 'default' is folded to the home root and never reaches the set."
+      ],
+      "selectionRefusal": "When the native CLI would refuse the captured selection, plan.refused / plan.selectionRefused = true with a refusedReason; the controller must not launch."
+    },
+    "externalDependencies": {
+      "honestScope": "no scenario currently requires an outside-scope dependency. Native skills/auth resolve from the effective HERMES_HOME (<home>/skills, <home>/.env), and the selected profile directory IS that home, so siblings/root markers are neighbors only. required is always false today; the adapter never emits required=true without concrete proof."
+    },
+    "storeTokenAccounting": {
+      "total": "input_tokens + output_tokens + cache_write_tokens",
+      "excluded": ["cache_read_tokens", "reasoning_tokens"],
+      "incompleteEvidence": [
+        "NULL token columns -> status 'ambiguous' (never a verified zero).",
+        "non-finite / non-numeric summed fields -> computeHermesTokenTotal returns NaN -> status 'unavailable' (never clamped to zero).",
+        "missing session row / missing state.db / read error -> 'unavailable' / 'truncated'."
+      ],
+      "scope": "storeDir is always passed explicitly; module never derives it from process.env or falls back to a host default."
+    },
+    "configAdmissionGuard": {
+      "purpose": "MTLK-HERMES-GUARD descriptor-stage admission for the effective terminal backend. Source-grounded in hermes_cli/config.py read/load semantics and tools/terminal_tool* (see guard evidence notes).",
+      "readHermesConfig": "Returns HermesConfigReadResult: {status:'absent'} ONLY for a genuinely missing config.yaml under a valid (existing directory) config root (native built-in defaults apply); {status:'ok', config} for a parseable mapping (config.ok === true, no blocking shapes); {status:'error', problem} for unreadable / not-a-file (config path is a directory, FIFO/socket/device, or EISDIR/ENOTDIR layout; a non-regular file is classified WITHOUT attempting a read — a FIFO would block) / invalid-root / malformed-yaml / top-level-not-mapping / terminal-not-mapping / terminal-backend-type. A read failure is NEVER reported as null/absent/default-local.",
+      "parseHermesConfig": "Returns a single ParsedHermesConfig object: ok:true with typed fields for a parseable mapping (or empty root -> defaults), or ok:false with a bounded `problem` for malformed YAML and invalid top-level/terminal/backend shapes. Malformed/invalid results are NEVER a usable config, and assertLocalTerminalBackend refuses them, so a failed parse passed straight into the check can never assert local. Backend string scalars are kept VERBATIM (never trimmed): native Hermes bridges the raw value to TERMINAL_ENV, so `\" local \"`, `\"   \"` and block-scalar values (`\"local\\n\"`) survive into the typed view where the exact-value check classifies them — padding is never folded into \"local\". Only an exact empty string behaves as unset/empty (default-local). Parser messages (which embed raw source lines) are never copied; only bounded line/column numbers are returned.",
+      "assertLocalTerminalBackend": "{ok:true} only for null (absent), an unset/exact-empty backend, or an explicit backend whose EXACT parsed string is 'local'. A parse result with ok:false is refused with its problem code. Known remote built-ins (docker/ssh/modal/singularity/daytona/vercel_sandbox, exact tokens) -> {ok:false, code:'terminal-backend-remote'}; any other explicit string — including whitespace-padded, whitespace-only and block-scalar variants — -> {ok:false, code:'terminal-backend-unknown'} (value never echoed; only the exact known remote token is echoed in the remote reason). Never {ok:true} for malformed/unreadable config — those are classified by the read/parse result and surfaced as ok:false at plan level.",
+      "facadeGating": "resolveHermesAdapterPlan leaves launch null when prompt is absent OR admission is refused (profile.refused, config read error, non-local backend). launchAdmission {ok, code, reason} summarizes the primary refusal (profile-refused | one of the HermesConfigProblemCode values). plan.config is a structured HermesConfigReadResult; absence and failure are never conflated.",
+      "diagnostics": "Reasons/details/plans contain bounded codes, field names, errno tokens and numeric locations only. Raw config lines, YAML-parser messages, credentials, dotenv values and arbitrary configured values are never copied into diagnostics. Synthetic-secret regressions assert no leakage.",
+      "optionsChange": "ResolveHermesAdapterOptions.guestConfigRoot was REMOVED (previously silently ignored). Guest config-root mapping stays fixed at DEFAULT_GUEST_HERMES_ROOT / profiles/<name> per design section 6.3; a per-run guest-root override is a controller/operator integration decision for later shared integration.",
+      "hermesProfileChange": "hermes-profile.ts only dropped two dead imports (readHermesConfig, ParsedHermesConfig type); profile resolution/refusal semantics are unchanged."
+    },
+    "buildAndTypecheck": {
+      "producer": "npm run build (tsc -p tsconfig.json)",
+      "producerExit": 0,
+      "test": "focused adapter test suite (tests/matchlock-hermes-adapter.test.ts)"
+    }
+  },
+  "integrationGatesNotClosed": [
+    "Live SQLite/WAL/VMFS cross-VM locking requires real VM proof; synthetic local tests do not prove it.",
+    "External profile/auth/skills dependency mounts (siblings, root stores) are controller/operator decisions; this adapter reports, it does not auto-mount.",
+    "vaivm-native model validation (deepseek-v4-flash-vision-exp / deepseek, no Codex/MoA) is controller/operator-owned; this adapter reads config read-only.",
+    "Guest binary resolution and /workspace/runtime helper-pack mapping are controller-owned.",
+    "realpath containment for symlinked profile/store paths is a VFS integration gate; this delivery uses lexical containment."
+  ]
+}

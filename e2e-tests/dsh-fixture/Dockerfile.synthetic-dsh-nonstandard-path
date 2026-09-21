@@ -1,0 +1,35 @@
+# MTLK-DSH-EXEC US-003 — TEST-ONLY POSITIVE fixture: NONSTANDARD image PATH.
+#
+# DERIVED from the TEST-ONLY synthetic-dsh positive fixture image (itself
+# derived from the accepted node LTS base). It relocates the fake dsh OFF
+# every standard PATH location (/usr/local/bin etc.) into a custom directory
+# that is ONLY reachable through a NONSTANDARD Dockerfile `ENV PATH` the image
+# itself declares. The dsh runner must preserve that nonstandard image PATH
+# (only the helper-pack bin is prepended — never a conservative default
+# substitution): with the image PATH preserved the guest genuinely resolves
+# `dsh`, so the real invocation SUCCEEDS through a real fresh VM. This
+# positive proves the dsh mount-plan/launch PATH contract end-to-end (US-002
+# mount-plan dsh mode). `/usr/local/bin` is kept ONLY so the image's `node`
+# runtime and the helper-pack launchers resolve; the fake `dsh` exists solely
+# under /opt/dsh-custom/bin, so a default-PATH substitution could never find
+# it.
+#
+# igorhvr/bedlam-ubuntu and the real user harness are never overwritten/
+# retagged/mutated; this is a NEW derived image used ONLY by the synthetic
+# gate's nonstandard-PATH positive.
+
+FROM tamandua-synthetic-dsh:gate-fixture
+
+LABEL org.tamandua.synthetic-dsh="TEST-ONLY-nonstandard-path"
+
+RUN mkdir -p /opt/dsh-custom/bin && \
+    mv /usr/local/bin/dsh /opt/dsh-custom/bin/dsh
+
+# Nonstandard image PATH: the CUSTOM directory /opt/dsh-custom/bin FIRST (the
+# only place the image keeps `dsh`), followed by the base image's standard
+# runtime/tool PATH so the guest runtime, helper-pack shell launchers and node
+# all resolve. /opt/dsh-custom/bin is NOT part of any conservative default
+# PATH and `dsh` exists ONLY there — so only the image's own declared PATH
+# (with the helper-pack prepend) can resolve the image-provided dsh; a
+# default-PATH substitution would not find it.
+ENV PATH=/opt/dsh-custom/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

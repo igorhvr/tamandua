@@ -32,6 +32,7 @@ import { runWorkflow } from "../installer/run.js";
 import { stopWorkflow, deleteWorkflow, getWorkflowStatus } from "../installer/status.js";
 import { parseRunContext } from "../installer/step-ops.js";
 import { monotonicNow, instantAgeMs, isOlderThan } from "../lib/instant.js";
+import { parseMatchlockPolicy } from "../installer/matchlock/policy.js";
 import { readVersionStatus } from "../lib/version-check.js";
 import { getBuildVersion } from "../lib/version.js";
 import {
@@ -828,9 +829,9 @@ async function handleRelaunchRun(
     const db = getDb();
 
     const run = db.prepare(
-      "SELECT id, workflow_id, task, status, context, notify_url FROM runs WHERE id = ?",
+      "SELECT id, workflow_id, task, status, context, notify_url, matchlock_policy FROM runs WHERE id = ?",
     ).get(runId) as
-      | { id: string; workflow_id: string; task: string; status: string; context: string; notify_url: string | null }
+      | { id: string; workflow_id: string; task: string; status: string; context: string; notify_url: string | null; matchlock_policy: string | null }
       | undefined;
 
     if (!run) {
@@ -842,6 +843,31 @@ async function handleRelaunchRun(
       errorResponse(
         res,
         `Cannot relaunch run in ${run.status} state. Only failed or canceled runs can be relaunched.`,
+        409,
+      );
+      return;
+    }
+
+    // MTLK-ADMIT (close): the dashboard relaunch endpoint has no Matchlock
+    // opt-in surface, so relaunching an OPTED-IN run through it would drop
+    // the run's persisted isolation policy (runs.matchlock_policy) and
+    // silently create NATIVE (non-isolated) work. Refuse every run whose
+    // stored policy is non-NULL — valid pinned v2 records and malformed or
+    // legacy/unpinned stored policies alike fail closed here — BEFORE any
+    // run creation, registration or spawn. Native (NULL-policy) relaunch
+    // below is unchanged.
+    if (run.matchlock_policy !== null) {
+      let policyNote = "a persisted Matchlock isolation policy";
+      try {
+        parseMatchlockPolicy(run.matchlock_policy);
+      } catch (err) {
+        policyNote =
+          `a persisted Matchlock isolation policy that cannot be used ` +
+          `(${(err as Error).message})`;
+      }
+      errorResponse(
+        res,
+        `Cannot relaunch run ${runId} through the dashboard: it carries ${policyNote}, and the dashboard has no Matchlock opt-in surface — relaunching here would create native (non-isolated) work. Recreate the run with --matchlock, or relaunch through the rugpull/CLI path which inherits the persisted policy.`,
         409,
       );
       return;

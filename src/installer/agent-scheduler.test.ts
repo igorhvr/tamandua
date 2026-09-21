@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
@@ -39,8 +40,16 @@ import {
   _operatorPausedRoundIds,
   _scheduledJobGitIdentity,
   buildHarnessChildEnv,
+  setMatchlockOrphanReapHookForTest,
 } from "../../dist/installer/agent-scheduler.js";
 import { getDaemonInstanceToken } from "../../dist/installer/sweep-ownership.js";
+import { reapOrphanedMatchlockVms } from "../../dist/installer/matchlock/vm-reaper.js";
+import { readOrphanVms, writeOrphanVm } from "../../dist/installer/matchlock/vm-orphans.js";
+import {
+  buildMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../dist/installer/matchlock/policy.js";
+import { setMatchlockSchedulerRoundRunnerForTest } from "../../dist/installer/matchlock/scheduler-matchlock.js";
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 import { emitRunTerminalEvent } from "../../dist/installer/step-ops.js";
@@ -749,6 +758,161 @@ describe("removeRunCrons sweep timer scheduling", () => {
         0,
         `cycle ${i}: end-of-cycle shutdown must leave zero pending sweep timers`,
       );
+    }
+  });
+
+  // ── MTLK-CLEANUP US-007: run-teardown Matchlock orphan reaper ───────
+  // The teardown hook fires the bounded reaper off the return path; these
+  // tests pin the invocation (and its guards) with the scheduler seam, plus
+  // one end-to-end pass wired to the REAL reaper over a fake matchlock CLI.
+
+  const US007_RUN = "1de3701b-f59c-47a8-be1d-b0f3840ddb12";
+
+  /** Fake `matchlock` CLI: records its argv + HOME and removes the VM dir. */
+  const US007_FAKE_CLI = `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const argv = process.argv.slice(2);
+const home = process.env.HOME || "";
+const vmId = argv[argv.length - 1];
+if (process.env.FAKE_RECORD) {
+  fs.appendFileSync(process.env.FAKE_RECORD, JSON.stringify({ argv, home }) + "\\n");
+}
+if (argv.includes("rm")) {
+  try { fs.rmSync(path.join(home, ".matchlock", "vms", vmId), { recursive: true, force: true }); } catch {}
+}
+process.exit(0);
+`;
+
+  function writeUs007FakeCli(dir: string): string {
+    const cli = path.join(dir, "fake-matchlock");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(cli, US007_FAKE_CLI, "utf-8");
+    fs.chmodSync(cli, 0o755);
+    return cli;
+  }
+
+  /** Real SQLite Matchlock state DB with the documented `vms` columns. */
+  function writeUs007StateDb(
+    home: string,
+    rows: Array<{ id: string; pid: number; status: string }>,
+  ): void {
+    const dir = path.join(home, ".matchlock");
+    fs.mkdirSync(dir, { recursive: true });
+    const db = new DatabaseSync(path.join(dir, "state.db"));
+    db.exec(
+      "CREATE TABLE vms (id TEXT PRIMARY KEY, pid INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL)",
+    );
+    const insert = db.prepare("INSERT INTO vms (id, pid, status) VALUES (?, ?, ?)");
+    for (const row of rows) insert.run(row.id, row.pid, row.status);
+    db.close();
+  }
+
+  it("US-007: removeRunCrons drives exactly one bounded Matchlock orphan reaper pass for the run", async () => {
+    const workflow = makeWorkflow();
+    const runId = `run-${US007_RUN}`;
+    const calls: string[] = [];
+    setMatchlockOrphanReapHookForTest((rid) => {
+      calls.push(rid);
+    });
+    try {
+      await setupAgentCrons(workflow, runId);
+      await removeRunCrons(runId);
+      assert.deepEqual(calls, [runId], "the run teardown drives exactly one reaper pass for the run");
+    } finally {
+      setMatchlockOrphanReapHookForTest(null);
+    }
+  });
+
+  it("US-007: the teardown reaper hook is not invoked with no jobs removed or a stale epoch", async () => {
+    const workflow = makeWorkflow();
+    const calls: string[] = [];
+    setMatchlockOrphanReapHookForTest((rid) => {
+      calls.push(rid);
+    });
+    try {
+      // No dispatch jobs torn down -> nothing to reap for this teardown.
+      await removeRunCrons(`run-${US007_RUN}`);
+      assert.deepEqual(calls, [], "a teardown that removed no jobs must not invoke the reaper");
+
+      // Stale epoch (a round that outlived shutdownAllCrons) is suppressed,
+      // exactly like the post-grace sweep timer.
+      const staleRun = "run-22222222-2222-2222-2222-222222222222";
+      await setupAgentCrons(workflow, staleRun);
+      const staleEpoch = _schedulerGeneration();
+      shutdownAllCrons();
+      await setupAgentCrons(workflow, staleRun);
+      await removeRunCrons(staleRun, { schedulerGeneration: staleEpoch });
+      assert.deepEqual(calls, [], "a stale-epoch teardown must not invoke the reaper");
+    } finally {
+      setMatchlockOrphanReapHookForTest(null);
+    }
+  });
+
+  it("US-007: a run teardown with a recorded orphan removes that exact VM and clears its orphan record", async () => {
+    const workflow = makeWorkflow();
+    const runId = `run-${US007_RUN}`;
+    const stateDir = process.env.TAMANDUA_STATE_DIR as string;
+    const runRoot = path.join(stateDir, "runs");
+    const home = path.join(tempHome, "matchlock-home");
+    const vmId = "vm-394274ee";
+    writeUs007StateDb(home, [{ id: vmId, pid: 0, status: "stopped" }]);
+    const vmDir = path.join(home, ".matchlock", "vms", vmId);
+    fs.mkdirSync(path.join(vmDir, "logs"), { recursive: true });
+    fs.writeFileSync(path.join(vmDir, "config.json"), `{"vm":"${vmId}"}\n`, "utf-8");
+    const fakeCli = writeUs007FakeCli(path.join(tempHome, "cli"));
+    const recordPath = path.join(tempHome, "rm-record.jsonl");
+
+    writeOrphanVm(
+      {
+        vmId,
+        matchlockHome: home,
+        invocationId: "inv-us007",
+        phase: "close",
+        error: "matchlock error [phase=close] code=-32000",
+      },
+      { runId, runRoot, onLog: () => {} },
+    );
+
+    // Hook the scheduler teardown seam to the REAL reaper (the production
+    // path) so this test proves the teardown actually disposes the VM.
+    let reaped: ReturnType<typeof reapOrphanedMatchlockVms> | null = null;
+    setMatchlockOrphanReapHookForTest((rid) => {
+      reaped = reapOrphanedMatchlockVms({
+        runId: rid,
+        runRoot,
+        cliBinaryPath: fakeCli,
+        env: { FAKE_RECORD: recordPath },
+        isProcessAlive: () => false,
+        onLog: () => {},
+      });
+    });
+    try {
+      await setupAgentCrons(workflow, runId);
+      await removeRunCrons(runId);
+
+      assert.ok(reaped, "the teardown ran the reaper pass");
+      assert.deepEqual(
+        reaped!.results.map((r) => ({ vmId: r.vmId, action: r.action })),
+        [{ vmId, action: "removed" }],
+      );
+      assert.equal(fs.existsSync(vmDir), false, "the exact VM was removed by teardown");
+      const argvRecords = fs
+        .readFileSync(recordPath, "utf-8")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as { argv: string[]; home: string });
+      assert.equal(argvRecords.length, 1, "exactly one matchlock child ran");
+      assert.deepEqual(argvRecords[0].argv, ["rm", vmId]);
+      assert.equal(argvRecords[0].home, home, "HOME forced to the orphan's matchlock home");
+      assert.deepEqual(
+        readOrphanVms({ runId, runRoot, onLog: () => {} }),
+        [],
+        "the run's orphan record was cleared",
+      );
+    } finally {
+      setMatchlockOrphanReapHookForTest(null);
     }
   });
 });
@@ -4819,5 +4983,221 @@ process.exit(0);
       0,
       "a post-terminal attribution without a grace teardown must not finalize",
     );
+  });
+});
+
+// ── Observation 4 (bead tamandua-6sy.33.38): Matchlock admission log noise ──
+// The admission info line must describe a round that ACTUALLY STARTS, not
+// every dispatch tick that merely parses the policy. Pre-fix it was emitted
+// inside the per-agent-job policy evaluation (BEFORE the deterministic peek),
+// so an opted-in run with a round in flight logged it for every OTHER agent
+// job on every ~15s tick (642 lines / 40 min for one run). These tests drive
+// the REAL executeDispatchRound with the Matchlock runner seam (no VM) and
+// read the isolated daemon log to pin the fixed behavior.
+describe("Matchlock dispatch admission log noise (observation 4)", () => {
+  type DispatchAgent = Parameters<typeof executeDispatchRound>[1];
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+  let seamJournal: Array<{ kind: string; jobId: string }>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-mtlk-admit-log-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_HARNESS_PROBE: process.env.TAMANDUA_HARNESS_PROBE,
+      TAMANDUA_DEBUG: process.env.TAMANDUA_DEBUG,
+      TAMANDUA_MATCHLOCK_HOME_ALIAS: process.env.TAMANDUA_MATCHLOCK_HOME_ALIAS,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_HARNESS_PROBE = "0";
+    // The idle/in-flight skip reasons are debug-level lines.
+    process.env.TAMANDUA_DEBUG = "1";
+    // Throwaway HOME deleted in afterEach: disable the short-HOME alias.
+    process.env.TAMANDUA_MATCHLOCK_HOME_ALIAS = "off";
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-matchlock-admission-log"),
+    );
+
+    // Deterministic substitute for the production in-VM runner (no VM):
+    // claim the run's next pending step as this scheduler job, then report
+    // done so the REAL step-ops auto-complete path marks it done.
+    seamJournal = [];
+    setMatchlockSchedulerRoundRunnerForTest(async (round) => {
+      seamJournal.push({ kind: round.kind, jobId: round.identity.jobId });
+      const db = getDb();
+      db.prepare(
+        `UPDATE steps SET status = 'running', claim_job_id = ?
+         WHERE id = (SELECT id FROM steps WHERE run_id = ? AND status = 'pending'
+                     ORDER BY step_index ASC LIMIT 1)`,
+      ).run(round.identity.jobId, round.identity.runId);
+      return {
+        output: "STATUS: done\nCHANGES: seam work\nTESTS: seam tests",
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        durationMs: 5,
+      };
+    });
+  });
+
+  afterEach(() => {
+    setMatchlockSchedulerRoundRunnerForTest(null);
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    // Clears the in-flight mark this suite may have taken.
+    shutdownAllCrons();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  function matchlockPolicyJson(): string {
+    return serializeMatchlockPolicy(
+      buildMatchlockPolicy({
+        requestedImage: "vic/ml:latest",
+        identity: {
+          digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          tag: "vic/ml:latest",
+        },
+        harness: "pi",
+        workingDirectory: "/srv/project",
+        originalRepositoryRoot: "/srv/project",
+        workMounts: [
+          { hostPath: "/srv/project", hostRealPath: "/srv/project", guestPath: "/srv/project" },
+        ],
+        gitMetadataRoots: [],
+      }),
+    );
+  }
+
+  function seedRun(
+    workflowId: string,
+    pendingSteps: number,
+    withPolicy: boolean,
+  ): { runId: string; job: CronJobInfo; agent: DispatchAgent; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    db.prepare(
+      `INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at, matchlock_policy)
+       VALUES (?, ?, 'observation 4 task', 'running', ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      workflowId,
+      JSON.stringify({ working_directory_for_harness: workdir }),
+      now,
+      now,
+      withPolicy ? matchlockPolicyJson() : null,
+    );
+    for (let i = 0; i < pendingSteps; i++) {
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'do work', 'STATUS', 'pending', ?, ?)`,
+      ).run(`${runId}-step-${i + 1}`, runId, `step-${i + 1}`, `${workflowId}_test-agent`, i, now, now);
+    }
+    const job: CronJobInfo = {
+      id: `tamandua-${workflowId}-${runId}-test-agent`,
+      workflowId,
+      runId,
+      agentId: `${workflowId}_test-agent`,
+      harnessType: "pi",
+      workingDirectoryForHarness: workdir,
+      createdAt: "",
+    };
+    return {
+      runId,
+      job,
+      agent: { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+      workdir,
+    };
+  }
+
+  /** Read this test's isolated scheduler log. */
+  function readStateLog(): string {
+    const logPath = path.join(tempHome, ".tamandua", "tamandua.log");
+    return fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf-8") : "";
+  }
+
+  function admissionCount(log: string): number {
+    return (log.match(/Dispatch round admitted/g) ?? []).length;
+  }
+
+  it("logs NO admission line on an idle Matchlock tick (no pending step)", async () => {
+    const { job, agent } = seedRun("do-now", 0, true);
+
+    await executeDispatchRound(job, agent);
+
+    const log = readStateLog();
+    assert.equal(admissionCount(log), 0, "an idle Matchlock tick must not log an admission line");
+    assert.match(log, /Dispatch round idle/, "the idle skip stays debug-level");
+    assert.equal(seamJournal.length, 0, "no runner/VM invocation may start for an idle tick");
+  });
+
+  it("logs NO admission line on repeated ticks while a round is already in flight", async () => {
+    const { job, agent } = seedRun("do-now", 1, true);
+    // Own the mark so both ticks deterministically hit the in-flight guard.
+    assert.equal(tryMarkJobInFlight(job.id), true, "the test must acquire the in-flight mark");
+
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+
+    const log = readStateLog();
+    assert.equal(admissionCount(log), 0, "an in-flight skip must not log an admission line");
+    assert.match(log, /previous round still in flight/, "the in-flight skip stays debug-level");
+    assert.equal(seamJournal.length, 0, "no round may start while the in-flight mark is held");
+  });
+
+  it("logs exactly one admission line per actually-started Matchlock round", async () => {
+    const { runId, job, agent } = seedRun("do-now", 2, true);
+
+    await executeDispatchRound(job, agent);
+    let log = readStateLog();
+    assert.equal(admissionCount(log), 1, "the first started round logs exactly one admission line");
+    assert.equal(seamJournal.filter((e) => e.kind === "work").length, 1, "exactly one work round started");
+
+    await executeDispatchRound(job, agent);
+    log = readStateLog();
+    assert.equal(admissionCount(log), 2, "each started round logs exactly one admission line");
+    assert.equal(seamJournal.filter((e) => e.kind === "work").length, 2, "a second work round started");
+
+    const row = getDb().prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(row.status, "completed", "the two-step run completes");
+  });
+
+  it("keeps native dispatch logging unchanged: a started native round logs Work round start but no Matchlock admission", async () => {
+    const fakePi = path.join(tempHome, "pi-native-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+console.log("STATUS: done");
+console.log("CHANGES: native");
+console.log("TESTS: native");
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+
+    const { job, agent } = seedRun("do-now", 1, false);
+
+    await executeDispatchRound(job, agent);
+
+    const log = readStateLog();
+    assert.equal(admissionCount(log), 0, "a native round must never log the Matchlock admission line");
+    assert.match(log, /Work round start/, "native rounds keep their work-round logging");
+    assert.equal(seamJournal.length, 0, "the native path never touches the Matchlock runner seam");
   });
 });

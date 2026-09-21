@@ -444,6 +444,158 @@ id resolved as `params.runId ?? process.env.TAMANDUA_RUN_ID ?? ''`:
   run-attributed and appear in `events/<runId>.jsonl` — index-based
   merge-event assertions must account for them.
 
+### Shared merge pure core (US-005)
+
+The atomic squash-merge algorithm lives in the dependency-free
+`src/installer/matchlock/merge-core.ts` (`runMergeCore`): Node-core imports
+only, with the git runner, the event emitter and the clock injected.
+`runPlumbingMerge` in `src/installer/merge-branch.ts` is a thin native
+delegate that resolves the run id (`params.runId ?? TAMANDUA_RUN_ID ?? ''`)
+and supplies the real host runner + `emitEvent`. The module is placed under
+`installer/matchlock/` on purpose: `guest-pack-builder.ts` walks its closure
+from explicit roots (`WALK_ROOTS`) and refuses any module resolving outside
+`dist/installer/matchlock`, so this is the only location a host/guest shared
+core can live. The guest pack ships it (Node-core only) even before a guest
+entry imports it. Mechanical parity coverage is
+`src/installer/matchlock/merge-core.test.ts` (serial lane).
+
+### Finalizer ledger seam (US-006)
+
+`evaluateFinalizeMergeLedgerGate(stepId, source?)` in
+`src/installer/ledger-gate.ts` and BOTH `finalize_merge` decision sites in
+`src/installer/step-ops.ts` (the claim gate in `enforceClaimLedgerGate` and the
+`completeStep` acceptance gate) accept an optional host-attested
+`FinalizeMergeEvidenceSource`. With no source the gate queries native
+`suite_results` exactly as before — decisions, events and refusal text are
+byte-identical. With a source the decision comes ONLY from
+`source.queryMergeEvidence` (exit 0 => green, other => red, no row => missing);
+the native ledger is never a fallback, and `formatLedgerGateRefusal` uses the
+source's `nearestEvidence` for diagnostics. The source is constructed ONLY by
+`pi-invocation-runner` (`createHostSuiteLedgerEvidenceSource`, over the same
+`HostSuiteStore` + canonical `GuestSuiteNamespace` the suite bridge serves) and
+threaded through `NativeStepServices` via `StepProgressOptions`/
+`StepMutationOptions.ledgerEvidenceSource`. No run context, guest input or env
+var can activate it. Coverage: `src/installer/ledger-gate-matchlock-seam.test.ts`
+and `src/installer/matchlock/finalizer-ledger-seam.test.ts` (both serial lane);
+see also `HostSuiteStore.nearestMergeEvidence`.
+
+### Scoped guest merge-branch + host merge authorization (US-007)
+
+The merger role of an opted-in merge workflow lands through the scoped bridge,
+never through host Git execution of guest-controlled config. Two wire ops
+(`merge.authorize` / `merge.report`, `BRIDGE_OPS` in
+`src/installer/matchlock/guest-protocol.ts`, validated canonically by
+`validateMergeBridgeParams` at BOTH the guest-service and broker boundaries)
+carry the exact named options (`--origin --branch --into --expect-tip
+--message [--run-id]`, multiline/Unicode safe).
+
+Flow: the guest CLI (`src/installer/matchlock/guest-cli.ts` `merge-branch`)
+asks `merge.authorize`; the broker threads the fresh authoritative claim into
+an optional `HostMergeServices` (`src/installer/matchlock/host-merge-services.ts`;
+production `createHostMergeService` in `host-merge-service.ts`) which refuses
+with a TYPED `MERGE_*` code BEFORE any Git when the role is not `merger`, the
+claim is missing/stale/foreign or not the run's `finalize_merge` step, the
+origin is outside the admitted original root, `--into` is not the run's
+original branch, the run id mismatches the binding, or `--expect-tip` differs
+from the authoritative target tip. Only then does the guest run the shared
+`runMergeCore` (US-005) with GUEST git against the RW-mounted original and
+report the outcome; the host independently verifies the authoritative target
+tip and emits the run-attributed `merge.landed`/`merge.target_moved`/
+`merge.conflicts` event (a mismatched/fabricated receipt refuses `MERGE_VERIFY`,
+never a fabricated landing). Reports are idempotent by `opKey` (exact ack
+replay) and bound to the live invocation + claim; cancel/close revoke.
+
+Executable-Git boundary: all hook/signing/helper-bearing plumbing
+(commit-tree/update-ref/read-tree/symbolic-ref/worktree/merge-tree) runs in the
+guest via `guestMergeGitRunner` (spawnSync argv, no shell). The ONLY host Git is
+the injected narrow `readTargetTip` — a fixed `rev-parse --verify <ref>^{commit}`
+plumbing read with `-C <admitted origin>` (no shell, no guest argv, no
+hooks/signing/credential helpers, no worktree-metadata path). Production
+runner/scheduler wiring (run context + `finalize_merge` step identity) is
+US-008; the broker accepts the optional service today. Coverage:
+`src/installer/matchlock/host-merge-service.test.ts` + the US-007 block in
+`broker.test.ts` (refusal matrix, recording-only zero-mutation) and
+`guest-bridge.test.ts` (real-fixture landed/noop/conflicts/target_moved/
+dirty-owner parking with MERGED_TREE parity, multiline/Unicode message).
+
+Harness parity (MTLK-ALL-WORKFLOWS US-001/US-002): the already-built
+`HostMergeServices` is forwarded into `createHostBroker` by the pi runner
+(`RunMatchlockInvocationOptions.merge`) and by the hermes runner
+(`RunHermesInvocationOptions.merge`); `runProductionHermesRound` converts a
+supplied `round.merge` with `createMergeServiceForContext` exactly like the pi
+path. The dsh scheduler route is the third seam: `DshSchedulerRound.merge`
+carries the host-attested `HostMergeContext`, `toDshSchedulerRound` forwards it,
+and `runProductionDshRound` converts it with `createMergeServiceForContext` and
+passes it to `runDshInvocation` (whose opts spread forwards it into
+`createHostBroker`); it also now mirrors the pi exact-path preflight
+(`matchlockRoundScopeRefusal`) and the merge-capability preflight. The broker
+keeps every merge op UNSUPPORTED when no service is wired (never a host
+fallback), and a merge-capability work round with no host merge context is
+refused by BOTH `runProductionMatchlockRound` and `runProductionDshRound`
+BEFORE any VM.
+
+### Capability admission + exact linked-worktree wiring (US-008)
+
+`src/installer/matchlock/capabilities.ts` is the declarative capability
+closure: `MATCHLOCK_WORKFLOW_CAPABILITIES` maps each ADMITTED workflow id to
+the later-role tools it needs (`guest-git`, `guest-test-suite`,
+`merge-branch`, `run-queries`), and `MATCHLOCK_AVAILABLE_CAPABILITIES` is what
+the integrated backend provides. `matchlockDispatchDecision` (dispatch-guard.ts)
+admits a valid pinned policy only when the workflow id is admitted AND its
+declared closure is a subset of `ctx.availableCapabilities` (defaults to the
+full set); anything else refuses `matchlock_workflow_unsupported` BEFORE any
+probe/findBinary/spawn/VM.
+
+Explicit per-shape catalog (MTLK-ALL-WORKFLOWS US-004): there is no blanket
+allow-list. Every bundled id under `workflows/` is either in
+`MATCHLOCK_WORKFLOW_CAPABILITIES` with an explicit closure or in
+`MATCHLOCK_REFUSED_WORKFLOWS`, which pins a precise
+`MatchlockWorkflowRefusalCode` + reason (`guest-github-cli` for `*-github-pr`,
+`child-workflow-dispatch` for `just-do-it`, `browser-visual-verification` for
+`frontend-test`, `unscoped-host-filesystem` for `skills-normalize-audit`).
+Admitted non-merge story/worktree shapes (`feature-dev[-worktree]`,
+`bug-fix[-worktree]`, `quarantine-broken-tests`, `security-audit[-worktree]`)
+declare `guest-git + guest-test-suite + run-queries`; every `*-merge` route
+adds `merge-branch`. `MATCHLOCK_BUNDLED_WORKFLOW_IDS` is the admitted ∪ refused
+set, and the dispatch-guard matrix test enumerates the real `workflows/`
+directory to prove no bundled id falls through to the generic message (which
+now applies ONLY to genuinely unknown/custom ids).
+
+Harness parity (MTLK-ALL-WORKFLOWS US-003): there is NO harness-by-workflow
+allow-list. `MATCHLOCK_HARNESS_WORKFLOW_IDS` is deleted and
+`matchlockHarnessSupportsWorkflow` delegates to the global admitted set, so a
+valid pinned policy is admitted on workflow + capability closure for `pi`,
+`hermes` and `dsh` alike. The only remaining harness check is policy-vs-context
+consistency: a context harness that differs from the pinned policy harness
+refuses `matchlock_workflow_unsupported` BEFORE any probe/findBinary/spawn/VM.
+The generic unknown-workflow refusal message names "the admitted workflows".
+
+Exact worktree scope: run creation (`admission.ts` `planFreshScope`) resolves a
+managed linked worktree via `repository-scope.ts` to the worktree cwd, the
+ENTIRE original/main checkout and any EXTERNAL git/common dirs
+(separate-git-dir). `mount-plan.ts` mounts the cwd, original root and external
+git metadata RW at their identical absolute host/guest paths; `.git`
+file/`commondir`/`gitdir` resolution follows the real git layout and a symlink
+spelling is refused (no clone, readonly origin, import, symlink-only cwd or
+metadata rewrite).
+
+Scheduler/runner: `agent-scheduler.ts` captures the run context, resolves the
+run's own `finalize_merge` step row id, and builds a `HostMergeContext`
+(`scheduler-matchlock.ts` `buildMatchlockMergeContext`) for workflows that
+require `merge-branch`. `runProductionMatchlockRound` enforces the exact-path
+invariant (`matchlockRoundScopeRefusal`: cwd === policy.workingDirectory, a
+work mount or original root at that exact path, identical host/guest spelling),
+refuses a merge-capability round with no merge context BEFORE any VM, and
+builds the production merge service in `merge-invocation-wiring.ts`
+(`createMergeServiceForContext` → `createHostMergeService` + the narrow
+`readAuthoritativeTargetTip`) which the runner forwards to the broker. The
+runner deliberately keeps NO direct `node:child_process` import (the wiring
+module owns it) so serial test classification is unaffected. Coverage:
+`dispatch-guard.test.ts` (admit/refuse + capability matrix), `admission.test.ts`
+(real linked-worktree / separate-git-dir exact paths + refusals),
+`agent-scheduler-matchlock.test.ts` (merge context, scope invariant, target-tip
+read, production merge service authorize, refusals before any probe/VM).
+
 ### Event log atomic appends (EVTA)
 
 Every event is written by `appendEventLine(filePath, line)` in
@@ -533,6 +685,282 @@ followed by a top-level command listing.
 - A corresponding `get<Thing>Help()` function
 - A `--help` dispatch if-block in `main()` (before the command execution path)
 
+### Real-VM whole-path merge-workflow gate (US-009/US-010)
+
+The on-demand real-VM gate for the genuine bundled merge workflows lives in
+`e2e-tests/matchlock-worktree-merge-gate.test.ts` and is run by
+`./run-matchlock-worktree-merge-e2e-test` (NOT part of `npm test` or any fast
+lane). It drives an isolated daemon → scheduler → Matchlock runner → fresh VMs
+to real workflow completion for `feature-dev-merge-worktree` (worktree) and
+`bug-fix-merge-worktree` (worktree) and the capability-equivalent direct route
+`bug-fix-merge` (launched from INSIDE the owned origin checkout so run creation
+seeds `original_branch`), with the tester/verifier's packed `tamandua-test`
+recording real `HostSuiteStore` rows and the guest `merge-branch` performing a
+real target advance on a tiny OWNED origin. Each scenario has its own owned
+origin, daemon/control port and positive exact-owned cleanup; all share one
+imported fixture image and one retained evidence dir.
+
+Shared, corrected exact-owned VM lifecycle helpers live in
+`e2e-tests/helpers/matchlock-gate-lifecycle.ts` (strict `readVmInventory`:
+corrupt DB throws, absent ≠ empty; `cleanupOwnedVms`: a failed/unknown
+`matchlock rm` FAILS and RETAINS state — no `fs.rmSync` fallback; corrupt event
+JSON throws). The fast injected-failure controls run under `npm test` via
+`tests/matchlock-gate-lifecycle.test.ts` (no real VM) and again inside the gate
+before any VM is created.
+
+The test-only synthetic pi harness
+(`e2e-tests/matchlock-fixture/synthetic-pi.mjs`) supports the worktree-merge
+roles: planner (STORIES_JSON/BRANCH), setup (creates the feature branch and
+emits the raw `TEST_CMD`), developer/fixer (commits an owned fixture change),
+tester (runs the wrapped `tamandua-test` and emits `TESTED_TREE`), verifier
+(emits `TESTED_TREE`; for the bug-fix workflows, which have no tester step, the
+verifier itself runs the wrapped `tamandua-test` to record the ledger row),
+triager (BRANCH/SEVERITY), investigator,
+auditor (HONEST), reviewer (ACCEPT) and merger (scoped guest `merge-branch`).
+On its first merger invocation it deterministically exercises the target-moved
+loop on OWNED refs: an owned external-actor same-tree advance of the target, a
+stale `--expect-tip` merge refusal, an in-worktree rebase, and `STATUS: retry`
+so the upstream producer (`test` for feature-dev, `verify` for bug-fix)
+re-validates the rebased tree; the second invocation lands for real.
+`MERGED_TREE` must equal the last `TESTED_TREE`. Production refuses a moved tip
+at `merge.authorize` (typed `MERGE_TIP`, before any Git), so the gate accepts
+either a `merge.target_moved` event or the recorded stale-tip refusal + rebase
+(`stale-merge rc=` / `rebased onto`) plus the `step.rerouted` event as the real
+loop.
+
+The TEST_CMD contract detail that makes the ledger seam green: setup emits a
+RAW command (`node test.mjs`), step-ops persists it as `test_cmd_established`
+and renders the wrapped `tamandua-test --repo … --run … --step … -- 'node
+test.mjs'` to the agent; the guest shim hashes the inner raw argv and records
+`committedTreeHash` (`git rev-parse HEAD^{tree}`), which is exactly the
+`TESTED_TREE` the tester reports — so `queryMergeEvidence(namespace, originRepo,
+testedTree, sha256(rawTestCmd))` finds the row.
+
+### MTLK-UNPIN: the real-VM gates are unpinned
+
+The nine on-demand Matchlock real-VM gate drivers (`run-matchlock-*-e2e-test`
+and `run-hermes-synthetic-e2e-test`) do **not** pin a runtime sha256. Each
+resolves `matchlock` from `PATH` (or an explicit `TAMANDUA_MATCHLOCK_RPC_BIN`
+override) and defaults guest-init to `guest-init` next to that binary or on
+`PATH` (`MATCHLOCK_GUEST_INIT` / `MATCHLOCK_GUEST_FUSED` are optional
+overrides); an unset guest-init is left for matchlock to resolve itself. Each
+driver records the observed `matchlock --version` and the sha256 of every
+resolved binary in `<TAMANDUA_GATE_EVIDENCE_DIR>/runtime-observed.txt`, so the
+runtime used by a gate run is reproducible from the retained evidence. There is
+no doctor check and no pinning (Igor's decision, bead tamandua-6sy.33.10.36).
+`tests/matchlock-unpin.test.ts` pins the absence of pins.
+
+### dsh mount plan changes: the contained real-dsh boot gate is REQUIRED
+
+Any change to the dsh Matchlock mount plan — `src/installer/matchlock/mount-plan.ts`,
+`src/installer/matchlock/dsh-profile-overlay.ts`, or the controller's composed
+`DSH_HOME` mounts — MUST run, in addition to `npm run build` and the touched
+unit tests, BOTH the synthetic profile-overlay gate
+(`./run-matchlock-dsh-profile-overlay-e2e-test`) AND the contained real-dsh boot
+gate (`./run-matchlock-dsh-real-boot-gate-e2e-test`). The real-dsh boot gate
+boots the REAL image `dsh` through the production invocation runner and is the
+only gate that executes the real `healProfilesModuleFallback` → `withFileLock`
+sibling `profiles/node_modules.lock`; the zero-provider synthetic gates cannot
+substitute for it (the #31 gate set reported a hollow green for exactly this
+reason). Run both under the shared gate lock (`flock --exclusive
+/home/kaladin/matchlock-work/vaivm-gate.lock`) with the SYSTEM matchlock (no
+pins) and from a fresh login session (`ssh localhost`) whose `NoNewPrivs` is
+unset and which carries the `kvm`/`netdev` supplementary groups — the developer
+sandbox runs with `NoNewPrivs=1`, so matchlock's file capabilities are ignored
+and VM creation fails with `TUNSETIFF: operation not permitted`. The
+zero-provider fixture `e2e-tests/dsh-fixture/fake-dsh.mjs` also reproduces
+`withFileLock` at the boot-sibling path `<profiles>/node_modules.lock`
+(`fs.openSync(lock, "wx", 0o600)`, released in `finally`), so ANY dsh mount plan
+MUST leave the guest a writable `profiles/` parent — the lock's parent is
+`profiles/` itself, never the mounted `node_modules` destination — or the
+synthetic gates fail too. `tests/matchlock-dsh-boot-lock-fixture.test.ts` is the
+fast regression pinning the writable/absent/non-writable `profiles/` outcomes
+(exit 0 vs the run #32 `ENOENT` shape with exit 8).
+
+Harness-sibling whole-path gates (MTLK-ALL-WORKFLOWS): the SAME genuine
+`feature-dev-merge-worktree` scenario is also driven under the dsh
+(`e2e-tests/matchlock-dsh-merge-worktree-gate.test.ts` /
+`./run-matchlock-dsh-merge-worktree-e2e-test`) and hermes
+(`e2e-tests/matchlock-hermes-merge-worktree-gate.test.ts` /
+`./run-matchlock-hermes-merge-worktree-e2e-test`) Matchlock routes with the
+TEST-ONLY synthetic dsh/hermes fixtures. Both are opt-in
+(`REAL_VM_GATE_ENABLED`), run under the shared gate lock, and pin the host-origin
+squash landing (`MERGED_TREE == TESTED_TREE`), the host-suite evidence row, the
+per-story target_moved → rebase → retest loop, distinct fresh VMs and
+exact-owned teardown. The hermes gate additionally reconciles
+`runs.tokens_spent` EXACTLY against the Σ projected mapped-store session totals
+(input + output + cache_write; cache_read excluded), which proves every
+story/verify/retry round recovered its authoritative session (stderr trailer or
+the H2 store fallback) with no borrowed session. Fast pure-fs artifact
+contracts: `tests/matchlock-dsh-merge-worktree-gate-artifacts.test.ts` and
+`tests/matchlock-hermes-merge-worktree-gate-artifacts.test.ts`.
+
+Real-model dsh canary (MTLK-ALL-WORKFLOWS US-010): the synthetic dsh gate is
+joined by the REAL-TOKEN, REAL-VM canary
+`e2e-tests/matchlock-dsh-merge-worktree-canary.test.ts` /
+`./run-matchlock-dsh-merge-worktree-canary-e2e-test`. It drives the genuine
+bundled `feature-dev-merge-worktree` through an isolated daemon → scheduler →
+dsh Matchlock runner → fresh VMs with the operator image
+`igorhvr/bedlam-ubuntu`, `--dsh-as-harness`, and the operator's REAL dsh
+credentials staged from `TAMANDUA_GATE_REAL_DSH_HOME` into a fresh gate-owned
+`DSH_HOME` (never `sessions/`, never printed). It is opt-in
+(`REAL_VM_CANARY_ENABLED = EVIDENCE_DIR && MATCHLOCK_RPC_BIN && REAL_DSH_HOME`),
+runs under the shared gate lock, and asserts a real squash landing on a tiny
+OWNED origin (`MERGED_TREE` == the origin target tree + a real `merge.landed`),
+`runs.tokens_spent > 0` with POSITIVE per-round attribution (every mapped v3
+session usage > 0 and the total equal to `runs.tokens_spent` under
+input+output / cache_read-excluded, tolerance 0), and an empty positive
+owned-VM inventory. Fast pure-fs artifact contract:
+`tests/matchlock-dsh-merge-worktree-canary-artifacts.test.ts`. Like every
+real-VM gate it cannot boot in the developer agent sandbox (`CapEff: 0` +
+`NoNewPrivs: 1` suppress matchlock's file caps → first VM create fails
+`TUNSETIFF: operation not permitted`); the operator/tester runs it outside the
+sandbox.
+
+Real-model hermes canary (MTLK-ALL-WORKFLOWS US-011): the hermes sibling is
+`e2e-tests/matchlock-hermes-merge-worktree-canary.test.ts` /
+`./run-matchlock-hermes-merge-worktree-canary-e2e-test`. It drives the same
+genuine bundled `feature-dev-merge-worktree` through an isolated daemon →
+scheduler → hermes Matchlock runner → fresh VMs with the operator image
+`igorhvr/bedlam-ubuntu` and `--hermes-as-harness`, staging the operator's REAL
+hermes config/credentials (`TAMANDUA_GATE_REAL_HERMES_HOME`, default
+`$HOME/.hermes`) into a fresh gate-owned default `<HOME>/.hermes` (only
+`config.yaml` / `auth.json` / `.env` etc. are copied — `state.db*` and
+`sessions/` are deliberately NOT, so the mapped token ledger starts EMPTY and
+never borrows an operator session; credentials are never printed). It is opt-in
+(`REAL_VM_CANARY_ENABLED = EVIDENCE_DIR && MATCHLOCK_RPC_BIN &&
+REAL_HERMES_HOME`), runs under the shared gate lock, and asserts a real squash
+landing on a tiny OWNED origin (`MERGED_TREE` == the origin target tree + a real
+`merge.landed`), `runs.tokens_spent > 0` with POSITIVE per-round attribution
+(every mapped `state.db` session row projects a positive total and the run total
+equals the Σ rows under input+output+cache_write / cache_read-excluded,
+tolerance 0), and an empty positive owned-VM inventory. Fast pure-fs artifact
+contract: `tests/matchlock-hermes-merge-worktree-canary-artifacts.test.ts`. Like
+every real-VM gate it cannot boot in the developer agent sandbox and is run by
+the operator/tester outside it.
+
+### Real-VM DSV2-in-VM dsh gate (MATCHLOCK-UNION-3 US-010)
+
+The on-demand REAL-TOKEN, REAL-VM gate for the in-VM dsh v3 store reader lives
+in `e2e-tests/matchlock-dsh-real-gate.test.ts` and is run by
+`./run-matchlock-dsh-real-gate-e2e-test` (NOT part of `npm test` or any fast
+lane; it boots fresh VMs and spends real model tokens). It drives ONE real
+`do-now` through an isolated daemon → scheduler → Matchlock dsh invocation
+runner → fresh VMs with `--dsh-as-harness --matchlock igorhvr/bedlam-ubuntu`,
+then asserts the run completes, `runs.tokens_spent > 0`, and
+`runs.tokens_spent ===` the mapped host v3 store total (input + output,
+cache_read excluded, tolerance 0). The store total is read with the PRODUCTION
+confined in-VM reader (`dist/installer/matchlock/dsh-session-store.js`
+`discoverSessionArtifacts` + `readDshSessionArtifact`) from
+`<DSH_HOME>/sessions/<projectKey>/session-<id>/session.v3.jsonl.zstd`
+(multi-frame zstd; TOP-LEVEL `data.usage` only, never the `data.stream`
+mirror). Every created VM is positively closed and recorded in the ledger.
+
+The gate stages a FRESH gate-owned `DSH_HOME` from the operator's real dsh home
+(credentials + `profiles/`, `sessions/` deliberately NOT copied so the
+attributed store starts empty) and runs the whole path through the production
+short-HOME alias, so no gate-side alias repair is needed.
+
+**Operator image gotcha:** the plain docker tag `igorhvr/bedlam-ubuntu:latest`
+is NOT the qualified toolchain image (it has node only). The REAL image that
+ships dsh 0.1.5-rc.2, hermes and pi exists ONLY in the operator matchlock
+image store (`~/.cache/matchlock/images`, scope `local`). The runner therefore
+always seeds the private store from `TAMANDUA_GATE_OPERATOR_CACHE`
+(hardlinked content-addressed blobs + copied metadata; the runner defaults it to
+`$HOME/.cache/matchlock`) instead of importing the docker tag. Gate E confirmed
+the store image digest `sha256:cd83b838…` / config `sha256:cca820df…` and the
+probe/work v3 session totals reconciled exactly (probe 6769 + work 5308 =
+12077 == `runs.tokens_spent`).
+
+## Real-VM gates cannot run in the developer agent sandbox
+
+The developer agent's command sandbox runs with `NoNewPrivs: 1` and
+`CapEff: 0`, so the matchlock binary's file capabilities
+(`cap_net_admin,cap_net_raw=ep`) are suppressed. The first VM create therefore
+fails with `create VM: create TAP device: TUNSETIFF: operation not permitted`
+(and `matchlock rm` with `reconcile nftables rule: netlink receive: operation
+not permitted`). This is documented pre-existing host behaviour, not a gate or
+product defect — see `docs/matchlock-dsh-qualification.md` §"Why #31's gates
+missed the boot-lock failure": the developer sandbox suppresses those caps and
+"the operator/tester must run real-VM gates outside that sandbox".
+
+Consequences:
+- New real-VM gates should make the VM scenario OPT-IN (skip the real-VM
+  `describe` unless the runner-provided environment is present) so a bare
+  `node --test` exercises only the fast no-VM controls. See
+  `e2e-tests/matchlock-dsh-merge-worktree-gate.test.ts` (`REAL_VM_GATE_ENABLED`)
+  and its pure-fs artifact contract
+  `tests/matchlock-dsh-merge-worktree-gate-artifacts.test.ts`.
+- The developer writes/commits the gate + the no-VM controls and records the
+  sandbox `TUNSETIFF`/`nf_tables` EPERM as ENVIRONMENT; the operator/tester runs
+  the real-VM gate under `flock --exclusive
+  /home/kaladin/matchlock-work/vaivm-gate.lock` outside the sandbox.
+
+### Pi gate family + fast-e2e regression (MTLK-ALL-WORKFLOWS US-012)
+
+`tests/matchlock-pi-gate-fast-e2e-regression.test.ts` is the fast, pure-fs
+(parallel-lane) contract for the pi gate family: it pins that the four
+real-VM runners (`run-matchlock-worktree-merge-e2e-test`,
+`run-matchlock-synthetic-e2e-test`, `run-matchlock-empty-output-e2e-test`,
+`run-matchlock-long-home-e2e-test`) stay wired to their gate files, build
+first, allocate an `mktemp -d` evidence dir and propagate the exit code; that
+every gate file keeps its "NOT part of any default fast lane" header and its
+no-VM controls; and that no real-VM gate/runner leaks into
+`run-all-e2e-tests` / `run-all-smoke-e2e-tests` / `run-all-scripted-e2e-tests`.
+The pi admission parity itself is pinned by `dispatch-guard.test.ts` (incl. the
+"pi differential unchanged" case) and `harness-workflow-matrix.test.ts`.
+
+`./run-all-e2e-tests` (smoke + scripted) has one host-environment red that is
+NOT a product regression: because `origin/main` is ahead of the branch,
+`src/server/daemon.ts`'s startup `runVersionCheck()` writes
+`updateAvailable: true` into the run's isolated state dir, so the CLI prints
+`WARNING: A new version of tamandua is available! Run: tamandua update` to
+stderr for `workflow status`, which breaks
+`e2e-tests/workflows-harness-probe.test.ts` test (a)'s
+`text.trimEnd().endsWith("STDERR_TAIL:")` assertion. This is the same class
+recorded in `MATCHLOCK_OBS_FINDINGS` (`host-origin-advanced-update-warning`) and
+reproduces deterministically when the file is run alone under the gate lock.
+Classify it ENVIRONMENT/host; do not "fix" the warning by touching product code
+in this integration run.
+
+### Full-suite #37 baseline comparison (MTLK-ALL-WORKFLOWS US-013)
+
+`tests/matchlock-all-workflows-baseline.test.ts` (parallel lane, pure fs)
+pins the recorded **#37 baseline failing-title set** (44 unique titles, the
+`baseline` section of
+`/home/kaladin/matchlock-work/dsh-overlay-fsync-fix-contract.json`, concrete
+list at `evidence/dsh-overlay-fsync-fix-us006-20260918T013731Z/baseline-failing-titles.txt`)
+and the pure comparison logic used by the full-suite gate:
+
+- `extractFailingTitles(logText)` pulls the unique failing titles from raw
+  node:test output: it matches the `✖ <title>` lines (U+2716 + one space),
+  strips the trailing ` (<duration>ms|s)`, drops the synthetic
+  `✖ failing tests:` suite summary, then dedupes and sorts.
+- `compareFailureSets(observed, baseline)` is the gate: **`newVsBaseline` must
+  be empty** (title-for-title subset). `baselineOnly` titles are flakes that
+  did not reproduce and are recorded, not regressions.
+- The two guard-sensitive baseline titles (a temp-dir helper call and a
+  hardcoded temp path) are assembled by concatenation so the file does not
+  itself trip `src/lib/temp-dir.guard.test.ts`; assembled strings stay
+  byte-identical. Do NOT put those two literals in this file's comments either —
+  the guard reads the whole file as one string.
+
+The US-013 full TEST_CMD under
+`flock --exclusive /home/kaladin/matchlock-work/vaivm-gate.lock` (detached
+setsid+nohup) produced `rc=1` with **serial 4290 tests / 4251 pass / 38 fail**
+and **parallel 3183 / 3176 / 4**; the observed failing-title set EXACTLY equals
+the 44-title #37 baseline (empty diff both directions). The failure classes are
+all host-environment/deterministic: 35 `/root`-fixture EACCES (hermes+pi
+invocation runners), 2 control-plane CLI (origin/main-ahead update warning), 1
+portability lint, 4 parallel guards, 1 guard-ledger. Re-running representative
+baseline-failing files ALONE under the lock reproduced each red
+deterministically, so none is a concurrent-load flake; the known
+SQLite/concurrency suites (`tests/update-protocol.test.ts`,
+`tests/step-ops-dispatch-races.test.ts`) passed in the full run. Evidence:
+`/home/kaladin/matchlock-work/evidence/us013-full-suite-F0pCEJ/`
+(`us013-results.json` sidecar for US-014). Never silence a baseline failure by
+touching product `src/`.
+
 ## Environment Overrides
 
 - `TAMANDUA_WORKFLOWS_SRC`: Overrides the directory from which bundled workflows are loaded. When set, the installer resolves this directory (relative or absolute) instead of the default `<repo>/workflows/`. Tests that exercise `workflow install --all` or `get-ready` with custom workflow fixtures should point this at a temp directory containing the desired workflow set. Set in `src/installer/paths.ts` `resolveBundledWorkflowsDir()`.
@@ -554,7 +982,7 @@ followed by a top-level command listing.
   table's `CREATE TABLE` statement keeps its original explicit column list,
   and nullable additions never touch explicit-column INSERTs or the status.ts
   SELECT column lists.
-- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 9). This is
+- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 13). This is
   the WLST5.1 failure mode: adding a guarded ALTER without bumping leaves
   existing DBs (user_version === the old version) early-returning in
   `migrate()` and skipping the ALTER, so any SQL touching the new column
@@ -562,11 +990,42 @@ followed by a top-level command listing.
   `applySchema()`, and `migrate()` now serializes cold-start migration across
   processes (`BEGIN IMMEDIATE` + bounded retry, re-reading `user_version`
   under the lock) so concurrent first-opens cannot race the guarded ALTERs.
+- ONE schema chain (UNION-PORT v13): the main and Matchlock lineages each
+  claimed a `v10`, and then each claimed a `v12` for a DIFFERENT column
+  (`steps.preclaim_death_count` on main, `runs.matchlock_policy` on the
+  Matchlock lineage), so the union port renumbers both into one idempotent
+  chain ending at `SCHEMA_VERSION = 13`.
+  `v9 -> v10` is `migrateInstantsToIsoZ()` (rewrites naive
+  `YYYY-MM-DD HH:MM:SS` values to ISO-8601 UTC `...Z` in every timestamp
+  column; idempotent, so it also normalizes a Matchlock-lineage DB that still
+  holds naive values). `v10 -> v11` is the guarded
+  `steps.target_moved_reroute_count INTEGER DEFAULT 0` ALTER (main's
+  REROUTE-BUDGET). `v11 -> v12` is the guarded
+  `steps.preclaim_death_count INTEGER NOT NULL DEFAULT 0` ALTER (main's
+  OUTAGE-ROUNDS pre-claim counter). `v12 -> v13` is the guarded
+  `runs.matchlock_policy TEXT` ALTER (the Matchlock lineage's nullable,
+  host-owned execution-isolation policy JSON; NULL means the native path).
+  `migrate()` does NOT early-return for any `user_version < 13`; it classifies
+  the starting lineage with the exported pure `detectSchemaLineage(db)` helper
+  by reading `PRAGMA table_info` — never the colliding `user_version` alone:
+  `main-v12` (preclaim present, matchlock absent), `union-v12` (matchlock
+  present, preclaim absent), `pre-v12` (earlier/empty) and `current` (v13 with
+  both). The matchlock-lineage old v10/v12 column is kept as-is (the
+  `pragma_table_info` guard on every ALTER stays authoritative), and
+  `migrateInstantsToIsoZ()` still runs for every DB below 13 so a
+  matchlock-lineage DB with naive instants is normalized; the final stamp is
+  `user_version = 13`.
 - Migration coverage belongs in `src/db.test.ts` MIGV tests: build a legacy DB
-  with raw pre-bump DDL + `PRAGMA user_version = SCHEMA_VERSION - 1` in a temp
+  with raw pre-bump DDL + `PRAGMA user_version = <starting version>` in a temp
   HOME, open it through `getDb()` in a subprocess (import from `dist/db.js`,
   `TAMANDUA_TEST_GUARD=1`), and assert the new column(s), the re-stamped
-  user_version, and a status SELECT over runs.
+  user_version, and a status SELECT over runs. The union4 matrix
+  (`MIGV union4 v13 schema chain`) covers every starting state: v9, v10 MAIN
+  (ISO-Z, no target_moved, no matchlock_policy), v10 MATCHLOCK
+  (matchlock_policy present, naive instants, no target_moved), v11 MAIN, v11
+  MATCHLOCK, v12 MAIN (preclaim present, no matchlock_policy), v12 UNION
+  (matchlock_policy present, no preclaim), and already-at-13, plus a forced
+  slow-path re-run proving each guarded step is idempotent.
 
 ### Time and staleness (TIME-CLOCKS)
 
@@ -730,6 +1189,21 @@ direction (everything listed must be spawn-capable and existing).
 Never convert absolute-deadline assertions into polls or retries to fix a
 flake — raise the timeout or move the file to the serial lane.
 
+#### Full-suite TMPDIR must stay short (matchlock long-home tests)
+
+Do **not** export `TMPDIR` under a deep directory (for example an evidence
+directory) when running `npm test`. Several serial-lane matchlock tests derive
+a throwaway `HOME` from `TMPDIR` and then build
+`<HOME>/.matchlock/vms/vm-*/vsock.sock_5001`; if that path exceeds the Linux
+107-byte `sun_path` limit the runner refuses early with
+`matchlock_home_socket_path_too_long`, and the FIFO/socket progress-resource
+test fails with `listen EINVAL`. That produces a cluster of ~11 spurious
+long-home serial failures that do not exist with the default short `TMPDIR`.
+If you must point evidence at a deep path, keep the test `TMPDIR` short (or
+leave it unset) and route only the log/evidence paths there. Always compare the
+observed failing-title set against the recorded #37 baseline before treating a
+red full-suite run as a regression.
+
 #### Launch-time harness probe in dispatch tests (IFLB)
 
 The dispatch motor probes a run's harness at its first real dispatch
@@ -787,7 +1261,8 @@ step) are the SLOW complement of an instant fail and join the SAME
 K = 6 / N = 20 escalating backoff and cap with a distinct vocabulary: each
 death emits `step.preclaim_round_died` (exit code, signal, harness wall ms,
 bounded stderr tail) and increments `steps.preclaim_death_count`
-(SCHEMA_VERSION 12), the dispatch gate is `preclaim_death_backoff`, and the
+(the `v11 -> v12` step; the overall `SCHEMA_VERSION` is 13), the dispatch gate
+is `preclaim_death_backoff`, and the
 N-th death emits `run.preclaim_death_loop` then force-fails the run
 (`formatPreclaimDeathReason`). Any successful claim resets the counter and
 the in-memory streak; detection is timing + claim state ONLY (no

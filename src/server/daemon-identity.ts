@@ -21,6 +21,7 @@
  *  - Probes never throw: any failure (ENOENT, ECONNREFUSED, timeout, corrupt
  *    payload) is reported as `null`.
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -54,6 +55,14 @@ export interface DaemonIdentity {
 export interface IdentityPathOptions {
   /** When set, use this directory instead of ~/.tamandua. */
   homeDir?: string;
+  /**
+   * Override the short alias root used when the state-dir socket path cannot
+   * fit the AF_UNIX `sun_path` limit (tests only; the default is
+   * {@link IDENTITY_SOCKET_ALIAS_ROOT}). It must itself be short.
+   */
+  socketAliasRoot?: string;
+  /** Override the effective uid embedded in the alias path (tests only). */
+  uid?: number;
 }
 
 /** Options for {@link bindIdentitySocket}. */
@@ -79,6 +88,28 @@ export interface BoundIdentitySocket {
 
 /** Default probe timeout (ms). Kept short — a probe is a liveness hint. */
 export const DEFAULT_PROBE_TIMEOUT_MS = 500;
+
+/**
+ * Usable AF_UNIX `sun_path` length in bytes. Linux caps `sun_path` at 108
+ * bytes including the trailing NUL (107 usable); the BSD/macOS limit is 104
+ * (103 usable), so the conservative platform value is used.
+ */
+export const IDENTITY_SOCKET_SUN_PATH_USABLE_LIMIT =
+  process.platform === "darwin" ? 103 : 107;
+
+/**
+ * Literal short root for the long-state-dir identity-socket alias.
+ *
+ * The alias exists precisely so the socket path stays short no matter how deep
+ * the state directory is, so the root is deliberately NOT the ambient platform
+ * temp dir (which can itself be deep). It mirrors the Matchlock short-HOME
+ * alias root (`/tmp/tamandua/<uid>`) and is created mode 0700 owned by the
+ * effective uid.
+ */
+export const IDENTITY_SOCKET_ALIAS_ROOT = "/tmp/tamandua";
+
+/** Hex chars of the state-dir digest in an aliased socket directory. */
+export const IDENTITY_SOCKET_ALIAS_DIGEST_CHARS = 24;
 
 /** Request line a client sends to ask for the identity. */
 const IDENTITY_REQUEST = '{"op":"identity"}\n';
@@ -127,6 +158,14 @@ function socketFileName(service: ServiceKind): string {
  * `mcp.sock`. Without a `homeDir`, the effective state dir is resolved through
  * the shared {@link resolveStateDir} (honoring `TAMANDUA_STATE_DIR`) and the
  * test-isolation guard is consulted (mirroring daemonctl.getPidFile).
+ *
+ * Long state dirs: an AF_UNIX socket address cannot exceed the platform
+ * `sun_path` limit, so a real HOME long enough to push
+ * `<stateDir>/daemon.sock` past it makes the daemon unbindable. The Matchlock
+ * long-HOME support (US-011) proves exactly that layout, so when the derived
+ * path does not fit, a deterministic short alias is returned instead of the
+ * long path (see {@link aliasedIdentitySocketPath}). Every caller resolves the
+ * path through this function, so bind and probe agree across processes.
  */
 export function getServiceSocketPath(
   service: ServiceKind,
@@ -136,7 +175,34 @@ export function getServiceSocketPath(
   if (!opts?.homeDir) {
     assertStatePathIsolation(socketPath, "getServiceSocketPath()");
   }
-  return socketPath;
+  if (Buffer.byteLength(socketPath, "utf8") <= IDENTITY_SOCKET_SUN_PATH_USABLE_LIMIT) {
+    return socketPath;
+  }
+  return aliasedIdentitySocketPath(socketPath, opts);
+}
+
+/**
+ * Deterministic short alias for an identity socket path that cannot fit the
+ * AF_UNIX `sun_path` limit.
+ *
+ * Layout: `<root>/<uid>/s/<digest>/<basename>` where `<digest>` is the first
+ * {@link IDENTITY_SOCKET_ALIAS_DIGEST_CHARS} hex chars of the SHA-256 of the
+ * absolute real socket path. Determinism matters: the daemon binds this path
+ * and every CLI probe must derive the identical one, and distinct state dirs
+ * must map to distinct aliases (state-dir scoping is preserved).
+ */
+export function aliasedIdentitySocketPath(
+  realSocketPath: string,
+  opts?: IdentityPathOptions,
+): string {
+  const root = opts?.socketAliasRoot ?? IDENTITY_SOCKET_ALIAS_ROOT;
+  const uid = opts?.uid ?? (typeof process.getuid === "function" ? process.getuid() : 0);
+  const digest = crypto
+    .createHash("sha256")
+    .update(path.resolve(realSocketPath))
+    .digest("hex")
+    .slice(0, IDENTITY_SOCKET_ALIAS_DIGEST_CHARS);
+  return path.join(root, String(uid), "s", digest, path.basename(realSocketPath));
 }
 
 /** True when `value` is a structurally valid {@link DaemonIdentity}. */
@@ -255,6 +321,45 @@ function listenOnSocket(server: net.Server, socketPath: string): Promise<void> {
 }
 
 /**
+ * Harden the alias root when binding an aliased identity socket.
+ *
+ * The alias lives under the shared literal `/tmp/tamandua/<uid>` path, so the
+ * per-uid directory and its descendants must be real directories owned by the
+ * effective uid and mode 0700 — never a symlink an attacker could have planted.
+ * A path that is not under the alias root (the normal short-state-dir case, in
+ * the user's own HOME) is left untouched.
+ */
+function assertAliasedSocketParentTrusted(socketPath: string): void {
+  const rootPrefix = `${IDENTITY_SOCKET_ALIAS_ROOT}${path.sep}`;
+  if (!socketPath.startsWith(rootPrefix)) return;
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  // Verify every level under the alias root: <uid>, <uid>/s, <uid>/s/<digest>.
+  const uidDir = path.join(IDENTITY_SOCKET_ALIAS_ROOT, String(uid));
+  const parents = [uidDir, path.join(uidDir, "s"), path.dirname(socketPath)];
+  for (const parent of parents) {
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(parent);
+    } catch {
+      continue; // mkdir recursive created it; a missing level is unreachable.
+    }
+    if (!st.isDirectory() || st.isSymbolicLink()) {
+      throw new Error(
+        `aliased identity socket parent "${parent}" is not a trusted directory`,
+      );
+    }
+    if (st.uid !== uid) {
+      throw new Error(
+        `aliased identity socket parent "${parent}" is owned by uid ${st.uid}, expected ${uid}`,
+      );
+    }
+    if ((st.mode & 0o777) !== 0o700) {
+      fs.chmodSync(parent, 0o700);
+    }
+  }
+}
+
+/**
  * Bind a service identity socket.
  *
  * Contract:
@@ -279,7 +384,8 @@ export async function bindIdentitySocket(
     throw new TypeError("bindIdentitySocket: identity is not a valid DaemonIdentity");
   }
 
-  fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+  assertAliasedSocketParentTrusted(socketPath);
 
   if (fs.existsSync(socketPath)) {
     const live = await probeIdentitySocket(socketPath, opts?.probeTimeoutMs);

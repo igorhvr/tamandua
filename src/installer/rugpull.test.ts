@@ -1,6 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import net from "node:net";
@@ -8,6 +9,24 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 import { tamanduaTempDir, tamanduaTempRoot } from "../../dist/lib/temp-dir.js";
+import {
+  buildMatchlockPolicy,
+  parseMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../dist/installer/matchlock/policy.js";
+import {
+  MATCHLOCK_RPC_ARGS_ENV,
+  MATCHLOCK_RPC_BIN_ENV,
+} from "../../dist/installer/matchlock/admission.js";
+import { tempTranscriptPath, writeFakeRpcDriver } from "../../dist/installer/matchlock/fake-rpc-driver.js";
+
+/**
+ * MTLK-ADMIT fixture base: work mounts must be at host paths whose exact-path
+ * GUEST mounts are allowed (guest /tmp is protected), so matchlock fixtures
+ * live under the real operator home, not the suite's /tmp temp homes.
+ * Captured at module load before any test mutates HOME.
+ */
+const MTLK_FIXTURE_BASE = path.join(os.homedir(), ".mtlk-rugpull-test");
 
 // ── Event helper ──
 
@@ -1852,6 +1871,374 @@ describe("relaunchRunAfterRugpull", () => {
     const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
     const corruptEvents = events.filter((e) => e.event === "run.context_corrupt");
     assert.equal(corruptEvents.length, 1, "should emit one run.context_corrupt event");
+  });
+
+  // ── MTLK-ADMIT: rugpull replacement of an OPTED-IN run ──────────
+  // A replacement must INHERIT the failed run's pinned Matchlock policy
+  // (image content+config pin, selected configuration root/profile, original
+  // repository authority) and must never silently become native. It may
+  // derive ONLY the new host-created worktree's exact path/metadata.
+
+  it("rugpull replacement of a MATCHLOCK run retains the image pin + config root and re-admits (never native)", async () => {
+    const workflowId = "test-relaunch-mtlk-direct";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+    const configRoot = path.join(tempHome, ".pi", "agent");
+    fs.mkdirSync(configRoot, { recursive: true });
+
+    const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+    fs.mkdirSync(fixtureRoot, { recursive: true });
+    const workDir = path.join(fixtureRoot, "wd");
+    initGitRepo(workDir);
+
+    const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+    const transcript = tempTranscriptPath();
+    const savedEnv: Array<[string, string | undefined]> = [];
+    const setEnv = (key: string, value: string | undefined): void => {
+      savedEnv.push([key, process.env[key]]);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+    setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+    setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+    setEnv("FAKE_IMAGE_TAG", "vic/ml:latest");
+    setEnv("FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    const { relaunchRunAfterRugpull } = await import("../../dist/installer/rugpull.js");
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    // The ORIGINAL opted-in run (as if it had been admitted earlier): a
+    // version-2 policy pinning the same content+config the fake store resolves.
+    const originalPolicy = buildMatchlockPolicy({
+      requestedImage: "vic/ml:latest",
+      identity: {
+        digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        tag: "vic/ml:latest",
+      },
+      harness: "pi",
+      workingDirectory: workDir,
+      originalRepositoryRoot: workDir,
+      workMounts: [{ hostPath: workDir, hostRealPath: workDir, guestPath: workDir }],
+      gitMetadataRoots: [],
+      configurationRoot: configRoot,
+    });
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      repo: workDir,
+      working_directory_for_harness: workDir,
+      workspace_mode: "direct",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+    insertStep(db, "step-" + failedRunId.slice(0, 8), failedRunId, "finalize_merge", "failed", 0, "single");
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?")
+      .run(serializeMatchlockPolicy(originalPolicy), failedRunId);
+
+    try {
+      const result = await relaunchRunAfterRugpull(failedRunId);
+      assert.equal(result.relaunched, true, "matchlock replacement must relaunch");
+      assert.ok(result.newRunId, "new run ID should be set");
+      assert.notEqual(result.newRunId, failedRunId);
+
+      const newRun = db.prepare(
+        "SELECT status, matchlock_policy FROM runs WHERE id = ?",
+      ).get(result.newRunId!) as { status: string; matchlock_policy: string | null } | undefined;
+      assert.ok(newRun, "replacement run must exist");
+      assert.equal(newRun.status, "running");
+      assert.ok(newRun.matchlock_policy, "replacement must carry an inherited pinned policy (never native)");
+      const replacementPolicy = parseMatchlockPolicy(newRun.matchlock_policy!);
+      assert.equal(replacementPolicy.resolvedImageDigest,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "replacement must keep the SAME immutable content pin (no re-pin to moved content)");
+      assert.equal(replacementPolicy.requestedImage, "vic/ml:latest");
+      assert.equal(replacementPolicy.configurationRoot, configRoot,
+        "replacement must retain the selected configuration root (never daemon re-discovery)");
+      assert.equal(replacementPolicy.workingDirectory, workDir);
+      assert.equal(replacementPolicy.originalRepositoryRoot, workDir,
+        "replacement must retain the original repository authority");
+
+      const originalRun = db.prepare("SELECT status FROM runs WHERE id = ?").get(failedRunId) as { status: string };
+      assert.equal(originalRun.status, "failed", "original failed run must be preserved");
+    } finally {
+      for (const [key, value] of savedEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+      if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rugpull replacement of a MATCHLOCK worktree run derives ONLY the new worktree while retaining origin authority + pin", async () => {
+    const workflowId = "test-relaunch-mtlk-worktree";
+    writeWorkflowYml(tempHome, workflowId, "worktree");
+    const configRoot = path.join(tempHome, ".pi", "agent");
+    fs.mkdirSync(configRoot, { recursive: true });
+
+    const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+    fs.mkdirSync(fixtureRoot, { recursive: true });
+    const originRepo = path.join(fixtureRoot, "origin");
+    initGitRepo(originRepo);
+    const worktreeRoot = path.join(fixtureRoot, "worktrees");
+    fs.mkdirSync(worktreeRoot, { recursive: true });
+
+    const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+    const transcript = tempTranscriptPath();
+    const savedEnv: Array<[string, string | undefined]> = [];
+    const setEnv = (key: string, value: string | undefined): void => {
+      savedEnv.push([key, process.env[key]]);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+    setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+    setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+    setEnv("FAKE_IMAGE_TAG", "vic/ml:latest");
+    setEnv("FAKE_IMAGE_DIGEST", "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+
+    const { relaunchRunAfterRugpull } = await import("../../dist/installer/rugpull.js");
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const originalPolicy = buildMatchlockPolicy({
+      requestedImage: "vic/ml:latest",
+      identity: {
+        digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        config_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        tag: "vic/ml:latest",
+      },
+      harness: "pi",
+      workingDirectory: path.join(fixtureRoot, "wt-old"),
+      originalRepositoryRoot: originRepo,
+      workMounts: [{ hostPath: path.join(fixtureRoot, "wt-old"), hostRealPath: path.join(fixtureRoot, "wt-old"), guestPath: path.join(fixtureRoot, "wt-old") }],
+      gitMetadataRoots: [],
+      configurationRoot: configRoot,
+    });
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      workspace_mode: "worktree",
+      worktree_origin_repository: originRepo,
+      worktree_origin_ref: "main",
+      worktree_path: path.join(fixtureRoot, "wt-old"),
+      worktree_origin_sha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+    insertStep(db, "step-" + failedRunId.slice(0, 8), failedRunId, "finalize_merge", "failed", 0, "single");
+    insertWorktree(db, failedRunId, originRepo, { worktreeOriginRef: "main" });
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?")
+      .run(serializeMatchlockPolicy(originalPolicy), failedRunId);
+
+    // The new managed worktree must be created under a MOUNTABLE root (guest
+    // /tmp is protected; the suite default is under /tmp).
+    const savedWorktreeRoot = process.env.TAMANDUA_WORKTREE_ROOT;
+    process.env.TAMANDUA_WORKTREE_ROOT = worktreeRoot;
+    try {
+      const result = await relaunchRunAfterRugpull(failedRunId);
+      assert.equal(result.relaunched, true, "matchlock worktree replacement must relaunch");
+      assert.ok(result.newRunId);
+
+      const newRun = db.prepare(
+        "SELECT status, matchlock_policy FROM runs WHERE id = ?",
+      ).get(result.newRunId!) as { status: string; matchlock_policy: string | null } | undefined;
+      assert.ok(newRun);
+      assert.equal(newRun.status, "running");
+      assert.ok(newRun.matchlock_policy, "replacement must inherit the pinned policy");
+      const replacementPolicy = parseMatchlockPolicy(newRun.matchlock_policy!);
+      assert.equal(replacementPolicy.resolvedImageDigest,
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+      assert.equal(replacementPolicy.originalRepositoryRoot, originRepo,
+        "the ORIGINAL repository authority is retained");
+      assert.equal(replacementPolicy.configurationRoot, configRoot);
+      const wtRow = db.prepare(
+        "SELECT worktree_path FROM run_worktrees WHERE run_id = ?",
+      ).get(result.newRunId!) as { worktree_path: string } | undefined;
+      assert.ok(wtRow, "replacement creates a fresh managed worktree record");
+      assert.ok(wtRow.worktree_path.startsWith(worktreeRoot + path.sep),
+        "only the NEW host-created worktree path may differ: " + wtRow.worktree_path);
+      assert.notEqual(wtRow.worktree_path, path.join(fixtureRoot, "wt-old"));
+    } finally {
+      if (savedWorktreeRoot === undefined) delete process.env.TAMANDUA_WORKTREE_ROOT;
+      else process.env.TAMANDUA_WORKTREE_ROOT = savedWorktreeRoot;
+      for (const [key, value] of savedEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+      if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rugpull replacement of a MATCHLOCK run whose image MOVED is refused (no native relaunch, no silent re-pin)", async () => {
+    const workflowId = "test-relaunch-mtlk-moved";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+    const configRoot = path.join(tempHome, ".pi", "agent");
+    fs.mkdirSync(configRoot, { recursive: true });
+
+    const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+    fs.mkdirSync(fixtureRoot, { recursive: true });
+    const workDir = path.join(fixtureRoot, "wd");
+    initGitRepo(workDir);
+
+    const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+    const transcript = tempTranscriptPath();
+    const savedEnv: Array<[string, string | undefined]> = [];
+    const setEnv = (key: string, value: string | undefined): void => {
+      savedEnv.push([key, process.env[key]]);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+    setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+    setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+    setEnv("FAKE_IMAGE_TAG", "vic/ml:latest");
+    // The store NOW resolves DIFFERENT content than the persisted pin.
+    setEnv("FAKE_IMAGE_DIGEST", "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+    const { relaunchRunAfterRugpull } = await import("../../dist/installer/rugpull.js");
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const originalPolicy = buildMatchlockPolicy({
+      requestedImage: "vic/ml:latest",
+      identity: {
+        digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        tag: "vic/ml:latest",
+      },
+      harness: "pi",
+      workingDirectory: workDir,
+      originalRepositoryRoot: workDir,
+      workMounts: [{ hostPath: workDir, hostRealPath: workDir, guestPath: workDir }],
+      gitMetadataRoots: [],
+      configurationRoot: configRoot,
+    });
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      repo: workDir,
+      working_directory_for_harness: workDir,
+      workspace_mode: "direct",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+    insertStep(db, "step-" + failedRunId.slice(0, 8), failedRunId, "finalize_merge", "failed", 0, "single");
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?")
+      .run(serializeMatchlockPolicy(originalPolicy), failedRunId);
+
+    try {
+      const result = await relaunchRunAfterRugpull(failedRunId);
+      assert.equal(result.relaunched, false,
+        "a moved-tag replacement must be refused, never relaunched natively or re-pinned");
+
+      const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
+      const failedEvents = events.filter((e) => e.event === "run.rugpull_relaunch_failed");
+      assert.equal(failedEvents.length, 1, "must emit run.rugpull_relaunch_failed");
+      assert.match(String(failedEvents[0].detail), /identity mismatch|NOT re-pinned/);
+
+      // The refused replacement attempt left NO runnable work: any new run row
+      // is failed with no policy pin and no steps (never a native runner).
+      const attempted = db.prepare(
+        "SELECT id, status, scheduling_status, matchlock_policy FROM runs WHERE workflow_id = ? AND id != ? ORDER BY created_at DESC LIMIT 1",
+      ).get(workflowId, failedRunId) as
+      | { id: string; status: string; scheduling_status: string | null; matchlock_policy: string | null }
+      | undefined;
+      if (attempted) {
+        assert.equal(attempted.status, "failed", "refused replacement attempt must be failed");
+        assert.equal(attempted.scheduling_status, null, "refused replacement must never be schedulable");
+        assert.equal(attempted.matchlock_policy, null, "no unpinned/native policy may be stored");
+        const steps = db.prepare("SELECT COUNT(*) AS n FROM steps WHERE run_id = ?").get(attempted.id) as { n: number };
+        assert.equal(steps.n, 0, "refused replacement has no runnable work");
+      }
+    } finally {
+      for (const [key, value] of savedEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+      if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rugpull replacement of a MATCHLOCK run with a MALFORMED stored policy is refused (no native replacement, run.rugpull_relaunch_failed)", async () => {
+    const workflowId = "test-relaunch-mtlk-malformed";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+
+    const { relaunchRunAfterRugpull } = await import("../../dist/installer/rugpull.js");
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      workspace_mode: "direct",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+    insertStep(db, "step-" + failedRunId.slice(0, 8), failedRunId, "finalize_merge", "failed", 0, "single");
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?")
+      .run("{this is not valid json", failedRunId);
+
+    const result = await relaunchRunAfterRugpull(failedRunId);
+    assert.equal(result.relaunched, false,
+      "a malformed stored Matchlock policy must refuse the rugpull relaunch, never go native");
+    assert.equal(result.newRunId, undefined, "no replacement run may be created");
+
+    const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
+    const failedEvents = events.filter((e) => e.event === "run.rugpull_relaunch_failed");
+    assert.equal(failedEvents.length, 1, "must emit run.rugpull_relaunch_failed");
+    assert.match(String(failedEvents[0].detail), /stored Matchlock policy is not reusable/);
+    assert.match(String(failedEvents[0].detail), /never become native/);
+
+    // NO replacement row exists for this workflow: the refusal happens before
+    // any runWorkflow call, so there is nothing to schedule — never native.
+    const replacements = db.prepare(
+      "SELECT id FROM runs WHERE workflow_id = ? AND id != ?",
+    ).all(workflowId, failedRunId) as Array<{ id: string }>;
+    assert.equal(replacements.length, 0, "a refused replacement must create NO new run row");
+  });
+
+  it("rugpull replacement of a MATCHLOCK run with a LEGACY UNPINNED (version-1) stored policy is refused (no native replacement)", async () => {
+    const workflowId = "test-relaunch-mtlk-legacy";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+
+    const { relaunchRunAfterRugpull } = await import("../../dist/installer/rugpull.js");
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      workspace_mode: "direct",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+    insertStep(db, "step-" + failedRunId.slice(0, 8), failedRunId, "finalize_merge", "failed", 0, "single");
+    // A version-1 legacy record (as US-001 wrote before MTLK-ADMIT): unpinned.
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?")
+      .run(JSON.stringify({ version: 1, backend: "matchlock", requestedImage: "vic/ml:latest" }), failedRunId);
+
+    const result = await relaunchRunAfterRugpull(failedRunId);
+    assert.equal(result.relaunched, false,
+      "a legacy UNPINNED stored policy must refuse the rugpull relaunch (it must never look like a working isolated run)");
+    assert.equal(result.newRunId, undefined, "no replacement run may be created");
+
+    const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
+    const failedEvents = events.filter((e) => e.event === "run.rugpull_relaunch_failed");
+    assert.equal(failedEvents.length, 1, "must emit run.rugpull_relaunch_failed");
+    assert.match(String(failedEvents[0].detail), /stored Matchlock policy is not reusable/);
+    assert.match(String(failedEvents[0].detail), /legacy UNPINNED record/);
+
+    const replacements = db.prepare(
+      "SELECT id FROM runs WHERE workflow_id = ? AND id != ?",
+    ).all(workflowId, failedRunId) as Array<{ id: string }>;
+    assert.equal(replacements.length, 0, "a refused replacement must create NO new run row");
   });
 });
 

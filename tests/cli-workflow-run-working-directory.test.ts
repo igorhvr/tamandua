@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import http from "node:http";
+import os from "node:os";
 import {
   cleanChildEnv,
   reservePortHandles,
@@ -17,6 +18,8 @@ import {
   formatSharedWorkdirWarning,
   formatWorkdirRefusalMessage,
 } from "../dist/installer/workdir-collision.js";
+import { writeFakeRpcDriver } from "../dist/installer/matchlock/fake-rpc-driver.js";
+import { parseMatchlockPolicy } from "../dist/installer/matchlock/policy.js";
 
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
@@ -725,4 +728,137 @@ describe("CLI workflow run working-directory-for-harness", () => {
       }
     }
   });
+
+  // MTLK-VM-SIZE US-003: the run action resolves the --matchlock-* size flags
+  // at launch, persists them in the run's Matchlock policy, and echoes the
+  // canonical 'matchlock: <image> cpus=… memory=…MB disk=…MB' launch line.
+  it("prints the resolved matchlock VM size and persists the exact limits (MTLK-VM-SIZE US-003)", async () => {
+    const env = await createTempEnv();
+    // The work mount must keep its exact host path, and guest /tmp is a
+    // protected root — so the fixture lives under the real operator home.
+    const fixtureRoot = fs.mkdtempSync(path.join(os.homedir(), ".mtlk-cli-size-"));
+    const fake = await startFakeControlPlane({ status: 200, body: { ok: true } });
+
+    try {
+      const workflowId = "cli-run-mtlk-size";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      // The ENTIRE selected host pi configuration directory must exist.
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      const workDir = path.join(fixtureRoot, "work");
+      fs.mkdirSync(workDir, { recursive: true });
+
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = path.join(fixtureRoot, "transcript.jsonl");
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Size the VM",
+          "--working-directory-for-harness",
+          workDir,
+          "--matchlock",
+          "vic/matchlock-base:latest",
+          "--matchlock-cpus",
+          "4",
+          "--matchlock-memory",
+          "4096",
+          "--matchlock-disk",
+          "20480",
+        ],
+        {
+          HOME: env.homeDir,
+          TAMANDUA_CONTROL_PORT: String(fake.port),
+          TAMANDUA_MATCHLOCK_RPC_BIN: process.execPath,
+          TAMANDUA_MATCHLOCK_RPC_ARGS: JSON.stringify([fakeDriver]),
+          FAKE_TRANSCRIPT_FILE: transcript,
+          FAKE_IMAGE_TAG: "vic/matchlock-base:latest",
+          FAKE_IMAGE_DIGEST: `sha256:${"a".repeat(64)}`,
+          FAKE_IMAGE_CONFIG_DIGEST: `sha256:${"b".repeat(64)}`,
+        },
+      );
+
+      assert.equal(
+        result.code,
+        0,
+        `expected exit code 0, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.match(
+        result.stdout,
+        /matchlock: vic\/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB/,
+        `the launch output must echo the admitted VM size:\n${result.stdout}`,
+      );
+
+      const db = new DatabaseSync(path.join(env.tamanduaDir, "tamandua.db"));
+      const row = db
+        .prepare("SELECT matchlock_policy FROM runs ORDER BY created_at DESC LIMIT 1")
+        .get() as { matchlock_policy: string | null } | undefined;
+      db.close();
+      assert.ok(row?.matchlock_policy, "the run must carry a persisted Matchlock policy");
+      assert.deepEqual(
+        parseMatchlockPolicy(row!.matchlock_policy!).resourceLimits,
+        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
+      );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+      try { fs.rmSync(fixtureRoot, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  // MTLK-VM-SIZE US-003: an invalid size resolves to a hard launch error that
+  // exits non-zero BEFORE runWorkflow creates any run row.
+  it("rejects an invalid --matchlock-cpus 0 before creating any run row (MTLK-VM-SIZE US-003)", async () => {
+    const env = await createTempEnv();
+
+    try {
+      const workflowId = "cli-run-mtlk-invalid";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Bad VM size",
+          "--matchlock",
+          "vic/matchlock-base:latest",
+          "--matchlock-cpus",
+          "0",
+        ],
+        { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(env.controlPort) },
+      );
+
+      assert.equal(
+        result.code,
+        1,
+        `expected exit code 1, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.match(result.stderr, /--matchlock-cpus/, `stderr must name the invalid flag:\n${result.stderr}`);
+      assert.ok(!result.stdout.includes("Run:"), "no successful run output may be printed");
+
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      if (fs.existsSync(dbPath)) {
+        const db = new DatabaseSync(dbPath);
+        const hasRuns = db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runs'")
+          .get();
+        if (hasRuns) {
+          const row = db.prepare("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
+          assert.equal(row.n, 0, "no run row may exist after a resolution error");
+        }
+        db.close();
+      }
+    } finally {
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
 });

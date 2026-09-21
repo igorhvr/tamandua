@@ -21,6 +21,26 @@ export interface WorkflowRunArgs {
    * `TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1`) runs concurrently.
    */
   workdirCollisionPolicy: WorkdirCollisionPolicy;
+  /**
+   * MTLK-PI US-001 / MTLK-HERMES-EXEC US-003 / MTLK-DSH-EXEC US-002: the
+   * explicitly requested Matchlock image (--matchlock IMAGE /
+   * --matchlock=IMAGE). Present only when the operator opted in; absent means
+   * the run uses the native path and performs zero Matchlock actions. With
+   * --matchlock the run executes the pi (default), hermes
+   * (--hermes-as-harness) or dsh (--dsh-as-harness) harness inside a fresh VM;
+   * all three harness selections are admitted.
+   */
+  matchlockImage?: string;
+  /**
+   * MTLK-VM-SIZE US-002: raw (unvalidated) VM size overrides for an opted-in
+   * Matchlock run. Kept as raw strings here on purpose — the resolver
+   * (`src/installer/matchlock/resource-limits.ts`) owns parsing, host-derived
+   * defaults and clamping at launch time. Present only when the flag was
+   * supplied; each of the three requires --matchlock <image>.
+   */
+  matchlockCpus?: string;
+  matchlockMemory?: string;
+  matchlockDisk?: string;
   /** Key-value pairs injected as run template context */
   context: Record<string, string>;
   /** Block until the run reaches a terminal status */
@@ -47,7 +67,23 @@ const KNOWN_FLAGS = new Set([
   "--task-file",
   "--queue-behind-holder",
   "--allow-multiple-runs-in-one-working-directory",
+  "--matchlock",
+  "--matchlock-cpus",
+  "--matchlock-memory",
+  "--matchlock-disk",
 ]);
+
+// MTLK-VM-SIZE US-002: the three raw VM-size overrides and the
+// WorkflowRunArgs field each populates. Order is significant for the
+// without---matchlock error (first supplied flag is named).
+const MATCHLOCK_SIZE_FLAG_TO_FIELD: Record<
+  string,
+  "matchlockCpus" | "matchlockMemory" | "matchlockDisk"
+> = {
+  "--matchlock-cpus": "matchlockCpus",
+  "--matchlock-memory": "matchlockMemory",
+  "--matchlock-disk": "matchlockDisk",
+};
 
 const HARNESS_FLAG_TO_TYPE: Record<string, "pi" | "hermes" | "dsh"> = {
   "--pi-as-harness": "pi",
@@ -111,6 +147,10 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   let harnessFlagName: string | undefined;
   let queueBehindHolder = false;
   let allowMultipleRunsInOneWorkingDirectory = false;
+  let matchlockImage: string | undefined;
+  const matchlockSizeValues: Partial<
+    Record<"matchlockCpus" | "matchlockMemory" | "matchlockDisk", string>
+  > = {};
   const context: Record<string, string> = {};
 
   let afterDashDash = false;
@@ -126,6 +166,102 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
 
     if (afterDashDash) {
       taskParts.push(token);
+      continue;
+    }
+
+    if (token === "--matchlock") {
+      // Image value is mandatory and must NEVER consume a following option:
+      // a missing value, an empty value, a duplicate occurrence, or a value
+      // that is actually another recognized --flag all fail clearly.
+      if (matchlockImage !== undefined) {
+        throw new Error(
+          "Duplicate --matchlock. Specify the Matchlock image at most once.",
+        );
+      }
+      const value = args[i + 1];
+      if (value === undefined || value.trim() === "") {
+        throw new Error(
+          "Missing value for --matchlock. Use --matchlock <image>.",
+        );
+      }
+      // A value that is actually another recognized --flag must not be
+      // consumed as the image (e.g. `--matchlock --pi-as-harness`).
+      if (value.startsWith("--") && KNOWN_FLAGS.has(value.split("=")[0])) {
+        throw new Error(
+          `Missing value for --matchlock. The next token "${value}" is an option, not an image.`,
+        );
+      }
+      matchlockImage = value;
+      i++;
+      continue;
+    }
+
+    const inlineMatchlockPrefix = "--matchlock=";
+    if (token.startsWith(inlineMatchlockPrefix)) {
+      if (matchlockImage !== undefined) {
+        throw new Error(
+          "Duplicate --matchlock. Specify the Matchlock image at most once.",
+        );
+      }
+      const value = token.slice(inlineMatchlockPrefix.length).trim();
+      if (value === "") {
+        throw new Error(
+          "Missing value for --matchlock (--matchlock= must be followed by an image).",
+        );
+      }
+      matchlockImage = value;
+      continue;
+    }
+
+    // MTLK-VM-SIZE US-002: raw `--matchlock-*` size overrides. The parser
+    // stores them verbatim (the launch-time resolver validates); it only
+    // enforces syntax-independent rules: at most once, a non-empty value,
+    // and a value that is not itself a recognized option.
+    const matchlockSizeField = MATCHLOCK_SIZE_FLAG_TO_FIELD[token];
+    if (matchlockSizeField !== undefined) {
+      if (matchlockSizeValues[matchlockSizeField] !== undefined) {
+        throw new Error(
+          `Duplicate ${token}. Specify ${token} at most once.`,
+        );
+      }
+      const value = args[i + 1];
+      if (value === undefined || value.trim() === "") {
+        throw new Error(`Missing value for ${token}. Use ${token} <value>.`);
+      }
+      // A value that is actually another recognized --flag must never be
+      // consumed (e.g. `--matchlock-cpus --wait`).
+      if (value.startsWith("--") && KNOWN_FLAGS.has(value.split("=")[0])) {
+        throw new Error(
+          `Missing value for ${token}. The next token "${value}" is an option, not a value.`,
+        );
+      }
+      matchlockSizeValues[matchlockSizeField] = value.trim();
+      i++;
+      continue;
+    }
+
+    const inlineMatchlockSizeFlag = Object.keys(MATCHLOCK_SIZE_FLAG_TO_FIELD).find(
+      (flag) => token.startsWith(`${flag}=`),
+    );
+    if (inlineMatchlockSizeFlag !== undefined) {
+      const field = MATCHLOCK_SIZE_FLAG_TO_FIELD[inlineMatchlockSizeFlag];
+      if (matchlockSizeValues[field] !== undefined) {
+        throw new Error(
+          `Duplicate ${inlineMatchlockSizeFlag}. Specify ${inlineMatchlockSizeFlag} at most once.`,
+        );
+      }
+      const value = token.slice(inlineMatchlockSizeFlag.length + 1).trim();
+      if (value === "") {
+        throw new Error(
+          `Missing value for ${inlineMatchlockSizeFlag} (${inlineMatchlockSizeFlag}= must be followed by a value).`,
+        );
+      }
+      if (value.startsWith("--") && KNOWN_FLAGS.has(value.split("=")[0])) {
+        throw new Error(
+          `Missing value for ${inlineMatchlockSizeFlag}. The value "${value}" is an option, not a value.`,
+        );
+      }
+      matchlockSizeValues[field] = value;
       continue;
     }
 
@@ -318,6 +454,14 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     taskParts.push(token);
   }
 
+  // MTLK-INTEGRATE union (MTLK-PI-EXEC + MTLK-HERMES-EXEC + MTLK-DSH-EXEC):
+  // --matchlock is admitted with ALL THREE harness selections. Earlier slices
+  // refused --dsh-as-harness (pi/hermes union) or --hermes-as-harness
+  // (pi/dsh union) here; the three-harness union supersedes both, so the
+  // paired refusal is intentionally dropped. Unknown/invalid harness values
+  // are still rejected by the flag parser above, so no silent degradation to
+  // a host fallback is possible.
+
   // Mutual exclusion: --task-file and inline task words cannot both be given
   const hasInlineTask = taskParts.length > 0;
   if (taskFileName && hasInlineTask) {
@@ -368,6 +512,17 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   // at CLI-parse time.
   const workdirCollisionPolicy = parseWorkdirCollisionPolicyFlags(flagArgs);
 
+  // MTLK-VM-SIZE US-002: a size override only makes sense for an opted-in
+  // Matchlock run, so any of the three without --matchlock is a usage error
+  // (naming the first supplied flag).
+  if (matchlockImage === undefined) {
+    for (const flag of Object.keys(MATCHLOCK_SIZE_FLAG_TO_FIELD)) {
+      if (matchlockSizeValues[MATCHLOCK_SIZE_FLAG_TO_FIELD[flag]] !== undefined) {
+        throw new Error(`${flag} requires --matchlock <image>.`);
+      }
+    }
+  }
+
   return {
     taskTitle,
     workingDirectoryForHarness,
@@ -377,6 +532,10 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     noRelaunchUponRugpull,
     harnessAs,
     workdirCollisionPolicy,
+    matchlockImage,
+    matchlockCpus: matchlockSizeValues.matchlockCpus,
+    matchlockMemory: matchlockSizeValues.matchlockMemory,
+    matchlockDisk: matchlockSizeValues.matchlockDisk,
     context,
     wait,
     timeout,

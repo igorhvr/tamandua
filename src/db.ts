@@ -44,17 +44,30 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // without it existing DBs (user_version === 9) early-return from migrate()
 // and skip the rewrite, so their stored instants stay naive and keep being
 // misread.
-// v11 (REROUTE-BUDGET): steps.target_moved_reroute_count. Bumping is REQUIRED
-// (WLST5.1 failure mode): without it existing DBs (user_version === 10)
-// early-return from migrate() and skip the guarded ALTER, so any SQL touching
-// the new column crashes with "no such column: target_moved_reroute_count".
-// v12 (OUTAGE-ROUNDS): steps.preclaim_death_count (consecutive rounds that ran
-// past the wall threshold and exited/died WITHOUT claiming the step). Bumping
-// is REQUIRED (WLST5.1 failure mode): without it existing DBs
-// (user_version === 11) early-return from migrate() and skip the guarded ALTER,
-// so any SQL touching the new column crashes with
-// "no such column: preclaim_death_count".
-export const SCHEMA_VERSION = 12;
+// ONE schema chain (MATCHLOCK-UNION-4): main and the Matchlock lineage each
+// claimed a version for their own column, so the union folds both into a
+// single chain ending at SCHEMA_VERSION = 13.
+//   9  -> 10  TIME-STORAGE: migrateInstantsToIsoZ() rewrites every stored
+//              naive `YYYY-MM-DD HH:MM:SS` instant to ISO-8601 UTC `...Z`.
+//              Idempotent, so it also normalizes a Matchlock-lineage DB that
+//              still holds naive values.
+//   10 -> 11  REROUTE-BUDGET: steps.target_moved_reroute_count (the
+//              stale-tip subset of reroute_count, budgeted separately against
+//              on_fail.max_target_moved_reroutes).
+//   11 -> 12  OUTAGE-ROUNDS: steps.preclaim_death_count (consecutive rounds
+//              that ran past the wall threshold and exited/died WITHOUT
+//              claiming the step). NOT NULL DEFAULT 0.
+//   12 -> 13  MATCHLOCK-UNION-4: runs.matchlock_policy (the nullable,
+//              host-owned execution-isolation policy JSON captured at run
+//              creation when `--matchlock IMAGE` is passed; NULL = native
+//              path). The Matchlock lineage previously numbered this column
+//              v10/v12; it is renumbered to 13 here.
+// Every bump is REQUIRED (WLST5.1 failure mode): adding a guarded ALTER
+// without bumping leaves existing DBs early-returning from migrate() and
+// skipping the ALTER, so any SQL touching the new column crashes with
+// "no such column". Every ALTER is guarded by PRAGMA table_info, so any
+// earlier lineage simply runs the chain and re-stamps v13.
+export const SCHEMA_VERSION = 13;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -184,6 +197,55 @@ export {
   acquireMigrationLock as _acquireMigrationLockForTest,
 };
 
+// ── Schema lineage detection (MATCHLOCK-UNION-4) ───────────────────────────
+// Before the union there were TWO v12 lineages and both stamped
+// `PRAGMA user_version = 12` for DIFFERENT columns:
+//   * main lineage:      11 -> 12 added steps.preclaim_death_count
+//   * Matchlock lineage: its own numbering (v10/v12) added runs.matchlock_policy
+// The union keeps ONE chain (9->10 instants, 10->11 target_moved_reroute_count,
+// 11->12 preclaim_death_count, 12->13 matchlock_policy), so the migration can
+// NOT trust the version number alone: a v12 main-lineage DB already has the
+// preclaim column and still needs matchlock_policy, while a v12 union-lineage
+// DB already has matchlock_policy and still needs preclaim_death_count.
+//
+// detectSchemaLineage() reads the ACTUAL column shape through PRAGMA
+// table_info (never a cached constant) and returns a discriminant that
+// migrate()/applySchema() use to drive the guarded ALTERs and the final v13
+// stamp. It is a pure read: it never writes and never throws on an absent
+// table (PRAGMA table_info on a missing table yields zero rows), so it is safe
+// to call on an empty database before applySchema() creates the tables.
+export type SchemaLineage =
+  // At v13 with both union columns — the migrate() fast path never reaches
+  // applySchema() in this state.
+  | "current"
+  // Pre-union main v12: preclaim_death_count present, matchlock_policy absent.
+  | "main-v12"
+  // Pre-union Matchlock v10/v12: matchlock_policy present, preclaim absent.
+  | "union-v12"
+  // Any earlier DB (v9/v10/v11), an unrecognized shape, or an empty database:
+  // run the whole chain.
+  | "pre-v12";
+
+function tableHasColumn(db: DatabaseSync, table: "runs" | "steps", column: string): boolean {
+  // The table name is a closed literal union (never caller input), so the
+  // interpolation cannot be used for SQL injection.
+  const rows = db
+    .prepare(`SELECT name FROM pragma_table_info('${table}') WHERE name = ?`)
+    .all(column) as Array<{ name: string }>;
+  return rows.length > 0;
+}
+
+export function detectSchemaLineage(db: DatabaseSync): SchemaLineage {
+  const version = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+  const hasPreclaim = tableHasColumn(db, "steps", "preclaim_death_count");
+  const hasMatchlock = tableHasColumn(db, "runs", "matchlock_policy");
+
+  if (version >= SCHEMA_VERSION && hasPreclaim && hasMatchlock) return "current";
+  if (hasPreclaim && !hasMatchlock) return "main-v12";
+  if (hasMatchlock && !hasPreclaim) return "union-v12";
+  return "pre-v12";
+}
+
 function migrate(db: DatabaseSync): void {
   // Fast path: the common case is an already-migrated database.
   const observed = db.prepare("PRAGMA user_version").get() as { user_version: number };
@@ -202,7 +264,11 @@ function migrate(db: DatabaseSync): void {
   try {
     const currentVersion = db.prepare("PRAGMA user_version").get() as { user_version: number };
     if (currentVersion.user_version !== SCHEMA_VERSION) {
-      applySchema(db);
+      // Detect the source lineage under the write lock, after the version
+      // re-read, so the discriminant cannot observe a half-committed
+      // migration from another initializer. applySchema() drives each guarded
+      // ALTER and the final v13 stamp from it.
+      applySchema(db, detectSchemaLineage(db));
       _migrateFullRuns++;
     }
     db.exec("COMMIT");
@@ -217,8 +283,12 @@ function migrate(db: DatabaseSync): void {
 }
 
 // Runs the full DDL upgrade. Callers MUST hold the migration write lock
-// (acquireMigrationLock) and commit the enclosing transaction.
-function applySchema(db: DatabaseSync): void {
+// (acquireMigrationLock) and commit the enclosing transaction. `lineage` is
+// the discriminant from detectSchemaLineage() sampled under that lock; it
+// selects which pre-union lineage's chain steps this DB still needs, while
+// every ALTER keeps its pragma_table_info guard as the authoritative,
+// idempotent check.
+function applySchema(db: DatabaseSync, lineage: SchemaLineage): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS runs (
       id TEXT PRIMARY KEY,
@@ -370,7 +440,7 @@ function applySchema(db: DatabaseSync): void {
     db.exec("ALTER TABLE steps ADD COLUMN ledger_concession_count INTEGER DEFAULT 0");
   }
 
-  // ── OUTAGE-ROUNDS preclaim_death_count ──
+  // ── OUTAGE-ROUNDS preclaim_death_count (11 -> 12) ──
   // Durable per-step count of consecutive dispatch rounds that passed the
   // launch probe, ran at least the instant-fail wall threshold, and exited or
   // died by signal WITHOUT claiming the step (a "pre-claim death"). Detection
@@ -379,7 +449,12 @@ function applySchema(db: DatabaseSync): void {
   // rounds (distinct step.preclaim_round_died / run.preclaim_death_loop
   // events) and every successful claim resets it to 0. NOT NULL DEFAULT 0
   // (unlike the other counter columns) so readers never have to coalesce.
-  if (!stepColNames.has("preclaim_death_count")) {
+  // Lineage: a pre-union main-v12 DB already carries the column (it was main's
+  // 11 -> 12 step); the union-v12 and every pre-v12 lineage still need it. The
+  // pragma_table_info guard stays authoritative so a forced re-run over an
+  // already-current shape adds nothing.
+  const lineageNeedsPreclaim = lineage !== "main-v12";
+  if (lineageNeedsPreclaim && !stepColNames.has("preclaim_death_count")) {
     db.exec("ALTER TABLE steps ADD COLUMN preclaim_death_count INTEGER NOT NULL DEFAULT 0");
   }
 
@@ -538,6 +613,24 @@ function applySchema(db: DatabaseSync): void {
     db.exec("ALTER TABLE runs ADD COLUMN harness_probe_at TEXT");
   }
 
+  // ── MTLK matchlock_policy for runs (12 -> 13) ──
+  // Persists the typed, host-owned Matchlock execution-isolation policy
+  // captured at run creation when `--matchlock IMAGE` is provided. Nullable
+  // with no backfill: existing rows and runs without `--matchlock` keep NULL
+  // and use the native path. NOTE (WLST5.1): the SCHEMA_VERSION bump to v13
+  // (above) is REQUIRED — adding the guarded ALTER without bumping leaves
+  // existing DBs early-returning and skipping the migration, so
+  // matchlock-policy writes/reads crash with "no such column:
+  // matchlock_policy". The PRAGMA table_info guard keeps it idempotent on
+  // re-run. Lineage: a pre-union union-v12 DB already carries the column from
+  // the Matchlock lineage's old v10/v12 numbering (renumbered to 13 here); the
+  // main-v12 and every pre-v12 lineage still need it.
+  const lineageNeedsMatchlock = lineage !== "union-v12";
+  const addMatchlockPolicy = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'matchlock_policy'").all();
+  if (lineageNeedsMatchlock && addMatchlockPolicy.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN matchlock_policy TEXT");
+  }
+
   // Indexes for run-scoped scheduling and step claim queries.
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_steps_agent_run_status ON steps(agent_id, run_id, status)",
@@ -643,9 +736,16 @@ function applySchema(db: DatabaseSync): void {
 
   // ── TIME-STORAGE v10: rewrite legacy naive instants to ISO-Z ──
   // Runs inside the enclosing migration write lock, immediately before the
-  // version re-stamp, so a DB at v10 always has normalized instants.
+  // version re-stamp, so a DB at v10 always has normalized instants. It is
+  // deliberately unconditional (it does not depend on `lineage`) because every
+  // DB below v13 — including a union-lineage DB that never ran main's chain —
+  // must be normalized.
   migrateInstantsToIsoZ(db);
 
+  // Final stamp: main-v12, union-v12 and every pre-v12 lineage converge here.
+  // `lineage` selected which guarded ALTERs were needed above; the stamp
+  // itself is unconditional because applySchema() only runs when
+  // user_version !== SCHEMA_VERSION.
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
 

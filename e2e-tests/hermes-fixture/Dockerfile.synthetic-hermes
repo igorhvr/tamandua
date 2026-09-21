@@ -1,0 +1,27 @@
+# MTLK-HERMES-EXEC US-004 — EXPLICITLY TEST-ONLY synthetic-hermes fixture image.
+#
+# A DERIVED fixture image used ONLY by the on-demand whole-path synthetic gate
+# (run-hermes-synthetic-e2e-test / e2e-tests/matchlock-hermes-synthetic-gate.test.ts).
+#
+# It derives from the real qualification base igorhvr/bedlam-ubuntu (Ubuntu
+# 24.04 with IMAGE-PROVIDED node >= 22 at /usr/bin/node and git) and ADDS a
+# deterministic synthetic `hermes` at /usr/local/bin/hermes
+# (e2e-tests/hermes-fixture/fake-hermes.mjs) plus a TEST-ONLY label.
+#
+# igorhvr/bedlam-ubuntu itself is NEVER overwritten, retagged or mutated — only
+# this NEW derived image is produced. The fake hermes lives IN THE IMAGE (never
+# mounted from the host) and contains NO provider credentials and performs NO
+# model calls. No real user harness is ever replaced or auto-installed.
+
+FROM igorhvr/bedlam-ubuntu:latest
+
+LABEL org.tamandua.synthetic-hermes="TEST-ONLY"
+
+# bedlam already ships node >= 22 (/usr/bin/node) and git on the default PATH;
+# the helper-pack launchers and the fake hermes resolve node from the image
+# PATH (the runner prepends only /workspace/runtime/bin).
+COPY fake-hermes.mjs /usr/local/bin/hermes
+RUN chmod 0755 /usr/local/bin/hermes
+
+WORKDIR /root
+CMD ["/bin/bash"]

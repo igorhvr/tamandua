@@ -9,6 +9,7 @@
 
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
@@ -21,6 +22,7 @@ import {
 } from "./helpers/test-env.ts";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import { stopDaemon } from "../dist/server/daemonctl.js";
+import { writeFakeRpcDriver } from "../dist/installer/matchlock/fake-rpc-driver.js";
 
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
@@ -566,6 +568,258 @@ describe("CLI workflow run --json resolution fields (SKILL-UX S3 / US-003)", () 
         stdout.trim().split(/\r?\n/).length,
         1,
         `expected exactly one stdout line, got:\n${stdout}`,
+      );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+/**
+ * MTLK-VM-SIZE US-005: the Matchlock VM-size line is fused into the SKILL-UX
+ * resolved-launch block (printed once, BEFORE the `run #N ... created` line)
+ * and the same facts appear in `workflow run --json`'s resolution object.
+ * Matchlock runs are driven through the real admission path against the fake
+ * JSON-RPC driver, so no VM is ever created.
+ */
+describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => {
+  /**
+   * Build the host fixture an opted-in Matchlock run needs: a real host path
+   * under the operator home for the harness workdir (guest mounts keep exact
+   * host paths), an existing selected pi configuration root, and the fake
+   * JSON-RPC driver that stands in for the matchlock runtime.
+   */
+  function writeMatchlockFixture(): {
+    fixtureRoot: string;
+    workDir: string;
+    driver: string;
+    transcript: string;
+  } {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.homedir(), ".mtlk-cli-us005-"));
+    const workDir = path.join(fixtureRoot, "work");
+    fs.mkdirSync(workDir, { recursive: true });
+    const driver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+    const transcript = path.join(fixtureRoot, "transcript.jsonl");
+    return { fixtureRoot, workDir, driver, transcript };
+  }
+
+  function matchlockEnv(
+    env: { homeDir: string },
+    fixture: { driver: string; transcript: string },
+    fakePort: number,
+    extra: Record<string, string> = {},
+  ): Record<string, string> {
+    return {
+      HOME: env.homeDir,
+      TAMANDUA_CONTROL_PORT: String(fakePort),
+      TAMANDUA_MATCHLOCK_RPC_BIN: process.execPath,
+      TAMANDUA_MATCHLOCK_RPC_ARGS: JSON.stringify([fixture.driver]),
+      FAKE_TRANSCRIPT_FILE: fixture.transcript,
+      FAKE_IMAGE_TAG: "vic/matchlock-base:latest",
+      FAKE_IMAGE_DIGEST: `sha256:${"a".repeat(64)}`,
+      FAKE_IMAGE_CONFIG_DIGEST: `sha256:${"b".repeat(64)}`,
+      ...extra,
+    };
+  }
+
+  it("prints exactly one matchlock line inside the resolved block before the Run: line", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+    const fixture = writeMatchlockFixture();
+
+    try {
+      const workflowId = "res-matchlock-text";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const { stdout, stderr, code } = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Matchlock launch facts",
+          "--working-directory-for-harness",
+          fixture.workDir,
+          "--matchlock",
+          "vic/matchlock-base:latest",
+          "--matchlock-cpus",
+          "4",
+          "--matchlock-memory",
+          "4096",
+          "--matchlock-disk",
+          "20480",
+        ],
+        matchlockEnv(env, fixture, fake.port),
+      );
+
+      assert.equal(code, 0, `expected exit 0, got ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+
+      const lines = stdoutLines(stdout);
+      const runIdx = lines.findIndex((l) => l.startsWith("Run: run-"));
+      assert.ok(runIdx > 0, `expected a Run: line, got:\n${stdout}`);
+
+      const wdIdx = lines.findIndex((l) => l.startsWith("working-directory:"));
+      const daemonIdx = lines.findIndex((l) => l.startsWith("daemon:"));
+      const matchlockLines = lines.filter((l) => l.startsWith("matchlock:"));
+      assert.equal(
+        matchlockLines.length,
+        1,
+        `expected EXACTLY one matchlock line, got ${matchlockLines.length}:\n${stdout}`,
+      );
+      const matchlockIdx = lines.findIndex((l) => l.startsWith("matchlock:"));
+      assert.ok(wdIdx >= 0 && daemonIdx >= 0, `expected the resolved block, got:\n${stdout}`);
+      // It is part of the SAME resolved block: after the other launch facts
+      // and strictly before the synchronous run-created line.
+      assert.ok(matchlockIdx > wdIdx, "matchlock line must follow working-directory:");
+      assert.ok(matchlockIdx > daemonIdx, "matchlock line must follow daemon:");
+      assert.ok(matchlockIdx < runIdx, "matchlock line must precede Run:");
+      assert.equal(
+        matchlockLines[0],
+        "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB",
+      );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("--json carries resolution.matchlockResources with the image and limits", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+    const fixture = writeMatchlockFixture();
+
+    try {
+      const workflowId = "res-matchlock-json";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const { stdout, stderr, code } = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Matchlock JSON facts",
+          "--working-directory-for-harness",
+          fixture.workDir,
+          "--matchlock",
+          "vic/matchlock-base:latest",
+          "--matchlock-cpus",
+          "2",
+          "--matchlock-memory",
+          "2048",
+          "--matchlock-disk",
+          "10240",
+          "--json",
+        ],
+        matchlockEnv(env, fixture, fake.port),
+      );
+
+      assert.equal(code, 0, `expected exit 0, got ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+
+      let parsed: Record<string, any>;
+      assert.doesNotThrow(
+        () => { parsed = JSON.parse(stdout.trim()); },
+        `stdout must be a single valid JSON document:\n${stdout}`,
+      );
+
+      assert.ok(parsed.resolution, `expected a resolution object:\n${stdout}`);
+      assert.deepEqual(
+        parsed.resolution.matchlockResources,
+        { image: "vic/matchlock-base:latest", cpus: 2, memoryMB: 2048, diskSizeMB: 10240 },
+        `--json must carry the matchlock facts in resolution.matchlockResources:\n${stdout}`,
+      );
+      // Mirrored at the top level exactly where `workflow status --json` puts
+      // them, so the same shape is readable from either command.
+      assert.deepEqual(
+        parsed.matchlockResources,
+        { image: "vic/matchlock-base:latest", cpus: 2, memoryMB: 2048, diskSizeMB: 10240 },
+        `--json must mirror matchlockResources at the top level:\n${stdout}`,
+      );
+      // JSON mode stays a single document: no human-readable matchlock line.
+      assert.ok(
+        !stdout.includes("matchlock: vic/"),
+        `no text matchlock line on stdout in JSON mode:\n${stdout}`,
+      );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("a native run prints no matchlock line and its --json resolution stays unchanged", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+
+    try {
+      const workflowId = "res-native-no-matchlock";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      const harnessDir = path.join(env.root, "workdir-native-us005");
+      initGitRepo(harnessDir);
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const text = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Native launch",
+          "--working-directory-for-harness",
+          harnessDir,
+        ],
+        { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+      assert.equal(text.code, 0, `expected exit 0, got ${text.code}\nstdout:\n${text.stdout}\nstderr:\n${text.stderr}`);
+      assert.ok(
+        !text.stdout.includes("matchlock:"),
+        `native run must print no matchlock line:\n${text.stdout}`,
+      );
+
+      const json = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Native JSON launch",
+          "--working-directory-for-harness",
+          harnessDir,
+          "--json",
+        ],
+        { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(fake.port) },
+      );
+      assert.equal(json.code, 0, `expected exit 0, got ${json.code}\nstdout:\n${json.stdout}\nstderr:\n${json.stderr}`);
+      const parsed = JSON.parse(json.stdout.trim());
+      assert.equal(parsed.resolution.matchlockResources, undefined);
+      assert.equal(parsed.resolution.workspaceMode, "direct");
+      assert.equal(parsed.resolution.workingDirectory, path.resolve(harnessDir));
+      assert.ok(
+        !("matchlockResources" in parsed),
+        `native --json document must not carry a top-level matchlockResources:\n${json.stdout}`,
       );
     } finally {
       try { await fake.close(); } catch {}

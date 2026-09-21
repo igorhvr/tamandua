@@ -147,6 +147,13 @@ export interface PlumbingMergeDependencies {
    * US-006) can be exercised without a database.
    */
   readRunContext?: (runId: string) => Record<string, unknown> | null;
+  /**
+   * Injectable clock forwarded to the pure merge core (parity/tests). The
+   * native path keeps main's full implementation and does not consult it; the
+   * field is retained so the native/guest parity harness can pass one clock to
+   * both call sites.
+   */
+  now?: () => Date;
 }
 
 function runGit(origin: string, args: string[], extraEnv?: NodeJS.ProcessEnv): GitResult {
@@ -370,8 +377,8 @@ function retryOnce(
   return first.status === 0 ? first : git(origin, args);
 }
 
-function generateBackupName(targetBranch: string, runId: string): string {
-  const timestamp = new Date().toISOString().replace(/[:-]/g, "").replace(/\..+/, "Z");
+function generateBackupName(targetBranch: string, runId: string, now: () => Date): string {
+  const timestamp = now().toISOString().replace(/[:-]/g, "").replace(/\..+/, "Z");
   const suffix = runId ? runId.slice(0, 8) : `manual-${randomBytes(3).toString("hex")}`;
   return `${targetBranch}-tamandua-parked-${timestamp}-${suffix}`;
 }
@@ -439,8 +446,12 @@ export function runPlumbingMerge(
     signingOutcome === "unsigned-matchlock" ? { signingSkipped: MATCHLOCK_SIGNING_SKIP_REASON } : {};
   const git = dependencies.runGit ?? ((origin: string, args: string[]) => runGit(origin, args, identityEnv));
   const emit = dependencies.emitEvent ?? emitTamanduaEvent;
+  // Injectable clock: defaults to the real clock so production behavior is
+  // unchanged, while the native/guest parity harness can pin one instant for
+  // both call sites (event ts + backup-branch names).
+  const now = dependencies.now ?? (() => new Date());
   const eventBase = {
-    ts: new Date().toISOString(),
+    ts: now().toISOString(),
     runId,
     origin: params.origin,
     branch: params.branch,
@@ -643,7 +654,7 @@ export function runPlumbingMerge(
       };
     }
 
-    const backupName = generateBackupName(params.into, runId);
+    const backupName = generateBackupName(params.into, runId, now);
     const backupRef = `refs/heads/${backupName}`;
     const backupCreateArgs = ["update-ref", backupRef, params.expectTip, "0".repeat(40)];
     const backupCreateResult = git(params.origin, backupCreateArgs);
@@ -908,3 +919,7 @@ export function runPlumbingMerge(
   });
   return result;
 }
+
+// Re-export the checkout refresh vocabulary that used to live here so existing
+// importers (`CheckoutRefreshOutcome` from merge-branch) keep resolving.
+export type { CheckoutRefreshOutcome };

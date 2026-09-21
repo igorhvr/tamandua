@@ -2,6 +2,10 @@ import { execFileSync } from "node:child_process";
 import { getDb } from "../db.js";
 import { emitEvent } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
+import {
+  parseMatchlockPolicy,
+  type ExecutionIsolation,
+} from "./matchlock/policy.js";
 import type { HarnessType } from "./types.js";
 
 /**
@@ -292,7 +296,7 @@ export async function relaunchRunAfterRugpull(
   // Read the failed run's parameters
   const run = db
     .prepare(
-      "SELECT workflow_id, task, context, notify_url FROM runs WHERE id = ?",
+      "SELECT workflow_id, task, context, notify_url, matchlock_policy FROM runs WHERE id = ?",
     )
     .get(failedRunId) as
     | {
@@ -300,6 +304,7 @@ export async function relaunchRunAfterRugpull(
         task: string;
         context: string;
         notify_url: string | null;
+        matchlock_policy: string | null;
       }
     | undefined;
 
@@ -308,6 +313,32 @@ export async function relaunchRunAfterRugpull(
   }
 
   const context: Record<string, string> = parseRunContext(failedRunId, run.context);
+
+  // MTLK-ADMIT: an automatic replacement of an OPTED-IN run inherits the
+  // failed run's pinned Matchlock policy (image content+config, selected
+  // configuration root/profile and original repository authority); only the
+  // new host-created worktree's exact path/metadata is re-derived at
+  // runWorkflow admission. The replacement must NEVER silently become native.
+  // A stored policy that cannot be re-admitted (malformed/legacy/unpinned)
+  // refuses the relaunch instead of launching a native replacement.
+  let inheritedMatchlockPolicy: ExecutionIsolation | undefined;
+  if (run.matchlock_policy) {
+    try {
+      inheritedMatchlockPolicy = parseMatchlockPolicy(run.matchlock_policy);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "run.rugpull_relaunch_failed",
+        runId: failedRunId,
+        workflowId: run.workflow_id,
+        detail:
+          `Rugpull relaunch not attempted: stored Matchlock policy is not reusable (${detail}). ` +
+          "A replacement must never become native; recreate the run with --matchlock.",
+      });
+      return { relaunched: false };
+    }
+  }
 
   // Check no_relaunch_upon_rugpull suppression flag
   if (context.no_relaunch_upon_rugpull === "true") {
@@ -361,6 +392,7 @@ export async function relaunchRunAfterRugpull(
         worktreeOriginRepository: worktreeOriginRepo,
         worktreeOriginRef,
         context: userContext,
+        matchlockPolicy: inheritedMatchlockPolicy,
       });
     } else {
       const workingDir =
@@ -386,6 +418,7 @@ export async function relaunchRunAfterRugpull(
         noHurrySaveTokensMode: noHurry,
         workingDirectoryForHarness: workingDir,
         context: userContext,
+        matchlockPolicy: inheritedMatchlockPolicy,
       });
     }
   } catch (err) {

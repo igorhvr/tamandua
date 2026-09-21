@@ -1,8 +1,20 @@
 import crypto from "node:crypto";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  serializeMatchlockPolicy,
+  type ExecutionIsolation,
+  type ExecutionIsolationResourceLimits,
+} from "./matchlock/policy.js";
+import {
+  resolveMatchlockResourceLimits,
+  type MatchlockResourceHostProbe,
+} from "./matchlock/resource-limits.js";
+import { admitMatchlockRun, type HermesAdmissionSubmission } from "./matchlock/admission.js";
+import type { DshSubmissionContext } from "./matchlock/dsh-adapter-contract.js";
 import { getDb } from "../db.js";
 import { SQL_NOW_ISO } from "../lib/instant.js";
 import { loadWorkflowSpec } from "./workflow-spec.js";
@@ -56,6 +68,56 @@ export interface RunWorkflowParams {
    * set the policy separately.
    */
   workdirCollisionPolicy?: WorkdirCollisionPolicy;
+  /**
+   * MTLK-PI US-001 / MTLK-HERMES-EXEC US-003 / MTLK-DSH-EXEC US-002: the
+   * explicitly requested Matchlock image (--matchlock IMAGE). When present, a
+   * typed execution-isolation policy is admitted and captured at run creation
+   * and frozen on the run row; absent, no policy is written and the run uses
+   * the native path. The policy's harness follows the selected harness: "pi"
+   * (default / --pi-as-harness), "hermes" (--hermes-as-harness, whose
+   * effective Hermes config selection is resolved from FROZEN submission
+   * inputs at admission) or "dsh" (--dsh-as-harness, whose effective
+   * DSH_HOME is resolved from FROZEN submission inputs at admission). The
+   * integrated candidate admits all three.
+   */
+  matchlockImage?: string;
+  /**
+   * MTLK-DSH-EXEC US-002: the harness running inside the Matchlock VM when
+   * --matchlock is present. "dsh" (with --dsh-as-harness) persists the frozen
+   * submission context and resolved effective DSH_HOME; "pi" is the default.
+   */
+  matchlockHarness?: "pi" | "dsh";
+  /**
+   * MTLK-DSH-EXEC US-002: the FROZEN submission context (HOME/DSH_HOME/cwd of
+   * the submitting command) for a harness "dsh" Matchlock run. Captured at run
+   * creation from the submitting process — never re-discovered from the daemon
+   * HOME/env at dispatch.
+   */
+  dshSubmission?: DshSubmissionContext;
+  /**
+   * MTLK-ADMIT: an INHERITED Matchlock policy (automatic rugpull replacement
+   * of a previously admitted run). Not a CLI flag — internal run-creator
+   * plumbing. The replacement retains the inherited image content+config pin,
+   * selected configuration root/profile and original repository authority,
+   * deriving ONLY the new host-created worktree's exact path/metadata. The
+   * image is re-resolved and MUST match the inherited pin (a moved tag fails
+   * closed instead of silently re-pinning or becoming native).
+   */
+  matchlockPolicy?: ExecutionIsolation;
+  /**
+   * MTLK-VM-SIZE US-003: CLI-resolved VM resource limits for a FRESH Matchlock
+   * opt-in (flag > env > host-derived default, already validated/clamped by
+   * the shared resolver). Ignored when `matchlockPolicy` (an inherited rugpull
+   * policy) is present — the inherited limits always win. When absent and no
+   * policy is inherited, the host-derived defaults are resolved here.
+   */
+  matchlockResourceLimits?: ExecutionIsolationResourceLimits;
+  /**
+   * MTLK-VM-SIZE US-003: injectable host capacity probe used ONLY when
+   * `matchlockResourceLimits` is absent and no policy is inherited, so the
+   * host-derived default is deterministic in tests. Production omits it.
+   */
+  matchlockResourceHostProbe?: MatchlockResourceHostProbe;
   /** When true, suppresses automatic replacement-run launch after a rugpull is detected */
   noRelaunchUponRugpull?: boolean;
   /**
@@ -108,6 +170,24 @@ export interface RunWorkflowResult {
     holder?: WorkdirCollisionHolder;
     workingDirectoryForHarness: string;
   };
+  /**
+   * MTLK-VM-SIZE US-003: the resource limits persisted in the run's Matchlock
+   * policy (undefined for a native run). Exposed so the CLI can echo the
+   * admitted VM size in the launch output.
+   */
+  matchlockResourceLimits?: ExecutionIsolationResourceLimits;
+}
+
+/**
+ * Resolve the host-derived built-in Matchlock VM resource limits
+ * (MTLK-VM-SIZE US-003). The optional probe keeps the default deterministic
+ * in tests; production omits it and probes the real host.
+ */
+function resolveDefaultMatchlockResourceLimits(
+  hostProbe?: MatchlockResourceHostProbe,
+): ExecutionIsolationResourceLimits {
+  const resolved = resolveMatchlockResourceLimits(hostProbe ? { hostProbe } : {});
+  return { cpus: resolved.cpus, memoryMB: resolved.memoryMB, diskSizeMB: resolved.diskSizeMB };
 }
 
 function failPersistedRunLaunch(params: {
@@ -252,10 +332,28 @@ export async function runWorkflow(
     worktreeOriginRef,
     noHurrySaveTokensMode,
     harnessType,
+    matchlockImage,
+    matchlockHarness,
+    dshSubmission,
+    matchlockPolicy,
+    matchlockResourceLimits,
+    matchlockResourceHostProbe,
     noRelaunchUponRugpull,
     parentRunId,
     workdirCollisionPolicy,
   } = params;
+
+  // MTLK-HERMES-EXEC US-003: FROZEN Hermes submission inputs captured AT RUN
+  // CREATION (the run creator's HOME / HERMES_HOME env snapshot / cwd). A
+  // hermes Matchlock opt-in resolves its effective config selection from ONLY
+  // these — never the daemon HOME or later ambient state. For pi runs (and
+  // runs that inherit an existing policy via `matchlockPolicy`) this capture
+  // is unused; pi behavior stays byte-identical.
+  const hermesSubmission: HermesAdmissionSubmission = {
+    homeDir: process.env.HOME?.trim() || os.homedir(),
+    cwd: process.cwd(),
+    hermesHomeEnv: process.env.HERMES_HOME ?? null,
+  };
 
   // Load the workflow spec from the installed workflow directory
   const workflowDir = resolveWorkflowDir(workflowId);
@@ -272,6 +370,9 @@ export async function runWorkflow(
   // Assigned on every reachable path through the workspace-mode branch below
   // (the invalid-mode branch throws).
   let gitIdentity: ResolvedGitIdentity;
+  // MTLK-VM-SIZE US-003: the limits persisted in the run's Matchlock policy,
+  // surfaced on RunWorkflowResult for the CLI launch line.
+  let persistedMatchlockResourceLimits: ExecutionIsolationResourceLimits | undefined;
 
   const workspaceMode = workflow.run?.workspace ?? "direct";
   const warnings: string[] = [];
@@ -589,6 +690,85 @@ export async function runWorkflow(
     );
   }
 
+  // MTLK-ADMIT: production Matchlock admission for opted-in runs. When the
+  // operator passed `--matchlock IMAGE` (or an automatic rugpull replacement
+  // inherits an existing policy via `matchlockPolicy`), the run is ADMITTED
+  // here — after the workspace/worktree exists but BEFORE any step is
+  // inserted, the pipeline advanced, or the run is registered/nudged for
+  // dispatch — so dispatch can never observe runnable work before the pinned
+  // policy is persisted:
+  //   - the selected configuration root/profile (pi, or the FROZEN-submission-
+  //     resolved Hermes selection when the run opted into
+  //     --hermes-as-harness --matchlock) and the exact work/original-repository/
+  //     Git scope are captured at submission;
+  //   - the immutable image content+config identity is resolved over a
+  //     bounded OWNED RPC (resolve only — NO create) and persisted with the
+  //     policy (version 2). A replacement verifies the freshly resolved
+  //     identity against the INHERITED pin (a moved tag fails closed);
+  //   - a resolve/admission/persistence failure throws here, the run row is
+  //     marked failed/refused by failPersistedRunLaunch, and NO native work
+  //     is produced (partial owned fixtures, e.g. a created worktree, are
+  //     retained with diagnostics — no broad cleanup).
+  // A missing host configuration root is a hard refusal; only the host
+  // harness EXECUTABLE may be absent (the image supplies it). Absent
+  // `--matchlock`
+  // (and no inherited policy) writes no policy and yields zero Matchlock
+  // actions.
+  if (matchlockImage || matchlockPolicy) {
+    const image = (matchlockPolicy?.requestedImage ?? matchlockImage)?.trim();
+    if (!image) {
+      throw new Error(
+        "Matchlock run requires a requested image; inherited policy or --matchlock is empty.",
+      );
+    }
+    // MTLK-VM-SIZE US-003: resolve the effective VM resource limits for a
+    // FRESH opt-in — explicit CLI limits win, else the host-derived defaults.
+    // An inherited policy's limits are resolved by admission and always win
+    // (a rugpull replacement keeps the failed run's admitted VM size).
+    const resourceLimitsForAdmission: ExecutionIsolationResourceLimits | undefined =
+      matchlockResourceLimits ??
+      (matchlockPolicy?.resourceLimits
+        ? undefined
+        : resolveDefaultMatchlockResourceLimits(matchlockResourceHostProbe));
+    // Harness union (MTLK-PI-EXEC + MTLK-HERMES-EXEC + MTLK-DSH-EXEC): a
+    // replacement retains its inherited harness; a fresh run uses the
+    // explicitly selected harness (pi default, hermes/dsh opt-in), never
+    // falling back to a native path.
+    const effectiveHarness: "pi" | "hermes" | "dsh" =
+      matchlockPolicy?.harness ??
+      (harnessType === "hermes"
+        ? "hermes"
+        : harnessType === "dsh" || matchlockHarness === "dsh"
+          ? "dsh"
+          : "pi");
+    const admission = await admitMatchlockRun({
+      requestedImage: image,
+      harness: effectiveHarness,
+      // FROZEN submission inputs for a FRESH hermes/dsh opt-in. A replacement
+      // (inheritedPolicy) carries its own frozen inputs on the inherited
+      // policy and never re-captures ambient state.
+      ...(effectiveHarness === "hermes" && !matchlockPolicy
+        ? { submission: hermesSubmission }
+        : {}),
+      ...(effectiveHarness === "dsh" && !matchlockPolicy && dshSubmission
+        ? { submission: dshSubmission }
+        : {}),
+      workspaceMode,
+      workingDirectory: workingDirectoryForHarness,
+      worktreeOriginRepository:
+        workspaceMode === "worktree"
+          ? (seededContext.worktree_origin_repository ?? undefined)
+          : undefined,
+      inheritedPolicy: matchlockPolicy,
+      resourceLimits: resourceLimitsForAdmission,
+    });
+    persistedMatchlockResourceLimits = { ...admission.policy.resourceLimits };
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run(
+      serializeMatchlockPolicy(admission.policy),
+      runId,
+    );
+  }
+
   // WAVE-A TCMD (US-004): a launch-declared `--context test_cmd=` establishes
   // the TEST_CMD contract at launch with source 'launch'. It wins over any
   // step-emitted marker: a later step re-emitting the identical value is not a
@@ -834,6 +1014,7 @@ export async function runWorkflow(
     queuedBehindRunId,
     schedulingState,
     captureWarnings: warnings.length > 0 ? warnings : undefined,
+    matchlockResourceLimits: persistedMatchlockResourceLimits,
   };
 }
 
@@ -874,13 +1055,15 @@ export async function resumeWorkflow(
 ): Promise<ResumeResult> {
   const db = getDb();
   const run = db.prepare(
-    "SELECT id, workflow_id, status, context FROM runs WHERE id = ? AND status = 'failed'",
-  ).get(runId) as { id: string; workflow_id: string; status: string; context: string } | undefined;
+    "SELECT id, workflow_id, status, context, matchlock_policy FROM runs WHERE id = ? AND status = 'failed'",
+  ).get(runId) as { id: string; workflow_id: string; status: string; context: string; matchlock_policy: string | null } | undefined;
 
   if (!run) return { status: "not_found" };
 
   await ensureDaemonControlAvailable();
-  const harnessValidation = await validateRunHarnessForScheduling(run.id, run.context);
+  const harnessValidation = await validateRunHarnessForScheduling(run.id, run.context, {
+    matchlockPolicy: run.matchlock_policy,
+  });
 
   // WORKDIR-FLAGS US-005: resume/replacement runs apply the same collision rule
   // as a fresh launch. The default (`refuse`) CLEARS any persisted policy so a

@@ -218,11 +218,18 @@ export function stepComplete(
 /**
  * Spawn `tamandua workflow run` and capture the 8-char run-ID prefix from stdout.
  * Kills the child process once the output is captured.
+ *
+ * The default timeout is 90s: `workflow run` must provision the workspace
+ * (git worktree + agent/skill files) and print the run id before this
+ * resolves, and the merge-worktree smoke shapes legitimately take 20-30s+
+ * on a loaded runner. AGENTS.md prescribes raising the timeout (never
+ * polling/retrying an absolute-deadline assertion) for such flakes; the
+ * assertions themselves are unchanged.
  */
 export function spawnWorkflowRun(
   args: string[],
   env: Record<string, string>,
-  timeoutMs = 30_000,
+  timeoutMs = 90_000,
   cwd?: string,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -296,7 +303,7 @@ export function spawnWorkflowRun(
 export function spawnScriptedWorkflowRun(
   args: string[],
   env: Record<string, string>,
-  timeoutMs = 30_000,
+  timeoutMs = 90_000,
   cwd?: string,
 ): Promise<string> {
   const workflowId = args[2] ?? "";

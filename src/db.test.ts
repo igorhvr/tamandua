@@ -10,7 +10,7 @@ import { createTempHome } from "../tests/helpers/test-env.ts";
 // We test the migration by directly importing getDb, which calls migrate().
 // But since getDb() uses a cached connection and resolves DB path from
 // env/home, we test the migration logic directly with an isolated DB.
-import { getDb, getDbPath, SCHEMA_VERSION, migrateInstantsToIsoZ, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults, _enableWalModeForTest, _acquireMigrationLockForTest } from "../dist/db.js";
+import { getDb, getDbPath, SCHEMA_VERSION, detectSchemaLineage, migrateInstantsToIsoZ, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults, _enableWalModeForTest, _acquireMigrationLockForTest } from "../dist/db.js";
 
 describe("PRAGMA synchronous", () => {
   let tempHome: string;
@@ -1391,8 +1391,12 @@ console.log(JSON.stringify({ version, rows }));
     }
   });
 
-  it("SCHEMA_VERSION is 12 (v11 target-moved reroute budget + v12 preclaim death counter)", () => {
-    assert.equal(SCHEMA_VERSION, 12, "SCHEMA_VERSION must be 12 after the preclaim_death_count bump");
+  it("SCHEMA_VERSION is 13 (9->10 instants -> 10->11 target-moved reroute budget -> 11->12 preclaim death counter -> 12->13 matchlock policy)", () => {
+    assert.equal(
+      SCHEMA_VERSION,
+      13,
+      "SCHEMA_VERSION must be 13 after the union folds runs.matchlock_policy in as the v12->v13 step; the full chain is 9->10 instants, 10->11 target_moved_reroute_count, 11->12 preclaim_death_count, 12->13 matchlock_policy",
+    );
   });
 
   it("mixed-format fixture: rewrites every naive instant, leaves ISO-Z/offset/NULL/other values byte-identical", () => {
@@ -4070,10 +4074,11 @@ describe("REROUTE-BUDGET steps.target_moved_reroute_count migration (v11)", () =
   });
 });
 
-describe("OUTAGE-ROUNDS steps.preclaim_death_count migration (v12)", () => {
+describe("OUTAGE-ROUNDS steps.preclaim_death_count migration (v12 step)", () => {
   // OUTAGE-ROUNDS US-003: steps gains preclaim_death_count
-  // (INTEGER NOT NULL DEFAULT 0) via a guarded idempotent ALTER, with
-  // SCHEMA_VERSION bumped (v11 → v12). The counter records consecutive
+  // (INTEGER NOT NULL DEFAULT 0) via a guarded idempotent ALTER (the
+  // v11 → v12 step of the combined union chain, which now runs on to v13).
+  // The counter records consecutive
   // dispatch rounds that ran past the wall threshold and exited/died WITHOUT
   // claiming the step. Without the bump, existing v11 DBs early-return from
   // migrate() and skip the ALTER, so any SQL touching the new column crashes
@@ -4082,7 +4087,7 @@ describe("OUTAGE-ROUNDS steps.preclaim_death_count migration (v12)", () => {
 
   // The pre-bump version is the literal v11, NOT SCHEMA_VERSION - 1: deriving
   // it from SCHEMA_VERSION would let the test pass on unbumped code (fixture
-  // at v10, migrate() still runs because 10 !== 12) and miss the very
+  // at v10, migrate() still runs because 10 !== 13) and miss the very
   // regression it exists to catch.
   const PRE_PRECLAIM_SCHEMA_VERSION = 11;
 
@@ -4239,7 +4244,7 @@ describe("OUTAGE-ROUNDS steps.preclaim_death_count migration (v12)", () => {
     assert.equal(parsed.col.type, "INTEGER");
     assert.equal(parsed.col.notnull, 1, "preclaim_death_count is NOT NULL");
     assert.equal(parsed.col.dflt_value, "0", "preclaim_death_count should default to 0");
-    assert.equal(parsed.schemaVersion, 12, "SCHEMA_VERSION is 12 for the preclaim bump");
+    assert.equal(parsed.schemaVersion, 13, "SCHEMA_VERSION is 13 for the preclaim bump");
     assert.equal(parsed.user_version, SCHEMA_VERSION,
       `user_version should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
     assert.equal(parsed.step.preclaim_death_count, 0,
@@ -4569,5 +4574,869 @@ describe("WAVE-A US-001 conditional-review + TEST_CMD contract columns", () => {
       tce: 1,
       tcs: 1,
     }, "each WAVE-A column must appear exactly once after repeated migration");
+  });
+});
+
+describe("MTLK matchlock_policy column migration", () => {
+  // MTLK-PI US-001: runs.matchlock_policy (TEXT, NULL = no Matchlock policy;
+  // JSON) durably persists the typed, host-owned execution-isolation policy
+  // captured at run creation when --matchlock IMAGE is passed. Nullable with
+  // no backfill, added via the guarded idempotent ALTER pattern (the runs
+  // CREATE TABLE keeps its explicit column list unchanged), with
+  // SCHEMA_VERSION bumped (v9 → v10) so existing v9 installs actually run the
+  // migration (the WLST5.1 failure mode). Existing rows read back NULL and
+  // use the native path.
+
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  // Pre-MTLK (v9) runs schema: identical to the current shape except runs
+  // lacks matchlock_policy (and includes all v9 columns).
+  const LEGACY_V9_DDL = `
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      run_number INTEGER,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      notify_url TEXT,
+      scheduling_status TEXT,
+      scheduling_requested_at TEXT,
+      scheduling_error TEXT,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      parent_run_id TEXT,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      test_cmd_established TEXT,
+      test_cmd_source TEXT,
+      harness_probe_status TEXT,
+      harness_probe_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO runs (
+      id, run_number, workflow_id, task, status, context, tokens_spent,
+      worker_lost_count, ceiling_expiry_count, instant_fail_count,
+      created_at, updated_at
+    ) VALUES (
+      'legacy-run', 1, 'workflow', 'task', 'running', '{}', 42, 3, 0, 2,
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+  `;
+
+  function runInSubprocess(
+    th: { homeDir: string },
+    dbPath: string,
+    script: string,
+  ): string {
+    return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    }).trim();
+  }
+
+  before(() => {
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  it("fresh DB: runs has matchlock_policy at SCHEMA_VERSION", () => {
+    const th = createTempHome("tamandua-mtlk-fresh-");
+    const dbPath = path.join(th.root, "fresh.db");
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const col = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "matchlock_policy");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      "console.log(JSON.stringify({ col, user_version: ver.user_version }));",
+    ].join("\n");
+
+    const result = runInSubprocess(th, dbPath, script);
+    const parsed = JSON.parse(result) as {
+      col?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+    };
+
+    assert.equal(parsed.user_version, SCHEMA_VERSION,
+      `fresh DB should be stamped at ${SCHEMA_VERSION}`);
+    assert.ok(parsed.col, "matchlock_policy column should exist on a fresh DB");
+    assert.equal(parsed.col.type, "TEXT", "matchlock_policy should be TEXT");
+    assert.equal(parsed.col.notnull, 0, "matchlock_policy should be nullable");
+    assert.equal(parsed.col.dflt_value, null, "matchlock_policy should have no default");
+  });
+
+  it("migrates a pre-MTLK (v9) DB: adds the column, re-stamps version, status SELECT reads NULL", () => {
+    // Regression for the WLST5.1 failure mode. This fixture is the exact
+    // broken state a real pre-v10 install carries: user_version at the
+    // pre-bump version with a runs table lacking matchlock_policy.
+    const PRE_MTLK_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-mtlk-migrate-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V9_DDL}
+      PRAGMA user_version = ${PRE_MTLK_SCHEMA_VERSION};
+    `);
+    // Sanity: the legacy DB really is in the pre-MTLK broken state.
+    const preCols = legacyDb.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    assert.ok(preCols.some((c) => c.name === "harness_probe_status"), "precondition: legacy runs has harness_probe_status");
+    assert.ok(preCols.some((c) => c.name === "harness_probe_at"), "precondition: legacy runs has harness_probe_at");
+    assert.ok(!preCols.some((c) => c.name === "matchlock_policy"), "precondition: legacy runs lacks matchlock_policy");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, PRE_MTLK_SCHEMA_VERSION, "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    // Spawn a fresh subprocess so getDb() runs migrate() from scratch on the legacy file.
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const col = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "matchlock_policy");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      // The exact status SELECT shape from src/installer/status.ts plus the new
+      // column; must no longer throw and must read the legacy row with NULL.
+      'const row = db.prepare("SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, matchlock_policy FROM runs WHERE id = ?").get("legacy-run");',
+      "console.log(JSON.stringify({ col, user_version: ver.user_version, row }));",
+    ].join("\n");
+
+    const result = runInSubprocess(th, dbPath, script);
+    const migrated = JSON.parse(result) as {
+      col?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+      row: {
+        id: string;
+        instant_fail_count: number;
+        worker_lost_count: number;
+        ceiling_expiry_count: number;
+        matchlock_policy: string | null;
+      };
+    };
+
+    assert.ok(migrated.col, "matchlock_policy column should be added by migration");
+    assert.equal(migrated.col.type, "TEXT", "matchlock_policy should be TEXT");
+    assert.equal(migrated.col.notnull, 0, "matchlock_policy should be nullable");
+    assert.equal(migrated.col.dflt_value, null, "matchlock_policy should have no default");
+    assert.equal(migrated.user_version, SCHEMA_VERSION,
+      `legacy DB should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
+    assert.equal(migrated.row.matchlock_policy, null,
+      "existing runs keep NULL matchlock_policy (native path) after migration");
+  });
+});
+
+describe("MIGV union4 v13 schema chain (every starting state)", () => {
+  // MATCHLOCK-UNION-4 US-002. The union keeps ONE schema chain with four
+  // guarded, idempotent steps:
+  //   9  -> 10  migrateInstantsToIsoZ(): rewrite naive `YYYY-MM-DD HH:MM:SS`
+  //   10 -> 11  steps.target_moved_reroute_count (ALTER ... DEFAULT 0)
+  //   11 -> 12  steps.preclaim_death_count (ALTER ... NOT NULL DEFAULT 0)
+  //   12 -> 13  runs.matchlock_policy TEXT
+  // Every step is a `pragma_table_info`-guarded ALTER, so re-running the full
+  // DDL pass over an already-current shape must not raise
+  // "duplicate column name" and must not churn values.
+  //
+  // Starting states under test (raw pre-bump DDL + PRAGMA user_version):
+  //   v9            main lineage, naive instants, no matchlock_policy, no target_moved
+  //   v10 MAIN      ISO-Z instants, no matchlock_policy, no target_moved
+  //   v10 MATCHLOCK matchlock_policy present, naive instants, no target_moved
+  //   v11 MAIN      ISO-Z instants, no matchlock_policy, target_moved present
+  //   v11 MATCHLOCK matchlock_policy present, target_moved present, naive instants
+  //   v12 MAIN      main lineage: preclaim_death_count present, matchlock_policy absent
+  //   v12 UNION     Matchlock lineage: matchlock_policy present, preclaim absent,
+  //                 naive instants (proves 9->10 normalization runs on this shape)
+  //   v13           already current -> migrate() fast-path no-op
+  //
+  // Every case asserts user_version === 13, that runs.matchlock_policy,
+  // steps.preclaim_death_count and steps.target_moved_reroute_count each exist
+  // exactly once, and that the representative status SELECT (which names the
+  // new columns) succeeds.
+
+  const MATCHLOCK_POLICY_JSON = '{"image":"ghcr.io/acme/pi:1"}';
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  function runInSubprocess(
+    th: { homeDir: string },
+    dbPath: string,
+    script: string,
+  ): string {
+    return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    }).trim();
+  }
+
+  interface SeedOpts {
+    userVersion: number;
+    matchlockPolicy: "absent" | "present";
+    targetMoved: "absent" | "present";
+    /** Only honored when targetMoved === "present". Defaults to 0. */
+    targetMovedValue?: number;
+    /**
+     * Pre-union main-v12 lineage carries steps.preclaim_death_count (main's
+     * 11 -> 12 step); the union lineage does not. Defaults to "absent".
+     */
+    preclaim?: "absent" | "present";
+    /** Only honored when preclaim === "present". Defaults to 0. */
+    preclaimValue?: number;
+    runCreatedAt: string;
+    runUpdatedAt: string;
+    stepCreatedAt: string;
+    stepUpdatedAt: string;
+    stepClaimUpdatedAt: string;
+  }
+
+  // Builds a legacy DB with the real historical column set for the requested
+  // starting state. matchlock_policy / target_moved_reroute_count are appended
+  // last when present, mirroring how an ALTER TABLE would have added them.
+  function seedLegacyState(dbPath: string, opts: SeedOpts): void {
+    const matchlockCol = opts.matchlockPolicy === "present"
+      ? ",\n      matchlock_policy TEXT"
+      : "";
+    const targetMovedCol = opts.targetMoved === "present"
+      ? ",\n      target_moved_reroute_count INTEGER DEFAULT 0"
+      : "";
+    const preclaimCol = opts.preclaim === "present"
+      ? ",\n      preclaim_death_count INTEGER NOT NULL DEFAULT 0"
+      : "";
+    const matchlockInsertCol = opts.matchlockPolicy === "present"
+      ? ", matchlock_policy"
+      : "";
+    const matchlockInsertVal = opts.matchlockPolicy === "present"
+      ? `, '${MATCHLOCK_POLICY_JSON}'`
+      : "";
+    const targetMovedInsertCol = opts.targetMoved === "present"
+      ? ", target_moved_reroute_count"
+      : "";
+    const targetMovedInsertVal = opts.targetMoved === "present"
+      ? `, ${opts.targetMovedValue ?? 0}`
+      : "";
+    const preclaimInsertCol = opts.preclaim === "present"
+      ? ", preclaim_death_count"
+      : "";
+    const preclaimInsertVal = opts.preclaim === "present"
+      ? `, ${opts.preclaimValue ?? 0}`
+      : "";
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        run_number INTEGER,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        notify_url TEXT,
+        scheduling_status TEXT,
+        scheduling_requested_at TEXT,
+        scheduling_error TEXT,
+        worker_lost_count INTEGER NOT NULL DEFAULT 0,
+        ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+        parent_run_id TEXT,
+        instant_fail_count INTEGER NOT NULL DEFAULT 0,
+        test_cmd_established TEXT,
+        test_cmd_source TEXT,
+        harness_probe_status TEXT,
+        harness_probe_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL${matchlockCol}
+      );
+      CREATE TABLE steps (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        step_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        input_template TEXT NOT NULL,
+        expects TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        output TEXT,
+        retry_count INTEGER DEFAULT 0,
+        max_retries INTEGER DEFAULT 4,
+        type TEXT NOT NULL DEFAULT 'single',
+        loop_config TEXT,
+        current_story_id TEXT,
+        abandoned_count INTEGER DEFAULT 0,
+        claim_job_id TEXT,
+        claim_pid INTEGER,
+        claim_pgid INTEGER,
+        claim_updated_at TEXT,
+        reroute_count INTEGER DEFAULT 0,
+        terminal_reroute_count INTEGER DEFAULT 0,
+        ledger_concession_count INTEGER DEFAULT 0,
+        claim_invalidated_by TEXT,
+        conditional_condition TEXT,
+        auto_completed INTEGER NOT NULL DEFAULT 0,
+        auto_complete_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL${targetMovedCol}${preclaimCol}
+      );
+      INSERT INTO runs (
+        id, run_number, workflow_id, task, status, context, tokens_spent,
+        worker_lost_count, ceiling_expiry_count, instant_fail_count,
+        created_at, updated_at${matchlockInsertCol}
+      ) VALUES (
+        'legacy-run', 1, 'workflow', 'task', 'running', '{}', 42, 3, 2, 1,
+        '${opts.runCreatedAt}', '${opts.runUpdatedAt}'${matchlockInsertVal}
+      );
+      INSERT INTO steps (
+        id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, reroute_count, terminal_reroute_count, created_at, updated_at,
+        claim_updated_at${targetMovedInsertCol}${preclaimInsertCol}
+      ) VALUES (
+        'legacy-step', 'legacy-run', 'finalize_merge', 'developer', 0, '', '{}',
+        'waiting', 2, 1, '${opts.stepCreatedAt}', '${opts.stepUpdatedAt}',
+        '${opts.stepClaimUpdatedAt}'${targetMovedInsertVal}${preclaimInsertVal}
+      );
+      PRAGMA user_version = ${opts.userVersion};
+    `);
+    db.close();
+  }
+
+  interface InspectResult {
+    user_version: number;
+    schemaVersion: number;
+    fullRuns: number;
+    runCols: string[];
+    stepCols: string[];
+    run: {
+      id: string;
+      created_at: string;
+      updated_at: string;
+      scheduling_requested_at: string | null;
+      harness_probe_at: string | null;
+      matchlock_policy: string | null;
+      tokens_spent: number;
+      worker_lost_count: number;
+    };
+    step: {
+      id: string;
+      created_at: string;
+      updated_at: string;
+      claim_updated_at: string | null;
+      reroute_count: number;
+      terminal_reroute_count: number;
+      target_moved_reroute_count: number;
+      preclaim_death_count: number;
+    };
+  }
+
+  function inspectScript(): string {
+    const dbJs = JSON.stringify(path.join(distDir(), "db.js"));
+    return [
+      `import { getDb, SCHEMA_VERSION, _migrateFullRuns } from ${dbJs};`,
+      "const db = getDb();",
+      'const user_version = db.prepare("PRAGMA user_version").get().user_version;',
+      'const runCols = db.prepare("PRAGMA table_info(runs)").all().map((c) => c.name);',
+      'const stepCols = db.prepare("PRAGMA table_info(steps)").all().map((c) => c.name);',
+      // The exact status SELECT shape from src/installer/status.ts plus the new
+      // matchlock_policy column — must not throw after migration.
+      'const run = db.prepare("SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, scheduling_requested_at, harness_probe_at, matchlock_policy FROM runs WHERE id = ?").get("legacy-run");',
+      'const step = db.prepare("SELECT id, reroute_count, terminal_reroute_count, target_moved_reroute_count, preclaim_death_count, created_at, updated_at, claim_updated_at FROM steps WHERE id = ?").get("legacy-step");',
+      "console.log(JSON.stringify({ user_version, schemaVersion: SCHEMA_VERSION, fullRuns: _migrateFullRuns, runCols, stepCols, run, step }));",
+    ].join("\n");
+  }
+
+  // Samples detectSchemaLineage() on the RAW pre-migration fixture (a second
+  // read-only connection), then again through getDb() after the chain ran.
+  // This proves the exported helper discriminates from PRAGMA table_info and
+  // that migrate() drives the same state to "current".
+  function lineageScript(): string {
+    const dbJs = JSON.stringify(path.join(distDir(), "db.js"));
+    return [
+      `import { DatabaseSync } from "node:sqlite";`,
+      `import { getDb, SCHEMA_VERSION, detectSchemaLineage } from ${dbJs};`,
+      "const raw = new DatabaseSync(process.env.TAMANDUA_DB_PATH);",
+      "const before = detectSchemaLineage(raw);",
+      "const beforeVersion = raw.prepare('PRAGMA user_version').get().user_version;",
+      "raw.close();",
+      "const db = getDb();",
+      "const after = detectSchemaLineage(db);",
+      "const user_version = db.prepare('PRAGMA user_version').get().user_version;",
+      'const runCols = db.prepare("PRAGMA table_info(runs)").all().map((c) => c.name);',
+      'const stepCols = db.prepare("PRAGMA table_info(steps)").all().map((c) => c.name);',
+      "console.log(JSON.stringify({ before, beforeVersion, after, user_version, schemaVersion: SCHEMA_VERSION, runCols, stepCols }));",
+    ].join("\n");
+  }
+
+  interface FreshInspectResult {
+    user_version: number;
+    schemaVersion: number;
+    fullRuns: number;
+    runCols: string[];
+    stepCols: string[];
+  }
+
+  function freshInspectScript(): string {
+    const dbJs = JSON.stringify(path.join(distDir(), "db.js"));
+    return [
+      `import { getDb, SCHEMA_VERSION, _migrateFullRuns } from ${dbJs};`,
+      "const db = getDb();",
+      'const user_version = db.prepare("PRAGMA user_version").get().user_version;',
+      'const runCols = db.prepare("PRAGMA table_info(runs)").all().map((c) => c.name);',
+      'const stepCols = db.prepare("PRAGMA table_info(steps)").all().map((c) => c.name);',
+      "console.log(JSON.stringify({ user_version, schemaVersion: SCHEMA_VERSION, fullRuns: _migrateFullRuns, runCols, stepCols }));",
+    ].join("\n");
+  }
+
+  function countOf(values: string[], target: string): number {
+    return values.filter((v) => v === target).length;
+  }
+
+  // Defaults for the common ISO-Z fixture shape; callers override just the
+  // lineage-relevant fields (userVersion, matchlockPolicy, targetMoved,
+  // preclaim).
+  function seedOpts(overrides: Partial<SeedOpts> & Pick<SeedOpts, "userVersion">): SeedOpts {
+    return {
+      matchlockPolicy: "absent",
+      targetMoved: "absent",
+      runCreatedAt: "2026-01-02T03:04:05.000Z",
+      runUpdatedAt: "2026-01-02T03:04:06.000Z",
+      stepCreatedAt: "2026-03-04T05:06:07.000Z",
+      stepUpdatedAt: "2026-03-04T05:06:08.000Z",
+      stepClaimUpdatedAt: "2026-03-04T05:06:09.000Z",
+      ...overrides,
+    };
+  }
+
+  it("v9 → v13: ISO-Z instants, target_moved_reroute_count and matchlock_policy added, status SELECT works", () => {
+    const th = createTempHome("tamandua-union4-v9-");
+    const dbPath = path.join(th.root, "v9.db");
+    seedLegacyState(dbPath, {
+      userVersion: 9,
+      matchlockPolicy: "absent",
+      targetMoved: "absent",
+      runCreatedAt: "2026-01-02 03:04:05",
+      runUpdatedAt: "2026-01-02 03:04:06",
+      stepCreatedAt: "2026-03-04 05:06:07",
+      stepUpdatedAt: "2026-03-04 05:06:08",
+      stepClaimUpdatedAt: "2026-03-04 05:06:09",
+    });
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+
+    assert.equal(parsed.schemaVersion, 13, "chain must converge on SCHEMA_VERSION 13");
+    assert.equal(parsed.user_version, 13, "v9 must be re-stamped to 13");
+    assert.equal(parsed.fullRuns, 1, "v9 must take the slow migration path exactly once");
+    assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
+      "12->13 must add runs.matchlock_policy exactly once");
+    assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1,
+      "10->11 must add steps.target_moved_reroute_count exactly once");
+    assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
+      "11->12 must add steps.preclaim_death_count exactly once");
+    assert.equal(parsed.run.created_at, "2026-01-02T03:04:05.000Z",
+      "9->10 must rewrite the naive runs instant to ISO-Z");
+    assert.equal(parsed.run.updated_at, "2026-01-02T03:04:06.000Z",
+      "9->10 must rewrite every naive runs instant");
+    assert.equal(parsed.run.scheduling_requested_at, null, "NULL instants stay NULL");
+    assert.equal(parsed.step.created_at, "2026-03-04T05:06:07.000Z",
+      "9->10 must rewrite the naive steps instant to ISO-Z");
+    assert.equal(parsed.step.updated_at, "2026-03-04T05:06:08.000Z");
+    assert.equal(parsed.step.claim_updated_at, "2026-03-04T05:06:09.000Z");
+    assert.equal(parsed.step.target_moved_reroute_count, 0,
+      "existing step gets the 10->11 DEFAULT 0");
+    assert.equal(parsed.run.matchlock_policy, null,
+      "existing run keeps NULL matchlock_policy (native path)");
+    assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
+    assert.equal(parsed.run.tokens_spent, 42, "existing values survive the chain");
+    assert.equal(parsed.run.worker_lost_count, 3, "existing counters survive the chain");
+  });
+
+  it("v10 MAIN lineage → v13: ISO-Z instants unchanged, target_moved and matchlock_policy added", () => {
+    const th = createTempHome("tamandua-union4-v10-main-");
+    const dbPath = path.join(th.root, "v10-main.db");
+    seedLegacyState(dbPath, {
+      userVersion: 10,
+      matchlockPolicy: "absent",
+      targetMoved: "absent",
+      runCreatedAt: "2026-01-02T03:04:05.000Z",
+      runUpdatedAt: "2026-01-02T03:04:06.123Z",
+      stepCreatedAt: "2026-03-04T05:06:07.000Z",
+      stepUpdatedAt: "2026-03-04T05:06:08.000Z",
+      stepClaimUpdatedAt: "2026-03-04T05:06:09.000Z",
+    });
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+
+    assert.equal(parsed.user_version, 13, "v10 MAIN must be re-stamped to 13");
+    assert.equal(parsed.fullRuns, 1, "v10 MAIN must take the slow migration path");
+    assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1);
+    assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1);
+    assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
+      "11->12 must add steps.preclaim_death_count exactly once to a v10 main DB");
+    assert.equal(parsed.run.created_at, "2026-01-02T03:04:05.000Z",
+      "main-lineage ISO-Z instants must stay byte-identical");
+    assert.equal(parsed.run.updated_at, "2026-01-02T03:04:06.123Z",
+      "millisecond precision must be preserved for main-lineage values");
+    assert.equal(parsed.step.created_at, "2026-03-04T05:06:07.000Z");
+    assert.equal(parsed.step.claim_updated_at, "2026-03-04T05:06:09.000Z");
+    assert.equal(parsed.step.target_moved_reroute_count, 0);
+    assert.equal(parsed.run.matchlock_policy, null,
+      "a main-lineage run keeps the native path (NULL policy)");
+    assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
+  });
+
+  it("v10 MATCHLOCK lineage → v13: policy preserved, naive instants rewritten, target_moved added", () => {
+    const th = createTempHome("tamandua-union4-v10-matchlock-");
+    const dbPath = path.join(th.root, "v10-matchlock.db");
+    seedLegacyState(dbPath, {
+      userVersion: 10,
+      matchlockPolicy: "present",
+      targetMoved: "absent",
+      runCreatedAt: "2026-02-03 04:05:06",
+      runUpdatedAt: "2026-02-03 04:05:07",
+      stepCreatedAt: "2026-04-05 06:07:08",
+      stepUpdatedAt: "2026-04-05 06:07:09",
+      stepClaimUpdatedAt: "2026-04-05 06:07:10",
+    });
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+
+    assert.equal(parsed.user_version, 13, "a Matchlock-lineage v10 DB must reach v13");
+    assert.equal(parsed.fullRuns, 1, "v10 MATCHLOCK must take the slow migration path");
+    assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
+      "the existing matchlock_policy column must not be duplicated");
+    assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1,
+      "10->11 must still add the missing target_moved column");
+    assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
+      "11->12 must add the missing preclaim column to a Matchlock-lineage v10 DB");
+    assert.equal(parsed.run.matchlock_policy, MATCHLOCK_POLICY_JSON,
+      "the Matchlock policy captured at run creation must survive the union");
+    assert.deepEqual(JSON.parse(parsed.run.matchlock_policy as string),
+      { image: "ghcr.io/acme/pi:1" },
+      "policy JSON must round-trip unchanged");
+    assert.equal(parsed.run.created_at, "2026-02-03T04:05:06.000Z",
+      "the 9->10 rewrite must also normalize Matchlock-lineage naive instants");
+    assert.equal(parsed.run.updated_at, "2026-02-03T04:05:07.000Z");
+    assert.equal(parsed.step.created_at, "2026-04-05T06:07:08.000Z");
+    assert.equal(parsed.step.claim_updated_at, "2026-04-05T06:07:10.000Z");
+    assert.equal(parsed.step.target_moved_reroute_count, 0);
+    assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
+  });
+
+  it("v11 MAIN lineage → v13: gains preclaim_death_count and matchlock_policy, keeps target_moved value, ends at 13", () => {
+    const th = createTempHome("tamandua-union4-v11-");
+    const dbPath = path.join(th.root, "v11.db");
+    seedLegacyState(dbPath, {
+      userVersion: 11,
+      matchlockPolicy: "absent",
+      targetMoved: "present",
+      targetMovedValue: 7,
+      runCreatedAt: "2026-01-02T03:04:05.000Z",
+      runUpdatedAt: "2026-01-02T03:04:06.000Z",
+      stepCreatedAt: "2026-03-04T05:06:07.000Z",
+      stepUpdatedAt: "2026-03-04T05:06:08.000Z",
+      stepClaimUpdatedAt: "2026-03-04T05:06:09.000Z",
+    });
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+
+    assert.equal(parsed.user_version, 13, "v11 must be re-stamped to 13");
+    assert.equal(parsed.fullRuns, 1, "v11 must take the slow migration path");
+    assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
+      "12->13 must add exactly one matchlock_policy column");
+    assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1,
+      "the pre-existing target_moved column must not be duplicated");
+    assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
+      "11->12 must add exactly one preclaim_death_count column");
+    assert.equal(parsed.step.preclaim_death_count, 0,
+      "a legacy v11 step reads back preclaim_death_count = 0 via DEFAULT");
+    assert.equal(parsed.step.target_moved_reroute_count, 7,
+      "an existing target_moved_reroute_count value must not be reset");
+    assert.equal(parsed.run.matchlock_policy, null);
+    assert.equal(parsed.run.created_at, "2026-01-02T03:04:05.000Z");
+    assert.equal(parsed.step.created_at, "2026-03-04T05:06:07.000Z");
+    assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
+  });
+
+  it("v11 MATCHLOCK lineage → v13: policy and target_moved preserved, preclaim added, naive instants normalized", () => {
+    const th = createTempHome("tamandua-union4-v11-matchlock-");
+    const dbPath = path.join(th.root, "v11-matchlock.db");
+    seedLegacyState(dbPath, seedOpts({
+      userVersion: 11,
+      matchlockPolicy: "present",
+      targetMoved: "present",
+      targetMovedValue: 9,
+      runCreatedAt: "2026-02-03 04:05:06",
+      runUpdatedAt: "2026-02-03 04:05:07",
+      stepCreatedAt: "2026-04-05 06:07:08",
+      stepUpdatedAt: "2026-04-05 06:07:09",
+      stepClaimUpdatedAt: "2026-04-05 06:07:10",
+    }));
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+
+    assert.equal(parsed.user_version, 13, "v11 MATCHLOCK must be re-stamped to 13");
+    assert.equal(parsed.fullRuns, 1, "v11 MATCHLOCK must take the slow migration path");
+    assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
+      "the pre-existing matchlock_policy column must not be duplicated");
+    assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1,
+      "the pre-existing target_moved column must not be duplicated");
+    assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
+      "11->12 must add exactly one preclaim_death_count column to a v11 Matchlock DB");
+    assert.equal(parsed.step.preclaim_death_count, 0,
+      "a v11 Matchlock step reads back preclaim_death_count = 0 via DEFAULT");
+    assert.equal(parsed.step.target_moved_reroute_count, 9,
+      "an existing target_moved_reroute_count value must not be reset");
+    assert.equal(parsed.run.matchlock_policy, MATCHLOCK_POLICY_JSON,
+      "the Matchlock policy captured at run creation must survive the union");
+    assert.deepEqual(JSON.parse(parsed.run.matchlock_policy as string),
+      { image: "ghcr.io/acme/pi:1" });
+    assert.equal(parsed.run.created_at, "2026-02-03T04:05:06.000Z",
+      "9->10 must normalize the v11 Matchlock-lineage naive runs instants");
+    assert.equal(parsed.run.updated_at, "2026-02-03T04:05:07.000Z");
+    assert.equal(parsed.step.created_at, "2026-04-05T06:07:08.000Z",
+      "9->10 must normalize the v11 Matchlock-lineage naive steps instants");
+    assert.equal(parsed.step.claim_updated_at, "2026-04-05T06:07:10.000Z");
+    assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
+  });
+
+  it("guards are idempotent: forcing the slow path over an already-v13 shape duplicates nothing", () => {
+    const th = createTempHome("tamandua-union4-guard-idem-");
+    const dbPath = path.join(th.root, "guard-idem.db");
+    seedLegacyState(dbPath, {
+      userVersion: 9,
+      matchlockPolicy: "absent",
+      targetMoved: "absent",
+      runCreatedAt: "2026-01-02 03:04:05",
+      runUpdatedAt: "2026-01-02 03:04:06",
+      stepCreatedAt: "2026-03-04 05:06:07",
+      stepUpdatedAt: "2026-03-04 05:06:08",
+      stepClaimUpdatedAt: "2026-03-04 05:06:09",
+    });
+
+    const first = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+    assert.equal(first.user_version, 13);
+
+    // Rewind only user_version (the columns stay at the v13 shape) and force
+    // applySchema() over an already-current schema. All three steps must
+    // no-op through their pragma_table_info guards instead of raising
+    // "duplicate column name".
+    const raw = new DatabaseSync(dbPath);
+    raw.exec("PRAGMA user_version = 9");
+    raw.close();
+
+    const again = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+    assert.equal(again.user_version, 13, "forced slow path re-stamps to 13");
+    assert.equal(again.fullRuns, 1, "forced slow path runs applySchema exactly once");
+    assert.equal(countOf(again.runCols, "matchlock_policy"), 1,
+      "12->13 guard must not duplicate runs.matchlock_policy");
+    assert.equal(countOf(again.stepCols, "target_moved_reroute_count"), 1,
+      "10->11 guard must not duplicate steps.target_moved_reroute_count");
+    assert.deepEqual(again.run, first.run,
+      "9->10 instant rewrite is idempotent: already-ISO-Z values stay byte-identical");
+    assert.deepEqual(again.step, first.step, "forced re-run leaves step values unchanged");
+  });
+
+  it("detectSchemaLineage discriminates both v12 lineages and every pre-v12 shape through PRAGMA table_info", () => {
+    const th = createTempHome("tamandua-union4-lineage-");
+    const fixtures: Array<{ name: string; opts: SeedOpts; expected: string }> = [
+      { name: "v9-main", opts: seedOpts({ userVersion: 9 }), expected: "pre-v12" },
+      { name: "v10-main", opts: seedOpts({ userVersion: 10 }), expected: "pre-v12" },
+      { name: "v10-union", opts: seedOpts({ userVersion: 10, matchlockPolicy: "present" }), expected: "union-v12" },
+      { name: "v11-main", opts: seedOpts({ userVersion: 11, targetMoved: "present" }), expected: "pre-v12" },
+      {
+        name: "v11-union",
+        opts: seedOpts({ userVersion: 11, targetMoved: "present", matchlockPolicy: "present" }),
+        expected: "union-v12",
+      },
+      {
+        name: "v12-main",
+        opts: seedOpts({ userVersion: 12, targetMoved: "present", preclaim: "present", preclaimValue: 5 }),
+        expected: "main-v12",
+      },
+      {
+        name: "v12-union",
+        opts: seedOpts({ userVersion: 12, targetMoved: "present", matchlockPolicy: "present" }),
+        expected: "union-v12",
+      },
+    ];
+
+    interface LineageResult {
+      before: string;
+      beforeVersion: number;
+      after: string;
+      user_version: number;
+      schemaVersion: number;
+      runCols: string[];
+      stepCols: string[];
+    }
+
+    for (const fixture of fixtures) {
+      const dbPath = path.join(th.root, `${fixture.name}.db`);
+      seedLegacyState(dbPath, fixture.opts);
+      const parsed = JSON.parse(runInSubprocess(th, dbPath, lineageScript())) as LineageResult;
+
+      assert.equal(parsed.before, fixture.expected,
+        `${fixture.name}: detector must classify the raw pre-migration fixture as ${fixture.expected}`);
+      assert.equal(parsed.beforeVersion, fixture.opts.userVersion,
+        `${fixture.name}: the version-only probe must see the raw user_version`);
+      assert.equal(parsed.after, "current",
+        `${fixture.name}: after getDb() the shape must be current`);
+      assert.equal(parsed.schemaVersion, 13, "the chain terminates at 13");
+      assert.equal(parsed.user_version, 13,
+        `${fixture.name}: migrate() must re-stamp to 13`);
+      assert.ok(parsed.runCols.includes("matchlock_policy"),
+        `${fixture.name}: runs.matchlock_policy must exist after the chain`);
+      assert.ok(parsed.stepCols.includes("preclaim_death_count"),
+        `${fixture.name}: steps.preclaim_death_count must exist after the chain`);
+    }
+  });
+
+  it("v12 MAIN lineage → v13: gains matchlock_policy, preserves preclaim count, status SELECT works", () => {
+    const th = createTempHome("tamandua-union4-v12-main-");
+    const dbPath = path.join(th.root, "v12-main.db");
+    seedLegacyState(dbPath, seedOpts({
+      userVersion: 12,
+      matchlockPolicy: "absent",
+      targetMoved: "present",
+      targetMovedValue: 4,
+      preclaim: "present",
+      preclaimValue: 5,
+    }));
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+
+    assert.equal(parsed.user_version, 13, "v12 MAIN must be re-stamped to 13");
+    assert.equal(parsed.fullRuns, 1, "v12 MAIN must take the slow migration path");
+    assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
+      "12->13 must add runs.matchlock_policy exactly once to a main-v12 DB");
+    assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
+      "the main-v12 preclaim column must not be duplicated");
+    assert.equal(parsed.step.preclaim_death_count, 5,
+      "an existing main-lineage preclaim_death_count must be preserved");
+    assert.equal(parsed.step.target_moved_reroute_count, 4,
+      "an existing target_moved_reroute_count must be preserved");
+    assert.equal(parsed.run.matchlock_policy, null,
+      "a main-v12 run keeps the native path (NULL policy)");
+    assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
+  });
+
+  it("v12 UNION lineage → v13: gains preclaim_death_count, preserves matchlock_policy, normalizes naive instants", () => {
+    const th = createTempHome("tamandua-union4-v12-union-");
+    const dbPath = path.join(th.root, "v12-union.db");
+    seedLegacyState(dbPath, seedOpts({
+      userVersion: 12,
+      matchlockPolicy: "present",
+      targetMoved: "present",
+      targetMovedValue: 4,
+      // The union cut predates the 9->10 instant normalization on some
+      // installs, so a union-v12 DB can still carry naive instants. The
+      // migration must normalize them even though it takes the v12 path.
+      runCreatedAt: "2026-02-03 04:05:06",
+      runUpdatedAt: "2026-02-03 04:05:07",
+      stepCreatedAt: "2026-04-05 06:07:08",
+      stepUpdatedAt: "2026-04-05 06:07:09",
+      stepClaimUpdatedAt: "2026-04-05 06:07:10",
+    }));
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+
+    assert.equal(parsed.user_version, 13, "v12 UNION must be re-stamped to 13");
+    assert.equal(parsed.fullRuns, 1, "v12 UNION must take the slow migration path");
+    assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
+      "11->12 must add steps.preclaim_death_count exactly once to a union-v12 DB");
+    assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
+      "the union-v12 matchlock_policy column must not be duplicated");
+    assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1,
+      "the union-v12 target_moved_reroute_count column must not be duplicated");
+    assert.equal(parsed.step.preclaim_death_count, 0,
+      "a new union-lineage preclaim column reads back NOT NULL DEFAULT 0");
+    assert.equal(parsed.run.matchlock_policy, MATCHLOCK_POLICY_JSON,
+      "the Matchlock policy captured at run creation must survive the union");
+    assert.deepEqual(JSON.parse(parsed.run.matchlock_policy as string),
+      { image: "ghcr.io/acme/pi:1" },
+      "policy JSON must round-trip unchanged");
+    assert.equal(parsed.run.created_at, "2026-02-03T04:05:06.000Z",
+      "the 9->10 normalization must run for a union-v12 DB with naive runs instants");
+    assert.equal(parsed.run.updated_at, "2026-02-03T04:05:07.000Z");
+    assert.equal(parsed.step.created_at, "2026-04-05T06:07:08.000Z",
+      "the 9->10 normalization must run for a union-v12 DB with naive steps instants");
+    assert.equal(parsed.step.updated_at, "2026-04-05T06:07:09.000Z");
+    assert.equal(parsed.step.claim_updated_at, "2026-04-05T06:07:10.000Z");
+    assert.equal(parsed.step.target_moved_reroute_count, 4,
+      "an existing target_moved_reroute_count must be preserved");
+    assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
+  });
+
+  it("re-opening an already-migrated v12-lineage DB is idempotent (both lineages, no throw)", () => {
+    for (const lineage of ["main-v12", "union-v12"] as const) {
+      const th = createTempHome(`tamandua-union4-v12-idem-${lineage}-`);
+      const dbPath = path.join(th.root, `${lineage}.db`);
+      seedLegacyState(dbPath, seedOpts({
+        userVersion: 12,
+        targetMoved: "present",
+        matchlockPolicy: lineage === "union-v12" ? "present" : "absent",
+        preclaim: lineage === "main-v12" ? "present" : "absent",
+      }));
+
+      const first = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+      assert.equal(first.user_version, 13, `${lineage}: first open stamps v13`);
+
+      // Second open: getDb() sees user_version === 13 and must early-return
+      // without running the DDL path or throwing.
+      const second = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+      assert.equal(second.user_version, 13, `${lineage}: second open keeps v13`);
+      assert.equal(second.fullRuns, 0, `${lineage}: second open early-returns (no DDL)`);
+      assert.deepEqual(second.run, first.run, `${lineage}: run values unchanged`);
+      assert.deepEqual(second.step, first.step, `${lineage}: step values unchanged`);
+    }
+  });
+
+  it("already at v13: migrate() fast-path is a no-op (no DDL, no re-stamp churn)", () => {
+    const th = createTempHome("tamandua-union4-v13-noop-");
+    const dbPath = path.join(th.root, "current.db");
+
+    const first = JSON.parse(runInSubprocess(th, dbPath, freshInspectScript())) as FreshInspectResult;
+    assert.equal(first.schemaVersion, 13);
+    assert.equal(first.user_version, 13, "a fresh DB starts at the current version");
+    assert.equal(first.fullRuns, 1, "first open stamps v13 through the full DDL path");
+    assert.equal(countOf(first.runCols, "matchlock_policy"), 1,
+      "a v13 DB must have runs.matchlock_policy exactly once");
+    assert.equal(countOf(first.stepCols, "preclaim_death_count"), 1,
+      "a v13 DB must have steps.preclaim_death_count exactly once");
+    assert.equal(countOf(first.stepCols, "target_moved_reroute_count"), 1,
+      "a v13 DB must have steps.target_moved_reroute_count exactly once");
+
+    const second = JSON.parse(runInSubprocess(th, dbPath, freshInspectScript())) as FreshInspectResult;
+    assert.equal(second.user_version, 13, "second open keeps user_version at 13");
+    assert.equal(second.fullRuns, 0,
+      "second open must early-return without running the DDL path");
+    assert.deepEqual(second.runCols, first.runCols, "no DDL: runs columns unchanged");
+    assert.deepEqual(second.stepCols, first.stepCols, "no DDL: steps columns unchanged");
   });
 });

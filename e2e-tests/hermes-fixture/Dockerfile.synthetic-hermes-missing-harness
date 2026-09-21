@@ -1,0 +1,29 @@
+# MTLK-HERMES-EXEC US-004 — TEST-ONLY NEGATIVE fixture: image WITHOUT hermes.
+#
+# A synthetic image that genuinely cannot supply a `hermes` guest executable
+# anywhere on the runner's composed PATH. It derives from the small upstream
+# node:22-bookworm-slim runtime (the SAME node runtime the synthetic-pi fixture
+# uses) so the negative imports cheaply and the multi-GB bedlam-based POSITIVE
+# fixture (Dockerfile.synthetic-hermes) remains the only heavy derived image.
+#
+# It is deliberately NOT derived from the bedlam positive: a matchlock import of
+# a bedlam-rooted image squashes a fresh ~4.8GB rootfs blob per image, which
+# does not fit this host's disk budget for two extra negatives. The POSITIVE
+# fixture still satisfies the "based on igorhvr/bedlam-ubuntu" requirement and
+# the image-provided fake hermes lives IN the positive image only.
+#
+# igorhvr/bedlam-ubuntu and the real user harness are never overwritten/
+# retagged/mutated; this is a NEW derived image used ONLY by the synthetic
+# gate's missing-harness negative. It contains NO provider credentials and
+# performs NO model calls.
+
+FROM node:22-bookworm-slim
+
+LABEL org.tamandua.synthetic-hermes="TEST-ONLY-missing-harness"
+
+# node:22-bookworm-slim ships node >= 22, /bin/sh and coreutils (the guest
+# bridge/runtime the packed helper pack needs). There is intentionally NO
+# hermes executable here.
+
+WORKDIR /root
+CMD ["/bin/bash"]

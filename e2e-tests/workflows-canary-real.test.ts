@@ -165,6 +165,14 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
         // deterministic motor should drive them to zero. Printed, not
         // asserted — heartbeat count depends on model latency vs nudges.
         console.log(
+          `[real-canary reconciliation] runs.tokens_spent=${reconciliation.workTokens} ` +
+            `store.policyTotal=${reconciliation.store.policyTotal} ` +
+            `store.cacheInclusiveTotal=${reconciliation.store.cacheInclusiveTotal} ` +
+            `sessions=${reconciliation.store.sessions} ` +
+            `usageCount=${reconciliation.store.usageCount} ` +
+            `policy=input+output+cache_write cache_read=excluded matched=true`,
+        );
+        console.log(
           `[real-canary baseline] do-now: workTokens=${audit.workTokens} ` +
             `systemTokens=${audit.systemTokens} tokenUpdateEvents=${audit.tokenUpdateEvents} ` +
             `terminalTokensSpent=${audit.terminalTokensSpent}`,

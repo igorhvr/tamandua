@@ -1,0 +1,32 @@
+# MTLK-DSH-EXEC US-003 — TEST-ONLY REAL-dsh boot-characterization image.
+#
+# A DERIVED image used ONLY by the on-demand synthetic dsh gate's REAL dsh
+# boot/profile-link characterization (no provider calls, no paid models). It
+# derives from the existing TEST-ONLY synthetic-pi node LTS image (node 22 /
+# Debian bookworm, git, /bin/sh — a compact Linux guest kept small to bound
+# the gate's image size) and ADDS the REAL dsh CLI installation (/opt/dsh +
+# the /usr/local/bin/dsh symlink, byte-copied from the qualified host
+# installation by the gate at runtime into a build context staged under the
+# gate evidence dir — the repo never contains the multi-GB install).
+#
+# The production target image remains the operator's igorhvr/bedlam-ubuntu
+# derived image; this characterization image exists to observe the REAL dsh
+# CLI's own profile-boot/installation-link maintenance with a fresh SYNTHETIC
+# DSH_HOME inside a real Matchlock VM. igorhvr/bedlam-ubuntu and the real user
+# harness/operator config are NEVER overwritten, retagged or mutated. No
+# provider credentials are baked in; the gate passes NO credentials and makes
+# NO model calls. The image carries a TEST-ONLY label.
+
+FROM tamandua-synthetic-pi:gate-fixture
+
+LABEL org.tamandua.synthetic-dsh="TEST-ONLY-real-dsh-boot"
+
+# The gate stages the real install (host /opt/dsh, minus VCS metadata) into
+# the build context as ./real-dsh so the guest sees the SAME absolute layout
+# (/opt/dsh) the profile links reference.
+COPY real-dsh/ /opt/dsh/
+RUN ln -sfn /opt/dsh/apps/cli/lib/bin.js /usr/local/bin/dsh && \
+    chmod 0755 /usr/local/bin/dsh
+
+WORKDIR /root
+CMD ["/bin/bash"]

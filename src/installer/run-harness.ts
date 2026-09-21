@@ -37,6 +37,22 @@ function readNonEmptyString(record: Record<string, unknown>, key: string): strin
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * True when a persisted `runs.matchlock_policy` raw value parses as a
+ * harness:"hermes" policy (the guest image supplies hermes inside the VM).
+ * Malformed/unparseable values return false (fail closed — the strict policy
+ * parser at dispatch refuses them anyway).
+ */
+function isMatchlockHermesPolicy(raw: string | null | undefined): boolean {
+  if (!raw || raw.trim() === "") return false;
+  try {
+    const parsed = JSON.parse(raw) as { harness?: unknown };
+    return parsed?.harness === "hermes";
+  } catch {
+    return false;
+  }
+}
+
 function readCurrentGitBranch(workdir: string): string {
   const result = spawnSync("git", ["-C", workdir, "branch", "--show-current"], {
     encoding: "utf-8",
@@ -56,6 +72,16 @@ function readCurrentGitBranch(workdir: string): string {
 export async function validateRunHarnessForScheduling(
   runId: string,
   contextRaw: string,
+  opts?: {
+    /**
+     * The run's persisted `runs.matchlock_policy` raw value. When it parses
+     * to a harness:"hermes" policy, the hermes executable is supplied by the
+     * Matchlock image INSIDE the VM — a host hermes binary must NOT be
+     * required for registration/resume. NULL-policy (native) runs and pi
+     * policies are unaffected.
+     */
+    matchlockPolicy?: string | null;
+  },
 ): Promise<HarnessValidationResult> {
   const context = parseRunContext(runId, contextRaw);
   const workspaceMode = readNonEmptyString(context, "workspace_mode") ?? "direct";
@@ -106,8 +132,13 @@ export async function validateRunHarnessForScheduling(
   // worktree run must not bypass harness-type validation. A missing dsh
   // fails the run at startup with an actionable error instead of stranding
   // every dispatch round on a resolution failure.
+  // MTLK-HERMES-EXEC US-003: an OPTED-IN hermes run (persisted
+  // harness:"hermes" Matchlock policy) executes the IMAGE's hermes inside a
+  // fresh VM — the host hermes binary is never consulted/spawned, so the
+  // host-binary check is skipped for it.
+  const matchlockHermes = isMatchlockHermesPolicy(opts?.matchlockPolicy);
   const harnessType = readNonEmptyString(context, "harness_type");
-  if (harnessType === "hermes") {
+  if (harnessType === "hermes" && !matchlockHermes) {
     try {
       await resolveHermesBinary();
     } catch (err) {
@@ -117,7 +148,7 @@ export async function validateRunHarnessForScheduling(
       );
     }
   }
-  if (harnessType === "dsh") {
+  if (harnessType === "dsh" && !matchlockHermes) {
     try {
       await resolveDshBinary();
     } catch (err) {

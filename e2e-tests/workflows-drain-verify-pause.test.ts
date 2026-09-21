@@ -596,7 +596,11 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
             const run = dbRun(ctx!, runId);
             return run?.status === "paused" && run?.scheduling_status === "paused";
           },
-          60_000,
+          // 120s (not 60s): the daemon must process the verify completion and
+          // promote the downstream step before it can finalize the drain; on a
+          // loaded shared runner that has exceeded 60s. AGENTS.md prescribes
+          // raising the absolute deadline rather than polling.
+          120_000,
         );
 
         events = readRunEvents(ctx, runId);

@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { tamanduaTempDir } from "../../../dist/lib/temp-dir.js";
+import {
+  buildMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../../dist/installer/matchlock/policy.js";
 
 import {
   getWorkflowAutoresearchHelp,
@@ -24,6 +28,10 @@ import {
   getWorkflowUninstallHelp,
   handleWorkflow,
 } from "../../../dist/cli/commands/workflow.js";
+import {
+  formatWorkflowRunLaunchLines,
+  workflowRunLaunchInfoToJson,
+} from "../../../dist/installer/workflow-run-resolution.js";
 
 class ExitError extends Error {
   code: number;
@@ -204,6 +212,182 @@ Examples:
   tamandua workflow wait run-abc12345
   tamandua workflow pause run-abc12345 --drain
   tamandua workflow fail run-abc12345 --reason "Stuck run"`);
+  });
+
+  // MTLK-PI-EXEC US-002: the --matchlock run help documents the integrated
+  // pi backend (supported workflows + refusal shapes), never a
+  // "not integrated" claim. Calling the getter is side-effect-free (pure).
+  describe("--matchlock workflow-run help (integrated semantics)", () => {
+    it("documents the explicit per-shape capability-closed workflows under --matchlock (US-004)", () => {
+      const help = getWorkflowRunHelp();
+      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      assert.match(
+        matchlockSection,
+        /Supported workflows under --matchlock in this build are exactly the/,
+      );
+      for (const id of [
+        "do-now",
+        "do-review-do-verify",
+        "feature-dev",
+        "bug-fix",
+        "quarantine-broken-tests",
+        "security-audit",
+        "feature-dev-merge",
+        "bug-fix-merge",
+      ]) {
+        assert.ok(matchlockSection.includes(id), `help must list ${id}`);
+      }
+      assert.match(matchlockSection, /workflow-specific\s+exact reason/);
+    });
+
+    it("no longer claims the Matchlock backend is 'not integrated'", () => {
+      const help = getWorkflowRunHelp();
+      assert.ok(!/not integrated/i.test(help), "help must not claim the backend is not integrated");
+      assert.ok(!/backend_not_integrated/.test(help));
+    });
+
+    // MTLK-HERMES-EXEC US-003: the --matchlock run help documents hermes
+    // support (the guarded Hermes backend is wired end-to-end), still
+    // refuses dsh with --matchlock, and documents that a hermes opt-in
+    // resolves its config from the SUBMISSION environment (never the
+    // daemon's). Help stays a pure string getter — side-effect-free.
+    it("documents --hermes-as-harness support under --matchlock with the submission-env config resolution", () => {
+      const help = getWorkflowRunHelp();
+      // The whole help carries the hermes flag documentation (before the
+      // --matchlock option header), including the --matchlock interaction.
+      assert.match(help, /--hermes-as-harness\n\s+Use hermes as the agent harness instead of pi\./);
+      assert.match(help, /With --matchlock <image>, the run executes the IMAGE's hermes/);
+      assert.match(help, /SUBMISSION\s+environment/);
+      // The --matchlock option section documents the harness axis. MTLK-
+      // HERMES-EXEC asserted "--dsh-as-harness fails" here; MTLK-DSH-EXEC
+      // admits dsh, so the union (MTLK-INTEGRATE US-003) rewrites the losing
+      // refusal assertion to the union's three-harness acceptance.
+      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      assert.match(matchlockSection, /hermes with --hermes-as-harness/);
+      assert.match(matchlockSection, /all three are\s+admitted with --matchlock/);
+      assert.match(matchlockSection, /guest HERMES_HOME/);
+    });
+
+    it("documents image-required, fresh VM per invocation, guest pack CLI, no native fallback and refusal shapes", () => {
+      const help = getWorkflowRunHelp();
+      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      assert.match(matchlockSection, /The image is MANDATORY/);
+      assert.match(matchlockSection, /FRESH Matchlock VM/);
+      assert.match(matchlockSection, /guest\s+reporting CLI at \/workspace\/runtime\/bin\/tamandua/);
+      assert.match(matchlockSection, /NO host\/native fallback/);
+      assert.match(matchlockSection, /REFUSED/);
+      assert.match(matchlockSection, /just-do-it child dispatch/);
+      assert.match(matchlockSection, /PR\/github-pr/);
+    });
+
+    it("remains side-effect-free: the help getter only returns a string", () => {
+      const before = getWorkflowRunHelp();
+      const again = getWorkflowRunHelp();
+      assert.equal(typeof before, "string");
+      assert.ok(before.length > 0);
+      assert.equal(before, again);
+    });
+
+    it("documents the dsh Matchlock opt-in (--matchlock IMAGE --dsh-as-harness) with the whole-home mount, supported workflows and refused capabilities (MTLK-DSH-EXEC US-002)", () => {
+      const help = getWorkflowRunHelp();
+      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      assert.match(matchlockSection, /--dsh-as-harness/);
+      assert.match(matchlockSection, /pi-as-harness \(default\) and --dsh-as-harness/);
+      assert.match(matchlockSection, /DSH_HOME/);
+      assert.match(matchlockSection, /\/workspace\/config\/dsh/);
+      assert.match(matchlockSection, /dsh --profile headless/);
+      assert.match(matchlockSection, /sessions\/, profiles\/, storages\/, credentials\/ and\s+unknown entries as\s+one mount/);
+      // The two-workflow milestone is never labelled completed overall support.
+      assert.match(matchlockSection, /not\s+completed overall workflow support/);
+      assert.match(matchlockSection, /just-do-it child dispatch/);
+      // Help is pure/side-effect-free.
+      assert.equal(getWorkflowRunHelp(), help);
+    });
+
+    // MTLK-ALL-WORKFLOWS US-004: the help lists the explicit per-shape admitted
+    // closure and the precise refusals; every harness carries the same set.
+    it("lists the exact three-harness supported/refused workflow matrix (US-003/US-004 parity)", () => {
+      const help = getWorkflowRunHelp();
+      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+
+      // Accepted: every harness carries the full capability-closed set.
+      for (const id of [
+        "do-now",
+        "do-review-do-verify",
+        "feature-dev",
+        "feature-dev-worktree",
+        "bug-fix",
+        "bug-fix-worktree",
+        "quarantine-broken-tests",
+        "security-audit",
+        "security-audit-worktree",
+        "feature-dev-merge-worktree",
+        "bug-fix-merge-worktree",
+        "feature-dev-merge",
+        "bug-fix-merge",
+        "quarantine-broken-tests-merge",
+        "quarantine-broken-tests-merge-worktree",
+        "security-audit-merge",
+        "security-audit-merge-worktree",
+      ]) {
+        assert.ok(matchlockSection.includes(id), `help must list the admitted workflow id ${id}`);
+      }
+      assert.match(
+        matchlockSection,
+        /All three harnesses \(pi, hermes and dsh\) carry the same admitted workflow/,
+      );
+      assert.match(matchlockSection, /no harness-by-workflow allow-list/);
+      assert.doesNotMatch(
+        matchlockSection,
+        /hermes and dsh\s+currently admit only do-now and do-review-do-verify/,
+      );
+      assert.doesNotMatch(matchlockSection, /Admitted merge shapes are refused for hermes\/dsh/);
+
+      // Refused shapes are shared by every harness and carry precise reasons.
+      assert.match(matchlockSection, /just-do-it child dispatch/);
+      assert.match(matchlockSection, /PR\/github-pr/);
+      assert.match(matchlockSection, /browser\/visual verification/);
+      assert.match(matchlockSection, /skills-normalize-audit scans an operator-specified directory/);
+      assert.match(matchlockSection, /workflow-specific\s+exact reason/);
+      assert.match(matchlockSection, /not completed overall workflow support/);
+
+      // The three harnesses are all admitted; never a pi-only claim.
+      assert.match(matchlockSection, /pi-as-harness \(default\)/);
+      assert.match(matchlockSection, /hermes with --hermes-as-harness/);
+      assert.match(matchlockSection, /--dsh-as-harness/);
+      assert.doesNotMatch(help, /only pi|pi only|only the pi harness is supported/i);
+    });
+
+    // MTLK-VM-SIZE US-002: the help documents the three VM-size flags, their
+    // env defaults, the built-in host-derived defaults and the clamp caps.
+    it("documents --matchlock-cpus/--matchlock-memory/--matchlock-disk with defaults, env vars and caps (US-002)", () => {
+      const help = getWorkflowRunHelp();
+      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+
+      // All three flags are listed in the --matchlock option section.
+      assert.match(matchlockSection, /--matchlock-cpus <n>/);
+      assert.match(matchlockSection, /--matchlock-memory <MB\|Ng>/);
+      assert.match(matchlockSection, /--matchlock-disk <MB\|Ng>/);
+
+      // Accepted value forms.
+      assert.match(matchlockSection, /MB, or a '<n>g' suffix/);
+
+      // Built-in defaults.
+      assert.match(matchlockSection, /min\(8, host online CPUs\)/);
+      assert.match(matchlockSection, /min\(16384 MB, 50% of\s+host MemTotal\)/);
+      assert.match(matchlockSection, /Built-in default: 20480 MB/);
+
+      // Clamp caps.
+      assert.match(matchlockSection, /at most 16 vCPUs/);
+      assert.match(matchlockSection, /at most 75% of\s+host MemTotal/);
+      assert.match(matchlockSection, /finite positive number/);
+
+      // The three env defaults and that each flag requires --matchlock.
+      assert.match(help, /TAMANDUA_MATCHLOCK_CPUS/);
+      assert.match(help, /TAMANDUA_MATCHLOCK_MEMORY_MB/);
+      assert.match(help, /TAMANDUA_MATCHLOCK_DISK_MB/);
+      assert.match(matchlockSection, /Requires --matchlock <image>/);
+    });
   });
 
   it("declines commands owned by other command groups", async () => {
@@ -594,6 +778,44 @@ Examples:
       return output;
     }
 
+    /** Build a valid persisted-shape version-2 Matchlock policy JSON. */
+    function matchlockPolicyJson(
+      limits: { cpus: number; memoryMB: number; diskSizeMB: number } = {
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+      },
+      image = "vic/matchlock-base:latest",
+    ): string {
+      return serializeMatchlockPolicy(
+        buildMatchlockPolicy({
+          requestedImage: image,
+          identity: {
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            config_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            tag: image,
+          },
+          harness: "pi",
+          workingDirectory: "/opt/project",
+          originalRepositoryRoot: "/opt/project",
+          workMounts: [
+            { hostPath: "/opt/project", hostRealPath: "/opt/project", guestPath: "/opt/project" },
+          ],
+          gitMetadataRoots: ["/opt/project/.git"],
+          resourceLimits: limits,
+        }),
+      );
+    }
+
+    /** Persist a Matchlock policy on a seeded run (adds the column if absent). */
+    function setMatchlockPolicy(runId: string, policyJson: string): void {
+      const cols = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "matchlock_policy")) {
+        db.exec("ALTER TABLE runs ADD COLUMN matchlock_policy TEXT");
+      }
+      db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run(policyJson, runId);
+    }
+
     it("getWorkflowStatus exposes harnessType 'dsh' from context", async () => {
       const runId = crypto.randomUUID();
       seedRun(runId, "dsh");
@@ -644,6 +866,53 @@ Examples:
       const output = await captureStatusOutput(runId, ["--json"]);
       const parsed = JSON.parse(output.trim());
       assert.equal(parsed.harnessType, "dsh");
+    });
+
+    // MTLK-VM-SIZE US-004: `workflow status` shows the resolved Matchlock VM
+    // size (human line + --json matchlockResources) only for Matchlock runs.
+    it("workflow status text output prints the matchlock VM size line for Matchlock runs", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      setMatchlockPolicy(runId, matchlockPolicyJson());
+
+      const output = await captureStatusOutput(runId);
+      assert.match(
+        output,
+        /matchlock: vic\/matchlock-base:latest cpus=8 memory=16384MB disk=20480MB/,
+      );
+    });
+
+    it("workflow status text output omits the matchlock line for native runs", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+
+      const output = await captureStatusOutput(runId);
+      assert.doesNotMatch(output, /matchlock:/);
+    });
+
+    it("workflow status --json includes matchlockResources only for Matchlock runs", async () => {
+      const matchlockRunId = crypto.randomUUID();
+      seedRun(matchlockRunId);
+      setMatchlockPolicy(matchlockRunId, matchlockPolicyJson());
+
+      const matchlockOut = await captureStatusOutput(matchlockRunId, ["--json"]);
+      const matchlockJson = JSON.parse(matchlockOut.trim());
+      assert.deepEqual(matchlockJson.matchlockResources, {
+        image: "vic/matchlock-base:latest",
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+      });
+
+      const nativeRunId = crypto.randomUUID();
+      seedRun(nativeRunId);
+      const nativeOut = await captureStatusOutput(nativeRunId, ["--json"]);
+      const nativeJson = JSON.parse(nativeOut.trim());
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(nativeJson, "matchlockResources"),
+        false,
+        "native --json output must not carry matchlockResources",
+      );
     });
   });
 
@@ -1168,5 +1437,94 @@ Examples:
       // Never a raw/naive or fabricated value anywhere in the serialized JSON.
       assert.doesNotMatch(output, /not-an-instant/);
     });
+  });
+});
+
+// MTLK-VM-SIZE US-005: the resolved Matchlock VM facts are fused into the
+// SKILL-UX resolved-launch block and its JSON. These exercise the exact
+// helpers the run action calls (formatWorkflowRunLaunchLines /
+// workflowRunLaunchInfoToJson); the full CLI-level ordering (before the
+// `run #N ... created` line) is pinned in
+// tests/cli-workflow-run-resolution.test.ts.
+describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", () => {
+  function baseLaunchInfo(overrides: Record<string, unknown> = {}): any {
+    return {
+      workspaceMode: "direct",
+      workingDirectory: "/srv/work",
+      clean: true,
+      harnessType: "pi",
+      harnessBinary: "/usr/bin/pi",
+      harnessVersion: "1.2.3",
+      daemonEndpoint: "http://127.0.0.1:3334",
+      daemonOk: true,
+      ...overrides,
+    };
+  }
+
+  it("appends exactly one matchlock line after the daemon line for a Matchlock run", () => {
+    const lines = formatWorkflowRunLaunchLines(
+      baseLaunchInfo({
+        matchlockResources: {
+          image: "vic/matchlock-base:latest",
+          cpus: 4,
+          memoryMB: 4096,
+          diskSizeMB: 20480,
+        },
+      }),
+    );
+
+    assert.deepEqual(lines, [
+      "working-directory: /srv/work clean",
+      "harness: pi /usr/bin/pi (1.2.3)",
+      "daemon: http://127.0.0.1:3334 ok",
+      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB",
+    ]);
+    assert.equal(
+      lines.filter((l) => l.startsWith("matchlock:")).length,
+      1,
+      "the matchlock line must appear exactly once",
+    );
+  });
+
+  it("prints no matchlock line for a native run (resolved block unchanged)", () => {
+    const lines = formatWorkflowRunLaunchLines(baseLaunchInfo());
+    assert.deepEqual(lines, [
+      "working-directory: /srv/work clean",
+      "harness: pi /usr/bin/pi (1.2.3)",
+      "daemon: http://127.0.0.1:3334 ok",
+    ]);
+    assert.ok(!lines.some((l) => l.startsWith("matchlock:")));
+  });
+
+  it("carries the same matchlockResources shape as workflow status --json", () => {
+    const json = workflowRunLaunchInfoToJson(
+      baseLaunchInfo({
+        matchlockResources: {
+          image: "vic/matchlock-base:latest",
+          cpus: 4,
+          memoryMB: 4096,
+          diskSizeMB: 20480,
+        },
+      }),
+    );
+
+    assert.deepEqual(json.matchlockResources, {
+      image: "vic/matchlock-base:latest",
+      cpus: 4,
+      memoryMB: 4096,
+      diskSizeMB: 20480,
+    });
+  });
+
+  it("omits matchlockResources from the launch JSON for a native run", () => {
+    const json = workflowRunLaunchInfoToJson(baseLaunchInfo());
+    assert.ok(!("matchlockResources" in json));
+    assert.deepEqual(Object.keys(json).sort(), [
+      "clean",
+      "daemon",
+      "harness",
+      "workingDirectory",
+      "workspaceMode",
+    ]);
   });
 });

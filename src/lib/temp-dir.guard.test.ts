@@ -62,7 +62,19 @@ const OS_TMPDIR_ALLOWLIST: Record<string, string> = {
   "src/lib/temp-dir.guard.test.ts":
     "the guard test itself — detection regex and test data",
 
+  // Subprocess TMPDIR fallback: the gate runner needs a writable TMPDIR for
+  // the shell it spawns.  os.tmpdir() here is a per-user writeable directory
+  // supplied as an env value (like the scripted-* HOME fallbacks), NOT a
+  // Tamandua-managed temp asset.
+  "tests/e2e-infrastructure.test.ts":
+    "TMPDIR fallback for a spawned gate subprocess env — not a temp asset",
 
+  // AF_UNIX sun_path limit: the FIFO/socket leaf case binds a unix socket at
+  // `<root>/<run-uuid>/progress-resource/progress.txt`; the tamanduaTempRoot
+  // base would push the path past 108 bytes (EINVAL), so this file needs the
+  // short os.tmpdir() base.
+  "src/installer/matchlock/progress-resource.test.ts":
+    "AF_UNIX socket fixture needs a short os.tmpdir() base to stay under sun_path",
 };
 
 /**
@@ -153,6 +165,56 @@ const TMP_PATH_ALLOWLIST: Record<string, string> = {
   "scripts/prll-verify.sh":
     "uses TAMANDUA_TEST_TMPDIR with /tmp/tamandua-test default (correct pattern)",
 
+  // ── Matchlock short-HOME alias literals ──
+  // The alias feature's WHOLE point is a literal short `/tmp/tamandua/<uid>/h`
+  // root (never the ambient TMPDIR, which can be deep), and the product tests
+  // assert that exact literal.  These are deliberate path literals, not
+  // Tamandua-managed temp assets; no fixture creates a real directory there.
+
+  "src/installer/matchlock/home-alias.ts":
+    "product default alias root is deliberately the LITERAL /tmp/tamandua/<uid>",
+  "src/installer/matchlock/home-alias.test.ts":
+    "asserts the literal /tmp/tamandua/<uid>/h alias path fixtures",
+  "src/installer/matchlock/controller.test.ts":
+    "short-HOME fixture uses the literal /tmp/tamandua/1234/h alias path",
+  "src/installer/matchlock/scheduler-home-alias-wiring.test.ts":
+    "asserts the literal /tmp/tamandua/<uid>/h alias wiring fixtures",
+  "src/installer/matchlock/dsh-profile-overlay.test.ts":
+    "fixture strings for live/foreign state roots under /tmp",
+  "tests/matchlock-long-home-plumbing.test.ts":
+    "deliberately short alias root and /tmp evidence fixture path",
+
+  // ── Identity-socket long-state-dir alias literals ──
+  // Same rationale as the Matchlock short-HOME alias: the DPID identity socket
+  // alias exists so the socket path fits `sun_path` under a deep state dir, so
+  // its root is deliberately the LITERAL `/tmp/tamandua/<uid>/s/<digest>`
+  // (never the ambient TMPDIR). No test creates a real directory at that exact
+  // path (tests inject a private alias root).
+  "src/server/daemon-identity.ts":
+    "product default alias root is deliberately the LITERAL /tmp/tamandua/<uid>/s/<digest>",
+
+  // ── Matchlock guest paths ──
+  // The guest bridge binds its socket inside the VM at `/tmp/tamandua-guest-*`;
+  // that literal is the GUEST path contract, not a host temp directory.
+
+  "src/installer/matchlock/pi-invocation-runner.ts":
+    "GUEST socket dir contract /tmp/tamandua-guest-<invocationId> inside the VM",
+  "src/installer/matchlock/pi-invocation-runner.test.ts":
+    "cleans up the GUEST socket dir path /tmp/tamandua-guest-<invocationId>",
+  "src/installer/matchlock/hermes-invocation-runner.test.ts":
+    "cleans up the GUEST socket dir path /tmp/tamandua-guest-<invocationId>",
+
+  // The fsync diagnosis gate writes its trace artifacts at GUEST paths under
+  // `/tmp/tamandua-dsh-*` inside the VM (the interposer, strace wrapper and
+  // mount dump run in the guest), never in a host temp directory.
+  "e2e-tests/helpers/matchlock-dsh-fsync-trace.ts":
+    "GUEST trace artifact paths /tmp/tamandua-dsh-* inside the VM",
+  "tests/matchlock-dsh-fsync-diagnosis.test.ts":
+    "asserts the GUEST /tmp/custom.* log paths embedded in the wrapper script",
+
+  // Comment-only mention of the literal alias root in the gate's docs block.
+  "e2e-tests/matchlock-long-home-gate.test.ts":
+    "comment-only mention of the literal short alias root — not a call",
 };
 
 // -------------------------------------------------------------------

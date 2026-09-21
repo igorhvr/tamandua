@@ -25,11 +25,61 @@
 #
 # Output is streamed to the terminal AND tee'd to a log file for inspection.
 # Exit code is non-zero if either suite fails.
+#
+# The two tiers run as two SEQUENTIAL `node --test` invocations. The smoke
+# tier manually provisions a workspace per scenario via `workflow run`
+# (git worktree + agent/skill copy), which is CPU/IO heavy and starves under
+# the concurrent scripted pipelines when both tiers share one invocation —
+# tripping the run-id deadline on loaded runners. Running smoke alone first
+# removes that contention (both tiers stay fast and zero-token, and any
+# failure still fails the gate).
+#
+# The scripted tier additionally runs with `--test-concurrency=1`: every file
+# there spawns a real daemon + CLI + harness processes against its own SQLite
+# DB, and running all twelve files at once stretched transaction lock waits past
+# the 5s busy timeout on a loaded runner (a `tamandua workflow run` would exit
+# 1 with "database is locked"). Serializing the files removes the cross-file
+# CPU/IO contention; the tests and assertions are unchanged.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 LOG="${TAMANDUA_E2E_TEST_LOG:-e2e-test-output.log}"
 
-npm run build
-node --test e2e-tests/workflows-smoke.test.ts e2e-tests/workflows-scripted.test.ts e2e-tests/workflows-scripted-hermes.test.ts e2e-tests/workflows-scripted-dsh.test.ts e2e-tests/workflows-harness-probe.test.ts e2e-tests/workflows-instant-fail-loop.test.ts e2e-tests/workflows-instant-fail-threshold.test.ts e2e-tests/workflows-preclaim-death-loop.test.ts e2e-tests/autoresearch-scripted.test.ts e2e-tests/fixture-health.test.ts e2e-tests/workflows-verify-each-nonadjacent.test.ts e2e-tests/workflows-verifier-verdict-retry.test.ts e2e-tests/workflows-round-git-identity.test.ts e2e-tests/workflows-drain-verify-pause.test.ts e2e-tests/workflows-stress-concurrent.test.ts 2>&1 | tee "$LOG"
-exit "${PIPESTATUS[1]}"
+BUILD_CMD="npm run build"
+SMOKE_TIER_CMD="node --test e2e-tests/workflows-smoke.test.ts"
+SCRIPTED_TIER_CMD="node --test --test-concurrency=1 e2e-tests/workflows-scripted.test.ts e2e-tests/workflows-scripted-hermes.test.ts e2e-tests/workflows-scripted-dsh.test.ts e2e-tests/workflows-harness-probe.test.ts e2e-tests/workflows-instant-fail-loop.test.ts e2e-tests/workflows-instant-fail-threshold.test.ts e2e-tests/workflows-preclaim-death-loop.test.ts e2e-tests/autoresearch-scripted.test.ts e2e-tests/fixture-health.test.ts e2e-tests/workflows-verify-each-nonadjacent.test.ts e2e-tests/workflows-verifier-verdict-retry.test.ts e2e-tests/workflows-round-git-identity.test.ts e2e-tests/workflows-drain-verify-pause.test.ts e2e-tests/workflows-stress-concurrent.test.ts"
+
+# Test seam for the failure-propagation regression (tests/e2e-infrastructure.test.ts):
+# with TAMANDUA_E2E_TEST_MODE=1 the three commands may be replaced by `true`/`false`
+# so the exit-code plumbing can be exercised without a 10+ minute suite. Without
+# that explicit opt-in the real commands above are hardwired, so an inherited
+# environment cannot fake the production gate green.
+if [ "${TAMANDUA_E2E_TEST_MODE:-0}" = "1" ]; then
+  BUILD_CMD="${TAMANDUA_E2E_BUILD_CMD:-$BUILD_CMD}"
+  SMOKE_TIER_CMD="${TAMANDUA_E2E_SMOKE_CMD:-$SMOKE_TIER_CMD}"
+  SCRIPTED_TIER_CMD="${TAMANDUA_E2E_SCRIPTED_CMD:-$SCRIPTED_TIER_CMD}"
+fi
+
+$BUILD_CMD
+
+# Exit-code capture: PIPESTATUS reflects the pipeline that JUST finished, and
+# ANY intervening command (including a bare assignment) resets it. The producer
+# is element [0]; `tee` is element [1] and is always 0. Capture the whole array
+# into a variable IMMEDIATELY after each pipeline, then read element 0.
+set +e
+echo "== smoke tier: $SMOKE_TIER_CMD =="
+bash -c "$SMOKE_TIER_CMD" 2>&1 | tee "$LOG"
+smoke_status=("${PIPESTATUS[@]}")
+smoke_rc="${smoke_status[0]}"
+
+echo "== scripted tier: $SCRIPTED_TIER_CMD =="
+bash -c "$SCRIPTED_TIER_CMD" 2>&1 | tee -a "$LOG"
+scripted_status=("${PIPESTATUS[@]}")
+scripted_rc="${scripted_status[0]}"
+set -e
+
+if [ "$smoke_rc" -ne 0 ] || [ "$scripted_rc" -ne 0 ]; then
+  echo "e2e gate FAILED: smoke_rc=$smoke_rc scripted_rc=$scripted_rc" | tee -a "$LOG"
+  exit 1
+fi
+exit 0

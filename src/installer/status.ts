@@ -1,13 +1,14 @@
 import { getDb } from "../db.js";
-import { SQL_NOW_ISO } from "../lib/instant.js";
+import { SQL_NOW_ISO, formatInstant } from "../lib/instant.js";
 import { scheduleRunCronTeardown, getWorkflowId, emitRunTerminalEvent, parseRunContext } from "./step-ops.js";
 import { removeRunCrons, settleRunInFlightRounds, HARNESS_TEARDOWN_GRACE_MS } from "./agent-scheduler.js";
 import { terminateRunWithDaemon } from "../server/control-client.js";
 import { getRunWorktree, removeRunWorktree } from "./worktree-manager.js";
 import { emitEvent, getRunEvents } from "./events.js";
 import { logger } from "../lib/logger.js";
-import { stripIdPrefix } from "../lib/id-prefix.js";
+import { stripIdPrefix, prefixRunId, prefixStepId } from "../lib/id-prefix.js";
 import { displayStepStatus } from "../lib/step-display.js";
+import { parseMatchlockPolicy } from "./matchlock/policy.js";
 import type { HarnessType } from "./types.js";
 
 export interface RunInfo {
@@ -49,6 +50,20 @@ export interface RedLedgerLanding {
   ledgerCreatedAt: string;
 }
 
+/**
+ * The resolved Matchlock VM resources surfaced to operator status surfaces
+ * (MTLK-VM-SIZE US-004). Built ONLY from a persisted version-2
+ * `runs.matchlock_policy` that parses; a native run (NULL policy) or a
+ * legacy/unreadable policy omits this entirely so status never throws.
+ */
+export interface MatchlockResourceInfo {
+  /** Operator-supplied image from the persisted policy. */
+  image: string;
+  cpus: number;
+  memoryMB: number;
+  diskSizeMB: number;
+}
+
 export interface RunDetail extends RunInfo {
   runNumber?: number;
   steps: StepInfo[];
@@ -70,6 +85,9 @@ export interface RunDetail extends RunInfo {
   worktree_origin_repository?: string;
   worktree_origin_ref?: string;
   worktree_origin_sha?: string;
+  /** Resolved Matchlock VM limits from a persisted v2 policy; undefined for
+   *  native runs and legacy/unreadable policies. */
+  matchlockResources?: MatchlockResourceInfo;
 }
 
 export interface StepInfo {
@@ -103,6 +121,107 @@ export interface StoryInfo {
 }
 
 /**
+ * Build the native `tamandua workflow status <run> --json` run-JSON object
+ * (US-004 shared builder).
+ *
+ * MTLK US-004 extracted this verbatim from the workflow CLI status action so
+ * the Matchlock host query service can answer the guest `workflow status
+ * <run> --json` bridge op with the EXACT same object the native CLI prints
+ * (byte-identical after JSON.stringify). Keep this byte-identical with the
+ * native CLI output; `workflow.ts` delegates to it.
+ */
+export function buildWorkflowStatusJson(result: RunDetail): Record<string, unknown> {
+  const jsonSteps = result.steps.map((s) => {
+    const entry: Record<string, unknown> = {
+      stepId: prefixStepId(s.stepId),
+      stepIndex: s.stepIndex,
+      agentRole: s.agentId.split("_").slice(-1)[0],
+      status: s.status,
+      displayStatus: s.displayStatus,
+      retryCount: s.retryCount,
+    };
+    if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
+    if (s.rerouteCount !== undefined) entry.rerouteCount = s.rerouteCount;
+    if (s.claimPid !== undefined) entry.claimPid = s.claimPid;
+    // TIME-OUTPUT US-005: instants serialize as ISO-8601 UTC with Z (legacy
+    // naive normalized); a missing/unparseable value is omitted.
+    const claimUpdatedAt = formatInstant(s.claimUpdatedAt, { style: "iso" });
+    if (claimUpdatedAt !== undefined) entry.claimUpdatedAt = claimUpdatedAt;
+    const updatedAt = formatInstant(s.updatedAt, { style: "iso" });
+    if (updatedAt !== undefined) entry.updatedAt = updatedAt;
+    return entry;
+  });
+  const jsonStories = result.stories ? result.stories.map((s) => {
+    const entry: Record<string, unknown> = {
+      storyId: s.storyId,
+      title: s.title,
+      status: s.status,
+      // YSE US-005: machine-readable reset-on-resume counters. status
+      // stays the RAW stored value; resumeResetCount (0 when the story
+      // was never reset) and priorFailureCount (only when > 0) expose
+      // the reset history.
+      resumeResetCount: s.resumeResetCount,
+    };
+    if (s.resumeResetCount > 0) entry.priorFailureCount = s.resumeResetCount;
+    if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
+    const storyUpdatedAt = formatInstant(s.updatedAt, { style: "iso" });
+    if (storyUpdatedAt !== undefined) entry.updatedAt = storyUpdatedAt;
+    return entry;
+  }) : undefined;
+  const jsonOutput: Record<string, unknown> = {
+    runId: prefixRunId(result.id),
+    runNumber: result.runNumber,
+    workflowId: result.workflowId,
+    status: result.status,
+    harnessType: result.harnessType,
+    task: result.task.slice(0, 200),
+    tokensSpent: result.tokensSpent,
+    // OUTAGE-ROUNDS (SCLS) US-006: machine-readable per-run pre-claim
+    // death total (SUM of the per-step counters).
+    preclaimDeathCount: result.preclaimDeathCount,
+  };
+  // TIME-OUTPUT US-005: run-level instants are ISO-8601 UTC with Z (legacy
+  // naive normalized); a missing/unparseable value is omitted.
+  const createdAt = formatInstant(result.createdAt, { style: "iso" });
+  if (createdAt !== undefined) jsonOutput.createdAt = createdAt;
+  const runUpdatedAt = formatInstant(result.updatedAt, { style: "iso" });
+  if (runUpdatedAt !== undefined) jsonOutput.updatedAt = runUpdatedAt;
+  jsonOutput.steps = jsonSteps;
+  // PAUS US-004: surface the daemon-side scheduling state (e.g.
+  // draining_pause) machine-readably when it is set.
+  if (result.schedulingStatus) jsonOutput.schedulingStatus = result.schedulingStatus;
+  // WORKDIR-QUEUE US-004: expose the scheduling reason (e.g. the
+  // workdir-busy wait text) so JSON consumers can tell waiting from
+  // dead without reconstructing it.
+  if (result.schedulingError) jsonOutput.schedulingError = result.schedulingError;
+  if (jsonStories) jsonOutput.stories = jsonStories;
+  if (result.redLedgerLanding) {
+    // TIME-OUTPUT US-005: the landing instant serializes as ISO-Z; when it is
+    // missing/unparseable only that field is omitted (the row id and exit code
+    // remain).
+    const landing: Record<string, unknown> = {
+      ledgerRowId: result.redLedgerLanding.ledgerRowId,
+      exitCode: result.redLedgerLanding.exitCode,
+    };
+    const ledgerCreatedAt = formatInstant(result.redLedgerLanding.ledgerCreatedAt, { style: "iso" });
+    if (ledgerCreatedAt !== undefined) landing.ledgerCreatedAt = ledgerCreatedAt;
+    jsonOutput.redLedgerLanding = landing;
+  }
+  if (result.workspace_mode === "worktree") {
+    jsonOutput.workspaceMode = result.workspace_mode;
+    if (result.worktree_path) jsonOutput.worktreePath = result.worktree_path;
+    if (result.worktree_origin_ref) jsonOutput.worktreeOriginRef = result.worktree_origin_ref;
+  }
+  // MTLK-VM-SIZE US-004: expose the resolved Matchlock VM size ONLY when a v2
+  // policy parsed, so native runs keep a byte-identical JSON shape. A legacy
+  // (v1) or malformed policy omits it rather than failing the query.
+  if (result.matchlockResources) {
+    jsonOutput.matchlockResources = result.matchlockResources;
+  }
+  return jsonOutput;
+}
+
+/**
  * Find a run by id prefix or task substring match.
  * Returns the run detail if exactly one match is found.
  * Throws if zero or multiple matches.
@@ -119,7 +238,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   // Try exact id match first (original)
   let row = db
     .prepare(
-      "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count FROM runs WHERE id = ?",
+      "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE id = ?",
     )
     .get(query) as unknown as (RunRow & { run_number: number | null }) | undefined;
 
@@ -127,7 +246,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row && useOriginal) {
     row = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count FROM runs WHERE id = ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE id = ?",
       )
       .get(stripped) as unknown as (RunRow & { run_number: number | null }) | undefined;
   }
@@ -136,7 +255,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let prefixRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count FROM runs WHERE id LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE id LIKE ?",
       )
       .all(`${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
@@ -144,7 +263,7 @@ export function getWorkflowStatus(query: string): RunDetail {
     if (prefixRows.length === 0 && useOriginal) {
       prefixRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count FROM runs WHERE id LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE id LIKE ?",
         )
         .all(`${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -165,7 +284,7 @@ export function getWorkflowStatus(query: string): RunDetail {
       const num = Number(nMatch[1]);
       row = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count FROM runs WHERE run_number = ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE run_number = ?",
         )
         .get(num) as unknown as (RunRow & { run_number: number | null }) | undefined;
       if (!row) {
@@ -178,14 +297,14 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let taskRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count FROM runs WHERE task LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE task LIKE ?",
       )
       .all(`%${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
     if (taskRows.length === 0 && useOriginal) {
       taskRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count FROM runs WHERE task LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE task LIKE ?",
         )
         .all(`%${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -571,6 +690,8 @@ interface RunRow {
   /** OUTAGE-ROUNDS (SCLS): SUM(steps.preclaim_death_count) — the correlated
    *  subquery alias carried by every run SELECT in this module. */
   preclaim_death_count: number;
+  /** Persisted Matchlock v2 policy (NULL for native runs). */
+  matchlock_policy: string | null;
 }
 
 function getStepSummary(db: ReturnType<typeof getDb>, runId: string): string {
@@ -746,6 +867,25 @@ function buildRunDetail(
     }
   }
 
+  // MTLK-VM-SIZE US-004: surface the resolved VM limits for Matchlock runs.
+  // parseMatchlockPolicy THROWS on a legacy version-1 unpinned record or a
+  // malformed row; a status query must never break on one, so swallow the
+  // error and omit the limits (the rest of the run detail is unaffected).
+  let matchlockResources: MatchlockResourceInfo | undefined;
+  if (row.matchlock_policy) {
+    try {
+      const policy = parseMatchlockPolicy(row.matchlock_policy);
+      matchlockResources = {
+        image: policy.requestedImage,
+        cpus: policy.resourceLimits.cpus,
+        memoryMB: policy.resourceLimits.memoryMB,
+        diskSizeMB: policy.resourceLimits.diskSizeMB,
+      };
+    } catch {
+      matchlockResources = undefined;
+    }
+  }
+
   return {
     id: row.id,
     runNumber: (row as any).run_number ?? undefined,
@@ -763,6 +903,7 @@ function buildRunDetail(
     instantFailCount: row.instant_fail_count,
     preclaimDeathCount: row.preclaim_death_count,
     ...(redLedgerLanding ? { redLedgerLanding } : {}),
+    ...(matchlockResources ? { matchlockResources } : {}),
     steps: stepInfos,
     stories: storyInfos.length > 0 ? storyInfos : undefined,
     harnessType,

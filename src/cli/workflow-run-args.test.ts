@@ -509,4 +509,292 @@ describe("parseWorkflowRunArgs", () => {
       });
     });
   });
+
+  // MTLK-PI US-001: `--matchlock` opt-in parsing.
+  describe("--matchlock", () => {
+    it("parses --matchlock IMAGE (space form)", () => {
+      const result = parseWorkflowRunArgs(["Build feature", "--matchlock", "vic/ml:latest"]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.taskTitle, "Build feature");
+    });
+
+    it("parses --matchlock=IMAGE (equals form)", () => {
+      const result = parseWorkflowRunArgs(["Build feature", "--matchlock=vic/ml:latest"]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.taskTitle, "Build feature");
+    });
+
+    it("matchlockImage is undefined when --matchlock is absent", () => {
+      const result = parseWorkflowRunArgs(["Build feature"]);
+      assert.equal(result.matchlockImage, undefined);
+    });
+
+    it("rejects --matchlock with a missing value (flag at end)", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["Build feature", "--matchlock"]),
+        /Missing value for --matchlock/,
+      );
+    });
+
+    it("rejects --matchlock= (empty value)", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["Build feature", "--matchlock="]),
+        /Missing value for --matchlock/,
+      );
+    });
+
+    it("rejects a duplicate --matchlock", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["--matchlock", "a", "--matchlock", "b"]),
+        /Duplicate --matchlock/,
+      );
+    });
+
+    it("rejects a duplicate via mixed forms", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["--matchlock=a", "--matchlock=b"]),
+        /Duplicate --matchlock/,
+      );
+    });
+
+    it("rejects a value that is another recognized --flag (never consumes it)", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["--matchlock", "--pi-as-harness"]),
+        /is an option, not an image/,
+      );
+    });
+
+    it("allows --matchlock with explicit --pi-as-harness", () => {
+      const result = parseWorkflowRunArgs([
+        "task",
+        "--matchlock", "vic/ml:latest",
+        "--pi-as-harness",
+      ]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.harnessAs, "pi");
+    });
+
+    it("allows --matchlock combined with --hermes-as-harness", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock", "vic/ml", "--hermes-as-harness"]);
+      assert.equal(result.matchlockImage, "vic/ml");
+      assert.equal(result.harnessAs, "hermes");
+    });
+
+    it("allows --matchlock combined with --hermes-as-harness (hermes first) — union supersedes the pi+dsh refusal", () => {
+      // MTLK-DSH-EXEC union MTLK-HERMES-EXEC: the pi+dsh slice rejected
+      // --hermes-as-harness with --matchlock ("only supported with
+      // --pi-as-harness or --dsh-as-harness"). The three-harness union admits
+      // all three, so the losing rejection assertion is rewritten to accept.
+      const result = parseWorkflowRunArgs(["task", "--hermes-as-harness", "--matchlock", "vic/ml"]);
+      assert.equal(result.matchlockImage, "vic/ml");
+      assert.equal(result.harnessAs, "hermes");
+    });
+
+    it("allows --matchlock with --pi-as-harness, --hermes-as-harness and --dsh-as-harness (MTLK-INTEGRATE US-003 acceptance)", () => {
+      // MTLK-PI-EXEC union MTLK-HERMES-EXEC union MTLK-DSH-EXEC: the union
+      // accepts exactly the union of the three harness opt-ins; the earlier
+      // pairwise refusals (dsh in the pi+hermes slice, hermes in the pi+dsh
+      // slice) are superseded by this explicit acceptance assertion.
+      for (const harness of ["pi", "hermes", "dsh"] as const) {
+        const result = parseWorkflowRunArgs(["task", `--${harness}-as-harness`, "--matchlock", "vic/ml"]);
+        assert.equal(result.matchlockImage, "vic/ml");
+        assert.equal(result.harnessAs, harness);
+      }
+    });
+
+    it("allows --matchlock IMAGE with --dsh-as-harness (MTLK-DSH-EXEC US-002)", () => {
+      const result = parseWorkflowRunArgs([
+        "task",
+        "--matchlock", "vic/ml:latest",
+        "--dsh-as-harness",
+      ]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.harnessAs, "dsh");
+    });
+
+    it("allows --matchlock=IMAGE with --dsh-as-harness (order independent)", () => {
+      const result = parseWorkflowRunArgs([
+        "--dsh-as-harness",
+        "--matchlock=vic/ml:latest",
+        "task",
+      ]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.harnessAs, "dsh");
+    });
+
+    it("still parses --dsh-as-harness WITHOUT --matchlock (native dsh unchanged)", () => {
+      const result = parseWorkflowRunArgs(["task", "--dsh-as-harness"]);
+      assert.equal(result.matchlockImage, undefined);
+      assert.equal(result.harnessAs, "dsh");
+    });
+
+    it("rejects --matchlock where the value is another recognized option even for dsh", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["--matchlock", "--dsh-as-harness"]),
+        /is an option, not an image/,
+      );
+    });
+
+    it("--matchlock after the -- separator is task text, not a flag", () => {
+      const result = parseWorkflowRunArgs(["task", "--", "--matchlock", "vic/ml"]);
+      assert.equal(result.matchlockImage, undefined);
+      assert.equal(result.taskTitle, "task --matchlock vic/ml");
+    });
+  });
+
+  // MTLK-VM-SIZE US-002: the three raw VM-size overrides.
+  describe("--matchlock size flags", () => {
+    const parseWithImage = (sizeArgs: string[]) =>
+      parseWorkflowRunArgs(["Build feature", "--matchlock", "vic/ml", ...sizeArgs]);
+
+    it("parses all three space forms into raw strings", () => {
+      const result = parseWithImage([
+        "--matchlock-cpus", "4",
+        "--matchlock-memory", "4096",
+        "--matchlock-disk", "40g",
+      ]);
+      assert.equal(result.matchlockCpus, "4");
+      assert.equal(result.matchlockMemory, "4096");
+      assert.equal(result.matchlockDisk, "40g");
+    });
+
+    it("parses all three --flag=value forms into raw strings", () => {
+      const result = parseWithImage([
+        "--matchlock-cpus=8",
+        "--matchlock-memory=16g",
+        "--matchlock-disk=20480",
+      ]);
+      assert.equal(result.matchlockCpus, "8");
+      assert.equal(result.matchlockMemory, "16g");
+      assert.equal(result.matchlockDisk, "20480");
+    });
+
+    it("size fields are undefined when the flags are absent", () => {
+      const result = parseWorkflowRunArgs(["Build feature", "--matchlock", "vic/ml"]);
+      assert.equal(result.matchlockCpus, undefined);
+      assert.equal(result.matchlockMemory, undefined);
+      assert.equal(result.matchlockDisk, undefined);
+    });
+
+    it("keeps raw unvalidated strings (no numeric validation in the parser)", () => {
+      const result = parseWithImage(["--matchlock-cpus", "not-a-number"]);
+      assert.equal(result.matchlockCpus, "not-a-number");
+    });
+
+    it("rejects a duplicate of any of the three flags", () => {
+      for (const [header, value] of [
+        ["--matchlock-cpus", "4"],
+        ["--matchlock-memory", "4096"],
+        ["--matchlock-disk", "20480"],
+      ] as const) {
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task", "--matchlock", "img",
+              header, value, header, value,
+            ]),
+          new RegExp(`Duplicate ${header}`),
+        );
+      }
+    });
+
+    it("rejects a duplicate via mixed space and equals forms", () => {
+      assert.throws(
+        () => parseWithImage(["--matchlock-cpus", "4", "--matchlock-cpus=8"]),
+        /Duplicate --matchlock-cpus/,
+      );
+    });
+
+    it("rejects a missing value for any of the three flags", () => {
+      for (const header of [
+        "--matchlock-cpus",
+        "--matchlock-memory",
+        "--matchlock-disk",
+      ] as const) {
+        assert.throws(
+          () => parseWithImage([header]),
+          new RegExp(`Missing value for ${header}`),
+        );
+      }
+    });
+
+    it("rejects an empty value for any of the three flags", () => {
+      for (const header of [
+        "--matchlock-cpus",
+        "--matchlock-memory",
+        "--matchlock-disk",
+      ] as const) {
+        assert.throws(
+          () => parseWorkflowRunArgs(["task", "--matchlock", "img", `${header}=`]),
+          new RegExp(`Missing value for ${header}`),
+        );
+      }
+    });
+
+    it("never consumes another recognized option as a size value (space and equals forms)", () => {
+      assert.throws(
+        () => parseWithImage(["--matchlock-cpus", "--wait"]),
+        /is an option, not a value/,
+      );
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock", "img", "--matchlock-disk=--pi-as-harness"]),
+        /is an option, not a value/,
+      );
+    });
+
+    it("'--matchlock --matchlock-cpus 4' does not consume the flag as the image and reports the missing-image error", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-cpus", "4"]),
+        /Missing value for --matchlock/,
+      );
+      // The partial-run guard: the size flag is treated as an option, never
+      // as the image.
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-cpus=4"]),
+        /Missing value for --matchlock/,
+      );
+    });
+
+    it("rejects a size flag supplied without --matchlock", () => {
+      for (const [header, value] of [
+        ["--matchlock-cpus", "4"],
+        ["--matchlock-memory", "4096"],
+        ["--matchlock-disk", "20480"],
+      ] as const) {
+        assert.throws(
+          () => parseWorkflowRunArgs(["task", header, value]),
+          new RegExp(`${header} requires --matchlock <image>`),
+        );
+      }
+    });
+
+    it("rejects an equals-form size flag supplied without --matchlock", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock-memory=4096"]),
+        /--matchlock-memory requires --matchlock <image>/,
+      );
+    });
+
+    it("size flags after the -- separator are task text, not flags", () => {
+      const result = parseWorkflowRunArgs([
+        "task", "--", "--matchlock-cpus", "4",
+      ]);
+      assert.equal(result.matchlockCpus, undefined);
+      assert.equal(result.taskTitle, "task --matchlock-cpus 4");
+    });
+
+    it("size flags combine with a harness opt-in and --matchlock", () => {
+      const result = parseWorkflowRunArgs([
+        "task",
+        "--dsh-as-harness",
+        "--matchlock", "vic/ml",
+        "--matchlock-cpus", "4",
+        "--matchlock-memory=8g",
+      ]);
+      assert.equal(result.harnessAs, "dsh");
+      assert.equal(result.matchlockImage, "vic/ml");
+      assert.equal(result.matchlockCpus, "4");
+      assert.equal(result.matchlockMemory, "8g");
+    });
+  });
 });

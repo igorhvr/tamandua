@@ -2118,14 +2118,19 @@ function resolveControlStandaloneScript(): string {
   return prodPath;
 }
 
-async function waitForHealthEndpoint(url: string, timeoutMs = 10_000): Promise<void> {
+export async function waitForHealthEndpoint(url: string, timeoutMs = 10_000): Promise<void> {
   const deadline = new Deadline(timeoutMs);
   while (!deadline.expired()) {
     try {
-      const res = await fetch(url);
+      // Bound EACH attempt. A socket that accepts but never responds (e.g. a
+      // plain http.Server with no request handler, as e2e tests use to hold a
+      // port) leaves an unbounded `fetch` hanging forever, so the loop's own
+      // 10s deadline would never be re-checked and `startDaemon` would hang
+      // far past it. AbortSignal.timeout makes the deadline authoritative.
+      const res = await fetch(url, { signal: AbortSignal.timeout(1_000) });
       if (res.ok) return;
     } catch {
-      // Server not reachable yet
+      // Server not reachable yet (or this attempt timed out)
     }
     await sleep(100);
   }

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
@@ -13,6 +14,7 @@ import {
   getDashboardPidFile,
   getDashboardPortFile,
   getDashboardLogFile,
+  waitForHealthEndpoint,
 } from "../../dist/server/daemonctl.js";
 
 describe("daemonctl port helpers", () => {
@@ -110,4 +112,52 @@ describe("daemonctl port helpers", () => {
     assert.ok(dashPort.startsWith(tempHome));
     assert.ok(dashLog.startsWith(tempHome));
   });
+});
+
+// Regression: `startDaemon` waits for the daemon's health endpoint, but a
+// socket that accepts and never responds (a plain `http.Server` with no
+// request handler, exactly how e2e tests hold a reserved port) used to hang
+// an unbounded `fetch` forever, so the health wait blew far past its 10s
+// deadline. That surfaced as a smoke-tier `workflow run` workspace-prep hang
+// (the daemon PID file is written before the control-port bind fails, the
+// parent catches it, then fetches the test's held port). Bound each attempt.
+describe("daemonctl waitForHealthEndpoint", () => {
+  it(
+    "times out at its deadline when the port accepts but never responds",
+    { timeout: 20_000 },
+    async () => {
+      const server = http.createServer(); // no request handler => no response
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      const url = `http://127.0.0.1:${address.port}/control/health`;
+
+      try {
+        // Race a watchdog so a reintroduced unbounded fetch fails the test
+        // with a clear assertion instead of hanging the whole process.
+        const outcome = await Promise.race([
+          waitForHealthEndpoint(url, 2_000).then(
+            () => "resolved" as const,
+            (err: unknown) => err,
+          ),
+          new Promise<"hung">((resolve) => {
+            const timer = setTimeout(() => resolve("hung"), 12_000);
+            // Don't keep the event loop alive for the full watchdog window
+            // once the race has already settled.
+            timer.unref();
+          }),
+        ]);
+        assert.ok(
+          outcome instanceof Error &&
+            /Timed out waiting for health endpoint/.test(outcome.message),
+          `expected a bounded timeout rejection, got ${String(outcome)}`,
+        );
+      } finally {
+        // Destroy any keep-alive connection the aborted fetch pooled, then
+        // close — otherwise the server waits on it and the process lingers.
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+  );
 });

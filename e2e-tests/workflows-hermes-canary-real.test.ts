@@ -193,6 +193,14 @@ describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
         );
 
         console.log(
+          `[hermes-canary reconciliation] runs.tokens_spent=${reconciliation.workTokens} ` +
+            `store.policyTotal=${reconciliation.store.policyTotal} ` +
+            `store.cacheInclusiveTotal=${reconciliation.store.cacheInclusiveTotal} ` +
+            `sessions=${reconciliation.store.sessions} ` +
+            `usageCount=${reconciliation.store.usageCount} ` +
+            `policy=input+output+cache_write cache_read=excluded matched=true`,
+        );
+        console.log(
           `[hermes-canary baseline] do-now: workTokens=${audit.workTokens} ` +
             `systemTokens=${audit.systemTokens} tokenUpdateEvents=${audit.tokenUpdateEvents} ` +
             `terminalTokensSpent=${audit.terminalTokensSpent}`,

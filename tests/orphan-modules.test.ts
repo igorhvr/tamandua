@@ -12,11 +12,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 
-// These two source surfaces predate package export metadata. They are kept
+// These source surfaces predate package export metadata. They are kept
 // deliberately: index.ts is the library facade, while cli/shared.ts is the
 // reserved shared API for the planned CLI re-split. Keep this exceptional
 // baseline short; runtime entrypoints belong in package/build metadata.
-const SOURCE_SURFACE_EXCEPTIONS = new Set(["src/index.ts", "src/cli/shared.ts"]);
+//
+// The three guest-pack entries are real runtime entrypoints, but they are
+// launched from the pack's own POSIX shims (bin/tamandua, bin/tamandua-bridge)
+// and declared only as guest-pack-builder ENTRY_REL build metadata, so no
+// static source import or package.json bin points at them.
+const SOURCE_SURFACE_EXCEPTIONS = new Set([
+  "src/index.ts",
+  "src/cli/shared.ts",
+  "src/installer/matchlock/guest-cli-entry.ts",
+  "src/installer/matchlock/guest-service-entry.ts",
+  "src/installer/matchlock/guest-suite-cli-entry.ts",
+]);
 
 function normalizeRepositoryPath(filePath: string): string {
   return path.posix.normalize(filePath.replaceAll("\\", "/")).replace(/^\.\//, "");

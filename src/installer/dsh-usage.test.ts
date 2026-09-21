@@ -715,6 +715,8 @@ describe("lookupDshSessionTokens", () => {
     );
   });
 
+  // ── v3-only layout probing (dsh >= 0.1.5) ──────────────────────
+
   it("returns null and warns once for a v1-only session.jsonl.zstd layout", async () => {
     const dshHome = path.join(tmpRoot!, "dsh-home");
     const workdir = path.join(tmpRoot!, "worktree", "repo");

@@ -12,6 +12,29 @@ import { parseRunContext, sanitizeStderrTail, type PendingStepRef } from "./step
 import { gitIdentityEnv, readGitIdentityFromContext } from "./git-identity.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
+import { matchlockDispatchDecision } from "./matchlock/dispatch-guard.js";
+import { matchlockWorkflowRequiresCapability } from "./matchlock/capabilities.js";
+import type { ExecutionIsolation } from "./matchlock/policy.js";
+import type { DshSessionInventory } from "./matchlock/dsh-adapter-contract.js";
+import {
+  buildMatchlockMergeContext,
+  buildMatchlockProbeCommand,
+  buildMatchlockProbePrompt,
+  MATCHLOCK_GUEST_CLI,
+  MATCHLOCK_GUEST_SKILL_FILE,
+  runMatchlockSchedulerRound,
+  MatchlockRunnerError,
+} from "./matchlock/scheduler-matchlock.js";
+import type { HostMergeContext } from "./matchlock/host-merge-services.js";
+import { describeMatchlockError } from "./matchlock/runner-error.js";
+import {
+  buildDshProbeCommand,
+  buildDshProbePrompt,
+  snapshotDshRoundStore,
+  attributeDshRoundStore,
+  DSH_MATCHLOCK_GUEST_CLI,
+  DSH_MATCHLOCK_GUEST_SKILL_FILE,
+} from "./matchlock/scheduler-dsh.js";
 import {
   isInstantFailRound,
   isPreclaimDeathRound,
@@ -621,8 +644,84 @@ export function buildWorkPrompt(
   jobId?: string,
   runNumber?: number,
 ): string {
-  const cli = resolveTamanduaCli();
+  // Native rounds embed the HOST CLI launcher (resolveTamanduaCli()); the
+  // shared builder keeps this output byte-identical for NULL-policy runs.
+  return buildWorkPromptForCli(
+    resolveTamanduaCli(),
+    workflowId,
+    agentId,
+    runId,
+    agentPersonaInstructions,
+    jobId,
+    runNumber,
+  );
+}
 
+/**
+ * Build the work prompt for an OPTED-IN Matchlock round. Identical to
+ * `buildWorkPrompt` EXCEPT the claim/complete/fail commands embed the GUEST
+ * helper CLI path (`/workspace/runtime/bin/tamandua`, the versioned RO pack
+ * mounted at /workspace/runtime) instead of the host `resolveTamanduaCli()`
+ * launcher — the guest agent reports through the host broker ONLY via the
+ * guest CLI, never a host CLI/DB/admin surface.
+ */
+export function buildMatchlockWorkPrompt(
+  workflowId: string,
+  agentId: string,
+  runId: string,
+  agentPersonaInstructions = "",
+  jobId?: string,
+  runNumber?: number,
+): string {
+  return buildWorkPromptForCli(
+    MATCHLOCK_GUEST_CLI,
+    workflowId,
+    agentId,
+    runId,
+    agentPersonaInstructions,
+    jobId,
+    runNumber,
+  );
+}
+
+/**
+ * Build the work prompt for an OPTED-IN dsh Matchlock round (MTLK-DSH-EXEC
+ * US-002). Identical to the pi Matchlock prompt EXCEPT the harness-mode line:
+ * dsh output is plain text (never pi JSON), and the guest dsh reports through
+ * the packed guest CLI (`/workspace/runtime/bin/tamandua`) exactly like the
+ * pi Matchlock rounds do.
+ */
+export function buildMatchlockDshWorkPrompt(
+  workflowId: string,
+  agentId: string,
+  runId: string,
+  agentPersonaInstructions = "",
+  jobId?: string,
+  runNumber?: number,
+): string {
+  return buildWorkPromptForCli(
+    DSH_MATCHLOCK_GUEST_CLI,
+    workflowId,
+    agentId,
+    runId,
+    agentPersonaInstructions,
+    jobId,
+    runNumber,
+    "You run in headless dsh mode with plain-text output.",
+  );
+}
+
+/** Shared prompt body parameterized by the reporting CLI path. */
+function buildWorkPromptForCli(
+  cli: string,
+  workflowId: string,
+  agentId: string,
+  runId: string,
+  agentPersonaInstructions = "",
+  jobId?: string,
+  runNumber?: number,
+  modeStatement = "You run in --print mode.",
+): string {
   const persona = agentPersonaInstructions.trim();
   const prompt: string[] = [];
 
@@ -637,7 +736,7 @@ export function buildWorkPrompt(
 
   prompt.push(
     `You are the work agent for workflow "${workflowId}", agent "${agentId}", run "run-${runId}".`,
-    `You run in --print mode. A pending step is waiting for you: claim it, execute it, report.`,
+    `${modeStatement} A pending step is waiting for you: claim it, execute it, report.`,
   );
 
   if (persona.length > 0) {
@@ -706,6 +805,14 @@ export function buildWorkPrompt(
 const MAX_WORK_OUTPUT_PREVIEW = 240;
 const MAX_WORK_ERROR_PREVIEW = 240;
 
+// US-006b: how often the Matchlock work-round watchdog checks the authoritative
+// step row, and how long the exec transport gets to settle on its own after the
+// step is observed done before the round is aborted (normal rounds settle in
+// well under a second; the grace preserves final stdout/usage in the common
+// case while bounding a lossy, never-settling exec).
+const MATCHLOCK_GUEST_STEP_POLL_MS = 1000;
+const MATCHLOCK_GUEST_SETTLE_GRACE_MS = 30_000;
+
 interface BoundedPreviewMetadata {
   preview: string;
   bytes: number;
@@ -758,6 +865,87 @@ export function classifyWorkRoundOutcome(output: string): WorkRoundOutcome {
   if (/^\s*STATUS:\s*(fail|failed|error)\b/im.test(output)) return "work_failed";
   if (/^\s*STATUS:\s*done\b/im.test(output)) return "work_done";
   return "other_output";
+}
+
+// ── US-006 (H1/D1): authoritative step-completion evidence ──────────────
+//
+// The harness stdout is NOT the only evidence a round did work. The guest
+// completes steps through the host broker, which mutates the authoritative
+// `steps` row, so that row is a stronger signal than the (lossy) VM stdout
+// transport. Under Matchlock an exec_pipe result can reject while the guest
+// has ALREADY completed the step (the harness's final plain-text stdout is
+// then lost with the broken transport — observed as outcome=empty_output,
+// outputBytes=0, exitCode=null). The scheduler must never report such a
+// round as empty_output: this overlay upgrades it to work_done from the
+// authoritative step row, while a round that truly produced nothing and
+// completed no step keeps an honest empty_output.
+
+/** A step row that this round's worker job transitioned to `done`. */
+export interface GuestCompletedStepEvidence {
+  /** Authoritative steps.id (row id). */
+  stepRowId: string;
+  /** Human step id (steps.step_id). */
+  stepId: string;
+}
+
+/**
+ * Pure classification overlay: an empty-output round backed by authoritative
+ * step-completion evidence is `work_done`, never `empty_output`. Every other
+ * classification is returned unchanged (STATUS markers still win, and a
+ * genuinely empty round with no completion stays `empty_output`).
+ *
+ * @internal exported for regression tests
+ */
+export function applyGuestStepCompletionEvidence(
+  outcome: WorkRoundOutcome,
+  evidence: GuestCompletedStepEvidence | null,
+): WorkRoundOutcome {
+  if (outcome === "empty_output" && evidence !== null) return "work_done";
+  return outcome;
+}
+
+/** Minimal DB surface used by the step-completion evidence helpers. */
+export interface StepCompletionEvidenceDb {
+  prepare(sql: string): { all(...params: unknown[]): unknown[] };
+}
+
+/**
+ * Snapshot the step row ids this worker job has ALREADY completed before a
+ * round starts, so a completion that lands during the round can be told apart
+ * from one inherited from an earlier round (the job is stable across rounds).
+ */
+export function snapshotDoneStepsClaimedByWorker(
+  db: StepCompletionEvidenceDb,
+  jobId: string,
+  runId: string,
+): Set<string> {
+  const rows = db
+    .prepare("SELECT id FROM steps WHERE run_id = ? AND claim_job_id = ? AND status = 'done'")
+    .all(runId, jobId) as Array<{ id: string }>;
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
+ * Authoritative evidence that THIS round did work although the harness stdout
+ * was lost: a step claimed by this job is now `done` and was not already done
+ * in the pre-round snapshot. Returns null when no such step exists (honest
+ * empty output, or a completion from an earlier round).
+ */
+export function findStepCompletedByWorker(
+  db: StepCompletionEvidenceDb,
+  jobId: string,
+  runId: string,
+  before: ReadonlySet<string>,
+): GuestCompletedStepEvidence | null {
+  const rows = db
+    .prepare(
+      "SELECT id, step_id FROM steps WHERE run_id = ? AND claim_job_id = ? AND status = 'done' ORDER BY updated_at DESC",
+    )
+    .all(runId, jobId) as Array<{ id: string; step_id: string }>;
+  for (const row of rows) {
+    if (!before.has(row.id)) return { stepRowId: row.id, stepId: row.step_id };
+  }
+  return null;
 }
 
 function summarizeWorkRoundOutput(output: string): WorkRoundOutputSummary {
@@ -1178,13 +1366,20 @@ export function buildDispatchRoundContext(
  * back to `job.runId` instead of being dumped on a system counter. Nothing
  * in the dispatch path ever touches `system_tokens_spent` — that counter
  * only measured model-driven polling overhead, which no longer exists.
+ *
+ * Returns the delta actually attributed to the run for this round (the round's
+ * `metadata.tokenUsage`) or `null` when nothing was attributed (no usage, a
+ * non-positive total, a missing run, or an attribution error). Callers that
+ * emit per-round metadata (the H3 "Work round complete" log) use this so the
+ * reported tokenUsage is the attributed delta, never a stdout-only null for
+ * harnesses whose usage lives in a session/store projection.
  */
 async function attributeWorkRoundTokenUsage(
   context: Record<string, unknown>,
   job: CronJobInfo,
   outputSummary: WorkRoundOutputSummary,
   metadata: WorkRoundMetadata,
-): Promise<void> {
+): Promise<number | null> {
   if (metadata.tokenUsage === null) {
     if (metadata.jsonMetadataDetected) {
       logger.debug("Work round token usage unavailable — usage metadata missing", {
@@ -1199,7 +1394,7 @@ async function attributeWorkRoundTokenUsage(
         reason: "non_json_output",
       });
     }
-    return;
+    return null;
   }
 
   if (metadata.tokenUsage <= 0) {
@@ -1209,7 +1404,7 @@ async function attributeWorkRoundTokenUsage(
       reason: "non_positive_usage",
       tokenUsage: metadata.tokenUsage,
     });
-    return;
+    return null;
   }
 
   const resolved = await resolveRunIdForAttribution(metadata);
@@ -1257,7 +1452,7 @@ async function attributeWorkRoundTokenUsage(
         runId,
         runIdSource,
       });
-      return;
+      return null;
     }
 
     // F3: remember the last settled round's delta for this run so the
@@ -1302,6 +1497,7 @@ async function attributeWorkRoundTokenUsage(
       roundId: job.id,
       tokensSpent: updated.tokensSpent,
     });
+    return metadata.tokenUsage;
   } catch (err) {
     logger.warn("Work round token attribution failed", {
       ...context,
@@ -1309,6 +1505,7 @@ async function attributeWorkRoundTokenUsage(
       tokenUsage: metadata.tokenUsage,
       error: String(err),
     });
+    return null;
   }
 }
 
@@ -1890,6 +2087,7 @@ export async function executeDispatchRound(
     return;
   }
 
+
   // ── Round completion signal (TATR US-005) ───────────────────────
   // Registered synchronously after the in-flight guard, BEFORE the first
   // await, so a concurrent settleRunInFlightRounds (the cancel path) can
@@ -1936,6 +2134,22 @@ export async function executeDispatchRound(
   // threaded into the recovery paths so their abandonReason is
   // 'paused_by_operator' (no retry charge) instead of 'worker_lost'.
   let operatorPaused = false;
+  // US-006 (H1/D1): snapshot of the step rows this worker job had ALREADY
+  // completed before the round. Taken immediately before a Matchlock work
+  // round so a step completed DURING the round can be told apart from one
+  // inherited from an earlier round — the authoritative evidence that the
+  // round did work even when the harness stdout was lost in the VM transport.
+  let stepsDoneByWorkerBefore: Set<string> | null = null;
+  // US-006b: a Matchlock guest can complete the step through the host broker
+  // and then hit a lossy exec transport whose result never settles (observed:
+  // run.completed but the round waiting out the wall budget, so the per-round
+  // classification is never logged). This watchdog observes the authoritative
+  // step row once the round has had a bounded grace to settle on its own, then
+  // aborts the round so the normal post-round classification + cleanup run.
+  let guestStepWatchdog: NodeJS.Timeout | null = null;
+  // Resolved once with the snapshot so the watchdog's synchronous poll can call
+  // the same DB accessor without re-importing per tick.
+  let getDbForStepWatchdog: (typeof import("../db.js"))["getDb"] | null = null;
   // Round-start timestamp captured for dsh token accounting. dsh never
   // prints usage; tokens are read from $DSH_HOME session files keyed on
   // the workdir + a "created since this time" scan. Captured BEFORE
@@ -1945,6 +2159,27 @@ export async function executeDispatchRound(
   // Captured from the run-status DB query so the traceability header can
   // include run_number without a second DB trip.
   let runNumber: number | undefined;
+
+  // MTLK-PI-EXEC US-002: when this dispatch round's run carries a VALID
+  // pinned Matchlock policy on a SUPPORTED workflow (pi or dsh do-now /
+  // do-review-do-verify — established at the MTLK-ADMIT barrier below), this
+  // holds the parsed policy and the round must dispatch through the Matchlock
+  // invocation runner (probe AND work) with ZERO native harness
+  // probe/findBinary/spawn. NULL for native (no-policy) rounds.
+  let matchlockPolicy: ExecutionIsolation | null = null;
+
+  // US-008: the run's captured context (original_branch/repo) and the
+  // host-attested merge context for an opted-in merge workflow work round.
+  // Built from the persisted policy + run context; never from guest input.
+  let matchlockRunContext: Record<string, string> = {};
+  let matchlockMergeContext: HostMergeContext | undefined;
+
+  // MTLK-DSH-EXEC US-002: pre-launch session-store inventory over the mounted
+  // (admitted) effective DSH_HOME, captured right before a dsh Matchlock work
+  // round so its newly-created session lineage can be attributed afterwards
+  // via the US-001 confined bounded read. Null for non-dsh Matchlock rounds
+  // and when the round has no workdir.
+  let dshMatchlockStorePre: DshSessionInventory | null = null;
 
   // KHYG US-002: this round's explicit launch-cancellation signal. The
   // teardown/cancel paths abort it (abortDispatchRound) when they kill the
@@ -1963,13 +2198,14 @@ export async function executeDispatchRound(
       const { getDb } = await import("../db.js");
       const db = getDb();
       const row = db
-        .prepare("SELECT status, scheduling_status, context, run_number FROM runs WHERE id = ?")
-        .get(job.runId) as { status: string; scheduling_status: string | null; context: string; run_number: number | null } | undefined;
+        .prepare("SELECT status, scheduling_status, context, run_number, matchlock_policy FROM runs WHERE id = ?")
+        .get(job.runId) as { status: string; scheduling_status: string | null; context: string; run_number: number | null; matchlock_policy: string | null } | undefined;
       if (row?.run_number !== null && row?.run_number !== undefined) {
         runNumber = row.run_number;
       }
       if (row?.context) {
         const runContext = parseRunContext(job.runId, row.context);
+        matchlockRunContext = runContext;
         preferTokenSaver = runContext.no_hurry_save_tokens_mode === "true";
       }
       if (!row || (row.status !== "running" && row.status !== "paused")) {
@@ -1991,6 +2227,117 @@ export async function executeDispatchRound(
       if (row.scheduling_status === "draining_pause") {
         logger.debug("Dispatch round skipped — run draining before pause (in-flight work can complete)", { ...context });
         return;
+      }
+      // ── MTLK-ADMIT: Matchlock dispatch admission barrier ─────────
+      // A run with a persisted (non-NULL) Matchlock policy is admitted HERE —
+      // before the launch-time probe and before ANY ordinary host harness
+      // resolution/spawn. With the pi execution backend integrated (US-001/
+      // US-002): a VALID pinned policy on a SUPPORTED workflow (pi do-now /
+      // do-review-do-verify) is ALLOWED and this round branches to the
+      // Matchlock invocation runner (probe AND work — zero native harness
+      // probe/findBinary/spawn); a valid policy on an UNSUPPORTED workflow is
+      // refused (matchlock_workflow_unsupported) and a malformed/legacy/
+      // unpinned stored policy is refused with an actionable message
+      // (matchlock_policy_invalid). No host harness is ever spawned for a
+      // refused run, and no fake success is produced. NULL-policy (native)
+      // runs are unaffected and never consult Matchlock beyond this pure parse
+      // gate.
+      if (row.matchlock_policy) {
+        const decision = matchlockDispatchDecision(row.matchlock_policy, {
+          workflowId: job.workflowId,
+          harnessType: job.harnessType ?? "pi",
+        });
+        if (decision.refused) {
+          logger.warn("Dispatch round refused — Matchlock run not admitted for dispatch", {
+            ...context,
+            code: decision.code,
+            reason: "matchlock_dispatch_refused",
+          });
+          emitEvent({
+            ts: new Date().toISOString(),
+            event: "run.matchlock_dispatch_refused",
+            runId: job.runId,
+            workflowId: job.workflowId,
+            reason: decision.code,
+            detail: decision.message,
+          });
+          try {
+            const { forceFailRun } = await import("./status.js");
+            const forceResult = await forceFailRun(job.runId, decision.message, true);
+            if (!forceResult.ok) {
+              logger.warn("Matchlock dispatch-refusal force-fail refused", {
+                ...context,
+                reason: forceResult.reason,
+              });
+            }
+          } catch (err) {
+            // Run already terminal — the normal run_not_running path handles
+            // the teardown; nothing else to do here.
+            logger.debug("Matchlock dispatch-refusal force-fail skipped (run terminal)", {
+              ...context,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // Return WITHOUT spawning the probe or any work round.
+          return;
+        }
+        // Allowed: valid pinned policy on a supported workflow. This round
+        // (probe + work) dispatches through the Matchlock invocation runner.
+        if (decision.policy) {
+          matchlockPolicy = decision.policy;
+          // US-008: for a workflow that declares the merge-branch capability,
+          // build the host merge context from immutable run scope so the
+          // invocation runner can serve the scoped merge op. The finalize_merge
+          // step id is the run's own step row (never guest input).
+          if (matchlockWorkflowRequiresCapability(job.workflowId, "merge-branch")) {
+            let finalizeMergeStepId: string | undefined;
+            try {
+              const stepRow = db
+                .prepare("SELECT id FROM steps WHERE run_id = ? AND step_id = 'finalize_merge' LIMIT 1")
+                .get(job.runId) as { id: string } | undefined;
+              finalizeMergeStepId = stepRow?.id;
+            } catch (stepErr) {
+              logger.warn("Matchlock merge context — finalize_merge step lookup failed", {
+                ...context,
+                error: stepErr instanceof Error ? stepErr.message : String(stepErr),
+              });
+            }
+            matchlockMergeContext = buildMatchlockMergeContext({
+              policy: decision.policy,
+              runId: job.runId,
+              runContext: matchlockRunContext,
+              finalizeMergeStepId,
+            });
+            if (!matchlockMergeContext) {
+              // Required capability absent for THIS run: refuse before the
+              // probe and before any VM create, exactly like a workflow-level
+              // capability refusal.
+              const message =
+                `Matchlock workflow "${job.workflowId}" requires the merge-branch capability, but no host ` +
+                `merge context (original repository/branch + finalize_merge step) could be built for run ` +
+                `${job.runId}; refusing before any native probe/harness spawn and before any VM create.`;
+              logger.warn("Dispatch round refused — Matchlock merge capability unavailable", {
+                ...context,
+                reason: "matchlock_merge_capability_unavailable",
+              });
+              emitEvent({
+                ts: new Date().toISOString(),
+                event: "run.matchlock_dispatch_refused",
+                runId: job.runId,
+                workflowId: job.workflowId,
+                reason: "matchlock_workflow_unsupported",
+                detail: message,
+              });
+              try {
+                const { forceFailRun } = await import("./status.js");
+                await forceFailRun(job.runId, message, true);
+              } catch {
+                /* run already terminal */
+              }
+              return;
+            }
+          }
+        }
       }
     } catch (err) {
       logger.warn("Run status check failed; continuing dispatch round", {
@@ -2191,17 +2538,56 @@ export async function executeDispatchRound(
           return;
         }
 
-        const probeOutcome = await runLaunchTimeHarnessProbe({
-          job,
-          context,
-          workdir: workingDirectoryForHarness,
-          preferTokenSaver,
-          wallMs: probeWallMs,
-          signal: roundAbort.signal,
-          onSpawn: ({ pid, pgid }: { pid: number; pgid: number }) => {
-            inFlightChildren.set(job.id, { pid, pgid, killed: false });
-          },
-        });
+        let probeOutcome: LaunchTimeProbeOutcome;
+        if (matchlockPolicy) {
+          // Opted-in run: the once-per-run launch probe executes IN-VM through
+          // the Matchlock invocation runner (fresh invocation, fresh VM) — the
+          // guest harness (pi or dsh) is asked to run the packed guest
+          // `tamandua skill-path` and reply with the guest-readable pack skill
+          // path. NEVER a host probe, host pi/hermes/dsh spawn, or host
+          // `<launcher> skill-path` expected-value computation.
+          probeOutcome =
+            matchlockPolicy.harness === "dsh"
+              ? await runDshLaunchTimeHarnessProbe({
+                  job,
+                  context,
+                  workdir: workingDirectoryForHarness,
+                  policy: matchlockPolicy,
+                  wallMs: probeWallMs,
+                  signal: roundAbort.signal,
+                })
+              : await runMatchlockLaunchTimeHarnessProbe({
+                  job,
+                  context,
+                  workdir: workingDirectoryForHarness,
+                  policy: matchlockPolicy,
+                  wallMs: probeWallMs,
+                  signal: roundAbort.signal,
+                });
+        } else {
+          probeOutcome = await runLaunchTimeHarnessProbe({
+            job,
+            context,
+            workdir: workingDirectoryForHarness,
+            preferTokenSaver,
+            wallMs: probeWallMs,
+            signal: roundAbort.signal,
+            onSpawn: ({ pid, pgid }: { pid: number; pgid: number }) => {
+              inFlightChildren.set(job.id, { pid, pgid, killed: false });
+            },
+          });
+        }
+
+        if (probeOutcome.canceled) {
+          // The round's launch-cancellation signal fired mid-probe (run
+          // teardown/cancel in progress). Record nothing — the run is going
+          // down; the run-status check tears the job down on the next tick.
+          logger.info("Dispatch round — Matchlock harness probe canceled by host", {
+            ...context,
+            reason: "harness_probe_canceled",
+          });
+          return;
+        }
 
         if (!probeOutcome.passed) {
           // ── Probe failure: fail the run fast and legibly ────────
@@ -2282,65 +2668,214 @@ export async function executeDispatchRound(
       });
     }
 
-    const workPrompt = buildWorkPrompt(
-      job.workflowId,
-      job.agentId,
-      job.runId,
-      agentPersonaInstructions,
-      job.id,
-      runNumber,
-    );
+    // Matchlock rounds report through the GUEST helper CLI (the packed
+    // /workspace/runtime/bin/tamandua claim/complete/fail surface), never the
+    // host resolveTamanduaCli() launcher. dsh Matchlock rounds keep plain-text
+    // dsh output (their mode line differs from pi). NULL-policy (native)
+    // rounds keep the byte-identical host-CLI prompt.
+    const workPrompt = matchlockPolicy
+      ? matchlockPolicy.harness === "dsh"
+        ? buildMatchlockDshWorkPrompt(
+            job.workflowId,
+            job.agentId,
+            job.runId,
+            agentPersonaInstructions,
+            job.id,
+            runNumber,
+          )
+        : buildMatchlockWorkPrompt(
+            job.workflowId,
+            job.agentId,
+            job.runId,
+            agentPersonaInstructions,
+            job.id,
+            runNumber,
+          )
+      : buildWorkPrompt(
+          job.workflowId,
+          job.agentId,
+          job.runId,
+          agentPersonaInstructions,
+          job.id,
+          runNumber,
+        );
+
+    // Observation 4 (bead tamandua-6sy.33.38): the admission line describes a
+    // round that ACTUALLY STARTS, not every dispatch tick that merely parses
+    // the policy. It used to be emitted inside the per-agent-job policy
+    // evaluation (before the deterministic peek), so a Matchlock run with a
+    // round in flight logged it for every OTHER agent job on every ~15s tick
+    // (642 lines / 40 min for one run). Emit it exactly once here, after the
+    // pending-step determination and all zero-token/probe gates have passed
+    // and immediately before the harness spawn; idle ticks keep their debug
+    // `Dispatch round idle — no pending step` line and in-flight skips keep
+    // their debug `previous round still in flight` line — the same treatment
+    // native rounds get.
+    if (matchlockPolicy) {
+      logger.info("Dispatch round admitted — Matchlock execution path (in-VM runner)", {
+        ...context,
+        reason: "matchlock_policy_allowed",
+        requestedImage: matchlockPolicy.requestedImage,
+        mergeCapabilityWired: matchlockMergeContext !== undefined,
+      });
+    }
 
     logger.info("Work round start", context);
 
-    const onSpawn = ({ pid, pgid }: { pid: number; pgid: number }) => {
-      inFlightChildren.set(job.id, { pid, pgid, killed: false });
-    };
-
     let output: string;
-    const adapter = getHarnessAdapter(harnessType);
-    if (harnessType === "dsh") {
-      // TIME-CLOCKS allow-list (rule 3): dsh session attribution compares
-      // this round-start stamp against OS file mtimes ($DSH_HOME session
-      // files), so it stays an epoch-ms instant and MUST NOT be switched to
-      // monotonic time. US-010 routes that comparison through the shared
-      // instant helpers/tolerance (dsh-usage's `createdSinceSpawn` /
-      // `instantAgeMs` with `DSH_SESSION_MTIME_TOLERANCE_MS`).
-      dshRoundStartedAtMs = Date.now();
+    if (matchlockPolicy) {
+      // Opted-in work round: dispatch through the Matchlock invocation runner
+      // (fresh invocation + fresh VM). pi Matchlock rounds run the guest pi
+      // `--mode json` harness; dsh Matchlock rounds run the guest dsh headless
+      // (plain-text output). Both report through the packed guest CLI. The
+      // runner returns a HarnessRoundResult-compatible object so ALL the
+      // post-round processing below (token attribution, STATUS classification,
+      // auto-complete, orphan recovery, instant-fail/backoff tracking) is
+      // reused unchanged. ZERO native adapter findBinary/runRound/spawn and no
+      // host harness env.
+      roundStartWatch = new Stopwatch();
+      // US-006 (H1/D1): capture the authoritative "already completed" step set
+      // for THIS worker job (stable across rounds) before the guest can act, so
+      // a step the round completes can be distinguished after a lossy
+      // empty-output harness transport.
+      try {
+        const { getDb } = await import("../db.js");
+        getDbForStepWatchdog = getDb;
+        stepsDoneByWorkerBefore = snapshotDoneStepsClaimedByWorker(getDb(), job.id, job.runId);
+      } catch (snapshotErr) {
+        stepsDoneByWorkerBefore = null;
+        logger.warn("Step-completion evidence snapshot unavailable", {
+          ...context,
+          error: snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr),
+        });
+      }
+      if (stepsDoneByWorkerBefore !== null) {
+        // US-006b: bound the lossy-exec settlement. Poll the authoritative step
+        // row; once this round's step is done give the transport a bounded
+        // grace to settle on its own (the common case, which preserves the
+        // harness's final stdout + usage), then abort the round so the normal
+        // post-round classification and owned cleanup run instead of waiting
+        // out the multi-hour wall budget.
+        const before = stepsDoneByWorkerBefore;
+        let completedAtMs: number | null = null;
+        guestStepWatchdog = setInterval(() => {
+          try {
+            const getDb = getDbForStepWatchdog;
+            if (getDb === null) return;
+            const done = findStepCompletedByWorker(getDb(), job.id, job.runId, before);
+            if (done === null) return;
+            if (completedAtMs === null) {
+              completedAtMs = monotonicNow();
+              return;
+            }
+            if (monotonicNow() - completedAtMs >= MATCHLOCK_GUEST_SETTLE_GRACE_MS) {
+              if (guestStepWatchdog !== null) {
+                clearInterval(guestStepWatchdog);
+                guestStepWatchdog = null;
+              }
+              logger.info("Guest completed the step but the Matchlock round did not settle — aborting the round", {
+                ...context,
+                stepRowId: done.stepRowId,
+                stepId: done.stepId,
+                graceMs: MATCHLOCK_GUEST_SETTLE_GRACE_MS,
+                reason: "guest_step_completed_exec_unsettled",
+              });
+              roundAbort.abort();
+            }
+          } catch {
+            /* evidence poll is best-effort; the round's own timeout still applies */
+          }
+        }, MATCHLOCK_GUEST_STEP_POLL_MS);
+        guestStepWatchdog.unref?.();
+      }
+      if (matchlockPolicy.harness === "dsh") {
+        // Pre-launch store inventory (US-001 confined presence/header read)
+        // over the mounted effective DSH_HOME, captured BEFORE the guest so
+        // the round's own created session lineage can be attributed. This is
+        // harness-specific PRE-round state, NOT a runner-selection branch:
+        // the shared runMatchlockSchedulerRound seam below routes the round to
+        // the dsh scheduler route from policy.harness alone.
+        dshMatchlockStorePre =
+          workingDirectoryForHarness && dshStoreAdmissible(matchlockPolicy)
+            ? snapshotDshRoundStore(matchlockPolicy, workingDirectoryForHarness)
+            : null;
+      }
+      // ONE harness-keyed dispatch for pi, hermes and dsh: the production
+      // runner routes purely from matchlockProductionRunnerKind(policy) (pi →
+      // pi invocation runner, hermes → Hermes invocation runner, dsh → dsh
+      // scheduler route). An opted-in merge workflow also forwards the
+      // host merge context built from immutable run scope for ALL three
+      // harnesses (MTLK-ALL-WORKFLOWS US-001..US-003).
+      result = await runMatchlockSchedulerRound({
+        policy: matchlockPolicy,
+        identity: {
+          runId: job.runId,
+          agentId: job.agentId,
+          workflowId: job.workflowId,
+          jobId: job.id,
+        },
+        kind: "work",
+        promptText: workPrompt,
+        workingDirectoryForHarness,
+        timeoutMs: timeout * 1000,
+        signal: roundAbort.signal,
+        // Preserve the USER IMAGE's effective guest PATH captured at admission
+        // (the runner prepends only the helper-pack bin; no host default when
+        // the image declares its own PATH).
+        ...(matchlockPolicy.imagePath ? { imagePath: matchlockPolicy.imagePath } : {}),
+        ...(matchlockMergeContext ? { merge: matchlockMergeContext } : {}),
+      });
+      output = result.output;
+    } else {
+      const onSpawn = ({ pid, pgid }: { pid: number; pgid: number }) => {
+        inFlightChildren.set(job.id, { pid, pgid, killed: false });
+      };
+
+      const adapter = getHarnessAdapter(harnessType);
+      if (harnessType === "dsh") {
+        // TIME-CLOCKS allow-list (rule 3): dsh session attribution compares
+        // this round-start stamp against OS file mtimes ($DSH_HOME session
+        // files), so it stays an epoch-ms instant and MUST NOT be switched to
+        // monotonic time. US-010 routes that comparison through the shared
+        // instant helpers/tolerance (dsh-usage's `createdSinceSpawn` /
+        // `instantAgeMs` with `DSH_SESSION_MTIME_TOLERANCE_MS`).
+        dshRoundStartedAtMs = Date.now();
+      }
+      // Round-start timestamp for instant-fail classification (RSPN). The
+      // adapters now report their own durationMs on resolved rounds; this
+      // capture covers the adapter-throw path (deleted/broken harness binary
+      // — findBinary/spawn failure), where no result ever exists to carry a
+      // duration. Captured BEFORE binary resolution so the throw path can
+      // still be classified on wall time.
+      roundStartWatch = new Stopwatch();
+      // Pre-resolve the binary path. For hermes and dsh, this goes through
+      // the same shared resolvers that admission validation uses,
+      // guaranteeing single-source dispatch — no disagreement between
+      // validation and invocation. The resolved path is passed in
+      // options.binaryPath so runRound skips its own redundant findBinary()
+      // call.
+      const binaryPath = await adapter.findBinary({ preferTokenSaver });
+      const harnessEnv = buildHarnessChildEnv(job, binaryPath);
+      result = await adapter.runRound(workPrompt, {
+        timeout,
+        workdir: workingDirectoryForHarness,
+        env: harnessEnv,
+        onSpawn,
+        preferTokenSaver,
+        binaryPath,
+        // KHYG US-002: run/execution identity for the per-launch
+        // isolation-mode records (run.harness_isolation), and this round's
+        // explicit cancellation signal (aborted on teardown/cancel).
+        execution: {
+          runId: job.runId,
+          agentId: job.agentId,
+          workflowId: job.workflowId,
+          roundId: job.id,
+        },
+        signal: roundAbort.signal,
+      });
+      output = result.output;
     }
-    // Round-start stopwatch for instant-fail classification (RSPN). The
-    // adapters now report their own durationMs on resolved rounds; this
-    // capture covers the adapter-throw path (deleted/broken harness binary
-    // — findBinary/spawn failure), where no result ever exists to carry a
-    // duration. Created BEFORE binary resolution (see roundElapsedMs).
-    roundStartWatch = new Stopwatch();
-    // Pre-resolve the binary path. For hermes and dsh, this goes through
-    // the same shared resolvers that admission validation uses,
-    // guaranteeing single-source dispatch — no disagreement between
-    // validation and invocation. The resolved path is passed in
-    // options.binaryPath so runRound skips its own redundant findBinary()
-    // call.
-    const binaryPath = await adapter.findBinary({ preferTokenSaver });
-    const harnessEnv = buildHarnessChildEnv(job, binaryPath);
-    result = await adapter.runRound(workPrompt, {
-      timeout,
-      workdir: workingDirectoryForHarness,
-      env: harnessEnv,
-      onSpawn,
-      preferTokenSaver,
-      binaryPath,
-      // KHYG US-002: run/execution identity for the per-launch
-      // isolation-mode records (run.harness_isolation), and this round's
-      // explicit cancellation signal (aborted on teardown/cancel).
-      execution: {
-        runId: job.runId,
-        agentId: job.agentId,
-        workflowId: job.workflowId,
-        roundId: job.id,
-      },
-      signal: roundAbort.signal,
-    });
-    output = result.output;
 
     // ── Post-round processing ──────────────────────────────────────
     const metadata = parseWorkRoundMetadata(output);
@@ -2356,18 +2891,45 @@ export async function executeDispatchRound(
     // clean exit after the pause both land here.
     operatorPaused = consumeOperatorPausedRound(job.id);
 
-    logger.info("Work round complete", {
-      ...context,
-      outcome: outputSummary.outcome,
-      outputBytes: outputSummary.bytes,
-      outputLines: outputSummary.lines,
-      outputPreview: outputSummary.preview,
-      outputTruncated: outputSummary.truncated,
-      tokenUsage: metadata.tokenUsage,
-      metadataFormat: metadata.jsonMetadataDetected ? "json" : "text",
-      ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
-      ...(result.signal ? { signal: result.signal } : {}),
-    });
+    // US-006 (H1/D1): a Matchlock round whose guest COMPLETED the step is
+    // never empty_output. When the harness transport dropped the final
+    // plain-text stdout (observed: outcome=empty_output, outputBytes=0,
+    // exitCode=null while the step row is `done`), the authoritative step
+    // completion recorded through the guest bridge/DB is the real evidence.
+    // A round that genuinely produced nothing and completed no step stays an
+    // honest empty_output.
+    if (matchlockPolicy && outputSummary.outcome === "empty_output" && stepsDoneByWorkerBefore !== null) {
+      let evidence: GuestCompletedStepEvidence | null = null;
+      try {
+        const { getDb } = await import("../db.js");
+        evidence = findStepCompletedByWorker(getDb(), job.id, job.runId, stepsDoneByWorkerBefore);
+      } catch (evidenceErr) {
+        logger.warn("Step-completion evidence lookup failed", {
+          ...context,
+          error: evidenceErr instanceof Error ? evidenceErr.message : String(evidenceErr),
+        });
+      }
+      if (evidence !== null) {
+        const reclassified = applyGuestStepCompletionEvidence(outputSummary.outcome, evidence);
+        outputSummary.outcome = reclassified;
+        logger.info("Empty harness stdout but the guest completed the step — classifying work_done", {
+          ...context,
+          stepRowId: evidence.stepRowId,
+          stepId: evidence.stepId,
+          previousOutcome: "empty_output",
+          outcome: reclassified,
+        });
+      }
+    }
+
+    // US-008 (H3): the per-round "Work round complete" metadata must carry the
+    // token delta ACTUALLY attributed to the run for this round. The log is
+    // emitted AFTER the attribution blocks below (harness usage is computed by
+    // them), because a plain-text hermes/dsh round's stdout carries no usage —
+    // `parseWorkRoundMetadata(output).tokenUsage` is null even when the hermes
+    // in-VM projection or the dsh matchlock store attribution lands a real
+    // delta. `metadataFormat` stays truthful ("text" for plain-text stdout).
+    let roundTokenDelta: number | null = metadata.tokenUsage;
 
     // Guard: pi is the ONLY harness whose stdout carries token usage
     // (--mode json message_end metadata). hermes and dsh stdout carry
@@ -2377,14 +2939,40 @@ export async function executeDispatchRound(
     // stops the misleading "--mode json may be off" warning for
     // hermes/dsh rounds.
     if (harnessType === "pi") {
-      await attributeWorkRoundTokenUsage(context, job, outputSummary, metadata);
+      // Do not change pi's attribution path: it still attributes from the
+      // stdout metadata, but we surface the delta it actually attributed.
+      roundTokenDelta = await attributeWorkRoundTokenUsage(context, job, outputSummary, metadata);
     }
 
     // ── Hermes token lookup ──────────────────────────────────────
     // When the round ran through hermes and a session id was captured,
     // look up token usage from hermes' own state.db and attribute it
     // exactly like pi rounds (reuses attributeWorkRoundTokenUsage).
-    if (harnessType === "hermes" && result.sessionRef) {
+    // MTLK-HERMES-EXEC US-003: for an OPTED-IN (Matchlock) hermes round the
+    // usage was already projected INSIDE the still-owned VM by the US-002
+    // runner (HermesInvocationResult.usage: input+output+cache_write over the
+    // selected MAPPED store) — never a host state.db lookup of the
+    // guest-writable mapped store. Unavailable/ambiguous/truncated usage is
+    // reported as evidence, never a fabricated zero.
+    if (harnessType === "hermes" && matchlockPolicy !== null && matchlockPolicy.harness === "hermes") {
+      const hermesUsage = (result as { usage?: { status?: string; tokens?: number } }).usage;
+      if (hermesUsage?.status === "ok" && typeof hermesUsage.tokens === "number" && hermesUsage.tokens > 0) {
+        const hermesMetadata: WorkRoundMetadata = {
+          assistantOutput: output,
+          tokenUsage: hermesUsage.tokens,
+          runId: null,
+          stepId: null,
+          jsonMetadataDetected: false,
+        };
+        roundTokenDelta = await attributeWorkRoundTokenUsage(context, job, outputSummary, hermesMetadata);
+      } else {
+        logger.info("Matchlock hermes round usage unavailable — no token delta", {
+          ...context,
+          status: hermesUsage?.status ?? "missing",
+          reason: "in_vm_usage_projection_unavailable",
+        });
+      }
+    } else if (harnessType === "hermes" && result.sessionRef) {
       const hermesTokens = await lookupHermesSessionTokens(result.sessionRef);
       if (hermesTokens !== null && hermesTokens > 0) {
         const hermesMetadata: WorkRoundMetadata = {
@@ -2394,7 +2982,7 @@ export async function executeDispatchRound(
           stepId: null,
           jsonMetadataDetected: false,
         };
-        await attributeWorkRoundTokenUsage(context, job, outputSummary, hermesMetadata);
+        roundTokenDelta = await attributeWorkRoundTokenUsage(context, job, outputSummary, hermesMetadata);
       }
     }
 
@@ -2405,8 +2993,11 @@ export async function executeDispatchRound(
     // timestamp and reads the newest (this includes timed-out rounds,
     // which resolve through the normal post-round path). Best-effort:
     // an unavailable lookup falls back to 0 tokens with a warning —
-    // never an error, never blocks the round.
-    if (harnessType === "dsh" && dshRoundStartedAtMs !== undefined && workingDirectoryForHarness) {
+    // never an error, never blocks the round. NATIVE dsh only: an
+    // opted-in dsh Matchlock round attributes from the MOUNTED store
+    // (policy.configurationRoot) via the confined US-001 read below and
+    // must never read the native host store.
+    if (harnessType === "dsh" && !matchlockPolicy && dshRoundStartedAtMs !== undefined && workingDirectoryForHarness) {
       const dshUsage = await lookupDshSessionTokens({
         spawnedAtMs: dshRoundStartedAtMs,
         workdir: workingDirectoryForHarness,
@@ -2419,7 +3010,7 @@ export async function executeDispatchRound(
           stepId: null,
           jsonMetadataDetected: false,
         };
-        await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
+        roundTokenDelta = await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
         logger.info("dsh token attribution from session file", {
           ...context,
           sessionRef: dshUsage.sessionRef,
@@ -2434,6 +3025,49 @@ export async function executeDispatchRound(
         });
       }
     }
+
+    // ── dsh Matchlock token lookup (mounted v2 store, confined bounded read) ─
+    // A dsh Matchlock round's usage lives in the MOUNTED effective DSH_HOME
+    // (policy.configurationRoot) under sessions/<projectKey(workdir)>/, never
+    // the native host store. The US-001 confined bounded attribution runs on
+    // the pre/post inventories around the round: integer single-count totals
+    // (the data.stream mirror is never summed), and incomplete/unavailable/
+    // ambiguous outcomes are reported honestly — never a fabricated zero and
+    // never a borrowed session. It NEVER blocks plain-text step status.
+    if (
+      matchlockPolicy?.harness === "dsh" &&
+      dshMatchlockStorePre !== null &&
+      workingDirectoryForHarness
+    ) {
+      roundTokenDelta = await attributeDshMatchlockRoundUsage({
+        context,
+        job,
+        policy: matchlockPolicy,
+        workdir: workingDirectoryForHarness,
+        pre: dshMatchlockStorePre,
+        output,
+      });
+      dshMatchlockStorePre = null;
+    }
+
+    // US-008 (H3): emit the per-round metadata AFTER attribution so the
+    // tokenUsage it carries is the delta this round attributed to the run
+    // (hermes in-VM projection / dsh matchlock store / pi stdout usage), not
+    // the stdout-only parse that is null for every plain-text hermes/dsh
+    // round. A genuinely unattributed round honestly reports null.
+    logger.info("Work round complete", {
+      ...context,
+      outcome: outputSummary.outcome,
+      outputBytes: outputSummary.bytes,
+      outputLines: outputSummary.lines,
+      outputPreview: outputSummary.preview,
+      outputTruncated: outputSummary.truncated,
+      tokenUsage: roundTokenDelta,
+      metadataFormat: metadata.jsonMetadataDetected ? "json" : "text",
+      ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
+      ...(result.signal ? { signal: result.signal } : {}),
+      ...(result.harnessExecError ? { harnessExecError: result.harnessExecError } : {}),
+    });
 
     if (outputSummary.outcome === "work_done") {
       await autoCompleteStepIfRunning(context, metadata);
@@ -2546,7 +3180,7 @@ export async function executeDispatchRound(
       operatorPaused,
     });
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
+    const errorMessage = describeMatchlockError(err);
     const errorSummary = buildBoundedPreview(errorMessage, MAX_WORK_ERROR_PREVIEW);
 
     // PKIL (US-005): the adapter threw (e.g. the cancellation signal aborted
@@ -2642,9 +3276,11 @@ export async function executeDispatchRound(
       // an error, never blocks the failure handling). `result ===
       // undefined` keeps this complementary to the success path: a round
       // that DID resolve already ran its lookup there, so re-running it
-      // here on a later post-round throw would double count.
+      // here on a later post-round throw would double count. NATIVE dsh
+      // only — opted-in dsh Matchlock rounds use the mounted store below.
       if (
         harnessType === "dsh" &&
+        !matchlockPolicy &&
         result === undefined &&
         dshRoundStartedAtMs !== undefined &&
         workingDirectoryForHarness
@@ -2669,6 +3305,67 @@ export async function executeDispatchRound(
             tokenDelta: dshUsage.totalTokens,
           });
         }
+      }
+
+      // ── dsh Matchlock token lookup on round failure ─────────────
+      // A dsh Matchlock round that failed before it resolved (or threw after
+      // the guest started) may still have flushed a session in the mounted
+      // store. When this round captured a pre-launch inventory, attribute from
+      // the post-round store via the confined bounded read — the same honest
+      // rules as the success path (never fabricated, never blocks failure
+      // handling).
+      if (
+        matchlockPolicy?.harness === "dsh" &&
+        result === undefined &&
+        dshMatchlockStorePre !== null &&
+        workingDirectoryForHarness
+      ) {
+        await attributeDshMatchlockRoundUsage({
+          context,
+          job,
+          policy: matchlockPolicy,
+          workdir: workingDirectoryForHarness,
+          pre: dshMatchlockStorePre,
+          output: "",
+        });
+        dshMatchlockStorePre = null;
+      }
+
+      // ── Matchlock infrastructure failure (typed) ───────────────
+      // An opted-in work round that throws a typed MatchlockRunnerError means
+      // the invocation infrastructure refused/failed (missing/unusable guest
+      // pack, unavailable backend, refused HELLO, cleanup failure…) — this is
+      // NOT a model/step failure and must NOT spin the ordinary instant-fail
+      // loop repeatedly booting VMs. Classify deterministic setup failures
+      // separately (design section 2): recover any orphaned claim as usual,
+      // then force-fail the run with the typed reason BEFORE instant-fail
+      // streak tracking.
+      if (matchlockPolicy !== null && err instanceof MatchlockRunnerError) {
+        logger.error("Matchlock invocation infrastructure failure — force-failing run", {
+          ...context,
+          code: err.code,
+          reason: "matchlock_invocation_infra_failed",
+        });
+        try {
+          const { forceFailRun } = await import("./status.js");
+          const forceResult = await forceFailRun(
+            job.runId,
+            `Matchlock invocation failed (${err.code}): ${errorMessage}`,
+            true,
+          );
+          if (!forceResult.ok) {
+            logger.warn("Matchlock infra-failure force-fail refused", {
+              ...context,
+              reason: forceResult.reason,
+            });
+          }
+        } catch (forceErr) {
+          logger.error("Matchlock infra-failure force-fail failed", {
+            ...context,
+            error: forceErr instanceof Error ? forceErr.message : String(forceErr),
+          });
+        }
+        return;
       }
 
       // ── Instant-fail classification on adapter throw (RSPN) ──
@@ -2708,6 +3405,11 @@ export async function executeDispatchRound(
       });
     }
   } finally {
+    if (guestStepWatchdog !== null) {
+      clearInterval(guestStepWatchdog);
+      guestStepWatchdog = null;
+    }
+    getDbForStepWatchdog = null;
     inFlightJobs.delete(job.id);
     inFlightChildren.delete(job.id);
     // PKIL (US-005): drop any operator-pause mark for this round. The normal
@@ -2733,6 +3435,137 @@ export async function executeDispatchRound(
       roundCompletionSignals.delete(job.id);
       signal.resolve();
     }
+  }
+}
+
+// ── dsh Matchlock store usage attribution (MTLK-DSH-EXEC US-002) ───────
+
+/**
+ * Whether a dsh Matchlock policy's mounted effective DSH_HOME is eligible for
+ * the confined store attribution at this point. The mounted host root is the
+ * admitted policy root (never re-discovered); when it does not exist as a
+ * real directory the inventory is simply empty and the round reports honest
+ * "unavailable" — it never blocks plain-text step status.
+ */
+function dshStoreAdmissible(policy: ExecutionIsolation): boolean {
+  if (policy.harness !== "dsh") return false;
+  if (typeof policy.configurationRoot !== "string" || policy.configurationRoot === "") return false;
+  try {
+    return fs.statSync(policy.configurationRoot).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * UNION-PORT US-012: per-run set of dsh session directories already observed as
+ * created by an earlier Matchlock round. A round's pre-launch inventory can be
+ * STALE — the scheduler admits a round before the previous round finished
+ * publishing its guest-written session back to the host home — so the naive
+ * pre/post diff would attribute the previous round's session a second time.
+ * Session dirs observed as created are therefore excluded from later rounds'
+ * attribution, keeping `runs.tokens_spent` an exact single count even when a
+ * step is retried after an empty/failed harness round. Keyed by run id; the
+ * oldest entries are dropped so a long-lived daemon cannot grow the map without
+ * bound (a run past the cap simply loses the cross-round guard, never data).
+ */
+const attributedDshSessionDirsByRun = new Map<string, Set<string>>();
+const ATTRIBUTED_DSH_SESSION_RUNS_MAX = 512;
+
+function attributedDshSessionDirsForRun(runId: string): Set<string> {
+  let set = attributedDshSessionDirsByRun.get(runId);
+  if (set === undefined) {
+    set = new Set<string>();
+    attributedDshSessionDirsByRun.set(runId, set);
+    while (attributedDshSessionDirsByRun.size > ATTRIBUTED_DSH_SESSION_RUNS_MAX) {
+      const oldest = attributedDshSessionDirsByRun.keys().next().value;
+      if (oldest === undefined) break;
+      attributedDshSessionDirsByRun.delete(oldest);
+    }
+  }
+  return set;
+}
+
+/**
+ * Attribute a dsh Matchlock round's tokens from the MOUNTED v2 store via the
+ * US-001 confined bounded read (pre/post inventories). Honest outcomes only:
+ * "attributed" with an integer single-count total is attributed through the
+ * normal per-round path; ambiguous/unavailable/incomplete are logged with
+ * their reason and NEVER fabricated as zero usage. Never blocks or throws to
+ * the caller (attribution is best-effort evidence).
+ *
+ * Returns the delta actually attributed to the run for this round (the
+ * dshMetadata total when the run accepted it) or `null` when nothing was
+ * attributed — so the H3 per-round metadata can carry the real delta.
+ */
+async function attributeDshMatchlockRoundUsage(params: {
+  context: Record<string, unknown>;
+  job: CronJobInfo;
+  policy: ExecutionIsolation;
+  workdir: string;
+  pre: DshSessionInventory;
+  output: string;
+}): Promise<number | null> {
+  const { context, job, policy, workdir, pre, output } = params;
+  try {
+    const post = snapshotDshRoundStore(policy, workdir);
+    const alreadyAttributed = attributedDshSessionDirsForRun(job.runId);
+    const attribution = attributeDshRoundStore(
+      policy,
+      workdir,
+      pre,
+      post,
+      undefined,
+      alreadyAttributed,
+    );
+    // Any session dir observed as created by this round is now owned by the
+    // round: it must never be re-attributed by a later round whose (possibly
+    // stale) pre-launch inventory does not list it. This includes ambiguous and
+    // incomplete rounds, whose honest outcome is "not attributed", not
+    // "attribute it next time".
+    for (const s of attribution.sessions) alreadyAttributed.add(s.dirName);
+    if (attribution.status === "attributed") {
+      const total = attribution.tokenTotal;
+      if (total !== null && total > 0) {
+        const dshMetadata: WorkRoundMetadata = {
+          assistantOutput: output,
+          tokenUsage: total,
+          runId: null,
+          stepId: null,
+          jsonMetadataDetected: false,
+        };
+        const outputSummary = summarizeWorkRoundOutput(output);
+        const attributed = await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
+        logger.info("dsh Matchlock token attribution from mounted store", {
+          ...context,
+          rootSessionId: attribution.rootSessionId,
+          lineageSessionIds: attribution.lineageSessionIds,
+          tokenDelta: total,
+          status: attribution.status,
+        });
+        return attributed;
+      }
+      logger.warn("dsh Matchlock store attribution: no usage tokens on the attributed root lineage", {
+        ...context,
+        rootSessionId: attribution.rootSessionId,
+        status: attribution.status,
+        reason: attribution.reason,
+      });
+      return null;
+    }
+    logger.warn("dsh Matchlock store usage not attributed (honest, never fabricated)", {
+      ...context,
+      status: attribution.status,
+      reason: attribution.reason,
+    });
+    return null;
+  } catch (err) {
+    // Attribution must never break the round's plain-text step status.
+    logger.warn("dsh Matchlock store attribution failed", {
+      ...context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
   }
 }
 
@@ -2851,6 +3684,12 @@ interface LaunchTimeProbeOutcome {
   durationMs: number;
   /** Probe tokens attributed to the run through the per-round path (0 when none/not parseable). */
   tokens: number;
+  /**
+   * True when the round's launch-cancellation signal fired mid-probe (run
+   * teardown/cancel in progress). The caller records nothing and returns —
+   * the run is going down; no failure block is produced.
+   */
+  canceled?: boolean;
   /** Present when passed === false: the mechanical failure keyline block. */
   failureBlock: string;
   /** Present when passed === false: capped single-line observed message (≤400 chars). */
@@ -3063,6 +3902,459 @@ async function runLaunchTimeHarnessProbe(params: {
       harness: harnessType,
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+
+  const outcome = evaluateHarnessProbe({
+    harness: harnessType,
+    probeCmd,
+    expectedPath,
+    wallMs,
+    adapter: {
+      output: observedMessage,
+      stderrTail: result.stderrTail,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      durationMs: result.durationMs,
+    },
+  });
+
+  if (outcome.passed) {
+    return {
+      passed: true,
+      harness: harnessType,
+      probeCmd,
+      expected: expectedPath,
+      durationMs,
+      tokens,
+      failureBlock: "",
+      observed: "",
+      exitCode: null,
+      signal: null,
+      stderrTail: "",
+    };
+  }
+  return fail({ ...(outcome.failure as HarnessProbeFailureFields), durationMs });
+}
+
+/**
+ * Run one launch-time harness probe round for an OPTED-IN (Matchlock) round
+ * IN-VM through the Matchlock invocation runner.
+ *
+ * Mirror of {@link runLaunchTimeHarnessProbe} for the Matchlock branch with
+ * the three structural differences the design (section 6.4) mandates:
+ *
+ *   1. the probe command/prompt ask the GUEST pi harness to run the packed
+ *      guest CLI (`/workspace/runtime/bin/tamandua skill-path`);
+ *   2. the expected value is the GUEST-readable skill file in the RO pack
+ *      (`/workspace/runtime/skills/tamandua-agents/SKILL.md`) — it is NEVER
+ *      computed by spawning a host `<launcher> skill-path` child;
+ *   3. the round executes through the Matchlock runner seam (fresh invocation,
+ *      fresh VM) — NO host adapter findBinary/runRound, NO host harness spawn,
+ *      NO host harness child env.
+ *
+ * The probe NEVER throws to the caller: every failure shape (infrastructure
+ * throw, wrong output, non-zero exit, signal death, wall exceeded, or host
+ * cancellation) is converted into a `passed: false` outcome carrying the
+ * mechanical keyline failure block, so the caller can record + force-fail
+ * without the round ever being classified by the instant-fail (RSPN) tracker.
+ * A host-canceled probe returns `canceled: true` with no failure block — the
+ * caller records nothing (the run is being torn down).
+ */
+async function runMatchlockLaunchTimeHarnessProbe(params: {
+  job: CronJobInfo;
+  context: Record<string, unknown>;
+  workdir: string;
+  policy: ExecutionIsolation;
+  wallMs: number;
+  /** KHYG US-002: the round's launch-cancellation signal. */
+  signal: AbortSignal;
+}): Promise<LaunchTimeProbeOutcome> {
+  const { job, context, workdir, policy, wallMs, signal } = params;
+  // The persisted policy decides which guest harness the probe speaks to: pi
+  // (--mode json semantics) or hermes (plain text). Both run the SAME packed
+  // guest CLI command (`/workspace/runtime/bin/tamandua skill-path`) and
+  // reply with the guest-readable pack skill path.
+  const harnessType: "pi" | "hermes" = policy.harness === "hermes" ? "hermes" : "pi";
+  const probeCmd = buildMatchlockProbeCommand();
+  const prompt = buildMatchlockProbePrompt();
+  // TIME-CLOCKS rule 1: the probe's duration fallback is an in-process
+  // interval, measured on the monotonic clock (never `Date.now()` math).
+  const probeWatch = new Stopwatch();
+  const expectedPath = MATCHLOCK_GUEST_SKILL_FILE;
+
+  const fail = (
+    fields: HarnessProbeFailureFields,
+    canceled = false,
+  ): LaunchTimeProbeOutcome => ({
+    passed: false,
+    ...(canceled ? { canceled: true } : {}),
+    harness: fields.harness,
+    probeCmd: fields.probeCmd,
+    expected: fields.expected,
+    durationMs: fields.durationMs ?? Math.max(0, probeWatch.elapsedMs()),
+    tokens: 0,
+    failureBlock: canceled ? "" : buildHarnessProbeFailureBlock(fields),
+    observed: harnessProbeObservedDisplay(fields.observed),
+    exitCode: fields.exitCode ?? null,
+    signal: fields.signal ?? null,
+    stderrTail: harnessProbeStderrTailDisplay(fields.stderrTail),
+  });
+
+  if (signal.aborted) {
+    return fail(
+      {
+        harness: harnessType,
+        probeCmd,
+        expected: expectedPath,
+        observed: "",
+        exitCode: null,
+        signal: null,
+        durationMs: undefined,
+        stderrTail: "matchlock probe canceled by host before invocation",
+      },
+      true,
+    );
+  }
+
+  let result: HarnessRoundResult & { canceled?: boolean };
+  try {
+    result = await runMatchlockSchedulerRound({
+      policy,
+      identity: {
+        runId: job.runId,
+        agentId: job.agentId,
+        workflowId: job.workflowId,
+        jobId: job.id,
+      },
+      kind: "probe",
+      promptText: prompt,
+      workingDirectoryForHarness: workdir,
+      timeoutMs: wallMs,
+      signal,
+      ...(policy.imagePath ? { imagePath: policy.imagePath } : {}),
+    });
+  } catch (err) {
+    if (signal.aborted) {
+      return fail(
+        {
+          harness: harnessType,
+          probeCmd,
+          expected: expectedPath,
+          observed: "",
+          exitCode: null,
+          signal: null,
+          durationMs: undefined,
+          stderrTail: "matchlock probe canceled by host during invocation",
+        },
+        true,
+      );
+    }
+    return fail({
+      harness: harnessType,
+      probeCmd,
+      expected: expectedPath,
+      observed: "",
+      exitCode: null,
+      signal: null,
+      durationMs: undefined,
+      stderrTail: `matchlock probe invocation failed: ${describeMatchlockError(err)}`,
+    });
+  }
+
+  if (signal.aborted || result.canceled) {
+    return fail(
+      {
+        harness: harnessType,
+        probeCmd,
+        expected: expectedPath,
+        observed: "",
+        exitCode: null,
+        signal: null,
+        durationMs: undefined,
+        stderrTail: "matchlock probe canceled by host during invocation",
+      },
+      true,
+    );
+  }
+
+  const durationMs = result.durationMs ?? Math.max(0, probeWatch.elapsedMs());
+
+  // The observed message is the harness's final assistant message — for pi
+  // (--mode json) that is the message_end assistant text; for hermes the
+  // plain-text final message (the trailer is stripped by the runner).
+  const metadata = parseWorkRoundMetadata(result.output);
+  const observedMessage =
+    metadata.assistantOutput.length > 0 ? metadata.assistantOutput : result.output;
+
+  // Attribute probe tokens through the existing per-round path so they land
+  // on runs.tokens_spent exactly once (pi usage from --mode json; hermes
+  // usage projected IN-VM by the US-002 runner — never a host state.db
+  // lookup of the guest-writable mapped store). Best-effort: an attribution
+  // hiccup must never flip a passing probe into a failed run.
+  let tokens = 0;
+  try {
+    const outputSummary = summarizeWorkRoundOutput(result.output);
+    if (harnessType === "pi") {
+      if (metadata.tokenUsage !== null && metadata.tokenUsage > 0) {
+        await attributeWorkRoundTokenUsage(context, job, outputSummary, metadata);
+        tokens = metadata.tokenUsage;
+      }
+    } else {
+      const hermesUsage = (result as { usage?: { status?: string; tokens?: number } }).usage;
+      if (hermesUsage?.status === "ok" && typeof hermesUsage.tokens === "number" && hermesUsage.tokens > 0) {
+        const hermesMetadata: WorkRoundMetadata = {
+          assistantOutput: result.output,
+          tokenUsage: hermesUsage.tokens,
+          runId: null,
+          stepId: null,
+          jsonMetadataDetected: false,
+        };
+        await attributeWorkRoundTokenUsage(context, job, outputSummary, hermesMetadata);
+        tokens = hermesUsage.tokens;
+      } else {
+        logger.info("Matchlock hermes probe usage unavailable — no token delta", {
+          ...context,
+          status: hermesUsage?.status ?? "missing",
+          reason: "in_vm_usage_projection_unavailable",
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn("Matchlock launch probe token attribution failed", {
+      ...context,
+      harness: harnessType,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const outcome = evaluateHarnessProbe({
+    harness: harnessType,
+    probeCmd,
+    expectedPath,
+    wallMs,
+    adapter: {
+      output: observedMessage,
+      stderrTail: result.stderrTail,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      durationMs: result.durationMs,
+    },
+  });
+
+  if (outcome.passed) {
+    return {
+      passed: true,
+      harness: harnessType,
+      probeCmd,
+      expected: expectedPath,
+      durationMs,
+      tokens,
+      failureBlock: "",
+      observed: "",
+      exitCode: null,
+      signal: null,
+      stderrTail: "",
+    };
+  }
+  return fail({ ...(outcome.failure as HarnessProbeFailureFields), durationMs });
+}
+
+/**
+ * Run one launch-time harness probe round for an OPTED-IN dsh (Matchlock)
+ * round IN-VM through the dsh scheduler round seam.
+ *
+ * Mirror of {@link runMatchlockLaunchTimeHarnessProbe} for harness "dsh":
+ *
+ *   1. the probe command/prompt ask the guest dsh to run the packed guest CLI
+ *      (`/workspace/runtime/bin/tamandua skill-path`);
+ *   2. the expected value is the GUEST-readable skill file in the RO pack
+ *      (`/workspace/runtime/skills/tamandua-agents/SKILL.md`) — NEVER computed
+ *      by spawning a host `<launcher> skill-path` child;
+ *   3. the round executes through the dsh runner seam (fresh invocation,
+ *      fresh VM) — NO host adapter findBinary/runRound, NO host harness spawn,
+ *      NO host harness child env; guest output is plain text (never pi JSON).
+ *
+ * Probe tokens are attributed from the mounted v2 store via the US-001
+ * confined bounded read (pre/post inventories) when available — honestly
+ * reported, never fabricated, and never allowed to flip a passing probe into
+ * a failed run. The probe NEVER throws to the caller: every failure shape is
+ * converted into a `passed: false` outcome carrying the mechanical keyline
+ * failure block. A host-canceled probe returns `canceled: true` with no
+ * failure block.
+ */
+async function runDshLaunchTimeHarnessProbe(params: {
+  job: CronJobInfo;
+  context: Record<string, unknown>;
+  workdir: string;
+  policy: ExecutionIsolation;
+  wallMs: number;
+  /** KHYG US-002: the round's launch-cancellation signal. */
+  signal: AbortSignal;
+}): Promise<LaunchTimeProbeOutcome> {
+  const { job, context, workdir, policy, wallMs, signal } = params;
+  const harnessType: "dsh" = "dsh";
+  const probeCmd = buildDshProbeCommand();
+  const prompt = buildDshProbePrompt();
+  // TIME-CLOCKS rule 1: the probe's duration fallback is an in-process
+  // interval, measured on the monotonic clock (never `Date.now()` math).
+  const probeWatch = new Stopwatch();
+  const expectedPath = DSH_MATCHLOCK_GUEST_SKILL_FILE;
+
+  const fail = (
+    fields: HarnessProbeFailureFields,
+    canceled = false,
+  ): LaunchTimeProbeOutcome => ({
+    passed: false,
+    ...(canceled ? { canceled: true } : {}),
+    harness: fields.harness,
+    probeCmd: fields.probeCmd,
+    expected: fields.expected,
+    durationMs: fields.durationMs ?? Math.max(0, probeWatch.elapsedMs()),
+    tokens: 0,
+    failureBlock: canceled ? "" : buildHarnessProbeFailureBlock(fields),
+    observed: harnessProbeObservedDisplay(fields.observed),
+    exitCode: fields.exitCode ?? null,
+    signal: fields.signal ?? null,
+    stderrTail: harnessProbeStderrTailDisplay(fields.stderrTail),
+  });
+
+  if (signal.aborted) {
+    return fail(
+      {
+        harness: harnessType,
+        probeCmd,
+        expected: expectedPath,
+        observed: "",
+        exitCode: null,
+        signal: null,
+        durationMs: undefined,
+        stderrTail: "dsh matchlock probe canceled by host before invocation",
+      },
+      true,
+    );
+  }
+
+  // Pre-launch store inventory over the mounted effective DSH_HOME so the
+  // probe's own session (if any) can be attributed after the round.
+  const storePre = dshStoreAdmissible(policy) ? snapshotDshRoundStore(policy, workdir) : null;
+
+  let result: HarnessRoundResult & { canceled?: boolean };
+  try {
+    // ONE harness-keyed dispatch: a dsh policy routes through the shared
+    // runMatchlockSchedulerRound seam to the dsh scheduler route (the dsh
+    // runner seam still owns the dsh-specific VM/DSH_HOME behavior).
+    result = await runMatchlockSchedulerRound({
+      policy,
+      identity: {
+        runId: job.runId,
+        agentId: job.agentId,
+        workflowId: job.workflowId,
+        jobId: job.id,
+      },
+      kind: "probe",
+      promptText: prompt,
+      workingDirectoryForHarness: workdir,
+      timeoutMs: wallMs,
+      signal,
+    });
+  } catch (err) {
+    if (signal.aborted) {
+      return fail(
+        {
+          harness: harnessType,
+          probeCmd,
+          expected: expectedPath,
+          observed: "",
+          exitCode: null,
+          signal: null,
+          durationMs: undefined,
+          stderrTail: "dsh matchlock probe canceled by host during invocation",
+        },
+        true,
+      );
+    }
+    return fail({
+      harness: harnessType,
+      probeCmd,
+      expected: expectedPath,
+      observed: "",
+      exitCode: null,
+      signal: null,
+      durationMs: undefined,
+      stderrTail: `dsh matchlock probe invocation failed: ${describeMatchlockError(err)}`,
+    });
+  }
+
+  if (signal.aborted || result.canceled) {
+    return fail(
+      {
+        harness: harnessType,
+        probeCmd,
+        expected: expectedPath,
+        observed: "",
+        exitCode: null,
+        signal: null,
+        durationMs: undefined,
+        stderrTail: "dsh matchlock probe canceled by host during invocation",
+      },
+      true,
+    );
+  }
+
+  const durationMs = result.durationMs ?? Math.max(0, probeWatch.elapsedMs());
+
+  // dsh output is PLAIN TEXT (never pi JSON): the observed message is the
+  // round's captured stdout verbatim (trimmed).
+  const observedMessage = (result.output ?? "").trim();
+
+  // Attribute probe tokens through the confined mounted-store read. Honest
+  // best-effort: an unavailable/incomplete attribution or a hiccup must never
+  // flip a passing probe into a failed run or fabricate a zero.
+  let tokens = 0;
+  if (storePre !== null) {
+    try {
+      const post = snapshotDshRoundStore(policy, workdir);
+      const attribution = attributeDshRoundStore(policy, workdir, storePre, post);
+      if (attribution.status === "attributed") {
+        const total = attribution.tokenTotal;
+        if (total !== null && total > 0) {
+          const outputSummary = summarizeWorkRoundOutput(result.output);
+          await attributeWorkRoundTokenUsage(context, job, outputSummary, {
+            assistantOutput: result.output,
+            tokenUsage: total,
+            runId: null,
+            stepId: null,
+            jsonMetadataDetected: false,
+          } as WorkRoundMetadata);
+          tokens = total;
+          logger.info("dsh Matchlock probe token attribution from mounted store", {
+            ...context,
+            rootSessionId: attribution.rootSessionId,
+            tokenDelta: total,
+          });
+        } else {
+          logger.warn("dsh Matchlock probe store attribution: no usage tokens on the attributed root lineage", {
+            ...context,
+            rootSessionId: attribution.rootSessionId,
+            status: attribution.status,
+            reason: attribution.reason,
+          });
+        }
+      } else {
+        logger.warn("dsh Matchlock probe store usage not attributed (honest, never fabricated)", {
+          ...context,
+          status: attribution.status,
+          reason: attribution.reason,
+        });
+      }
+    } catch (err) {
+      logger.warn("dsh Matchlock probe store attribution failed", {
+        ...context,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   const outcome = evaluateHarnessProbe({
@@ -3471,19 +4763,79 @@ export async function runPostGraceSweep(
 }
 
 /**
+ * MTLK-CLEANUP US-007: best-effort Matchlock orphan reaper pass for ONE run at
+ * teardown. It disposes ONLY the run's own recorded orphan VMs (US-003) — and
+ * a stopped VM only when the US-006 guard proves its process is dead — by exact
+ * id. It NEVER throws and is deliberately off the teardown return path, so a
+ * failing reap can never affect dispatch, classification or the terminal run
+ * status. A run with no orphan records is a bounded no-op.
+ *
+ * The module is imported lazily so the scheduler's static dependency graph (and
+ * the documented invocation-runner import cycle) is unchanged.
+ */
+async function reapRunMatchlockOrphans(runId: string): Promise<void> {
+  try {
+    if (matchlockOrphanReapHook) {
+      await matchlockOrphanReapHook(runId);
+      return;
+    }
+    const { reapOrphanedMatchlockVms } = await import("./matchlock/vm-reaper.js");
+    const result = reapOrphanedMatchlockVms({ runId });
+    const removed = result.results.filter((entry) => entry.action === "removed");
+    // Log ONLY when the pass actually disposed something: a run with no
+    // orphans must stay a silent no-op (no default-logger writes).
+    if (removed.length > 0) {
+      logger.info("Matchlock orphan reaper disposed handed-off VMs at run teardown", {
+        runId,
+        removedVmIds: removed.map((entry) => entry.vmId),
+        diagnostics: result.diagnostics,
+      });
+    }
+  } catch (err) {
+    // Defense-in-depth: the teardown hook is best-effort by contract.
+    logger.warn("Matchlock orphan reaper pass at run teardown failed", {
+      runId,
+      error: (err as Error).message,
+    });
+  }
+}
+
+export type MatchlockOrphanReapHook = (runId: string) => void | Promise<void>;
+
+/**
+ * Test-only seam: replace the scheduler's run-teardown Matchlock orphan reaper
+ * pass (used to assert the teardown drives the reaper without spawning a real
+ * `matchlock` child). Pass `null` to restore the production reaper.
+ */
+let matchlockOrphanReapHook: MatchlockOrphanReapHook | null = null;
+export function setMatchlockOrphanReapHookForTest(
+  hook: MatchlockOrphanReapHook | null,
+): void {
+  matchlockOrphanReapHook = hook;
+}
+
+/**
  * Schedule a one-shot post-grace sweep timer for a run. Deduplicated: at
  * most one pending timer per runId. The timer is unref-ed so a process
  * with an empty event loop exits without waiting. Called from
  * `removeRunCrons` so every run teardown path (control-plane terminate,
  * dispatch-round run_not_running) gets a sweep scheduled.
+ *
+ * MTLK-CLEANUP US-007: the callback also runs one bounded Matchlock orphan
+ * reaper pass, so a VM handed off after a post-harness close/dispose failure
+ * (US-005) is retried on the next pass.
  */
 function scheduleSweepTimer(runId: string, target: PostGraceSweepTarget = {}): void {
   if (pendingSweepTimers.has(runId)) return;
 
   const delayMs = HARNESS_TEARDOWN_GRACE_MS + 2_000;
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
     pendingSweepTimers.delete(runId);
     pendingSweepTargets.delete(runId);
+    // MTLK-CLEANUP US-007: retry the run's orphaned-VM disposal on the sweep
+    // pass (independent of whether the run had a worktree). Bounded + never
+    // throws, so the process sweep below always runs.
+    await reapRunMatchlockOrphans(runId);
     void runPostGraceSweep(runId, target);
   }, delayMs);
 
@@ -3724,6 +5076,10 @@ export async function removeRunCrons(
   const epoch = options.schedulerGeneration;
   const epochStale = epoch !== undefined && epoch !== schedulerGeneration;
   if (removed.length > 0 && !epochStale) {
+    // MTLK-CLEANUP US-007: the run's cleanup at completion retries any VM it
+    // handed to the orphan store. Fire-and-forget + bounded so teardown never
+    // blocks on a `matchlock rm` child; the sweep timer below is a second pass.
+    void reapRunMatchlockOrphans(runId);
     scheduleSweepTimer(runId, {
       workingDirectory: sweepWorkingDirectory,
       pgids: [...sweepPgids],

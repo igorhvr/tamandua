@@ -2,11 +2,19 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
 
 import { runWorkflow, resumeWorkflow, isGitRepositoryForHarness } from "../../dist/installer/run.js";
+import { parseMatchlockPolicy } from "../../dist/installer/matchlock/policy.js";
+import {
+  MatchlockAdmissionError,
+  MATCHLOCK_RPC_ARGS_ENV,
+  MATCHLOCK_RPC_BIN_ENV,
+} from "../../dist/installer/matchlock/admission.js";
+import { tempTranscriptPath, writeFakeRpcDriver } from "../../dist/installer/matchlock/fake-rpc-driver.js";
 import { getPidFile, getPortFile, stopDaemon, stopDaemonFamily } from "../../dist/server/daemonctl.js";
 import {
   reservePortHandles,
@@ -19,6 +27,15 @@ import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 import { formatWorkdirRefusalMessage } from "../../dist/installer/workdir-collision.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
+
+/**
+ * MTLK-ADMIT: fixture base for MATCHLOCK RUN-CREATION tests. Work mounts must
+ * live at host paths whose exact-path GUEST mounts are allowed — guest /tmp is
+ * a protected disposable root, so a work directory under the suite's /tmp
+ * temp homes would be refused by the mount policy. Captured at module load
+ * (before any test mutates HOME).
+ */
+const MTLK_FIXTURE_BASE = path.join(os.homedir(), ".mtlk-run-test");
 
 // ── Helpers ──
 
@@ -1139,6 +1156,671 @@ describe("runWorkflow", () => {
       assert.equal(rows[0].test_cmd_established, null,
         "without a launch declaration the contract is established by the first step marker, not at launch");
       assert.equal(rows[0].test_cmd_source, null);
+    });
+
+    // MTLK-ADMIT: the --matchlock policy is ADMITTED and pinned at run
+    // creation (submission time) via the production admission path: the image
+    // identity is resolved over an owned RPC (resolve_image ONLY — zero
+    // create), validated host sources are captured, and the version-2 policy
+    // is persisted BEFORE step insertion / pipeline advance / registration.
+    // Absent --matchlock yields no policy.
+    it("admits and persists a PINNED Matchlock policy when matchlockImage is provided (resolve-only wire journal, no create)", async () => {
+      const workflowId = "test-ctx-mtlk-on";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      // Work fixture must be mountable at its exact host path (guest /tmp is
+      // protected) — place it under the real-home fixture base.
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      // The ENTIRE selected host pi configuration directory must exist (only
+      // the host pi executable may be absent). Default capture = <HOME>/.pi/agent.
+      const configRoot = path.join(tempHome, ".pi", "agent");
+      fs.mkdirSync(configRoot, { recursive: true });
+
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+      setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+      setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+      setEnv("FAKE_IMAGE_TAG", "vic/matchlock-base:latest");
+      setEnv("FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test matchlock policy capture",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/matchlock-base:latest",
+        });
+      } catch (err) {
+        // Daemon registration may fail after persisting the run; the
+        // assertions below only need the stored policy + wire journal.
+        assert.ok(
+          err instanceof Error && /Failed to register run with daemon|daemon/.test(err.message),
+          `unexpected runWorkflow failure: ${String(err)}`,
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.ok(rows[0].matchlock_policy, "matchlock_policy should be persisted");
+      const policy = parseMatchlockPolicy(rows[0].matchlock_policy!);
+      assert.equal(policy.backend, "matchlock");
+      assert.equal(policy.requestedImage, "vic/matchlock-base:latest",
+        "the requested image reaches run creation");
+      // The immutable content+config pin resolved by admission is REQUIRED.
+      assert.equal(policy.resolvedImageDigest,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      assert.equal(policy.resolvedImageConfigDigest,
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+      assert.equal(policy.harness, "pi");
+      assert.equal(policy.workPathMode, "host-absolute");
+      assert.equal(policy.configurationRoot, configRoot, "pi config root captured");
+      assert.equal(policy.workingDirectory, repoDir, "working directory captured");
+      assert.equal(policy.originalRepositoryRoot, repoDir, "original repo captured (direct)");
+      assert.ok(policy.workMounts.length >= 1, "work mounts captured");
+      assert.equal(policy.workMounts[0].guestPath, policy.workMounts[0].hostPath,
+        "exact host/guest path rule holds");
+
+      // Wire journal: admission issued resolve_image ONLY — zero create
+      // frames, and the pin was stored before any runnable registration.
+      const txn = fs.readFileSync(transcript, "utf-8").trim().split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const methods = txn.map((e) => e.method).filter(Boolean);
+      assert.deepEqual(methods, ["resolve_image"], "admission must resolve WITHOUT creating a VM");
+      if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+    });
+
+    // MTLK-VM-SIZE US-003: CLI-resolved limits are persisted in the run's
+    // policy (serialize/parse round-trip) and surfaced on the result so the
+    // CLI can echo the admitted VM size. An injected host probe proves the
+    // explicit limits are used verbatim (no host re-derivation).
+    it("persists supplied matchlockResourceLimits (serialize/parse round-trip) and surfaces them on RunWorkflowResult (US-003)", async () => {
+      const workflowId = "test-ctx-mtlk-size-explicit";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      const configRoot = path.join(tempHome, ".pi", "agent");
+      fs.mkdirSync(configRoot, { recursive: true });
+
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+      setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+      setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+      setEnv("FAKE_IMAGE_TAG", "vic/matchlock-base:latest");
+      setEnv("FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+      let result: Awaited<ReturnType<typeof runWorkflow>> | undefined;
+      try {
+        result = await runWorkflow({
+          workflowId,
+          taskTitle: "Test explicit matchlock resource limits",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/matchlock-base:latest",
+          matchlockResourceLimits: { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
+          matchlockResourceHostProbe: { onlineCpus: () => 96, totalMemoryMB: () => 1048576 },
+        });
+      } catch (err) {
+        // Daemon registration may fail after persisting the run; the
+        // assertions below only need the stored policy + returned result.
+        assert.ok(
+          err instanceof Error && /Failed to register run with daemon|daemon/.test(err.message),
+          `unexpected runWorkflow failure: ${String(err)}`,
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      assert.ok(result, "runWorkflow should return a result");
+      assert.deepEqual(
+        result.matchlockResourceLimits,
+        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
+        "the persisted limits must be surfaced on RunWorkflowResult",
+      );
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.ok(rows[0].matchlock_policy, "matchlock_policy should be persisted");
+      assert.deepEqual(
+        parseMatchlockPolicy(rows[0].matchlock_policy!).resourceLimits,
+        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
+      );
+    });
+
+    // MTLK-VM-SIZE US-003: when no explicit limits are supplied, runWorkflow
+    // resolves the host-derived default through the injectable probe.
+    it("resolves host-derived default matchlockResourceLimits through the injected probe when none are supplied (US-003)", async () => {
+      const workflowId = "test-ctx-mtlk-size-default";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      const configRoot = path.join(tempHome, ".pi", "agent");
+      fs.mkdirSync(configRoot, { recursive: true });
+
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+      setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+      setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+      setEnv("FAKE_IMAGE_TAG", "vic/matchlock-base:latest");
+      setEnv("FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+      let result: Awaited<ReturnType<typeof runWorkflow>> | undefined;
+      try {
+        result = await runWorkflow({
+          workflowId,
+          taskTitle: "Test default matchlock resource limits",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/matchlock-base:latest",
+          matchlockResourceHostProbe: { onlineCpus: () => 4, totalMemoryMB: () => 16384 },
+        });
+      } catch (err) {
+        assert.ok(
+          err instanceof Error && /Failed to register run with daemon|daemon/.test(err.message),
+          `unexpected runWorkflow failure: ${String(err)}`,
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      assert.ok(result, "runWorkflow should return a result");
+      assert.deepEqual(
+        result.matchlockResourceLimits,
+        { cpus: 4, memoryMB: 8192, diskSizeMB: 20480 },
+        "4 online CPUs / 16 GB host => cpus min(8,4)=4, memory min(16384,50%)=8192",
+      );
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.ok(rows[0].matchlock_policy, "matchlock_policy should be persisted");
+      assert.deepEqual(
+        parseMatchlockPolicy(rows[0].matchlock_policy!).resourceLimits,
+        { cpus: 4, memoryMB: 8192, diskSizeMB: 20480 },
+      );
+    });
+
+    it("writes no Matchlock policy (NULL) when matchlockImage is absent", async () => {
+      const workflowId = "test-ctx-mtlk-off";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test no matchlock policy",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.equal(rows[0].matchlock_policy, null,
+        "absent --matchlock must leave the policy NULL (zero Matchlock actions)");
+    });
+
+    it("HERMES opt-in: admits and persists a PINNED harness-hermes policy carrying the FROZEN submission inputs + resolved Hermes config root/profile (resolve-only wire journal, no create)", async () => {
+      const workflowId = "test-ctx-mtlk-hermes-on";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      // The ENTIRE selected host Hermes configuration directory must exist
+      // (only the guest hermes executable may be absent). Default Hermes root
+      // from the FROZEN submission env = <HOME>/.hermes.
+      const hermesRoot = path.join(tempHome, ".hermes");
+      fs.mkdirSync(hermesRoot, { recursive: true });
+
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+      setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+      setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+      setEnv("FAKE_IMAGE_TAG", "vic/hermes-base:latest");
+      setEnv("FAKE_IMAGE_DIGEST", "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+      setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+      // No stray HERMES_HOME: the frozen snapshot captures HERMES_HOME as
+      // unset → default ~/.hermes under the frozen homeDir.
+      setEnv("HERMES_HOME", undefined);
+      const frozenCwd = process.cwd();
+      const frozenHome = tempHome;
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test hermes policy capture",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/hermes-base:latest",
+          harnessType: "hermes",
+        });
+      } catch (err) {
+        assert.ok(
+          err instanceof Error && /Failed to register run with daemon|daemon/.test(err.message),
+          `unexpected runWorkflow failure: ${String(err)}`,
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.ok(rows[0].matchlock_policy, "hermes matchlock_policy should be persisted");
+      const policy = parseMatchlockPolicy(rows[0].matchlock_policy!);
+      assert.equal(policy.harness, "hermes", "the persisted policy harness must be hermes");
+      assert.equal(policy.resolvedImageDigest,
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+      assert.equal(policy.resolvedImageConfigDigest,
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+      // The resolved effective Hermes config root/profile + guest mapping.
+      assert.equal(policy.configurationRoot, hermesRoot, "canonical host Hermes config root captured");
+      assert.equal(policy.configurationProfile, "default", "default Hermes profile id captured");
+      assert.equal(policy.guestConfigurationRoot, "/workspace/config/hermes",
+        "approved guest HERMES_HOME mapping captured");
+      // The FROZEN submission inputs are captured at run creation (HOME + cwd
+      // + HERMES_HOME snapshot), never daemon ambient state.
+      assert.deepEqual(policy.hermes, {
+        homeDir: frozenHome,
+        cwd: frozenCwd,
+        hermesHomeEnv: null,
+      });
+      assert.equal(policy.workingDirectory, repoDir, "working directory captured");
+      assert.equal(policy.originalRepositoryRoot, repoDir, "original repo captured (direct)");
+
+      // Wire journal: admission issued resolve_image ONLY — zero create.
+      const txn = fs.readFileSync(transcript, "utf-8").trim().split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const methods = txn.map((e) => e.method).filter(Boolean);
+      assert.deepEqual(methods, ["resolve_image"], "hermes admission must resolve WITHOUT creating a VM");
+      if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+    });
+
+    it("HERMES opt-in with a custom absolute HERMES_HOME: the frozen env snapshot steers the persisted Hermes config root", async () => {
+      const workflowId = "test-ctx-mtlk-hermes-env";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      const customHermesRoot = path.join(tempHome, "custom-hermes");
+      fs.mkdirSync(customHermesRoot, { recursive: true });
+
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+      setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+      setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+      setEnv("FAKE_IMAGE_TAG", "vic/hermes-env:latest");
+      setEnv("FAKE_IMAGE_DIGEST", "sha256:1111111111111111111111111111111111111111111111111111111111111111");
+      setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:2222222222222222222222222222222222222222222222222222222222222222");
+      setEnv("HERMES_HOME", customHermesRoot);
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test hermes env policy capture",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/hermes-env:latest",
+          harnessType: "hermes",
+        });
+      } catch (err) {
+        assert.ok(
+          err instanceof Error && /Failed to register run with daemon|daemon/.test(err.message),
+          `unexpected runWorkflow failure: ${String(err)}`,
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const policy = parseMatchlockPolicy(rows[0].matchlock_policy!);
+      assert.equal(policy.harness, "hermes");
+      assert.equal(policy.configurationRoot, customHermesRoot,
+        "the frozen HERMES_HOME snapshot steers the admitted Hermes root");
+      assert.equal(policy.hermes?.hermesHomeEnv, customHermesRoot,
+        "the raw HERMES_HOME snapshot value is frozen on the policy");
+      assert.equal(policy.hermes?.homeDir, tempHome);
+      if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+    });
+
+    it("HERMES opt-in refuses when the selected host Hermes configuration directory is ABSENT: run failed, no steps, no image RPC", async () => {
+      const workflowId = "test-ctx-mtlk-hermes-refuse";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      const missingHermes = path.join(tempHome, "hermes-missing");
+      // Do NOT create the Hermes configuration directory. The env override
+      // keeps the default <HOME>/.hermes untouched for the rest of the suite.
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv("HERMES_HOME", missingHermes);
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test hermes refusal on absent config root",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/hermes-base:latest",
+          harnessType: "hermes",
+        });
+        assert.fail("runWorkflow must refuse an absent Hermes config root");
+      } catch (err) {
+        assert.ok(
+          err instanceof MatchlockAdmissionError && err.code === "hermes_selection_refused",
+          `expected hermes_selection_refused refusal, got ${String(err)}`,
+        );
+        assert.match(err.message, /invalid-root/, "the adapter classifies a missing root as invalid-root (never an image default)");
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const run = db.prepare(
+        "SELECT id, status, scheduling_status, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).get(workflowId) as { id: string; status: string; scheduling_status: string | null; context: string } | undefined;
+      assert.ok(run, "the run row must exist (honest refused run)");
+      assert.equal(run.status, "failed", "refused hermes run must be failed, never running");
+      assert.equal(run.scheduling_status, null, "refused run must never be schedulable");
+      assert.match(JSON.parse(run.context).launch_error ?? "", /Hermes adapter refused the frozen submission selection/);
+      const steps = db.prepare("SELECT COUNT(*) AS n FROM steps WHERE run_id = ?").get(run.id) as { n: number };
+      assert.equal(steps.n, 0, "no step/work may be runnable for a refused hermes run");
+    });
+
+    it("refuses an opted-in run whose image cannot be resolved: run failed, no steps, no native work, resolve-only journal", async () => {
+      const workflowId = "test-ctx-mtlk-refuse-resolve";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      fs.mkdirSync(path.join(tempHome, ".pi", "agent"), { recursive: true });
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+      setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+      setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+      setEnv("FAKE_RESOLVE_MISSING", "1");
+
+      let runId: string | undefined;
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test matchlock refusal on unresolvable image",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/matchlock-base:latest",
+        });
+        assert.fail("runWorkflow must refuse an unresolvable Matchlock image");
+      } catch (err) {
+        assert.ok(
+          err instanceof MatchlockAdmissionError && err.code === "image_unusable",
+          `expected image_unusable refusal, got ${String(err)}`,
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const run = db.prepare(
+        "SELECT id, status, scheduling_status, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).get(workflowId) as { id: string; status: string; scheduling_status: string | null; context: string } | undefined;
+      assert.ok(run, "the run row must exist (honest refused run)");
+      assert.equal(run.status, "failed", "refused run must be failed, never running");
+      assert.equal(run.scheduling_status, null, "refused run must never be schedulable");
+      assert.match(JSON.parse(run.context).launch_error ?? "", /could not resolve image/);
+      const steps = db.prepare("SELECT COUNT(*) AS n FROM steps WHERE run_id = ?").get(run.id) as { n: number };
+      assert.equal(steps.n, 0, "no step/work may be runnable for a refused run");
+      const methods = fs.readFileSync(transcript, "utf-8").trim().split("\n")
+        .filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>).map((e) => e.method).filter(Boolean);
+      assert.deepEqual(methods, ["resolve_image"], "refusal journal has resolve only, no create");
+      if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+      runId = run.id;
+    });
+
+    it("refuses an opted-in run whose selected host config directory is ABSENT: run failed, no steps, no RPC", async () => {
+      const workflowId = "test-ctx-mtlk-refuse-config";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      const missingConfig = path.join(tempHome, ".pi", "agent-missing");
+      // Do NOT create the config directory. The env override keeps the
+      // default <HOME>/.pi/agent untouched for the rest of the suite.
+      const savedPiDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = missingConfig;
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test matchlock refusal on absent config root",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/matchlock-base:latest",
+        });
+        assert.fail("runWorkflow must refuse an absent Matchlock config root");
+      } catch (err) {
+        assert.ok(
+          err instanceof MatchlockAdmissionError && err.code === "guest_configuration_incompatible",
+          `expected guest_configuration_incompatible refusal, got ${String(err)}`,
+        );
+      } finally {
+        if (savedPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = savedPiDir;
+        if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const run = db.prepare(
+        "SELECT id, status, scheduling_status, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).get(workflowId) as { id: string; status: string; scheduling_status: string | null; context: string } | undefined;
+      assert.ok(run, "the run row must exist (honest refused run)");
+      assert.equal(run.status, "failed");
+      assert.equal(run.scheduling_status, null);
+      const steps = db.prepare("SELECT COUNT(*) AS n FROM steps WHERE run_id = ?").get(run.id) as { n: number };
+      assert.equal(steps.n, 0, "no step/work may be runnable for a refused run");
+    });
+
+    it("worktree mode: an admission failure AFTER the managed worktree exists retains the worktree fixture + diagnostics (failed run, zero steps, never schedulable)", async () => {
+      // The task requires a FRESH worktree-mode admission failure: the run
+      // row exists, the managed worktree was created, and the resolve step
+      // fails — the run must fail honestly with NO runnable work while the
+      // created run_worktrees row / worktree path (partial owned fixture) is
+      // RETAINED with diagnostics — never broadly cleaned up.
+      const workflowId = "test-ctx-mtlk-wt-refuse";
+      writeMinimalWorkflow(tempHome, workflowId, "worktree");
+
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const savedWorktreeRoot = process.env.TAMANDUA_WORKTREE_ROOT;
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      let transcript: string | undefined;
+      try {
+        fs.mkdirSync(fixtureRoot, { recursive: true });
+        const originDir = path.join(fixtureRoot, "origin");
+        initGitRepo(originDir);
+        fs.mkdirSync(path.join(tempHome, ".pi", "agent"), { recursive: true });
+        // The managed worktree must be created under a MOUNTABLE root: the
+        // suite default lives under host /tmp, whose guest mirror is a
+        // protected disposable root, so the image-resolve refusal would never
+        // be reached. Point TAMANDUA_WORKTREE_ROOT at a narrow fixture root.
+        const worktreeRoot = path.join(fixtureRoot, "worktrees");
+        fs.mkdirSync(worktreeRoot, { recursive: true });
+        process.env.TAMANDUA_WORKTREE_ROOT = worktreeRoot;
+
+        const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+        transcript = tempTranscriptPath();
+        setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+        setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+        setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+        setEnv("FAKE_RESOLVE_MISSING", "1");
+
+        await assert.rejects(
+          runWorkflow({
+            workflowId,
+            taskTitle: "Test worktree-mode admission refusal fixture retention",
+            worktreeOriginRepository: originDir,
+            matchlockImage: "vic/matchlock-base:latest",
+          }),
+          (err: unknown) =>
+            err instanceof MatchlockAdmissionError &&
+            err.code === "image_unusable" &&
+            /could not resolve image/.test(err.message),
+          "runWorkflow must refuse an unresolvable image in worktree mode AFTER creating the managed worktree",
+        );
+
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const run = db.prepare(
+          "SELECT id, status, scheduling_status, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+        ).get(workflowId) as
+        | { id: string; status: string; scheduling_status: string | null; context: string }
+        | undefined;
+        assert.ok(run, "the refused run row must exist");
+        assert.equal(run.status, "failed", "worktree-mode admission failure must leave the run failed, never running");
+        assert.equal(run.scheduling_status, null, "the refused run must never be schedulable");
+        const runContext = JSON.parse(run.context) as Record<string, string>;
+        assert.equal(runContext.workspace_mode, "worktree");
+        assert.match(runContext.launch_error ?? "", /could not resolve image/, "launch_error diagnostics retained");
+        const steps = db.prepare("SELECT COUNT(*) AS n FROM steps WHERE run_id = ?").get(run.id) as { n: number };
+        assert.equal(steps.n, 0, "no step/work may be runnable for a refused run");
+
+        // The created managed worktree fixture is RETAINED (no broad cleanup).
+        const wt = db.prepare(
+          "SELECT worktree_path, status FROM run_worktrees WHERE run_id = ?",
+        ).get(run.id) as { worktree_path: string; status: string } | undefined;
+        assert.ok(wt, "the created run_worktrees row must be retained after an admission failure");
+        assert.equal(wt.status, "ready", "the worktree was fully created before admission refused");
+        assert.equal(wt.worktree_path, runContext.worktree_path,
+          "the retained run_worktrees path must match the run context's worktree_path");
+        assert.ok(fs.existsSync(wt.worktree_path),
+          `the managed worktree on disk must be retained for diagnostics: ${wt.worktree_path}`);
+
+        // Wire journal: the refusal reached the resolve step once and NEVER
+        // issued a create (zero runnable/VM work).
+        const methods = fs.readFileSync(transcript!, "utf-8").trim().split("\n")
+          .filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>).map((e) => e.method).filter(Boolean);
+        assert.deepEqual(methods, ["resolve_image"], "worktree-mode refusal journal has resolve only, no create");
+      } finally {
+        if (savedWorktreeRoot === undefined) delete process.env.TAMANDUA_WORKTREE_ROOT;
+        else process.env.TAMANDUA_WORKTREE_ROOT = savedWorktreeRoot;
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (transcript && fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+        if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
     });
   });
 

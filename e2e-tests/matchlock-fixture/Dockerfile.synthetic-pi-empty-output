@@ -1,0 +1,39 @@
+# MTLK-FIX US-006 (H1/D1) — TEST-ONLY synthetic-pi fixture variant that makes
+# every WORK round complete its step through the packed guest CLI while
+# emitting NOTHING on stdout.
+#
+# This is the real-VM reproduction of the real-model defect: a round whose
+# guest completed the step protocol but whose final plain-text/pi-JSON stdout
+# was lost in the VM transport (observed as outcome=empty_output,
+# outputBytes=0 while the step row is `done`). The production scheduler must
+# classify such a round work_done from the AUTHORITATIVE step row, never
+# empty_output.
+#
+# It is identical to Dockerfile.synthetic-pi except for the single TEST-ONLY
+# ENV knob consumed by synthetic-pi.mjs (TAMANDUA_SYNTHETIC_PI_EMPTY_HARNESS_STDOUT).
+# The launch probe is never silenced, so the run still passes admission.
+#
+# Used ONLY by the on-demand gate ./run-matchlock-empty-output-e2e-test
+# (e2e-tests/matchlock-empty-output-gate.test.ts). NO provider credentials and
+# NO model calls anywhere in the gate.
+
+FROM node:22-bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Deterministic TEST-ONLY non-default image PATH (mirrors Dockerfile.synthetic-pi).
+ENV PATH="/opt/tamandua-synthetic-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+RUN mkdir -p /opt/tamandua-synthetic-bin
+
+# Deterministic test-only synthetic pi harness (see synthetic-pi.mjs).
+COPY synthetic-pi.mjs /opt/tamandua-synthetic-bin/pi
+RUN chmod 0755 /opt/tamandua-synthetic-bin/pi
+
+# US-006 knob: suppress the work-round pi JSON stdout while the step is still
+# completed through the host broker (the lost-final-message defect path).
+ENV TAMANDUA_SYNTHETIC_PI_EMPTY_HARNESS_STDOUT=1
+
+WORKDIR /root
+CMD ["/bin/sh"]

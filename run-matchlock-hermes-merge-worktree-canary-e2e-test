@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Run the MTLK-ALL-WORKFLOWS US-011 REAL-MODEL hermes canary for the genuine
+# bundled `feature-dev-merge-worktree` workflow under the Matchlock hermes route:
+#
+#   isolated daemon -> scheduler -> hermes Matchlock invocation runner -> fresh
+#   VMs -> real workflow completion, a REAL final squash landing on the tiny
+#   OWNED origin, positive per-round mapped-store token attribution, and
+#   exact-owned VM teardown with retained evidence.
+#
+# This tier makes REAL model calls (REAL TOKENS) through the operator's own
+# hermes config/credential home and boots REAL Firecracker VMs with the real
+# operator image `igorhvr/bedlam-ubuntu`. It is deliberately NOT part of the
+# default fast lanes (npm test / run-all-smoke / run-all-scripted /
+# run-all-e2e-tests). Run it on demand UNDER THE SHARED GATE LOCK:
+#
+#   flock --exclusive /home/kaladin/matchlock-work/vaivm-gate.lock \
+#     ./run-matchlock-hermes-merge-worktree-canary-e2e-test
+#
+# The runner does NOT take the lock itself (the caller holds it; a nested flock
+# on the same file would deadlock).
+#
+# Runtime resolution: this host (vaimetal) runs the SYSTEM matchlock pair (no
+# hash pins; see /home/kaladin/matchlock-work/matchlock-runtime.env). The pair
+# is resolved from TAMANDUA_MATCHLOCK_RPC_BIN / MATCHLOCK_GUEST_INIT /
+# MATCHLOCK_GUEST_FUSED when set, else from TAMANDUA_MATCHLOCK_RUNTIME_DIR, else
+# from PATH. Set TAMANDUA_GATE_EXPECT_RUNTIME_PINS=1 to additionally enforce the
+# historical accepted-pin hashes.
+#
+# What it does:
+#   1. resolves + (optionally) validates the runtime binaries
+#   2. npm run build (compiled dist is what the isolated daemon runs)
+#   3. allocates a NEW evidence directory with mkdtemp under
+#      ${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}
+#      (outside the repo; NEVER pre-cleaned/reused) plus a private fresh TMPDIR
+#      inside it
+#   4. sources the REAL operator image store (TAMANDUA_GATE_OPERATOR_CACHE,
+#      default $HOME/.cache/matchlock) and the operator's real hermes home
+#      (TAMANDUA_GATE_REAL_HERMES_HOME, default $HOME/.hermes). Credentials are
+#      never printed.
+#   5. runs e2e-tests/matchlock-hermes-merge-worktree-canary.test.ts with all
+#      logs tee'd into the evidence dir; exit code propagates (cleanup failures
+#      included).
+#
+# Never touches the live worker daemon, live tamandua state, the operator's
+# matchlock store, or any live branch: the canary uses a private fresh HOME and
+# a tiny OWNED origin repository under the evidence dir.
+set -u
+
+cd "$(dirname "$0")"
+
+# Optional historical runtime pins (enforced only when explicitly requested).
+EXPECTED_MATCHLOCK="a278f9c153c91a76bcfca3abe2ff4146996e48ad4f3b36e47026e605e9232136"
+EXPECTED_GUEST_INIT="f76f00fbc089dea1f1e5eba536778da9bee9f20f547a6779f14b76a700d35c06"
+
+if [ -n "${TAMANDUA_MATCHLOCK_RUNTIME_DIR:-}" ]; then
+  RUNTIME_DIR="$TAMANDUA_MATCHLOCK_RUNTIME_DIR"
+else
+  RUNTIME_DIR=""
+fi
+MATCHLOCK_RPC_BIN="${TAMANDUA_MATCHLOCK_RPC_BIN:-${RUNTIME_DIR:+$RUNTIME_DIR/matchlock}}"
+MATCHLOCK_RPC_BIN="${MATCHLOCK_RPC_BIN:-$(command -v matchlock || true)}"
+GUEST_INIT="${MATCHLOCK_GUEST_INIT:-${RUNTIME_DIR:+$RUNTIME_DIR/guest-init}}"
+GUEST_INIT="${GUEST_INIT:-$(command -v guest-init || true)}"
+GUEST_FUSED="${MATCHLOCK_GUEST_FUSED:-$GUEST_INIT}"
+
+fail() { echo "run-matchlock-hermes-merge-worktree-canary-e2e-test: FATAL: $*" >&2; exit 90; }
+
+for p in "$MATCHLOCK_RPC_BIN" "$GUEST_INIT" "$GUEST_FUSED"; do
+  [ -x "$p" ] || fail "runtime binary missing or not executable: $p"
+done
+
+if [ "${TAMANDUA_GATE_EXPECT_RUNTIME_PINS:-0}" = "1" ]; then
+  ACTUAL_MATCHLOCK=$(sha256sum "$MATCHLOCK_RPC_BIN" | awk '{print $1}')
+  ACTUAL_GUEST_INIT=$(sha256sum "$GUEST_INIT" | awk '{print $1}')
+  ACTUAL_GUEST_FUSED=$(sha256sum "$GUEST_FUSED" | awk '{print $1}')
+  [ "$ACTUAL_MATCHLOCK" = "$EXPECTED_MATCHLOCK" ] \
+    || fail "TAMANDUA_MATCHLOCK_RPC_BIN hash mismatch: got $ACTUAL_MATCHLOCK expected $EXPECTED_MATCHLOCK"
+  [ "$ACTUAL_GUEST_INIT" = "$EXPECTED_GUEST_INIT" ] \
+    || fail "MATCHLOCK_GUEST_INIT hash mismatch: got $ACTUAL_GUEST_INIT expected $EXPECTED_GUEST_INIT"
+  [ "$ACTUAL_GUEST_FUSED" = "$EXPECTED_GUEST_INIT" ] \
+    || fail "MATCHLOCK_GUEST_FUSED hash mismatch: got $ACTUAL_GUEST_FUSED expected $EXPECTED_GUEST_INIT (fused must equal guest-init)"
+  echo "paired runtime pins OK (matchlock $ACTUAL_MATCHLOCK, guest-init $ACTUAL_GUEST_INIT)"
+else
+  echo "runtime: $MATCHLOCK_RPC_BIN (guest-init $GUEST_INIT, guest-fused $GUEST_FUSED; system pair, no pins)"
+fi
+
+# The REAL qualified `igorhvr/bedlam-ubuntu` image (dsh + hermes + pi) lives
+# ONLY in the operator matchlock store; the plain docker tag is a different,
+# tool-less image. The operator's real hermes home carries the config and
+# credentials the canary stages into a fresh gate-owned HERMES_HOME. Neither is
+# printed.
+OPERATOR_CACHE="${TAMANDUA_GATE_OPERATOR_CACHE:-$HOME/.cache/matchlock}"
+REAL_HERMES_HOME="${TAMANDUA_GATE_REAL_HERMES_HOME:-$HOME/.hermes}"
+[ -f "$OPERATOR_CACHE/images/metadata.db" ] \
+  || fail "operator matchlock image store missing at $OPERATOR_CACHE/images/metadata.db"
+[ -f "$REAL_HERMES_HOME/config.yaml" ] \
+  || fail "operator hermes config missing at $REAL_HERMES_HOME/config.yaml"
+[ -f "$REAL_HERMES_HOME/auth.json" ] || [ -f "$REAL_HERMES_HOME/.env" ] \
+  || fail "operator hermes credentials missing under $REAL_HERMES_HOME"
+
+export TAMANDUA_GATE_OPERATOR_CACHE="$OPERATOR_CACHE"
+export TAMANDUA_GATE_FIXTURE_IMAGE_CACHE="$OPERATOR_CACHE"
+export TAMANDUA_GATE_REAL_HERMES_HOME="$REAL_HERMES_HOME"
+
+npm run build || fail "npm run build failed"
+
+EVIDENCE_ROOT="${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}"
+mkdir -p "$EVIDENCE_ROOT"
+EV="$(mktemp -d "$EVIDENCE_ROOT/hermes-merge-worktree-canary-XXXXXX")" || fail "mktemp -d under $EVIDENCE_ROOT failed"
+echo "evidence dir: $EV"
+
+export TAMANDUA_MATCHLOCK_RPC_BIN="$MATCHLOCK_RPC_BIN"
+export MATCHLOCK_GUEST_INIT="$GUEST_INIT"
+export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"
+export TAMANDUA_GATE_EVIDENCE_DIR="$EV"
+export TAMANDUA_GATE_EVIDENCE_ROOT="$EVIDENCE_ROOT"
+
+# Private fresh TMPDIR inside the evidence dir (guest-pack builds and any canary
+# scratch stay under owned evidence).
+export TMPDIR="$EV/tmp"
+mkdir -p "$TMPDIR"
+
+LOG="$EV/canary-run.log"
+CANARY_CMD="node --test e2e-tests/matchlock-hermes-merge-worktree-canary.test.ts"
+echo "=== MATCHLOCK HERMES MERGE-WORKTREE REAL CANARY START $(date -u +%FT%TZ) EV=$EV ===" | tee "$LOG"
+echo "runtime:              $MATCHLOCK_RPC_BIN" | tee -a "$LOG"
+echo "operator image:       $OPERATOR_CACHE" | tee -a "$LOG"
+echo "operator hermes home: $REAL_HERMES_HOME (credentials copied, never printed)" | tee -a "$LOG"
+echo "canary command:       $CANARY_CMD" | tee -a "$LOG"
+$CANARY_CMD 2>&1 | tee -a "$LOG"
+RC=${PIPESTATUS[0]}
+echo "=== MATCHLOCK HERMES MERGE-WORKTREE REAL CANARY END $(date -u +%FT%TZ) rc=$RC ===" | tee -a "$LOG"
+exit "$RC"

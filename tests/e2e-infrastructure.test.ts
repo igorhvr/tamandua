@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { releasePortReservations } from "../e2e-tests/helpers/smoke-helpers.ts";
+import { tamanduaTempDir } from "../dist/lib/temp-dir.js";
 
 const repoRoot = process.cwd();
 const e2eDatabaseHelper = path.join(
@@ -25,6 +27,11 @@ function findDatabaseSyncConstructors(source: string): number[] {
 function walkFiles(directory: string): string[] {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const entryPath = path.join(directory, entry.name);
+    // Guest fixture image sources (`e2e-tests/<name>-fixture/`) are copied INTO
+    // a Matchlock VM and executed guest-locally; they are not host test code and
+    // cannot import the host busy-timeout helper. Skip them from the host-test
+    // DatabaseSync-construction scan.
+    if (entry.isDirectory() && /-fixture$/.test(entry.name)) return [];
     return entry.isDirectory() ? walkFiles(entryPath) : [entryPath];
   });
 }
@@ -233,25 +240,41 @@ describe("e2e test infrastructure", () => {
     );
   });
 
-  it("both e2e runner scripts keep a single serial-safe node --test invocation", () => {
-    for (const scriptName of [
-      "run-all-e2e-tests",
-      "run-all-scripted-e2e-tests",
-    ]) {
-      const content = fs.readFileSync(path.join(repoRoot, scriptName), "utf-8");
-      const testInvocations = content
-        .split("\n")
-        .filter((line) => /^\s*node\s+--test\b/.test(line));
-      assert.equal(
-        testInvocations.length,
-        1,
-        `${scriptName} should have exactly one node --test invocation`,
-      );
-      assert.ok(
-        !testInvocations[0].includes("--test-concurrency"),
-        `${scriptName} should not add a test-concurrency flag (stress test must stay serial-safe)`,
-      );
-    }
+  it("e2e runner scripts keep serial-safe node --test invocations", () => {
+    // run-all-scripted-e2e-tests is a single plain invocation (the stress test
+    // inside it must stay serial-safe at the file level).
+    const scripted = fs.readFileSync(
+      path.join(repoRoot, "run-all-scripted-e2e-tests"),
+      "utf-8",
+    );
+    const scriptedInvocations = scripted
+      .split("\n")
+      .filter((line) => /^\s*node\s+--test\b/.test(line));
+    assert.equal(
+      scriptedInvocations.length,
+      1,
+      "run-all-scripted-e2e-tests should have exactly one node --test invocation",
+    );
+    assert.ok(
+      !scriptedInvocations[0].includes("--test-concurrency"),
+      "run-all-scripted-e2e-tests should not add a test-concurrency flag (stress test must stay serial-safe)",
+    );
+
+    // run-all-e2e-tests runs two SEQUENTIAL tiers declared as command
+    // variables (the exit-code propagation suite below pins the PIPESTATUS
+    // capture and the scripted tier's --test-concurrency=1).
+    const gate = fs.readFileSync(
+      path.join(repoRoot, "run-all-e2e-tests"),
+      "utf-8",
+    );
+    const tiers = gate
+      .split("\n")
+      .filter((line) => /^\s*(SMOKE|SCRIPTED)_TIER_CMD="node\s+--test\b/.test(line));
+    assert.equal(
+      tiers.length,
+      2,
+      "run-all-e2e-tests should declare both sequential tiers as node --test command variables",
+    );
   });
 
   it("concurrent stress test documents both e2e runner entry points", () => {
@@ -740,6 +763,117 @@ describe("e2e test infrastructure", () => {
     assert.ok(
       repoDirMatches && repoDirMatches.length >= 4,
       `repoDir should be referenced in both tests. Found: ${repoDirMatches?.length || 0} references`,
+    );
+  });
+});
+
+// ── US-011 Gate 2: run-all-e2e-tests must propagate tier failures ────────
+//
+// Regression for the shipped bug where the gate captured `${PIPESTATUS[1]}`
+// (`tee`, always 0) instead of `${PIPESTATUS[0]}` (`node --test`), so a failing
+// smoke/scripted tier still exited the gate 0. The gate script exposes an
+// explicit opt-in test seam (TAMANDUA_E2E_TEST_MODE=1 plus the *_CMD overrides)
+// so the real plumbing is exercised without running the ~10 minute suite; the
+// production commands stay hardwired unless that flag is set.
+describe("run-all-e2e-tests exit-code propagation", () => {
+  const gateScript = path.join(repoRoot, "run-all-e2e-tests");
+
+  function runGate(smokeCmd: string, scriptedCmd: string) {
+    const tmpDir = tamanduaTempDir("tamandua-gate-propagation-");
+    try {
+      const result = spawnSync(gateScript, [], {
+        cwd: repoRoot,
+        encoding: "utf-8",
+        timeout: 60_000,
+        env: {
+          // Explicit env (never a process.env spread — the isolation
+          // guard forbids the anti-pattern because it can leak live state).
+          // With TAMANDUA_E2E_TEST_MODE=1 the gate runs only true/false, so
+          // it just needs a shell + tee on PATH and a writable HOME/TMPDIR.
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? os.homedir(),
+          TMPDIR: process.env.TMPDIR ?? os.tmpdir(),
+          TAMANDUA_E2E_TEST_MODE: "1",
+          TAMANDUA_E2E_BUILD_CMD: "true",
+          TAMANDUA_E2E_SMOKE_CMD: smokeCmd,
+          TAMANDUA_E2E_SCRIPTED_CMD: scriptedCmd,
+          TAMANDUA_E2E_TEST_LOG: path.join(tmpDir, "gate.log"),
+        },
+      });
+      const log = fs.readFileSync(path.join(tmpDir, "gate.log"), "utf-8");
+      return { result, log };
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  it("captures the producer element of PIPESTATUS, never tee", () => {
+    const content = fs.readFileSync(gateScript, "utf-8");
+    assert.ok(
+      content.includes("PIPESTATUS[@]"),
+      "run-all-e2e-tests must capture the full PIPESTATUS array immediately after each pipeline",
+    );
+    assert.ok(
+      !content.includes("PIPESTATUS[1]"),
+      "run-all-e2e-tests must never read PIPESTATUS[1]: that is tee (always 0), not node --test",
+    );
+  });
+
+  it("serializes the process-spawning scripted tier to bound SQLite lock contention", () => {
+    const content = fs.readFileSync(gateScript, "utf-8");
+    assert.match(
+      content,
+      /SCRIPTED_TIER_CMD="node --test --test-concurrency=1 /,
+      "the scripted tier must run with --test-concurrency=1: each file spawns a daemon + CLI + harness against its own DB, and whole-tier parallelism stretched the 5s SQLite busy timeout into 'database is locked' gate failures",
+    );
+  });
+
+  it("exits 0 only when both tiers pass", () => {
+    const { result } = runGate("true", "true");
+    assert.equal(
+      result.status,
+      0,
+      `gate should pass when both tiers pass:\n${result.stdout}\n${result.stderr}`,
+    );
+    assert.ok(!result.stdout.includes("e2e gate FAILED"));
+  });
+
+  it("fails when the smoke tier fails", () => {
+    const { result, log } = runGate("false", "true");
+    assert.equal(
+      result.status,
+      1,
+      `smoke failure must fail the gate:\n${result.stdout}\n${result.stderr}`,
+    );
+    assert.ok(
+      log.includes("smoke_rc=1") && log.includes("scripted_rc=0"),
+      `log should record smoke_rc=1 scripted_rc=0:\n${log}`,
+    );
+  });
+
+  it("fails when the scripted tier fails (a green smoke tier must not mask it)", () => {
+    const { result, log } = runGate("true", "false");
+    assert.equal(
+      result.status,
+      1,
+      `scripted failure must fail the gate:\n${result.stdout}\n${result.stderr}`,
+    );
+    assert.ok(
+      log.includes("smoke_rc=0") && log.includes("scripted_rc=1"),
+      `log should record smoke_rc=0 scripted_rc=1:\n${log}`,
+    );
+  });
+
+  it("fails when both tiers fail", () => {
+    const { result, log } = runGate("false", "false");
+    assert.equal(
+      result.status,
+      1,
+      `double failure must fail the gate:\n${result.stdout}\n${result.stderr}`,
+    );
+    assert.ok(
+      log.includes("smoke_rc=1") && log.includes("scripted_rc=1"),
+      `log should record smoke_rc=1 scripted_rc=1:\n${log}`,
     );
   });
 });

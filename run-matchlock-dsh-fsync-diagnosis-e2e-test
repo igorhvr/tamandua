@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Run the DSH-OVERLAY-FSYNC-FIX US-002 on-demand in-VM dsh fsync diagnosis.
+#
+# It stages the US-001 real-LAYOUT DSH_HOME (placeholder credentials), makes the
+# guest `dsh` a wrapper that dumps /proc/mounts and runs the REAL dsh under
+# `strace -f -y -e trace=fsync,fdatasync,openat,... -e status=failed`, boots one
+# fresh Matchlock VM through the PRODUCTION dsh invocation runner, reconciles the
+# observed guest mount table with the per-durable-entry destinations
+# planDshHomeMounts emits, and writes the diagnosis JSON to
+# TAMANDUA_GATE_FSYNC_DIAGNOSIS_JSON (default
+# /home/kaladin/matchlock-work/dsh-fsync-diagnosis.json; never committed).
+#
+# This tier is a REAL-VM gate and is deliberately NOT part of the default fast
+# lanes (npm test / run-all-smoke / run-all-scripted / run-all-e2e-tests). Run
+# it on demand UNDER THE SHARED GATE LOCK:
+#
+#   flock --exclusive /home/kaladin/matchlock-work/vaivm-gate.lock \
+#     ./run-matchlock-dsh-fsync-diagnosis-e2e-test
+#
+# The runner does NOT take the lock itself (the caller holds it; a nested
+# flock on the same file would deadlock).
+#
+# It runs the SYSTEM matchlock/guest-init pair by default (PATH, no pins); a
+# pinned runtime can be selected by exporting TAMANDUA_MATCHLOCK_RPC_BIN /
+# MATCHLOCK_GUEST_INIT / MATCHLOCK_GUEST_FUSED.
+#
+# Never touches the live worker daemon, live tamandua state, or the operator's
+# real ~/.dsh: the gate uses a private fresh HOME under the evidence dir, reads
+# only the durable profile config, and writes placeholder credentials.
+set -u
+
+cd "$(dirname "$0")"
+
+MATCHLOCK_RPC_BIN="${TAMANDUA_MATCHLOCK_RPC_BIN:-/usr/local/bin/matchlock}"
+GUEST_INIT="${MATCHLOCK_GUEST_INIT:-/usr/local/bin/guest-init}"
+GUEST_FUSED="${MATCHLOCK_GUEST_FUSED:-$GUEST_INIT}"
+
+fail() { echo "run-matchlock-dsh-fsync-diagnosis-e2e-test: FATAL: $*" >&2; exit 90; }
+
+for p in "$MATCHLOCK_RPC_BIN" "$GUEST_INIT" "$GUEST_FUSED"; do
+  [ -x "$p" ] || fail "runtime binary missing or not executable: $p"
+done
+
+echo "runtime: $MATCHLOCK_RPC_BIN"
+"$MATCHLOCK_RPC_BIN" version 2>/dev/null | head -1 || true
+
+OPERATOR_CACHE="${TAMANDUA_GATE_OPERATOR_CACHE:-$HOME/.cache/matchlock}"
+REAL_DSH_HOME="${TAMANDUA_GATE_REAL_DSH_HOME:-$HOME/.dsh}"
+[ -f "$OPERATOR_CACHE/images/metadata.db" ] \
+  || fail "operator matchlock image store missing at $OPERATOR_CACHE/images/metadata.db"
+[ -f "$REAL_DSH_HOME/profiles/headless/package.json" ] \
+  || fail "operator dsh headless profile missing at $REAL_DSH_HOME/profiles/headless/package.json"
+
+export TAMANDUA_GATE_OPERATOR_CACHE="$OPERATOR_CACHE"
+export TAMANDUA_GATE_REAL_DSH_HOME="$REAL_DSH_HOME"
+
+npm run build || fail "npm run build failed"
+
+EVIDENCE_ROOT="${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}"
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+EV="$EVIDENCE_ROOT/dsh-fsync-diagnosis-$TS"
+if [ -e "$EV" ]; then
+  # NEVER pre-clean or reuse an existing dir: append a fresh unique suffix.
+  EV="$EV-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+fi
+mkdir -p "$EV"
+echo "evidence dir: $EV"
+
+export TAMANDUA_MATCHLOCK_RPC_BIN="$MATCHLOCK_RPC_BIN"
+export MATCHLOCK_GUEST_INIT="$GUEST_INIT"
+export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"
+export TAMANDUA_GATE_EVIDENCE_DIR="$EV"
+export TAMANDUA_GATE_EVIDENCE_ROOT="$EVIDENCE_ROOT"
+export TAMANDUA_GATE_FSYNC_DIAGNOSIS_JSON="${TAMANDUA_GATE_FSYNC_DIAGNOSIS_JSON:-/home/kaladin/matchlock-work/dsh-fsync-diagnosis.json}"
+
+LOG="$EV/gate-run.log"
+echo "=== MATCHLOCK DSH FSYNC DIAGNOSIS START $(date -u +%FT%TZ) EV=$EV ===" | tee "$LOG"
+echo "runtime: $MATCHLOCK_RPC_BIN" | tee -a "$LOG"
+echo "operator image store: $OPERATOR_CACHE" | tee -a "$LOG"
+echo "operator dsh home:    $REAL_DSH_HOME" | tee -a "$LOG"
+echo "diagnosis JSON:       $TAMANDUA_GATE_FSYNC_DIAGNOSIS_JSON" | tee -a "$LOG"
+node --test e2e-tests/matchlock-dsh-fsync-diagnosis.test.ts 2>&1 | tee -a "$LOG"
+RC=${PIPESTATUS[0]}
+echo "=== MATCHLOCK DSH FSYNC DIAGNOSIS END $(date -u +%FT%TZ) rc=$RC ===" | tee -a "$LOG"
+exit "$RC"

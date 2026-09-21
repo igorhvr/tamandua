@@ -768,15 +768,18 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
         };
         const scripted = createScriptedHermes(env.root, behaviors);
 
-        // Create a separate empty HERMES_HOME that has no state.db and
-        // will stay empty (the hermes runtime will try to write state.db
-        // here, which is fine — we just need the token LOOKUP to fail).
-        // To make the lookup fail consistently, we create a read-only
-        // directory so the runtime can't create state.db either.
+        // Create a separate HERMES_HOME that has no state.db and can never
+        // grow one, so the token LOOKUP fails (the runtime will try to write
+        // state.db here and degrade gracefully).
+        //
+        // The home path is a REGULAR FILE, not a chmod-0555 directory: the
+        // integration gate runs as root, and root bypasses DAC mode bits, so
+        // an 0555 dir is still writable and state.db would be created,
+        // defeating the degraded lookup. `<file>/state.db` is absent and
+        // uncreatable for every euid, enforcing the intended degraded lookup
+        // with the assertion (`tokens_spent === 0`) unchanged.
         const brokenHermesHome = path.join(env.root, "broken-hermes-home");
-        fs.mkdirSync(brokenHermesHome, { recursive: true });
-        // Make it read-only: mkdir + chmod 0o555
-        fs.chmodSync(brokenHermesHome, 0o555);
+        fs.writeFileSync(brokenHermesHome, "");
 
         // Build daemon env with the broken HERMES_HOME
         const daemonEnv = {
@@ -838,23 +841,11 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
         assert.equal(steps.length, 1, "do-now should have exactly 1 step");
         assert.equal(steps[0].status, "done", "step should complete normally");
 
-        // ── Restore writability so teardown can clean up ──────────
-        fs.chmodSync(brokenHermesHome, 0o755);
-
         console.log(
-          `[scripted-hermes-e2e degradation] do-now with broken HERMES_HOME: ` +
+          `[scripted-hermes-e2e degradation] do-now with unusable HERMES_HOME: ` +
             `run completed, tokens_spent=${tokens} (degraded gracefully)`,
         );
       } finally {
-        // Restore writability before cleanup in case the test failed mid-way
-        try {
-          const brokenHermesHome = path.join(ctx?.env.root ?? "/tmp", "broken-hermes-home");
-          if (fs.existsSync(brokenHermesHome)) {
-            fs.chmodSync(brokenHermesHome, 0o755);
-          }
-        } catch {
-          // best-effort
-        }
         await teardown(ctx);
       }
     },

@@ -159,6 +159,33 @@ Verdict channels are distinct:
   dereferenced once at CLI time; the path is never stored downstream. Remove
   it with `rm -f -- "$reason_file"` only after `step fail` succeeds.
 
+#### Test evidence: report what actually ran
+
+The tester/verifier evidence-persona contract is part of every report. A green
+exit code is **not** evidence on its own: before reporting a command as passed,
+read its output and confirm it exercised the behavior under test. If the output
+shows the check was skipped, short-circuited, collected zero cases, or failed
+during setup, report it as **NOT RUN** with what you observed, never as a pass.
+This is not a coverage requirement: if the project has no tests for the area,
+say so and base your verdict on the tests the story added or on direct
+verification of the behavior.
+
+- Tester pass blocks carry an informational `EVIDENCE:` line — `EVIDENCE: For
+  each gate you relied on, what its output shows it actually exercised (cases
+  run, or NOT RUN and why)` — after `RESULTS:` and before the next KEY: line
+  (e.g. `TESTED_TREE:`). It is an informational line, never a required expects
+  key, and the `expects` validator tolerates it.
+- A verifier rejects a story whose test evidence shows a gate exited 0 without
+  exercising the behavior (zero cases, skipped, or setup failure reported as a
+  rejection): a story like that is not verified; return it with
+  `STATUS: retry` and name the gate. A verifier that always reports
+  `STATUS: done` expresses the same rejection with its
+  `VERDICT: not_accomplished` channel.
+
+This contract is pinned by `tests/tester-evidence-persona.test.ts` and by the
+bundled persona files under `workflows/*/agents/{tester,verifier}/AGENTS.md`
+and `agents/shared/verifier/AGENTS.md`.
+
 #### STORIES_JSON and STORIES_JSON_FILE reports
 
 When a step requires `STORIES_JSON:`, its value must be a single-line JSON
@@ -608,6 +635,40 @@ no automatic replacement is triggered. Use `tamandua workflow resume
 <run-id>` to reattempt a permanently failed run; fix the underlying issue
 before resuming.
 
+#### Matchlock VM resources
+
+`tamandua workflow run ... --matchlock <image>` accepts three VM-size flags:
+`--matchlock-cpus <n>` (a positive integer), `--matchlock-memory <MB|16g>` and
+`--matchlock-disk <MB|40g>` (MB, or a `<n>g` suffix). Any size flag requires
+`--matchlock`. An absent flag falls back to the env var
+`TAMANDUA_MATCHLOCK_CPUS`, `TAMANDUA_MATCHLOCK_MEMORY_MB` or
+`TAMANDUA_MATCHLOCK_DISK_MB`, then to the built-in defaults
+`cpus = min(8, host CPUs)`, `memory = min(16384 MB, 50% of host RAM)`,
+`disk = 20480 MB`. Explicit flags and env values are clamped by the caps:
+`cpus <= 16` ALWAYS and `cpus <= host online CPUs`,
+`memory <= 75% of host MemTotal`, and `disk` finite positive. A Matchlock
+launch prints
+`matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB` and
+`tamandua workflow status` shows the same limits.
+
+Every real-VM Matchlock gate refuses a hollow green: the driver writes an
+`observed-rounds.json` evidence file and `scripts/observed-rounds-guard.mjs`
+requires `observed_rounds > 0`, printing
+`observed-rounds-guard: PASS gate=<label> observed_rounds=<n> observed_vm_ids=<ids>`
+and exiting **92** on a missing/malformed file or zero rounds. The dsh
+mount-plan boot gate (`./run-matchlock-dsh-real-boot-gate-e2e-test`) is
+REQUIRED for any dsh mount-plan change.
+
+A `close`/`dispose` failure **after** the harness process has exited is not
+fatal to the round: the pi/Hermes runners keep the round result
+(`cleanupConfirmed=false` plus a bounded `vmCleanupFailure`), log exactly one
+serialized WARN (`serializeMatchlockError` — never `[object Object]`) and record
+an orphan VM for the stopped-VM reaper, which removes it by **exact id** after a
+live-process guard and never uses `prune`/`gc` or name/glob selection.
+`create`/`probe`/`exec` and pre-harness cleanup failures stay fatal. The full
+phase policy, error serialization and reaper rules are in
+`docs/matchlock-cleanup-policy.md`.
+
 ### Worktree management
 
 Worktree commands manage the git worktrees Tamandua creates for isolated
@@ -735,6 +796,55 @@ or any user executable or symlink. Tamandua does not own or manage a
 `~/.local/bin/hermes` symlink. The only Hermes-related operation is resolving
 and running an existing binary.
 
+#### Hermes under Matchlock (`--hermes-as-harness --matchlock <image>`)
+
+An opted-in Hermes run executes the **image's** Hermes inside a **fresh
+Matchlock VM for each launch probe and each work round**; the host Hermes
+binary resolution above does not apply to these runs (no host install, no host
+lookup, no native fallback).
+
+```bash
+tamandua workflow run <workflow-id> "<task>" --hermes-as-harness --matchlock <image>
+```
+
+All three harnesses are admitted with `--matchlock` and all three carry the
+same full capability-closed workflow set — there is no harness-by-workflow
+allow-list. `pi` (the default), `hermes` and `dsh` each admit `do-now`,
+`do-review-do-verify`, the non-merge story/worktree pipelines and every merge
+route. For all three harnesses the shapes outside that closure
+(just-do-it child orchestration, PR/github-pr shapes, browser/frontend shapes,
+skills-normalize-audit and unknown/custom ids) are refused before any VM starts
+with a workflow-specific precise reason. See `README.md` and
+`tamandua workflow run --help` for the exact harness × workflow matrix.
+
+The whole effective Hermes configuration directory is resolved from the
+**submission** environment (`HOME`/`HERMES_HOME`/cwd at run creation, frozen
+into the persisted policy) and mounted **read-write** inside the VM:
+
+| Effective selection | Host source (whole, RW) | Guest `HERMES_HOME` |
+|---------------------|-------------------------|---------------------|
+| default | `$HERMES_HOME` (or `~/.hermes`) | `/workspace/config/hermes` |
+| named profile | `<root>/profiles/<name>` | `/workspace/config/hermes/profiles/<name>` |
+
+The entire selected configuration directory (credentials, settings, sessions,
+`state.db`, logs, plugins) is writable inside the VM; broad host `HOME` and
+`.tamandua` administrative state are never exported. A missing/malformed/
+unreadable/non-regular config or an explicitly non-`local` terminal backend is
+refused with bounded diagnostics before any VM create.
+
+Guest Hermes emits **plain text** (not pi JSON). The session id comes from the
+`session_id:` stderr trailer; usage is read from the selected mapped store
+**inside the still-owned VM** and totals `input + output + cache_write` only
+(cache reads excluded). Unknown/ambiguous/truncated usage is `unavailable`,
+never a fabricated `0`.
+
+This build's Hermes-under-Matchlock qualification is **synthetic-fixture
+qualification, not real-Hermes acceptance**: the fresh-VM whole-path gate uses
+an image-provided fake Hermes with zero models and no credentials. Real
+`deepseek-v4-flash-vision-exp` (DeepSeek provider) config/model qualification
+remains coordinator-owned. See `README.md` for the full actual-vs-synthetic
+matrix.
+
 ### dsh (DeepSeek Harness) support (Alpha)
 
 The `--dsh-as-harness` flag runs agents with the DeepSeek Harness (`dsh`)
@@ -807,7 +917,7 @@ login-shell startup files (e.g. `~/.zshrc`, `~/.zprofile`) can be discovered.
 This is a bounded, best-effort fallback — if zsh is not available or returns
 nothing, resolution fails.
 
-#### Absolute-Path Invocation
+#### dsh Absolute-Path Invocation
 
 Every resolved dsh binary path is **always absolute**. Relative
 `TAMANDUA_DSH_BINARY` values and relative/empty `PATH` entries are resolved
@@ -815,7 +925,7 @@ against the daemon process cwd at validation time before the result is stored.
 This prevents `./dsh: not found` errors when the dispatcher invokes the binary
 from a different working directory.
 
-#### Child-Only PATH Adjustment
+#### dsh Child-Only PATH Adjustment
 
 When dispatching a dsh agent session, the resolved binary's directory is
 prepended to the child's `PATH` so nested dsh invocations within the agent
@@ -823,7 +933,7 @@ session find the same binary — even if it lives outside the original `PATH`
 (e.g. login-shell-discovered dsh). The original `PATH` is preserved as a
 suffix; this adjustment applies only to the child process.
 
-#### Zero Filesystem Mutation
+#### dsh Zero Filesystem Mutation
 
 Tamandua's dsh discovery is **entirely side-effect-free**: it never
 creates, deletes, replaces, chmods, or otherwise mutates any user executable
@@ -849,6 +959,47 @@ doctor` includes a dsh session-store probe that warns when the sessions
 directory is unreadable or zstd decompression is unavailable, and a
 permission-mode probe that warns when a profile layer pins sandbox/approval
 rows that override the injected permission mode.
+
+#### dsh under Matchlock (opt-in, MTLK-DSH-EXEC)
+
+`--dsh-as-harness --matchlock <image>` runs **every** launch probe and work
+round as the image's own `dsh` inside a **fresh Matchlock VM**. The host dsh
+binary/resolver is never used for an opted-in run and there is no native
+fallback.
+
+- The effective `DSH_HOME` is resolved once at **submission** time from the
+  submitting process (default `<captured home>/.dsh`; explicit `DSH_HOME`
+  supports relative-to-captured-cwd and `~` semantics), not from the daemon
+  environment. It is mounted **whole and read-write at the guest
+  `/workspace/config/dsh` as one mount**, preserving `sessions/`, `profiles/`,
+  `storages/`, credentials and unknown entries.
+- The image must already provide `dsh` plus its runtime. Tamandua preserves
+  the image's effective `PATH` and prepends only its version-matched RO helper
+  pack at `/workspace/runtime` (guest reporting CLI
+  `/workspace/runtime/bin/tamandua`). The guest runs
+  `dsh --profile headless <prompt>` with stdin EOF and plain-text stdout.
+- Supported workflows in this build are the same full capability-closed set as
+  `pi`: the shallow `do-now` / `do-review-do-verify`, the non-merge
+  story/worktree pipelines and every merge route. There is no
+  harness-by-workflow allow-list. Shapes outside that closure (just-do-it
+  child orchestration, PR/github-pr shapes, browser/frontend shapes and
+  skills-normalize-audit) are **refused before any VM/probe/native harness
+  starts** with a workflow-specific precise reason.
+- Token usage is read from the mounted v2 session store after each round:
+  `session.v2.jsonl` / concatenated-frame `session.v2.jsonl.zstd`, counting
+  `data.usage.inputTokens + outputTokens` exactly once (the mirrored
+  `data.stream[*].chunk.usage` is never summed; cache reads excluded).
+  Missing/malformed/ambiguous/truncated usage is reported honestly and is
+  never fabricated as a zero; it never blocks plain-text step status.
+- Test classification: the pure `src/installer/matchlock/dsh-*.ts` module graph
+  is process-spawn-free (parallel lane); `dsh-scheduler-seam.test.ts` is in
+  `tests/serial-files.txt`; the real-VM gates
+  (`./run-matchlock-dsh-gate-e2e-test`,
+  `./run-matchlock-dsh-profile-overlay-e2e-test`, and the contained real-dsh
+  boot gate `e2e-tests/matchlock-dsh-real-boot-gate.test.ts` via
+  `./run-matchlock-dsh-real-boot-gate-e2e-test`) are on demand and in no
+  default lane. The real-dsh boot gate is REQUIRED for any change to the dsh
+  mount plan (see `AGENTS.md` Matchlock section).
 
 ## Services & maintenance
 
