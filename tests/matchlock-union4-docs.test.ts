@@ -263,20 +263,22 @@ describe("US-004 union docs: the Matchlock lineage is documented once", () => {
   });
 });
 
-describe("US-004 union docs: the single v13 schema chain", () => {
+describe("US-004 union docs: the single v14 schema chain", () => {
   const agents = doc("AGENTS.md");
 
-  it("AGENTS.md documents the ONE 9->10->11->12->13 chain", () => {
+  it("AGENTS.md documents the ONE 9->10->11->12->13->14 chain", () => {
     for (const token of [
-      "SCHEMA_VERSION = 13",
+      "SCHEMA_VERSION = 14",
       "v9 -> v10",
       "v10 -> v11",
       "v11 -> v12",
       "v12 -> v13",
+      "v13 -> v14",
       "migrateInstantsToIsoZ()",
       "steps.target_moved_reroute_count",
       "steps.preclaim_death_count",
       "runs.matchlock_policy",
+      "suite_results.log_path",
     ]) {
       assert.ok(agents.includes(token), `AGENTS.md schema history must mention ${token}`);
     }

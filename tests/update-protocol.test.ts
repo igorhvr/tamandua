@@ -256,13 +256,21 @@ describe("DB-PATH resolution", () => {
     const temp = createTempHome("update-protocol-dbpath2-");
     roots.add(temp.root);
 
-    const stateDir = path.join(temp.root, "custom-state");
-    fs.mkdirSync(stateDir, { recursive: true });
+    // US-008: cleanChildEnv ignores an injected TAMANDUA_STATE_DIR and forces
+    // the child state dir to <HOME>/.tamandua. Inject a deliberately distinct
+    // dir to prove the override is dropped.
+    const injectedStateDir = path.join(temp.root, "custom-state");
+    fs.mkdirSync(injectedStateDir, { recursive: true });
 
     const env = cleanChildEnv({
       HOME: temp.homeDir,
-      TAMANDUA_STATE_DIR: stateDir,
+      TAMANDUA_STATE_DIR: injectedStateDir,
     });
+    assert.equal(
+      env.TAMANDUA_STATE_DIR,
+      path.join(temp.homeDir, ".tamandua"),
+      "an injected TAMANDUA_STATE_DIR must be ignored (US-008)",
+    );
     // cleanChildEnv synthesizes TAMANDUA_DB_PATH — delete it so the true
     // HOME fallback path is exercised.
     delete env.TAMANDUA_DB_PATH;
@@ -295,11 +303,11 @@ writeSync(1, JSON.stringify({ phase: r.phase, mode: r.mode }) + "\\n");`,
     const parsed = JSON.parse(result.stdout);
     assert.deepEqual(parsed, { phase: "ACQUIRED", mode: "current" });
 
-    // HOME default DB should exist, custom-state DB should not
+    // HOME default DB should exist, injected-state DB should not
     const homeDb = path.join(temp.homeDir, ".tamandua", "tamandua.db");
     assert.ok(fs.existsSync(homeDb), "HOME/.tamandua/tamandua.db should exist");
     assert.ok(
-      !fs.existsSync(path.join(stateDir, "tamandua.db")),
+      !fs.existsSync(path.join(injectedStateDir, "tamandua.db")),
       "custom-state/tamandua.db should NOT exist",
     );
   });

@@ -1,11 +1,16 @@
 /**
- * Tests for CLI version update warning (US-003).
+ * Tests for CLI version update warning (US-003, LEDGER-DIAG-2 US-007).
  *
  * Validates:
  * 1. CLI prints update warning to stderr when version-status.json says updateAvailable is true
+ *    and the warning is forced (`TAMANDUA_FORCE_UPDATE_WARNING`) — spawned stderr is a pipe
  * 2. Warning suppressed for 'update', 'version', 'step peek', 'step claim' subcommands
- * 3. 'step peek' output is not corrupted by warning text
- * 4. No git fetch triggered during CLI invocation
+ * 3. Warning suppressed for test children (TAMANDUA_TEST_GUARD) and non-TTY stderr
+ * 4. 'step peek' output is not corrupted by warning text
+ * 5. No git fetch triggered during CLI invocation
+ *
+ * The pure suppression matrix (guard set / non-TTY / interactive) is unit-tested
+ * in src/cli/shared.test.ts; this file exercises the real CLI wiring.
  *
  * All tests use isolated temp HOME directories.
  */
@@ -100,7 +105,10 @@ const UPDATE_WARNING = "WARNING: A new version of tamandua is available! Run: ta
 // ═══════════════════════════════════════════════════════════════════
 
 describe("CLI version warning", () => {
-  // AC 1: CLI prints update warning to stderr when version-status.json says updateAvailable is true
+  // AC 1: CLI prints update warning to stderr when updateAvailable is true.
+  // The spawned CLI's stderr is a pipe, so the non-TTY suppression applies;
+  // the documented TAMANDUA_FORCE_UPDATE_WARNING escape hatch forces the
+  // warning through for this integration assertion.
   it("prints warning to stderr when update available", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {
       t.skip("CLI script not built — run npm run build first");
@@ -116,6 +124,7 @@ describe("CLI version warning", () => {
       // Use a non-update command (e.g. help output from 'workflow list')
       const { stderr, exitCode } = await runCli(["workflow", "list"], {
         HOME: tempHome,
+        TAMANDUA_FORCE_UPDATE_WARNING: "1",
       });
 
       const cleaned = cleanStderr(stderr);
@@ -124,6 +133,35 @@ describe("CLI version warning", () => {
       assert.ok(
         cleaned.includes(UPDATE_WARNING),
         `Expected stderr to contain "${UPDATE_WARNING}", got: "${cleaned}"`,
+      );
+  });
+
+  // AC 2 (LEDGER-DIAG-2 US-007): piped/non-TTY stderr suppresses the warning even
+  // when an update is available and no test guard is involved.
+  it("suppresses warning on piped stderr even when update available", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+      writeVersionStatus(
+        path.join(tempHome, ".tamandua"),
+        { updateAvailable: true },
+      );
+
+      const { stderr, exitCode } = await runCli(["workflow", "list"], {
+        HOME: tempHome,
+        TAMANDUA_TEST_GUARD: undefined,
+      });
+
+      const cleaned = cleanStderr(stderr);
+
+      assert.equal(exitCode, 0);
+      assert.equal(
+        cleaned.includes(UPDATE_WARNING),
+        false,
+        `Expected no warning on piped stderr, got: "${cleaned}"`,
       );
   });
 
@@ -385,6 +423,7 @@ describe("CLI version warning", () => {
   });
 
   // Verify source-path and skill-path commands (non-update commands) still show warning
+  // (forced through the documented override, since the spawned stderr is a pipe).
   it("prints warning for skill-path command when update available", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {
       t.skip("CLI script not built — run npm run build first");
@@ -399,6 +438,7 @@ describe("CLI version warning", () => {
 
       const { stderr, exitCode } = await runCli(["skill-path"], {
         HOME: tempHome,
+        TAMANDUA_FORCE_UPDATE_WARNING: "1",
       });
 
       const cleaned = cleanStderr(stderr);

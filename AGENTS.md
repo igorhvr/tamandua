@@ -1018,6 +1018,60 @@ SQLite/concurrency suites (`tests/update-protocol.test.ts`,
 (`us013-results.json` sidecar for US-014). Never silence a baseline failure by
 touching product `src/`.
 
+### Suite ledger full logs (LEDGER-DIAG / TSTX)
+
+The tamandua-test ledger (`src/suite/shim.ts`, `src/suite/log-tail.ts`,
+`src/suite/config.ts`, `src/server/control-server.ts`) stores a bounded
+evidence tail per execution AND the complete output on disk. This is the bead
+`tamandua-6sy.79` product change (P1-P3); any future cleanup of the stored
+files is owned by the evidence-prune work (bead `6sy.69`), never by the shim.
+
+- **Full log path.** Every suite execution writes its COMPLETE combined
+  stdout+stderr to `<state dir>/suite-logs/<row id>.log`; the absolute path is
+  stored in the nullable `suite_results.log_path` column (schema
+  `v13 -> v14`, see "DB schema changes" above). Older rows keep `log_path`
+  NULL. Nothing under `suite-logs/` is deleted automatically.
+- **Tail composer.** `composeLogTail(fullOutput, capBytes)` in
+  `src/suite/log-tail.ts` composes the stored `log_tail` when the output
+  exceeds `LOG_TAIL_KB` (20 KB; `src/suite/config.ts`). Priority order, never
+  exceeding the cap: (1) the lane verdict and per-lane tests/pass/fail counter
+  lines (`Serial lane:` / `Parallel lane:`, the intermediate `>>> ... lane:
+  FAILED/PASSED` form, and `ℹ tests|pass|fail N` or the legacy `# ...` form);
+  (2) the complete `✖ failing tests:` block(s), splitting the remaining budget
+  fairly when more than one lane produced one; (3) as much of the final raw
+  output as still fits. Repeated markers/counters are deduped and lane order
+  is preserved. `tamandua-test` stores the composed tail for over-cap output
+  and reports the row's `log_path` next to red evidence and in the replay
+  banner only when the row has one (never a fabricated placeholder). The
+  module imports no `node:child_process`, so its test stays in the parallel
+  lane. `tamandua-test --help` documents the suite-logs path.
+- **Update-warning suppression matrix.** `shouldSuppressUpdateWarning` in
+  `src/cli/shared.ts` suppresses the launch-time "WARNING: A new version of
+  tamandua is available!" stderr line when `TAMANDUA_TEST_GUARD` is set to a
+  non-empty value OR when stderr is not an interactive TTY; interactive users
+  (TTY stderr, no guard) keep it. `TAMANDUA_FORCE_UPDATE_WARNING` set to a
+  non-empty value is the explicit escape hatch that forces the warning through
+  for integration tests whose stderr is a pipe. The dashboard version banner
+  (`src/server/*`) is a separate code path and is unchanged.
+- **Test-child isolation.** `cleanChildEnv` in `tests/helpers/test-env.ts`
+  ALWAYS forces `TAMANDUA_STATE_DIR` to `<temp HOME>/.tamandua` (an injected
+  override is ignored) and strips `TAMANDUA_RUN_ID`, `TAMANDUA_WORKER_JOB_ID`,
+  `TAMANDUA_DAEMON_INSTANCE`, `TAMANDUA_WORKER_PID` and `TAMANDUA_DAEMON_PID`
+  even when passed as overrides. The static guard
+  `findIsolationEnvViolations` (`tests/helpers/isolation-env-guard.ts`,
+  enforced by `tests/test-isolation-guard.test.ts`) fails any test file that
+  spawns a daemon (`startDaemon`/`startMcp`/`startControlPlane`/
+  `startDashboardStandalone`) or references the CLI entry (`bin/tamandua`,
+  `cli.js`) unless the child env is built through `cleanChildEnv` (directly or
+  through an imported helper); a minimal reasoned allowlist covers pure static
+  scanners that only mention the CLI as fixture text.
+- **Tracked contract.** The run contract for these changes is
+  `torture-test/impl-tasks/ledger-diag-contract.json` (top-level keys
+  `migration`, `tailComposer`, `suppression`, `isolationGuard`,
+  `gateCommands`). The host copy at
+  `/home/kaladin/matchlock-work/ledger-diag-contract.json` is identical; no
+  test depends on the host copy.
+
 ## Environment Overrides
 
 - `TAMANDUA_WORKFLOWS_SRC`: Overrides the directory from which bundled workflows are loaded. When set, the installer resolves this directory (relative or absolute) instead of the default `<repo>/workflows/`. Tests that exercise `workflow install --all` or `get-ready` with custom workflow fixtures should point this at a temp directory containing the desired workflow set. Set in `src/installer/paths.ts` `resolveBundledWorkflowsDir()`.
@@ -1039,7 +1093,7 @@ touching product `src/`.
   table's `CREATE TABLE` statement keeps its original explicit column list,
   and nullable additions never touch explicit-column INSERTs or the status.ts
   SELECT column lists.
-- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 13). This is
+- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 14). This is
   the WLST5.1 failure mode: adding a guarded ALTER without bumping leaves
   existing DBs (user_version === the old version) early-returning in
   `migrate()` and skipping the ALTER, so any SQL touching the new column
@@ -1047,11 +1101,11 @@ touching product `src/`.
   `applySchema()`, and `migrate()` now serializes cold-start migration across
   processes (`BEGIN IMMEDIATE` + bounded retry, re-reading `user_version`
   under the lock) so concurrent first-opens cannot race the guarded ALTERs.
-- ONE schema chain (UNION-PORT v13): the main and Matchlock lineages each
-  claimed a `v10`, and then each claimed a `v12` for a DIFFERENT column
-  (`steps.preclaim_death_count` on main, `runs.matchlock_policy` on the
+- ONE schema chain (UNION-PORT + LEDGER-DIAG v14): the main and Matchlock
+  lineages each claimed a `v10`, and then each claimed a `v12` for a DIFFERENT
+  column (`steps.preclaim_death_count` on main, `runs.matchlock_policy` on the
   Matchlock lineage), so the union port renumbers both into one idempotent
-  chain ending at `SCHEMA_VERSION = 13`.
+  chain ending at `SCHEMA_VERSION = 14`.
   `v9 -> v10` is `migrateInstantsToIsoZ()` (rewrites naive
   `YYYY-MM-DD HH:MM:SS` values to ISO-8601 UTC `...Z` in every timestamp
   column; idempotent, so it also normalizes a Matchlock-lineage DB that still
@@ -1062,26 +1116,31 @@ touching product `src/`.
   OUTAGE-ROUNDS pre-claim counter). `v12 -> v13` is the guarded
   `runs.matchlock_policy TEXT` ALTER (the Matchlock lineage's nullable,
   host-owned execution-isolation policy JSON; NULL means the native path).
-  `migrate()` does NOT early-return for any `user_version < 13`; it classifies
+  `v13 -> v14` is the guarded `suite_results.log_path TEXT` ALTER (LEDGER-DIAG:
+  the absolute path of the full suite log; nullable with no backfill).
+  `migrate()` does NOT early-return for any `user_version < 14`; it classifies
   the starting lineage with the exported pure `detectSchemaLineage(db)` helper
   by reading `PRAGMA table_info` — never the colliding `user_version` alone:
   `main-v12` (preclaim present, matchlock absent), `union-v12` (matchlock
-  present, preclaim absent), `pre-v12` (earlier/empty) and `current` (v13 with
-  both). The matchlock-lineage old v10/v12 column is kept as-is (the
+  present, preclaim absent), `pre-v14` (both union columns present but
+  `suite_results.log_path` absent — a v13 DB, which must NOT be mistaken for
+  `current`), `pre-v12` (earlier/empty) and `current` (v14 with all three).
+  The matchlock-lineage old v10/v12 column is kept as-is (the
   `pragma_table_info` guard on every ALTER stays authoritative), and
-  `migrateInstantsToIsoZ()` still runs for every DB below 13 so a
+  `migrateInstantsToIsoZ()` still runs for every DB below 14 so a
   matchlock-lineage DB with naive instants is normalized; the final stamp is
-  `user_version = 13`.
+  `user_version = 14`.
 - Migration coverage belongs in `src/db.test.ts` MIGV tests: build a legacy DB
   with raw pre-bump DDL + `PRAGMA user_version = <starting version>` in a temp
   HOME, open it through `getDb()` in a subprocess (import from `dist/db.js`,
   `TAMANDUA_TEST_GUARD=1`), and assert the new column(s), the re-stamped
   user_version, and a status SELECT over runs. The union4 matrix
-  (`MIGV union4 v13 schema chain`) covers every starting state: v9, v10 MAIN
+  (`MIGV union4 v14 schema chain`) covers every starting state: v9, v10 MAIN
   (ISO-Z, no target_moved, no matchlock_policy), v10 MATCHLOCK
   (matchlock_policy present, naive instants, no target_moved), v11 MAIN, v11
   MATCHLOCK, v12 MAIN (preclaim present, no matchlock_policy), v12 UNION
-  (matchlock_policy present, no preclaim), and already-at-13, plus a forced
+  (matchlock_policy present, no preclaim), v13 (both union columns present, no
+  `suite_results.log_path`) and already-at-14, plus a forced
   slow-path re-run proving each guarded step is idempotent.
 
 ### Time and staleness (TIME-CLOCKS)
@@ -1325,7 +1384,7 @@ step) are the SLOW complement of an instant fail and join the SAME
 K = 6 / N = 20 escalating backoff and cap with a distinct vocabulary: each
 death emits `step.preclaim_round_died` (exit code, signal, harness wall ms,
 bounded stderr tail) and increments `steps.preclaim_death_count`
-(the `v11 -> v12` step; the overall `SCHEMA_VERSION` is 13), the dispatch gate
+(the `v11 -> v12` step; the overall `SCHEMA_VERSION` is 14), the dispatch gate
 is `preclaim_death_backoff`, and the
 N-th death emits `run.preclaim_death_loop` then force-fails the run
 (`formatPreclaimDeathReason`). Any successful claim resets the counter and

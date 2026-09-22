@@ -958,7 +958,7 @@ async function handleSuiteLookup(url: string): Promise<JsonResponse> {
     const db = getDb();
 
     const latest = db.prepare(
-      `SELECT id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at
+      `SELECT id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, log_path, run_id, step_id, created_at
        FROM suite_results
        WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?
        ORDER BY created_at DESC
@@ -981,6 +981,79 @@ async function handleSuiteLookup(url: string): Promise<JsonResponse> {
   }
 }
 
+/**
+ * Upper bound (characters) for any path/error value copied into a suite-log
+ * publish warning. The shim controls the temp path, but a failure must never
+ * let one line bloat the daemon log with an unbounded path or OS error string.
+ */
+const SUITE_LOG_WARN_FIELD_MAX = 300;
+
+/** Bound one warning field so a single failure logs exactly one short line. */
+function boundedWarnField(value: unknown): string {
+  const s = typeof value === "string" ? value : String(value ?? "");
+  return s.length > SUITE_LOG_WARN_FIELD_MAX ? `${s.slice(0, SUITE_LOG_WARN_FIELD_MAX)}\u2026` : s;
+}
+
+/**
+ * Resolve a shim-supplied temp log path to an absolute path strictly inside
+ * `<state dir>/suite-logs/`, or null when it is absent, not absolute, or
+ * escapes the directory (including via `..`). Exported as a pure rule so the
+ * control-plane tests can pin the path validation without a running server.
+ */
+export function resolveSuiteLogTempPath(tempLogPath: unknown, stateDir: string): string | null {
+  if (typeof tempLogPath !== "string" || tempLogPath.length === 0) return null;
+  if (!path.isAbsolute(tempLogPath)) return null;
+  const suiteLogsDir = path.join(stateDir, "suite-logs");
+  const resolved = path.resolve(tempLogPath);
+  if (!resolved.startsWith(suiteLogsDir + path.sep)) return null;
+  return resolved;
+}
+
+/**
+ * Publish a shim-written temp suite log as the ledger row's full log.
+ *
+ * The shim writes the COMPLETE combined stdout+stderr to a temp file it owns
+ * inside `<state dir>/suite-logs/`; the daemon assigns the row id, so only the
+ * daemon can name the final `<row id>.log`. The temp file is moved with a
+ * same-filesystem atomic rename and the row's `log_path` is updated to the
+ * final absolute path. On any failure (missing/invalid/out-of-directory temp
+ * path, rename error) exactly ONE bounded warning is logged, `log_path` stays
+ * NULL, and nothing is deleted — the temp file is left in place for forensics
+ * (evidence prune is bead 6sy.69).
+ */
+function publishSuiteLog(
+  db: DatabaseSync,
+  ledgerRowId: number,
+  tempLogPath: unknown,
+): string | null {
+  if (typeof tempLogPath !== "string" || tempLogPath.length === 0) return null;
+  const stateDir = resolveStateDir();
+  const resolvedTemp = resolveSuiteLogTempPath(tempLogPath, stateDir);
+  if (resolvedTemp === null) {
+    logger.warn("control-server: suite log publish skipped", {
+      rowId: ledgerRowId,
+      logPath: boundedWarnField(tempLogPath),
+      reason: "not an absolute path inside <state dir>/suite-logs/",
+    });
+    return null;
+  }
+  const suiteLogsDir = path.join(stateDir, "suite-logs");
+  const finalPath = path.join(suiteLogsDir, `${ledgerRowId}.log`);
+  try {
+    fs.mkdirSync(suiteLogsDir, { recursive: true });
+    fs.renameSync(resolvedTemp, finalPath);
+    db.prepare("UPDATE suite_results SET log_path = ? WHERE id = ?").run(finalPath, ledgerRowId);
+    return finalPath;
+  } catch (err) {
+    logger.warn("control-server: suite log publish failed", {
+      rowId: ledgerRowId,
+      logPath: boundedWarnField(resolvedTemp),
+      error: boundedWarnField(err instanceof Error ? err.message : err),
+    });
+    return null;
+  }
+}
+
 async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonResponse> {
   const originRepo = typeof body.origin_repo === "string" ? body.origin_repo : "";
   const treeHash = typeof body.tree_hash === "string" ? body.tree_hash : "";
@@ -989,6 +1062,10 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
   const exitCode = typeof body.exit_code === "number" ? body.exit_code : null;
   const durationMs = typeof body.duration_ms === "number" ? body.duration_ms : null;
   const logTail = typeof body.log_tail === "string" ? body.log_tail : null;
+  // LEDGER-DIAG US-002: the shim's absolute temp-file path for the COMPLETE
+  // combined output. Published below as `<state dir>/suite-logs/<row id>.log`
+  // once the INSERT has assigned the row id.
+  const tempLogPath = typeof body.log_path === "string" ? body.log_path : null;
   const runId = typeof body.run_id === "string" ? body.run_id : null;
   const stepId = typeof body.step_id === "string" ? body.step_id : null;
   const force = body.force === true;
@@ -1014,6 +1091,23 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
     ).run(originRepo, treeHash, cmdHash, cmdDisplay, exitCode, durationMs, logTail, runId, stepId, created_at);
 
     const ledgerRowId = Number(result.lastInsertRowid);
+    // Publish the full log BEFORE emitting the event so a reader of
+    // suite.executed (US-006) always sees the settled log_path.
+    const storedLogPath = publishSuiteLog(db, ledgerRowId, tempLogPath);
+    // LEDGER-DIAG US-006: a RED result gets exactly ONE daemon log line naming
+    // the persisted full-log path (when there is one) next to the execution
+    // identity; a green result logs nothing extra, so an all-green ledger
+    // stays quiet. The path is omitted, never null, when no log was persisted.
+    if (exitCode !== 0) {
+      logger.info("control-server: suite record red", {
+        originRepo,
+        treeHash,
+        cmdHash,
+        cmdDisplay,
+        exitCode,
+        ...(storedLogPath ? { logPath: storedLogPath } : {}),
+      });
+    }
     // Emit exact-key execution/record evidence for immutable O9 harvesting.
     const eventRunId = runId || "";
     emitEvent({
@@ -1030,6 +1124,10 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
       force,
       startedAt,
       ledgerRowId,
+      // LEDGER-DIAG US-006: the full-log path on the immutable evidence, ONLY
+      // when the publish settled. A reader that sees no logPath knows no log
+      // exists for this row.
+      ...(storedLogPath ? { logPath: storedLogPath } : {}),
     });
 
     // Clear any pending claim so waiters can pick up the result.
@@ -1037,7 +1135,7 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
     suiteClaims.delete(claimKey);
     sweptDeadSuiteClaims.delete(claimKey);
 
-    return ok({ id: ledgerRowId, created_at });
+    return ok({ id: ledgerRowId, created_at, ...(storedLogPath ? { log_path: storedLogPath } : {}) });
   } catch (err) {
     logger.warn("control-server: suite record failed", { error: String(err) });
     return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };

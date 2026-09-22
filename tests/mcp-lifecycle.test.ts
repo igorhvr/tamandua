@@ -52,7 +52,10 @@ async function createTempEnv(): Promise<{
   const controlPort = portHandles[0].port;
   const dashboardPort = portHandles[1].port;
   const th = createTempHome("tamandua-mcp-lifecycle-");
-  const stateDir = path.join(th.root, "state");
+  // US-008: cleanChildEnv forces the child state dir to <HOME>/.tamandua, so
+  // the state this test seeds must live there (a distinct root/state would be
+  // ignored by the spawned CLI).
+  const stateDir = th.tamanduaDir;
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(path.join(th.tamanduaDir, "port"), String(dashboardPort), "utf-8");
   return { root: th.root, stateDir, homeDir: th.homeDir, controlPort, dashboardPort, portHandles };

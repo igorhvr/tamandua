@@ -2309,6 +2309,38 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     db.close();
   }
 
+  function readDaemonLog(): string {
+    try {
+      return fs.readFileSync(path.join(stateDir, "tamandua.log"), "utf-8");
+    } catch {
+      return "";
+    }
+  }
+
+  function suiteLogPublishWarnLines(logText: string): string[] {
+    return logText
+      .split("\n")
+      .filter((line) => line.includes("suite log publish") && line.trim() !== "");
+  }
+
+  /** LEDGER-DIAG US-006: the per-RED-result daemon log lines. */
+  function suiteRecordRedLines(logText: string): string[] {
+    return logText
+      .split("\n")
+      .filter((line) => line.includes("suite record red") && line.trim() !== "");
+  }
+
+  function readRunEvents(runId: string): Array<Record<string, unknown>> {
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    if (!fs.existsSync(runEventsPath)) return [];
+    return fs
+      .readFileSync(runEventsPath, "utf-8")
+      .trim()
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
   // ── 1. GET /suite/lookup ──────────────────────────────────────────
 
   it("GET /suite/lookup returns 401 without auth", async () => {
@@ -2482,6 +2514,313 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     assert.equal(r.status, 200);
     assert.ok(typeof r.body.id === "number", "should return inserted row id");
     assert.ok(typeof r.body.created_at === "string", "should return created_at");
+  });
+
+  // ── LEDGER-DIAG US-002: full-log publishing on /suite/record ──────
+
+  it("resolveSuiteLogTempPath accepts only absolute paths inside <state dir>/suite-logs/", async () => {
+    const { resolveSuiteLogTempPath } = await import("../../dist/server/control-server.js");
+    const dir = path.join(stateDir, "suite-logs");
+    assert.equal(
+      resolveSuiteLogTempPath(path.join(dir, "a.log"), stateDir),
+      path.join(dir, "a.log"),
+    );
+    assert.equal(resolveSuiteLogTempPath("relative/a.log", stateDir), null);
+    assert.equal(resolveSuiteLogTempPath("", stateDir), null);
+    assert.equal(resolveSuiteLogTempPath(undefined, stateDir), null);
+    assert.equal(resolveSuiteLogTempPath(42, stateDir), null);
+    assert.equal(resolveSuiteLogTempPath(path.join(dir, "..", "escape.log"), stateDir), null);
+    assert.equal(resolveSuiteLogTempPath(dir, stateDir), null);
+    assert.equal(resolveSuiteLogTempPath(path.join(stateDir, "other", "a.log"), stateDir), null);
+  });
+
+  it("POST /suite/record publishes a shim temp log to <state dir>/suite-logs/<row id>.log", async () => {
+    const suiteLogsDir = path.join(stateDir, "suite-logs");
+    fs.mkdirSync(suiteLogsDir, { recursive: true });
+    const tempLog = path.join(suiteLogsDir, `.pending-${crypto.randomUUID()}.log`);
+    const complete = "FULL-LOG-SENTINEL\n" + "x".repeat(64 * 1024);
+    fs.writeFileSync(tempLog, complete, "utf-8");
+
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/log-publish",
+      tree_hash: "log-publish-tree",
+      cmd_hash: "log-publish-cmd",
+      cmd_display: "npm test",
+      exit_code: 1,
+      duration_ms: 10,
+      log_tail: "tail stays capped",
+      log_path: tempLog,
+    });
+    assert.equal(r.status, 200);
+    const rowId = r.body.id as number;
+    const expected = path.join(suiteLogsDir, `${rowId}.log`);
+    assert.equal(r.body.log_path, expected, "record result must expose the stored log_path");
+    assert.ok(fs.existsSync(expected), "published full log must exist at <state dir>/suite-logs/<row id>.log");
+    assert.equal(fs.readFileSync(expected, "utf-8"), complete, "complete output must be intact");
+    assert.ok(!fs.existsSync(tempLog), "temp file must be renamed away");
+
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare("SELECT log_path, log_tail FROM suite_results WHERE id = ?").get(rowId) as {
+      log_path: string | null;
+      log_tail: string | null;
+    };
+    db.close();
+    assert.equal(row.log_path, expected, "suite_results.log_path must store the published path");
+    assert.equal(row.log_tail, "tail stays capped", "log_tail must be unchanged");
+
+    const lookup = await suiteRequest(
+      "GET",
+      `/suite/lookup?origin_repo=${encodeURIComponent("/test/log-publish")}&tree_hash=log-publish-tree&cmd_hash=log-publish-cmd`,
+    );
+    assert.equal(lookup.status, 200);
+    assert.equal(
+      (lookup.body.latest as Record<string, unknown>).log_path,
+      expected,
+      "lookup latest must expose the stored log_path",
+    );
+  });
+
+  it("a record without a log_path keeps suite_results.log_path NULL", async () => {
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/no-log",
+      tree_hash: "no-log-tree",
+      cmd_hash: "no-log-cmd",
+      cmd_display: "npm test",
+      exit_code: 0,
+      duration_ms: 5,
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.log_path, undefined, "no log_path in the result when none was supplied");
+    const rowId = r.body.id as number;
+
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare("SELECT log_path FROM suite_results WHERE id = ?").get(rowId) as {
+      log_path: string | null;
+    };
+    db.close();
+    assert.equal(row.log_path, null, "log_path must stay NULL without a full log");
+
+    const lookup = await suiteRequest(
+      "GET",
+      `/suite/lookup?origin_repo=${encodeURIComponent("/test/no-log")}&tree_hash=no-log-tree&cmd_hash=no-log-cmd`,
+    );
+    assert.equal((lookup.body.latest as Record<string, unknown>).log_path, null);
+  });
+
+  it("a missing temp log path leaves log_path NULL with exactly one bounded warning", async () => {
+    const suiteLogsDir = path.join(stateDir, "suite-logs");
+    fs.mkdirSync(suiteLogsDir, { recursive: true });
+    const tempLog = path.join(suiteLogsDir, `.missing-${crypto.randomUUID()}.log`);
+    const before = suiteLogPublishWarnLines(readDaemonLog()).length;
+
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/log-missing",
+      tree_hash: "log-missing-tree",
+      cmd_hash: "log-missing-cmd",
+      cmd_display: "npm test",
+      exit_code: 1,
+      duration_ms: 10,
+      log_path: tempLog,
+    });
+    assert.equal(r.status, 200, "a failed publish must not fail the record");
+    assert.equal(r.body.log_path, undefined);
+    const rowId = r.body.id as number;
+
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare("SELECT log_path FROM suite_results WHERE id = ?").get(rowId) as {
+      log_path: string | null;
+    };
+    db.close();
+    assert.equal(row.log_path, null, "a missing temp file must leave log_path NULL");
+
+    const warns = suiteLogPublishWarnLines(readDaemonLog());
+    assert.equal(warns.length - before, 1, "exactly one bounded warning for one failed publish");
+    const warn = warns[warns.length - 1];
+    assert.ok(warn.includes("suite log publish"), `warning should name the publish failure: ${warn}`);
+    assert.ok(warn.length < 1000, "warning must be bounded");
+  });
+
+  it("an out-of-directory temp log path is refused, leaves NULL, logs one warning and deletes nothing", async () => {
+    const outsideA = path.join(stateDir, `.outside-${crypto.randomUUID()}.log`);
+    fs.writeFileSync(outsideA, "outside-a", "utf-8");
+    const before = suiteLogPublishWarnLines(readDaemonLog()).length;
+
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/log-outside",
+      tree_hash: "log-outside-tree",
+      cmd_hash: "log-outside-cmd",
+      cmd_display: "npm test",
+      exit_code: 1,
+      duration_ms: 10,
+      log_path: outsideA,
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.log_path, undefined);
+    const rowId = r.body.id as number;
+
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare("SELECT log_path FROM suite_results WHERE id = ?").get(rowId) as {
+      log_path: string | null;
+    };
+    db.close();
+    assert.equal(row.log_path, null);
+    assert.ok(fs.existsSync(outsideA), "the refused temp file must not be deleted");
+
+    // A relative path is likewise refused.
+    const rel = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/log-relative",
+      tree_hash: "log-relative-tree",
+      cmd_hash: "log-relative-cmd",
+      cmd_display: "npm test",
+      exit_code: 1,
+      duration_ms: 10,
+      log_path: path.join("relative", "out.log"),
+    });
+    assert.equal(rel.body.log_path, undefined);
+
+    const warns = suiteLogPublishWarnLines(readDaemonLog());
+    assert.equal(warns.length - before, 2, "one warning per refused path");
+    for (const warn of warns.slice(-2)) {
+      assert.ok(warn.includes("suite log publish"));
+      assert.ok(warn.length < 1000, "warning must be bounded");
+    }
+  });
+
+  it("an un-renameable temp log leaves log_path NULL with one warning and preserves every file", async () => {
+    const suiteLogsDir = path.join(stateDir, "suite-logs");
+    fs.mkdirSync(suiteLogsDir, { recursive: true });
+
+    // Predict the next row id: this file runs one test at a time and the
+    // suite_results id is an INTEGER PRIMARY KEY (max rowid + 1).
+    const pre = new DatabaseSync(dbPath);
+    const nextId = (pre.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM suite_results").get() as { m: number }).m + 1;
+    pre.close();
+    const destDir = path.join(suiteLogsDir, `${nextId}.log`);
+    fs.mkdirSync(destDir, { recursive: true });
+    fs.writeFileSync(path.join(destDir, "keep.txt"), "keep", "utf-8");
+
+    const tempLog = path.join(suiteLogsDir, `.pending-${crypto.randomUUID()}.log`);
+    fs.writeFileSync(tempLog, "full log", "utf-8");
+    const before = suiteLogPublishWarnLines(readDaemonLog()).length;
+
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/log-unrenameable",
+      tree_hash: "log-unrenameable-tree",
+      cmd_hash: "log-unrenameable-cmd",
+      cmd_display: "npm test",
+      exit_code: 1,
+      duration_ms: 10,
+      log_path: tempLog,
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.id, nextId, "predicted row id must match the inserted row");
+    assert.equal(r.body.log_path, undefined);
+
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare("SELECT log_path FROM suite_results WHERE id = ?").get(r.body.id) as {
+      log_path: string | null;
+    };
+    db.close();
+    assert.equal(row.log_path, null, "an un-renameable temp path must leave log_path NULL");
+    assert.ok(fs.existsSync(tempLog), "the temp log must be preserved after a failed rename");
+    assert.ok(fs.existsSync(destDir), "the blocking destination must be preserved");
+    assert.equal(fs.readFileSync(path.join(destDir, "keep.txt"), "utf-8"), "keep");
+
+    const warns = suiteLogPublishWarnLines(readDaemonLog());
+    assert.equal(warns.length - before, 1, "exactly one bounded warning for one failed publish");
+    assert.ok(warns[warns.length - 1].length < 1000, "warning must be bounded");
+  });
+
+  // ── LEDGER-DIAG US-006: red ledger line carries the full-log path ─
+
+  it("a red record with a persisted log emits suite.executed logPath and exactly one daemon red line naming it", async () => {
+    const suiteLogsDir = path.join(stateDir, "suite-logs");
+    fs.mkdirSync(suiteLogsDir, { recursive: true });
+    const tempLog = path.join(suiteLogsDir, `.pending-${crypto.randomUUID()}.log`);
+    fs.writeFileSync(tempLog, "full red log", "utf-8");
+
+    const runId = `us006-red-${crypto.randomUUID()}`;
+    const before = suiteRecordRedLines(readDaemonLog()).length;
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/us006-red",
+      tree_hash: "us006-red-tree",
+      cmd_hash: "us006-red-cmd",
+      cmd_display: "npm test",
+      exit_code: 1,
+      duration_ms: 10,
+      run_id: runId,
+      log_path: tempLog,
+    });
+    assert.equal(r.status, 200);
+    const rowId = r.body.id as number;
+    const expected = path.join(suiteLogsDir, `${rowId}.log`);
+
+    const events = readRunEvents(runId);
+    const executed = events.find((e) => e.event === "suite.executed");
+    assert.ok(executed, "suite.executed event should be emitted");
+    assert.equal(executed!.logPath, expected, "suite.executed must carry the persisted log path");
+
+    const redLines = suiteRecordRedLines(readDaemonLog());
+    assert.equal(redLines.length - before, 1, "exactly one daemon red line for one red record");
+    const line = redLines[redLines.length - 1];
+    assert.ok(line.includes(expected), "the red daemon line must name the full-log path");
+    assert.ok(line.includes("/test/us006-red"), "the red daemon line must name the origin");
+    assert.ok(line.includes("us006-red-tree"), "the red daemon line must name the tree");
+    assert.ok(line.includes("us006-red-cmd"), "the red daemon line must name the command");
+    assert.ok(line.includes("npm test"), "the red daemon line must name the command display");
+    assert.ok(line.includes("\"exitCode\":1"), "the red daemon line must carry the exit code");
+    assert.ok(line.length < 1000, "the red daemon line must stay bounded");
+  });
+
+  it("a green record emits no per-red daemon line and omits logPath", async () => {
+    const runId = `us006-green-${crypto.randomUUID()}`;
+    const before = suiteRecordRedLines(readDaemonLog()).length;
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/us006-green",
+      tree_hash: "us006-green-tree",
+      cmd_hash: "us006-green-cmd",
+      cmd_display: "npm test",
+      exit_code: 0,
+      duration_ms: 10,
+      run_id: runId,
+    });
+    assert.equal(r.status, 200);
+
+    assert.equal(
+      suiteRecordRedLines(readDaemonLog()).length - before,
+      0,
+      "a green record must not emit a per-red daemon line",
+    );
+    const executed = readRunEvents(runId).find((e) => e.event === "suite.executed");
+    assert.ok(executed, "suite.executed event should be emitted");
+    assert.ok(!("logPath" in executed!), "a green record with no log must omit logPath");
+  });
+
+  it("a red record with no persisted log still emits one daemon line without a path and omits logPath", async () => {
+    const runId = `us006-red-nolog-${crypto.randomUUID()}`;
+    const before = suiteRecordRedLines(readDaemonLog()).length;
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/us006-red-nolog",
+      tree_hash: "us006-red-nolog-tree",
+      cmd_hash: "us006-red-nolog-cmd",
+      cmd_display: "npm test",
+      exit_code: 2,
+      duration_ms: 10,
+      run_id: runId,
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.log_path, undefined, "no log must be published");
+
+    const executed = readRunEvents(runId).find((e) => e.event === "suite.executed");
+    assert.ok(executed, "suite.executed event should be emitted");
+    assert.ok(!("logPath" in executed!), "a red record with no log must omit logPath");
+
+    const redLines = suiteRecordRedLines(readDaemonLog());
+    assert.equal(redLines.length - before, 1, "a red record always logs exactly one red line");
+    const line = redLines[redLines.length - 1];
+    assert.ok(!line.includes("logPath"), "the red daemon line must not print a path when none exists");
+    assert.ok(!line.includes("null"), "the red daemon line must not print a null path");
+    assert.ok(line.includes("\"exitCode\":2"), "the red daemon line must carry the exit code");
   });
 
   it("POST /suite/record clears pending claim", async () => {

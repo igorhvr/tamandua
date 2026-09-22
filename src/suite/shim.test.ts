@@ -6,7 +6,7 @@
  */
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, mkdirSync, chmodSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { execSync, spawn, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
@@ -905,6 +905,428 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       assert.equal(special?.junkProbeTracked, false);
     });
   }
+
+  // ── LEDGER-DIAG US-003: full suite-log persistence ──────────────────
+
+  describe("full suite-log persistence (US-003)", () => {
+    /**
+     * Write a script whose combined output is comfortably above the 20 KB
+     * log_tail cap. The first line and the final marker let the test prove
+     * the persisted log is COMPLETE, not a truncated slice.
+     */
+    function writeLargeOutputScript(repoDir: string, name: string, marker: string): string {
+      const script = join(repoDir, name);
+      writeFileSync(
+        script,
+        `#!/bin/sh\ni=0\nwhile [ $i -lt 700 ]; do\n  echo "PADDING-${marker}-$i-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"\n  i=$((i + 1))\ndone\necho "TAIL-MARKER-${marker}"\nexit 0\n`,
+      );
+      chmodSync(script, 0o755);
+      return script;
+    }
+
+    it("writes the complete >20KB output to <state dir>/suite-logs/<row id>.log with a capped log_tail", async () => {
+      const fixture = createFixtureRepo(tempBase, "full-suite-log");
+      const marker = "FULLLOG";
+      const script = writeLargeOutputScript(fixture.repoDir, "large-output.sh", marker);
+      const runId = "r-full-suite-log";
+      const stepId = "s-full-suite-log";
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = committedTreeHash(fixture.repoDir);
+      assert.ok(treeHash, "fixture should have a committed tree hash");
+      const cmdHash = computeCmdHash(script);
+      const originRepo = getOriginRepo(fixture.repoDir);
+
+      const result = await runShim(
+        ["--repo", fixture.repoDir, "--run", runId, "--step", stepId, "--", script],
+        shimChildEnv(controlEnv),
+      );
+      assert.equal(result.exitCode, 0, "the large-output suite itself passed");
+
+      const db = new DatabaseSync(controlEnv.dbPath);
+      const rows = db.prepare(
+        `SELECT id, log_path, log_tail FROM suite_results
+         WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND run_id = ? AND step_id = ?`,
+      ).all(originRepo, treeHash, cmdHash, runId, stepId) as Array<{
+        id: number;
+        log_path: string | null;
+        log_tail: string | null;
+      }>;
+      db.close();
+
+      assert.equal(rows.length, 1, "exactly one ledger row for this run/step");
+      const row = rows[0]!;
+      const expectedPath = join(controlEnv.stateDir, "suite-logs", `${row.id}.log`);
+      assert.equal(row.log_path, expectedPath, "the row stores the published absolute log path");
+
+      const full = readFileSync(expectedPath, "utf8");
+      assert.ok(full.length > 20 * 1024, "persisted log must exceed the 20 KB cap");
+      assert.ok(full.includes(`PADDING-${marker}-0-`), "full log keeps the first line");
+      assert.ok(full.includes(`TAIL-MARKER-${marker}`), "full log keeps the final marker");
+
+      assert.ok(row.log_tail !== null, "log_tail stays populated");
+      assert.ok(
+        row.log_tail.length <= 20 * 1024,
+        "log_tail stays capped at LOG_TAIL_KB*1024",
+      );
+      assert.equal(
+        row.log_tail,
+        full.slice(-20 * 1024),
+        "log_tail is still the trailing slice of the captured output",
+      );
+
+      // The control plane renames the shim temp file; nothing is left behind.
+      const leftovers = readdirSync(join(controlEnv.stateDir, "suite-logs")).filter(
+        (entry) => entry.startsWith(".pending-"),
+      );
+      assert.deepEqual(leftovers, [], "no .pending temp files remain after a successful publish");
+    });
+
+    it("a log-write failure warns once, records log_path NULL and preserves the exit code", async () => {
+      const fixture = createFixtureRepo(tempBase, "full-suite-log-write-failure");
+      const script = join(fixture.repoDir, "failing-suite.sh");
+      writeFileSync(script, "#!/bin/sh\necho 'FAIL-WRITE-TEST' >&2\nexit 7\n");
+      chmodSync(script, 0o755);
+      const runId = "r-full-suite-log-write-failure";
+      const stepId = "s-full-suite-log-write-failure";
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = committedTreeHash(fixture.repoDir);
+      assert.ok(treeHash);
+      const cmdHash = computeCmdHash(script);
+      const originRepo = getOriginRepo(fixture.repoDir);
+
+      // Block `<state dir>/suite-logs` with a regular file so the shim's
+      // mkdirSync/writeFileSync fails. Preserve any existing directory.
+      const suiteLogsDir = join(controlEnv.stateDir, "suite-logs");
+      const savedDir = join(controlEnv.stateDir, "suite-logs.saved");
+      let moved = false;
+      if (existsSync(suiteLogsDir)) {
+        renameSync(suiteLogsDir, savedDir);
+        moved = true;
+      }
+      writeFileSync(suiteLogsDir, "blocked\n");
+
+      let result: ShimResult;
+      try {
+        result = await runShim(
+          ["--repo", fixture.repoDir, "--run", runId, "--step", stepId, "--", script],
+          shimChildEnv(controlEnv),
+        );
+      } finally {
+        rmSync(suiteLogsDir, { force: true });
+        if (moved) renameSync(savedDir, suiteLogsDir);
+      }
+
+      assert.equal(result.exitCode, 7, "the command's exit code is preserved");
+      const warnings = result.stderr
+        .split("\n")
+        .filter((line) => line.includes("failed to write full suite log"));
+      assert.equal(warnings.length, 1, "exactly one bounded log-write warning");
+      assert.ok(warnings[0]!.length <= 1000, "the warning line is bounded");
+
+      const db = new DatabaseSync(controlEnv.dbPath);
+      const rows = db.prepare(
+        `SELECT log_path, log_tail FROM suite_results
+         WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND run_id = ? AND step_id = ?`,
+      ).all(originRepo, treeHash, cmdHash, runId, stepId) as Array<{
+        log_path: string | null;
+        log_tail: string | null;
+      }>;
+      db.close();
+
+      assert.equal(rows.length, 1, "the result is still recorded");
+      assert.equal(rows[0]!.log_path, null, "log_path stays NULL on a write failure");
+      assert.match(rows[0]!.log_tail ?? "", /FAIL-WRITE-TEST/);
+    });
+
+    it("TAMANDUA_TSTX=0 passthrough writes no suite-log file", async () => {
+      const isolated = createTempHome("tamandua-shim-tstx0-");
+      const fixture = createFixtureRepo(tempBase, "full-suite-log-tstx0");
+      const env = cleanChildEnv({
+        HOME: isolated.homeDir,
+        TAMANDUA_STATE_DIR: isolated.tamanduaDir,
+        TAMANDUA_TEST_GUARD: "1",
+        TAMANDUA_TSTX: "0",
+      });
+
+      const result = await runShim(
+        ["--repo", fixture.repoDir, "--run", "r-tstx0", "--step", "s-tstx0", "--", fixture.passScript],
+        env,
+      );
+
+      assert.equal(result.exitCode, 0, "passthrough executes the command");
+      assert.ok(result.stderr.includes("passthrough mode"), "passthrough notice is present");
+      assert.equal(
+        existsSync(join(isolated.tamanduaDir, "suite-logs")),
+        false,
+        "TAMANDUA_TSTX=0 must not create the suite-logs directory",
+      );
+    });
+  });
+
+  // ── LEDGER-DIAG US-005: composed tail + log_path in output ──────────
+
+  describe("composed evidence tail and full-log path output (US-005)", () => {
+    /**
+     * Write a red suite script whose diagnostic failing-tests block appears
+     * EARLY and is followed by >20 KB of padding. A blind trailing slice
+     * would keep only padding; the composer must retain the failing block.
+     */
+    function writeRedComposedOutputScript(repoDir: string, name: string): string {
+      const script = join(repoDir, name);
+      writeFileSync(
+        script,
+        `#!/bin/sh\n`
+          + `echo "  Serial lane:   FAILED"\n`
+          + `echo "\u2139 tests 2"\n`
+          + `echo "\u2139 pass 1"\n`
+          + `echo "\u2139 fail 1"\n`
+          + `echo "\u2716 failing tests:"\n`
+          + `echo "\u2716 should compose the diagnostic tail (12.3ms)"\n`
+          + `echo "  Error: expected true"\n`
+          + `echo ">>> SERIAL lane: FAILED (exit code 1)"\n`
+          + `i=0\n`
+          + `while [ $i -lt 800 ]; do\n`
+          + `  echo "PADDING-US005-$i-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"\n`
+          + `  i=$((i + 1))\n`
+          + `done\n`
+          + `exit 1\n`,
+      );
+      chmodSync(script, 0o755);
+      return script;
+    }
+
+    it("stores the composed tail (failing block retained, not a blind slice) for over-cap output", async () => {
+      const fixture = createFixtureRepo(tempBase, "composed-tail-red");
+      const script = writeRedComposedOutputScript(fixture.repoDir, "red-composed.sh");
+      const runId = "r-composed-tail";
+      const stepId = "s-composed-tail";
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = committedTreeHash(fixture.repoDir);
+      assert.ok(treeHash);
+      const cmdHash = computeCmdHash(script);
+      const originRepo = getOriginRepo(fixture.repoDir);
+
+      const result = await runShim(
+        ["--repo", fixture.repoDir, "--run", runId, "--step", stepId, "--", script],
+        shimChildEnv(controlEnv),
+      );
+      assert.equal(result.exitCode, 1, "the red suite's exit code is preserved");
+
+      const db = new DatabaseSync(controlEnv.dbPath);
+      const rows = db.prepare(
+        `SELECT id, log_path, log_tail FROM suite_results
+         WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND run_id = ? AND step_id = ?`,
+      ).all(originRepo, treeHash, cmdHash, runId, stepId) as Array<{
+        id: number;
+        log_path: string | null;
+        log_tail: string | null;
+      }>;
+      db.close();
+
+      assert.equal(rows.length, 1, "exactly one ledger row");
+      const tail = rows[0]!.log_tail ?? "";
+      assert.ok(
+        Buffer.byteLength(tail, "utf8") <= 20 * 1024,
+        "the stored tail never exceeds the LOG_TAIL_KB cap",
+      );
+      assert.ok(
+        tail.includes("\u2716 failing tests:"),
+        "the composed tail retains the failing-tests block",
+      );
+      assert.ok(
+        tail.includes("should compose the diagnostic tail"),
+        "the composed tail retains the failing test name",
+      );
+      assert.ok(
+        tail.includes("Serial lane") && tail.includes("\u2139 fail 1"),
+        "the composed tail retains the lane verdict and counters",
+      );
+      // A blind slice would have kept only the trailing padding lines.
+      assert.ok(
+        !tail.trimStart().startsWith("PADDING-US005-"),
+        "the tail does not degrade to trailing padding only",
+      );
+    });
+
+    /** Insert a row directly for a key so the shim sees it as the latest. */
+    function insertRow(
+      row: {
+        originRepo: string;
+        treeHash: string;
+        cmdHash: string;
+        exitCode: number;
+        logPath: string | null;
+        runId: string;
+        stepId: string;
+      },
+    ): void {
+      const db = new DatabaseSync(controlEnv.dbPath);
+      db.prepare(
+        `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, log_path, run_id, step_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.originRepo,
+        row.treeHash,
+        row.cmdHash,
+        "direct-row",
+        row.exitCode,
+        100,
+        "recorded tail",
+        row.logPath,
+        row.runId,
+        row.stepId,
+        new Date().toISOString(),
+      );
+      db.close();
+    }
+
+    it("prints the full-log path in the red context note when the row has one", async () => {
+      const fixture = createFixtureRepo(tempBase, "red-context-with-log");
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = committedTreeHash(fixture.repoDir);
+      assert.ok(treeHash);
+      const cmdHash = computeCmdHash(fixture.passScript);
+      const originRepo = getOriginRepo(fixture.repoDir);
+      const fullLog = join(tempBase, "ledger-diag-red-full.log");
+
+      insertRow({
+        originRepo,
+        treeHash,
+        cmdHash,
+        exitCode: 1,
+        logPath: fullLog,
+        runId: "r-red-log",
+        stepId: "s-red-log",
+      });
+
+      const result = await runShim(
+        ["--repo", fixture.repoDir, "--run", "r-red-log-run", "--step", "s-red-log-run", "--", fixture.passScript],
+        shimChildEnv(controlEnv),
+      );
+      assert.ok(result.stderr.includes("note: this tree failed"), "red context note present");
+      assert.ok(
+        result.stderr.includes(`(full log: ${fullLog})`),
+        "red context note names the persisted full log",
+      );
+    });
+
+    it("omits any full-log placeholder in the red context note when log_path is absent", async () => {
+      const fixture = createFixtureRepo(tempBase, "red-context-no-log");
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = committedTreeHash(fixture.repoDir);
+      assert.ok(treeHash);
+      const cmdHash = computeCmdHash(fixture.passScript);
+      const originRepo = getOriginRepo(fixture.repoDir);
+
+      insertRow({
+        originRepo,
+        treeHash,
+        cmdHash,
+        exitCode: 1,
+        logPath: null,
+        runId: "r-red-nolog",
+        stepId: "s-red-nolog",
+      });
+
+      const result = await runShim(
+        ["--repo", fixture.repoDir, "--run", "r-red-nolog-run", "--step", "s-red-nolog-run", "--", fixture.passScript],
+        shimChildEnv(controlEnv),
+      );
+      assert.ok(result.stderr.includes("note: this tree failed"), "red context note present");
+      assert.ok(
+        !result.stderr.includes("full log:"),
+        "no full-log placeholder when the row has no log_path",
+      );
+    });
+
+    it("prints the full-log path in the replay banner when the row has one", async () => {
+      const fixture = createFixtureRepo(tempBase, "replay-with-log");
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = committedTreeHash(fixture.repoDir);
+      assert.ok(treeHash);
+      const cmdHash = computeCmdHash(fixture.passScript);
+      const originRepo = getOriginRepo(fixture.repoDir);
+      const fullLog = join(tempBase, "ledger-diag-replay-full.log");
+
+      insertRow({
+        originRepo,
+        treeHash,
+        cmdHash,
+        exitCode: 0,
+        logPath: fullLog,
+        runId: "r-replay-log",
+        stepId: "s-replay-log",
+      });
+
+      const result = await runShim(
+        ["--repo", fixture.repoDir, "--run", "r-replay-log-run", "--step", "s-replay-log-run", "--", fixture.passScript],
+        shimChildEnv(controlEnv),
+      );
+      assert.equal(result.exitCode, 0, "replay exits 0");
+      assert.ok(result.stdout.includes("TAMANDUA-TEST CACHED"), "replay banner present");
+      assert.ok(
+        result.stdout.includes(`full log: ${fullLog}`),
+        "replay banner names the persisted full log",
+      );
+    });
+
+    it("omits any full-log placeholder in the replay banner when log_path is absent", async () => {
+      const fixture = createFixtureRepo(tempBase, "replay-no-log");
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = committedTreeHash(fixture.repoDir);
+      assert.ok(treeHash);
+      const cmdHash = computeCmdHash(fixture.passScript);
+      const originRepo = getOriginRepo(fixture.repoDir);
+
+      insertRow({
+        originRepo,
+        treeHash,
+        cmdHash,
+        exitCode: 0,
+        logPath: null,
+        runId: "r-replay-nolog",
+        stepId: "s-replay-nolog",
+      });
+
+      const result = await runShim(
+        ["--repo", fixture.repoDir, "--run", "r-replay-nolog-run", "--step", "s-replay-nolog-run", "--", fixture.passScript],
+        shimChildEnv(controlEnv),
+      );
+      assert.equal(result.exitCode, 0, "replay exits 0");
+      assert.ok(result.stdout.includes("TAMANDUA-TEST CACHED"), "replay banner present");
+      assert.ok(
+        !result.stdout.includes("full log:"),
+        "no full-log placeholder when the row has no log_path",
+      );
+    });
+
+    it("--help documents the suite-logs full log and still documents TAMANDUA_TSTX", async () => {
+      const r = await runShim(["--help"], shimChildEnv(controlEnv));
+      assert.equal(r.exitCode, 0, "--help exits 0");
+      assert.ok(
+        r.stderr.includes("suite-logs"),
+        "help documents the <state dir>/suite-logs/<row id>.log path",
+      );
+      assert.ok(
+        r.stderr.includes("TAMANDUA_TSTX=0"),
+        "help keeps the existing TAMANDUA_TSTX documentation",
+      );
+    });
+  });
 
   describe("dead-owner reclaim", () => {
     // US-002: Snapshot pre-existing dead-owner-suite orphans so the

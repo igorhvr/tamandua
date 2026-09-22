@@ -15,6 +15,13 @@
  *     passthrough key — every call site supplies it as an explicit override,
  *     which also drives the TAMANDUA_STATE_DIR/DB/WORKTREE_ROOT synthesis).
  *
+ * Additionally covers the US-008 test-child isolation contract:
+ *  - TAMANDUA_STATE_DIR is ALWAYS forced to <HOME>/.tamandua and an injected
+ *    state dir is ignored;
+ *  - TAMANDUA_DB_PATH / TAMANDUA_WORKTREE_ROOT default to that forced path;
+ *  - the inherited run/job markers are stripped even when passed as overrides;
+ *  - a no-HOME call leaves the state dir exactly as before.
+ *
  * These tests are pure and host-independent: every call passes an explicit
  * synthetic baseEnv (never process.env), no assertion relies on the host
  * timezone being set or unset, and nothing spawns child processes. The file
@@ -159,5 +166,107 @@ describe("cleanChildEnv existing allowlist semantics (regression)", () => {
 
     assert.ok(!("PATH" in env), "PATH must be removed by explicit undefined");
     assert.equal(env.PATH, undefined);
+  });
+});
+
+describe("cleanChildEnv forces the child state dir from HOME (US-008)", () => {
+  const homeDir = "/home/isolation-test/home";
+  const forcedStateDir = `${homeDir}/.tamandua`;
+
+  it("ignores an injected TAMANDUA_STATE_DIR override", () => {
+    const env = cleanChildEnv(
+      { HOME: homeDir, TAMANDUA_STATE_DIR: "/somewhere/else/.tamandua" },
+      syntheticBaseEnv(),
+    );
+
+    assert.equal(env.TAMANDUA_STATE_DIR, forcedStateDir);
+  });
+
+  it("ignores an ambient base-env TAMANDUA_STATE_DIR", () => {
+    const env = cleanChildEnv(
+      { HOME: homeDir },
+      { ...syntheticBaseEnv(), TAMANDUA_STATE_DIR: "/ambient/state" },
+    );
+
+    assert.equal(env.TAMANDUA_STATE_DIR, forcedStateDir);
+  });
+
+  it("derives exactly <HOME>/.tamandua, its DB and its worktree root", () => {
+    const env = cleanChildEnv({ HOME: homeDir }, syntheticBaseEnv());
+
+    assert.equal(env.TAMANDUA_STATE_DIR, forcedStateDir);
+    assert.equal(env.TAMANDUA_DB_PATH, `${forcedStateDir}/tamandua.db`);
+    assert.equal(env.TAMANDUA_WORKTREE_ROOT, `${forcedStateDir}/worktrees`);
+  });
+
+  it("leaves the state dir unset when HOME is absent", () => {
+    const env = cleanChildEnv({}, syntheticBaseEnv());
+
+    assert.ok(!("TAMANDUA_STATE_DIR" in env), "no HOME => no forced state dir");
+    assert.ok(!("TAMANDUA_DB_PATH" in env), "no HOME => no synthesized DB path");
+    assert.ok(
+      !("TAMANDUA_WORKTREE_ROOT" in env),
+      "no HOME => no synthesized worktree root",
+    );
+  });
+
+  it("preserves an explicit TAMANDUA_STATE_DIR when HOME is absent", () => {
+    const env = cleanChildEnv(
+      { TAMANDUA_STATE_DIR: "/explicit/state" },
+      syntheticBaseEnv(),
+    );
+
+    assert.equal(env.TAMANDUA_STATE_DIR, "/explicit/state");
+  });
+});
+
+describe("cleanChildEnv strips inherited run/job markers (US-008)", () => {
+  const homeDir = "/home/isolation-test/home";
+  const markers = [
+    "TAMANDUA_RUN_ID",
+    "TAMANDUA_WORKER_JOB_ID",
+    "TAMANDUA_DAEMON_INSTANCE",
+    "TAMANDUA_WORKER_PID",
+    "TAMANDUA_DAEMON_PID",
+  ] as const;
+
+  it("is absent for every marker even when present in the base env", () => {
+    const base: NodeJS.ProcessEnv = { ...syntheticBaseEnv(), HOME: homeDir };
+    for (const marker of markers) base[marker] = `base-${marker}`;
+
+    const env = cleanChildEnv({}, base);
+
+    for (const marker of markers) {
+      assert.ok(!(marker in env), `${marker} must not leak from the base env`);
+      assert.equal(env[marker], undefined);
+    }
+  });
+
+  it("is absent for every marker even when supplied as an override", () => {
+    const overrides: Record<string, string> = { HOME: homeDir };
+    for (const marker of markers) overrides[marker] = `override-${marker}`;
+
+    const env = cleanChildEnv(overrides, syntheticBaseEnv());
+
+    for (const marker of markers) {
+      assert.ok(!(marker in env), `${marker} must not leak from an override`);
+      assert.equal(env[marker], undefined);
+    }
+  });
+
+  it("keeps the guard and harness pins while dropping the markers", () => {
+    const env = cleanChildEnv(
+      {
+        HOME: homeDir,
+        TAMANDUA_TEST_GUARD: "1",
+        TAMANDUA_PI_BINARY: "/bin/echo",
+        TAMANDUA_RUN_ID: "run-outer",
+      },
+      syntheticBaseEnv(),
+    );
+
+    assert.equal(env.TAMANDUA_TEST_GUARD, "1");
+    assert.equal(env.TAMANDUA_PI_BINARY, "/bin/echo");
+    assert.ok(!("TAMANDUA_RUN_ID" in env));
   });
 });

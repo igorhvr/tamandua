@@ -10,7 +10,8 @@
  *      single-parent descendant on the integration branch — the merge is
  *      deliberately squashed there, so the parents are only asserted when HEAD
  *      actually is the merge commit);
- *   3. the ONE schema chain tops out at SCHEMA_VERSION 13 with the
+ *   3. the ONE schema chain tops out at SCHEMA_VERSION 14 (13 at the union
+ *      landing plus LEDGER-DIAG's 13->14 suite_results.log_path step) with the
  *      `runs.matchlock_policy` (12->13) and `steps.target_moved_reroute_count`
  *      (10->11) guarded ALTERs present.
  *
@@ -185,8 +186,8 @@ describe("matchlock-union4 merge deliverable", () => {
     }
   });
 
-  it("tops out the one schema chain at SCHEMA_VERSION 13", () => {
-    assert.equal(SCHEMA_VERSION, 13);
+  it("tops out the one schema chain at SCHEMA_VERSION 14", () => {
+    assert.equal(SCHEMA_VERSION, 14);
   });
 
   it("carries both guarded ALTERs in src/db.ts", () => {

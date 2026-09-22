@@ -33,16 +33,26 @@ function git(repo: string, args: string[]): string {
   return result.stdout;
 }
 
-function runCli(args: string[], envOverrides: Record<string, string> = {}) {
+function runCli(
+  args: string[],
+  envOverrides: Record<string, string> = {},
+  // US-008: cleanChildEnv strips the run/job markers unconditionally, so a
+  // test that deliberately simulates a run injects TAMANDUA_RUN_ID here,
+  // AFTER the isolation cleanup.
+  postEnv: Record<string, string> = {},
+) {
   const testHome = createTempHome("tamandua-merge-branch-cli-home-");
   cleanup.push(testHome.root);
   const result = spawnSync("/bin/sh", [path.resolve("bin/tamandua"), ...args], {
     encoding: "utf-8",
-    env: cleanChildEnv({
-      HOME: testHome.homeDir,
-      TAMANDUA_STATE_DIR: testHome.tamanduaDir,
-      ...envOverrides,
-    }),
+    env: {
+      ...cleanChildEnv({
+        HOME: testHome.homeDir,
+        TAMANDUA_STATE_DIR: testHome.tamanduaDir,
+        ...envOverrides,
+      }),
+      ...postEnv,
+    },
   });
   return { ...result, testHome };
 }
@@ -390,7 +400,7 @@ describe("tamandua merge-branch CLI", () => {
     git(repo, ["branch", "scratch", initial]);
     createFeature(repo, initial);
 
-    const result = runCli(validArgs(repo, initial), { TAMANDUA_RUN_ID: "run-from-env" });
+    const result = runCli(validArgs(repo, initial), {}, { TAMANDUA_RUN_ID: "run-from-env" });
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^STATUS: landed$/m);
@@ -486,10 +496,11 @@ describe("tamandua merge-branch CLI", () => {
     git(repo, ["config", "gpg.format", "ssh"]);
     git(repo, ["config", "user.signingkey", `${keyPath}.pub`]);
 
-    const result = runCli(validArgs(repo, initial), {
-      TAMANDUA_RUN_ID: "run-cli-matchlock",
-      [MATCHLOCK_GUEST_ENV_VAR]: "1",
-    });
+    const result = runCli(
+      validArgs(repo, initial),
+      { [MATCHLOCK_GUEST_ENV_VAR]: "1" },
+      { TAMANDUA_RUN_ID: "run-cli-matchlock" },
+    );
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^SIGNING: unsigned-matchlock$/m);

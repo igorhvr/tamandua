@@ -147,3 +147,35 @@ export function shouldSkipUpdateWarning(group: string, action: string): boolean 
   if (group === "merge-branch") return true;
   return false;
 }
+
+/** Inputs for {@link shouldSuppressUpdateWarning}. */
+export interface UpdateWarningSuppressionInput {
+  /** Environment to inspect (typically `process.env`). */
+  env: Record<string, string | undefined>;
+  /** Whether stderr is attached to an interactive terminal. */
+  stderrIsTTY: boolean;
+}
+
+/**
+ * Decide whether the launch-time "new version available" warning must be
+ * suppressed.
+ *
+ * The warning is suppressed when `TAMANDUA_TEST_GUARD` is set to a non-empty
+ * value (every test child, whose stderr is inherited or piped) OR when stderr
+ * is not an interactive TTY (redirects, pipes, agent harnesses and captured
+ * logs: a notice written into a captured stream is noise). Interactive users
+ * (TTY stderr, no test guard) always keep the warning.
+ *
+ * `TAMANDUA_FORCE_UPDATE_WARNING` set to a non-empty value is the explicit
+ * escape hatch that forces the warning through; integration tests (whose
+ * spawned stderr is always a pipe) use it to assert the real CLI output.
+ */
+export function shouldSuppressUpdateWarning(
+  input: UpdateWarningSuppressionInput,
+): boolean {
+  const force = input.env.TAMANDUA_FORCE_UPDATE_WARNING;
+  if (typeof force === "string" && force !== "") return false;
+  const guard = input.env.TAMANDUA_TEST_GUARD;
+  if (typeof guard === "string" && guard !== "") return true;
+  return input.stderrIsTTY === false;
+}

@@ -199,17 +199,19 @@ describe("US-008 reconciliation: Matchlock observed-rounds + real-boot docs", ()
 describe("US-008 reconciliation: AGENTS.md documents the combined lineages", () => {
   const agents = read("AGENTS.md");
 
-  it("documents the combined v13 schema chain with lineage detection", () => {
+  it("documents the combined v14 schema chain with lineage detection", () => {
     for (const token of [
-      "SCHEMA_VERSION = 13",
+      "SCHEMA_VERSION = 14",
       "v9 -> v10",
       "v10 -> v11",
       "v11 -> v12",
       "v12 -> v13",
+      "v13 -> v14",
       "migrateInstantsToIsoZ()",
       "steps.target_moved_reroute_count",
       "steps.preclaim_death_count",
       "runs.matchlock_policy",
+      "suite_results.log_path",
       "detectSchemaLineage",
       "PRAGMA table_info",
       "v12 MAIN",

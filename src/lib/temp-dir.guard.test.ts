@@ -57,6 +57,13 @@ const OS_TMPDIR_ALLOWLIST: Record<string, string> = {
   "src/server/dashboard.test.ts":
     "comment explaining macOS os.tmpdir() symlink behavior — not a call",
 
+  // Fixture strings quote the captured real two-lane log, whose parallel-lane
+  // failing-test title is literally "✖ os.tmpdir() calls are only in allowed
+  // files". The composer test never calls os.tmpdir(); it only carries the
+  // title as log text.
+  "src/suite/log-tail.test.ts":
+    "fixture strings quote the real log's os.tmpdir() failing-test title — not a call",
+
   // The guard test itself — contains os.tmpdir() in the detection regex and
   // test assertions/allowlist data.  Self-reference is unavoidable.
   "src/lib/temp-dir.guard.test.ts":

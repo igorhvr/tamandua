@@ -46,7 +46,7 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // misread.
 // ONE schema chain (MATCHLOCK-UNION-4): main and the Matchlock lineage each
 // claimed a version for their own column, so the union folds both into a
-// single chain ending at SCHEMA_VERSION = 13.
+// single chain ending at SCHEMA_VERSION = 14.
 //   9  -> 10  TIME-STORAGE: migrateInstantsToIsoZ() rewrites every stored
 //              naive `YYYY-MM-DD HH:MM:SS` instant to ISO-8601 UTC `...Z`.
 //              Idempotent, so it also normalizes a Matchlock-lineage DB that
@@ -62,12 +62,18 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 //              creation when `--matchlock IMAGE` is passed; NULL = native
 //              path). The Matchlock lineage previously numbered this column
 //              v10/v12; it is renumbered to 13 here.
+//   13 -> 14  LEDGER-DIAG US-001: suite_results.log_path (the absolute path
+//              of the full combined stdout+stderr log written to
+//              `<state dir>/suite-logs/<row id>.log`; NULL for legacy rows
+//              and for any execution whose log could not be persisted). The
+//              20 KB `log_tail` column is unchanged, so every existing reader
+//              keeps working.
 // Every bump is REQUIRED (WLST5.1 failure mode): adding a guarded ALTER
 // without bumping leaves existing DBs early-returning from migrate() and
 // skipping the ALTER, so any SQL touching the new column crashes with
 // "no such column". Every ALTER is guarded by PRAGMA table_info, so any
-// earlier lineage simply runs the chain and re-stamps v13.
-export const SCHEMA_VERSION = 13;
+// earlier lineage simply runs the chain and re-stamps v14.
+export const SCHEMA_VERSION = 14;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -210,23 +216,31 @@ export {
 //
 // detectSchemaLineage() reads the ACTUAL column shape through PRAGMA
 // table_info (never a cached constant) and returns a discriminant that
-// migrate()/applySchema() use to drive the guarded ALTERs and the final v13
+// migrate()/applySchema() use to drive the guarded ALTERs and the final v14
 // stamp. It is a pure read: it never writes and never throws on an absent
 // table (PRAGMA table_info on a missing table yields zero rows), so it is safe
 // to call on an empty database before applySchema() creates the tables.
 export type SchemaLineage =
-  // At v13 with both union columns — the migrate() fast path never reaches
-  // applySchema() in this state.
+  // At v14 with every union column AND suite_results.log_path — the migrate()
+  // fast path never reaches applySchema() in this state.
   | "current"
   // Pre-union main v12: preclaim_death_count present, matchlock_policy absent.
   | "main-v12"
   // Pre-union Matchlock v10/v12: matchlock_policy present, preclaim absent.
   | "union-v12"
+  // At v13: both union columns present but suite_results.log_path absent, so
+  // the 13 -> 14 ALTER (and the entity guards) still need to run. Classifying
+  // this as "current" would make migrate() early-return and skip the ALTER.
+  | "pre-v14"
   // Any earlier DB (v9/v10/v11), an unrecognized shape, or an empty database:
   // run the whole chain.
   | "pre-v12";
 
-function tableHasColumn(db: DatabaseSync, table: "runs" | "steps", column: string): boolean {
+function tableHasColumn(
+  db: DatabaseSync,
+  table: "runs" | "steps" | "suite_results",
+  column: string,
+): boolean {
   // The table name is a closed literal union (never caller input), so the
   // interpolation cannot be used for SQL injection.
   const rows = db
@@ -239,10 +253,15 @@ export function detectSchemaLineage(db: DatabaseSync): SchemaLineage {
   const version = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
   const hasPreclaim = tableHasColumn(db, "steps", "preclaim_death_count");
   const hasMatchlock = tableHasColumn(db, "runs", "matchlock_policy");
+  const hasLogPath = tableHasColumn(db, "suite_results", "log_path");
 
-  if (version >= SCHEMA_VERSION && hasPreclaim && hasMatchlock) return "current";
+  if (version >= SCHEMA_VERSION && hasPreclaim && hasMatchlock && hasLogPath) return "current";
   if (hasPreclaim && !hasMatchlock) return "main-v12";
   if (hasMatchlock && !hasPreclaim) return "union-v12";
+  // A v13 DB (both union columns, no log_path) or any DB whose version stamp
+  // claims v14 but lacks the column is NOT current: run applySchema() so the
+  // guarded 13 -> 14 ALTER lands.
+  if (hasPreclaim && hasMatchlock && !hasLogPath) return "pre-v14";
   return "pre-v12";
 }
 
@@ -267,7 +286,7 @@ function migrate(db: DatabaseSync): void {
       // Detect the source lineage under the write lock, after the version
       // re-read, so the discriminant cannot observe a half-committed
       // migration from another initializer. applySchema() drives each guarded
-      // ALTER and the final v13 stamp from it.
+      // ALTER and the final v14 stamp from it.
       applySchema(db, detectSchemaLineage(db));
       _migrateFullRuns++;
     }
@@ -724,6 +743,7 @@ function applySchema(db: DatabaseSync, lineage: SchemaLineage): void {
       exit_code INTEGER NOT NULL,
       duration_ms INTEGER NOT NULL,
       log_tail TEXT,
+      log_path TEXT,
       run_id TEXT,
       step_id TEXT,
       created_at TEXT NOT NULL
@@ -734,6 +754,24 @@ function applySchema(db: DatabaseSync, lineage: SchemaLineage): void {
     "CREATE INDEX IF NOT EXISTS idx_suite_results_lookup ON suite_results(origin_repo, tree_hash, cmd_hash, created_at)",
   );
 
+  // ── LEDGER-DIAG suite_results.log_path (13 -> 14) ──
+  // Absolute path of the FULL combined stdout+stderr log persisted under
+  // `<state dir>/suite-logs/<row id>.log`. Nullable with no backfill: legacy
+  // rows (and any execution whose log could not be persisted) keep NULL while
+  // the existing 20 KB `log_tail` keeps every current reader working. NOTE
+  // (WLST5.1): the SCHEMA_VERSION bump to v14 (above) is REQUIRED — adding
+  // the guarded ALTER without bumping leaves existing DBs (user_version ===
+  // 13) early-returning and skipping the migration, so log_path reads/writes
+  // crash with "no such column: log_path". The PRAGMA table_info guard keeps
+  // it idempotent on re-run. It runs for EVERY lineage: a
+  // pre-union/union-v12 or pre-v12 DB reaches v14 in one pass too.
+  const addLogPath = db.prepare(
+    "SELECT name FROM pragma_table_info('suite_results') WHERE name = 'log_path'",
+  ).all();
+  if (addLogPath.length === 0) {
+    db.exec("ALTER TABLE suite_results ADD COLUMN log_path TEXT");
+  }
+
   // ── TIME-STORAGE v10: rewrite legacy naive instants to ISO-Z ──
   // Runs inside the enclosing migration write lock, immediately before the
   // version re-stamp, so a DB at v10 always has normalized instants. It is
@@ -742,9 +780,9 @@ function applySchema(db: DatabaseSync, lineage: SchemaLineage): void {
   // must be normalized.
   migrateInstantsToIsoZ(db);
 
-  // Final stamp: main-v12, union-v12 and every pre-v12 lineage converge here.
-  // `lineage` selected which guarded ALTERs were needed above; the stamp
-  // itself is unconditional because applySchema() only runs when
+  // Final stamp: pre-v14, main-v12, union-v12 and every pre-v12 lineage
+  // converge here. `lineage` selected which guarded ALTERs were needed above;
+  // the stamp itself is unconditional because applySchema() only runs when
   // user_version !== SCHEMA_VERSION.
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }

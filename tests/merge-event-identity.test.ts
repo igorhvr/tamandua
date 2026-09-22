@@ -94,11 +94,22 @@ function runNodeEval(script: string, env: Record<string, string>) {
   };
 }
 
-/** Spawn the merge-branch CLI (node dist/cli/cli.js merge-branch ...). */
-function runMergeCli(args: string[], env: Record<string, string>) {
+/**
+ * Spawn the merge-branch CLI (node dist/cli/cli.js merge-branch ...).
+ *
+ * US-008: cleanChildEnv strips the run/job markers unconditionally, so the
+ * TAMANDUA_RUN_ID-fallback case injects that marker via `postEnv` AFTER the
+ * isolation cleanup (the runless case leaves it empty and stays genuinely
+ * runless).
+ */
+function runMergeCli(
+  args: string[],
+  env: Record<string, string>,
+  postEnv: Record<string, string> = {},
+) {
   const result = spawnSync(process.execPath, [cliPath, "merge-branch", ...args], {
     cwd: repoRoot,
-    env: cleanChildEnv(env),
+    env: { ...cleanChildEnv(env), ...postEnv },
     encoding: "utf-8",
     maxBuffer: 16 * 1024 * 1024,
   });
@@ -262,11 +273,12 @@ describe("merge event identity end-to-end (TATR US-010)", () => {
     seedRunRow(env.homeDir, env.tamanduaDir, runId);
 
     // No --run-id: runPlumbingMerge falls back to TAMANDUA_RUN_ID (US-003).
-    const result = runMergeCli(mergeCliArgs(repo, initial), {
-      HOME: env.homeDir,
-      TAMANDUA_STATE_DIR: env.tamanduaDir,
-      TAMANDUA_RUN_ID: runId,
-    });
+    // cleanChildEnv strips the marker, so inject it AFTER the cleanup.
+    const result = runMergeCli(
+      mergeCliArgs(repo, initial),
+      { HOME: env.homeDir, TAMANDUA_STATE_DIR: env.tamanduaDir },
+      { TAMANDUA_RUN_ID: runId },
+    );
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^STATUS: landed$/m);
 

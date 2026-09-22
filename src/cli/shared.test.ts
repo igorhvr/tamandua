@@ -8,6 +8,7 @@ import {
   readOption,
   requireOption,
   shouldSkipUpdateWarning,
+  shouldSuppressUpdateWarning,
 } from "../../dist/cli/shared.js";
 
 describe("SPL2 shared CLI utilities", () => {
@@ -98,5 +99,58 @@ describe("SPL2 shared CLI utilities", () => {
 
     assert.equal(shouldSkipUpdateWarning("step", "complete"), false);
     assert.equal(shouldSkipUpdateWarning("doctor", ""), false);
+  });
+
+  describe("shouldSuppressUpdateWarning", () => {
+    it("suppresses when TAMANDUA_TEST_GUARD is set to a non-empty value", () => {
+      assert.equal(
+        shouldSuppressUpdateWarning({
+          env: { TAMANDUA_TEST_GUARD: "1" },
+          stderrIsTTY: true,
+        }),
+        true,
+      );
+    });
+
+    it("suppresses when stderr is not a TTY", () => {
+      assert.equal(
+        shouldSuppressUpdateWarning({ env: {}, stderrIsTTY: false }),
+        true,
+      );
+    });
+
+    it("does not suppress for an interactive user with no test guard", () => {
+      assert.equal(
+        shouldSuppressUpdateWarning({ env: {}, stderrIsTTY: true }),
+        false,
+      );
+    });
+
+    it("treats an empty or absent guard as unset", () => {
+      assert.equal(
+        shouldSuppressUpdateWarning({
+          env: { TAMANDUA_TEST_GUARD: "" },
+          stderrIsTTY: true,
+        }),
+        false,
+      );
+      assert.equal(
+        shouldSuppressUpdateWarning({ env: {}, stderrIsTTY: true }),
+        false,
+      );
+    });
+
+    it("honors the force override even with a guard and non-TTY stderr", () => {
+      assert.equal(
+        shouldSuppressUpdateWarning({
+          env: {
+            TAMANDUA_TEST_GUARD: "1",
+            TAMANDUA_FORCE_UPDATE_WARNING: "1",
+          },
+          stderrIsTTY: false,
+        }),
+        false,
+      );
+    });
   });
 });

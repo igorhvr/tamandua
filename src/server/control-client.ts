@@ -199,6 +199,13 @@ export interface SuiteRecordParams {
   exit_code: number;
   duration_ms: number;
   log_tail?: string | null;
+  /**
+   * LEDGER-DIAG US-002: absolute path of a shim-written temp file holding the
+   * COMPLETE combined stdout+stderr. The daemon publishes it as
+   * `<state dir>/suite-logs/<row id>.log` and stores that path. Sent only
+   * when set; absent/empty means "no full log for this run".
+   */
+  log_path?: string | null;
   run_id?: string | null;
   step_id?: string | null;
   force?: boolean;
@@ -209,6 +216,11 @@ export interface SuiteRecordParams {
 export interface SuiteRecordResult {
   id: number;
   created_at: string;
+  /**
+   * Absolute path of the published full log (`<state dir>/suite-logs/<row
+   * id>.log`) when the daemon persisted one for this row.
+   */
+  log_path?: string;
 }
 
 /** Result of a suite claim operation. */
@@ -276,6 +288,9 @@ export async function recordSuiteResult(
     duration_ms: params.duration_ms,
   };
   if (params.log_tail != null) body.log_tail = params.log_tail;
+  // Send the shim's temp log path only when it is set; an empty string is
+  // treated as "no full log" and omitted from the body.
+  if (params.log_path != null && params.log_path !== "") body.log_path = params.log_path;
   if (params.run_id != null) body.run_id = params.run_id;
   if (params.step_id != null) body.step_id = params.step_id;
   if (params.force != null) body.force = params.force;

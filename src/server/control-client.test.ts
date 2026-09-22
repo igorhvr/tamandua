@@ -550,6 +550,32 @@ describe("suite control-plane client", { concurrency: 1 }, () => {
     assert.equal(row!.log_tail, "some error");
     assert.equal(row!.run_id, "run-1");
     assert.equal(row!.step_id, "step-1");
+    assert.equal(row!.log_path, null, "no log_path supplied -> stored NULL");
+    assert.equal(result!.log_path, undefined, "no log_path supplied -> omitted from the result");
+  });
+
+  it("recordSuiteResult forwards a shim temp log and returns the published log_path", async () => {
+    const suiteLogsDir = path.join(stateDir, "suite-logs");
+    fs.mkdirSync(suiteLogsDir, { recursive: true });
+    const tempLog = path.join(suiteLogsDir, `.pending-${crypto.randomUUID()}.log`);
+    fs.writeFileSync(tempLog, "full-client-log", "utf-8");
+    const treeHash = crypto.createHash("sha1").update("tree-log").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("cmd-log").digest("hex");
+
+    const { recordSuiteResult } = await import("../../dist/server/control-client.js");
+    const result = await recordSuiteResult({
+      origin_repo: "/tmp/test-repo",
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: "npm test",
+      exit_code: 1,
+      duration_ms: 22,
+      log_path: tempLog,
+    });
+    assert.ok(result !== null, "record should succeed");
+    assert.equal(typeof result!.log_path, "string", "result must expose the published log_path");
+    assert.equal(result!.log_path, path.join(suiteLogsDir, `${result!.id}.log`));
+    assert.equal(fs.readFileSync(result!.log_path!, "utf-8"), "full-client-log");
   });
 
   it("recordSuiteResult returns null when daemon is unreachable", async () => {

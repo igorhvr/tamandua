@@ -1,0 +1,237 @@
+{
+  "schema": "ledger-diag-contract/1",
+  "task": "LEDGER-DIAG-2",
+  "title": "suite ledger full logs + informative tail; update-warning suppression; test-child isolation",
+  "bead": "tamandua-6sy.79",
+  "designApprovedBy": "Igor",
+  "designApprovedAt": "2026-09-22",
+  "generatedAt": "2026-09-22T15:39:26Z",
+  "runId": "run-71724c4c-1e95-4b67-8c1b-1243b0baad50",
+  "runNumber": 71,
+  "integrationBranch": "integration/ledger-diag",
+  "baseCommit": "ab1130a2",
+  "featureBranch": "feature/ledger-diag-2-suite-logs",
+  "hostContractCopy": "/home/kaladin/matchlock-work/ledger-diag-contract.json",
+  "migration": {
+    "schemaVersionBefore": 13,
+    "schemaVersionAfter": 14,
+    "column": "suite_results.log_path",
+    "columnType": "TEXT",
+    "nullable": true,
+    "backfill": "none",
+    "olderRows": "existing and pre-v14 rows keep log_path NULL; no value is fabricated",
+    "guard": "SELECT name FROM pragma_table_info('suite_results') WHERE name = 'log_path'",
+    "idempotent": true,
+    "lineageClassification": "pre-v14",
+    "lineageDetection": "detectSchemaLineage() reads PRAGMA table_info (never the colliding user_version alone); a DB with steps.preclaim_death_count and runs.matchlock_policy present but suite_results.log_path absent is pre-v14 and MUST run the guarded ALTER",
+    "finalStamp": "user_version = 14",
+    "testFile": "src/db.test.ts",
+    "testName": "MIGV union4 v14 schema chain",
+    "startingStates": [
+      "v9",
+      "v10-main",
+      "v10-matchlock",
+      "v11-main",
+      "v11-matchlock",
+      "v12-main",
+      "v12-union",
+      "v13",
+      "already-at-14"
+    ],
+    "idempotencyCheck": "forced slow-path re-run proves every guarded step is idempotent and adds no duplicate column"
+  },
+  "tailComposer": {
+    "module": "src/suite/log-tail.ts",
+    "export": "composeLogTail(fullOutput, capBytes)",
+    "capBytes": 20480,
+    "logTailKb": 20,
+    "logTailKbSource": "src/suite/config.ts LOG_TAIL_KB",
+    "importsChildProcess": false,
+    "parallelLaneSafe": true,
+    "priority": [
+      "lane verdict and per-lane tests/pass/fail counter lines (Serial lane: / Parallel lane:, the intermediate >>> ... lane: FAILED/PASSED form, and the current ℹ tests|pass|fail N and legacy # tests|pass|fail N forms)",
+      "the complete ✖ failing tests: block(s); when more than one lane produced a block the remaining budget is split fairly so no lane's failures vanish",
+      "as much of the final raw output as still fits under the cap"
+    ],
+    "rules": [
+      "the composed tail never exceeds capBytes",
+      "repeated lane markers/counters are deduped while lane order is preserved",
+      "output at or under the cap is returned unchanged (the caller keeps the raw output)",
+      "the shim stores the composed tail only when the output exceeds the cap; the full log is persisted separately at <state dir>/suite-logs/<row id>.log",
+      "no evidence is deleted: the full log path is reported with red evidence and in the replay banner when the row has one"
+    ],
+    "logDirectory": "<state dir>/suite-logs",
+    "logFileName": "<row id>.log",
+    "publishSplit": "the shim writes a unique <state dir>/suite-logs/.pending-<random>.log temp file and passes it as log_path; the control plane renames it to <row id>.log and stores the absolute path, or leaves log_path NULL with one bounded warning",
+    "testFile": "src/suite/log-tail.test.ts",
+    "shapes": [
+      {
+        "name": "serial-red-parallel-green",
+        "fixture": "captured real two-lane log with the serial lane red and the parallel lane green",
+        "expectation": "both lane verdicts plus the complete serial ✖ failing tests: block are retained; the parallel green summary/counters survive"
+      },
+      {
+        "name": "both-red",
+        "fixture": "captured real two-lane log with both lanes red",
+        "expectation": "both lane verdicts and both ✖ failing tests: blocks are retained within the cap"
+      },
+      {
+        "name": "green",
+        "fixture": "captured real two-lane log with both lanes green",
+        "expectation": "the lane summary lines survive and no ✖ failing tests: block is emitted; trailing raw output fills the remaining budget"
+      }
+    ],
+    "boundaryChecks": [
+      "Buffer.byteLength(result) <= capBytes for every over-cap fixture",
+      "a ✖ failing tests: block that alone approaches the cap is retained",
+      "a plain oversized output with no lane markers yields the last cap bytes"
+    ]
+  },
+  "suppression": {
+    "function": "shouldSuppressUpdateWarning",
+    "module": "src/cli/shared.ts",
+    "warningText": "WARNING: A new version of tamandua is available! Run: tamandua update",
+    "stream": "stderr",
+    "matrix": [
+      {
+        "case": "TAMANDUA_TEST_GUARD set to a non-empty value",
+        "env": { "TAMANDUA_TEST_GUARD": "1" },
+        "stderrIsTTY": true,
+        "suppressed": true
+      },
+      {
+        "case": "interactive user (no guard, TTY stderr)",
+        "env": {},
+        "stderrIsTTY": true,
+        "suppressed": false
+      },
+      {
+        "case": "non-TTY stderr (pipe, redirect or captured log)",
+        "env": {},
+        "stderrIsTTY": false,
+        "suppressed": true
+      },
+      {
+        "case": "TAMANDUA_FORCE_UPDATE_WARNING escape hatch overrides guard and non-TTY",
+        "env": { "TAMANDUA_TEST_GUARD": "1", "TAMANDUA_FORCE_UPDATE_WARNING": "1" },
+        "stderrIsTTY": false,
+        "suppressed": false
+      },
+      {
+        "case": "empty TAMANDUA_TEST_GUARD is not a guard",
+        "env": { "TAMANDUA_TEST_GUARD": "" },
+        "stderrIsTTY": true,
+        "suppressed": false
+      }
+    ],
+    "interactiveKeepsWarning": true,
+    "dashboardBanner": "unchanged (separate server code path)",
+    "testFiles": [
+      "src/cli/shared.test.ts",
+      "tests/cli-version-warning.test.ts"
+    ]
+  },
+  "isolationGuard": {
+    "helper": "tests/helpers/test-env.ts#cleanChildEnv",
+    "forcedStateDir": "<temp HOME>/.tamandua",
+    "injectedStateDirIgnored": true,
+    "derivedDefaults": [
+      "TAMANDUA_DB_PATH defaults to <forced state dir>/tamandua.db",
+      "TAMANDUA_WORKTREE_ROOT defaults to <forced state dir>/worktrees"
+    ],
+    "strippedMarkers": [
+      "TAMANDUA_RUN_ID",
+      "TAMANDUA_WORKER_JOB_ID",
+      "TAMANDUA_DAEMON_INSTANCE",
+      "TAMANDUA_WORKER_PID",
+      "TAMANDUA_DAEMON_PID"
+    ],
+    "strippedEvenWhenPassedAsOverrides": true,
+    "staticGuard": "tests/helpers/isolation-env-guard.ts#findIsolationEnvViolations",
+    "spawnerSymbols": ["startDaemon", "startMcp", "startControlPlane", "startDashboardStandalone"],
+    "cliReferenceSymbols": ["bin/tamandua", "cli.js"],
+    "violation": "a tests/**/*.test.ts or e2e-tests/**/*.test.ts file that spawns a daemon or references the CLI entry without building the child env through cleanChildEnv (directly or through an imported helper that uses it)",
+    "allowlist": [
+      {
+        "path": "tests/orphan-modules.test.ts",
+        "reason": "pure static scanner; mentions bin/tamandua only as fixture/comment text and never spawns"
+      },
+      {
+        "path": "tests/update-contract-scope-policy.test.ts",
+        "reason": "pure static scanner; mentions bin/tamandua only as fixture/comment text and never spawns"
+      }
+    ],
+    "guardTest": "tests/test-isolation-guard.test.ts",
+    "unitTest": "tests/helpers/isolation-env-guard.test.ts",
+    "childEnvTest": "tests/helpers/clean-child-env.test.ts"
+  },
+  "gateCommands": [
+    {
+      "command": "npm run build",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "build",
+      "observedExit": 0
+    },
+    {
+      "command": "node --experimental-test-module-mocks --test --test-concurrency=1 src/db.test.ts",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "serial",
+      "observedExit": 0
+    },
+    {
+      "command": "node --test src/suite/log-tail.test.ts",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "parallel",
+      "observedExit": 0
+    },
+    {
+      "command": "node --experimental-test-module-mocks --test --test-concurrency=1 src/suite/shim.test.ts",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "serial",
+      "observedExit": 0
+    },
+    {
+      "command": "node --test tests/helpers/clean-child-env.test.ts",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "parallel",
+      "observedExit": 0
+    },
+    {
+      "command": "node --experimental-test-module-mocks --test --test-concurrency=1 tests/cli-version-warning.test.ts",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "serial",
+      "observedExit": 0
+    },
+    {
+      "command": "node --test tests/test-isolation-guard.test.ts tests/helpers/isolation-env-guard.test.ts",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "parallel",
+      "observedExit": 0
+    },
+    {
+      "command": "tamandua-test --repo '<repo>' --run '<run>' --step 'implement' -- 'npm test'",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "full-suite-shim",
+      "note": "exact TEST_CMD for this run; both lanes must be green"
+    },
+    {
+      "command": "./run-all-e2e-tests",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "e2e",
+      "note": "smoke + scripted tiers; the real tier and Matchlock VM gates are NOT run by this run"
+    }
+  ],
+  "notRun": {
+    "realE2eTier": "not run (./run-all-real-e2e-tests) - spends real tokens",
+    "matchlockVmGates": "not run - this run's own rounds execute inside VMs; the coordinator certifies on both machines"
+  }
+}

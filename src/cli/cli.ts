@@ -13,6 +13,7 @@ import {
   hasHelpFlag,
   printHelp,
   shouldSkipUpdateWarning,
+  shouldSuppressUpdateWarning,
   isTopLevelGroup,
   KNOWN_TOP_LEVEL,
   reportUnknownCommand,
@@ -349,8 +350,17 @@ async function main() {
 
   // Display update warning before command output, but suppress for
   // update/version commands (user is already acting on versions) and
-  // step peek/claim (would break polling agent output parsing).
-  if (!shouldSkipUpdateWarning(group, action)) {
+  // step peek/claim (would break polling agent output parsing). The warning
+  // is ALSO suppressed for test children (TAMANDUA_TEST_GUARD) and whenever
+  // stderr is not an interactive TTY, so piped/captured output stays clean;
+  // TAMANDUA_FORCE_UPDATE_WARNING forces it through (integration tests).
+  if (
+    !shouldSkipUpdateWarning(group, action) &&
+    !shouldSuppressUpdateWarning({
+      env: process.env,
+      stderrIsTTY: process.stderr.isTTY === true,
+    })
+  ) {
     const status = readVersionStatus();
     if (status.updateAvailable) {
       process.stderr.write("WARNING: A new version of tamandua is available! Run: tamandua update\n");

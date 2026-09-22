@@ -15,9 +15,11 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { realpathSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getProcessStartIdentity } from "../lib/process-start-identity.js";
+import { resolveStateDir } from "../lib/tamandua-config.js";
 import {
   instantAgeMs,
   Stopwatch,
@@ -31,6 +33,7 @@ import {
   LOG_TAIL_KB,
   isTstxEnabled,
 } from "./config.js";
+import { composeLogTail } from "./log-tail.js";
 
 const SINGLEFLIGHT_POLL_INTERVAL_MS = 1000; // 1s
 /** Dedicated fail-closed exit when a passing command cannot be attributed. */
@@ -139,6 +142,11 @@ Environment:
 A content-addressed test-suite ledger that skips re-execution of test
 commands against byte-identical working trees, replaying the recorded
 result instead. Strictly monotone: degrades to passthrough on any doubt.
+The complete combined stdout+stderr of every execution is written to
+<state dir>/suite-logs/<row id>.log; the stored 20 KB tail keeps the lane
+verdicts/counters and the complete failing-tests block for red results, and
+the row's full-log path is reported with red evidence and in the replay
+banner when present. Nothing under suite-logs is deleted automatically.
 Results are recorded only when tracked repository content stays unchanged
 through process exit. Tree drift requires a stable-tree rerun and makes an
 otherwise passing command exit ${TREE_DRIFT_EXIT_CODE}.
@@ -298,6 +306,58 @@ function executeAndCapture(cmdString: string): Promise<ExecuteResult> {
   });
 }
 
+// ── Full suite-log persistence (LEDGER-DIAG US-003) ───────────────────
+
+/**
+ * Upper bound (characters) for any path/error value copied into the suite-log
+ * write warning. A failure must never let one line bloat the shim's stderr
+ * with an unbounded OS error string.
+ */
+const SUITE_LOG_WARN_FIELD_MAX = 300;
+
+/** Bound one warning field so a failure logs exactly one short line. */
+function boundedLogWarnField(value: unknown): string {
+  const s = typeof value === "string" ? value : String(value ?? "");
+  return s.length > SUITE_LOG_WARN_FIELD_MAX
+    ? `${s.slice(0, SUITE_LOG_WARN_FIELD_MAX)}\u2026`
+    : s;
+}
+
+/**
+ * Write the COMPLETE combined stdout+stderr to a unique temp file inside
+ * `<state dir>/suite-logs/` for this execution's ledger row.
+ *
+ * The daemon owns the row id, so the shim writes a `.pending-<uuid>.log` name
+ * and the control plane (US-002) renames it to `<row id>.log` with a
+ * same-filesystem atomic rename. Returns the absolute temp path, or null when
+ * the write failed.
+ *
+ * A write failure MUST NEVER change the command exit code or the recorded
+ * evidence: exactly ONE bounded warning is written to stderr and the caller
+ * records the result without `log_path` (the row's `log_path` stays NULL).
+ *
+ * Nothing is deleted here. A temp file left behind by a failed record is kept
+ * as forensic evidence; the eventual evidence prune (bead 6sy.69) owns the
+ * `<state dir>/suite-logs/` directory.
+ */
+function writeSuiteLogTempFile(output: string): string | null {
+  const suiteLogsDir = path.join(resolveStateDir(), "suite-logs");
+  const tempPath = path.join(suiteLogsDir, `.pending-${randomUUID()}.log`);
+  try {
+    mkdirSync(suiteLogsDir, { recursive: true });
+    // One write of the complete captured output. The final rename to
+    // `<row id>.log` is the control plane's job (US-002).
+    writeFileSync(tempPath, output);
+    return tempPath;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(
+      `tamandua-test: warning: failed to write full suite log ${boundedLogWarnField(tempPath)}: ${boundedLogWarnField(message)} — recording without log_path\n`,
+    );
+    return null;
+  }
+}
+
 // ── Replay ────────────────────────────────────────────────────────────
 
 function formatAge(ms: number): string {
@@ -322,10 +382,14 @@ function replay(
     ? (latest.duration_ms / 1000).toFixed(1)
     : "?";
   const logTail = typeof latest.log_tail === "string" ? latest.log_tail : "";
+  // US-005: surface the persisted complete-log path when the row has one.
+  const logPath = typeof latest.log_path === "string" && latest.log_path.length > 0
+    ? latest.log_path
+    : null;
 
   // R12: Replay banner (greppable).
   process.stdout.write(
-    `TAMANDUA-TEST CACHED: tree ${treeHashShort} passed ${cmdDisplay} ${formatAge(ageMs)} ago (run #${runId}, step ${stepId}, exit 0, ${duration}s)\n`,
+    `TAMANDUA-TEST CACHED: tree ${treeHashShort} passed ${cmdDisplay} ${formatAge(ageMs)} ago (run #${runId}, step ${stepId}, exit 0, ${duration}s${logPath !== null ? `, full log: ${logPath}` : ""})\n`,
   );
 
   const tailKB = logTail.length > 0
@@ -350,8 +414,13 @@ function printRedContextNote(
   const minutesAgo = Math.max(1, Math.round(ageMs / 60_000));
   const runId = latest.run_id ?? "?";
   const stepId = latest.step_id ?? "?";
+  // US-005: point a red result at its complete log when the ledger row has
+  // one. Never print a placeholder when it is absent.
+  const logPath = typeof latest.log_path === "string" && latest.log_path.length > 0
+    ? latest.log_path
+    : null;
   process.stderr.write(
-    `note: this tree failed ${cmdDisplay} ${minutesAgo}m ago (run #${runId}, step ${stepId}) — rerunning\n`,
+    `note: this tree failed ${cmdDisplay} ${minutesAgo}m ago (run #${runId}, step ${stepId})${logPath !== null ? ` (full log: ${logPath})` : ""} — rerunning\n`,
   );
 }
 
@@ -974,9 +1043,17 @@ async function main(): Promise<void> {
   // R10: Record via control plane. R11: Recording failure MUST NOT affect
   //      exit code or output — log a warning line to stderr and continue.
   try {
+    // US-005: over-cap evidence is COMPOSED (lane summaries + complete
+    // failing-tests block + trailing output) so a red tail always answers
+    // "which tests failed"; under the cap the raw output is kept unchanged.
     const logTail = output.length > LOG_TAIL_KB * 1024
-      ? output.slice(-LOG_TAIL_KB * 1024)
+      ? composeLogTail(output, LOG_TAIL_KB * 1024)
       : output || null;
+
+    // US-003: persist the COMPLETE combined output to a shim-owned temp file
+    // inside `<state dir>/suite-logs/`; the control plane publishes it as
+    // `<row id>.log`. A write failure (null) records without log_path.
+    const tempLogPath = writeSuiteLogTempFile(output);
 
     const recorded = await recordSuiteResult({
       origin_repo: originRepo,
@@ -986,6 +1063,7 @@ async function main(): Promise<void> {
       exit_code: exitCode,
       duration_ms: durationMs,
       log_tail: logTail,
+      log_path: tempLogPath,
       run_id: runId || null,
       step_id: stepId || null,
       force,

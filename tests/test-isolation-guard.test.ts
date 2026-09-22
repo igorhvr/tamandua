@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
+import {
+  ISOLATION_ENV_ALLOWLIST,
+  findIsolationEnvViolations,
+} from "./helpers/isolation-env-guard.ts";
 
 function collectTestFiles(dir: string): string[] {
   const files: string[] = [];
@@ -10,6 +14,21 @@ function collectTestFiles(dir: string): string[] {
     if (entry.isDirectory()) {
       files.push(...collectTestFiles(fullPath));
     } else if (entry.isFile() && entry.name.endsWith(".test.ts")) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+const SCRIPT_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs"]);
+
+function collectScriptFiles(dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...collectScriptFiles(fullPath));
+    } else if (entry.isFile() && SCRIPT_EXTENSIONS.has(path.extname(entry.name))) {
       files.push(fullPath);
     }
   }
@@ -248,6 +267,38 @@ describe("test isolation guard", () => {
         "control-server.ts uses readDaemonSecret/ensureDaemonSecret but does not import assertStatePathIsolation or testGuardActive from test-guard.js",
       );
     }
+  });
+});
+
+describe("static daemon/CLI spawn isolation guard (US-009)", () => {
+  it("ships an explicit allowlist where every entry carries a concrete reason", () => {
+    const seen = new Set<string>();
+    for (const entry of ISOLATION_ENV_ALLOWLIST) {
+      assert.ok(entry.path.length > 0, "allowlist path must be non-empty");
+      assert.ok(
+        entry.reason.trim().length >= 20,
+        `allowlist entry ${entry.path} must carry a concrete reason`,
+      );
+      assert.ok(!seen.has(entry.path), `duplicate allowlist entry ${entry.path}`);
+      seen.add(entry.path);
+    }
+  });
+
+  it("reports zero unexplained violations across tests/ and e2e-tests/", () => {
+    const files = [
+      ...collectScriptFiles(path.join(process.cwd(), "tests")),
+      ...collectScriptFiles(path.join(process.cwd(), "e2e-tests")),
+    ].map((file) => ({
+      path: path.relative(process.cwd(), file).split(path.sep).join("/"),
+      content: fs.readFileSync(file, "utf-8"),
+    }));
+
+    const violations = findIsolationEnvViolations(files);
+    assert.deepEqual(
+      violations,
+      [],
+      `daemon/CLI-spawning test files must use cleanChildEnv or be allow-listed:\n${violations.join("\n")}`,
+    );
   });
 });
 

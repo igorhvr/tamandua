@@ -16,10 +16,11 @@ function appendEvent(filePath: string, event: Record<string, unknown>): void {
 
 function createTempEnv() {
   const root = tamanduaTempDir("tamandua-token-log-format-");
-  const stateDir = path.join(root, "state");
   const homeDir = path.join(root, "home");
-  fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(homeDir, { recursive: true });
+  // US-008: cleanChildEnv forces the child state dir to <HOME>/.tamandua.
+  const stateDir = path.join(homeDir, ".tamandua");
+  fs.mkdirSync(stateDir, { recursive: true });
   return { root, stateDir, homeDir };
 }
 

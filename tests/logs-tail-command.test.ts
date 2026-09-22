@@ -26,8 +26,9 @@ function appendEvent(filePath: string, event: ReturnType<typeof makeEvent>): voi
 function createTempEnv() {
   const th = createTempHome("tamandua-logs-tail-");
   const root = th.root;
-  const stateDir = path.join(root, "state");
   const homeDir = th.homeDir;
+  // US-008: cleanChildEnv forces the child state dir to <HOME>/.tamandua.
+  const stateDir = path.join(homeDir, ".tamandua");
   fs.mkdirSync(stateDir, { recursive: true });
   return { root, stateDir, homeDir };
 }

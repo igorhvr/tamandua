@@ -144,6 +144,15 @@ export interface TamanduaEvent {
   treeHash?: string;
   cmdDisplay?: string;
   cmdHash?: string;
+  /**
+   * LEDGER-DIAG US-006: the absolute path of the persisted COMPLETE suite
+   * output (`<state dir>/suite-logs/<row id>.log`) for this `suite_results`
+   * row. Present on `suite.executed` ONLY when the control plane published a
+   * full log; a row whose log was never persisted omits the field entirely
+   * (never a fabricated or null path). `log_tail` and every existing event
+   * field are unchanged.
+   */
+  logPath?: string;
   savedDurationMs?: number;
   durationMs?: number;
   exitCode?: number;

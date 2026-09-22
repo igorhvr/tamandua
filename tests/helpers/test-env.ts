@@ -204,6 +204,20 @@ const BASE_ENV_KEYS = [
   "TAMANDUA_TEST_GUARD_TEST_FILE",
 ];
 
+/**
+ * Run/job markers that a spawning test round carries but that a CHILD must
+ * never inherit: a child belongs to its OWN run/job, not to the round that
+ * spawned it. They are stripped unconditionally after overrides are applied,
+ * so even a caller that passes one explicitly cannot leak it into the child.
+ */
+const CHILD_ENV_MARKER_KEYS = [
+  "TAMANDUA_RUN_ID",
+  "TAMANDUA_WORKER_JOB_ID",
+  "TAMANDUA_DAEMON_INSTANCE",
+  "TAMANDUA_WORKER_PID",
+  "TAMANDUA_DAEMON_PID",
+] as const;
+
 export function cleanChildEnv(
   overrides: Record<string, string | undefined> = {},
   baseEnv: NodeJS.ProcessEnv = process.env,
@@ -223,14 +237,27 @@ export function cleanChildEnv(
     }
   }
 
+  // A child's state directory is ALWAYS derived from its HOME, never from an
+  // injected TAMANDUA_STATE_DIR (which may point at the real ~/.tamandua or a
+  // sibling test's state). When HOME is absent the state dir is left unset
+  // exactly as before. Explicit TAMANDUA_DB_PATH / TAMANDUA_WORKTREE_ROOT
+  // overrides are still honored, but their defaults derive from the FORCED
+  // state dir so they can never point somewhere else by accident.
   const homeDir = env.HOME?.trim();
-  const configuredStateDir = env.TAMANDUA_STATE_DIR?.trim();
-  const stateDir = configuredStateDir || (homeDir ? path.join(homeDir, ".tamandua") : undefined);
-  if (stateDir) {
-    env.TAMANDUA_STATE_DIR = stateDir;
-    env.TAMANDUA_DB_PATH = env.TAMANDUA_DB_PATH?.trim() || path.join(stateDir, "tamandua.db");
+  if (homeDir) {
+    const forcedStateDir = path.join(homeDir, ".tamandua");
+    env.TAMANDUA_STATE_DIR = forcedStateDir;
+    env.TAMANDUA_DB_PATH =
+      env.TAMANDUA_DB_PATH?.trim() || path.join(forcedStateDir, "tamandua.db");
     env.TAMANDUA_WORKTREE_ROOT =
-      env.TAMANDUA_WORKTREE_ROOT?.trim() || path.join(stateDir, "worktrees");
+      env.TAMANDUA_WORKTREE_ROOT?.trim() || path.join(forcedStateDir, "worktrees");
+  }
+  // No HOME: leave TAMANDUA_STATE_DIR exactly as it was (an explicit override
+  // is preserved; otherwise it stays unset), matching the historical no-HOME
+  // behavior. Nothing else is synthesized.
+
+  for (const marker of CHILD_ENV_MARKER_KEYS) {
+    delete env[marker];
   }
 
   return env;

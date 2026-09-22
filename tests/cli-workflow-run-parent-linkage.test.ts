@@ -53,10 +53,14 @@ async function runCliUntilOutput(
   args: string[],
   env: Record<string, string>,
   pattern: RegExp,
+  // US-008: cleanChildEnv strips the run/job markers unconditionally, so a
+  // test that deliberately simulates a run injects TAMANDUA_RUN_ID here,
+  // AFTER the isolation cleanup.
+  postEnv: Record<string, string> = {},
 ): Promise<{ stdout: string; stderr: string; code: number | null }> {
   return await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cliPath, ...args], {
-      env: cleanChildEnv(env),
+      env: { ...cleanChildEnv(env), ...postEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -145,9 +149,9 @@ describe("CLI workflow run parent linkage (TATR US-009)", () => {
         {
           HOME: env.homeDir,
           TAMANDUA_CONTROL_PORT: String(env.controlPort),
-          TAMANDUA_RUN_ID: parentRunId,
         },
         /Run: run-/i,
+        { TAMANDUA_RUN_ID: parentRunId },
       );
       assert.match(stdout, /Run: run-/i, `expected run output, got: ${stdout}`);
 

@@ -1391,11 +1391,11 @@ console.log(JSON.stringify({ version, rows }));
     }
   });
 
-  it("SCHEMA_VERSION is 13 (9->10 instants -> 10->11 target-moved reroute budget -> 11->12 preclaim death counter -> 12->13 matchlock policy)", () => {
+  it("SCHEMA_VERSION is 14 (9->10 instants -> 10->11 target-moved reroute budget -> 11->12 preclaim death counter -> 12->13 matchlock policy -> 13->14 suite_results.log_path)", () => {
     assert.equal(
       SCHEMA_VERSION,
-      13,
-      "SCHEMA_VERSION must be 13 after the union folds runs.matchlock_policy in as the v12->v13 step; the full chain is 9->10 instants, 10->11 target_moved_reroute_count, 11->12 preclaim_death_count, 12->13 matchlock_policy",
+      14,
+      "SCHEMA_VERSION must be 14 after the union folds runs.matchlock_policy in as the v12->v13 step and LEDGER-DIAG adds suite_results.log_path as the v13->v14 step; the full chain is 9->10 instants, 10->11 target_moved_reroute_count, 11->12 preclaim_death_count, 12->13 matchlock_policy, 13->14 suite_results.log_path",
     );
   });
 
@@ -2662,6 +2662,12 @@ describe("suite_results table migration", () => {
     assert.equal(logTailCol.type, "TEXT", "log_tail should be TEXT");
     assert.equal(logTailCol.notnull, 0, "log_tail should be nullable");
 
+    // log_path: TEXT (nullable) — LEDGER-DIAG 13->14
+    const logPathCol = colMap.get("log_path");
+    assert.ok(logPathCol, "log_path column should exist");
+    assert.equal(logPathCol.type, "TEXT", "log_path should be TEXT");
+    assert.equal(logPathCol.notnull, 0, "log_path should be nullable");
+
     // run_id: TEXT (nullable)
     const runIdCol = colMap.get("run_id");
     assert.ok(runIdCol, "run_id column should exist");
@@ -2702,7 +2708,7 @@ describe("suite_results table migration", () => {
     const colNames = cols.map((c) => c.name).sort();
     const expectedCols = [
       "id", "origin_repo", "tree_hash", "cmd_hash", "cmd_display",
-      "exit_code", "duration_ms", "log_tail", "run_id", "step_id", "created_at",
+      "exit_code", "duration_ms", "log_tail", "log_path", "run_id", "step_id", "created_at",
     ];
     assert.deepEqual(colNames, expectedCols.sort(), "columns should match expected after idempotent migrate");
   });
@@ -2843,10 +2849,16 @@ describe("suite_results table migration", () => {
     );
 
     const row = db.prepare(
-      "SELECT log_tail, run_id, step_id FROM suite_results WHERE tree_hash = ?",
-    ).get("tree-nullable") as { log_tail: string | null; run_id: string | null; step_id: string | null };
+      "SELECT log_tail, log_path, run_id, step_id FROM suite_results WHERE tree_hash = ?",
+    ).get("tree-nullable") as {
+      log_tail: string | null;
+      log_path: string | null;
+      run_id: string | null;
+      step_id: string | null;
+    };
 
     assert.equal(row.log_tail, null, "log_tail should be null");
+    assert.equal(row.log_path, null, "log_path should default to null when omitted");
     assert.equal(row.run_id, null, "run_id should be null");
     assert.equal(row.step_id, null, "step_id should be null");
   });
@@ -4244,7 +4256,7 @@ describe("OUTAGE-ROUNDS steps.preclaim_death_count migration (v12 step)", () => 
     assert.equal(parsed.col.type, "INTEGER");
     assert.equal(parsed.col.notnull, 1, "preclaim_death_count is NOT NULL");
     assert.equal(parsed.col.dflt_value, "0", "preclaim_death_count should default to 0");
-    assert.equal(parsed.schemaVersion, 13, "SCHEMA_VERSION is 13 for the preclaim bump");
+    assert.equal(parsed.schemaVersion, 14, "SCHEMA_VERSION is 14 after the LEDGER-DIAG 13->14 log_path bump");
     assert.equal(parsed.user_version, SCHEMA_VERSION,
       `user_version should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
     assert.equal(parsed.step.preclaim_death_count, 0,
@@ -4748,13 +4760,14 @@ describe("MTLK matchlock_policy column migration", () => {
   });
 });
 
-describe("MIGV union4 v13 schema chain (every starting state)", () => {
-  // MATCHLOCK-UNION-4 US-002. The union keeps ONE schema chain with four
-  // guarded, idempotent steps:
+describe("MIGV union4 v14 schema chain (every starting state)", () => {
+  // MATCHLOCK-UNION-4 US-002 + LEDGER-DIAG US-001. The union keeps ONE schema
+  // chain with five guarded, idempotent steps:
   //   9  -> 10  migrateInstantsToIsoZ(): rewrite naive `YYYY-MM-DD HH:MM:SS`
   //   10 -> 11  steps.target_moved_reroute_count (ALTER ... DEFAULT 0)
   //   11 -> 12  steps.preclaim_death_count (ALTER ... NOT NULL DEFAULT 0)
   //   12 -> 13  runs.matchlock_policy TEXT
+  //   13 -> 14  suite_results.log_path TEXT (nullable, no backfill)
   // Every step is a `pragma_table_info`-guarded ALTER, so re-running the full
   // DDL pass over an already-current shape must not raise
   // "duplicate column name" and must not churn values.
@@ -4768,10 +4781,15 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
   //   v12 MAIN      main lineage: preclaim_death_count present, matchlock_policy absent
   //   v12 UNION     Matchlock lineage: matchlock_policy present, preclaim absent,
   //                 naive instants (proves 9->10 normalization runs on this shape)
-  //   v13           already current -> migrate() fast-path no-op
+  //   v13           both union columns present, suite_results.log_path absent
+  //                 (the LEDGER-DIAG 13->14 step must still land)
+  //   v14           already current -> migrate() fast-path no-op
   //
-  // Every case asserts user_version === 13, that runs.matchlock_policy,
-  // steps.preclaim_death_count and steps.target_moved_reroute_count each exist
+  // Every legacy fixture seeds a pre-v14 suite_results row (no log_path) so the
+  // chain proves the guarded 13->14 ALTER adds the column while existing rows
+  // keep NULL. Every case asserts user_version === 14, that
+  // runs.matchlock_policy, steps.preclaim_death_count,
+  // steps.target_moved_reroute_count and suite_results.log_path each exist
   // exactly once, and that the representative status SELECT (which names the
   // new columns) succeeds.
 
@@ -4922,6 +4940,29 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
         'waiting', 2, 1, '${opts.stepCreatedAt}', '${opts.stepUpdatedAt}',
         '${opts.stepClaimUpdatedAt}'${targetMovedInsertVal}${preclaimInsertVal}
       );
+      -- Pre-v14 suite_results shape: log_path does NOT exist yet. The seeded
+      -- row proves the 13->14 ALTER adds the column without backfilling.
+      CREATE TABLE suite_results (
+        id INTEGER PRIMARY KEY,
+        origin_repo TEXT NOT NULL,
+        tree_hash TEXT NOT NULL,
+        cmd_hash TEXT NOT NULL,
+        cmd_display TEXT NOT NULL,
+        exit_code INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        log_tail TEXT,
+        run_id TEXT,
+        step_id TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO suite_results (
+        id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code,
+        duration_ms, log_tail, run_id, step_id, created_at
+      ) VALUES (
+        7, '/repo', 'legacy-tree', 'legacy-cmd', 'npm test', 1,
+        1234, 'legacy tail', 'legacy-run', 'legacy-step',
+        '${opts.runCreatedAt}'
+      );
       PRAGMA user_version = ${opts.userVersion};
     `);
     db.close();
@@ -4933,6 +4974,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     fullRuns: number;
     runCols: string[];
     stepCols: string[];
+    suiteCols: string[];
     run: {
       id: string;
       created_at: string;
@@ -4953,6 +4995,12 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       target_moved_reroute_count: number;
       preclaim_death_count: number;
     };
+    suite: {
+      id: number;
+      exit_code: number;
+      log_tail: string | null;
+      log_path: string | null;
+    };
   }
 
   function inspectScript(): string {
@@ -4963,11 +5011,13 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       'const user_version = db.prepare("PRAGMA user_version").get().user_version;',
       'const runCols = db.prepare("PRAGMA table_info(runs)").all().map((c) => c.name);',
       'const stepCols = db.prepare("PRAGMA table_info(steps)").all().map((c) => c.name);',
+      'const suiteCols = db.prepare("PRAGMA table_info(suite_results)").all().map((c) => c.name);',
       // The exact status SELECT shape from src/installer/status.ts plus the new
       // matchlock_policy column — must not throw after migration.
       'const run = db.prepare("SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, scheduling_requested_at, harness_probe_at, matchlock_policy FROM runs WHERE id = ?").get("legacy-run");',
       'const step = db.prepare("SELECT id, reroute_count, terminal_reroute_count, target_moved_reroute_count, preclaim_death_count, created_at, updated_at, claim_updated_at FROM steps WHERE id = ?").get("legacy-step");',
-      "console.log(JSON.stringify({ user_version, schemaVersion: SCHEMA_VERSION, fullRuns: _migrateFullRuns, runCols, stepCols, run, step }));",
+      'const suite = db.prepare("SELECT id, exit_code, log_tail, log_path FROM suite_results WHERE id = ?").get(7);',
+      "console.log(JSON.stringify({ user_version, schemaVersion: SCHEMA_VERSION, fullRuns: _migrateFullRuns, runCols, stepCols, suiteCols, run, step, suite }));",
     ].join("\n");
   }
 
@@ -4989,7 +5039,8 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       "const user_version = db.prepare('PRAGMA user_version').get().user_version;",
       'const runCols = db.prepare("PRAGMA table_info(runs)").all().map((c) => c.name);',
       'const stepCols = db.prepare("PRAGMA table_info(steps)").all().map((c) => c.name);',
-      "console.log(JSON.stringify({ before, beforeVersion, after, user_version, schemaVersion: SCHEMA_VERSION, runCols, stepCols }));",
+      'const suiteCols = db.prepare("PRAGMA table_info(suite_results)").all().map((c) => c.name);',
+      "console.log(JSON.stringify({ before, beforeVersion, after, user_version, schemaVersion: SCHEMA_VERSION, runCols, stepCols, suiteCols }));",
     ].join("\n");
   }
 
@@ -4999,6 +5050,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     fullRuns: number;
     runCols: string[];
     stepCols: string[];
+    suiteCols: string[];
   }
 
   function freshInspectScript(): string {
@@ -5009,7 +5061,8 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       'const user_version = db.prepare("PRAGMA user_version").get().user_version;',
       'const runCols = db.prepare("PRAGMA table_info(runs)").all().map((c) => c.name);',
       'const stepCols = db.prepare("PRAGMA table_info(steps)").all().map((c) => c.name);',
-      "console.log(JSON.stringify({ user_version, schemaVersion: SCHEMA_VERSION, fullRuns: _migrateFullRuns, runCols, stepCols }));",
+      'const suiteCols = db.prepare("PRAGMA table_info(suite_results)").all().map((c) => c.name);',
+      "console.log(JSON.stringify({ user_version, schemaVersion: SCHEMA_VERSION, fullRuns: _migrateFullRuns, runCols, stepCols, suiteCols }));",
     ].join("\n");
   }
 
@@ -5033,7 +5086,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     };
   }
 
-  it("v9 → v13: ISO-Z instants, target_moved_reroute_count and matchlock_policy added, status SELECT works", () => {
+  it("v9 → v14: ISO-Z instants, target_moved_reroute_count, matchlock_policy and suite_results.log_path added, status SELECT works", () => {
     const th = createTempHome("tamandua-union4-v9-");
     const dbPath = path.join(th.root, "v9.db");
     seedLegacyState(dbPath, {
@@ -5049,8 +5102,8 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.schemaVersion, 13, "chain must converge on SCHEMA_VERSION 13");
-    assert.equal(parsed.user_version, 13, "v9 must be re-stamped to 13");
+    assert.equal(parsed.schemaVersion, 14, "chain must converge on SCHEMA_VERSION 14");
+    assert.equal(parsed.user_version, 14, "v9 must be re-stamped to 14");
     assert.equal(parsed.fullRuns, 1, "v9 must take the slow migration path exactly once");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "12->13 must add runs.matchlock_policy exactly once");
@@ -5058,6 +5111,14 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       "10->11 must add steps.target_moved_reroute_count exactly once");
     assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
       "11->12 must add steps.preclaim_death_count exactly once");
+    assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+      "13->14 must add suite_results.log_path exactly once");
+    assert.equal(parsed.suite.log_path, null,
+      "an existing suite_results row keeps NULL log_path (no backfill)");
+    assert.equal(parsed.suite.id, 7, "suite_results SELECT still works after the chain");
+    assert.equal(parsed.suite.exit_code, 1, "existing suite row values survive the chain");
+    assert.equal(parsed.suite.log_tail, "legacy tail",
+      "the existing 20 KB log_tail column is untouched");
     assert.equal(parsed.run.created_at, "2026-01-02T03:04:05.000Z",
       "9->10 must rewrite the naive runs instant to ISO-Z");
     assert.equal(parsed.run.updated_at, "2026-01-02T03:04:06.000Z",
@@ -5076,7 +5137,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     assert.equal(parsed.run.worker_lost_count, 3, "existing counters survive the chain");
   });
 
-  it("v10 MAIN lineage → v13: ISO-Z instants unchanged, target_moved and matchlock_policy added", () => {
+  it("v10 MAIN lineage → v14: ISO-Z instants unchanged, target_moved, matchlock_policy and log_path added", () => {
     const th = createTempHome("tamandua-union4-v10-main-");
     const dbPath = path.join(th.root, "v10-main.db");
     seedLegacyState(dbPath, {
@@ -5092,12 +5153,16 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 13, "v10 MAIN must be re-stamped to 13");
+    assert.equal(parsed.user_version, 14, "v10 MAIN must be re-stamped to 14");
     assert.equal(parsed.fullRuns, 1, "v10 MAIN must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1);
     assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1);
     assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
       "11->12 must add steps.preclaim_death_count exactly once to a v10 main DB");
+    assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+      "13->14 must add suite_results.log_path exactly once to a v10 main DB");
+    assert.equal(parsed.suite.log_path, null,
+      "an existing suite row keeps NULL log_path");
     assert.equal(parsed.run.created_at, "2026-01-02T03:04:05.000Z",
       "main-lineage ISO-Z instants must stay byte-identical");
     assert.equal(parsed.run.updated_at, "2026-01-02T03:04:06.123Z",
@@ -5110,7 +5175,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
   });
 
-  it("v10 MATCHLOCK lineage → v13: policy preserved, naive instants rewritten, target_moved added", () => {
+  it("v10 MATCHLOCK lineage → v14: policy preserved, naive instants rewritten, target_moved and log_path added", () => {
     const th = createTempHome("tamandua-union4-v10-matchlock-");
     const dbPath = path.join(th.root, "v10-matchlock.db");
     seedLegacyState(dbPath, {
@@ -5126,7 +5191,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 13, "a Matchlock-lineage v10 DB must reach v13");
+    assert.equal(parsed.user_version, 14, "a Matchlock-lineage v10 DB must reach v14");
     assert.equal(parsed.fullRuns, 1, "v10 MATCHLOCK must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "the existing matchlock_policy column must not be duplicated");
@@ -5134,6 +5199,10 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       "10->11 must still add the missing target_moved column");
     assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
       "11->12 must add the missing preclaim column to a Matchlock-lineage v10 DB");
+    assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+      "13->14 must add the missing log_path column to a Matchlock-lineage v10 DB");
+    assert.equal(parsed.suite.log_path, null,
+      "a matchlock-lineage suite row keeps NULL log_path (no backfill)");
     assert.equal(parsed.run.matchlock_policy, MATCHLOCK_POLICY_JSON,
       "the Matchlock policy captured at run creation must survive the union");
     assert.deepEqual(JSON.parse(parsed.run.matchlock_policy as string),
@@ -5148,7 +5217,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
   });
 
-  it("v11 MAIN lineage → v13: gains preclaim_death_count and matchlock_policy, keeps target_moved value, ends at 13", () => {
+  it("v11 MAIN lineage → v14: gains preclaim_death_count, matchlock_policy and log_path, keeps target_moved value, ends at 14", () => {
     const th = createTempHome("tamandua-union4-v11-");
     const dbPath = path.join(th.root, "v11.db");
     seedLegacyState(dbPath, {
@@ -5165,7 +5234,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 13, "v11 must be re-stamped to 13");
+    assert.equal(parsed.user_version, 14, "v11 must be re-stamped to 14");
     assert.equal(parsed.fullRuns, 1, "v11 must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "12->13 must add exactly one matchlock_policy column");
@@ -5173,6 +5242,10 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       "the pre-existing target_moved column must not be duplicated");
     assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
       "11->12 must add exactly one preclaim_death_count column");
+    assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+      "13->14 must add exactly one suite_results.log_path column");
+    assert.equal(parsed.suite.log_path, null,
+      "the pre-existing suite row keeps NULL log_path");
     assert.equal(parsed.step.preclaim_death_count, 0,
       "a legacy v11 step reads back preclaim_death_count = 0 via DEFAULT");
     assert.equal(parsed.step.target_moved_reroute_count, 7,
@@ -5183,7 +5256,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
   });
 
-  it("v11 MATCHLOCK lineage → v13: policy and target_moved preserved, preclaim added, naive instants normalized", () => {
+  it("v11 MATCHLOCK lineage → v14: policy and target_moved preserved, preclaim and log_path added, naive instants normalized", () => {
     const th = createTempHome("tamandua-union4-v11-matchlock-");
     const dbPath = path.join(th.root, "v11-matchlock.db");
     seedLegacyState(dbPath, seedOpts({
@@ -5200,7 +5273,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 13, "v11 MATCHLOCK must be re-stamped to 13");
+    assert.equal(parsed.user_version, 14, "v11 MATCHLOCK must be re-stamped to 14");
     assert.equal(parsed.fullRuns, 1, "v11 MATCHLOCK must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "the pre-existing matchlock_policy column must not be duplicated");
@@ -5208,6 +5281,10 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       "the pre-existing target_moved column must not be duplicated");
     assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
       "11->12 must add exactly one preclaim_death_count column to a v11 Matchlock DB");
+    assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+      "13->14 must add exactly one log_path column to a v11 Matchlock DB");
+    assert.equal(parsed.suite.log_path, null,
+      "a v11 Matchlock suite row keeps NULL log_path");
     assert.equal(parsed.step.preclaim_death_count, 0,
       "a v11 Matchlock step reads back preclaim_death_count = 0 via DEFAULT");
     assert.equal(parsed.step.target_moved_reroute_count, 9,
@@ -5225,7 +5302,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
   });
 
-  it("guards are idempotent: forcing the slow path over an already-v13 shape duplicates nothing", () => {
+  it("guards are idempotent: forcing the slow path over an already-v14 shape duplicates nothing", () => {
     const th = createTempHome("tamandua-union4-guard-idem-");
     const dbPath = path.join(th.root, "guard-idem.db");
     seedLegacyState(dbPath, {
@@ -5240,29 +5317,32 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     });
 
     const first = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
-    assert.equal(first.user_version, 13);
+    assert.equal(first.user_version, 14);
 
-    // Rewind only user_version (the columns stay at the v13 shape) and force
-    // applySchema() over an already-current schema. All three steps must
-    // no-op through their pragma_table_info guards instead of raising
+    // Rewind only user_version (the columns stay at the v14 shape) and force
+    // applySchema() over an already-current schema. Every guarded step must
+    // no-op through its pragma_table_info guard instead of raising
     // "duplicate column name".
     const raw = new DatabaseSync(dbPath);
     raw.exec("PRAGMA user_version = 9");
     raw.close();
 
     const again = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
-    assert.equal(again.user_version, 13, "forced slow path re-stamps to 13");
+    assert.equal(again.user_version, 14, "forced slow path re-stamps to 14");
     assert.equal(again.fullRuns, 1, "forced slow path runs applySchema exactly once");
     assert.equal(countOf(again.runCols, "matchlock_policy"), 1,
       "12->13 guard must not duplicate runs.matchlock_policy");
     assert.equal(countOf(again.stepCols, "target_moved_reroute_count"), 1,
       "10->11 guard must not duplicate steps.target_moved_reroute_count");
+    assert.equal(countOf(again.suiteCols, "log_path"), 1,
+      "13->14 guard must not duplicate suite_results.log_path");
     assert.deepEqual(again.run, first.run,
       "9->10 instant rewrite is idempotent: already-ISO-Z values stay byte-identical");
     assert.deepEqual(again.step, first.step, "forced re-run leaves step values unchanged");
+    assert.deepEqual(again.suite, first.suite, "forced re-run leaves suite values unchanged");
   });
 
-  it("detectSchemaLineage discriminates both v12 lineages and every pre-v12 shape through PRAGMA table_info", () => {
+  it("detectSchemaLineage discriminates both v12 lineages, the v13 pre-v14 shape and every pre-v12 shape through PRAGMA table_info", () => {
     const th = createTempHome("tamandua-union4-lineage-");
     const fixtures: Array<{ name: string; opts: SeedOpts; expected: string }> = [
       { name: "v9-main", opts: seedOpts({ userVersion: 9 }), expected: "pre-v12" },
@@ -5284,6 +5364,19 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
         opts: seedOpts({ userVersion: 12, targetMoved: "present", matchlockPolicy: "present" }),
         expected: "union-v12",
       },
+      {
+        // A v13 DB already carries both union columns; only the 13->14
+        // log_path ALTER is outstanding, so it must NOT be classified as
+        // "current" (that would let migrate() early-return and skip it).
+        name: "v13-pre-v14",
+        opts: seedOpts({
+          userVersion: 13,
+          targetMoved: "present",
+          matchlockPolicy: "present",
+          preclaim: "present",
+        }),
+        expected: "pre-v14",
+      },
     ];
 
     interface LineageResult {
@@ -5294,6 +5387,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       schemaVersion: number;
       runCols: string[];
       stepCols: string[];
+      suiteCols: string[];
     }
 
     for (const fixture of fixtures) {
@@ -5307,13 +5401,17 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
         `${fixture.name}: the version-only probe must see the raw user_version`);
       assert.equal(parsed.after, "current",
         `${fixture.name}: after getDb() the shape must be current`);
-      assert.equal(parsed.schemaVersion, 13, "the chain terminates at 13");
-      assert.equal(parsed.user_version, 13,
-        `${fixture.name}: migrate() must re-stamp to 13`);
+      assert.equal(parsed.schemaVersion, 14, "the chain terminates at 14");
+      assert.equal(parsed.user_version, 14,
+        `${fixture.name}: migrate() must re-stamp to 14`);
       assert.ok(parsed.runCols.includes("matchlock_policy"),
         `${fixture.name}: runs.matchlock_policy must exist after the chain`);
       assert.ok(parsed.stepCols.includes("preclaim_death_count"),
         `${fixture.name}: steps.preclaim_death_count must exist after the chain`);
+      assert.ok(parsed.suiteCols.includes("log_path"),
+        `${fixture.name}: suite_results.log_path must exist after the chain`);
+      assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+        `${fixture.name}: suite_results.log_path must exist exactly once`);
     }
   });
 
@@ -5331,12 +5429,16 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 13, "v12 MAIN must be re-stamped to 13");
+    assert.equal(parsed.user_version, 14, "v12 MAIN must be re-stamped to 14");
     assert.equal(parsed.fullRuns, 1, "v12 MAIN must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "12->13 must add runs.matchlock_policy exactly once to a main-v12 DB");
     assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
       "the main-v12 preclaim column must not be duplicated");
+    assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+      "13->14 must add suite_results.log_path exactly once to a main-v12 DB");
+    assert.equal(parsed.suite.log_path, null,
+      "an existing main-v12 suite row keeps NULL log_path");
     assert.equal(parsed.step.preclaim_death_count, 5,
       "an existing main-lineage preclaim_death_count must be preserved");
     assert.equal(parsed.step.target_moved_reroute_count, 4,
@@ -5346,7 +5448,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
   });
 
-  it("v12 UNION lineage → v13: gains preclaim_death_count, preserves matchlock_policy, normalizes naive instants", () => {
+  it("v12 UNION lineage → v14: gains preclaim_death_count and log_path, preserves matchlock_policy, normalizes naive instants", () => {
     const th = createTempHome("tamandua-union4-v12-union-");
     const dbPath = path.join(th.root, "v12-union.db");
     seedLegacyState(dbPath, seedOpts({
@@ -5366,7 +5468,7 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 13, "v12 UNION must be re-stamped to 13");
+    assert.equal(parsed.user_version, 14, "v12 UNION must be re-stamped to 14");
     assert.equal(parsed.fullRuns, 1, "v12 UNION must take the slow migration path");
     assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
       "11->12 must add steps.preclaim_death_count exactly once to a union-v12 DB");
@@ -5374,6 +5476,10 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       "the union-v12 matchlock_policy column must not be duplicated");
     assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1,
       "the union-v12 target_moved_reroute_count column must not be duplicated");
+    assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+      "13->14 must add suite_results.log_path exactly once to a union-v12 DB");
+    assert.equal(parsed.suite.log_path, null,
+      "an existing union-v12 suite row keeps NULL log_path");
     assert.equal(parsed.step.preclaim_death_count, 0,
       "a new union-lineage preclaim column reads back NOT NULL DEFAULT 0");
     assert.equal(parsed.run.matchlock_policy, MATCHLOCK_POLICY_JSON,
@@ -5393,6 +5499,52 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
     assert.equal(parsed.run.id, "legacy-run", "status SELECT over runs still works");
   });
 
+  it("v13 → v14: existing suite_results rows keep NULL log_path, additional columns preserved", () => {
+    const th = createTempHome("tamandua-union4-v13-pre-v14-");
+    const dbPath = path.join(th.root, "v13.db");
+    seedLegacyState(dbPath, seedOpts({
+      userVersion: 13,
+      matchlockPolicy: "present",
+      targetMoved: "present",
+      targetMovedValue: 3,
+      preclaim: "present",
+      preclaimValue: 2,
+      runCreatedAt: "2026-02-03 04:05:06",
+      stepCreatedAt: "2026-04-05 06:07:08",
+      stepClaimUpdatedAt: "2026-04-05 06:07:10",
+    }));
+
+    // Precondition: a real v13 DB has both union columns but no log_path.
+    const rawPre = new DatabaseSync(dbPath);
+    const preSuiteCols = rawPre.prepare("PRAGMA table_info(suite_results)").all()
+      .map((c) => (c as { name: string }).name);
+    assert.ok(!preSuiteCols.includes("log_path"),
+      "precondition: the v13 fixture's suite_results has no log_path yet");
+    rawPre.close();
+
+    const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
+
+    assert.equal(parsed.user_version, 14, "a v13 DB must be re-stamped to 14");
+    assert.equal(parsed.fullRuns, 1, "v13 must take the slow migration path exactly once");
+    assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
+      "13->14 must add suite_results.log_path exactly once");
+    assert.equal(parsed.suite.log_path, null,
+      "an existing v13 suite row keeps NULL log_path (no backfill)");
+    assert.equal(parsed.suite.exit_code, 1, "the existing suite row is untouched");
+    assert.equal(parsed.suite.log_tail, "legacy tail",
+      "the existing 20 KB log_tail column survives the 13->14 step");
+    assert.equal(parsed.step.preclaim_death_count, 2,
+      "the pre-existing preclaim count is preserved");
+    assert.equal(parsed.step.target_moved_reroute_count, 3,
+      "the pre-existing target_moved count is preserved");
+    assert.equal(parsed.run.matchlock_policy, MATCHLOCK_POLICY_JSON,
+      "the Matchlock policy survives the 13->14 step");
+    assert.equal(parsed.run.created_at, "2026-02-03T04:05:06.000Z",
+      "the unconditional 9->10 normalization still runs");
+    assert.equal(parsed.step.created_at, "2026-04-05T06:07:08.000Z");
+    assert.equal(parsed.step.claim_updated_at, "2026-04-05T06:07:10.000Z");
+  });
+
   it("re-opening an already-migrated v12-lineage DB is idempotent (both lineages, no throw)", () => {
     for (const lineage of ["main-v12", "union-v12"] as const) {
       const th = createTempHome(`tamandua-union4-v12-idem-${lineage}-`);
@@ -5405,38 +5557,42 @@ describe("MIGV union4 v13 schema chain (every starting state)", () => {
       }));
 
       const first = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
-      assert.equal(first.user_version, 13, `${lineage}: first open stamps v13`);
+      assert.equal(first.user_version, 14, `${lineage}: first open stamps v14`);
 
-      // Second open: getDb() sees user_version === 13 and must early-return
+      // Second open: getDb() sees user_version === 14 and must early-return
       // without running the DDL path or throwing.
       const second = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
-      assert.equal(second.user_version, 13, `${lineage}: second open keeps v13`);
+      assert.equal(second.user_version, 14, `${lineage}: second open keeps v14`);
       assert.equal(second.fullRuns, 0, `${lineage}: second open early-returns (no DDL)`);
       assert.deepEqual(second.run, first.run, `${lineage}: run values unchanged`);
       assert.deepEqual(second.step, first.step, `${lineage}: step values unchanged`);
+      assert.deepEqual(second.suite, first.suite, `${lineage}: suite values unchanged`);
     }
   });
 
-  it("already at v13: migrate() fast-path is a no-op (no DDL, no re-stamp churn)", () => {
-    const th = createTempHome("tamandua-union4-v13-noop-");
+  it("already at v14: migrate() fast-path is a no-op (no DDL, no re-stamp churn)", () => {
+    const th = createTempHome("tamandua-union4-v14-noop-");
     const dbPath = path.join(th.root, "current.db");
 
     const first = JSON.parse(runInSubprocess(th, dbPath, freshInspectScript())) as FreshInspectResult;
-    assert.equal(first.schemaVersion, 13);
-    assert.equal(first.user_version, 13, "a fresh DB starts at the current version");
-    assert.equal(first.fullRuns, 1, "first open stamps v13 through the full DDL path");
+    assert.equal(first.schemaVersion, 14);
+    assert.equal(first.user_version, 14, "a fresh DB starts at the current version");
+    assert.equal(first.fullRuns, 1, "first open stamps v14 through the full DDL path");
     assert.equal(countOf(first.runCols, "matchlock_policy"), 1,
-      "a v13 DB must have runs.matchlock_policy exactly once");
+      "a v14 DB must have runs.matchlock_policy exactly once");
     assert.equal(countOf(first.stepCols, "preclaim_death_count"), 1,
-      "a v13 DB must have steps.preclaim_death_count exactly once");
+      "a v14 DB must have steps.preclaim_death_count exactly once");
     assert.equal(countOf(first.stepCols, "target_moved_reroute_count"), 1,
-      "a v13 DB must have steps.target_moved_reroute_count exactly once");
+      "a v14 DB must have steps.target_moved_reroute_count exactly once");
+    assert.equal(countOf(first.suiteCols, "log_path"), 1,
+      "a v14 DB must have suite_results.log_path exactly once");
 
     const second = JSON.parse(runInSubprocess(th, dbPath, freshInspectScript())) as FreshInspectResult;
-    assert.equal(second.user_version, 13, "second open keeps user_version at 13");
+    assert.equal(second.user_version, 14, "second open keeps user_version at 14");
     assert.equal(second.fullRuns, 0,
       "second open must early-return without running the DDL path");
     assert.deepEqual(second.runCols, first.runCols, "no DDL: runs columns unchanged");
     assert.deepEqual(second.stepCols, first.stepCols, "no DDL: steps columns unchanged");
+    assert.deepEqual(second.suiteCols, first.suiteCols, "no DDL: suite columns unchanged");
   });
 });
