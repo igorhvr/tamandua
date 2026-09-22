@@ -32,8 +32,16 @@ import {
 import { setDshSchedulerRoundRunnerForTest } from "../../../dist/installer/matchlock/scheduler-dsh.js";
 import {
   MATCHLOCK_HOME_ALIAS_ENV,
+  MATCHLOCK_HOME_ALIAS_OWNER_SCHEMA,
   MatchlockHomeAliasError,
+  matchlockHomeAliasKey,
+  matchlockHomeAliasOwnerPath,
+  type MatchlockHomeAliasOwnerRecord,
 } from "../../../dist/installer/matchlock/home-alias.js";
+import {
+  resolveMatchlockHomeAliasWithOwner,
+  type MatchlockOwnerResolverDeps,
+} from "../../../dist/installer/matchlock/home-alias-owner.js";
 import {
   buildMatchlockPolicy,
   type ExecutionIsolation,
@@ -312,5 +320,147 @@ describe("Matchlock short-HOME alias wiring (US-002)", () => {
       else process.env[MATCHLOCK_HOME_ALIAS_ENV] = prevOverride;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── US-003: owner-aware production resolver wiring ──────────────────────
+//
+// The production default is now the OWNER-AWARE keyed resolver
+// (resolveMatchlockHomeAliasWithOwner): every round derives the per-daemon key
+// from the daemon's REAL HOME and applies the ownership protocol. These tests
+// drive that resolver hermetically with an injected tmpdir + uid + kernel
+// identity, so they never touch the host HOME or `/tmp`.
+describe("owner-aware Matchlock alias wiring (US-003)", () => {
+  const UID = typeof process.getuid === "function" ? process.getuid() : 0;
+  let root: string;
+
+  beforeEach(() => {
+    // Use the REAL production (owner-aware) resolver, not the fixed test seam.
+    setMatchlockHomeAliasResolverForTest(null);
+    root = tamanduaTempDir("tamandua-mtlk-owner-wire-");
+  });
+
+  afterEach(() => {
+    setMatchlockHomeAliasResolverForTest(null);
+    setMatchlockSchedulerRoundRunnerForTest(null);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Hermetic owner-aware resolver deps: tmpdir/uid/home + a pinned identity. */
+  function ownerDeps(
+    home: string,
+    over: Partial<MatchlockOwnerResolverDeps> = {},
+  ): MatchlockOwnerResolverDeps {
+    return {
+      env: { HOME: home },
+      tmpdir: path.join(root, "tmp"),
+      uid: UID,
+      ownerPid: 5555,
+      ownerStartIdentity: "v2:5555:1700000000000",
+      ...over,
+    };
+  }
+
+  function makeHome(name: string): string {
+    const home = path.join(root, name);
+    fs.mkdirSync(home, { recursive: true });
+    return home;
+  }
+
+  it("resolves rpcEnv.HOME to the keyed alias derived from the daemon's real HOME", () => {
+    const home = makeHome("home");
+    const built = buildMatchlockRoundRpcEnv(undefined, ownerDeps(home));
+    const expected = path.join(
+      root,
+      "tmp",
+      "tamandua",
+      String(UID),
+      matchlockHomeAliasKey(home),
+      "h",
+    );
+    assert.equal(built.HOME, expected);
+    assert.equal(fs.readlinkSync(expected), home, "alias target is the daemon's real HOME");
+    assert.deepEqual(Object.keys(built), ["HOME"], "no caller keys were present");
+  });
+
+  it("resolves two different HOME values to two distinct keyed alias paths (AC5)", () => {
+    const homeA = makeHome("home-a");
+    const homeB = makeHome("home-b");
+    const a = buildMatchlockRoundRpcEnv(undefined, ownerDeps(homeA));
+    const b = buildMatchlockRoundRpcEnv(
+      undefined,
+      ownerDeps(homeB, { ownerPid: 5556, ownerStartIdentity: "v2:5556:1700000000000" }),
+    );
+    assert.notEqual(a.HOME, b.HOME, "distinct homes must key to distinct aliases");
+    assert.equal(path.basename(path.dirname(a.HOME)), matchlockHomeAliasKey(homeA));
+    assert.equal(path.basename(path.dirname(b.HOME)), matchlockHomeAliasKey(homeB));
+  });
+
+  it("carries the caller's other rpcEnv keys while the keyed HOME always wins", () => {
+    const home = makeHome("home");
+    const base = { TAMANDUA_MATCHLOCK_RPC_BIN: "/bin/m", KEEP: "yes" };
+    const built = buildMatchlockRoundRpcEnv(base, ownerDeps(home));
+    assert.equal(built.TAMANDUA_MATCHLOCK_RPC_BIN, "/bin/m");
+    assert.equal(built.KEEP, "yes");
+    assert.equal(built.HOME, path.join(root, "tmp", "tamandua", String(UID), matchlockHomeAliasKey(home), "h"));
+    assert.deepEqual(base, { TAMANDUA_MATCHLOCK_RPC_BIN: "/bin/m", KEEP: "yes" });
+  });
+
+  it("a LIVE holder refuses through the production resolver and the round runner is never entered", async () => {
+    const home = makeHome("home");
+    const other = makeHome("other-home");
+    const key = matchlockHomeAliasKey(home);
+    const aliasDir = path.join(root, "tmp", "tamandua", String(UID), key);
+    fs.mkdirSync(aliasDir, { recursive: true, mode: 0o700 });
+    const aliasPath = path.join(aliasDir, "h");
+    fs.symlinkSync(other, aliasPath);
+    const holder: MatchlockHomeAliasOwnerRecord = {
+      schema: MATCHLOCK_HOME_ALIAS_OWNER_SCHEMA,
+      pid: 7777,
+      startIdentity: "v2:7777:1600000000000",
+      realHome: other,
+      aliasPath,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    fs.writeFileSync(matchlockHomeAliasOwnerPath(aliasDir), `${JSON.stringify(holder)}\n`, {
+      mode: 0o600,
+    });
+    const deps = ownerDeps(home, {
+      ownerProbe: {
+        getProcessStartIdentity: (pid: number) =>
+          pid === 7777 ? "v2:7777:1600000000000" : null,
+        processExists: () => true,
+      },
+    });
+
+    // (a) the env builder refuses before returning any HOME.
+    assert.throws(
+      () => buildMatchlockRoundRpcEnv(undefined, deps),
+      (err: unknown) =>
+        err instanceof MatchlockRunnerError &&
+        err.code === "matchlock_home_alias_untrusted" &&
+        /alias_owned_by_live_daemon/.test(err.message) &&
+        /pid 7777/.test(err.message),
+    );
+
+    // (b) the whole scheduler seam refuses before the per-kind round runner.
+    let runnerCalls = 0;
+    setMatchlockSchedulerRoundRunnerForTest(async () => {
+      runnerCalls += 1;
+      return okRound();
+    });
+    setMatchlockHomeAliasResolverForTest(() => resolveMatchlockHomeAliasWithOwner(deps));
+    await assert.rejects(
+      async () => runMatchlockSchedulerRound(round(piPolicy())),
+      (err: unknown) =>
+        err instanceof MatchlockRunnerError &&
+        err.code === "matchlock_home_alias_untrusted" &&
+        /alias_owned_by_live_daemon/.test(err.message) &&
+        /pid 7777/.test(err.message) &&
+        /v2:7777:1600000000000/.test(err.message),
+    );
+    assert.equal(runnerCalls, 0, "no VM/round work happens behind a live holder");
+    // The refusal leaves the holder's alias symlink untouched.
+    assert.equal(fs.readlinkSync(aliasPath), other);
   });
 });

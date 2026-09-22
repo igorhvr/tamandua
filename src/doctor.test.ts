@@ -14,8 +14,20 @@ import { DatabaseSync } from "node:sqlite";
 
 import { runDoctorChecks, runLlmPromptAdherenceChecks, formatDoctorOutput,
   checkDshSessionStore, detectDshZstdSupport, evaluateDshPermissionDump,
-  runLivenessChecks, repairLiveness } from "../dist/doctor.js";
+  runLivenessChecks, repairLiveness, runMatchlockAliasChecks,
+  MATCHLOCK_ALIAS_CHECK_NAME } from "../dist/doctor.js";
 import type { DoctorCheckResult, CheckGroup } from "../dist/doctor.js";
+import {
+  MATCHLOCK_HOME_ALIAS_ENV,
+  MatchlockHomeAliasError,
+  matchlockHomeAliasKey,
+  matchlockHomeAliasOwnerPath,
+} from "../dist/installer/matchlock/home-alias.js";
+import type {
+  MatchlockHomeAliasFs,
+  MatchlockHomeAliasInspection,
+  MatchlockHomeAliasOwnerRecord,
+} from "../dist/installer/matchlock/home-alias.js";
 import {
   startDaemon,
   stopDaemonFamily,
@@ -2233,7 +2245,7 @@ describe("LIVENESS checks (US-007)", () => {
     return found!;
   }
 
-  it("runDoctorChecks includes a LIVENESS group with the four DPID checks", async () => {
+  it("runDoctorChecks includes a LIVENESS group with the DPID checks plus the Matchlock alias report", async () => {
     const homeDir = createTempHome();
     try {
       const groups = await runDoctorChecks({ homeDir });
@@ -2241,7 +2253,8 @@ describe("LIVENESS checks (US-007)", () => {
       assert.ok(liveness, "Expected a LIVENESS group");
       assert.deepStrictEqual(
         liveness!.checks.map((c) => c.name),
-        ["Daemon pidfile", "Daemon liveness socket", "Control port holder", "Running daemon build"],
+        ["Daemon pidfile", "Daemon liveness socket", "Control port holder", "Running daemon build",
+          MATCHLOCK_ALIAS_CHECK_NAME],
       );
       for (const check of liveness!.checks) {
         assert.ok(check.message.length > 0, `Check "${check.name}" has an empty message`);
@@ -3823,6 +3836,196 @@ describe("STORIES_JSON validation rejection check (US-005)", () => {
         `Should be info when no events file, got: ${check!.status}`);
     } finally {
       try { fs.rmSync(homeDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+// ── Matchlock short-HOME alias reporting (US-004) ─────────────────
+
+describe("Matchlock short-HOME alias doctor reporting (US-004)", () => {
+  const FIXTURE_HOME = "/home/alias-fixture/real-home";
+  const FIXTURE_KEY = "abc12345";
+  const FIXTURE_ALIAS_DIR = `/home/alias-fixture/root/tamandua/1000/${FIXTURE_KEY}`;
+  const FIXTURE_ALIAS_PATH = `${FIXTURE_ALIAS_DIR}/h`;
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : 0;
+
+  function fakeInspection(
+    over: Partial<MatchlockHomeAliasInspection> = {},
+  ): MatchlockHomeAliasInspection {
+    return {
+      realHome: FIXTURE_HOME,
+      disabled: false,
+      aliasPath: FIXTURE_ALIAS_PATH,
+      aliasDir: FIXTURE_ALIAS_DIR,
+      aliasKey: FIXTURE_KEY,
+      exists: true,
+      trusted: true,
+      ...over,
+    };
+  }
+
+  function fakeOwner(
+    over: Partial<MatchlockHomeAliasOwnerRecord> = {},
+  ): MatchlockHomeAliasOwnerRecord {
+    return {
+      schema: "tamandua.matchlock.home-alias-owner.v1",
+      pid: 4242,
+      startIdentity: "v2:4242:1700000000000",
+      realHome: FIXTURE_HOME,
+      aliasPath: FIXTURE_ALIAS_PATH,
+      updatedAt: "2026-09-22T00:00:00.000Z",
+      ...over,
+    };
+  }
+
+  function oneCheck(checks: DoctorCheckResult[]): DoctorCheckResult {
+    assert.strictEqual(checks.length, 1);
+    assert.strictEqual(checks[0].name, MATCHLOCK_ALIAS_CHECK_NAME);
+    return checks[0];
+  }
+
+  it("reports the resolved alias path and the owner pid when a sidecar exists", () => {
+    const check = oneCheck(runMatchlockAliasChecks({}, {
+      resolveAlias: () => fakeInspection(),
+      readOwner: () => fakeOwner(),
+    }));
+    assert.strictEqual(check.status, "pass");
+    assert.ok(check.message.includes(FIXTURE_ALIAS_PATH), check.message);
+    assert.ok(check.message.includes("4242"), check.message);
+    assert.ok(check.message.includes("v2:4242:1700000000000"), check.message);
+  });
+
+  it("reports the alias key, real HOME and 'no owner sidecar' when the sidecar is absent", () => {
+    const check = oneCheck(runMatchlockAliasChecks({}, {
+      resolveAlias: () => fakeInspection(),
+      readOwner: () => null,
+    }));
+    assert.strictEqual(check.status, "pass");
+    assert.ok(check.message.includes(FIXTURE_KEY), check.message);
+    assert.ok(check.message.includes(FIXTURE_HOME), check.message);
+    assert.ok(check.message.includes("no owner sidecar"), check.message);
+  });
+
+  it("reports disabled plus the real HOME through the escape hatch (real resolver)", () => {
+    let readOwnerCalled = false;
+    const check = oneCheck(runMatchlockAliasChecks({}, {
+      readOwner: () => { readOwnerCalled = true; return null; },
+      aliasDeps: {
+        realHome: "/home/alias-fixture/disabled-home",
+        env: { [MATCHLOCK_HOME_ALIAS_ENV]: "off" },
+        tmpdir: "/home/alias-fixture/tmp",
+        uid: currentUid,
+      },
+    }));
+    assert.strictEqual(check.status, "pass");
+    assert.ok(check.message.includes("disabled"), check.message);
+    assert.ok(check.message.includes("/home/alias-fixture/disabled-home"), check.message);
+    assert.strictEqual(readOwnerCalled, false, "a disabled alias must not read an owner sidecar");
+  });
+
+  it("reports a typed non-ok check for an untrusted alias resolution", () => {
+    const check = oneCheck(runMatchlockAliasChecks({}, {
+      resolveAlias: () => {
+        throw new MatchlockHomeAliasError(
+          "parent_untrusted",
+          'short-HOME alias key directory is not a real directory',
+        );
+      },
+    }));
+    assert.notStrictEqual(check.status, "pass");
+    assert.ok(check.message.includes("parent_untrusted"), check.message);
+  });
+
+  it("reports override_not_absolute for a non-absolute escape hatch (real resolver)", () => {
+    const check = oneCheck(runMatchlockAliasChecks({}, {
+      aliasDeps: {
+        realHome: "/home/alias-fixture/real-home",
+        env: { [MATCHLOCK_HOME_ALIAS_ENV]: "relative/alias" },
+        tmpdir: "/home/alias-fixture/tmp",
+        uid: currentUid,
+      },
+    }));
+    assert.strictEqual(check.status, "fail");
+    assert.ok(check.message.includes("override_not_absolute"), check.message);
+  });
+
+  it("reports an unreadable owner sidecar naming its path (real resolver + reader)", () => {
+    const aliasRoot = tamanduaTempDir("tamandua-doctor-alias-");
+    try {
+      const realHome = path.join(aliasRoot, "home");
+      fs.mkdirSync(realHome, { recursive: true, mode: 0o700 });
+      const aliasKey = matchlockHomeAliasKey(realHome);
+      const aliasDir = path.join(aliasRoot, "tamandua", String(currentUid), aliasKey);
+      fs.mkdirSync(aliasDir, { recursive: true, mode: 0o700 });
+      const aliasPath = path.join(aliasDir, "h");
+      fs.symlinkSync(realHome, aliasPath);
+      const ownerPath = matchlockHomeAliasOwnerPath(aliasDir);
+      fs.writeFileSync(ownerPath, "{ this is not valid owner json", { mode: 0o600 });
+
+      const check = oneCheck(runMatchlockAliasChecks({}, {
+        aliasDeps: { realHome, tmpdir: aliasRoot, uid: currentUid, env: {} },
+      }));
+      assert.notStrictEqual(check.status, "pass");
+      assert.ok(check.message.includes(ownerPath),
+        `message should name the sidecar path: ${check.message}`);
+      // Report-only: the malformed sidecar is left untouched.
+      assert.ok(fs.existsSync(ownerPath), "doctor must not remove an unreadable sidecar");
+    } finally {
+      removeTestTempDirWithDiagnostics(aliasRoot);
+    }
+  });
+
+  it("is report-only: no create/unlink/symlink/chmod on alias paths (fs spy)", () => {
+    const aliasRoot = tamanduaTempDir("tamandua-doctor-alias-readonly-");
+    try {
+      const realHome = path.join(aliasRoot, "home");
+      fs.mkdirSync(realHome, { recursive: true, mode: 0o700 });
+      const mutations: string[] = [];
+      const record = (op: string): void => { mutations.push(op); };
+      const spyFs: MatchlockHomeAliasFs = {
+        lstatSync: (p) => fs.lstatSync(p),
+        readlinkSync: (p) => fs.readlinkSync(p),
+        statSync: (p) => fs.statSync(p),
+        readFileSync: (p, encoding) => fs.readFileSync(p, encoding),
+        symlinkSync: (target, linkPath) => { record("symlinkSync"); fs.symlinkSync(target, linkPath); },
+        mkdirSync: (p, opts) => { record("mkdirSync"); return fs.mkdirSync(p, opts); },
+        chmodSync: (p, mode) => { record("chmodSync"); fs.chmodSync(p, mode); },
+        unlinkSync: (p) => { record("unlinkSync"); fs.unlinkSync(p); },
+        writeFileSync: (p, data, opts) => { record("writeFileSync"); fs.writeFileSync(p, data, opts); },
+        renameSync: (oldPath, newPath) => { record("renameSync"); fs.renameSync(oldPath, newPath); },
+      };
+      const before = fs.readdirSync(aliasRoot).sort();
+
+      const check = oneCheck(runMatchlockAliasChecks({}, {
+        aliasDeps: { realHome, tmpdir: aliasRoot, uid: currentUid, env: {}, fs: spyFs },
+      }));
+
+      assert.strictEqual(check.status, "pass");
+      assert.deepStrictEqual(mutations, [],
+        `doctor alias check mutated the fs: ${mutations.join(", ")}`);
+      assert.deepStrictEqual(fs.readdirSync(aliasRoot).sort(), before,
+        "doctor alias check must not add entries under the alias root");
+      const aliasPath = path.join(aliasRoot, "tamandua", String(currentUid),
+        matchlockHomeAliasKey(realHome), "h");
+      assert.strictEqual(fs.existsSync(aliasPath), false,
+        "doctor must not create the alias symlink");
+    } finally {
+      removeTestTempDirWithDiagnostics(aliasRoot);
+    }
+  });
+
+  it("runLivenessChecks appends the alias report without disturbing the DPID checks", async () => {
+    const homeDir = createTempHome();
+    try {
+      const checks = await runLivenessChecks({ homeDir });
+      const alias = checks.find((c) => c.name === MATCHLOCK_ALIAS_CHECK_NAME);
+      assert.ok(alias, `expected the alias report in LIVENESS (have: ${checks.map((c) => c.name).join(", ")})`);
+      assert.strictEqual(alias!.status, "pass",
+        `an isolated home has no alias yet, expected pass: ${alias!.message}`);
+      assert.ok(alias!.message.includes(MATCHLOCK_HOME_ALIAS_ENV) || alias!.message.includes("alias"),
+        alias!.message);
+    } finally {
+      removeTestTempDirWithDiagnostics(homeDir);
     }
   });
 });

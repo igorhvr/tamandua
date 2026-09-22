@@ -59,10 +59,11 @@ import type { GuestSuiteNamespace } from "./guest-suite-contract.js";
 import { matchlockWorkflowRequiresCapability } from "./capabilities.js";
 import type { HostMergeContext } from "./host-merge-services.js";
 import { createMergeServiceForContext } from "./merge-invocation-wiring.js";
+import { MatchlockHomeAliasError } from "./home-alias.js";
 import {
-  resolveMatchlockHomeAlias,
-  MatchlockHomeAliasError,
-} from "./home-alias.js";
+  resolveMatchlockHomeAliasWithOwner,
+  type MatchlockOwnerResolverDeps,
+} from "./home-alias-owner.js";
 
 // ── guest-path constants (probe gate + guest work prompt) ────────────────
 
@@ -155,10 +156,11 @@ export interface MatchlockSchedulerRound {
   /**
    * Extra env keys for the Matchlock CONTROL child (the `matchlock rpc`
    * process and whatever it forks). The scheduler REPLACES HOME with the
-   * verified short alias (home-alias.ts) before dispatch, so a caller-supplied
-   * value here can never keep a long/untrusted HOME. Every other key is
-   * preserved. Never forwarded to the daemon, the harness round or the guest
-   * create-config env (those keep the real HOME).
+   * verified owner-aware keyed short alias (home-alias.ts +
+   * home-alias-owner.ts) before dispatch, so a caller-supplied value here can
+   * never keep a long/untrusted HOME. Every other key is preserved. Never
+   * forwarded to the daemon, the harness round or the guest create-config env
+   * (those keep the real HOME).
    */
   rpcEnv?: Record<string, string>;
   /**
@@ -296,9 +298,10 @@ function toDshSchedulerRound(round: MatchlockSchedulerRound): DshSchedulerRound 
 
 /**
  * Resolver seam for the verified short-HOME alias. Production uses
- * {@link resolveMatchlockHomeAlias} (home-alias.ts); deterministic scheduler
- * tests install a fixed resolver so they never depend on the host HOME or
- * touch `/tmp`. NEVER used outside tests.
+ * {@link resolveMatchlockHomeAliasWithOwner} (home-alias-owner.ts): the
+ * owner-aware keyed resolver that records/kernel-proves per-daemon alias
+ * ownership; deterministic scheduler tests install a fixed resolver so they
+ * never depend on the host HOME or touch `/tmp`. NEVER used outside tests.
  */
 export type MatchlockHomeAliasResolver = () => string;
 
@@ -315,15 +318,25 @@ export function setMatchlockHomeAliasResolverForTest(
  * caller's extra RPC env plus the VERIFIED short-HOME alias as HOME. Called
  * once per round; the alias is re-verified on every call (see home-alias.ts).
  *
- * Fail-closed: an untrustworthy alias surfaces as a typed
+ * The production default is the OWNER-AWARE keyed resolver
+ * ({@link resolveMatchlockHomeAliasWithOwner}): it derives the per-daemon key
+ * from the daemon's REAL HOME and applies the ownership protocol, so a second
+ * daemon can never re-point this daemon's alias. Deterministic tests replace it
+ * with {@link setMatchlockHomeAliasResolverForTest} or pass hermetic
+ * `resolverDeps` (tmpdir/uid/owner identity).
+ *
+ * Fail-closed: an untrustworthy alias (including one held by a LIVE other
+ * daemon, reason `alias_owned_by_live_daemon`) surfaces as a typed
  * {@link MatchlockRunnerError} (code `matchlock_home_alias_untrusted`) BEFORE
  * any route/VM is entered, so the scheduler force-fails the run instead of
  * silently keeping a long HOME that Firecracker refuses mid-boot.
  */
 export function buildMatchlockRoundRpcEnv(
   baseRpcEnv?: Record<string, string>,
+  resolverDeps?: MatchlockOwnerResolverDeps,
 ): Record<string, string> {
-  const resolveAlias = testHomeAliasResolver ?? resolveMatchlockHomeAlias;
+  const resolveAlias =
+    testHomeAliasResolver ?? (() => resolveMatchlockHomeAliasWithOwner(resolverDeps));
   let aliasHome: string;
   try {
     aliasHome = resolveAlias();

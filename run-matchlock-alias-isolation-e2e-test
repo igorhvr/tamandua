@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Run the MTLK-ALIAS-FIX US-005 two-daemon alias isolation regression gate.
+#
+# This tier is a REAL-VM gate: it boots fresh Firecracker VMs for TWO isolated
+# production-style daemons (same uid, different private HOME) with the
+# TEST-ONLY synthetic-pi fixture image and proves that daemon B resolving its
+# keyed alias never re-points daemon A's alias, so A's live VM directory stays
+# valid and both concurrent rounds complete. It reproduces the exact shape of
+# the vaimetal run #44/#53/#54 defect (one shared /tmp/tamandua/<uid>/h alias).
+#
+# It is deliberately NOT part of the default fast lanes (npm test /
+# run-all-smoke / run-all-scripted / run-all-e2e-tests). Run on demand only:
+#
+#   ./run-matchlock-alias-isolation-e2e-test
+#
+# It takes the shared VAIVM gate lock EXCLUSIVELY
+# (flock --exclusive /home/kaladin/matchlock-work/vaivm-gate.lock) for the whole
+# run, so it never races another real-VM gate on the host. Each VM is capped at
+# <= 16 vCPUs (TAMANDUA_GATE_VCPUS, default 1).
+#
+# What it does:
+#   1. re-execs itself under `flock --exclusive <gate lock>` (once)
+#   2. resolves the system matchlock from PATH (unpinned) with optional
+#      TAMANDUA_MATCHLOCK_RPC_BIN / MATCHLOCK_GUEST_INIT / MATCHLOCK_GUEST_FUSED
+#      overrides and records the observed version + sha256 hashes as evidence
+#   3. npm run build (compiled dist is what the isolated daemons run)
+#   4. allocates a NEW mkdtemp evidence directory under the evidence root
+#      (outside the repo; NEVER pre-cleaned, NEVER reused) plus a private fresh
+#      TMPDIR inside it
+#   5. runs e2e-tests/matchlock-alias-isolation-gate.test.ts with all logs tee'd
+#      into the evidence dir; exit code propagates (cleanup failures included)
+#   6. runs the shared observed-rounds guard and propagates its zero-round
+#      refusal (exit 92)
+#
+# Never touches the live worker daemon, the live tamandua state, the operator's
+# matchlock store, or the live daemon's legacy /tmp/tamandua/<uid>/h alias.
+set -u
+
+cd "$(dirname "$0")"
+
+LOCK_FILE="${TAMANDUA_GATE_LOCK:-/home/kaladin/matchlock-work/vaivm-gate.lock}"
+if [ "${TAMANDUA_GATE_FLOCK_HELD:-}" != "1" ]; then
+  command -v flock >/dev/null 2>&1 || {
+    echo "run-matchlock-alias-isolation-e2e-test: FATAL: flock not found (required for the exclusive VM gate lock)" >&2
+    exit 90
+  }
+  mkdir -p "$(dirname "$LOCK_FILE")" || exit 90
+  export TAMANDUA_GATE_FLOCK_HELD=1
+  # Re-exec under the exclusive lock; this process (and every child) holds it.
+  exec flock --exclusive "$LOCK_FILE" "$0" "$@"
+fi
+
+fail() { echo "run-matchlock-alias-isolation-e2e-test: FATAL: $*" >&2; exit 90; }
+
+# -- UNPINNED runtime resolution: default to whatever `matchlock` resolves on
+# PATH and let matchlock resolve its own guest-init. The observed version and
+# hashes are recorded as gate evidence instead of being checked against pins.
+if [ -n "${TAMANDUA_MATCHLOCK_RPC_BIN:-}" ]; then
+  MATCHLOCK_RPC_BIN="$TAMANDUA_MATCHLOCK_RPC_BIN"
+else
+  MATCHLOCK_RPC_BIN="$(command -v matchlock 2>/dev/null || true)"
+fi
+[ -n "$MATCHLOCK_RPC_BIN" ] || fail "matchlock not found on PATH; set TAMANDUA_MATCHLOCK_RPC_BIN to the matchlock CLI"
+[ -f "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not found: $MATCHLOCK_RPC_BIN"
+[ -x "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not executable: $MATCHLOCK_RPC_BIN"
+
+matchlock_default_guest_init() {
+  local dir candidate
+  dir="$(dirname -- "$1")"
+  candidate="$dir/guest-init"
+  if [ -f "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
+  command -v guest-init 2>/dev/null || true
+}
+if [ -n "${MATCHLOCK_GUEST_INIT:-}" ]; then
+  GUEST_INIT="$MATCHLOCK_GUEST_INIT"
+else
+  GUEST_INIT="$(matchlock_default_guest_init "$MATCHLOCK_RPC_BIN")"
+fi
+if [ -n "${MATCHLOCK_GUEST_FUSED:-}" ]; then
+  GUEST_FUSED="$MATCHLOCK_GUEST_FUSED"
+else
+  GUEST_FUSED="$GUEST_INIT"
+fi
+if [ -n "$GUEST_INIT" ]; then
+  [ -f "$GUEST_INIT" ] || fail "guest-init not found: $GUEST_INIT (unset MATCHLOCK_GUEST_INIT to let matchlock resolve it)"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  [ -f "$GUEST_FUSED" ] || fail "guest-fused not found: $GUEST_FUSED (unset MATCHLOCK_GUEST_FUSED to let matchlock resolve it)"
+fi
+
+# Observed (NOT pinned) runtime identity: recorded into the gate evidence dir.
+OBSERVED_MATCHLOCK_VERSION="$("$MATCHLOCK_RPC_BIN" --version 2>&1 | head -n 1 || true)"
+OBSERVED_MATCHLOCK_SHA="$(sha256sum "$MATCHLOCK_RPC_BIN" | awk '{print $1}')"
+if [ -n "$GUEST_INIT" ]; then
+  OBSERVED_GUEST_INIT_SHA="$(sha256sum "$GUEST_INIT" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_INIT_SHA="unset => resolved by matchlock"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  OBSERVED_GUEST_FUSED_SHA="$(sha256sum "$GUEST_FUSED" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_FUSED_SHA="unset => resolved by matchlock"
+fi
+echo "runtime observed (unpinned): matchlock ${OBSERVED_MATCHLOCK_VERSION:-no-version} sha256 $OBSERVED_MATCHLOCK_SHA"
+echo "runtime observed (unpinned): guest-init ${GUEST_INIT:-resolved-by-matchlock} sha256 $OBSERVED_GUEST_INIT_SHA"
+echo "runtime observed (unpinned): guest-fused ${GUEST_FUSED:-resolved-by-matchlock} sha256 $OBSERVED_GUEST_FUSED_SHA"
+echo "flock: $LOCK_FILE (exclusive)"
+
+# <= 16 vCPUs per VM (default 1).
+GATE_VCPUS="${TAMANDUA_GATE_VCPUS:-1}"
+case "$GATE_VCPUS" in
+  ''|*[!0-9]*) fail "TAMANDUA_GATE_VCPUS must be a positive integer (got '$GATE_VCPUS')" ;;
+esac
+[ "$GATE_VCPUS" -ge 1 ] && [ "$GATE_VCPUS" -le 16 ] \
+  || fail "TAMANDUA_GATE_VCPUS must be between 1 and 16 (got $GATE_VCPUS)"
+export TAMANDUA_GATE_VCPUS="$GATE_VCPUS"
+
+npm run build || fail "npm run build failed"
+
+EVIDENCE_ROOT="${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}"
+# A NEW unique evidence dir every run — never a pre-clean of anything under the
+# evidence root.
+EV="$(mktemp -d "$EVIDENCE_ROOT/alias-isolation-XXXXXX")" || fail "mktemp -d under $EVIDENCE_ROOT failed"
+echo "evidence dir: $EV"
+
+export TAMANDUA_MATCHLOCK_RPC_BIN="$MATCHLOCK_RPC_BIN"
+if [ -n "$GUEST_INIT" ]; then export MATCHLOCK_GUEST_INIT="$GUEST_INIT"; fi
+if [ -n "$GUEST_FUSED" ]; then export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"; fi
+
+# Observed-not-pinned runtime evidence: the gate accepts whatever `matchlock`
+# resolves and records the observed version/hashes here.
+RUNTIME_OBSERVED="$EV/runtime-observed.txt"
+{
+  echo "matchlock.path=$MATCHLOCK_RPC_BIN"
+  echo "matchlock.version=${OBSERVED_MATCHLOCK_VERSION:-no-version}"
+  echo "matchlock.sha256=$OBSERVED_MATCHLOCK_SHA"
+  echo "guest_init.path=${GUEST_INIT:-unset => resolved by matchlock}"
+  echo "guest_init.sha256=$OBSERVED_GUEST_INIT_SHA"
+  echo "guest_fused.path=${GUEST_FUSED:-unset => resolved by matchlock}"
+  echo "guest_fused.sha256=$OBSERVED_GUEST_FUSED_SHA"
+} > "$RUNTIME_OBSERVED"
+echo "runtime evidence: $RUNTIME_OBSERVED"
+cat "$RUNTIME_OBSERVED"
+
+export TAMANDUA_GATE_EVIDENCE_DIR="$EV"
+export TAMANDUA_GATE_EVIDENCE_ROOT="$EVIDENCE_ROOT"
+# The private matchlock HOME resolves kernels/cache under HOME/.cache/matchlock;
+# default the kernel source to the operator cache (never mutated).
+export TAMANDUA_GATE_KERNEL_CACHE="${TAMANDUA_GATE_KERNEL_CACHE:-${HOME}/.cache/matchlock/kernels}"
+# Private fresh TMPDIR inside the evidence dir (guest-pack builds and any
+# /tmp-scratch the gate needs stay under the owned evidence).
+export TMPDIR="$EV/tmp"
+mkdir -p "$TMPDIR"
+
+LOG="$EV/gate-run.log"
+echo "=== MATCHLOCK ALIAS ISOLATION GATE START $(date -u +%FT%TZ) EV=$EV vcpus=$GATE_VCPUS ===" | tee "$LOG"
+node --test e2e-tests/matchlock-alias-isolation-gate.test.ts 2>&1 | tee -a "$LOG"
+RC=${PIPESTATUS[0]}
+echo "=== MATCHLOCK ALIAS ISOLATION GATE END $(date -u +%FT%TZ) rc=$RC ===" | tee -a "$LOG"
+
+# ── no-fake-green: refuse PASS when no in-VM round was observed ──────────
+# The driver writes <EV>/observed-rounds.json. This guard reads it and exits
+# 92 — distinct from a test failure (1) and this runner's FATAL (90) — when
+# the count is zero or the evidence is missing/malformed. A gate whose VM
+# creation fails (or whose probe never reached a round) must fail loudly,
+# never report a vacuous assertion as a green run.
+GUARD_RC=0
+node scripts/observed-rounds-guard.mjs --dir "$EV" --gate alias-isolation 2>&1 | tee -a "$LOG"
+GUARD_RC=${PIPESTATUS[0]}
+if [ "$GUARD_RC" -eq 92 ]; then
+  echo "run-matchlock-alias-isolation-e2e-test: ZERO-ROUND REFUSAL: no VM round observed (VM creation or probe failed before any round)" >&2
+  exit 92
+fi
+exit "$RC"

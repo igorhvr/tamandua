@@ -23,6 +23,7 @@ import {
   matchlockProductionRunnerKind,
   runMatchlockSchedulerRound,
   setMatchlockProductionRouteRunnerForTest,
+  setMatchlockHomeAliasResolverForTest,
   MatchlockRunnerError,
   buildMatchlockMergeContext,
   type MatchlockSchedulerRound,
@@ -149,6 +150,11 @@ describe("scheduler-matchlock production suite wiring", () => {
   let stateRoot: string;
 
   before(() => {
+    // US-003: the production default is the owner-aware keyed resolver, which
+    // would claim the host daemon's real alias. These routing/suite tests are
+    // not about the alias, so install the deterministic fixed-alias seam (no
+    // host HOME, no `/tmp` side effects).
+    setMatchlockHomeAliasResolverForTest(() => "/home/alias-fixture/tamandua/4242/h");
     tmp = tamanduaTempDir("tamandua-mtlk-sched-");
     packRoot = path.join(tmp, "pack");
     // Build a REAL versioned RO guest pack from the compiled checkout so the
@@ -164,6 +170,7 @@ describe("scheduler-matchlock production suite wiring", () => {
   });
 
   after(() => {
+    setMatchlockHomeAliasResolverForTest(null);
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 

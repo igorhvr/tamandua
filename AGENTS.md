@@ -750,6 +750,63 @@ runtime used by a gate run is reproducible from the retained evidence. There is
 no doctor check and no pinning (Igor's decision, bead tamandua-6sy.33.10.36).
 `tests/matchlock-unpin.test.ts` pins the absence of pins.
 
+### Matchlock short-HOME alias: keyed per daemon instance (MTLK-ALIAS-FIX)
+
+Matchlock binds its per-VM Firecracker API unix socket under
+`<HOME>/.matchlock/vms/vm-<8hex>/vsock.sock_5001`, and Linux caps a
+`sockaddr_un` path at 107 usable bytes (103 on macOS). Every Matchlock control
+process Tamandua spawns therefore runs with a short HOME alias, and the alias is
+**keyed per daemon instance**:
+
+- path: `/tmp/tamandua/<uid>/<k>/h`
+- `<k>` = the first 8 lowercase hex chars of `sha256(<absolute real HOME>)`
+  (`matchlockHomeAliasKey`). The same daemon HOME reuses the same `<k>` across
+  restarts; two daemons with different homes get different `<k>`.
+- both `/tmp/tamandua/<uid>` and `/tmp/tamandua/<uid>/<k>` are real directories
+  (mode 0700, owned by the effective uid); `/tmp` is the LITERAL root, never the
+  ambient TMPDIR.
+- a daemon only ever touches its own `<k>` and never another daemon's `<k>`.
+
+Ownership is recorded in `<aliasDir>/owner.json` (mode 0600), a sidecar holding
+the owner `pid`, its kernel `startIdentity` (`v2:<pid>:<ms>`, read through the
+start-identity helper), `realHome`, `aliasPath` and `updatedAt`. Before
+creating/re-pointing the alias a daemon consults that sidecar:
+
+- no sidecar -> repair/re-point and adopt ownership;
+- our own pid + start identity -> reuse/refresh, never refuse;
+- a **live holder** (kernel start identity still proves the same process) ->
+  REFUSE with `alias_owned_by_live_daemon`, naming the holder pid,
+  startIdentity, realHome and alias path, BEFORE any RPC/VM effect — never
+  re-point;
+- a **stale sidecar** (dead/reused pid) -> take over: re-point and rewrite the
+  sidecar;
+- malformed/unreadable -> refuse `alias_owner_unreadable` (fail closed).
+
+MIGRATION: the historical single-symlink layout `/tmp/tamandua/<uid>/h` is
+IGNORED — never `lstat`ed, read, unlinked or re-pointed — and legacy symlinks
+are never deleted; only the keyed `<uid>/<k>` tree is touched. `tamandua doctor`
+reports the Matchlock alias path and its owner. The two-daemon isolation
+regression gate lives in `e2e-tests/matchlock-alias-isolation-gate.test.ts` and
+is run on demand by `./run-matchlock-alias-isolation-e2e-test`.
+
+The real-VM gate family (US-008) is run under the shared gate lock by each
+`run-matchlock-*-e2e-test` driver and recorded in the external contract
+`/home/kaladin/matchlock-work/alias-fix-contract.json` under `realGates` (one
+entry per gate: driver, evidenceDir, logPath, `exitCode`, positive
+`observed_rounds`, owned `vm-<8hex>` ids). The committed validator
+`tests/alias-fix-contract.test.ts` enforces `exitCode === 0` for a green gate:
+a non-zero driver exit is accepted only with an explicit
+`deviation: { authorized: true, item, reason, signature, documentedIn, evidencePath }`
+disclosure, and a published `dsh` entry must disclose the documented
+NONSTANDARD image PATH guest re-exec block
+(`fork/exec /proc/self/exe: no such file or directory`,
+docs/matchlock-dsh-qualification.md section 4) as an explicit authorized
+`deviation` or `deferredItems` disclosure. The dsh gate keeps that honesty: it
+skips ONLY that exact signature (with the host invocation completed and its
+owned VM positively closed) and records
+`nonstandard-path-authorized-deviation.json`; any other failure, or
+`TAMANDUA_DSH_NONSTANDARD_STRICT=1`, fails the gate hard.
+
 ### dsh mount plan changes: the contained real-dsh boot gate is REQUIRED
 
 Any change to the dsh Matchlock mount plan — `src/installer/matchlock/mount-plan.ts`,

@@ -208,6 +208,19 @@ const TMP_PATH_ALLOWLIST: Record<string, string> = {
   // Comment-only mention of the literal alias root in the gate's docs block.
   "e2e-tests/matchlock-long-home-gate.test.ts":
     "comment-only mention of the literal short alias root — not a call",
+
+  // ── MTLK-ALIAS-FIX two-daemon alias isolation gate ──
+  // Both files only MENTION the historical single-symlink alias layout in
+  // their doc comments (the defect they regress against). The fast plumbing
+  // test injects a private alias root via tamanduaTempDir(); the real-VM gate
+  // resolves each daemon's own keyed alias through the product resolver. Neither
+  // creates a directory at the literal per-uid alias path.
+  "tests/matchlock-alias-isolation-plumbing.test.ts":
+    "comment-only mention of the historical alias path — no real /tmp fixture",
+  "e2e-tests/matchlock-alias-isolation-gate.test.ts":
+    "comment-only mention of the historical alias path and the captured defect log line",
+  "tests/matchlock-alias-docs.test.ts":
+    "doc-contract assertions quote the literal keyed and legacy alias layouts — no real /tmp fixture",
 };
 
 // -------------------------------------------------------------------

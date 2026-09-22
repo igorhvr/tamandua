@@ -33,7 +33,7 @@
  * module imports `node:child_process` for the narrow authoritative target-tip
  * read). It is listed in tests/serial-files.txt.
  */
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -58,6 +58,7 @@ import {
   matchlockRoundScopeRefusal,
   runMatchlockSchedulerRound,
   setMatchlockProductionRouteRunnerForTest,
+  setMatchlockHomeAliasResolverForTest,
   type MatchlockSchedulerRound,
 } from "../../../dist/installer/matchlock/scheduler-matchlock.js";
 import { createMergeServiceForContext } from "../../../dist/installer/matchlock/merge-invocation-wiring.js";
@@ -200,6 +201,17 @@ async function dispatchLikeScheduler(
 }
 
 describe("harness x workflow admission matrix (MTLK-ALL-WORKFLOWS US-003/US-005)", () => {
+  before(() => {
+    // US-003: the production default is the owner-aware keyed resolver, which
+    // would claim the host daemon's real alias. This admission matrix is not
+    // about the alias, so install the deterministic fixed-alias seam.
+    setMatchlockHomeAliasResolverForTest(() => "/home/alias-fixture/tamandua/4242/h");
+  });
+
+  after(() => {
+    setMatchlockHomeAliasResolverForTest(null);
+  });
+
   it("declares harness parity: every harness supports the full capability-closed set (no allow-list)", () => {
     for (const harness of HARNESSES) {
       for (const workflowId of SHAPE_MATRIX) {

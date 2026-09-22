@@ -478,6 +478,16 @@ read as green:
    (guest-agent sandbox re-exec), even though `dsh` resolved only through the
    image's declared non-default PATH. Retained receipt:
    `/root/matchlock-work/evidence/dsh-exec-20260910T014511Z/nonstandard-path-invocation.json`.
+   MTLK-ALIAS-FIX US-008 keeps this item **not green**: the committed gate
+   recognizes ONLY this exact signature (with the host invocation completed and
+   its owned VM positively closed) and converts it into an explicit, retained
+   **authorized deviation** (`nonstandard-path-authorized-deviation.json` in the
+   gate evidence, and a `deviation` disclosure on the contract's `dsh` real-gate
+   entry) — the item is reported `skipped`, never `pass`. Any other failure, a
+   missing/unclosed VM, or `TAMANDUA_DSH_NONSTANDARD_STRICT=1` still fails the
+   gate hard, so the deviation can never hide a different break. The rest of the
+   dsh family (whole-path, persistence, ambiguity, missing-harness refusal, real
+   dsh boot) is green.
 2. **Real-dsh boot characterization** — the historical real-dsh test-only image
    import could not complete under host-concurrent disk pressure
    (`mkfs.erofs ... No space left on device`). The superseding committed
@@ -584,19 +594,33 @@ real-VM gate is in no default lane.
 - **Short HOME path (sockaddr_un / SUN_LEN): Tamandua handles this.** Matchlock
   binds its per-VM Firecracker API unix socket under
   `$HOME/.matchlock/vms/vm-<8hex>/socket.sock`; Linux caps a `sockaddr_un` path
-  at 107 usable bytes, so a long HOME would otherwise make every `create` fail
-  closed with `VM failed to become ready` while `matchlock log <vm>` shows
-  Firecracker exiting with `path must be shorter than SUN_LEN`. Tamandua gives
-  EVERY Matchlock control process it spawns a verified short HOME alias
-  (`/tmp/tamandua/<uid>/h`) and refuses, before any RPC/VM effect, when even
-  that path would exceed the 107-byte limit. Because the alias is a **symlink
-  whose target is the real HOME**, the image cache, kernel cache and VM
-  registry stay shared — `matchlock list/rm/gc` see the same VMs and the state
-  stays physically under the real HOME. Operators no longer need to keep the
-  private HOME short. Escape hatch: `TAMANDUA_MATCHLOCK_HOME_ALIAS` disables the
-  alias (`off` or `0` — the real HOME is passed through unchanged) or points it
-  at another short absolute directory; the override, like the default, is
-  verified on every use and an untrustworthy alias refuses the launch loudly.
+  at 107 usable bytes (103 on macOS), so a long HOME would otherwise make every
+  `create` fail closed with `VM failed to become ready` while `matchlock log
+  <vm>` shows Firecracker exiting with `path must be shorter than SUN_LEN`.
+  Tamandua gives EVERY Matchlock control process it spawns a verified short HOME
+  alias and refuses, before any RPC/VM effect, when even that path would exceed
+  the limit. The alias is **keyed per daemon instance** at
+  `/tmp/tamandua/<uid>/<k>/h`, where `<k>` is the first 8 lowercase hex chars of
+  `sha256(<absolute real HOME>)`; the same HOME reuses the same `<k>` and two
+  daemons with different homes can never re-point each other's alias. Ownership
+  lives in the `<aliasDir>/owner.json` sidecar (mode 0600) recording the owner
+  `pid`, its kernel `startIdentity` (`v2:<pid>:<ms>`), `realHome`, `aliasPath`
+  and `updatedAt`: a daemon whose alias is held by a **live holder** refuses with
+  `alias_owned_by_live_daemon`, naming the holder pid/startIdentity/realHome/
+  alias path, instead of re-pointing; a **stale sidecar** (dead/reused owner) is
+  taken over; a malformed one refuses `alias_owner_unreadable`. A daemon only
+  ever touches its own `<k>` and never another daemon's `<k>`. MIGRATION: the
+  legacy single-symlink layout `/tmp/tamandua/<uid>/h` is IGNORED and never
+  deleted (never `lstat`ed, read, unlinked or re-pointed); only `<uid>/<k>` is
+  touched. Because the alias is a **symlink whose target is the real HOME**, the
+  image cache, kernel cache and VM registry stay shared — `matchlock list/rm/gc`
+  see the same VMs and the state stays physically under the real HOME. Operators
+  no longer need to keep the private HOME short. `tamandua doctor` reports the
+  alias path and its owner. Escape hatch: `TAMANDUA_MATCHLOCK_HOME_ALIAS`
+  disables the alias (`off` or `0` — the real HOME is passed through unchanged)
+  or points it at another short absolute directory; the override, like the
+  default, is verified on every use and an untrustworthy alias refuses the
+  launch loudly.
 - Step reporting only via the stable `/opt/tamandua/bin/tamandua`.
 - No recursive state deletion; no `rm -rf`/preclean/globs/cache purge/git
   reset/clean/prune/gc/worktree removal; exact currently owned VM ids only;

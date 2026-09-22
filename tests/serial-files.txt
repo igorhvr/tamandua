@@ -60,6 +60,7 @@ src/installer/matchlock/guest-bridge.test.ts
 src/installer/matchlock/guest-suite.test.ts
 src/installer/matchlock/harness-workflow-matrix.test.ts
 src/installer/matchlock/hermes-invocation-runner.test.ts
+src/installer/matchlock/home-alias-owner.test.ts
 src/installer/matchlock/host-merge-service.test.ts
 src/installer/matchlock/host-query-service.test.ts
 src/installer/matchlock/host-suite-service.test.ts

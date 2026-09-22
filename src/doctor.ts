@@ -65,6 +65,19 @@ import type { HermesSource } from "./installer/hermes-resolver.js";
 import { resolveDshBinaryDetailed, DshResolverError } from "./installer/dsh-resolver.js";
 import type { DshSource } from "./installer/dsh-resolver.js";
 import { resolveDshHome, nodeZstdDecompressAvailable } from "./installer/dsh-usage.js";
+import {
+  MATCHLOCK_HOME_ALIAS_ENV,
+  MatchlockHomeAliasError,
+  inspectMatchlockHomeAlias,
+  matchlockHomeAliasOwnerPath,
+  readMatchlockHomeAliasOwner,
+} from "./installer/matchlock/home-alias.js";
+import type {
+  MatchlockHomeAliasDeps,
+  MatchlockHomeAliasFs,
+  MatchlockHomeAliasInspection,
+  MatchlockHomeAliasOwnerRecord,
+} from "./installer/matchlock/home-alias.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -1017,6 +1030,8 @@ export interface LivenessCheckDeps {
   getCmdline?: (pid: number) => string;
   /** Pid liveness probe (default: kill(pid, 0) — never signals). */
   isPidAlive?: (pid: number) => boolean;
+  /** Matchlock short-HOME alias report deps (default: real read-only inspector). */
+  alias?: MatchlockAliasCheckDeps;
 }
 
 /** Default `kill(pid, 0)` liveness probe — a pure existence check. */
@@ -1042,6 +1057,137 @@ function readPidFileHint(pidFile: string): number | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Check name reported in the doctor LIVENESS group for the Matchlock alias.
+ * Exported so tests assert against the exact name (US-004).
+ */
+export const MATCHLOCK_ALIAS_CHECK_NAME = "Matchlock short-HOME alias";
+
+/**
+ * Injectable, report-only probes for {@link runMatchlockAliasChecks}.
+ *
+ * The defaults are the real read-only alias inspector and owner-sidecar reader.
+ * Tests inject fakes (or an `aliasDeps.fs` spy/fixture) so the check never
+ * reads or writes the literal host alias root.
+ */
+export interface MatchlockAliasCheckDeps {
+  /** Read-only alias resolver (default: inspectMatchlockHomeAlias). */
+  resolveAlias?: (deps?: MatchlockHomeAliasDeps) => MatchlockHomeAliasInspection;
+  /** Read-only owner sidecar reader (default: readMatchlockHomeAliasOwner). */
+  readOwner?: (
+    aliasDir: string,
+    io?: MatchlockHomeAliasFs,
+  ) => MatchlockHomeAliasOwnerRecord | null;
+  /** Inputs for the default resolver/reader (env/realHome/uid/tmpdir/fs). */
+  aliasDeps?: MatchlockHomeAliasDeps;
+}
+
+/**
+ * Report the effective Matchlock short-HOME alias and its recorded owner.
+ *
+ * Report-only by construction: it resolves the alias through
+ * {@link inspectMatchlockHomeAlias} (read-only) and reads
+ * `<aliasDir>/owner.json`; it never creates, re-points, unlinks, chmods or
+ * signals anything. A typed {@link MatchlockHomeAliasError} becomes a failing
+ * check whose message names the typed reason; an unreadable owner sidecar
+ * becomes a warning naming its path.
+ */
+export function runMatchlockAliasChecks(
+  opts?: DoctorOpts,
+  deps?: MatchlockAliasCheckDeps,
+): DoctorCheckResult[] {
+  const resolveAlias = deps?.resolveAlias ?? inspectMatchlockHomeAlias;
+  const readOwner = deps?.readOwner ?? readMatchlockHomeAliasOwner;
+  const aliasDeps: MatchlockHomeAliasDeps = { ...(deps?.aliasDeps ?? {}) };
+  if (aliasDeps.realHome === undefined && opts?.homeDir !== undefined) {
+    // An isolated doctor home must inspect THAT daemon's alias, not the real one.
+    aliasDeps.realHome = opts.homeDir;
+  }
+
+  let inspection: MatchlockHomeAliasInspection;
+  try {
+    inspection = resolveAlias(aliasDeps);
+  } catch (err) {
+    if (err instanceof MatchlockHomeAliasError) {
+      return [{
+        name: MATCHLOCK_ALIAS_CHECK_NAME,
+        status: "fail",
+        message: `Matchlock short-HOME alias is not usable (${err.reason}): ${err.message}`,
+        remedy: "Fix the reported short-HOME alias problem; tamandua doctor only reports and never re-points an alias.",
+      }];
+    }
+    return [{
+      name: MATCHLOCK_ALIAS_CHECK_NAME,
+      status: "fail",
+      message: `Matchlock short-HOME alias check failed: ${err instanceof Error ? err.message : String(err)}`,
+    }];
+  }
+
+  if (inspection.disabled) {
+    return [{
+      name: MATCHLOCK_ALIAS_CHECK_NAME,
+      status: "pass",
+      message:
+        `Matchlock short-HOME alias is disabled via ${MATCHLOCK_HOME_ALIAS_ENV}; ` +
+        `the daemon runs with the real HOME ${inspection.realHome}`,
+    }];
+  }
+
+  const aliasPath = inspection.aliasPath ?? inspection.realHome;
+  const aliasDir = inspection.aliasDir ?? path.dirname(aliasPath);
+  const ownerPath = matchlockHomeAliasOwnerPath(aliasDir);
+  const keyLabel = inspection.aliasKey ?? "override";
+  const base =
+    `Matchlock short-HOME alias ${aliasPath} (key ${keyLabel}, real HOME ${inspection.realHome})`;
+
+  let owner: MatchlockHomeAliasOwnerRecord | null = null;
+  try {
+    owner = readOwner(aliasDir, aliasDeps.fs);
+  } catch (err) {
+    const reason = err instanceof MatchlockHomeAliasError ? ` (${err.reason})` : "";
+    return [{
+      name: MATCHLOCK_ALIAS_CHECK_NAME,
+      status: "warn",
+      message:
+        `Matchlock short-HOME alias ${aliasPath} has an unreadable owner sidecar${reason} at ${ownerPath}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      remedy: `Inspect or remove ${ownerPath}, then retry.`,
+    }];
+  }
+
+  if (!inspection.exists && owner === null) {
+    return [{
+      name: MATCHLOCK_ALIAS_CHECK_NAME,
+      status: "pass",
+      message: `${base} is not created yet; no owner sidecar at ${ownerPath}`,
+    }];
+  }
+  if (!inspection.exists && owner !== null) {
+    return [{
+      name: MATCHLOCK_ALIAS_CHECK_NAME,
+      status: "warn",
+      message:
+        `${base} is not created yet but its owner sidecar at ${ownerPath} names ` +
+        `pid ${owner.pid} start identity ${owner.startIdentity}`,
+      remedy: `Inspect or remove ${ownerPath}, then retry.`,
+    }];
+  }
+  if (owner !== null) {
+    return [{
+      name: MATCHLOCK_ALIAS_CHECK_NAME,
+      status: "pass",
+      message:
+        `${base} is owned by pid ${owner.pid} start identity ${owner.startIdentity} ` +
+        `(recorded ${owner.updatedAt})`,
+    }];
+  }
+  return [{
+    name: MATCHLOCK_ALIAS_CHECK_NAME,
+    status: "pass",
+    message: `${base}; no owner sidecar at ${ownerPath}`,
+  }];
 }
 
 /**
@@ -1228,6 +1374,9 @@ export async function runLivenessChecks(
       message: "No running daemon to compare against the installed build",
     });
   }
+
+  // 5. Matchlock short-HOME alias — report-only path/key/owner (US-004).
+  results.push(...runMatchlockAliasChecks(opts, deps?.alias));
 
   return results;
 }

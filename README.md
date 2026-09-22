@@ -1042,6 +1042,7 @@ pi/dsh, an `igorhvr/bedlam-ubuntu`-derived fixture for hermes; the real
 | worktree/merge (pi) | `e2e-tests/matchlock-worktree-merge-gate.test.ts` | `./run-matchlock-worktree-merge-e2e-test` |
 | long HOME (>= 90 chars) | `e2e-tests/matchlock-long-home-gate.test.ts` | `./run-matchlock-long-home-e2e-test` |
 | empty-output/completed-step (US-006) | `e2e-tests/matchlock-empty-output-gate.test.ts` | `./run-matchlock-empty-output-e2e-test` |
+| alias isolation (two daemons, MTLK-ALIAS-FIX) | `e2e-tests/matchlock-alias-isolation-gate.test.ts` | `./run-matchlock-alias-isolation-e2e-test` |
 
 ```bash
 ./run-matchlock-synthetic-e2e-test        # pi gate
@@ -1052,14 +1053,31 @@ pi/dsh, an `igorhvr/bedlam-ubuntu`-derived fixture for hermes; the real
 ./run-matchlock-worktree-merge-e2e-test   # pi worktree/merge gate
 ./run-matchlock-long-home-e2e-test        # long-HOME (>= 90 char) gate
 ./run-matchlock-empty-output-e2e-test     # empty-output/completed-step gate (US-006)
+./run-matchlock-alias-isolation-e2e-test  # two-daemon alias isolation gate (MTLK-ALIAS-FIX)
 ```
 
 The long-HOME gate is a focused regression for the short-HOME alias: a real
-HOME path of >= 90 characters, with the DEFAULT short-HOME alias (no
-`TAMANDUA_MATCHLOCK_HOME_ALIAS` override), must still drive one zero-provider
-`do-now` run to completion through a fresh VM whose exact-owned teardown is
-recorded. It retains evidence under
+HOME path of >= 90 characters, with the DEFAULT keyed short-HOME alias
+(`/tmp/tamandua/<uid>/<k>/h`, no `TAMANDUA_MATCHLOCK_HOME_ALIAS` override), must
+still drive one zero-provider `do-now` run to completion through a fresh VM
+whose exact-owned teardown is recorded. It retains evidence under
 `/root/matchlock-work/evidence/mtlk-fix-XXXXXX/`.
+
+The alias-isolation gate is the MTLK-ALIAS-FIX regression: the short-HOME alias
+is keyed per daemon INSTANCE at `/tmp/tamandua/<uid>/<k>/h`, where `<k>` is the
+first 8 lowercase hex chars of `sha256(<absolute real HOME>)`, so two daemons of
+the same uid with different homes can never re-point each other's alias and a
+daemon only ever touches its own `<k>`. Ownership is recorded in the
+`<aliasDir>/owner.json` sidecar (mode 0600: owner `pid`, kernel `startIdentity`
+`v2:<pid>:<ms>`, `realHome`, `aliasPath`, `updatedAt`): a live holder causes a
+refusal naming the holder instead of a re-point, a stale sidecar is taken over,
+and the legacy `/tmp/tamandua/<uid>/h` symlink is IGNORED and never deleted. The
+gate drives a production-style daemon with a live in-VM round while a second
+daemon (different HOME, same uid) starts and admits its own Matchlock round; the
+first round's VM directory must stay valid and both rounds must complete. It
+runs under the shared gate lock (`flock --exclusive
+/home/kaladin/matchlock-work/vaivm-gate.lock`) and records `observed-rounds.json`
+through the same zero-round guard as every other gate.
 
 The empty-output/completed-step gate is the US-006 (H1/D1) regression: a
 TEST-ONLY synthetic-pi variant completes every work step through the packed

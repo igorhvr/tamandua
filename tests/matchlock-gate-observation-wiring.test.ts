@@ -27,10 +27,11 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const SERIAL_FILES = "tests/serial-files.txt";
 
 /**
- * The nine WIRED real-VM gates: each runs `node --test <driver>` and then
+ * The WIRED real-VM gates: each runs `node --test <driver>` and then
  * `scripts/observed-rounds-guard.mjs`, refusing PASS at zero observed rounds.
  * Order is irrelevant; membership is. `EXPECTED` below also pins the one
- * deliberately unwired on-demand diagnosis runner.
+ * deliberately unwired on-demand diagnosis runner. MTLK-ALIAS-FIX US-005 wires
+ * the two-daemon alias-isolation regression gate.
  */
 const WIRED_GATE_RUNNERS: readonly string[] = [
   "run-matchlock-synthetic-e2e-test",
@@ -42,6 +43,7 @@ const WIRED_GATE_RUNNERS: readonly string[] = [
   "run-matchlock-empty-output-e2e-test",
   "run-matchlock-long-home-e2e-test",
   "run-matchlock-worktree-merge-e2e-test",
+  "run-matchlock-alias-isolation-e2e-test",
 ];
 
 /**
@@ -210,7 +212,7 @@ describe("US-009 Matchlock gate observation wiring", () => {
     });
   }
 
-  it("all nine wired runners pair with nine distinct drivers", () => {
+  it("all wired runners pair with distinct drivers", () => {
     const drivers = WIRED_GATE_RUNNERS.map((name) => driverOf(readRepoFile(name)));
     assert.equal(new Set(drivers).size, drivers.length, "no two gates may share one driver");
   });

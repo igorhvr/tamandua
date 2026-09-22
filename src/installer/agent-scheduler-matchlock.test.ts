@@ -58,6 +58,7 @@ import {
   MATCHLOCK_GUEST_CLI,
   MATCHLOCK_GUEST_SKILL_FILE,
   setMatchlockSchedulerRoundRunnerForTest,
+  setMatchlockHomeAliasResolverForTest,
   buildMatchlockProbeCommand,
   buildMatchlockProbePrompt,
   buildMatchlockMergeContext,
@@ -70,7 +71,7 @@ import {
 } from "../../dist/installer/matchlock/runner-error.js";
 import { classifyInvocationError } from "../../dist/installer/matchlock/pi-invocation-runner.js";
 import { MatchlockControllerError } from "../../dist/installer/matchlock/controller.js";
-import { MATCHLOCK_SOCKET_PATH_TOO_LONG_CODE } from "../../dist/installer/matchlock/home-alias.js";
+import { MATCHLOCK_SOCKET_PATH_TOO_LONG_CODE, MatchlockHomeAliasError } from "../../dist/installer/matchlock/home-alias.js";
 import {
   setDshSchedulerRoundRunnerForTest,
   buildDshProbeCommand,
@@ -393,6 +394,7 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
   afterEach(() => {
     setMatchlockSchedulerRoundRunnerForTest(null);
     setDshSchedulerRoundRunnerForTest(null);
+    setMatchlockHomeAliasResolverForTest(null);
     if (savedPiBinary === undefined) delete process.env.TAMANDUA_PI_BINARY;
     else process.env.TAMANDUA_PI_BINARY = savedPiBinary;
     if (savedHarnessProbe === undefined) delete process.env.TAMANDUA_HARNESS_PROBE;
@@ -1916,6 +1918,39 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     const failed = eventsFor(runId).filter((e) => e.event === "run.force_failed");
     assert.equal(failed.length, 1);
     assert.match(String(failed[0].reason ?? failed[0].detail ?? ""), /Matchlock invocation failed/);
+  });
+
+  it("US-003: an owner-aware LIVE-holder alias refusal force-fails the run before any runner (typed matchlock_home_alias_untrusted)", async () => {
+    const runId = "a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3";
+    const workflowId = "do-now";
+    const workdir = path.join(tempHome, "work-alias-holder");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, policyJson(), { workflowId });
+    // Simulate the production owner-aware resolver refusing because another
+    // (live) daemon holds this daemon's keyed alias. The seam takes precedence
+    // over the throwaway-HOME override installed in beforeEach.
+    setMatchlockHomeAliasResolverForTest(() => {
+      throw new MatchlockHomeAliasError(
+        "alias_owned_by_live_daemon",
+        'short-HOME alias "/home/alias-fixture/tamandua/1000/abc12345/h" is held by a live daemon ' +
+          '(pid 4242, start identity v2:4242:1700000000000, real HOME "/home/other"); ' +
+          "refusing to re-point it.",
+      );
+    });
+
+    await dispatchJob(runId, workdir, { workflowId, harnessType: "pi" });
+
+    const row = runRow(runId);
+    assert.ok(row);
+    assert.equal(row.status, "failed", "a refused alias force-fails the run");
+    assert.equal(seamJournal.length, 0, "the round runner is never entered behind a live holder");
+    assert.ok(!fs.existsSync(piLog), "no host harness fallback after an alias refusal");
+    const failed = eventsFor(runId).filter((e) => e.event === "run.force_failed");
+    assert.equal(failed.length, 1);
+    assert.match(
+      String(failed[0].reason ?? failed[0].detail ?? ""),
+      /short-HOME alias unavailable|alias_owned_by_live_daemon/,
+    );
   });
 
   it("dsh: buildMatchlockDshWorkPrompt keeps the GUEST CLI with headless dsh wording; the pi/pi-default prompts are unchanged (differential)", () => {
