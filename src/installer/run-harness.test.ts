@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { validateRunHarnessForScheduling, getRunHarnessType } from "../../dist/installer/run-harness.js";
+import { MATCHLOCK_NETWORK_POLICY_VERSION } from "../../dist/installer/matchlock/policy.js";
 import {
   createRunWorktree,
   removeRunWorktree,
@@ -372,7 +373,7 @@ describe("validateRunHarnessForScheduling", () => {
         originalRepositoryRoot: originRepo,
         gitMetadataRoots: [],
         mountPolicyVersion: 1,
-        networkPolicyVersion: 1,
+        networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
         resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
       });
 

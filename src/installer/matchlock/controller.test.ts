@@ -9,6 +9,7 @@ import { writeFakeRpcDriver, tempTranscriptPath } from "../../../dist/installer/
 import { dshProfileOverlayRoot } from "../../../dist/installer/matchlock/dsh-profile-overlay.js";
 import type { PinnedImageIdentity } from "../../../dist/installer/matchlock/image.js";
 import type { ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
+import { MATCHLOCK_NETWORK_POLICY_VERSION } from "../../../dist/installer/matchlock/policy.js";
 import type { MatchlockStreamFrame } from "../../../dist/installer/matchlock/types.js";
 import { decodeFramesText, MATCHLOCK_CLIENT_ERROR_CODES } from "../../../dist/installer/matchlock/rpc-client.js";
 
@@ -87,7 +88,7 @@ function policy(over: Partial<ExecutionIsolation> = {}): ExecutionIsolation {
     originalRepositoryRoot: "/opt/project",
     gitMetadataRoots: ["/opt/project/.git"],
     mountPolicyVersion: 1,
-    networkPolicyVersion: 1,
+    networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
     resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
   };
   return { ...base, ...over };

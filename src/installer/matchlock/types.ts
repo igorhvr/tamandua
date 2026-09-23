@@ -94,6 +94,13 @@ export interface MatchlockNetworkConfig {
   intercept?: boolean;
   no_network?: boolean;
   hostname?: string;
+  /**
+   * MTLK-ALLOW-PRIVATE: per-run exception list of private destinations
+   * (host names, IP literals or CIDRs, optional `:port`). Mirrors the
+   * matchlock fork's `network.allow_private`; omitted when no entries were
+   * admitted.
+   */
+  allow_private?: string[];
 }
 
 export interface MatchlockMountConfig {

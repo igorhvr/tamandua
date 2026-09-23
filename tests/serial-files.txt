@@ -54,6 +54,7 @@ src/installer/ledger-gate-enforcement.test.ts
 src/installer/ledger-gate-matchlock-seam.test.ts
 src/installer/ledger-gate.test.ts
 src/installer/matchlock/admission.test.ts
+src/installer/matchlock/allow-private-support.test.ts
 src/installer/matchlock/controller.test.ts
 src/installer/matchlock/dsh-scheduler-seam.test.ts
 src/installer/matchlock/finalizer-ledger-seam.test.ts

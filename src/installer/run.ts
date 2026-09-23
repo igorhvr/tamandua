@@ -13,7 +13,11 @@ import {
   resolveMatchlockResourceLimits,
   type MatchlockResourceHostProbe,
 } from "./matchlock/resource-limits.js";
-import { admitMatchlockRun, type HermesAdmissionSubmission } from "./matchlock/admission.js";
+import {
+  admitMatchlockRun,
+  type HermesAdmissionSubmission,
+  type MatchlockAllowPrivateSupportProbe,
+} from "./matchlock/admission.js";
 import type { DshSubmissionContext } from "./matchlock/dsh-adapter-contract.js";
 import { getDb } from "../db.js";
 import { SQL_NOW_ISO } from "../lib/instant.js";
@@ -119,6 +123,22 @@ export interface RunWorkflowParams {
    * host-derived default is deterministic in tests. Production omits it.
    */
   matchlockResourceHostProbe?: MatchlockResourceHostProbe;
+  /**
+   * MTLK-ALLOW-PRIVATE: CLI-resolved per-run allow-private destination list
+   * for a FRESH Matchlock opt-in (flag > TAMANDUA_MATCHLOCK_ALLOW_PRIVATE env,
+   * already shape-validated at parse time). Admission persists the normalized
+   * list as `networkAllowPrivate` on the run's policy so every round/retry/
+   * resume of the run dispatches the SAME exceptions. Ignored when
+   * `matchlockPolicy` (an inherited rugpull policy) is present — the persisted
+   * policy list always wins and is never re-derived from the environment.
+   */
+  matchlockAllowPrivate?: string[];
+  /**
+   * MTLK-ALLOW-PRIVATE US-008: injectable allow-private support probe threaded
+   * to admission so tests never need a real matchlock binary. Production omits
+   * it and admission probes the resolved rpc binary itself.
+   */
+  matchlockAllowPrivateSupportProbe?: MatchlockAllowPrivateSupportProbe;
   /** When true, suppresses automatic replacement-run launch after a rugpull is detected */
   noRelaunchUponRugpull?: boolean;
   /**
@@ -339,6 +359,8 @@ export async function runWorkflow(
     matchlockPolicy,
     matchlockResourceLimits,
     matchlockResourceHostProbe,
+    matchlockAllowPrivate,
+    matchlockAllowPrivateSupportProbe,
     noRelaunchUponRugpull,
     parentRunId,
     workdirCollisionPolicy,
@@ -742,6 +764,14 @@ export async function runWorkflow(
         : harnessType === "dsh" || matchlockHarness === "dsh"
           ? "dsh"
           : "pi");
+    // MTLK-ALLOW-PRIVATE: the CLI-resolved allow-private list is supplied for
+    // a FRESH opt-in ONLY. A replacement (inherited `matchlockPolicy`) retains
+    // the persisted policy's list — admission resolves inherited > supplied so
+    // the list is never re-derived from the daemon environment here.
+    const allowPrivateForAdmission: string[] | undefined =
+      !matchlockPolicy && matchlockAllowPrivate && matchlockAllowPrivate.length > 0
+        ? [...matchlockAllowPrivate]
+        : undefined;
     const admission = await admitMatchlockRun({
       requestedImage: image,
       harness: effectiveHarness,
@@ -762,6 +792,10 @@ export async function runWorkflow(
           : undefined,
       inheritedPolicy: matchlockPolicy,
       resourceLimits: resourceLimitsForAdmission,
+      ...(allowPrivateForAdmission ? { allowPrivate: allowPrivateForAdmission } : {}),
+      ...(matchlockAllowPrivateSupportProbe
+        ? { allowPrivateSupportProbe: matchlockAllowPrivateSupportProbe }
+        : {}),
     });
     persistedMatchlockResourceLimits = { ...admission.policy.resourceLimits };
     db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run(

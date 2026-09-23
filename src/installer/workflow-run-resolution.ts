@@ -38,6 +38,13 @@ export interface WorkflowRunLaunchMatchlockResources {
   memoryMB: number;
   /** Resolved guest disk size in MB. */
   diskSizeMB: number;
+  /**
+   * MTLK-ALLOW-PRIVATE (US-006): the launch-resolved (flag > env) per-run
+   * exception list of private destinations the VM may reach. Omitted for a
+   * run that admitted no entries, so the launch line and JSON stay
+   * byte-identical in that case.
+   */
+  allowPrivate?: string[];
 }
 
 export interface WorkflowRunLaunchInfo {
@@ -240,6 +247,7 @@ export function formatWorkflowRunLaunchLines(
       formatMatchlockResourceSummary(
         info.matchlockResources.image,
         info.matchlockResources,
+        info.matchlockResources.allowPrivate,
       ),
     );
   }
@@ -252,7 +260,7 @@ export function formatWorkflowRunLaunchLines(
  * Field names stay close to the text prefixes so scripts can correlate them:
  *   working-directory / origin.path / origin.ref / origin.sha / clean /
  *   harness.type / harness.path / harness.version / daemon.endpoint /
- *   daemon.ok / matchlockResources.{image,cpus,memoryMB,diskSizeMB}.
+ *   daemon.ok / matchlockResources.{image,cpus,memoryMB,diskSizeMB,allowPrivate}.
  *
  * US-003: this is emitted whenever `workflow run --json` is requested, so the
  * resolved values are machine-consumable; optional facts (a missing harness
@@ -302,8 +310,17 @@ export function workflowRunLaunchInfoToJson(
 
   // MTLK-VM-SIZE US-005: mirror the matchlock launch line in the same JSON
   // document (inside `resolution`, next to the other launch facts).
+  // MTLK-ALLOW-PRIVATE (US-006): the optional allow-private list is copied
+  // only when non-empty (and cloned), so an absent/empty list keeps the JSON
+  // byte-identical to the pre-change shape.
   if (info.matchlockResources) {
-    json.matchlockResources = { ...info.matchlockResources };
+    const { allowPrivate, ...limits } = info.matchlockResources;
+    json.matchlockResources = {
+      ...limits,
+      ...(allowPrivate && allowPrivate.length > 0
+        ? { allowPrivate: [...allowPrivate] }
+        : {}),
+    };
   }
 
   if (info.workspaceMode === "direct" && info.workingDirectory) {

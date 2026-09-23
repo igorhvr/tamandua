@@ -51,6 +51,17 @@ import {
   type ExecutionIsolationWorkMount,
 } from "./policy.js";
 import { resolveMatchlockResourceLimits } from "./resource-limits.js";
+import {
+  MATCHLOCK_ALLOW_PRIVATE_ENV,
+  MATCHLOCK_ALLOW_PRIVATE_GRAMMAR,
+  normalizeAllowPrivateEntries,
+  validateAllowPrivateEntry,
+} from "./allow-private.js";
+import {
+  MATCHLOCK_ALLOW_PRIVATE_FLAG,
+  probeMatchlockAllowPrivateSupport,
+  type MatchlockAllowPrivateSupport,
+} from "./allow-private-support.js";
 import type { DshSubmissionContext } from "./dsh-adapter-contract.js";
 import {
   canonicalRealPath,
@@ -109,6 +120,17 @@ export const MATCHLOCK_RPC_BIN_ENV = "TAMANDUA_MATCHLOCK_RPC_BIN";
 /** Environment override for the matchlock rpc CLI args (JSON string array). */
 export const MATCHLOCK_RPC_ARGS_ENV = "TAMANDUA_MATCHLOCK_RPC_ARGS";
 
+/**
+ * MTLK-ALLOW-PRIVATE US-008: injectable probe for the installed matchlock's
+ * allow-private support. It receives the binary path resolved from
+ * {@link resolveRpcInvocation} and returns the US-007 probe result. Production
+ * uses {@link probeMatchlockAllowPrivateSupport}; tests inject a
+ * supporting/refusing fake so they never need a real matchlock binary.
+ */
+export type MatchlockAllowPrivateSupportProbe = (
+  binaryPath: string,
+) => MatchlockAllowPrivateSupport | Promise<MatchlockAllowPrivateSupport>;
+
 export interface MatchlockAdmissionOptions {
   /** Operator-supplied mandatory image (a replacement inherits its tag). */
   requestedImage: string;
@@ -149,6 +171,27 @@ export interface MatchlockAdmissionOptions {
    * neither is present the host-derived built-in defaults are used.
    */
   resourceLimits?: ExecutionIsolationResourceLimits;
+  /**
+   * MTLK-ALLOW-PRIVATE: the operator-resolved allow-private destination list
+   * for a FRESH Matchlock opt-in (flag > env, already shape-validated by the
+   * CLI). Admission normalizes/validates it and persists it as
+   * `networkAllowPrivate` on the run policy, so every round/retry/resume of
+   * the run dispatches the SAME list. Ignored when `inheritedPolicy` is
+   * present — a rugpull replacement retains the inherited policy's list (the
+   * persisted policy, never the daemon environment, is authoritative). Absent
+   * or empty keeps the pre-change policy byte-identical.
+   */
+  allowPrivate?: readonly string[];
+  /**
+   * MTLK-ALLOW-PRIVATE US-008: injectable allow-private support probe. When an
+   * effective (inherited or supplied) allow-private list is non-empty, admission
+   * probes the resolved rpc binary BEFORE the image resolve / any create effect
+   * and refuses with `matchlock_allow_private_unsupported` when the installed
+   * matchlock does not advertise `--allow-private`. Production omits this (the
+   * default US-007 probe runs against the real binary); tests inject a
+   * deterministic fake.
+   */
+  allowPrivateSupportProbe?: MatchlockAllowPrivateSupportProbe;
   /** Override the matchlock rpc binary (tests inject a fake driver). */
   rpcBinaryPath?: string;
   /** Override the matchlock rpc args (tests pass [driverPath]). */
@@ -428,6 +471,84 @@ function resolveAdmissionResourceLimits(
   return { cpus: resolved.cpus, memoryMB: resolved.memoryMB, diskSizeMB: resolved.diskSizeMB };
 }
 
+/**
+ * Resolve the effective allow-private destination list for one admission
+ * (MTLK-ALLOW-PRIVATE). Precedence: an INHERITED policy's persisted list
+ * (a rugpull replacement retains the failed run's admitted exceptions) > the
+ * operator-supplied list (a fresh opt-in) > absent. The effective list is
+ * normalized (trim/blank-drop/dedupe, first-seen order) and every entry is
+ * shape-validated; an invalid entry refuses the admission BEFORE any effect,
+ * naming the offending entry and the grammar, rather than dropping it.
+ * An absent/empty effective list yields `undefined` so the persisted policy
+ * stays byte-identical to a pre-change admission.
+ */
+function resolveAdmissionAllowPrivate(
+  inherited: ExecutionIsolation | undefined,
+  supplied: readonly string[] | undefined,
+): string[] | undefined {
+  const source = inherited?.networkAllowPrivate ?? supplied;
+  if (source === undefined) return undefined;
+  const normalized = normalizeAllowPrivateEntries(source);
+  if (normalized.length === 0) return undefined;
+  for (const entry of normalized) {
+    const result = validateAllowPrivateEntry(entry);
+    if (!result.ok) {
+      throw new MatchlockAdmissionError(
+        "policy_invalid_record",
+        `Matchlock admission allow-private ${result.reason}. Entries are ${MATCHLOCK_ALLOW_PRIVATE_GRAMMAR}.`,
+      );
+    }
+  }
+  return normalized;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * MTLK-ALLOW-PRIVATE US-008: refuse an allow-private run when the installed
+ * matchlock cannot honour the list. The US-007 probe runs against the rpc binary
+ * resolved by {@link resolveRpcInvocation} BEFORE the image resolve / any create
+ * effect; an unsupported (older) build, a missing binary or a probe that cannot
+ * run is a fail-closed `matchlock_allow_private_unsupported` refusal naming the
+ * binary and every requested entry. The list is NEVER silently dropped and no
+ * policy is written (the refusal precedes `buildMatchlockPolicy`). The probe is
+ * injectable so tests never need a real matchlock binary.
+ */
+async function assertMatchlockAllowPrivateSupport(
+  opts: MatchlockAdmissionOptions,
+  allowPrivate: readonly string[],
+): Promise<void> {
+  const { binaryPath } = resolveRpcInvocation(opts);
+  const probe =
+    opts.allowPrivateSupportProbe ??
+    ((bin: string) => probeMatchlockAllowPrivateSupport({ binaryPath: bin }));
+
+  let support: MatchlockAllowPrivateSupport;
+  try {
+    support = await probe(binaryPath);
+  } catch (err) {
+    throw new MatchlockAdmissionError(
+      "matchlock_allow_private_unsupported",
+      `Refusing allow-private run: could not verify that the matchlock binary at ${binaryPath} supports ${MATCHLOCK_ALLOW_PRIVATE_FLAG} (${errorMessage(err)}). ` +
+        `The requested private destinations (${allowPrivate.join(", ")}) are never silently dropped; ` +
+        `upgrade matchlock to a build that lists ${MATCHLOCK_ALLOW_PRIVATE_FLAG} (verify with \`matchlock run --help\`) ` +
+        `or drop --matchlock-allow-private / ${MATCHLOCK_ALLOW_PRIVATE_ENV} for this run.`,
+    );
+  }
+  if (support.supported) return;
+
+  const detail = support.reason ? ` Reason: ${support.reason}.` : "";
+  throw new MatchlockAdmissionError(
+    "matchlock_allow_private_unsupported",
+    `Refusing allow-private run: the matchlock binary at ${binaryPath} does not support ${MATCHLOCK_ALLOW_PRIVATE_FLAG}.${detail} ` +
+      `The requested private destinations (${allowPrivate.join(", ")}) cannot be honoured and are never silently dropped; ` +
+      `upgrade matchlock to a build that lists ${MATCHLOCK_ALLOW_PRIVATE_FLAG} (verify with \`matchlock run --help\`) ` +
+      `or drop --matchlock-allow-private / ${MATCHLOCK_ALLOW_PRIVATE_ENV} for this run.`,
+  );
+}
+
 function resolveRpcInvocation(opts: MatchlockAdmissionOptions): { binaryPath: string; args: string[] } {
   const binaryPath = (opts.rpcBinaryPath ?? process.env[MATCHLOCK_RPC_BIN_ENV]?.trim()) || "matchlock";
   let args = opts.rpcArgs;
@@ -578,8 +699,20 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
   }
 
   const ctx = opts.admission;
+  // MTLK-ALLOW-PRIVATE: resolve the effective per-run exception list ONCE,
+  // before either harness branch, so the pi/dsh and hermes paths cannot drift.
+  // The persisted inherited policy wins for a replacement; a fresh opt-in uses
+  // the operator-supplied list. The value is persisted in the returned policy
+  // and is never re-derived from the daemon environment at dispatch.
+  const allowPrivate = resolveAdmissionAllowPrivate(inherited, opts.allowPrivate);
+  // US-008: fail closed BEFORE the harness split / image resolve / any create
+  // when the installed matchlock cannot honour a non-empty list. An empty list
+  // performs no probe and admission stays byte-identical.
+  if (allowPrivate && allowPrivate.length > 0) {
+    await assertMatchlockAllowPrivateSupport(opts, allowPrivate);
+  }
   if (harness === "hermes") {
-    return admitHermesMatchlockRun(opts, inherited, ctx);
+    return admitHermesMatchlockRun(opts, inherited, ctx, allowPrivate);
   }
 
   // Selected configuration source/profile/guest destination: inherited for
@@ -680,6 +813,7 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
         }
       : {}),
     resourceLimits,
+    networkAllowPrivate: allowPrivate,
   });
   return { policy, identity: admitted.pin };
 }
@@ -703,6 +837,7 @@ async function admitHermesMatchlockRun(
   opts: MatchlockAdmissionOptions,
   inherited: ExecutionIsolation | undefined,
   ctx: MountAdmissionContext | undefined,
+  allowPrivate: string[] | undefined,
 ): Promise<MatchlockAdmissionResult> {
   const requestedImage = opts.requestedImage.trim();
 
@@ -789,6 +924,7 @@ async function admitHermesMatchlockRun(
       hermesHomeEnv: submission.hermesHomeEnv,
     },
     resourceLimits,
+    networkAllowPrivate: allowPrivate,
   });
   return { policy, identity };
 }

@@ -45,6 +45,7 @@ describe("parseWorkflowRunArgs", () => {
       matchlockCpus: undefined,
       matchlockMemory: undefined,
       matchlockDisk: undefined,
+      matchlockAllowPrivate: undefined,
       context: {},
       wait: false,
       timeout: undefined,

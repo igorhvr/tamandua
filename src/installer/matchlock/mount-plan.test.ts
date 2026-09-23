@@ -20,6 +20,7 @@ import {
   prepareDshProfileOverlay,
 } from "../../../dist/installer/matchlock/dsh-profile-overlay.js";
 import type { ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
+import { MATCHLOCK_NETWORK_POLICY_VERSION } from "../../../dist/installer/matchlock/policy.js";
 
 const IDENTITY = { digest: "sha256:aaaa", config_digest: "sha256:bbbb", tag: "img:1" };
 
@@ -42,7 +43,7 @@ function policy(over: Partial<ExecutionIsolation> = {}): ExecutionIsolation {
     originalRepositoryRoot: "/opt/project",
     gitMetadataRoots: ["/opt/project/.git"],
     mountPolicyVersion: 1,
-    networkPolicyVersion: 1,
+    networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
     resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
   };
   return { ...base, ...over };
@@ -91,6 +92,51 @@ describe("matchlock mount plan", () => {
     });
     const cfg = buildMatchlockCreateConfig(p, IDENTITY, { helperPackHostPath: helperPack });
     assert.deepEqual(cfg.resources, { cpus: 4, memory_mb: 4096, disk_size_mb: 20480 });
+  });
+
+  // MTLK-ALLOW-PRIVATE US-003: the persisted per-run allow-private list must
+  // reach the create request as `network.allow_private`, and the field must be
+  // OMITTED entirely (not `allow_private: []` / `undefined`) when empty.
+  it("MTLK-ALLOW-PRIVATE: a policy with networkAllowPrivate emits network.allow_private equal to the exact list", () => {
+    const p = policy({
+      configurationRoot: tmp,
+      networkAllowPrivate: ["192.168.107.74:8888", "registry.internal.example", "[2001:db8::1]:443", "10.0.0.0/8"],
+    });
+    const cfg = buildMatchlockCreateConfig(p, IDENTITY, { helperPackHostPath: helperPack });
+    assert.equal(cfg.network?.block_private_ips, true);
+    assert.equal(cfg.network?.intercept, true);
+    assert.deepEqual(cfg.network?.allow_private, [
+      "192.168.107.74:8888",
+      "registry.internal.example",
+      "[2001:db8::1]:443",
+      "10.0.0.0/8",
+    ]);
+  });
+
+  it("MTLK-ALLOW-PRIVATE: a policy without networkAllowPrivate omits the allow_private key entirely", () => {
+    const absent = buildMatchlockCreateConfig(policy({ configurationRoot: tmp }), IDENTITY, {
+      helperPackHostPath: helperPack,
+    });
+    assert.equal(Object.keys(absent.network ?? {}).includes("allow_private"), false);
+    assert.equal("allow_private" in (absent.network ?? {}), false);
+
+    // An explicit empty list is also omitted — the block stays on.
+    const empty = buildMatchlockCreateConfig(
+      policy({ configurationRoot: tmp, networkAllowPrivate: [] }),
+      IDENTITY,
+      { helperPackHostPath: helperPack },
+    );
+    assert.deepEqual(Object.keys(empty.network ?? {}).sort(), ["block_private_ips", "intercept"]);
+  });
+
+  it("MTLK-ALLOW-PRIVATE: the emitted allow_private list is a clone, never a live alias of the policy", () => {
+    const entries = ["192.168.107.74:8888"];
+    const p = policy({ configurationRoot: tmp, networkAllowPrivate: entries });
+    const cfg = buildMatchlockCreateConfig(p, IDENTITY, { helperPackHostPath: helperPack });
+    assert.deepEqual(cfg.network?.allow_private, entries);
+    assert.notEqual(cfg.network?.allow_private, entries, "create params must not alias the policy array");
+    entries.push("evil.example");
+    assert.deepEqual(cfg.network?.allow_private, ["192.168.107.74:8888"]);
   });
 
   it("rejects a missing host configuration directory (fail closed, never image default)", () => {
@@ -593,7 +639,7 @@ describe("matchlock mount plan", () => {
       originalRepositoryRoot: "/opt/project",
       gitMetadataRoots: [],
       mountPolicyVersion: 1,
-      networkPolicyVersion: 1,
+      networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
       resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
       submissionHomeDir: "/home/operator",
       submissionCwd: "/home/operator/work",

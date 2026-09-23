@@ -201,4 +201,35 @@ describe("matchlock resource limits", () => {
       "matchlock: img cpus=8 memory=16384MB disk=20480MB",
     );
   });
+
+  // MTLK-ALLOW-PRIVATE (US-006): the allow-private segment is appended ONLY
+  // when the resolved list is non-empty, so absent/empty stays byte-identical.
+  it("appends allow-private=<comma-separated entries> when the list is non-empty", () => {
+    assert.equal(
+      formatMatchlockResourceSummary(
+        "img",
+        { cpus: 8, memoryMB: 16384, diskSizeMB: 20480 },
+        ["192.168.107.74:8888", "box.internal", "[2001:db8::1]:443"],
+      ),
+      "matchlock: img cpus=8 memory=16384MB disk=20480MB allow-private=192.168.107.74:8888,box.internal,[2001:db8::1]:443",
+    );
+  });
+
+  it("appends no allow-private segment for an absent or empty list", () => {
+    const base = "matchlock: img cpus=8 memory=16384MB disk=20480MB";
+    assert.equal(
+      formatMatchlockResourceSummary("img", { cpus: 8, memoryMB: 16384, diskSizeMB: 20480 }),
+      base,
+      "absent list must append nothing",
+    );
+    assert.equal(
+      formatMatchlockResourceSummary(
+        "img",
+        { cpus: 8, memoryMB: 16384, diskSizeMB: 20480 },
+        [],
+      ),
+      base,
+      "empty list must append nothing",
+    );
+  });
 });

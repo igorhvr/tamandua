@@ -13,6 +13,7 @@ import {
   reserveHarnessProbe,
 } from "../../dist/installer/harness-probe.js";
 import { parseMatchlockPolicy } from "../../dist/installer/matchlock/policy.js";
+import { buildMatchlockCreateConfig } from "../../dist/installer/matchlock/mount-plan.js";
 import {
   MatchlockAdmissionError,
   MATCHLOCK_RPC_ARGS_ENV,
@@ -1395,6 +1396,163 @@ describe("runWorkflow", () => {
       assert.deepEqual(
         parseMatchlockPolicy(rows[0].matchlock_policy!).resourceLimits,
         { cpus: 4, memoryMB: 8192, diskSizeMB: 20480 },
+      );
+    });
+
+    // MTLK-ALLOW-PRIVATE: a FRESH opt-in's CLI-resolved allow-private list is
+    // persisted on the run's Matchlock policy at admission. The persisted
+    // policy — never the daemon environment — is the source a later round /
+    // retry / resume reads, so the dispatch create params map the SAME list.
+    it("persists RunWorkflowParams.matchlockAllowPrivate on runs.matchlock_policy and re-reads it for dispatch (US-005)", async () => {
+      const workflowId = "test-ctx-mtlk-allow-private";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      const configRoot = path.join(tempHome, ".pi", "agent");
+      fs.mkdirSync(configRoot, { recursive: true });
+
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+      setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+      setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+      setEnv("FAKE_IMAGE_TAG", "vic/matchlock-base:latest");
+      setEnv("FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+      // A decoy env default must NEVER be consulted at admission/dispatch: the
+      // explicitly supplied list is the one persisted.
+      setEnv("TAMANDUA_MATCHLOCK_ALLOW_PRIVATE", "10.9.9.9:1234");
+
+      const requested = ["192.168.107.74:8888", "registry.internal"];
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test matchlock allow-private persistence",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/matchlock-base:latest",
+          matchlockAllowPrivate: requested,
+          // US-008: allow-private admission probes the resolved rpc binary for
+          // support; inject a supporting fake so no real matchlock is needed.
+          matchlockAllowPrivateSupportProbe: () => ({
+            supported: true,
+            binaryPath: "fake-matchlock",
+          }),
+        });
+      } catch (err) {
+        assert.ok(
+          err instanceof Error && /Failed to register run with daemon|daemon/.test(err.message),
+          `unexpected runWorkflow failure: ${String(err)}`,
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.ok(rows[0].matchlock_policy, "matchlock_policy should be persisted");
+      const policy = parseMatchlockPolicy(rows[0].matchlock_policy!);
+      assert.deepEqual(
+        policy.networkAllowPrivate,
+        requested,
+        "the supplied allow-private list must land on the persisted policy",
+      );
+
+      // A later round/retry/resume re-reads the PERSISTED policy and maps it to
+      // the create params (the controller path); no environment re-derivation.
+      const helperPack = path.join(tempHome, "mtlk-ap-guest-pack");
+      fs.mkdirSync(helperPack, { recursive: true });
+      const cfg = buildMatchlockCreateConfig(policy, {
+        digest: policy.resolvedImageDigest ?? "",
+        config_digest: policy.resolvedImageConfigDigest ?? "",
+      }, { helperPackHostPath: helperPack });
+      assert.deepEqual(cfg.network.allow_private, requested);
+      assert.equal(cfg.network.block_private_ips, true);
+      assert.equal(cfg.network.intercept, true);
+    });
+
+    it("refuses an allow-private run on a matchlock WITHOUT support and persists NO policy (US-008)", async () => {
+      const workflowId = "test-ctx-mtlk-allow-private-unsupported";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(fixtureRoot, { recursive: true });
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      const configRoot = path.join(tempHome, ".pi", "agent");
+      fs.mkdirSync(configRoot, { recursive: true });
+
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+      setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+      setEnv("FAKE_IMAGE_TAG", "vic/matchlock-base:latest");
+      setEnv("FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+      let refused: Error | undefined;
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test matchlock allow-private refusal",
+          workingDirectoryForHarness: repoDir,
+          matchlockImage: "vic/matchlock-base:latest",
+          matchlockAllowPrivate: ["192.168.107.74:8888"],
+          // US-008: an older matchlock without --allow-private must refuse the
+          // launch instead of silently dropping the requested exceptions.
+          matchlockAllowPrivateSupportProbe: () => ({
+            supported: false,
+            binaryPath: "fake-matchlock",
+            reasonCode: "unsupported",
+          }),
+        });
+      } catch (err) {
+        refused = err as Error;
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      assert.ok(refused, "an unsupported allow-private admission must refuse the launch");
+      assert.match(
+        refused.message,
+        /does not support --allow-private|cannot be honoured/,
+        `unexpected refusal: ${refused.message}`,
+      );
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.equal(
+        rows[0].matchlock_policy,
+        null,
+        "a refused allow-private probe must persist NO policy",
       );
     });
 

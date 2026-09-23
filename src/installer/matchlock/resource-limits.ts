@@ -238,7 +238,21 @@ export function resolveMatchlockResourceLimits(
 /**
  * Canonical launch/status line for resolved limits:
  * `matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB`.
+ *
+ * MTLK-ALLOW-PRIVATE (US-006): when the run admitted a non-empty allow-private
+ * destination list, the resolved entries are appended as
+ * ` allow-private=<comma-separated entries>`. An absent or empty list appends
+ * nothing, so native runs and allow-private-free Matchlock runs keep the
+ * byte-identical line they had before this field existed.
  */
-export function formatMatchlockResourceSummary(image: string, limits: MatchlockResourceLimits): string {
-  return `matchlock: ${image} cpus=${limits.cpus} memory=${limits.memoryMB}MB disk=${limits.diskSizeMB}MB`;
+export function formatMatchlockResourceSummary(
+  image: string,
+  limits: MatchlockResourceLimits,
+  allowPrivate?: readonly string[],
+): string {
+  let summary = `matchlock: ${image} cpus=${limits.cpus} memory=${limits.memoryMB}MB disk=${limits.diskSizeMB}MB`;
+  if (allowPrivate && allowPrivate.length > 0) {
+    summary += ` allow-private=${allowPrivate.join(",")}`;
+  }
+  return summary;
 }

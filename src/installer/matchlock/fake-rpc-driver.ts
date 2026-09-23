@@ -86,6 +86,20 @@ const DRIVER_SOURCE = `#!/usr/bin/env node
 import readline from "node:readline";
 import fs from "node:fs";
 
+// MTLK-ALLOW-PRIVATE: this same script doubles as a stand-in \`matchlock\` CLI
+// so capability probes (\`matchlock run --help\` / \`matchlock --version\`) can be
+// driven WITHOUT a real binary. Normal RPC invocations carry neither flag and
+// fall through to the JSON-RPC loop below.
+const cliArgs = process.argv.slice(2);
+if (cliArgs.includes("--help") || cliArgs.includes("-h")) {
+  process.stdout.write("Usage: matchlock run [--allow-private <entry>] [--cpus N] [--memory MB]\\n");
+  process.exit(0);
+}
+if (cliArgs.includes("--version") || cliArgs.includes("-v")) {
+  process.stdout.write("matchlock version 9.9.9-fake\\n");
+  process.exit(0);
+}
+
 const env = process.env;
 const imageDigest = env.FAKE_IMAGE_DIGEST || "sha256:fakedigest";
 const imageConfigDigest = env.FAKE_IMAGE_CONFIG_DIGEST || "sha256:fakeconfigdigest";

@@ -1932,10 +1932,12 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
   function matchlockPolicyJson(
     limits: { cpus: number; memoryMB: number; diskSizeMB: number } = POLICY_LIMITS,
     image: string = POLICY_IMAGE,
+    networkAllowPrivate?: string[],
   ): string {
     return serializeMatchlockPolicy(
       buildMatchlockPolicy({
         requestedImage: image,
+        networkAllowPrivate,
         identity: {
           digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
           config_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -2039,6 +2041,83 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
         image: POLICY_IMAGE,
         cpus: 2,
         memoryMB: 2048,
+        diskSizeMB: 20480,
+      });
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("getWorkflowStatus surfaces the persisted allow-private list in matchlockResources", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(
+      env,
+      runId,
+      matchlockPolicyJson(POLICY_LIMITS, POLICY_IMAGE, [
+        "192.168.107.74:8888",
+        "box.internal",
+      ]),
+    );
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      assert.deepEqual(detail.matchlockResources, {
+        image: POLICY_IMAGE,
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+        allowPrivate: ["192.168.107.74:8888", "box.internal"],
+      });
+      const json = buildWorkflowStatusJson(detail);
+      assert.deepEqual(json.matchlockResources, detail.matchlockResources);
+      // The persisted list is cloned, never aliased into the status result.
+      detail.matchlockResources!.allowPrivate!.push("mutated.internal");
+      const reread = getWorkflowStatus(runId);
+      assert.deepEqual(reread.matchlockResources!.allowPrivate, [
+        "192.168.107.74:8888",
+        "box.internal",
+      ]);
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("a policy without allow-private keeps matchlockResources free of the key", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(env, runId, matchlockPolicyJson());
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(detail.matchlockResources, "allowPrivate"),
+        false,
+        "an allow-private-free policy must not add the key",
+      );
+      const json = buildWorkflowStatusJson(detail);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(json.matchlockResources, "allowPrivate"),
+        false,
+      );
+      assert.deepEqual(json.matchlockResources, {
+        image: POLICY_IMAGE,
+        cpus: 8,
+        memoryMB: 16384,
         diskSizeMB: 20480,
       });
     } finally {

@@ -309,6 +309,25 @@ Options:
       built-in default; env values are clamped by the same caps as flags.
       The resolved limits are printed at launch and recorded in the run
       policy.
+  --matchlock-allow-private <entry>
+      Per-run exception list of private destinations the opted-in Matchlock
+      VM may reach; mapped to the Matchlock network.allow_private policy.
+      Repeatable (also accepted as --matchlock-allow-private=<entry>); every
+      occurrence appends one entry, duplicates are deduped, and the resolved
+      list is persisted in the run's Matchlock policy so every round, retry
+      and resume of the run reaches the same destinations.
+      Requires --matchlock <image>; without it the flag is a usage error.
+      An entry is a host name, an IPv4/IPv6 literal or CIDR, optionally
+      suffixed with :port (a bracketed IPv6 destination uses [addr]:port; a
+      bare IPv6 literal carries no port). Entries are validated by SHAPE at
+      launch only — DNS resolution is Matchlock's job, and a host name
+      qualifies only when every address it resolves to is allowed or public.
+      Env default (read at launch, only when the flag is absent):
+      TAMANDUA_MATCHLOCK_ALLOW_PRIVATE, a comma-separated list of the same
+      entries. An explicit --matchlock-allow-private overrides the env list;
+      the env var is ignored without --matchlock. Private, loopback,
+      link-local, CGNAT and Yggdrasil (including IPv6) destinations stay
+      blocked for everything not explicitly listed.
   --task-file <path>
       Read the task description from a file instead of passing it inline.
       The file path is dereferenced exactly once at CLI time — the path
@@ -1148,6 +1167,13 @@ export async function handleWorkflow(
       launchInfo.matchlockResources = {
         image: runArgs.matchlockImage,
         ...matchlockResourceLimits,
+        // MTLK-ALLOW-PRIVATE (US-006): show the launch-resolved (flag > env)
+        // exception list in the SAME resolved-launch block. Omitted entirely
+        // when empty so the line/JSON stay byte-identical for a run that
+        // admitted no allow-private entries.
+        ...(runArgs.matchlockAllowPrivate && runArgs.matchlockAllowPrivate.length > 0
+          ? { allowPrivate: [...runArgs.matchlockAllowPrivate] }
+          : {}),
       };
     }
     if (launchInfo && !runArgs.jsonFlag) {
@@ -1170,6 +1196,9 @@ export async function handleWorkflow(
       matchlockHarness: runArgs.matchlockImage !== undefined && harnessType === "dsh" ? "dsh" : "pi",
       dshSubmission,
       matchlockResourceLimits,
+      // MTLK-ALLOW-PRIVATE: the launch-resolved (flag > env) entry list reaches
+      // run creation/admission, which persists it on the run's Matchlock policy.
+      matchlockAllowPrivate: runArgs.matchlockAllowPrivate,
       context: runArgs.context,
       parentRunId,
     });
@@ -1294,6 +1323,7 @@ export async function handleWorkflow(
           formatMatchlockResourceSummary(
             result.matchlockResources.image,
             result.matchlockResources,
+            result.matchlockResources.allowPrivate,
           ),
         );
       }

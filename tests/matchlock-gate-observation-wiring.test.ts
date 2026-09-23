@@ -44,6 +44,10 @@ const WIRED_GATE_RUNNERS: readonly string[] = [
   "run-matchlock-long-home-e2e-test",
   "run-matchlock-worktree-merge-e2e-test",
   "run-matchlock-alias-isolation-e2e-test",
+  // MTLK-ALLOW-PRIVATE US-009: the on-demand allow-private gate is guard-wired
+  // (driver writes observed-rounds.json; runner invokes the shared guard and
+  // refuses a zero-round PASS), so it joins the WIRED family.
+  "run-matchlock-allow-private-e2e-test",
 ];
 
 /**

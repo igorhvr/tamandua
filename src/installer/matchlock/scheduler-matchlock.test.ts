@@ -35,6 +35,7 @@ import {
 } from "../../../dist/installer/matchlock/scheduler-dsh.js";
 import {
   buildMatchlockPolicy,
+  MATCHLOCK_NETWORK_POLICY_VERSION,
   type ExecutionIsolation,
 } from "../../../dist/installer/matchlock/policy.js";
 
@@ -64,7 +65,7 @@ function policy(over: Partial<ExecutionIsolation> = {}): ExecutionIsolation {
     originalRepositoryRoot: "/srv/repo",
     gitMetadataRoots: ["/srv/repo/.git"],
     mountPolicyVersion: 1,
-    networkPolicyVersion: 1,
+    networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
     resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
     requestedImageDigest: undefined,
     resolvedImageDigest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",

@@ -65,6 +65,7 @@ import {
 } from "../../../dist/installer/matchlock/home-alias.js";
 import { readOrphanVms } from "../../../dist/installer/matchlock/vm-orphans.js";
 import type { ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
+import { MATCHLOCK_NETWORK_POLICY_VERSION } from "../../../dist/installer/matchlock/policy.js";
 import { guestSuiteNamespaceId, type GuestSuiteNamespace } from "../../../dist/installer/matchlock/guest-suite-contract.js";
 import { committedTreeHash, computeCmdHash } from "../../../dist/installer/matchlock/guest-suite-git.js";
 import type { FrozenHermesSubmissionInput } from "../../../dist/installer/matchlock/hermes-profile.js";
@@ -230,7 +231,7 @@ function fixturePolicy(rig: FixtureRig, over: Partial<ExecutionIsolation> = {}):
     originalRepositoryRoot: rig.repoDir,
     gitMetadataRoots: [],
     mountPolicyVersion: 1,
-    networkPolicyVersion: 1,
+    networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
     resourceLimits: { cpus: 1, memoryMB: 512, diskSizeMB: 2048 },
     ...over,
   };

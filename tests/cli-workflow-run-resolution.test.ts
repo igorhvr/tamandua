@@ -772,6 +772,96 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
     }
   });
 
+  it("shows the resolved allow-private entries on the launch line and in --json", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+    const fixture = writeMatchlockFixture();
+
+    try {
+      const workflowId = "res-matchlock-allow-private";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      // Separate workdirs so the second launch is not refused by the first
+      // (still-registered) run holding the same harness workdir.
+      const jsonWorkDir = path.join(fixture.fixtureRoot, "work-json");
+      fs.mkdirSync(jsonWorkDir, { recursive: true });
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const baseArgs = [
+        "workflow",
+        "run",
+        workflowId,
+        "Matchlock allow-private",
+        "--matchlock",
+        "vic/matchlock-base:latest",
+        "--matchlock-cpus",
+        "2",
+        "--matchlock-memory",
+        "2048",
+        "--matchlock-disk",
+        "10240",
+        "--matchlock-allow-private",
+        "192.168.107.74:8888",
+        "--matchlock-allow-private",
+        "box.internal",
+      ];
+      // US-008: an allow-private run probes the resolved matchlock binary for
+      // --allow-private support BEFORE the image resolve. The fake rpc driver
+      // doubles as that stand-in CLI (it answers `run --help` with the flag),
+      // so no real matchlock binary is needed here.
+      const allowPrivateEnv = { TAMANDUA_MATCHLOCK_RPC_BIN: fixture.driver };
+
+      const text = await runCliToExit(
+        [...baseArgs, "--working-directory-for-harness", fixture.workDir],
+        matchlockEnv(env, fixture, fake.port, allowPrivateEnv),
+      );
+      assert.equal(text.code, 0, `expected exit 0, got ${text.code}\nstdout:\n${text.stdout}\nstderr:\n${text.stderr}`);
+      const matchlockLines = stdoutLines(text.stdout).filter((l) => l.startsWith("matchlock:"));
+      assert.deepEqual(
+        matchlockLines,
+        [
+          "matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB allow-private=192.168.107.74:8888,box.internal",
+        ],
+        `launch line must carry the resolved allow-private entries:\n${text.stdout}`,
+      );
+
+      const json = await runCliToExit(
+        [...baseArgs, "--working-directory-for-harness", jsonWorkDir, "--json"],
+        matchlockEnv(env, fixture, fake.port, allowPrivateEnv),
+      );
+      assert.equal(json.code, 0, `expected exit 0, got ${json.code}\nstdout:\n${json.stdout}\nstderr:\n${json.stderr}`);
+      const parsed = JSON.parse(json.stdout.trim());
+      const expected = {
+        image: "vic/matchlock-base:latest",
+        cpus: 2,
+        memoryMB: 2048,
+        diskSizeMB: 10240,
+        allowPrivate: ["192.168.107.74:8888", "box.internal"],
+      };
+      assert.deepEqual(
+        parsed.resolution.matchlockResources,
+        expected,
+        `--json resolution must carry the resolved allow-private entries:\n${json.stdout}`,
+      );
+      assert.deepEqual(
+        parsed.matchlockResources,
+        expected,
+        `--json top-level matchlockResources must mirror the entries:\n${json.stdout}`,
+      );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true }); } catch {}
+    }
+  });
+
   it("a native run prints no matchlock line and its --json resolution stays unchanged", async () => {
     const env = await createTempEnv();
     const fake = await startFakeControlPlane();

@@ -4,6 +4,11 @@ import {
   resolveWorkdirCollisionPolicy,
   type WorkdirCollisionPolicy,
 } from "../installer/workdir-collision.js";
+import {
+  MATCHLOCK_ALLOW_PRIVATE_ENV,
+  assertAllowPrivateEntries,
+  parseAllowPrivateEnv,
+} from "../installer/matchlock/allow-private.js";
 
 export interface WorkflowRunArgs {
   taskTitle: string;
@@ -41,6 +46,17 @@ export interface WorkflowRunArgs {
   matchlockCpus?: string;
   matchlockMemory?: string;
   matchlockDisk?: string;
+  /**
+   * MTLK-ALLOW-PRIVATE US-004: the launch-resolved per-run exception list of
+   * private destinations the Matchlock VM may reach (repeatable
+   * `--matchlock-allow-private <entry>`, falling back to the comma-separated
+   * `TAMANDUA_MATCHLOCK_ALLOW_PRIVATE` env default when the flag is absent).
+   * Entries are shape-validated and deduped here; DNS resolution stays
+   * matchlock's job. Present only for an opted-in Matchlock run with a
+   * non-empty effective list — a native run never carries one, and the env
+   * default is ignored without --matchlock.
+   */
+  matchlockAllowPrivate?: string[];
   /** Key-value pairs injected as run template context */
   context: Record<string, string>;
   /** Block until the run reaches a terminal status */
@@ -71,11 +87,16 @@ const KNOWN_FLAGS = new Set([
   "--matchlock-cpus",
   "--matchlock-memory",
   "--matchlock-disk",
+  "--matchlock-allow-private",
 ]);
 
+// MTLK-ALLOW-PRIVATE US-004: the repeatable allow-private flag. Its entry
+// grammar lives in the shared validator module (allow-private.ts).
+const MATCHLOCK_ALLOW_PRIVATE_FLAG = "--matchlock-allow-private";
+
 // MTLK-VM-SIZE US-002: the three raw VM-size overrides and the
-// WorkflowRunArgs field each populates. Order is significant for the
-// without---matchlock error (first supplied flag is named).
+// WorkflowRunArgs field each populates. The without---matchlock error names
+// the FIRST supplied --matchlock-dependent flag, tracked while parsing.
 const MATCHLOCK_SIZE_FLAG_TO_FIELD: Record<
   string,
   "matchlockCpus" | "matchlockMemory" | "matchlockDisk"
@@ -151,6 +172,12 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   const matchlockSizeValues: Partial<
     Record<"matchlockCpus" | "matchlockMemory" | "matchlockDisk", string>
   > = {};
+  // MTLK-ALLOW-PRIVATE US-004: raw repeatable allow-private entries (validated
+  // and deduped after the loop) plus the first --matchlock-dependent flag
+  // supplied, so a missing --matchlock names the flag the operator wrote first.
+  const matchlockAllowPrivateEntries: string[] = [];
+  let matchlockAllowPrivateSupplied = false;
+  let firstMatchlockDependentFlag: string | undefined;
   const context: Record<string, string> = {};
 
   let afterDashDash = false;
@@ -236,6 +263,7 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
         );
       }
       matchlockSizeValues[matchlockSizeField] = value.trim();
+      if (firstMatchlockDependentFlag === undefined) firstMatchlockDependentFlag = token;
       i++;
       continue;
     }
@@ -262,6 +290,56 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
         );
       }
       matchlockSizeValues[field] = value;
+      if (firstMatchlockDependentFlag === undefined) {
+        firstMatchlockDependentFlag = inlineMatchlockSizeFlag;
+      }
+      continue;
+    }
+
+    // MTLK-ALLOW-PRIVATE US-004: repeatable `--matchlock-allow-private <entry>`
+    // (space and `--matchlock-allow-private=<entry>` forms). Entries are stored
+    // raw here and validated/normalized once after the loop so a malformed
+    // entry exits non-zero before run creation. Reusing the size-flag error
+    // style keeps missing-value / next-token-is-an-option behaviour uniform.
+    if (token === MATCHLOCK_ALLOW_PRIVATE_FLAG) {
+      const value = args[i + 1];
+      if (value === undefined || value.trim() === "") {
+        throw new Error(
+          `Missing value for ${MATCHLOCK_ALLOW_PRIVATE_FLAG}. Use ${MATCHLOCK_ALLOW_PRIVATE_FLAG} <entry>.`,
+        );
+      }
+      if (value.startsWith("--") && KNOWN_FLAGS.has(value.split("=")[0])) {
+        throw new Error(
+          `Missing value for ${MATCHLOCK_ALLOW_PRIVATE_FLAG}. The next token "${value}" is an option, not an entry.`,
+        );
+      }
+      matchlockAllowPrivateEntries.push(value);
+      matchlockAllowPrivateSupplied = true;
+      if (firstMatchlockDependentFlag === undefined) {
+        firstMatchlockDependentFlag = MATCHLOCK_ALLOW_PRIVATE_FLAG;
+      }
+      i++;
+      continue;
+    }
+
+    const inlineAllowPrivatePrefix = `${MATCHLOCK_ALLOW_PRIVATE_FLAG}=`;
+    if (token.startsWith(inlineAllowPrivatePrefix)) {
+      const value = token.slice(inlineAllowPrivatePrefix.length).trim();
+      if (value === "") {
+        throw new Error(
+          `Missing value for ${MATCHLOCK_ALLOW_PRIVATE_FLAG} (${MATCHLOCK_ALLOW_PRIVATE_FLAG}= must be followed by an entry).`,
+        );
+      }
+      if (value.startsWith("--") && KNOWN_FLAGS.has(value.split("=")[0])) {
+        throw new Error(
+          `Missing value for ${MATCHLOCK_ALLOW_PRIVATE_FLAG}. The value "${value}" is an option, not an entry.`,
+        );
+      }
+      matchlockAllowPrivateEntries.push(value);
+      matchlockAllowPrivateSupplied = true;
+      if (firstMatchlockDependentFlag === undefined) {
+        firstMatchlockDependentFlag = MATCHLOCK_ALLOW_PRIVATE_FLAG;
+      }
       continue;
     }
 
@@ -512,14 +590,32 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   // at CLI-parse time.
   const workdirCollisionPolicy = parseWorkdirCollisionPolicyFlags(flagArgs);
 
-  // MTLK-VM-SIZE US-002: a size override only makes sense for an opted-in
-  // Matchlock run, so any of the three without --matchlock is a usage error
-  // (naming the first supplied flag).
-  if (matchlockImage === undefined) {
-    for (const flag of Object.keys(MATCHLOCK_SIZE_FLAG_TO_FIELD)) {
-      if (matchlockSizeValues[MATCHLOCK_SIZE_FLAG_TO_FIELD[flag]] !== undefined) {
-        throw new Error(`${flag} requires --matchlock <image>.`);
-      }
+  // MTLK-VM-SIZE US-002 / MTLK-ALLOW-PRIVATE US-004: the size overrides and
+  // the allow-private list only make sense for an opted-in Matchlock run, so
+  // any of them without --matchlock is a usage error naming the first supplied
+  // flag (`--matchlock-allow-private` is repeatable, so its first occurrence
+  // is the one named).
+  if (matchlockImage === undefined && firstMatchlockDependentFlag !== undefined) {
+    throw new Error(`${firstMatchlockDependentFlag} requires --matchlock <image>.`);
+  }
+
+  // MTLK-ALLOW-PRIVATE US-004 precedence: explicit repeated flags win, and the
+  // comma-separated env default is consulted only when the flag is absent (and
+  // only for a Matchlock run — a native run ignores it entirely). The shape
+  // validator is authoritative and runs at launch so an invalid flag or env
+  // entry exits non-zero before run creation. A flag-supplied list is
+  // normalized/deduped; the field stays absent when the effective list is
+  // empty.
+  let matchlockAllowPrivate: string[] | undefined;
+  if (matchlockAllowPrivateSupplied) {
+    matchlockAllowPrivate = assertAllowPrivateEntries(
+      matchlockAllowPrivateEntries,
+      MATCHLOCK_ALLOW_PRIVATE_FLAG,
+    );
+  } else if (matchlockImage !== undefined) {
+    const envEntries = parseAllowPrivateEnv(process.env[MATCHLOCK_ALLOW_PRIVATE_ENV]);
+    if (envEntries.length > 0) {
+      matchlockAllowPrivate = assertAllowPrivateEntries(envEntries, MATCHLOCK_ALLOW_PRIVATE_ENV);
     }
   }
 
@@ -536,6 +632,7 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     matchlockCpus: matchlockSizeValues.matchlockCpus,
     matchlockMemory: matchlockSizeValues.matchlockMemory,
     matchlockDisk: matchlockSizeValues.matchlockDisk,
+    matchlockAllowPrivate,
     context,
     wait,
     timeout,

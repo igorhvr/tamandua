@@ -727,11 +727,19 @@ export function buildMatchlockCreateConfig(
       memory_mb: policy.resourceLimits.memoryMB,
       disk_size_mb: policy.resourceLimits.diskSizeMB,
     },
-    // Provisional network boundary: public allowed, private/loopback denied.
-    // Qualified separately by the network-admission contract (IPv6 caveat).
+    // Network boundary: public destinations are allowed; private, loopback,
+    // link-local, CGNAT and Yggdrasil destinations (including IPv6) stay
+    // blocked for everything not explicitly listed. The current matchlock
+    // fork intercepts IPv6 too, so the old IPv6 caveat is gone. The per-run
+    // allow-private exceptions (MTLK-ALLOW-PRIVATE) are emitted as
+    // `network.allow_private` ONLY when the admitted policy carries entries;
+    // with none admitted the key is omitted entirely and the block stays on.
     network: {
       block_private_ips: true,
       intercept: true,
+      ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
+        ? { allow_private: [...policy.networkAllowPrivate] }
+        : {}),
     },
     // Guest harness directory override: pin the image's harness into its real
     // config mount rather than the image default HOME. pi pins

@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Run the MTLK-ALLOW-PRIVATE US-009 real-VM gate:
+#   do-now under --matchlock TWICE through an isolated daemon -> scheduler ->
+#   fresh VM, with a TEST-ONLY synthetic-pi fixture whose in-guest curl probe
+#   targets the private endpoint 192.168.107.74:8888.
+#
+#   RUN A: --matchlock-allow-private 192.168.107.74:8888 => run completes and
+#          the in-guest curl exit code is 0 with a response body;
+#   RUN B: no allow-private flag => run completes while the in-guest curl is
+#          REFUSED (nonzero exit).
+#
+# This tier is a REAL-VM gate and is deliberately NOT part of the default fast
+# lanes (npm test / run-all-smoke / run-all-scripted / run-all-e2e-tests). Run
+# it on demand:
+#
+#   ./run-matchlock-allow-private-e2e-test
+#
+# The runner itself takes the SHARED GATE LOCK
+# (`flock --exclusive /home/kaladin/matchlock-work/vaivm-gate.lock`), so a
+# concurrent real-VM gate cannot race the host. Override the lock path with
+# TAMANDUA_GATE_LOCK.
+#
+# It also UNSETS TAMANDUA_MATCHLOCK_TEMP_ALLOW_PRIVATE before launching the
+# gate, so neither the isolated daemon nor the rounds it drives can depend on
+# the temporary host exemption (the gate additionally asserts the daemon child
+# env excludes that key).
+#
+# What it does:
+#   1. resolves the system matchlock pair (PATH, or TAMANDUA_MATCHLOCK_RPC_BIN /
+#      MATCHLOCK_GUEST_INIT / MATCHLOCK_GUEST_FUSED overrides) and records the
+#      observed version + sha256 hashes as evidence -- no runtime pins
+#   2. npm run build (compiled dist is what the isolated gate runs)
+#   3. creates a NEW mkdtemp evidence directory under the evidence root
+#      (outside the repo; NEVER pre-cleaned/reused) with a private TMPDIR/HOME,
+#      and exports TAMANDUA_GATE_EVIDENCE_DIR
+#   4. seeds (read-only) from the operator matchlock image store, which the
+#      gate copies into its private HOME
+#   5. runs e2e-tests/matchlock-allow-private-gate.test.ts under the shared gate
+#      lock with all logs tee'd into the evidence dir; the exit code propagates
+#   6. invokes the shared observed-rounds guard (--gate allow-private), which
+#      refuses a zero-round PASS with exit 92.
+set -u
+
+cd "$(dirname "$0")"
+
+fail() { echo "run-matchlock-allow-private-e2e-test: FATAL: $*" >&2; exit 90; }
+
+GATE_LOCK="${TAMANDUA_GATE_LOCK:-/home/kaladin/matchlock-work/vaivm-gate.lock}"
+OPERATOR_CACHE="${TAMANDUA_GATE_OPERATOR_CACHE:-$HOME/.cache/matchlock}"
+EVIDENCE_ROOT="${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}"
+
+# -- UNPINNED runtime resolution (MTLK-UNPIN, tamandua-6sy.33.10.36) ----------
+if [ -n "${TAMANDUA_MATCHLOCK_RPC_BIN:-}" ]; then
+  MATCHLOCK_RPC_BIN="$TAMANDUA_MATCHLOCK_RPC_BIN"
+else
+  MATCHLOCK_RPC_BIN="$(command -v matchlock 2>/dev/null || true)"
+fi
+[ -n "$MATCHLOCK_RPC_BIN" ] || fail "matchlock not found on PATH; set TAMANDUA_MATCHLOCK_RPC_BIN to the matchlock CLI"
+[ -f "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not found: $MATCHLOCK_RPC_BIN"
+[ -x "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not executable: $MATCHLOCK_RPC_BIN"
+
+# Default guest-init: `guest-init` next to the resolved matchlock binary, else
+# `guest-init` on PATH. An unresolved value stays UNSET so the matchlock CLI
+# resolves it itself.
+matchlock_default_guest_init() {
+  local dir candidate
+  dir="$(dirname -- "$1")"
+  candidate="$dir/guest-init"
+  if [ -f "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
+  command -v guest-init 2>/dev/null || true
+}
+if [ -n "${MATCHLOCK_GUEST_INIT:-}" ]; then
+  GUEST_INIT="$MATCHLOCK_GUEST_INIT"
+else
+  GUEST_INIT="$(matchlock_default_guest_init "$MATCHLOCK_RPC_BIN")"
+fi
+if [ -n "${MATCHLOCK_GUEST_FUSED:-}" ]; then
+  GUEST_FUSED="$MATCHLOCK_GUEST_FUSED"
+else
+  GUEST_FUSED="$GUEST_INIT"
+fi
+if [ -n "$GUEST_INIT" ]; then
+  [ -f "$GUEST_INIT" ] || fail "guest-init not found: $GUEST_INIT (unset MATCHLOCK_GUEST_INIT to let matchlock resolve it)"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  [ -f "$GUEST_FUSED" ] || fail "guest-fused not found: $GUEST_FUSED (unset MATCHLOCK_GUEST_FUSED to let matchlock resolve it)"
+fi
+
+# Observed (NOT pinned) runtime identity: recorded into the gate evidence dir.
+OBSERVED_MATCHLOCK_VERSION="$("$MATCHLOCK_RPC_BIN" --version 2>&1 | head -n 1 || true)"
+OBSERVED_MATCHLOCK_SHA="$(sha256sum "$MATCHLOCK_RPC_BIN" | awk '{print $1}')"
+if [ -n "$GUEST_INIT" ]; then
+  OBSERVED_GUEST_INIT_SHA="$(sha256sum "$GUEST_INIT" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_INIT_SHA="unset => resolved by matchlock"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  OBSERVED_GUEST_FUSED_SHA="$(sha256sum "$GUEST_FUSED" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_FUSED_SHA="unset => resolved by matchlock"
+fi
+echo "runtime observed (unpinned): matchlock ${OBSERVED_MATCHLOCK_VERSION:-no-version} sha256 $OBSERVED_MATCHLOCK_SHA"
+
+[ -f "$OPERATOR_CACHE/images/metadata.db" ] \
+  || fail "operator matchlock image store missing at $OPERATOR_CACHE/images/metadata.db"
+[ -d "$OPERATOR_CACHE/kernels" ] \
+  || fail "operator matchlock kernel cache missing at $OPERATOR_CACHE/kernels"
+
+npm run build || fail "npm run build failed"
+
+# The temporary host exemption MUST NOT be inherited by the gate daemon or any
+# round it drives; unset it in this runner's own environment.
+unset TAMANDUA_MATCHLOCK_TEMP_ALLOW_PRIVATE
+
+mkdir -p "$EVIDENCE_ROOT" || fail "cannot create evidence root $EVIDENCE_ROOT"
+# mkdtemp allocation: a NEW unique evidence dir every run — never a reused or
+# pre-cleaned path.
+EV="$(mktemp -d "$EVIDENCE_ROOT/allow-private-XXXXXX")" || fail "mktemp -d under $EVIDENCE_ROOT failed"
+echo "evidence dir: $EV"
+
+export TAMANDUA_MATCHLOCK_RPC_BIN="$MATCHLOCK_RPC_BIN"
+if [ -n "$GUEST_INIT" ]; then export MATCHLOCK_GUEST_INIT="$GUEST_INIT"; fi
+if [ -n "$GUEST_FUSED" ]; then export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"; fi
+export TAMANDUA_GATE_EVIDENCE_DIR="$EV"
+export TAMANDUA_GATE_EVIDENCE_ROOT="$EVIDENCE_ROOT"
+export TAMANDUA_GATE_OPERATOR_CACHE="$OPERATOR_CACHE"
+# Private fresh TMPDIR/HOME inside the owned evidence dir (guest-pack builds and
+# any scratch stay under owned evidence; never the operator's real HOME).
+export TMPDIR="$EV/tmp"
+mkdir -p "$TMPDIR"
+export HOME="$EV/home"
+mkdir -p "$HOME"
+
+RUNTIME_OBSERVED="$EV/runtime-observed.txt"
+{
+  echo "matchlock.path=$MATCHLOCK_RPC_BIN"
+  echo "matchlock.version=${OBSERVED_MATCHLOCK_VERSION:-no-version}"
+  echo "matchlock.sha256=$OBSERVED_MATCHLOCK_SHA"
+  echo "guest_init.path=${GUEST_INIT:-unset => resolved by matchlock}"
+  echo "guest_init.sha256=$OBSERVED_GUEST_INIT_SHA"
+  echo "guest_fused.path=${GUEST_FUSED:-unset => resolved by matchlock}"
+  echo "guest_fused.sha256=$OBSERVED_GUEST_FUSED_SHA"
+} > "$RUNTIME_OBSERVED"
+echo "runtime evidence: $RUNTIME_OBSERVED"
+
+LOG="$EV/gate-run.log"
+{
+  echo "=== MATCHLOCK ALLOW-PRIVATE GATE START $(date -u +%FT%TZ) EV=$EV ==="
+  echo "runtime: $MATCHLOCK_RPC_BIN"
+  echo "operator image store: $OPERATOR_CACHE"
+  echo "shared gate lock: $GATE_LOCK"
+  echo "private HOME: $HOME"
+  echo "TAMANDUA_MATCHLOCK_TEMP_ALLOW_PRIVATE: ${TAMANDUA_MATCHLOCK_TEMP_ALLOW_PRIVATE:-unset}"
+} | tee "$LOG"
+
+# The shared real-VM gate lock: a concurrent gate must never race this host.
+# flock propagates the wrapped command's exit status, so PIPESTATUS[0] is the
+# real test exit code.
+flock --exclusive "$GATE_LOCK" \
+  node --test --test-force-exit e2e-tests/matchlock-allow-private-gate.test.ts 2>&1 | tee -a "$LOG"
+RC=${PIPESTATUS[0]}
+echo "$RC" > "$EV/gate-exit-code.txt"
+echo "=== MATCHLOCK ALLOW-PRIVATE GATE END $(date -u +%FT%TZ) rc=$RC ===" | tee -a "$LOG"
+
+# ── no-fake-green: refuse PASS when no in-VM round was observed ──────────
+# The driver writes <EV>/observed-rounds.json. This guard reads it and exits
+# 92 — distinct from a test failure (1) and this runner's FATAL (90) — when the
+# count is zero or the evidence is missing/malformed.
+GUARD_RC=0
+node scripts/observed-rounds-guard.mjs --dir "$EV" --gate allow-private 2>&1 | tee -a "$LOG"
+GUARD_RC=${PIPESTATUS[0]}
+if [ "$GUARD_RC" -eq 92 ]; then
+  echo "run-matchlock-allow-private-e2e-test: ZERO-ROUND REFUSAL: no VM round observed (VM creation or probe failed before any round)" >&2
+  exit 92
+fi
+exit "$RC"

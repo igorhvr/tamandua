@@ -42,6 +42,13 @@ import {
   resolveMatchlockResourceLimits,
   type MatchlockResourceHostProbe,
 } from "./resource-limits.js";
+import {
+  MATCHLOCK_ALLOW_PRIVATE_GRAMMAR,
+  MATCHLOCK_ALLOW_PRIVATE_MAX_ENTRIES,
+  isAllowPrivateEntryShape,
+  normalizeAllowPrivateEntries,
+  validateAllowPrivateEntry,
+} from "./allow-private.js";
 
 /**
  * Current policy record version. Bump when the field set changes
@@ -52,8 +59,16 @@ import {
 export const MATCHLOCK_POLICY_VERSION = 2;
 /** Current mount-planning policy version (host/guest path rules). */
 export const MATCHLOCK_MOUNT_POLICY_VERSION = 1;
-/** Current guest network policy version (destination allow/deny). */
-export const MATCHLOCK_NETWORK_POLICY_VERSION = 1;
+/**
+ * Current guest network policy version (destination allow/deny).
+ *
+ * Version 2 (MTLK-ALLOW-PRIVATE) adds the optional allow-private destination
+ * list (`networkAllowPrivate`): the per-run exception list of private
+ * destinations the guest network may reach, mapped to the matchlock fork's
+ * `network.allow_private`. Version 1 records carry no such list; a persisted
+ * record whose `networkPolicyVersion` is not the current version fails closed.
+ */
+export const MATCHLOCK_NETWORK_POLICY_VERSION = 2;
 
 /**
  * Guest path where the resolved configuration directory is mounted. Kept
@@ -244,6 +259,15 @@ export interface ExecutionIsolation {
   gitMetadataRoots: string[];
   mountPolicyVersion: number;
   networkPolicyVersion: number;
+  /**
+   * Optional per-run allow-private destination list (MTLK-ALLOW-PRIVATE): the
+   * private destinations (host names, IP literals or CIDRs, optional `:port`)
+   * the guest network may reach; every other private destination stays
+   * blocked. Absent when empty. Persisted here so every round, retry and
+   * resume of the run dispatches the SAME list and dispatch never re-derives
+   * it from the daemon environment.
+   */
+  networkAllowPrivate?: string[];
   resourceLimits: ExecutionIsolationResourceLimits;
 }
 
@@ -307,6 +331,14 @@ export interface BuildMatchlockPolicyParams {
   submissionDshHomeEnv?: string | null;
   submissionDshHomeSource?: "env" | "default";
   resourceLimits?: ExecutionIsolationResourceLimits;
+  /**
+   * Optional per-run allow-private destination list (MTLK-ALLOW-PRIVATE)
+   * resolved at launch. Entries are normalized (trim/drop-blank/dedupe) and
+   * shape-validated here; the normalized list is stored ONLY when non-empty.
+   * Resolution/DNS is deliberately left to the matchlock fork — this is a
+   * shape check that fails closed before an invalid policy is persisted.
+   */
+  networkAllowPrivate?: readonly string[];
   /**
    * Optional injected host probe used ONLY when `resourceLimits` is absent, so
    * the host-derived defaults are deterministic in tests. Production callers
@@ -457,6 +489,28 @@ export function buildMatchlockPolicy(params: BuildMatchlockPolicyParams): Execut
   // imagePath normalization AND the hermes/dsh harness/submission validation.
   const imagePath = normalizeImagePath(params.imagePath);
 
+  // MTLK-ALLOW-PRIVATE: normalize then shape-validate the per-run allow-private
+  // destination list. The resolver is deliberately NOT consulted here — DNS
+  // resolution and rebinding-safe name matching are the matchlock fork's job;
+  // this fails closed on a malformed entry BEFORE an invalid policy is
+  // persisted. The field is stored ONLY when the normalized list is non-empty.
+  const networkAllowPrivate = normalizeAllowPrivateEntries(params.networkAllowPrivate ?? []);
+  if (networkAllowPrivate.length > MATCHLOCK_ALLOW_PRIVATE_MAX_ENTRIES) {
+    throw new MatchlockPolicyError(
+      "policy_invalid_record",
+      `Matchlock policy networkAllowPrivate accepts at most ${MATCHLOCK_ALLOW_PRIVATE_MAX_ENTRIES} entries (got ${networkAllowPrivate.length}).`,
+    );
+  }
+  for (const entry of networkAllowPrivate) {
+    const result = validateAllowPrivateEntry(entry);
+    if (!result.ok) {
+      throw new MatchlockPolicyError(
+        "policy_invalid_record",
+        `Matchlock policy networkAllowPrivate ${result.reason}. Entries are ${MATCHLOCK_ALLOW_PRIVATE_GRAMMAR}.`,
+      );
+    }
+  }
+
   // Harness axis: "pi" (pi configuration root/profile/defaults), "hermes"
   // (explicit Hermes configuration selection + FROZEN submission inputs), or
   // "dsh" (FROZEN submission context + resolved effective DSH_HOME). A record
@@ -539,6 +593,9 @@ export function buildMatchlockPolicy(params: BuildMatchlockPolicyParams): Execut
     gitMetadataRoots: [...params.gitMetadataRoots],
     mountPolicyVersion: MATCHLOCK_MOUNT_POLICY_VERSION,
     networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
+    // Clone so the persisted record never aliases caller state; omit entirely
+    // when empty so an unset list stays absent.
+    ...(networkAllowPrivate.length > 0 ? { networkAllowPrivate: [...networkAllowPrivate] } : {}),
     resourceLimits: params.resourceLimits
       ? { ...params.resourceLimits }
       : resolveDefaultResourceLimits(params.resourceHostProbe),
@@ -594,6 +651,7 @@ const EXECUTION_ISOLATION_KEYS = new Set([
   "gitMetadataRoots",
   "mountPolicyVersion",
   "networkPolicyVersion",
+  "networkAllowPrivate",
   "resourceLimits",
 ]);
 
@@ -822,6 +880,17 @@ export function matchlockPolicyValidationErrors(v: unknown): string[] {
   }
   if (v.networkPolicyVersion !== MATCHLOCK_NETWORK_POLICY_VERSION) {
     errors.push(`networkPolicyVersion must be ${MATCHLOCK_NETWORK_POLICY_VERSION} (got ${String(v.networkPolicyVersion)})`);
+  }
+  if (v.networkAllowPrivate !== undefined) {
+    if (!Array.isArray(v.networkAllowPrivate)) {
+      errors.push("networkAllowPrivate must be an array of allow-private entries when present");
+    } else if (v.networkAllowPrivate.length > MATCHLOCK_ALLOW_PRIVATE_MAX_ENTRIES) {
+      errors.push(
+        `networkAllowPrivate accepts at most ${MATCHLOCK_ALLOW_PRIVATE_MAX_ENTRIES} entries (got ${v.networkAllowPrivate.length})`,
+      );
+    } else if (!(v.networkAllowPrivate as unknown[]).every(isAllowPrivateEntryShape)) {
+      errors.push(`every networkAllowPrivate entry must be ${MATCHLOCK_ALLOW_PRIVATE_GRAMMAR}`);
+    }
   }
   if (!isExecutionIsolationResourceLimits(v.resourceLimits)) {
     errors.push("resourceLimits must be finite positive numbers");

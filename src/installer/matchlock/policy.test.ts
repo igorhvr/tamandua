@@ -419,6 +419,138 @@ describe("matchlock policy", () => {
     }
   });
 
+  // ── MTLK-ALLOW-PRIVATE US-002: persisted per-run allow-private list ──────
+
+  it("MATCHLOCK_NETWORK_POLICY_VERSION is 2 (version 2 adds the allow-private destination list)", () => {
+    assert.equal(MATCHLOCK_NETWORK_POLICY_VERSION, 2);
+  });
+
+  it("buildMatchlockPolicy records a normalized networkAllowPrivate list and round-trips it", () => {
+    const policy = buildMatchlockPolicy({
+      ...BASE,
+      networkAllowPrivate: [
+        " 192.168.107.74:8888 ",
+        "example.internal",
+        "192.168.107.74:8888",
+        "10.0.0.0/8",
+      ],
+    });
+    assert.equal(policy.networkPolicyVersion, MATCHLOCK_NETWORK_POLICY_VERSION);
+    assert.deepEqual(policy.networkAllowPrivate, [
+      "192.168.107.74:8888",
+      "example.internal",
+      "10.0.0.0/8",
+    ]);
+    const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(policy));
+    assert.deepEqual(parsed, policy);
+    assert.deepEqual(parsed.networkAllowPrivate, policy.networkAllowPrivate);
+    assert.ok(isExecutionIsolationPolicy(parsed));
+  });
+
+  it("buildMatchlockPolicy clones the allow-private array (persisted record never aliases caller state)", () => {
+    const supplied = ["192.168.107.74:8888"];
+    const policy = buildMatchlockPolicy({ ...BASE, networkAllowPrivate: supplied });
+    supplied.push("later.example");
+    assert.deepEqual(policy.networkAllowPrivate, ["192.168.107.74:8888"]);
+  });
+
+  it("buildMatchlockPolicy omits networkAllowPrivate when no entries are admitted", () => {
+    const policy = buildMatchlockPolicy(BASE);
+    assert.equal("networkAllowPrivate" in policy, false);
+    const empty = buildMatchlockPolicy({ ...BASE, networkAllowPrivate: [] });
+    assert.equal("networkAllowPrivate" in empty, false);
+    const blanks = buildMatchlockPolicy({ ...BASE, networkAllowPrivate: ["  ", ""] });
+    assert.equal("networkAllowPrivate" in blanks, false);
+    const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(policy));
+    assert.equal(parsed.networkAllowPrivate, undefined);
+  });
+
+  it("buildMatchlockPolicy rejects an invalid allow-private entry naming the entry", () => {
+    assert.throws(
+      () => buildMatchlockPolicy({ ...BASE, networkAllowPrivate: ["good.example", "10.0.0.0/99"] }),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /networkAllowPrivate/.test(err.message) &&
+        /10\.0\.0\.0\/99/.test(err.message),
+    );
+  });
+
+  it("buildMatchlockPolicy rejects an oversized allow-private list", () => {
+    const many = Array.from({ length: 65 }, (_, i) => `10.0.${Math.floor(i / 256)}.${i % 256}`);
+    assert.throws(
+      () => buildMatchlockPolicy({ ...BASE, networkAllowPrivate: many }),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /networkAllowPrivate/.test(err.message) &&
+        /at most 64/.test(err.message),
+    );
+  });
+
+  it("parse accepts a record carrying networkAllowPrivate", () => {
+    const policy = buildMatchlockPolicy({ ...BASE, networkAllowPrivate: ["192.168.107.74:8888"] });
+    const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(policy));
+    assert.deepEqual(parsed.networkAllowPrivate, ["192.168.107.74:8888"]);
+  });
+
+  it("parse fails closed on a non-array networkAllowPrivate", () => {
+    const policy = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+    for (const bad of ["192.168.107.74:8888", 42, { entry: "192.168.107.74:8888" }, null]) {
+      policy.networkAllowPrivate = bad;
+      assert.throws(
+        () => parseMatchlockPolicy(JSON.stringify(policy)),
+        (err: unknown) =>
+          err instanceof MatchlockPolicyError &&
+          err.code === "policy_invalid_record" &&
+          /networkAllowPrivate/.test(err.message),
+        `networkAllowPrivate ${JSON.stringify(bad)} must fail closed`,
+      );
+    }
+  });
+
+  it("parse fails closed on an entry that fails the US-001 shape validator", () => {
+    const policy = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+    for (const bad of [["10.0.0.0/99"], ["has space"], [""], ["host:0"], ["[fe80::1]"]]) {
+      policy.networkAllowPrivate = bad;
+      assert.throws(
+        () => parseMatchlockPolicy(JSON.stringify(policy)),
+        (err: unknown) =>
+          err instanceof MatchlockPolicyError &&
+          err.code === "policy_invalid_record" &&
+          /networkAllowPrivate/.test(err.message),
+        `networkAllowPrivate ${JSON.stringify(bad)} must fail closed`,
+      );
+    }
+  });
+
+  it("parse fails closed on an oversized networkAllowPrivate list", () => {
+    const policy = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+    policy.networkAllowPrivate = Array.from({ length: 65 }, (_, i) => `10.0.${Math.floor(i / 256)}.${i % 256}`);
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(policy)),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /networkAllowPrivate/.test(err.message),
+    );
+  });
+
+  it("unknown-field rejection is unaffected by the new networkAllowPrivate key", () => {
+    const policy = buildMatchlockPolicy({
+      ...BASE,
+      networkAllowPrivate: ["192.168.107.74:8888"],
+    }) as unknown as Record<string, unknown>;
+    policy["not_a_policy_field"] = "x";
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(policy)),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /unknown field "not_a_policy_field"/.test(err.message),
+    );
+  });
+
   // ── MTLK-HERMES-EXEC US-003: hermes harness axis on the persisted policy ─
 
   const HERMES_SUBMISSION = {

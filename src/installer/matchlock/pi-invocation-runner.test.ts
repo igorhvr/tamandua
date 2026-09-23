@@ -51,6 +51,7 @@ import {
   type MatchlockInvocationFaults,
 } from "../../../dist/installer/matchlock/pi-invocation-runner.js";
 import type { ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
+import { MATCHLOCK_NETWORK_POLICY_VERSION } from "../../../dist/installer/matchlock/policy.js";
 import { guestSuiteNamespaceId, type GuestSuiteNamespace } from "../../../dist/installer/matchlock/guest-suite-contract.js";
 import { stripGuestSuiteEnv, GUEST_SUITE_ENV_KEYS } from "../../../dist/installer/matchlock/suite-wire-env.js";
 import { committedTreeHash, computeCmdHash } from "../../../dist/installer/matchlock/guest-suite-git.js";
@@ -218,7 +219,7 @@ function fixturePolicy(rig: FixtureRig, over: Partial<ExecutionIsolation> = {}):
     originalRepositoryRoot: rig.repoDir,
     gitMetadataRoots: [],
     mountPolicyVersion: 1,
-    networkPolicyVersion: 1,
+    networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
     resourceLimits: { cpus: 1, memoryMB: 512, diskSizeMB: 2048 },
     ...over,
   };

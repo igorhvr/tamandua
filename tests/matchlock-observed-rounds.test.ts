@@ -39,7 +39,7 @@ interface GateWiring {
  * union-final adds the four gates the three Matchlock-line landings brought
  * (dsh/hermes merge-worktree, VM-size, cleanup), so the full thirteen-runner
  * family is pinned here. MTLK-ALIAS-FIX US-005 adds the two-daemon
- * alias-isolation regression gate (fourteenth runner).
+ * alias-isolation regression gate (fourteenth runner; MTLK-ALLOW-PRIVATE US-009 adds the allow-private gate, fifteenth).
  */
 const WIRED_GATES: readonly GateWiring[] = [
   {
@@ -126,6 +126,12 @@ const WIRED_GATES: readonly GateWiring[] = [
     driver: "e2e-tests/matchlock-alias-isolation-gate.test.ts",
     gate: "alias-isolation",
   },
+  {
+    label: "allow-private",
+    runner: "run-matchlock-allow-private-e2e-test",
+    driver: "e2e-tests/matchlock-allow-private-gate.test.ts",
+    gate: "allow-private",
+  },
 ];
 
 /**
@@ -148,6 +154,7 @@ const EXPECTED_GATE_RUNNERS: readonly string[] = [
   "run-matchlock-vm-size-gate-e2e-test",
   "run-matchlock-cleanup-e2e-test",
   "run-matchlock-alias-isolation-e2e-test",
+  "run-matchlock-allow-private-e2e-test",
 ];
 
 function readRepoFile(relativePath: string): string {
@@ -165,7 +172,7 @@ describe("observed-rounds wiring: wired Matchlock gates refuse hollow greens", (
     assert.notEqual(ZERO_ROUND_EXIT_CODE, 90);
   });
 
-  it("pins the complete fourteen-runner Matchlock/hermes gate family", () => {
+  it("pins the complete fifteen-runner Matchlock/hermes gate family", () => {
     const wired = WIRED_GATES.map((w) => w.runner).sort();
     const expected = [...EXPECTED_GATE_RUNNERS].sort();
     assert.deepEqual(

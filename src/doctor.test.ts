@@ -15,8 +15,10 @@ import { DatabaseSync } from "node:sqlite";
 import { runDoctorChecks, runLlmPromptAdherenceChecks, formatDoctorOutput,
   checkDshSessionStore, detectDshZstdSupport, evaluateDshPermissionDump,
   runLivenessChecks, repairLiveness, runMatchlockAliasChecks,
+  checkMatchlockAllowPrivateSupport, MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
   MATCHLOCK_ALIAS_CHECK_NAME } from "../dist/doctor.js";
 import type { DoctorCheckResult, CheckGroup } from "../dist/doctor.js";
+import type { MatchlockAllowPrivateSupport } from "../dist/installer/matchlock/allow-private-support.js";
 import {
   MATCHLOCK_HOME_ALIAS_ENV,
   MatchlockHomeAliasError,
@@ -623,6 +625,81 @@ describe("ENVIRONMENT checks (US-003)", () => {
   });
 });
 
+// ── ENVIRONMENT matchlock allow_private support (US-007) ──────────
+
+describe("ENVIRONMENT matchlock allow_private support (US-007)", () => {
+  it("passes and names the resolved path/version when the probe reports support", async () => {
+    const support: MatchlockAllowPrivateSupport = {
+      supported: true,
+      binaryPath: "/opt/matchlock/bin/matchlock",
+      version: "0.2.17",
+    };
+    const check = await checkMatchlockAllowPrivateSupport(async () => support);
+    assert.strictEqual(check.name, MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME);
+    assert.strictEqual(check.status, "pass");
+    assert.ok(check.message.includes("/opt/matchlock/bin/matchlock"),
+      `Message should name the resolved binary, got: ${check.message}`);
+    assert.ok(check.message.includes("0.2.17"),
+      `Message should carry the version, got: ${check.message}`);
+    assert.strictEqual(check.remedy, undefined);
+  });
+
+  it("warns with the upgrade remedy when the binary lacks --allow-private", async () => {
+    const check = await checkMatchlockAllowPrivateSupport(async () => ({
+      supported: false,
+      binaryPath: "/usr/local/bin/matchlock",
+      version: "0.1.0",
+      reasonCode: "unsupported",
+      reason: "\"… run --help\" does not list --allow-private",
+    }));
+    assert.strictEqual(check.status, "warn");
+    assert.ok(check.message.includes("--allow-private"),
+      `Message should name the flag, got: ${check.message}`);
+    assert.ok(check.message.includes("/usr/local/bin/matchlock"),
+      `Message should name the binary, got: ${check.message}`);
+    assert.ok(check.message.includes("will be refused at admission"),
+      `Message should state the impact, got: ${check.message}`);
+    assert.ok(check.remedy, "warn must carry a remedy");
+    assert.match(check.remedy!, /Upgrade matchlock/);
+    assert.match(check.remedy!, /refused/);
+  });
+
+  it("returns info (non-fatal) when matchlock is absent", async () => {
+    const check = await checkMatchlockAllowPrivateSupport(async () => ({
+      supported: false,
+      binaryPath: "matchlock",
+      reasonCode: "missing_binary",
+      reason: "matchlock binary not found: matchlock",
+    }));
+    assert.strictEqual(check.status, "info");
+    assert.ok(check.message.includes("not found"),
+      `Message should say the binary is missing, got: ${check.message}`);
+    assert.strictEqual(check.remedy, undefined);
+  });
+
+  it("warns without throwing when the probe itself throws", async () => {
+    const check = await checkMatchlockAllowPrivateSupport(async () => {
+      throw new Error("spawn blew up");
+    });
+    assert.strictEqual(check.status, "warn");
+    assert.ok(check.message.includes("spawn blew up"),
+      `Message should carry the probe error, got: ${check.message}`);
+    assert.ok(check.remedy, "warn must carry a remedy");
+  });
+
+  it("runDoctorChecks includes the check and never fails the doctor on it", async () => {
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+    const check = env!.checks.find(
+      (c) => c.name === MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+    );
+    assert.ok(check, "Expected the matchlock allow_private support check");
+    assert.notStrictEqual(check!.status, "fail",
+      `allow_private support probe must never fail the doctor, got: ${check!.status}`);
+  });
+});
+
 // ── Hermes contract check helpers ────────────────────────────────
 
 /** Create a fixture HERMES_HOME directory with a state.db. */
@@ -718,7 +795,7 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     }
   });
 
-  it("when no hermes binary, ENVIRONMENT group has exactly 8 checks (no contract check)", async () => {
+  it("when no hermes binary, ENVIRONMENT group has exactly 9 checks (no contract check)", async () => {
     delete process.env.TAMANDUA_HERMES_BINARY;
 
     // Create a fake zsh that won't find hermes via login shell
@@ -755,10 +832,11 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
       "Should NOT have dsh permission-mode check when dsh binary is absent");
 
     // Discovery checks always present; contract absent when no hermes.
-    // 8 always-on checks: node, pi, gh, pi-token-saver,
-    // hermes-token-saver, dsh-token-saver, hermes discovery, dsh discovery.
-    assert.strictEqual(env!.checks.length, 8,
-      `Expected exactly 8 ENVIRONMENT checks when no hermes and no dsh, got ${env!.checks.length}: ${env!.checks.map((c: DoctorCheckResult) => c.name).join(", ")}`);
+    // 9 always-on checks: node, pi, gh, pi-token-saver, hermes-token-saver,
+    // dsh-token-saver, matchlock allow_private support, hermes discovery,
+    // dsh discovery.
+    assert.strictEqual(env!.checks.length, 9,
+      `Expected exactly 9 ENVIRONMENT checks when no hermes and no dsh, got ${env!.checks.length}: ${env!.checks.map((c: DoctorCheckResult) => c.name).join(", ")}`);
   });
 
   it("hermes contract check shows info with 'contract OK' when state.db is valid", async () => {
@@ -793,10 +871,10 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     assert.ok(contractCheck!.message.includes(stubPath),
       `Message should include the resolved binary path, got: ${contractCheck!.message}`);
 
-    // 8 always-on checks + hermes contract check = 9 (no dsh available:
+    // 9 always-on checks + hermes contract check = 10 (no dsh available:
     // PATH is the fixture dir with no dsh/zsh).
-    assert.strictEqual(env!.checks.length, 9,
-      `Expected exactly 9 ENVIRONMENT checks with hermes available and no dsh, got ${env!.checks.length}`);
+    assert.strictEqual(env!.checks.length, 10,
+      `Expected exactly 10 ENVIRONMENT checks with hermes available and no dsh, got ${env!.checks.length}`);
   });
 
   it("hermes contract check shows warn when state.db has no sessions table", async () => {
@@ -1040,9 +1118,9 @@ describe("ENVIRONMENT dsh checks (US-009)", () => {
     assert.notStrictEqual(permissionCheck!.status, "fail",
       `dsh permission-mode check must never fail, got: ${permissionCheck!.status}`);
 
-    // 8 always-on + 2 gated dsh probes = 10 (no hermes).
-    assert.strictEqual(env!.checks.length, 10,
-      `Expected exactly 10 ENVIRONMENT checks with dsh available and no hermes, got ${env!.checks.length}`);
+    // 9 always-on + 2 gated dsh probes = 11 (no hermes).
+    assert.strictEqual(env!.checks.length, 11,
+      `Expected exactly 11 ENVIRONMENT checks with dsh available and no hermes, got ${env!.checks.length}`);
   });
 
   it("discovery warns when TAMANDUA_DSH_BINARY is set but not executable", async () => {

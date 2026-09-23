@@ -62,6 +62,13 @@ export interface MatchlockResourceInfo {
   cpus: number;
   memoryMB: number;
   diskSizeMB: number;
+  /**
+   * MTLK-ALLOW-PRIVATE (US-006): the persisted per-run exception list of
+   * private destinations from `networkAllowPrivate`. Omitted when the policy
+   * carries no entries, so native runs and empty-list runs keep the previous
+   * status output byte-identical.
+   */
+  allowPrivate?: string[];
 }
 
 export interface RunDetail extends RunInfo {
@@ -880,6 +887,12 @@ function buildRunDetail(
         cpus: policy.resourceLimits.cpus,
         memoryMB: policy.resourceLimits.memoryMB,
         diskSizeMB: policy.resourceLimits.diskSizeMB,
+        // MTLK-ALLOW-PRIVATE (US-006): surface the persisted exception list so
+        // `workflow status` can show which private destinations the run may
+        // reach. Omitted entirely when the policy carries none.
+        ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
+          ? { allowPrivate: [...policy.networkAllowPrivate] }
+          : {}),
       };
     } catch {
       matchlockResources = undefined;

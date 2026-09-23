@@ -78,6 +78,14 @@ import type {
   MatchlockHomeAliasInspection,
   MatchlockHomeAliasOwnerRecord,
 } from "./installer/matchlock/home-alias.js";
+import {
+  MATCHLOCK_ALLOW_PRIVATE_FLAG,
+  probeMatchlockAllowPrivateSupport,
+} from "./installer/matchlock/allow-private-support.js";
+import type {
+  MatchlockAllowPrivateSupport,
+  ProbeMatchlockAllowPrivateSupportOptions,
+} from "./installer/matchlock/allow-private-support.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -719,6 +727,82 @@ export async function checkDshPermissionMode(
     message:
       `could not verify the composed sandbox/approval config: ${evaluation.reason}. ` +
       `Out-of-worktree actions like \`tamandua step complete\` may be auto-denied if ${patchPath} pins sandbox/approval rows (alpha support)`,
+  };
+}
+
+// ── Matchlock allow_private support probe (MTLK-ALLOW-PRIVATE) ───
+
+/** Check name reported in the ENVIRONMENT group for the matchlock allow_private probe. */
+export const MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME = "Matchlock allow_private support";
+
+/** Injectable probe seam for {@link checkMatchlockAllowPrivateSupport} (tests). */
+export type MatchlockAllowPrivateSupportProbe = (
+  options?: ProbeMatchlockAllowPrivateSupportOptions,
+) => Promise<MatchlockAllowPrivateSupport>;
+
+const MATCHLOCK_ALLOW_PRIVATE_UPGRADE_REMEDY =
+  `Upgrade matchlock to a build whose \`matchlock run --help\` lists ${MATCHLOCK_ALLOW_PRIVATE_FLAG}; ` +
+  "runs requesting --matchlock-allow-private will be refused at admission until then.";
+
+/**
+ * Report whether the installed matchlock supports `--allow-private`.
+ *
+ * Report-only and side-effect-free: it runs the bounded
+ * {@link probeMatchlockAllowPrivateSupport} (help/version reads only) and maps
+ * the outcome to a non-fatal doctor check:
+ *
+ *  - supported          → pass, naming the resolved binary (and version);
+ *  - binary absent      → info (matchlock is optional for native runs);
+ *  - flag absent/failed → warn with the upgrade remedy (allow-private runs
+ *                         will be refused rather than silently downgraded).
+ *
+ * The probe is injectable so unit tests never spawn a real matchlock.
+ */
+export async function checkMatchlockAllowPrivateSupport(
+  probe: MatchlockAllowPrivateSupportProbe = probeMatchlockAllowPrivateSupport,
+): Promise<DoctorCheckResult> {
+  let result: MatchlockAllowPrivateSupport;
+  try {
+    result = await probe();
+  } catch (err) {
+    return {
+      name: MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+      status: "warn",
+      message:
+        "could not probe the installed matchlock for " +
+        `${MATCHLOCK_ALLOW_PRIVATE_FLAG} support: ${err instanceof Error ? err.message : String(err)}`,
+      remedy: MATCHLOCK_ALLOW_PRIVATE_UPGRADE_REMEDY,
+    };
+  }
+
+  const versionSuffix = result.version ? `, version ${result.version}` : "";
+
+  if (result.supported) {
+    return {
+      name: MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+      status: "pass",
+      message: `installed matchlock supports ${MATCHLOCK_ALLOW_PRIVATE_FLAG} (${result.binaryPath}${versionSuffix})`,
+    };
+  }
+
+  if (result.reasonCode === "missing_binary") {
+    return {
+      name: MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+      status: "info",
+      message:
+        `matchlock binary not found (${result.binaryPath}); --matchlock runs are unavailable ` +
+        `and ${MATCHLOCK_ALLOW_PRIVATE_FLAG} cannot be used`,
+    };
+  }
+
+  return {
+    name: MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+    status: "warn",
+    message:
+      `installed matchlock does not support ${MATCHLOCK_ALLOW_PRIVATE_FLAG} ` +
+      `(${result.binaryPath}${versionSuffix}): ${result.reason ?? "the flag is not listed by `run --help`"}. ` +
+      "Runs requesting --matchlock-allow-private will be refused at admission.",
+    remedy: MATCHLOCK_ALLOW_PRIVATE_UPGRADE_REMEDY,
   };
 }
 
@@ -2037,6 +2121,9 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
     checkPiTokenSaver(),
     checkHermesTokenSaver(),
     checkDshTokenSaver(),
+    // MTLK-ALLOW-PRIVATE: always-on, non-fatal probe of the installed
+    // matchlock's --allow-private support (reports absent/unsupported).
+    checkMatchlockAllowPrivateSupport(),
     buildHermesBinaryDiscoveryCheck(hermesAvailable),
     buildDshBinaryDiscoveryCheck(dshAvailable),
   ];

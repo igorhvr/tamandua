@@ -388,6 +388,32 @@ Examples:
       assert.match(help, /TAMANDUA_MATCHLOCK_DISK_MB/);
       assert.match(matchlockSection, /Requires --matchlock <image>/);
     });
+
+    // MTLK-ALLOW-PRIVATE US-004: the help documents the repeatable
+    // allow-private flag, its entry grammar, the env fallback and that it
+    // requires --matchlock.
+    it("documents --matchlock-allow-private and TAMANDUA_MATCHLOCK_ALLOW_PRIVATE (US-004)", () => {
+      const help = getWorkflowRunHelp();
+      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+
+      // The option header and its required value placeholder.
+      assert.match(matchlockSection, /--matchlock-allow-private <entry>/);
+
+      // Repeatability and the inline form.
+      assert.match(matchlockSection, /Repeatable/);
+      assert.match(matchlockSection, /--matchlock-allow-private=<entry>/);
+
+      // The entry grammar (shape-only validation; resolution is matchlock's).
+      assert.match(matchlockSection, /host name, an IPv4\/IPv6 literal or CIDR/);
+      assert.match(matchlockSection, /\[addr\]:port/);
+      assert.match(matchlockSection, /DNS resolution is Matchlock's job/);
+
+      // Env fallback + precedence and the requires---matchlock rule.
+      assert.match(help, /TAMANDUA_MATCHLOCK_ALLOW_PRIVATE/);
+      assert.match(matchlockSection, /comma-separated list/);
+      assert.match(matchlockSection, /Requires --matchlock <image>/);
+      assert.match(matchlockSection, /network\.allow_private/);
+    });
   });
 
   it("declines commands owned by other command groups", async () => {
@@ -786,10 +812,12 @@ Examples:
         diskSizeMB: 20480,
       },
       image = "vic/matchlock-base:latest",
+      networkAllowPrivate?: string[],
     ): string {
       return serializeMatchlockPolicy(
         buildMatchlockPolicy({
           requestedImage: image,
+          networkAllowPrivate,
           identity: {
             digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             config_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -913,6 +941,68 @@ Examples:
         false,
         "native --json output must not carry matchlockResources",
       );
+    });
+
+    // MTLK-ALLOW-PRIVATE (US-006): status shows the PERSISTED allow-private
+    // list (text and --json) and stays byte-identical when the policy carries
+    // none.
+    it("workflow status text output appends the persisted allow-private entries", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      setMatchlockPolicy(
+        runId,
+        matchlockPolicyJson(undefined, undefined, [
+          "192.168.107.74:8888",
+          "box.internal",
+        ]),
+      );
+
+      const output = await captureStatusOutput(runId);
+      assert.match(
+        output,
+        /matchlock: vic\/matchlock-base:latest cpus=8 memory=16384MB disk=20480MB allow-private=192\.168\.107\.74:8888,box\.internal/,
+      );
+    });
+
+    it("workflow status --json carries the persisted allowPrivate in matchlockResources", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      setMatchlockPolicy(
+        runId,
+        matchlockPolicyJson(undefined, undefined, ["192.168.107.74:8888"]),
+      );
+
+      const output = await captureStatusOutput(runId, ["--json"]);
+      const parsed = JSON.parse(output.trim());
+      assert.deepEqual(parsed.matchlockResources, {
+        image: "vic/matchlock-base:latest",
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+        allowPrivate: ["192.168.107.74:8888"],
+      });
+    });
+
+    it("workflow status omits allow-private for a policy that never admitted any", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      setMatchlockPolicy(runId, matchlockPolicyJson());
+
+      const text = await captureStatusOutput(runId);
+      assert.doesNotMatch(text, /allow-private/);
+
+      const json = JSON.parse((await captureStatusOutput(runId, ["--json"])).trim());
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(json.matchlockResources, "allowPrivate"),
+        false,
+        "an empty allow-private list must not add a status JSON key",
+      );
+      assert.deepEqual(json.matchlockResources, {
+        image: "vic/matchlock-base:latest",
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+      });
     });
   });
 
@@ -1526,5 +1616,70 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
       "workingDirectory",
       "workspaceMode",
     ]);
+  });
+
+  // MTLK-ALLOW-PRIVATE (US-006): the resolved allow-private list is shown on
+  // the launch line and in the launch JSON only when non-empty.
+  it("appends the resolved allow-private entries to the launch line", () => {
+    const lines = formatWorkflowRunLaunchLines(
+      baseLaunchInfo({
+        matchlockResources: {
+          image: "vic/matchlock-base:latest",
+          cpus: 4,
+          memoryMB: 4096,
+          diskSizeMB: 20480,
+          allowPrivate: ["192.168.107.74:8888", "box.internal"],
+        },
+      }),
+    );
+
+    assert.equal(
+      lines[3],
+      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB allow-private=192.168.107.74:8888,box.internal",
+    );
+  });
+
+  it("carries the resolved allow-private entries in the launch JSON", () => {
+    const json = workflowRunLaunchInfoToJson(
+      baseLaunchInfo({
+        matchlockResources: {
+          image: "vic/matchlock-base:latest",
+          cpus: 4,
+          memoryMB: 4096,
+          diskSizeMB: 20480,
+          allowPrivate: ["192.168.107.74:8888"],
+        },
+      }),
+    );
+    assert.deepEqual(json.matchlockResources, {
+      image: "vic/matchlock-base:latest",
+      cpus: 4,
+      memoryMB: 4096,
+      diskSizeMB: 20480,
+      allowPrivate: ["192.168.107.74:8888"],
+    });
+  });
+
+  it("keeps the launch line/JSON byte-identical when the allow-private list is empty or absent", () => {
+    const base = {
+      image: "vic/matchlock-base:latest",
+      cpus: 4,
+      memoryMB: 4096,
+      diskSizeMB: 20480,
+    };
+    const expectedLine =
+      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB";
+
+    for (const matchlockResources of [base, { ...base, allowPrivate: [] }]) {
+      const lines = formatWorkflowRunLaunchLines(baseLaunchInfo({ matchlockResources }));
+      assert.equal(lines[3], expectedLine);
+      const json = workflowRunLaunchInfoToJson(baseLaunchInfo({ matchlockResources }));
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(json.matchlockResources as object, "allowPrivate"),
+        false,
+        "empty allow-private must not add a JSON key",
+      );
+      assert.deepEqual(json.matchlockResources, base);
+    }
   });
 });

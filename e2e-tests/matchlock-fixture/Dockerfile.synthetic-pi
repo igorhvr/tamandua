@@ -27,10 +27,20 @@ FROM node:22-bookworm-slim
 
 # git (committed-tree/tracked-tree hashing for the suite ledger) + basic
 # utilities (mktemp/dirname are already in coreutils; ca-certificates keeps
-# git usable offline-free). No build toolchain is installed.
+# git usable offline-free) + curl for the MTLK-ALLOW-PRIVATE US-009 in-guest
+# private-destination probe (default-off; see below). No build toolchain is
+# installed.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
+
+# MTLK-ALLOW-PRIVATE (US-009): the allow-private gate bakes the in-guest curl
+# probe URL into a DERIVED image through this build arg, so it reaches the
+# guest as image config env. The default is EMPTY, which leaves the probe off
+# and keeps every existing synthetic pi/dsh/hermes gate byte-identical at
+# runtime (synthetic-pi.mjs spawns no curl and writes no marker).
+ARG TAMANDUA_SYNTHETIC_PI_CURL_URL=
+ENV TAMANDUA_SYNTHETIC_PI_CURL_URL=${TAMANDUA_SYNTHETIC_PI_CURL_URL}
 
 # Deterministic TEST-ONLY non-default image PATH: pi is reachable ONLY through
 # the image's own ENV PATH (plus the standard runtime dirs the guest needs).

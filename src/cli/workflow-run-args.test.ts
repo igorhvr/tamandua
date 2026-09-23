@@ -797,4 +797,233 @@ describe("parseWorkflowRunArgs", () => {
       assert.equal(result.matchlockMemory, "8g");
     });
   });
+
+  // MTLK-ALLOW-PRIVATE US-004: the repeatable allow-private flag + env default.
+  describe("--matchlock-allow-private", () => {
+    const ENV_VAR = "TAMANDUA_MATCHLOCK_ALLOW_PRIVATE";
+
+    function withEnv<T>(value: string | undefined, fn: () => T): T {
+      const previous = process.env[ENV_VAR];
+      if (value === undefined) delete process.env[ENV_VAR];
+      else process.env[ENV_VAR] = value;
+      try {
+        return fn();
+      } finally {
+        if (previous === undefined) delete process.env[ENV_VAR];
+        else process.env[ENV_VAR] = previous;
+      }
+    }
+
+    it("parses repeated space-form entries alongside --matchlock", () => {
+      withEnv(undefined, () => {
+        const result = parseWorkflowRunArgs([
+          "Build feature",
+          "--matchlock", "vic/ml",
+          "--matchlock-allow-private", "192.168.107.74:8888",
+          "--matchlock-allow-private", "registry.internal.example",
+        ]);
+        assert.deepEqual(result.matchlockAllowPrivate, [
+          "192.168.107.74:8888",
+          "registry.internal.example",
+        ]);
+        assert.equal(result.matchlockImage, "vic/ml");
+        assert.equal(result.taskTitle, "Build feature");
+      });
+    });
+
+    it("parses the inline --matchlock-allow-private=<entry> form", () => {
+      withEnv(undefined, () => {
+        const result = parseWorkflowRunArgs([
+          "task",
+          "--matchlock=vic/ml",
+          "--matchlock-allow-private=10.0.0.0/8",
+          "--matchlock-allow-private=[2001:db8::1]:443",
+        ]);
+        assert.deepEqual(result.matchlockAllowPrivate, ["10.0.0.0/8", "[2001:db8::1]:443"]);
+      });
+    });
+
+    it("dedupes repeated entries and trims them, preserving first-seen order", () => {
+      withEnv(undefined, () => {
+        const result = parseWorkflowRunArgs([
+          "task",
+          "--matchlock", "vic/ml",
+          "--matchlock-allow-private", "  example.com ",
+          "--matchlock-allow-private", "example.com",
+          "--matchlock-allow-private", "10.0.0.0/8",
+        ]);
+        assert.deepEqual(result.matchlockAllowPrivate, ["example.com", "10.0.0.0/8"]);
+      });
+    });
+
+    it("is absent when neither the flag nor the env var is set", () => {
+      withEnv(undefined, () => {
+        const result = parseWorkflowRunArgs(["task", "--matchlock", "vic/ml"]);
+        assert.equal(result.matchlockAllowPrivate, undefined);
+      });
+    });
+
+    it("falls back to the comma-separated env default when the flag is absent", () => {
+      withEnv(" 192.168.107.74:8888 , registry.internal.example ,, ", () => {
+        const result = parseWorkflowRunArgs(["task", "--matchlock", "vic/ml"]);
+        assert.deepEqual(result.matchlockAllowPrivate, [
+          "192.168.107.74:8888",
+          "registry.internal.example",
+        ]);
+      });
+    });
+
+    it("uses an explicit flag list instead of the env default", () => {
+      withEnv("env-only.example", () => {
+        const result = parseWorkflowRunArgs([
+          "task",
+          "--matchlock", "vic/ml",
+          "--matchlock-allow-private", "flag-only.example",
+        ]);
+        assert.deepEqual(result.matchlockAllowPrivate, ["flag-only.example"]);
+      });
+    });
+
+    it("ignores the env default (even an invalid one) without --matchlock", () => {
+      withEnv("10.0.0.0/99", () => {
+        const result = parseWorkflowRunArgs(["task"]);
+        assert.equal(result.matchlockAllowPrivate, undefined);
+      });
+    });
+
+    it("rejects an invalid flag entry, naming the entry", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task",
+              "--matchlock", "vic/ml",
+              "--matchlock-allow-private", "10.0.0.0/99",
+            ]),
+          (err: unknown) => {
+            const message = (err as Error).message;
+            return (
+              message.includes("--matchlock-allow-private") &&
+              message.includes("10.0.0.0/99")
+            );
+          },
+        );
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task",
+              "--matchlock", "vic/ml",
+              "--matchlock-allow-private", "host:70000",
+            ]),
+          /host:70000/,
+        );
+      });
+    });
+
+    it("rejects an invalid env entry, naming the entry and the env var", () => {
+      withEnv("ok.example,10.0.0.0/99", () => {
+        assert.throws(
+          () => parseWorkflowRunArgs(["task", "--matchlock", "vic/ml"]),
+          (err: unknown) => {
+            const message = (err as Error).message;
+            return message.includes("TAMANDUA_MATCHLOCK_ALLOW_PRIVATE") &&
+              message.includes("10.0.0.0/99");
+          },
+        );
+      });
+    });
+
+    it("rejects the flag without --matchlock, naming the flag", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () => parseWorkflowRunArgs(["task", "--matchlock-allow-private", "10.0.0.0/8"]),
+          /--matchlock-allow-private requires --matchlock <image>/,
+        );
+        // The requires---matchlock usage error wins even when the entry is
+        // itself malformed, so no shape error masks the real problem.
+        assert.throws(
+          () => parseWorkflowRunArgs(["task", "--matchlock-allow-private", "10.0.0.0/99"]),
+          /--matchlock-allow-private requires --matchlock <image>/,
+        );
+      });
+    });
+
+    it("names the first supplied --matchlock-dependent flag when --matchlock is missing", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task",
+              "--matchlock-allow-private", "10.0.0.0/8",
+              "--matchlock-cpus", "4",
+            ]),
+          /--matchlock-allow-private requires --matchlock <image>/,
+        );
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task",
+              "--matchlock-cpus", "4",
+              "--matchlock-allow-private", "10.0.0.0/8",
+            ]),
+          /--matchlock-cpus requires --matchlock <image>/,
+        );
+      });
+    });
+
+    it("rejects a missing or empty value", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () => parseWorkflowRunArgs(["task", "--matchlock", "vic/ml", "--matchlock-allow-private"]),
+          /Missing value for --matchlock-allow-private/,
+        );
+        assert.throws(
+          () => parseWorkflowRunArgs(["task", "--matchlock", "vic/ml", "--matchlock-allow-private="]),
+          /Missing value for --matchlock-allow-private/,
+        );
+      });
+    });
+
+    it("never consumes a following recognized option as an entry", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task",
+              "--matchlock", "vic/ml",
+              "--matchlock-allow-private", "--wait",
+            ]),
+          /is an option, not an entry/,
+        );
+        assert.throws(
+          () =>
+            parseWorkflowRunArgs([
+              "task",
+              "--matchlock", "vic/ml",
+              "--matchlock-allow-private=--pi-as-harness",
+            ]),
+          /is an option, not an entry/,
+        );
+      });
+    });
+
+    it("--matchlock does not consume --matchlock-allow-private as its image", () => {
+      withEnv(undefined, () => {
+        assert.throws(
+          () => parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-allow-private", "10.0.0.0/8"]),
+          /Missing value for --matchlock/,
+        );
+      });
+    });
+
+    it("treats the flag after the -- separator as task text", () => {
+      withEnv(undefined, () => {
+        const result = parseWorkflowRunArgs([
+          "task", "--", "--matchlock-allow-private", "10.0.0.0/8",
+        ]);
+        assert.equal(result.matchlockAllowPrivate, undefined);
+        assert.equal(result.taskTitle, "task --matchlock-allow-private 10.0.0.0/8");
+      });
+    });
+  });
 });

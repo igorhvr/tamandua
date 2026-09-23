@@ -20,8 +20,9 @@ import {
   MATCHLOCK_RPC_BIN_ENV,
   MATCHLOCK_RPC_ARGS_ENV,
   pinFromPolicy,
+  type MatchlockAllowPrivateSupportProbe,
 } from "../../../dist/installer/matchlock/admission.js";
-import { serializeMatchlockPolicy } from "../../../dist/installer/matchlock/policy.js";
+import { serializeMatchlockPolicy, parseMatchlockPolicy } from "../../../dist/installer/matchlock/policy.js";
 import { buildMatchlockCreateConfig } from "../../../dist/installer/matchlock/mount-plan.js";
 import { writeFakeRpcDriver, tempTranscriptPath } from "../../../dist/installer/matchlock/fake-rpc-driver.js";
 
@@ -860,6 +861,303 @@ describe("matchlock run-creation admission", () => {
         /is a symlink/.test(err.message),
     );
     assert.deepEqual(readTranscript(transcript), []);
+  });
+
+  // ── MTLK-ALLOW-PRIVATE: per-run private-destination exceptions ─────────
+  //
+  // Admission is the ONE persistence point for the operator-resolved
+  // allow-private list: a FRESH opt-in records it as `networkAllowPrivate` on
+  // the returned/persisted policy (pi, dsh and hermes alike) and a rugpull
+  // replacement RETAINS the inherited policy's list — never the daemon
+  // environment, never a newly supplied list.
+
+  function allowPrivateFakes(over: Record<string, string | undefined> = {}): void {
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      FAKE_RESOLVE_MISSING: undefined,
+      ...over,
+    });
+  }
+
+  /**
+   * US-008: a deterministic supporting probe so allow-private admissions never
+   * need a real matchlock binary. It echoes back the resolved rpc binary path.
+   */
+  const supportingAllowPrivateProbe: MatchlockAllowPrivateSupportProbe = (binaryPath) => ({
+    supported: true,
+    binaryPath,
+  });
+
+  it("ALLOW-PRIVATE pi: a FRESH admission persists the normalized list on the pinned policy (resolve-only)", async () => {
+    transcript = tempTranscriptPath();
+    allowPrivateFakes();
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        allowPrivate: ["  192.168.107.74:8888  ", "registry.internal", "192.168.107.74:8888", "10.0.0.0/8"],
+        allowPrivateSupportProbe: supportingAllowPrivateProbe,
+      }) as never,
+    );
+    assert.deepEqual(
+      result.policy.networkAllowPrivate,
+      ["192.168.107.74:8888", "registry.internal", "10.0.0.0/8"],
+      "trimmed, blank-free, deduped first-seen order",
+    );
+    // Round-trip through the serializer the caller persists with.
+    const reparsed = parseMatchlockPolicy(serializeMatchlockPolicy(result.policy));
+    assert.deepEqual(reparsed.networkAllowPrivate, result.policy.networkAllowPrivate);
+    assert.equal(reparsed.networkPolicyVersion, 2);
+    // The dispatch-side create params map the PERSISTED policy list (the
+    // controller reads `runs.matchlock_policy`, never the daemon environment).
+    const helperPack = path.join(tmpRoot, "ap-guest-pack");
+    fs.mkdirSync(helperPack, { recursive: true });
+    const cfg = buildMatchlockCreateConfig(reparsed, result.identity, { helperPackHostPath: helperPack });
+    assert.deepEqual(cfg.network.allow_private, ["192.168.107.74:8888", "registry.internal", "10.0.0.0/8"]);
+    assert.equal(cfg.network.block_private_ips, true);
+    // Still resolve-only: allow-private never triggers a create.
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
+  it("ALLOW-PRIVATE dsh: a FRESH admission persists the list on the harness-dsh policy", async () => {
+    const homeDir = path.join(tmpRoot, "ap-home");
+    fs.mkdirSync(path.join(homeDir, ".dsh"), { recursive: true });
+    transcript = tempTranscriptPath();
+    setFake({
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_RESOLVE_MISSING: undefined,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    });
+    const result = await admitMatchlockRun(
+      admissionOptsDsh({
+        harness: "dsh",
+        submission: { homeDir, env: {}, cwd: nonRepoDir },
+        allowPrivate: ["[2001:db8::1]:443", "metadata.internal"],
+        allowPrivateSupportProbe: supportingAllowPrivateProbe,
+      }) as never,
+    );
+    assert.equal(result.policy.harness, "dsh");
+    assert.deepEqual(result.policy.networkAllowPrivate, ["[2001:db8::1]:443", "metadata.internal"]);
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
+  it("ALLOW-PRIVATE hermes: a FRESH admission persists the list on the harness-hermes policy", async () => {
+    const hermesRoot = path.join(tmpRoot, "ap-hermes");
+    fs.mkdirSync(hermesRoot, { recursive: true });
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: undefined,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/hermes:latest",
+      FAKE_IMAGE_DIGEST: "sha256:hermesdigest00000000000000000000000000000000000000000000000000000",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:hermesconfig0000000000000000000000000000000000000000000000000000",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        harness: "hermes",
+        submission: { homeDir: path.join(tmpRoot, "operator"), cwd: nonRepoDir, hermesHomeEnv: hermesRoot },
+        allowPrivate: ["192.168.107.74:8888"],
+        allowPrivateSupportProbe: supportingAllowPrivateProbe,
+      }) as never,
+    );
+    assert.equal(result.policy.harness, "hermes");
+    assert.deepEqual(result.policy.networkAllowPrivate, ["192.168.107.74:8888"]);
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
+  it("ALLOW-PRIVATE replacement: the INHERITED policy list wins over a newly supplied list and env is never consulted", async () => {
+    transcript = tempTranscriptPath();
+    allowPrivateFakes();
+    const first = await admitMatchlockRun(
+      admissionOpts({
+        allowPrivate: ["192.168.107.74:8888"],
+        allowPrivateSupportProbe: supportingAllowPrivateProbe,
+      }) as never,
+    );
+    // A moved environment and a DIFFERENT supplied list must not retarget the
+    // replacement: the persisted policy list is authoritative.
+    process.env.TAMANDUA_MATCHLOCK_ALLOW_PRIVATE = "10.9.9.9:1234";
+    try {
+      const replacement = await admitMatchlockRun(
+        admissionOpts({
+          inheritedPolicy: first.policy,
+          allowPrivate: ["10.9.9.9:1234", "elsewhere.internal"],
+          allowPrivateSupportProbe: supportingAllowPrivateProbe,
+        }) as never,
+      );
+      assert.deepEqual(
+        replacement.policy.networkAllowPrivate,
+        ["192.168.107.74:8888"],
+        "a rugpull replacement retains the failed run's admitted exceptions",
+      );
+    } finally {
+      delete process.env.TAMANDUA_MATCHLOCK_ALLOW_PRIVATE;
+    }
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image", "resolve_image"]);
+  });
+
+  it("ALLOW-PRIVATE absent/empty: no support probe runs and the persisted policy has no networkAllowPrivate key", async () => {
+    transcript = tempTranscriptPath();
+    allowPrivateFakes();
+    let probeCalls = 0;
+    const neverProbe: MatchlockAllowPrivateSupportProbe = () => {
+      probeCalls += 1;
+      throw new Error("the allow-private support probe must not run for an empty list");
+    };
+    const absent = await admitMatchlockRun(
+      admissionOpts({ allowPrivateSupportProbe: neverProbe }) as never,
+    );
+    const empty = await admitMatchlockRun(
+      admissionOpts({ allowPrivate: [], allowPrivateSupportProbe: neverProbe }) as never,
+    );
+    assert.equal(probeCalls, 0, "an absent/empty list must never probe the installed binary");
+    assert.equal("networkAllowPrivate" in absent.policy, false);
+    assert.equal("networkAllowPrivate" in empty.policy, false);
+    assert.deepEqual(
+      readTranscript(transcript).map((e) => e.method).filter(Boolean),
+      ["resolve_image", "resolve_image"],
+      "empty/absent allow-private admission stays resolve-only and byte-identical",
+    );
+  });
+
+  it("ALLOW-PRIVATE invalid entry refuses the admission BEFORE any RPC effect", async () => {
+    const dir = path.join(tmpRoot, "ap-invalid");
+    fs.mkdirSync(dir, { recursive: true });
+    const isolatedTranscript = path.join(dir, "wire.jsonl");
+    // Point the fake at a transcript in an isolated dir but do NOT create it:
+    // a refusal before any RPC leaves it non-existent.
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: isolatedTranscript,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    await assert.rejects(
+      () => admitMatchlockRun(admissionOpts({ allowPrivate: ["host:0"] }) as never),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "policy_invalid_record" &&
+        /invalid allow-private entry/.test(err.message),
+    );
+    assert.equal(fs.existsSync(isolatedTranscript), false, "no RPC child may be spawned for an invalid entry");
+  });
+
+  // ── MTLK-ALLOW-PRIVATE US-008: fail closed when matchlock lacks the flag ──
+
+  it("ALLOW-PRIVATE unsupported (pi): a non-empty list on a matchlock without --allow-private refuses with matchlock_allow_private_unsupported and writes NO policy", async () => {
+    const dir = path.join(tmpRoot, "ap-unsupported");
+    fs.mkdirSync(dir, { recursive: true });
+    const isolatedTranscript = path.join(dir, "wire.jsonl");
+    // Point the fake at a transcript in an isolated dir but do NOT create it:
+    // the refusal precedes every RPC/create effect.
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: isolatedTranscript,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const requested = ["192.168.107.74:8888", "registry.internal"];
+    let probedBinary: string | undefined;
+    let probedCalls = 0;
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            allowPrivate: requested,
+            allowPrivateSupportProbe: (binaryPath: string) => {
+              probedBinary = binaryPath;
+              probedCalls += 1;
+              return {
+                supported: false,
+                binaryPath,
+                version: "0.1.0",
+                reasonCode: "unsupported",
+                reason: '"matchlock run --help" does not list --allow-private',
+              };
+            },
+          }) as never,
+        ),
+      (err: unknown) => {
+        if (!(err instanceof MatchlockAdmissionError)) return false;
+        assert.equal(err.code, "matchlock_allow_private_unsupported");
+        // Names the resolved binary and EVERY requested entry.
+        assert.ok(err.message.includes(process.execPath), `names the binary: ${err.message}`);
+        for (const entry of requested) {
+          assert.ok(err.message.includes(entry), `names the requested entry ${entry}: ${err.message}`);
+        }
+        // Actionable remedies: upgrade matchlock or drop the flag/env.
+        assert.match(err.message, /upgrade matchlock/i);
+        assert.match(err.message, /--matchlock-allow-private/);
+        assert.match(err.message, /TAMANDUA_MATCHLOCK_ALLOW_PRIVATE/);
+        return true;
+      },
+    );
+    assert.equal(probedCalls, 1, "the support probe runs exactly once");
+    assert.equal(probedBinary, process.execPath, "the probe runs against the resolved rpc binary");
+    assert.equal(fs.existsSync(isolatedTranscript), false, "no RPC child may be spawned when the probe refuses");
+  });
+
+  it("ALLOW-PRIVATE unsupported (hermes): the refusal fires before the harness branch and any effect", async () => {
+    const hermesRoot = path.join(tmpRoot, "ap-hermes-unsupported");
+    fs.mkdirSync(hermesRoot, { recursive: true });
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            harness: "hermes",
+            submission: { homeDir: path.join(tmpRoot, "operator"), cwd: nonRepoDir, hermesHomeEnv: hermesRoot },
+            allowPrivate: ["registry.internal"],
+            allowPrivateSupportProbe: () => ({
+              supported: false,
+              binaryPath: "fake-matchlock",
+              reasonCode: "missing_binary",
+            }),
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "matchlock_allow_private_unsupported" &&
+        /registry\.internal/.test(err.message),
+    );
+  });
+
+  it("ALLOW-PRIVATE unsupported: a throwing probe fails closed with the same typed refusal", async () => {
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            allowPrivate: ["192.168.107.74:8888"],
+            allowPrivateSupportProbe: () => {
+              throw new Error("probe exploded");
+            },
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "matchlock_allow_private_unsupported" &&
+        /probe exploded/.test(err.message),
+    );
+  });
+
+  it("ALLOW-PRIVATE supported: a supporting probe persists the list and admission stays resolve-only", async () => {
+    transcript = tempTranscriptPath();
+    allowPrivateFakes();
+    let probedBinary: string | undefined;
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        allowPrivate: ["192.168.107.74:8888", "box.internal"],
+        allowPrivateSupportProbe: (binaryPath: string) => {
+          probedBinary = binaryPath;
+          return { supported: true, binaryPath, version: "9.9.9" };
+        },
+      }) as never,
+    );
+    assert.equal(probedBinary, process.execPath, "the probe runs against the resolved rpc binary");
+    assert.deepEqual(result.policy.networkAllowPrivate, ["192.168.107.74:8888", "box.internal"]);
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
   });
 
 });

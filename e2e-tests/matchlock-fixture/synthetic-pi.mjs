@@ -25,6 +25,10 @@
  *     trivial passing command against the admitted git fixture repo, then
  *     submits a report that satisfies the step's Reply-with/KEY shape and
  *     completes the step through the guest CLI;
+ *   - (default-off) when TAMANDUA_SYNTHETIC_PI_CURL_URL is provided by the
+ *     fixture image, a work round also `curl`s that destination inside the
+ *     guest and records { url, exitCode, stdout } under the mounted working
+ *     directory (the MTLK-ALLOW-PRIVATE US-009 probe);
  *   - emits pi --mode json frames (tool_execution_end + message_end with
  *     usage.totalTokens) exactly like the scripted runtime so the scheduler's
  *     existing post-round parsing/accounting is reused unchanged.
@@ -52,6 +56,15 @@ const HARNESS_PROBE_MARKER = "TAMANDUA_HARNESS_PROBE: skill-path";
 // row. The launch probe is never silenced, and the default (unset) keeps the
 // shared fixture byte-identical for every existing gate.
 const SILENT_WORK_STDOUT = process.env.TAMANDUA_SYNTHETIC_PI_EMPTY_HARNESS_STDOUT === "1";
+
+// MTLK-ALLOW-PRIVATE (US-009) TEST-ONLY knob: when the fixture image provides a
+// URL (via the Dockerfile build arg, so it becomes part of the image config
+// env the guest inherits), every WORK round additionally runs
+// `curl -sS --max-time 10 <url>` INSIDE the guest and records the observed
+// { url, exitCode, stdout } under the mounted working directory. The default
+// (unset/empty) keeps every existing synthetic gate byte-identical: no curl
+// process is spawned and no marker is written.
+const CURL_PROBE_URL = (process.env.TAMANDUA_SYNTHETIC_PI_CURL_URL ?? "").trim();
 
 function isHarnessProbePrompt(prompt) {
   const firstLine = String(prompt ?? "").split(/\r?\n/, 1)[0] ?? "";
@@ -644,6 +657,36 @@ try {
     `synthetic-pi agent=${agentId} run=${runId} step=${stepId} cwd=${cwd}\n`,
     "utf-8",
   );
+
+  // MTLK-ALLOW-PRIVATE (US-009) optional in-guest private-destination probe:
+  // DEFAULT-OFF (empty URL => no curl, no marker). When the allow-private gate
+  // bakes a URL into the derived fixture image, this runs the real curl inside
+  // the guest and records the observed exit code so the host can prove the
+  // destination was reachable (exit 0 + response) or refused (nonzero).
+  if (CURL_PROBE_URL.length > 0) {
+    const curl = spawnSync("curl", ["-sS", "--max-time", "10", CURL_PROBE_URL], {
+      encoding: "utf-8",
+      cwd,
+      env: process.env,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const curlExitCode = curl.status === null ? -1 : curl.status;
+    const curlProbe = {
+      url: CURL_PROBE_URL,
+      exitCode: curlExitCode,
+      stdout: (curl.stdout ?? "").slice(0, 4000),
+    };
+    fs.writeFileSync(
+      path.join(markerDir, "curl-probe.json"),
+      `${JSON.stringify(curlProbe, null, 2)}\n`,
+      "utf-8",
+    );
+    appendProgress(
+      `- curl probe url=${CURL_PROBE_URL} exitCode=${curlExitCode} stdout=${JSON.stringify(curlProbe.stdout).slice(0, 300)}${
+        curl.error ? ` spawnError=${curl.error.message}` : ""
+      }`,
+    );
+  }
 
   // Harmless OWNED fixture action #2: packed tamandua-test with a trivial
   // passing command against the admitted git fixture repo (records a real
