@@ -32,6 +32,7 @@ src/cli/wizard.test.ts
 src/db.test.ts
 src/doctor.test.ts
 src/installer/agent-scheduler-binary-discovery.test.ts
+src/installer/agent-scheduler-drain-guard.test.ts
 src/installer/agent-scheduler-dsh-routing.test.ts
 src/installer/agent-scheduler-dsh-tokens.test.ts
 src/installer/agent-scheduler-harness-routing.test.ts

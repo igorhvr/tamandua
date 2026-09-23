@@ -44,6 +44,26 @@ function withShimOnPath<T>(dir: string, fn: () => T): T {
   }
 }
 
+/**
+ * Bounded poll for the shim's recorded pid. The spawned shell writes `$$` to
+ * the pid file asynchronously, so under host load that write can land after the
+ * observer's bounded probe returns; poll for the file's presence and parseable
+ * positive-integer content (same deadline style as the reap check below)
+ * instead of a one-shot read that can throw ENOENT.
+ */
+function waitForRecordedPid(pidFile: string, timeoutMs = 1000): number {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const parsed = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(parsed) && parsed > 0) return parsed;
+    } catch {
+      /* not written yet — keep polling until the deadline */
+    }
+    if (Date.now() >= deadline) return 0;
+  }
+}
+
 /** Run `fn` with the observer's timeout env seam set (undefined clears it). */
 function withObserverTimeout<T>(ms: number | undefined, fn: () => T): T {
   const prev = process.env.TAMANDUA_DARWIN_LSOF_TIMEOUT_MS;
@@ -135,7 +155,7 @@ describe("LSOF-EVTA US-005 — bounded Darwin ownership observer", () => {
         elapsed < TIMEOUT_MS + 1000,
         `the bounded probe must return within timeout+1000ms, took ${elapsed}ms`,
       );
-      shimPid = Number(readFileSync(pidFile, "utf8").trim());
+      shimPid = waitForRecordedPid(pidFile);
       assert.ok(
         Number.isInteger(shimPid) && shimPid > 0,
         "the hanging shim must have recorded its pid",

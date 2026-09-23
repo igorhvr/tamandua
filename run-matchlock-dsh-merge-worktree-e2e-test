@@ -27,11 +27,12 @@
 # hash pins; see /home/kaladin/matchlock-work/matchlock-runtime.env). The pair
 # is resolved from TAMANDUA_MATCHLOCK_RPC_BIN / MATCHLOCK_GUEST_INIT /
 # MATCHLOCK_GUEST_FUSED when set, else from TAMANDUA_MATCHLOCK_RUNTIME_DIR, else
-# from PATH. Set TAMANDUA_GATE_EXPECT_RUNTIME_PINS=1 to additionally enforce the
-# historical accepted-pin hashes (matching run-matchlock-worktree-merge-e2e-test).
+# from PATH. The observed matchlock --version + sha256 hashes are recorded as
+# gate evidence instead of being checked against runtime pins (MTLK-UNPIN,
+# tamandua-6sy.33.10.36).
 #
 # What it does:
-#   1. resolves + (optionally) validates the runtime binaries
+#   1. resolves + records the observed runtime binaries (no pins)
 #   2. npm run build (compiled dist is what the isolated daemon runs)
 #   3. allocates a NEW evidence directory with mkdtemp under
 #      ${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}
@@ -48,9 +49,14 @@ set -u
 
 cd "$(dirname "$0")"
 
-# Optional historical runtime pins (enforced only when explicitly requested).
-EXPECTED_MATCHLOCK="a278f9c153c91a76bcfca3abe2ff4146996e48ad4f3b36e47026e605e9232136"
-EXPECTED_GUEST_INIT="f76f00fbc089dea1f1e5eba536778da9bee9f20f547a6779f14b76a700d35c06"
+# -- UNPINNED runtime resolution (MTLK-UNPIN, tamandua-6sy.33.10.36) ----------
+# No runtime sha256 pins: default to whatever `matchlock` resolves on PATH
+# (system /usr/local/bin/matchlock on vaimetal) and let matchlock resolve its
+# own guest-init. TAMANDUA_MATCHLOCK_RPC_BIN / MATCHLOCK_GUEST_INIT /
+# MATCHLOCK_GUEST_FUSED are OPTIONAL overrides; TAMANDUA_MATCHLOCK_RUNTIME_DIR
+# remains the fallback location for the pair. The observed version and hashes
+# are recorded as gate evidence instead of being checked against pins.
+fail() { echo "run-matchlock-dsh-merge-worktree-e2e-test: FATAL: $*" >&2; exit 90; }
 
 if [ -n "${TAMANDUA_MATCHLOCK_RUNTIME_DIR:-}" ]; then
   RUNTIME_DIR="$TAMANDUA_MATCHLOCK_RUNTIME_DIR"
@@ -58,31 +64,37 @@ else
   RUNTIME_DIR=""
 fi
 MATCHLOCK_RPC_BIN="${TAMANDUA_MATCHLOCK_RPC_BIN:-${RUNTIME_DIR:+$RUNTIME_DIR/matchlock}}"
-MATCHLOCK_RPC_BIN="${MATCHLOCK_RPC_BIN:-$(command -v matchlock || true)}"
+MATCHLOCK_RPC_BIN="${MATCHLOCK_RPC_BIN:-$(command -v matchlock 2>/dev/null || true)}"
 GUEST_INIT="${MATCHLOCK_GUEST_INIT:-${RUNTIME_DIR:+$RUNTIME_DIR/guest-init}}"
-GUEST_INIT="${GUEST_INIT:-$(command -v guest-init || true)}"
+GUEST_INIT="${GUEST_INIT:-$(command -v guest-init 2>/dev/null || true)}"
 GUEST_FUSED="${MATCHLOCK_GUEST_FUSED:-$GUEST_INIT}"
 
-fail() { echo "run-matchlock-dsh-merge-worktree-e2e-test: FATAL: $*" >&2; exit 90; }
-
-for p in "$MATCHLOCK_RPC_BIN" "$GUEST_INIT" "$GUEST_FUSED"; do
-  [ -x "$p" ] || fail "runtime binary missing or not executable: $p"
-done
-
-if [ "${TAMANDUA_GATE_EXPECT_RUNTIME_PINS:-0}" = "1" ]; then
-  ACTUAL_MATCHLOCK=$(sha256sum "$MATCHLOCK_RPC_BIN" | awk '{print $1}')
-  ACTUAL_GUEST_INIT=$(sha256sum "$GUEST_INIT" | awk '{print $1}')
-  ACTUAL_GUEST_FUSED=$(sha256sum "$GUEST_FUSED" | awk '{print $1}')
-  [ "$ACTUAL_MATCHLOCK" = "$EXPECTED_MATCHLOCK" ] \
-    || fail "TAMANDUA_MATCHLOCK_RPC_BIN hash mismatch: got $ACTUAL_MATCHLOCK expected $EXPECTED_MATCHLOCK"
-  [ "$ACTUAL_GUEST_INIT" = "$EXPECTED_GUEST_INIT" ] \
-    || fail "MATCHLOCK_GUEST_INIT hash mismatch: got $ACTUAL_GUEST_INIT expected $EXPECTED_GUEST_INIT"
-  [ "$ACTUAL_GUEST_FUSED" = "$EXPECTED_GUEST_INIT" ] \
-    || fail "MATCHLOCK_GUEST_FUSED hash mismatch: got $ACTUAL_GUEST_FUSED expected $EXPECTED_GUEST_INIT (fused must equal guest-init)"
-  echo "paired runtime pins OK (matchlock $ACTUAL_MATCHLOCK, guest-init $ACTUAL_GUEST_INIT)"
-else
-  echo "runtime: $MATCHLOCK_RPC_BIN (guest-init $GUEST_INIT, guest-fused $GUEST_FUSED; system pair, no pins)"
+[ -n "$MATCHLOCK_RPC_BIN" ] || fail "matchlock not found on PATH; set TAMANDUA_MATCHLOCK_RPC_BIN to the matchlock CLI"
+[ -f "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not found: $MATCHLOCK_RPC_BIN"
+[ -x "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not executable: $MATCHLOCK_RPC_BIN"
+if [ -n "$GUEST_INIT" ]; then
+  [ -f "$GUEST_INIT" ] || fail "guest-init not found: $GUEST_INIT (unset MATCHLOCK_GUEST_INIT to let matchlock resolve it)"
 fi
+if [ -n "$GUEST_FUSED" ]; then
+  [ -f "$GUEST_FUSED" ] || fail "guest-fused not found: $GUEST_FUSED (unset MATCHLOCK_GUEST_FUSED to let matchlock resolve it)"
+fi
+
+# Observed (NOT pinned) runtime identity: recorded into the gate evidence dir.
+OBSERVED_MATCHLOCK_VERSION="$("$MATCHLOCK_RPC_BIN" --version 2>&1 | head -n 1 || true)"
+OBSERVED_MATCHLOCK_SHA="$(sha256sum "$MATCHLOCK_RPC_BIN" | awk '{print $1}')"
+if [ -n "$GUEST_INIT" ]; then
+  OBSERVED_GUEST_INIT_SHA="$(sha256sum "$GUEST_INIT" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_INIT_SHA="unset => resolved by matchlock"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  OBSERVED_GUEST_FUSED_SHA="$(sha256sum "$GUEST_FUSED" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_FUSED_SHA="unset => resolved by matchlock"
+fi
+echo "runtime observed (unpinned): matchlock ${OBSERVED_MATCHLOCK_VERSION:-no-version} sha256 $OBSERVED_MATCHLOCK_SHA"
+echo "runtime observed (unpinned): guest-init ${GUEST_INIT:-resolved-by-matchlock} sha256 $OBSERVED_GUEST_INIT_SHA"
+echo "runtime observed (unpinned): guest-fused ${GUEST_FUSED:-resolved-by-matchlock} sha256 $OBSERVED_GUEST_FUSED_SHA"
 
 npm run build || fail "npm run build failed"
 
@@ -92,10 +104,26 @@ EV="$(mktemp -d "$EVIDENCE_ROOT/dsh-merge-worktree-XXXXXX")" || fail "mktemp -d 
 echo "evidence dir: $EV"
 
 export TAMANDUA_MATCHLOCK_RPC_BIN="$MATCHLOCK_RPC_BIN"
-export MATCHLOCK_GUEST_INIT="$GUEST_INIT"
-export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"
+if [ -n "$GUEST_INIT" ]; then export MATCHLOCK_GUEST_INIT="$GUEST_INIT"; fi
+if [ -n "$GUEST_FUSED" ]; then export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"; fi
 export TAMANDUA_GATE_EVIDENCE_DIR="$EV"
 export TAMANDUA_GATE_EVIDENCE_ROOT="$EVIDENCE_ROOT"
+
+# Observed-not-pinned runtime evidence (MTLK-UNPIN): the gate accepts whatever
+# `matchlock` resolves and records the observed version/hashes here.
+RUNTIME_OBSERVED="$EV/runtime-observed.txt"
+{
+  echo "matchlock.path=$MATCHLOCK_RPC_BIN"
+  echo "matchlock.version=${OBSERVED_MATCHLOCK_VERSION:-no-version}"
+  echo "matchlock.sha256=$OBSERVED_MATCHLOCK_SHA"
+  echo "guest_init.path=${GUEST_INIT:-unset => resolved by matchlock}"
+  echo "guest_init.sha256=$OBSERVED_GUEST_INIT_SHA"
+  echo "guest_fused.path=${GUEST_FUSED:-unset => resolved by matchlock}"
+  echo "guest_fused.sha256=$OBSERVED_GUEST_FUSED_SHA"
+} > "$RUNTIME_OBSERVED"
+echo "runtime evidence: $RUNTIME_OBSERVED"
+cat "$RUNTIME_OBSERVED"
+
 # Private fresh TMPDIR inside the evidence dir (guest-pack builds and any gate
 # scratch stay under owned evidence).
 export TMPDIR="$EV/tmp"

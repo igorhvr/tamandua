@@ -28,6 +28,10 @@ const GATE_DRIVERS = [
   "run-matchlock-dsh-real-gate-e2e-test",
   "run-matchlock-dsh-profile-overlay-e2e-test",
   "run-matchlock-dsh-real-boot-gate-e2e-test",
+  "run-matchlock-dsh-merge-worktree-e2e-test",
+  "run-matchlock-dsh-merge-worktree-canary-e2e-test",
+  "run-matchlock-hermes-merge-worktree-e2e-test",
+  "run-matchlock-hermes-merge-worktree-canary-e2e-test",
 ] as const;
 
 const GATE_TESTS = [
@@ -84,7 +88,7 @@ describe("MTLK-UNPIN: gate drivers are unpinned", () => {
     });
   }
 
-  it("all nine drivers exist and are shell scripts", () => {
+  it("all thirteen drivers exist and are shell scripts", () => {
     for (const driver of GATE_DRIVERS) {
       const source = readRepoFile(driver);
       assert.match(source, /^#!\/usr\/bin\/env bash/, `${driver} must be a bash script`);

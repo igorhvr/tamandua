@@ -1110,6 +1110,53 @@ describe("daemon control plane", { concurrency: 1 }, () => {
     db2.close();
   });
 
+  it("register-run does not reset a pending drain to active (PAUSE-DRAIN nudge bypass)", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const workflowId = "wf-drain-readmit";
+    const now = new Date().toISOString();
+
+    // The exact state left by `pause --drain`: status still running,
+    // scheduling_status draining_pause, pause_drain marker set. A step
+    // completion fires /control/nudge, whose admission loop registers every
+    // running run; before the fix that reset scheduling_status to 'active'
+    // and re-launched a round, bypassing the drain.
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'drain-readmit', 'running', ?, 0, 'draining_pause', ?, ?)",
+    ).run(runId, workflowId, JSON.stringify({ pause_drain: "true" }), now, now);
+    db.close();
+
+    const r = await jsonRequest("POST", "/control/register-run", { runId }, secret);
+    assert.equal(r.status, 200);
+    assert.equal(
+      r.body.state,
+      "draining_pause",
+      "register-run must report the pending drain, not re-admit it as active",
+    );
+
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT status, scheduling_status FROM runs WHERE id = ?").get(runId) as
+      | { status: string; scheduling_status: string }
+      | undefined;
+    assert.ok(row, "run should exist");
+    assert.equal(row.status, "running", "the run stays running while the drain is pending");
+    assert.equal(
+      row.scheduling_status,
+      "draining_pause",
+      "a nudge/register must never clobber a pending drain",
+    );
+
+    db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db2.close();
+  });
+
   it("finalizeDrainingPause does nothing when running steps remain", async (t) => {
     if (!daemon) {
       t.skip("daemon not started");
@@ -1455,6 +1502,22 @@ describe("daemon control plane", { concurrency: 1 }, () => {
     const resumedEvent = runEvents.find((e: any) => e.event === "run.resumed");
     assert.ok(resumedEvent, "expected a run.resumed event for the plain resume");
     assert.equal(resumedEvent.runId, runId);
+
+    // PAUSE-DRAIN US-002: even though a finalized drain is not cancelled (no
+    // flag/event), its historical pause_drain marker MUST be cleared by resume
+    // — handleRegisterRun refuses re-admission of any run whose marker is
+    // "true", so leaving it would silently wedge the resumed run at
+    // state:'draining_pause' with no timers.
+    const dbAfterResume = new DatabaseSync(dbPath);
+    const rowAfterResume = dbAfterResume
+      .prepare("SELECT context FROM runs WHERE id = ?")
+      .get(runId) as { context: string } | undefined;
+    assert.ok(rowAfterResume, "run should exist after resume");
+    assert.ok(
+      !("pause_drain" in JSON.parse(rowAfterResume.context)),
+      "historical pause_drain marker must be cleared by resume so re-admission is not blocked",
+    );
+    dbAfterResume.close();
 
     // Cleanup
     const db2 = new DatabaseSync(dbPath);

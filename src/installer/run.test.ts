@@ -8,6 +8,10 @@ import http from "node:http";
 import { spawnSync } from "node:child_process";
 
 import { runWorkflow, resumeWorkflow, isGitRepositoryForHarness } from "../../dist/installer/run.js";
+import {
+  readHarnessProbeStatus,
+  reserveHarnessProbe,
+} from "../../dist/installer/harness-probe.js";
 import { parseMatchlockPolicy } from "../../dist/installer/matchlock/policy.js";
 import {
   MatchlockAdmissionError,
@@ -2524,6 +2528,197 @@ describe("runWorkflow", () => {
         }
         await fake.close();
       }
+    });
+  });
+
+  // RPRB (6sy.37): an EXPLICIT `workflow resume` of a run whose launch-time
+  // harness probe recorded a definitive 'failed' outcome must clear that
+  // outcome (and its timestamp) so a fresh once-per-run probe runs. 'ok' must
+  // stay passed and an in-flight 'probing' reservation must be left to the
+  // existing staleness protocol. The daemon's automatic recovery paths never
+  // reset the probe (static call-site guard below).
+  describe("RPRB: explicit resume re-probes a failed harness probe", () => {
+    async function startFakeControlPlane(response: {
+      status: number;
+      body: Record<string, unknown>;
+    }): Promise<{ port: number; close: () => Promise<void> }> {
+      const server = http.createServer((req, res) => {
+        // Drain the request body before replying so the client socket can close.
+        req.on("data", () => {});
+        req.on("end", () => {
+          if (req.method === "GET" && req.url === "/control/health") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+          if (req.method === "POST" && req.url === "/control/register-run") {
+            res.writeHead(response.status, { "content-type": "application/json" });
+            res.end(JSON.stringify(response.body));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      return {
+        port: address.port,
+        close: async () => {
+          server.closeAllConnections?.();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    async function seedFailedRun(
+      harnessDir: string,
+      probeStatus: "failed" | "ok" | "probing" | null,
+    ): Promise<{ runId: string }> {
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      fs.mkdirSync(harnessDir, { recursive: true });
+      db.prepare(
+        `INSERT INTO runs (id, run_number, workflow_id, task, status, context, harness_probe_status, harness_probe_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?)`,
+      ).run(
+        runId,
+        556,
+        "test-rprb-resume",
+        "RPRB resume re-probe",
+        JSON.stringify({ working_directory_for_harness: path.resolve(harnessDir) }),
+        probeStatus,
+        probeStatus === null ? null : now,
+        now,
+        now,
+      );
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, type, created_at, updated_at)
+         VALUES (?, ?, 'implement', 'dev', 0, 'input', 'STATUS, CHANGES, TESTS', 'failed', 'single', ?, ?)`,
+      ).run(stepId, runId, now, now);
+      return { runId };
+    }
+
+    async function resumeAgainstFakeDaemon(runId: string): Promise<Awaited<ReturnType<typeof resumeWorkflow>>> {
+      const fake = await startFakeControlPlane({
+        status: 200,
+        body: { state: "active", requiredTimers: 1 },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        return await resumeWorkflow(runId);
+      } finally {
+        if (prevControlPort !== undefined) {
+          process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        } else {
+          delete process.env.TAMANDUA_CONTROL_PORT;
+        }
+        await fake.close();
+      }
+    }
+
+    it("clears a failed probe and lets a fresh once-per-run probe be reserved", async () => {
+      const harnessDir = path.join(tempHome, "rprb-failed-workdir");
+      const { runId } = await seedFailedRun(harnessDir, "failed");
+      assert.equal(readHarnessProbeStatus(runId), "failed");
+
+      const result = await resumeAgainstFakeDaemon(runId);
+
+      assert.equal(result.status, "resumed");
+      const { getDb } = await import("../../dist/db.js");
+      const row = getDb()
+        .prepare("SELECT harness_probe_status, harness_probe_at FROM runs WHERE id = ?")
+        .get(runId) as { harness_probe_status: string | null; harness_probe_at: string | null };
+      assert.equal(row.harness_probe_status, null, "resume must clear the failed probe status");
+      assert.equal(row.harness_probe_at, null, "resume must clear the failed probe timestamp");
+
+      const T0 = Date.UTC(2026, 8, 23, 12, 0, 0);
+      assert.equal(
+        reserveHarnessProbe(runId, { wallMs: 1000, nowMs: T0 }),
+        true,
+        "the resumed run must be re-probeable exactly once",
+      );
+    });
+
+    it("never resets an 'ok' probe on resume (passed stays passed)", async () => {
+      const harnessDir = path.join(tempHome, "rprb-ok-workdir");
+      const { runId } = await seedFailedRun(harnessDir, "ok");
+
+      const result = await resumeAgainstFakeDaemon(runId);
+
+      assert.equal(result.status, "resumed");
+      assert.equal(readHarnessProbeStatus(runId), "ok", "an 'ok' probe must survive resume");
+      const T0 = Date.UTC(2026, 8, 23, 12, 0, 0);
+      assert.equal(
+        reserveHarnessProbe(runId, { wallMs: 1000, nowMs: T0 + 1_000_000 }),
+        false,
+        "a resumed passed run must never be re-probed",
+      );
+    });
+
+    it("never clears an in-flight 'probing' reservation on resume", async () => {
+      const harnessDir = path.join(tempHome, "rprb-probing-workdir");
+      const { runId } = await seedFailedRun(harnessDir, "probing");
+
+      const result = await resumeAgainstFakeDaemon(runId);
+
+      assert.equal(result.status, "resumed");
+      assert.equal(readHarnessProbeStatus(runId), "probing", "the reservation must be untouched");
+      const { getDb } = await import("../../dist/db.js");
+      const row = getDb()
+        .prepare("SELECT harness_probe_at FROM runs WHERE id = ?")
+        .get(runId) as { harness_probe_at: string | null };
+      assert.ok(row.harness_probe_at, "the reservation timestamp must be preserved");
+      const probeAtMs = Date.parse(row.harness_probe_at);
+      assert.equal(
+        reserveHarnessProbe(runId, { wallMs: 1000, nowMs: probeAtMs }),
+        false,
+        "a live reservation must not be double-claimed after resume",
+      );
+      // The staleness protocol is unchanged: past the wall a crash-recovery
+      // reclaim still succeeds.
+      assert.equal(
+        reserveHarnessProbe(runId, { wallMs: 1000, nowMs: probeAtMs + 2000 }),
+        true,
+        "staleness handling must be unchanged by the resume reset",
+      );
+    });
+
+    it("is called only from resumeWorkflow (daemon automatic recovery paths never reset the probe)", () => {
+      const repoRoot = path.resolve(import.meta.dirname, "..", "..");
+      const srcRoot = path.join(repoRoot, "src");
+      const callers: string[] = [];
+      const walk = (dir: string): void => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full);
+            continue;
+          }
+          if (!entry.isFile() || !entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
+          for (const line of fs.readFileSync(full, "utf-8").split("\n")) {
+            if (!/resetFailedHarnessProbeForResume\s*\(/.test(line)) continue;
+            // The definition itself is not a call site.
+            if (line.includes("function resetFailedHarnessProbeForResume")) continue;
+            callers.push(path.relative(repoRoot, full));
+            break;
+          }
+        }
+      };
+      walk(srcRoot);
+      assert.deepEqual(
+        callers,
+        ["src/installer/run.ts"],
+        "resetFailedHarnessProbeForResume must only be called from the explicit resume path",
+      );
     });
   });
 

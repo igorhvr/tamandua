@@ -3,8 +3,10 @@
  *
  * Real harnesses legitimately write some noisy-but-benign lines to stderr:
  *
- *   - dsh prints `reasoning:` trace blocks (the reasoning line plus its
- *     indented continuation/body lines).
+ *   - dsh prints `reasoning:` trace blocks. Real dsh 0.1.3-alpha.2 emits a
+ *     `dsh: reasoning:` header followed by UNINDENTED body lines, so the
+ *     static indentation heuristic cannot be the block boundary; a block
+ *     runs until a genuine diagnostic closes it.
  *   - hermes prints a `session_id: <id>` trailer at session end by design
  *     (on both the normal-exit and KeyboardInterrupt paths).
  *
@@ -35,19 +37,31 @@ export interface HarnessStderrClassification {
 }
 
 /**
- * A dsh reasoning-block header: `reasoning:` at the start of the line
- * (leading whitespace tolerated so an indented block still opens).
+ * A dsh reasoning-block header: `reasoning:` at the start of the line, with
+ * an optional `dsh: ` prefix (real dsh 0.1.3-alpha.2 emits
+ * `dsh: reasoning:` followed by UNINDENTED body lines). Leading whitespace
+ * is tolerated so an indented block still opens.
  */
 function isDshReasoningLine(trimmed: string): boolean {
-  return trimmed.startsWith("reasoning:");
+  return /^(?:dsh:\s*)?reasoning:/.test(trimmed);
 }
 
+/** The explicit truncation marker the adapters insert between head and tail. */
+const TRUNCATION_MARKER_LINE = "[…output truncated…]";
+
 /**
- * A continuation/body line inside a dsh reasoning block: an indented,
- * non-empty line.
+ * A genuine dsh diagnostic: the line that ends an open reasoning block and
+ * must stay at WARN. This intentionally covers only clear error signal —
+ *   - the truncation marker,
+ *   - a `dsh: <non-reasoning>` prefix (e.g. `dsh: E_CREDENTIALS: ...`),
+ *   - a Python `Traceback`, an `Error` line, or `fatal:`.
+ * Anything else while a reasoning block is open is treated as benign body
+ * text, even when UNINDENTED.
  */
-function isIndentedContinuation(line: string): boolean {
-  return /^\s+\S/.test(line);
+function isDshGenuineDiagnostic(trimmed: string): boolean {
+  if (trimmed === TRUNCATION_MARKER_LINE) return true;
+  if (/^dsh:\s*\S/.test(trimmed)) return true;
+  return /^(?:Traceback\b|Error\b|fatal:)/.test(trimmed);
 }
 
 /** A hermes `session_id: <id>` trailer line. */
@@ -61,8 +75,10 @@ function isHermesSessionIdLine(trimmed: string): boolean {
  * Rules:
  *   - Empty/whitespace-only stderr => `{ benign: true, genuineLines: [],
  *     benignLines: [] }`.
- *   - dsh: `reasoning:` headers and the indented body lines that belong to
- *     the open reasoning block are benign.
+ *   - dsh: a reasoning header (`reasoning:` or `dsh: reasoning:`) opens a
+ *     block; every following non-blank line belongs to it — indented or
+ *     not — until a genuine diagnostic (truncation marker, `dsh:`
+ *     non-reasoning line, `Traceback`/`Error`/`fatal:`) closes it.
  *   - hermes: `session_id: <id>` trailer lines are benign.
  *   - Everything else (including pi stderr) is genuine.
  */
@@ -94,11 +110,12 @@ export function classifyHarnessStderr(
         inDshReasoningBlock = true;
         continue;
       }
-      if (inDshReasoningBlock && isIndentedContinuation(rawLine)) {
+      // While a reasoning block is open, only a genuine diagnostic ends
+      // it; every other line (indented or not) is benign body text.
+      if (inDshReasoningBlock && !isDshGenuineDiagnostic(trimmed)) {
         benignLines.push(rawLine);
         continue;
       }
-      // Any other line ends the reasoning block.
       inDshReasoningBlock = false;
     }
 

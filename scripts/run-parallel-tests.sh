@@ -1,8 +1,8 @@
 #!/bin/bash
 # Run parallel-lane tests (all non-serial test files) with default concurrency.
 # Excludes files listed in tests/serial-files.txt and e2e-tests/.
-# Passes through TAMANDUA_TEST_GUARD, TAMANDUA_PI_BINARY, and
-# TAMANDUA_DSH_BINARY env vars.
+# Passes through TAMANDUA_TEST_GUARD, TAMANDUA_PI_BINARY,
+# TAMANDUA_DSH_BINARY, and TAMANDUA_HERMES_BINARY env vars.
 # Exit code: 0 on pass, non-zero on any failure.
 #
 # Portability: must run under bash 3.2 (macOS /bin/bash) — no associative
@@ -17,6 +17,7 @@ cd "$REPO_ROOT"
 export TAMANDUA_TEST_GUARD="${TAMANDUA_TEST_GUARD:-1}"
 export TAMANDUA_PI_BINARY="${TAMANDUA_PI_BINARY:-/usr/bin/false}"
 export TAMANDUA_DSH_BINARY="${TAMANDUA_DSH_BINARY:-/usr/bin/false}"
+export TAMANDUA_HERMES_BINARY="${TAMANDUA_HERMES_BINARY:-/usr/bin/false}"
 
 # Read serial files to exclude: newline-delimited absolute paths.
 SERIAL_FILES_LIST="$REPO_ROOT/tests/serial-files.txt"
@@ -62,9 +63,16 @@ echo "=== Parallel lane: running ${#FILES[@]} test files with default concurrenc
 LEDGER_FILE="$(mktemp -t "tamandua-guard-ledger-$$.jsonl" 2>/dev/null || mktemp)"
 export TAMANDUA_TEST_GUARD_LEDGER="$LEDGER_FILE"
 
-# Capture node's exit code without set -e aborting the lane early.
+# Capture node's TAP output while still streaming it: `tee` writes the stream
+# to a temp file the negative-TAP gate audits below. `set +e` lets the pipeline
+# finish so PIPESTATUS can carry node's true exit status through the tee; it is
+# re-enabled immediately after.
+NODE_TAP_FILE="$(mktemp -t "tamandua-node-tap-$$.tap" 2>/dev/null || mktemp)"
 NODE_EXIT=0
-node --test "${FILES[@]}" || NODE_EXIT=$?
+set +e
+node --test "${FILES[@]}" 2>&1 | tee "$NODE_TAP_FILE"
+NODE_EXIT="${PIPESTATUS[0]}"
+set -e
 
 # Enforcement: run the ledger report (it prints grouped violations to stderr
 # and exits 1 when any non-expected entry exists). A non-zero report exit
@@ -76,7 +84,25 @@ if [ -f "$REPO_ROOT/scripts/guard-ledger-report.mjs" ]; then
 fi
 rm -f -- "$LEDGER_FILE"
 if [ "$REPORT_EXIT" -ne 0 ]; then
+  rm -f -- "$NODE_TAP_FILE"
   echo ">>> Parallel lane FAILED: test-isolation violations detected (see report above)" >&2
   exit 1
 fi
+
+# NHFG negative-TAP gate: Node 22.23.1 can print a top-level or nested
+# `not ok` record (or a `hookFailed` diagnostic) for a failed after-hook while
+# the run summary reports fail 0 and the process exits 0. An exit-code-only
+# gate would false-green, so fail the lane on any such record even when
+# NODE_EXIT is 0. `ok ... # SKIP` / `# TODO` records stay green. Bash 3.2
+# portable: plain grep, no associative arrays or mapfile. The hookFailed
+# alternative is anchored to a TAP diagnostic (`# hookFailed`) so a test title
+# merely containing that word can never trip the gate.
+TAP_FAILURES="$(grep -E '^[[:space:]]*not ok |^[[:space:]]*#[[:space:]]*hookFailed' "$NODE_TAP_FILE" || true)"
+if [ -n "$TAP_FAILURES" ]; then
+  rm -f -- "$NODE_TAP_FILE"
+  echo ">>> Parallel lane FAILED: negative TAP records present despite node exit $NODE_EXIT" >&2
+  printf '%s\n' "$TAP_FAILURES" >&2
+  exit 1
+fi
+rm -f -- "$NODE_TAP_FILE"
 exit "$NODE_EXIT"

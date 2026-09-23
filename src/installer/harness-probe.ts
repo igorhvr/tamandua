@@ -455,6 +455,33 @@ export function readHarnessProbeStatus(runId: string): HarnessProbeStatus | null
   return status as HarnessProbeStatus | null;
 }
 
+/**
+ * RPRB (6sy.37): clear a DEFINITIVE 'failed' harness-probe outcome so an
+ * explicit `tamandua workflow resume` re-probes a repaired harness.
+ *
+ * The conditional WHERE is the whole safety contract:
+ *  - only `harness_probe_status = 'failed'` matches, so a passed ('ok') run
+ *    is never re-probed ("passed stays passed");
+ *  - an in-flight 'probing' reservation is left untouched — the existing
+ *    staleness CAS in reserveHarnessProbe() is the only way to reclaim it;
+ *  - a NULL row (never probed) is a no-op.
+ *
+ * Returns true when a failed row was actually cleared. Callers must invoke
+ * this ONLY from the explicit resume path; the daemon's automatic recovery
+ * paths (rugpull replacement, worker-loss recovery, registration retries)
+ * must never reset the probe.
+ */
+export function resetFailedHarnessProbeForResume(runId: string): boolean {
+  const result = getDb()
+    .prepare(
+      `UPDATE runs
+       SET harness_probe_status = NULL, harness_probe_at = NULL
+       WHERE id = ? AND harness_probe_status = 'failed'`,
+    )
+    .run(runId);
+  return result.changes > 0;
+}
+
 // ── Small text helpers ──────────────────────────────────────────────
 
 const ANSI_CSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;

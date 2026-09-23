@@ -37,6 +37,7 @@ fi
 export TAMANDUA_TEST_GUARD="${TAMANDUA_TEST_GUARD:-1}"
 export TAMANDUA_PI_BINARY="${TAMANDUA_PI_BINARY:-/usr/bin/false}"
 export TAMANDUA_DSH_BINARY="${TAMANDUA_DSH_BINARY:-/usr/bin/false}"
+export TAMANDUA_HERMES_BINARY="${TAMANDUA_HERMES_BINARY:-/usr/bin/false}"
 
 # --- Syntax Gate ---
 # Catch merge-artifact syntax errors (unbalanced braces, etc.) that

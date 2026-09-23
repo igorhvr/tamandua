@@ -25,6 +25,7 @@ import {
   nudgeWithDaemon,
 } from "../server/control-client.js";
 import { emitEvent } from "./events.js";
+import { resetFailedHarnessProbeForResume } from "./harness-probe.js";
 import { advancePipeline, resetFailedStoriesForResume, scheduleRunCronTeardown, setRunContextKey, removeRunContextKey } from "./step-ops.js";
 import {
   RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY,
@@ -1083,6 +1084,15 @@ export async function resumeWorkflow(
   db.prepare(
     `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
   ).run(resumeNow, run.id);
+
+  // RPRB (6sy.37): an explicit resume must re-probe a run whose launch-time
+  // harness probe recorded a definitive 'failed' outcome — the operator has
+  // presumably repaired the harness since. The conditional helper clears ONLY
+  // 'failed' (with its timestamp); 'ok' stays passed and an in-flight
+  // 'probing' reservation is left to the existing staleness protocol. This is
+  // deliberately scoped to the explicit-resume path only; the daemon's
+  // automatic recovery paths must never call it.
+  resetFailedHarnessProbeForResume(run.id);
 
   // Find the first failed step and reset it + subsequent steps
   const failedStep = db.prepare(

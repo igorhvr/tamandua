@@ -59,6 +59,13 @@
  *     `step fail`, and a seeded run stopped mid-round via `workflow stop`)
  *     refuse drain-pause with 409 and are never flipped to paused.
  *
+ *  5. US-002 multi-step corridor (SMALL-FIXES-0923 PAUSE-DRAIN part 2): the
+ *     drain is requested while the IMPLEMENT step is in flight (the #66
+ *     shape). After implement completes the scheduler must dispatch NO new
+ *     verify/test round, finalize exactly one run.paused with no retry
+ *     charge, and a plain resume must dispatch verify -> test and complete
+ *     the run. The other corridors cover only the final-verify step.
+ *
  * Registration: listed in run-all-scripted-e2e-tests and run-all-e2e-tests.
  *
  * Run via: npm run build && node --test e2e-tests/workflows-drain-verify-pause.test.ts
@@ -421,6 +428,13 @@ function corridorBehaviors(opts: {
   branch: string;
   markerContent: string;
   verifier: ScriptedBehavior[];
+  /**
+   * Optional developer (implement) behavior overrides merged over the
+   * default writer+committer shape. Used by the US-002 multi-step corridor to
+   * hold the implement step open (a `sleep` command) so a drain can be
+   * requested while the pipeline is still mid-flight.
+   */
+  developer?: Partial<ScriptedBehavior>;
 }): ScriptedAgentConfig {
   return {
     agents: {
@@ -457,6 +471,7 @@ function corridorBehaviors(opts: {
           "CHANGES: story US-001 marker added",
           "TESTS: scripted fixture",
         ].join("\n"),
+        ...opts.developer,
       },
       verifier: opts.verifier,
       tester: {
@@ -734,6 +749,222 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
           `[drvp e2e main corridor] run ${runId.slice(0, 8)}: drain during final verify finalized to paused once, ` +
             `report retained, no downstream dispatch under drain, flush grace honored (tokens ${runFinal?.tokens_spent}), ` +
             `plain resume dispatched the test step and the run completed; terminal pause refused 409`,
+        );
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "US-002 multi-step corridor: drain requested while implement is in flight stops the verify/test dispatch, pauses exactly once with no retry, and a plain resume completes the run",
+    { timeout: 360_000 },
+    async () => {
+      let ctx: DrvpRunContext | undefined;
+      try {
+        const MULTI_BRANCH = "feature/drvp-multistep-drain-scripted";
+        const MULTI_MARKER = "drain-verify-pause multi-step corridor story one\n";
+        ctx = await startDrvpEnvironment("feature-dev-merge-worktree", corridorBehaviors({
+          branch: MULTI_BRANCH,
+          markerContent: MULTI_MARKER,
+          developer: {
+            // Hold the implement step open ~15s after claim so the test can
+            // request the drain while the pipeline is still mid-flight, then
+            // finish the marker commit normally. This is the reported #66
+            // shape: a multi-step implement -> verify -> test run that used to
+            // keep advancing after the drain request.
+            commands: [
+              "sleep 15",
+              "git add -A",
+              `git commit -m "feat: US-001 - drain-verify-pause multi-step marker one"`,
+            ],
+          },
+          verifier: [
+            {
+              output: verifierPassReport("story one (multi-step drain corridor)"),
+            },
+          ],
+        }));
+        const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+        const { branch: originalBranch } = detachOriginCheckout(repoDir);
+        const runId = await launchRun(
+          ctx,
+          "feature-dev-merge-worktree",
+          "Exercise the DRVP multi-step drain corridor (US-002)",
+          repoDir,
+          originalBranch,
+        );
+
+        // ── Phase 1: reach the in-flight IMPLEMENT step ────────────────
+        await waitForDb(
+          ctx,
+          runId,
+          "implement step claimed (running)",
+          () => dbStep(ctx!, runId, "implement")?.status === "running",
+          120_000,
+        );
+        // Pipeline is mid-flight: implement is running, verify/test untouched.
+        const runBefore = dbRun(ctx, runId);
+        assert.ok(runBefore, "run row should exist");
+        assert.equal(runBefore.status, "running");
+        assert.equal(runBefore.scheduling_status, "active");
+        // verify/test are still upstream-blocked: never claimed yet.
+        assert.notEqual(dbStep(ctx, runId, "verify")?.status, "running");
+        assert.notEqual(dbStep(ctx, runId, "test")?.status, "running");
+        let events = readRunEvents(ctx, runId);
+        assert.equal(countEvent(events, "step.running", "implement"), 1, "implement claimed once");
+        assert.equal(countEvent(events, "step.running", "verify"), 0, "verify not dispatched yet");
+        assert.equal(countEvent(events, "step.running", "test"), 0, "test not dispatched yet");
+
+        // ── Phase 2: request the drain while implement is in flight ────
+        const drainResp = await requestDrainPause(ctx, runId);
+        assert.equal(
+          drainResp.status,
+          200,
+          `drain pause should succeed, got ${drainResp.status}: ${JSON.stringify(drainResp.body)}\n${diagnostics(ctx, runId)}`,
+        );
+        assert.equal(drainResp.body.state, "draining_pause");
+
+        // Still-in-flight control: the drain must NOT be finalized while the
+        // implement round is running — run stays running/draining_pause with
+        // no run.paused yet (deferred until the last in-flight session ends).
+        const runDraining = dbRun(ctx, runId);
+        assert.ok(runDraining, "run row missing");
+        assert.equal(
+          runDraining.status,
+          "running",
+          `drain must not pause the run while implement is in flight; got ${JSON.stringify(runDraining)}\n${diagnostics(ctx, runId)}`,
+        );
+        assert.equal(runDraining.scheduling_status, "draining_pause");
+        assert.equal(contextJson(ctx, runId).pause_drain, "true", "pause_drain attribution should be set");
+        events = readRunEvents(ctx, runId);
+        assert.equal(countEvent(events, "run.paused"), 0, "no run.paused while implement is still in flight");
+        assert.equal(countEvent(events, "run.pause_requested"), 1, "exactly one pause request");
+
+        // ── Phase 3: implement completes → no verify/test dispatch → pause ─
+        await waitForDb(
+          ctx,
+          runId,
+          "run finalized to paused after implement completion with the drain pending",
+          () => {
+            const run = dbRun(ctx!, runId);
+            return run?.status === "paused" && run?.scheduling_status === "paused";
+          },
+          180_000,
+        );
+
+        events = readRunEvents(ctx, runId);
+        assert.equal(countEvent(events, "run.paused"), 1, `exactly one run.paused; ledger: ${events.map((e) => e.event).join(",")}`);
+        const pauseReqIdx = eventIndexes(events, "run.pause_requested")[0]!;
+        const pausedIdx = eventIndexes(events, "run.paused")[0]!;
+
+        // No-new-dispatch while draining: between the drain request and the
+        // pause there must be no new step claim at all (implement was already
+        // running before the request; nothing else may start).
+        const runningBetween = events
+          .map((e, i) => (e.event === "step.running" && i > pauseReqIdx && i < pausedIdx ? i : -1))
+          .filter((i) => i >= 0);
+        assert.equal(
+          runningBetween.length,
+          0,
+          `no step may be claimed between the drain request and the pause; claimed at indices ${runningBetween}\n${diagnostics(ctx, runId)}`,
+        );
+        assert.equal(countEvent(events, "step.running", "implement"), 1, "implement ran exactly once");
+        assert.equal(countEvent(events, "step.running", "verify"), 0, "verify must NOT dispatch during the drain");
+        assert.equal(countEvent(events, "step.running", "test"), 0, "test must NOT dispatch during the drain");
+
+        // A drain pause is not a worker loss and never charges a retry.
+        assert.equal(countEvent(events, "step.worker_lost"), 0, "a drain pause must not emit step.worker_lost");
+        assert.equal(countEvent(events, "story.retry"), 0, "no story retry on this path");
+        const stepsAtPause = dbRows<{ step_id: string; status: string; retry_count: number }>(
+          ctx.env.tamanduaDir,
+          "SELECT step_id, status, retry_count FROM steps WHERE run_id = ?",
+          runId,
+        );
+        for (const step of stepsAtPause) {
+          assert.equal(
+            step.retry_count,
+            0,
+            `step ${step.step_id} must not be charged a retry; got ${step.retry_count}\n${diagnostics(ctx, runId)}`,
+          );
+        }
+        // The implement loop step stays open (verify_each: it holds the loop
+        // across its verify) or is already done — either way it was never
+        // retried. verify is promoted but never claimed; test stays
+        // upstream-blocked behind verify.
+        const implementAtPause = dbStep(ctx, runId, "implement");
+        assert.ok(
+          implementAtPause?.status === "running" || implementAtPause?.status === "done",
+          `implement loop must stay open (running) or be done at pause; got ${implementAtPause?.status}\n${diagnostics(ctx, runId)}`,
+        );
+        assert.equal(
+          dbStep(ctx, runId, "verify")?.status,
+          "pending",
+          `verify must be promoted (never claimed) at pause; got ${dbStep(ctx, runId, "verify")?.status}\n${diagnostics(ctx, runId)}`,
+        );
+        assert.equal(
+          dbStep(ctx, runId, "test")?.status,
+          "waiting",
+          `test must stay upstream-blocked (never claimed) at pause; got ${dbStep(ctx, runId, "test")?.status}\n${diagnostics(ctx, runId)}`,
+        );
+
+        // ── Phase 4: plain resume dispatches the remaining steps ───────
+        const resumeResp = await requestPlainResume(ctx, runId);
+        assert.ok(
+          resumeResp.status === 200 || resumeResp.status === 202,
+          `resume should succeed, got ${resumeResp.status}: ${JSON.stringify(resumeResp.body)}\n${diagnostics(ctx, runId)}`,
+        );
+
+        const terminal = await waitForRunTerminalByDb(ctx, runId, 240_000);
+        assert.equal(terminal, "completed", `run should complete after resume, got ${terminal}\n${diagnostics(ctx, runId)}`);
+
+        assertAllStepsDone(ctx, runId);
+
+        // Full lifecycle: one pause, one resume; verify then test dispatches
+        // only after the resume and the run completes after them.
+        events = readRunEvents(ctx, runId);
+        assert.equal(countEvent(events, "run.paused"), 1, `exactly one run.paused for the whole run; ledger: ${events.map((e) => e.event).join(",")}`);
+        assert.equal(countEvent(events, "run.resume_requested"), 1);
+        assert.equal(countEvent(events, "run.resumed"), 1);
+        const resumedIdx = eventIndexes(events, "run.resumed")[0]!;
+        const verifyRunning = eventIndexes(events, "step.running", "verify");
+        const testRunning = eventIndexes(events, "step.running", "test");
+        assert.equal(verifyRunning.length, 1, "verify dispatches exactly once after the resume");
+        assert.equal(testRunning.length, 1, "test dispatches exactly once after the resume");
+        assert.ok(
+          verifyRunning[0]! > resumedIdx,
+          `verify must dispatch only after the resume (verify at ${verifyRunning[0]}, resumed at ${resumedIdx})`,
+        );
+        assert.ok(
+          testRunning[0]! > verifyRunning[0]!,
+          `test must dispatch after verify (test at ${testRunning[0]}, verify at ${verifyRunning[0]})`,
+        );
+        assert.ok(
+          eventIndexes(events, "run.completed")[0]! > testRunning[0]!,
+          "run completes after the downstream test step",
+        );
+        assert.equal(countEvent(events, "step.worker_lost"), 0, "no worker loss across the whole lifecycle");
+        assert.equal(countEvent(events, "story.retry"), 0, "no story retry across the whole lifecycle");
+
+        // Zero model tokens / no heartbeat rounds on the scripted corridor.
+        const runFinal = dbRun(ctx, runId);
+        assert.equal(runFinal?.tokens_spent, 0, "zero model tokens on the multi-step drain corridor");
+        assertZeroHeartbeatContract(ctx, runId);
+
+        // Repository outcome: the marker landed on the original branch.
+        const marker = execFileSync("git", ["show", `refs/heads/${originalBranch}:marker-one.txt`], {
+          cwd: repoDir,
+          encoding: "utf-8",
+        });
+        assert.ok(marker.includes("multi-step corridor"), `marker-one.txt should carry the story marker:\n${marker}`);
+        const mergeStep = dbStep(ctx, runId, "finalize_merge");
+        assert.equal(mergeStep?.status, "done");
+        assert.match(mergeStep?.output ?? "", /^STATUS: landed$/m);
+
+        console.log(
+          `[drvp e2e US-002 multi-step corridor] run ${runId.slice(0, 8)}: drain during implement stopped the ` +
+            `verify/test dispatch, paused once with no retry, and a plain resume dispatched verify -> test ` +
+            `and the run completed`,
         );
       } finally {
         await teardown(ctx);

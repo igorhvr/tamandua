@@ -3604,9 +3604,26 @@ export function validateExpects(output: string, expects: string): string | null 
 export function finalizeDrainingPause(runId: string): void {
   const db = getDb();
   const run = db
-    .prepare("SELECT status, scheduling_status, workflow_id FROM runs WHERE id = ?")
-    .get(runId) as { status: string; scheduling_status: string; workflow_id: string } | undefined;
-  if (!run || run.scheduling_status !== "draining_pause") return;
+    .prepare("SELECT status, scheduling_status, context, workflow_id FROM runs WHERE id = ?")
+    .get(runId) as
+    | { status: string; scheduling_status: string | null; context: string | null; workflow_id: string }
+    | undefined;
+  if (!run) return;
+
+  // PAUSE-DRAIN: a pending drain is recorded by scheduling_status OR by the
+  // durable pause_drain run-context marker. The marker survives a nudge
+  // re-admission that could transiently reset scheduling_status to 'active',
+  // so accept either signal as proof of a pending drain. A 'false' marker
+  // (a plain non-drain pause, or a resume) is never a drain.
+  const drainPending =
+    run.scheduling_status === "draining_pause" ||
+    parseRunContext(runId, run.context ?? "").pause_drain === "true";
+  if (!drainPending) return;
+
+  // PAUSE-DRAIN idempotency: an already-paused run must never be finalized
+  // again (the pause_drain marker outlives the pause), so exactly one
+  // run.paused is emitted per drain.
+  if (run.status === "paused") return;
 
   // DRVP terminal guard: a completed/failed/canceled run is never flipped to
   // paused by any drain-finalization call. Terminal transitions normally wipe

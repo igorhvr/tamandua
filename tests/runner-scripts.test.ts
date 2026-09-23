@@ -1685,3 +1685,306 @@ describe("guard-ledger-report.mjs", () => {
     assert.equal(stderr, "", "an all-expected ledger must not print a report");
   });
 });
+
+describe("TAMANDUA_HERMES_BINARY safety pin (HTPN)", () => {
+  const PACKAGE_JSON = path.join(REPO_ROOT, "package.json");
+  const ALL_LANES_SCRIPT = path.join(REPO_ROOT, "scripts", "run-all-lanes.sh");
+
+  // Every entry point that can spawn a harness during `npm test` must pin the
+  // three binary seams so the suite can never discover a real model / dsh /
+  // hermes on a developer machine or CI host. The hermes pin uses the
+  // override-respecting `${VAR:-/usr/bin/false}` form so tests that need a fake
+  // (e2e-tests/helpers/scripted-hermes.ts) still win.
+  const ENTRY_POINTS = [
+    { name: "package.json test script", file: PACKAGE_JSON, isPackageJson: true },
+    { name: "scripts/run-all-lanes.sh", file: ALL_LANES_SCRIPT, isPackageJson: false },
+    { name: "scripts/run-serial-tests.sh", file: SERIAL_SCRIPT, isPackageJson: false },
+    { name: "scripts/run-parallel-tests.sh", file: PARALLEL_SCRIPT, isPackageJson: false },
+  ];
+
+  // Matches the assignment either unquoted (package.json shell command) or
+  // quoted (export form in the lane scripts).
+  const HERMES_PIN_RE = /(?:export\s+)?TAMANDUA_HERMES_BINARY=("?\$\{TAMANDUA_HERMES_BINARY:-[^}]*\}"?)/;
+
+  function entryContent(entry) {
+    const raw = fs.readFileSync(entry.file, "utf-8");
+    if (entry.isPackageJson) {
+      return JSON.parse(raw).scripts.test;
+    }
+    return raw;
+  }
+
+  function extractHermesPin(content) {
+    const match = content.match(HERMES_PIN_RE);
+    assert.ok(
+      match,
+      "entry point must pin TAMANDUA_HERMES_BINARY with the override-respecting default: " +
+        content.slice(0, 300),
+    );
+    return match[0];
+  }
+
+  function runPinAssignment(assignment, { unset = false, env = {} } = {}) {
+    const tmpDir = makeTmpDir();
+    try {
+      const lines = ["#!/bin/bash"];
+      if (unset) lines.push("unset TAMANDUA_HERMES_BINARY");
+      lines.push(assignment);
+      lines.push('echo "HERMES=$TAMANDUA_HERMES_BINARY"');
+      const scriptPath = path.join(tmpDir, "hermes-pin-check.sh");
+      fs.writeFileSync(scriptPath, lines.join("\n"), { mode: 0o755 });
+      return execFileSync("bash", [scriptPath], {
+        encoding: "utf-8",
+        stdio: "pipe",
+        env: { PATH: process.env.PATH, ...env },
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  for (const entry of ENTRY_POINTS) {
+    it(entry.name + " pins pi, dsh and hermes", () => {
+      const content = entryContent(entry);
+      for (const key of ["TAMANDUA_PI_BINARY", "TAMANDUA_DSH_BINARY", "TAMANDUA_HERMES_BINARY"]) {
+        assert.ok(
+          content.includes(key),
+          entry.name + " must reference " + key,
+        );
+      }
+      const pin = extractHermesPin(content);
+      assert.ok(
+        pin.includes("/usr/bin/false"),
+        entry.name + " hermes pin must default to /usr/bin/false. Got: " + pin,
+      );
+    });
+
+    it(entry.name + " hermes pin defaults to /usr/bin/false when unset", () => {
+      const pin = extractHermesPin(entryContent(entry));
+      const out = runPinAssignment(pin, { unset: true });
+      assert.ok(
+        out.includes("HERMES=/usr/bin/false"),
+        entry.name + " must default TAMANDUA_HERMES_BINARY to /usr/bin/false. Got: " + out.trim(),
+      );
+    });
+
+    it(entry.name + " hermes pin preserves an explicit override", () => {
+      const pin = extractHermesPin(entryContent(entry));
+      const out = runPinAssignment(pin, {
+        env: { TAMANDUA_HERMES_BINARY: "/opt/fake-hermes/hermes" },
+      });
+      assert.ok(
+        out.includes("HERMES=/opt/fake-hermes/hermes"),
+        entry.name + " must preserve an explicit TAMANDUA_HERMES_BINARY override. Got: " + out.trim(),
+      );
+    });
+  }
+});
+
+describe("NHFG: negative-TAP gate in both lane runners", () => {
+  // On Node 22.23.1 a failed node:test after-hook prints `not ok`/`hookFailed`
+  // but the run summary reports fail 0 and the process exits 0. Linux Node 24
+  // exits 1 instead, so the captured-TAP shape is simulated with a fake `node`
+  // that streams a fixed TAP body and always exits 0. The lane runners must
+  // still fail the lane on any negative-TAP record.
+
+  // A fake `node` placed first on PATH: emits the supplied TAP to stdout and
+  // exits 0 regardless of the arguments the lane passes it.
+  function fakeNodeSource(tapBody: string): string {
+    return [
+      "#!/bin/sh",
+      "cat <<'TAMANDUA_FAKE_TAP'",
+      tapBody.replace(/\n+$/, ""),
+      "TAMANDUA_FAKE_TAP",
+      "exit 0",
+      "",
+    ].join("\n");
+  }
+
+  const CLEAN_TAP = [
+    "TAP version 13",
+    "1..3",
+    "ok 1 - passes",
+    "ok 2 - skipped # SKIP",
+    "ok 3 - todo # TODO",
+    "# tests 3",
+    "# pass 1",
+    "# fail 0",
+    "# skipped 1",
+    "# todo 1",
+  ].join("\n");
+
+  // Summary deliberately says `# fail 0` (the false-green shape) while the TAP
+  // body carries a real negative record.
+  const TOP_LEVEL_NOT_OK_TAP = [
+    "TAP version 13",
+    "1..2",
+    "ok 1 - passes",
+    "not ok 2 - a failing subtest",
+    "  ---",
+    "  duration_ms: 1.234",
+    "  type: 'test'",
+    "  ...",
+    "# tests 2",
+    "# pass 1",
+    "# fail 0",
+  ].join("\n");
+
+  const NESTED_NOT_OK_TAP = [
+    "TAP version 13",
+    "1..1",
+    "# Subtest: outer",
+    "    ok 1 - inner passes",
+    "    not ok 2 - inner fails",
+    "    1..2",
+    "not ok 1 - outer",
+    "  ---",
+    "  duration_ms: 2.0",
+    "  type: 'test'",
+    "  ...",
+    "# tests 2",
+    "# pass 1",
+    "# fail 0",
+  ].join("\n");
+
+  const HOOK_FAILED_TAP = [
+    "TAP version 13",
+    "1..1",
+    "ok 1 - a passing test",
+    "# tests 1",
+    "# pass 1",
+    "# fail 0",
+    '# hookFailed: "after" hook failed',
+  ].join("\n");
+
+  // Regression for the false positive that the unanchored `hookFailed` match
+  // caused in the real serial lane: Node 24's spec reporter prints passing
+  // test titles (which may quote the word `hookFailed`), and only a genuine
+  // TAP diagnostic (`# hookFailed`) may trip the gate.
+  const CLEAN_TAP_WITH_HOOKFAILED_TITLE = [
+    "TAP version 13",
+    "1..1",
+    "ok 1 - serial lane fails on a `hookFailed` diagnostic even when node exits 0",
+    "# tests 1",
+    "# pass 1",
+    "# fail 0",
+  ].join("\n");
+
+  const LANES = [
+    { name: "serial", script: SERIAL_SCRIPT },
+    { name: "parallel", script: PARALLEL_SCRIPT },
+  ];
+
+  /**
+   * Copy the lane script into an isolated repo with a fake `node` first on
+   * PATH, run it, and return its observed exit status/output.
+   */
+  function runLaneWithFakeNode(script: string, tap: string) {
+    const tmpDir = makeTmpDir();
+    try {
+      const scriptsDir = path.join(tmpDir, "scripts");
+      fs.mkdirSync(scriptsDir, { recursive: true });
+      const scriptName = path.basename(script);
+      fs.copyFileSync(script, path.join(scriptsDir, scriptName));
+      fs.chmodSync(path.join(scriptsDir, scriptName), 0o755);
+
+      const binDir = path.join(tmpDir, "fake-bin");
+      fs.mkdirSync(binDir, { recursive: true });
+      fs.writeFileSync(path.join(binDir, "node"), fakeNodeSource(tap), { mode: 0o755 });
+
+      // One serial-lane file and one non-serial file so both lanes have a
+      // non-empty FILES list (the parallel lane discovers them with `find`).
+      writeText(path.join(tmpDir, "src", "serial.test.ts"), "// fake\n");
+      writeText(path.join(tmpDir, "src", "parallel.test.ts"), "// fake\n");
+      writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/serial.test.ts\n");
+
+      try {
+        const stdout = execFileSync("bash", [path.join(scriptsDir, scriptName)], {
+          cwd: tmpDir,
+          env: cleanChildEnv({
+            HOME: tmpDir,
+            TAMANDUA_REPO_ROOT: tmpDir,
+            TAMANDUA_TEST_GUARD: "0",
+            PATH: binDir + ":" + (process.env.PATH || ""),
+          }),
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        return { status: 0, stdout, stderr: "" };
+      } catch (e: any) {
+        return { status: e.status ?? 1, stdout: e.stdout || "", stderr: e.stderr || "" };
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  for (const lane of LANES) {
+    it(lane.name + " lane fails on a top-level `not ok` even when node exits 0", () => {
+      const r = runLaneWithFakeNode(lane.script, TOP_LEVEL_NOT_OK_TAP);
+      const combined = r.stderr + r.stdout;
+      assert.notEqual(r.status, 0, "lane must exit non-zero: " + combined.slice(0, 400));
+      assert.ok(
+        combined.includes("negative TAP records present"),
+        "lane must report the negative-TAP gate: " + combined.slice(0, 400),
+      );
+      assert.ok(
+        combined.includes("not ok 2 - a failing subtest"),
+        "lane must print the offending record: " + combined.slice(0, 400),
+      );
+    });
+
+    it(lane.name + " lane fails on a nested/indented `not ok` even when node exits 0", () => {
+      const r = runLaneWithFakeNode(lane.script, NESTED_NOT_OK_TAP);
+      const combined = r.stderr + r.stdout;
+      assert.notEqual(r.status, 0, "lane must exit non-zero: " + combined.slice(0, 400));
+      assert.ok(
+        combined.includes("negative TAP records present"),
+        "lane must report the negative-TAP gate: " + combined.slice(0, 400),
+      );
+      assert.ok(
+        combined.includes("not ok 2 - inner fails"),
+        "lane must print the offending nested record: " + combined.slice(0, 400),
+      );
+    });
+
+    it(lane.name + " lane fails on a `hookFailed` diagnostic even when node exits 0", () => {
+      const r = runLaneWithFakeNode(lane.script, HOOK_FAILED_TAP);
+      const combined = r.stderr + r.stdout;
+      assert.notEqual(r.status, 0, "lane must exit non-zero: " + combined.slice(0, 400));
+      assert.ok(
+        combined.includes("negative TAP records present"),
+        "lane must report the negative-TAP gate: " + combined.slice(0, 400),
+      );
+      assert.ok(
+        combined.includes("hookFailed"),
+        "lane must print the hookFailed diagnostic: " + combined.slice(0, 400),
+      );
+    });
+
+    it(lane.name + " lane stays green on a clean TAP with skip/todo and node exit 0", () => {
+      const r = runLaneWithFakeNode(lane.script, CLEAN_TAP);
+      const combined = r.stderr + r.stdout;
+      assert.equal(
+        r.status,
+        0,
+        "lane must exit 0 for a clean skip/todo TAP: " + combined.slice(0, 400),
+      );
+      assert.ok(
+        combined.includes("ok 1 - passes"),
+        "lane must stream the clean TAP: " + combined.slice(0, 400),
+      );
+    });
+
+    it(lane.name + " lane does not trip on a test title mentioning hookFailed", () => {
+      const r = runLaneWithFakeNode(lane.script, CLEAN_TAP_WITH_HOOKFAILED_TITLE);
+      const combined = r.stderr + r.stdout;
+      assert.equal(
+        r.status,
+        0,
+        "a passing test title containing `hookFailed` must not fail the lane: " +
+          combined.slice(0, 400),
+      );
+    });
+  }
+});

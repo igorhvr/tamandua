@@ -1355,6 +1355,26 @@ async function handleRegisterRun(runId: string): Promise<JsonResponse> {
   if (run.status === "paused" || run.scheduling_status === "paused") {
     return ok({ state: "paused" });
   }
+  // ── PAUSE-DRAIN re-admission guard ─────────────────────────────
+  // A pending drain must never be re-admitted. A step completion fires
+  // POST /control/nudge, whose admission loop iterates every running run;
+  // the old path reset a draining run's scheduling_status back to 'active'
+  // (and re-created timers), which bypassed the scheduler's drain guard and
+  // let the run keep dispatching new rounds. Preserve the drain state here;
+  // the scheduler's dispatch guard finalizes it to 'paused' once the last
+  // in-flight step ends. Only an explicit `workflow resume` (which clears
+  // the marker and flips scheduling_status before re-registering) cancels a
+  // pending drain.
+  if (
+    run.scheduling_status === "draining_pause" ||
+    parseRunContext(run.id, run.context ?? "").pause_drain === "true"
+  ) {
+    logger.debug("control-server: register-run skipped — drain pending", {
+      runId: run.id,
+      schedulingStatus: run.scheduling_status,
+    });
+    return ok({ state: "draining_pause" });
+  }
   if (run.scheduling_status === "active") {
     const { _scheduledJobCountForRun } = await import("../installer/agent-scheduler.js");
     if (_scheduledJobCountForRun(run.id) >= requiredTimersForRun(run.id)) {
@@ -1559,6 +1579,17 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
   // callers — instead of silently dropping the marker so a later drain
   // finalization could pause the run out from under the resume.
   const cancelledDrain = run.scheduling_status === "draining_pause";
+  // PAUSE-DRAIN US-002: a drain that already FINALIZED leaves the historical
+  // `pause_drain` marker on the paused run (the marker also drives
+  // finalizeDrainingPause idempotency). That is not a pending drain, so it
+  // must not be audited as a cancel — but it MUST still be cleared on resume:
+  // handleRegisterRun refuses re-admission of any run whose marker is "true",
+  // so leaving it behind would silently wedge the resumed run at
+  // state:'draining_pause' with no timers (the reported resume-after-drain
+  // hang). Clear it without the cancel flag/event.
+  const staleDrainMarker =
+    !cancelledDrain &&
+    parseRunContext(run.id, run.context ?? "").pause_drain === "true";
 
   logger.info("control-server: resume requested", { runId, requestedBy });
 
@@ -1592,11 +1623,11 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
         `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
       )
       .run(new Date().toISOString(), runId);
-    if (cancelledDrain) {
-      // Cancel the pending drain in the same synchronous DB section as the
-      // status flip (no awaits between the UPDATE and this context rewrite),
-      // so the marker can never half-exist with scheduling_status already
-      // flipped out of draining_pause.
+    if (cancelledDrain || staleDrainMarker) {
+      // Cancel the pending drain / clear the historical marker in the same
+      // synchronous DB section as the status flip (no awaits between the
+      // UPDATE and this context rewrite), so the marker can never half-exist
+      // with scheduling_status already flipped out of draining_pause.
       removeRunContextKey(runId, "pause_drain");
     }
   } catch {

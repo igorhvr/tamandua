@@ -2224,8 +2224,39 @@ export async function executeDispatchRound(
         logger.debug("Dispatch round skipped — run paused", { ...context });
         return;
       }
-      if (row.scheduling_status === "draining_pause") {
-        logger.debug("Dispatch round skipped — run draining before pause (in-flight work can complete)", { ...context });
+      // ── PAUSE-DRAIN dispatch guard ────────────────────────────────
+      // A pending drain must stop EVERY new dispatch entry — the initial
+      // tick, a step-completion nudge (the daemon /control/nudge path
+      // re-admits running runs and can reset scheduling_status back to
+      // 'active'), and fire-and-forget rounds — BEFORE the deterministic
+      // peek and BEFORE any harness spawn. The durable pause_drain
+      // run-context marker is therefore authoritative alongside
+      // scheduling_status: it survives the nudge re-admission that used to
+      // bypass a draining_pause row. In-flight sessions are allowed to
+      // finish; this guard also runs the drain finalizer so a run with a
+      // pending drain and zero in-flight steps reaches 'paused' even when
+      // no step-completion callback fires.
+      if (
+        row.scheduling_status === "draining_pause" ||
+        matchlockRunContext.pause_drain === "true"
+      ) {
+        logger.debug(
+          "Dispatch round skipped — run draining before pause (in-flight work can complete)",
+          {
+            ...context,
+            schedulingStatus: row.scheduling_status,
+            drainMarker: matchlockRunContext.pause_drain ?? null,
+          },
+        );
+        try {
+          const { finalizeDrainingPause } = await import("./step-ops.js");
+          finalizeDrainingPause(job.runId);
+        } catch (err) {
+          logger.warn("Drain-pending dispatch guard: finalize check failed", {
+            ...context,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
         return;
       }
       // ── MTLK-ADMIT: Matchlock dispatch admission barrier ─────────

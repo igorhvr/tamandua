@@ -2341,6 +2341,49 @@ echo "STATUS: done"
     }
   });
 
+  it("dsh: real `dsh: reasoning:` with an unindented body writes no WARN", async () => {
+    // Regression for the audited dsh 0.1.3-alpha.2 shape: a `dsh:
+    // reasoning:` header followed by an UNINDENTED body line. The old
+    // indentation heuristic left the body genuine and WARNed.
+    const adapter = getHarnessAdapter("dsh");
+    const { root: tmpDir } = createTempHome("tamandua-test-dsh-real-reasoning-stderr-");
+    const fakeDsh = path.join(tmpDir, "dsh");
+    fs.writeFileSync(
+      fakeDsh,
+      `#!/bin/sh
+echo "dsh: reasoning:" >&2
+echo "The user wants me to run the exact command \\"/opt/tamandua/bin/tamandua skill-path\\" and reply with the PATH and nothing else." >&2
+echo "STATUS: done"
+`,
+      { mode: 0o755 },
+    );
+
+    const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    const savedDebug = process.env.TAMANDUA_DEBUG;
+    process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+    process.env.TAMANDUA_DEBUG = "1";
+    try {
+      const result = await adapter.runRound("prompt", { timeout: 5, workdir: tmpDir });
+      assert.equal(result.exitCode, 0);
+
+      const logContent = readIsolatedLog();
+      assert.equal(
+        hasWarnStderr(logContent, "dsh"),
+        false,
+        `real benign dsh stderr must NOT produce a WARN "dsh stderr" line.\n${logContent}`,
+      );
+      assert.ok(
+        logContent.includes("dsh stderr (benign)"),
+        "real benign dsh stderr must be logged at debug",
+      );
+    } finally {
+      if (originalDshBinary === undefined) delete process.env.TAMANDUA_DSH_BINARY;
+      else process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+      if (savedDebug === undefined) delete process.env.TAMANDUA_DEBUG;
+      else process.env.TAMANDUA_DEBUG = savedDebug;
+    }
+  });
+
   it("dsh: genuine stderr still writes the WARN 'dsh stderr' line", async () => {
     const adapter = getHarnessAdapter("dsh");
     const { root: tmpDir } = createTempHome("tamandua-test-dsh-genuine-stderr-");

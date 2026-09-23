@@ -45,6 +45,7 @@ import {
   reserveHarnessProbe,
   recordHarnessProbeResult,
   readHarnessProbeStatus,
+  resetFailedHarnessProbeForResume,
   type HarnessProbeAdapterResult,
   type HarnessProbeFailureFields,
 } from "../../dist/installer/harness-probe.js";
@@ -570,5 +571,79 @@ describe("harness-probe once-per-run DB helpers (IFLB)", () => {
 
   it("reserving a run that does not exist returns false", () => {
     assert.equal(reserveHarnessProbe("never-created"), false);
+  });
+
+  // ── RPRB: explicit-resume re-probe reset ──────────────────────────
+  // resetFailedHarnessProbeForResume is the ONLY sanctioned way to clear a
+  // definitive probe outcome. Its conditional WHERE is the safety contract:
+  // 'failed' -> NULL, 'ok' and 'probing' untouched.
+
+  it("clears a 'failed' outcome (status + timestamp) so a fresh probe can be reserved", () => {
+    insertRun("resume-failed-run");
+    const T0 = Date.UTC(2026, 8, 3, 12, 0, 0);
+    assert.equal(reserveHarnessProbe("resume-failed-run", { wallMs: 1000, nowMs: T0 }), true);
+    recordHarnessProbeResult("resume-failed-run", "failed", { nowMs: T0 + 400 });
+    assert.equal(readHarnessProbeStatus("resume-failed-run"), "failed");
+
+    // Explicit resume: the definitive failure is cleared.
+    assert.equal(resetFailedHarnessProbeForResume("resume-failed-run"), true);
+    assert.equal(readHarnessProbeStatus("resume-failed-run"), null, "status must read NULL after resume");
+
+    const row = getDb()
+      .prepare("SELECT harness_probe_status, harness_probe_at FROM runs WHERE id = ?")
+      .get("resume-failed-run") as { harness_probe_status: string | null; harness_probe_at: string | null };
+    assert.equal(row.harness_probe_status, null);
+    assert.equal(row.harness_probe_at, null, "the failed outcome timestamp is cleared with the status");
+
+    // A fresh once-per-run probe can now be reserved.
+    assert.equal(
+      reserveHarnessProbe("resume-failed-run", { wallMs: 1000, nowMs: T0 + 5000 }),
+      true,
+      "a resumed failed-probe run must be re-reservable",
+    );
+    assert.equal(readHarnessProbeStatus("resume-failed-run"), "probing");
+  });
+
+  it("never resets an 'ok' outcome ('passed stays passed')", () => {
+    insertRun("resume-ok-run");
+    const T0 = Date.UTC(2026, 8, 3, 12, 0, 0);
+    assert.equal(reserveHarnessProbe("resume-ok-run", { wallMs: 1000, nowMs: T0 }), true);
+    recordHarnessProbeResult("resume-ok-run", "ok", { nowMs: T0 + 300 });
+    assert.equal(readHarnessProbeStatus("resume-ok-run"), "ok");
+
+    assert.equal(resetFailedHarnessProbeForResume("resume-ok-run"), false, "an 'ok' row must never be reset");
+    assert.equal(readHarnessProbeStatus("resume-ok-run"), "ok");
+    assert.equal(
+      reserveHarnessProbe("resume-ok-run", { wallMs: 1000, nowMs: T0 + 1_000_000 }),
+      false,
+      "a resumed passed run must never be re-probed",
+    );
+  });
+
+  it("never touches an in-flight 'probing' reservation (staleness protocol unchanged)", () => {
+    insertRun("resume-probing-run");
+    const T0 = Date.UTC(2026, 8, 3, 12, 0, 0);
+    assert.equal(reserveHarnessProbe("resume-probing-run", { wallMs: 1000, nowMs: T0 }), true);
+    assert.equal(readHarnessProbeStatus("resume-probing-run"), "probing");
+
+    assert.equal(
+      resetFailedHarnessProbeForResume("resume-probing-run"),
+      false,
+      "a live reservation must not be cleared by resume",
+    );
+    assert.equal(readHarnessProbeStatus("resume-probing-run"), "probing");
+    // Inside the wall the reservation still holds …
+    assert.equal(reserveHarnessProbe("resume-probing-run", { wallMs: 1000, nowMs: T0 + 500 }), false);
+    // … and only the existing stale CAS can reclaim it, exactly as before.
+    assert.equal(reserveHarnessProbe("resume-probing-run", { wallMs: 1000, nowMs: T0 + 2000 }), true);
+  });
+
+  it("is a no-op for an unprobed run (and for a missing row)", () => {
+    insertRun("resume-null-run");
+    assert.equal(readHarnessProbeStatus("resume-null-run"), null);
+    assert.equal(resetFailedHarnessProbeForResume("resume-null-run"), false, "NULL is not 'failed'");
+    assert.equal(readHarnessProbeStatus("resume-null-run"), null);
+
+    assert.equal(resetFailedHarnessProbeForResume("resume-missing-run"), false);
   });
 });
