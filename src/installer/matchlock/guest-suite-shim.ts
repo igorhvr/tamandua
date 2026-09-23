@@ -65,6 +65,7 @@ import {
   getTrackedDirtyPaths,
   trackedTreeHash,
 } from "./guest-suite-git.js";
+import { parseSuiteWireInstant } from "./guest-protocol.js";
 
 // ── Native parity constants ───────────────────────────────────────────
 
@@ -517,8 +518,11 @@ async function emitSuiteEvent(
 }
 
 function fmtAge(nowMs: number, createdAt: string): number {
-  const t = new Date(createdAt).getTime();
-  return Number.isNaN(t) ? NaN : nowMs - t;
+  // Host-supplied ledger instant: parse it in-pack, pinning a zone-less value
+  // to UTC. An unreadable value stays NaN, which every caller treats as "no
+  // replay / no red note".
+  const t = parseSuiteWireInstant(createdAt);
+  return t === undefined ? NaN : nowMs - t;
 }
 
 function formatAge(ms: number): string {

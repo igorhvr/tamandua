@@ -217,10 +217,15 @@ export function getMedicStatus(): MedicStatus {
       "SELECT checked_at, summary, issues_found, actions_taken FROM medic_checks ORDER BY checked_at DESC LIMIT 1"
     ).get() as { checked_at: string; summary: string; issues_found: number; actions_taken: number } | undefined;
 
+    // Numeric 24h window: checked_at is canonical ISO-Z while SQLite's naive
+    // 'now' cutoff is 'YYYY-MM-DD HH:MM:SS', so a string comparison is lexical
+    // ('T' > ' ') and counts every row on the cutoff's UTC date (up to ~48h).
+    // julianday() accepts the ISO-Z shape, the legacy naive shape, and
+    // fractional seconds.
     const stats = db.prepare(`
       SELECT COUNT(*) as checks, COALESCE(SUM(issues_found), 0) as issues, COALESCE(SUM(actions_taken), 0) as actions
       FROM medic_checks
-      WHERE checked_at > datetime('now', '-24 hours')
+      WHERE julianday(checked_at) > julianday('now', '-24 hours')
     `).get() as { checks: number; issues: number; actions: number };
 
     return {

@@ -282,6 +282,31 @@ export const SUITE_WIRE_ORIGIN_REPO_MAX_BYTES = 4096;
 const SUITE_WIRE_TREE_HASH_RE = /^[0-9a-f]{40}$/;
 const SUITE_WIRE_CMD_HASH_RE = /^[0-9a-f]{64}$/;
 const SUITE_WIRE_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+// Zone-less suite-wire instant: `YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DDTHH:MM:SS`,
+// with optional fractional seconds. Host-supplied ledger rows may predate the
+// ISO-Z write path, so a naive value must be read as UTC (never host-local).
+const SUITE_WIRE_NAIVE_RE = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?)$/;
+
+/**
+ * Parse a suite-wire instant to epoch milliseconds, treating a zone-less
+ * (naive) value as UTC. Returns `undefined` for anything unreadable: a
+ * non-match or a value whose epoch is not finite. This module ships inside the
+ * Node-core-only Matchlock guest pack, so it must not import the host
+ * `src/lib/instant.ts`; the parsing is deliberately in-pack and dependency-free.
+ */
+export function parseSuiteWireInstant(value: string): number | undefined {
+  if (typeof value !== "string") return undefined;
+  if (SUITE_WIRE_ISO_RE.test(value)) {
+    const iso = Date.parse(value);
+    return Number.isFinite(iso) ? iso : undefined;
+  }
+  const naive = SUITE_WIRE_NAIVE_RE.exec(value);
+  if (!naive) return undefined;
+  // Pin a naive match to UTC instead of letting the host/guest TZ decide:
+  // `2026-09-09 01:00:00` becomes `2026-09-09T01:00:00Z`.
+  const parsed = Date.parse(`${naive[1]}T${naive[2]}Z`);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
 
 function wireBytes(s: string): number {
   return Buffer.byteLength(s, "utf-8");

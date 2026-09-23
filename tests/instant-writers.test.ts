@@ -4,9 +4,10 @@
  * Two halves:
  *  1. Comment-blind source scan — the five converted files contain no
  *     `datetime('now')` writer, every one of them interpolates the shared
- *     `SQL_NOW_ISO` fragment, and the intentionally-skipped SQL comparison
- *     forms (the medic `checked_at` window and every `julianday('now')`
- *     comparison) are left untouched.
+ *     `SQL_NOW_ISO` fragment, the medic `checked_at` window is a numeric
+ *     `julianday` comparison (no lexical `datetime('now', ...)` cutoff), and
+ *     the intentionally-skipped `julianday('now')` comparisons are left
+ *     untouched.
  *  2. Behavioral — the real writer SQL text is read out of each source file,
  *     rendered with the shared `SQL_NOW_ISO` fragment, executed against a real
  *     SQLite database, and the persisted `updated_at` is asserted to match the
@@ -64,11 +65,15 @@ describe("US-003 instant writers: comment-blind source scan", () => {
     }
   });
 
-  it("keeps the intentionally-skipped SQL comparison forms unchanged", () => {
+  it("uses the numeric medic checked_at window and keeps the julianday comparisons", () => {
     const medic = stripComments(readSource("src/medic/medic.ts"));
     assert.ok(
-      medic.includes("WHERE checked_at > datetime('now', '-24 hours')"),
-      "the medic checked_at SQL comparison (skipped item) must remain unchanged",
+      medic.includes("WHERE julianday(checked_at) > julianday('now', '-24 hours')"),
+      "the medic checked_at 24h window must be a numeric julianday comparison",
+    );
+    assert.ok(
+      !medic.includes("checked_at > datetime('now', '-24 hours')"),
+      "the lexical medic checked_at window must be gone",
     );
     assert.equal(
       (medic.match(/julianday\('now'\)/g) ?? []).length,

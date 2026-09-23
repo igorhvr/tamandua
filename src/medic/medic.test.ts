@@ -205,5 +205,34 @@ describe("medic", () => {
       assert.equal(status.lastCheck?.checkedAt, secondCheck.checkedAt);
       assert.ok(status.recentChecks >= 1);
     });
+
+    it("counts only rows inside the numeric 24h window, not the lexical cutoff's UTC date", () => {
+      ensureMedicTables();
+
+      const nowMs = Date.now();
+      const cutoffUtcDate = new Date(nowMs - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      // UTC midnight of the cutoff's date: always older than 24h, yet it carries
+      // the same UTC date as the cutoff. The old lexical predicate
+      // (checked_at > 'YYYY-MM-DD HH:MM:SS') counted it because 'T' > ' '.
+      const cutoffDateMidnight = `${cutoffUtcDate}T00:00:00.000Z`;
+      const oneHourAgo = new Date(nowMs - 60 * 60 * 1000).toISOString();
+
+      const insert = db.prepare(
+        "INSERT INTO medic_checks (id, checked_at, issues_found, actions_taken, summary, details) VALUES (?, ?, ?, ?, ?, ?)"
+      );
+      insert.run("old-midnight", cutoffDateMidnight, 5, 5, "old", "[]");
+      insert.run("recent-hour", oneHourAgo, 1, 1, "recent", "[]");
+
+      const status = getMedicStatus();
+      assert.equal(status.recentChecks, 1, "only the ~1h row is inside the numeric 24h window");
+      assert.equal(status.recentIssues, 1, "the >24h midnight row contributes no issues");
+      assert.equal(status.recentActions, 1, "the >24h midnight row contributes no actions");
+
+      // Red-arm: the legacy lexical predicate really does count both rows.
+      const legacy = db.prepare(
+        "SELECT COUNT(*) as checks FROM medic_checks WHERE checked_at > datetime('now', '-24 hours')"
+      ).get() as { checks: number };
+      assert.equal(legacy.checks, 2, "the legacy lexical predicate also counts the >24h midnight row");
+    });
   });
 });

@@ -276,10 +276,11 @@ describe("US-009 instant guard: allow-list", () => {
   it("scans the real src/ tree and still sees the known legitimate hits", () => {
     const real = scanRealTree();
     assert.ok(real.length > 0, "guard must actually be scanning src/");
-    // Sanity: the two pinned occurrences are found so the allow-list is exercised.
+    // Sanity: the remaining pinned occurrence is found so the allow-list is
+    // exercised, and the fixed medic query reports no violation at all.
     assert.ok(
-      real.some((v) => v.file === "src/medic/medic.ts" && v.snippet.includes("datetime('now', '-24 hours')")),
-      "medic 24h comparison must be detected",
+      !real.some((v) => v.file === "src/medic/medic.ts"),
+      "medic must be violation-free after the numeric 24h window fix",
     );
     assert.ok(
       real.some((v) => v.file === "src/server/control-server.ts" && v.snippet.includes("new Date(existing.claimedAt)")),

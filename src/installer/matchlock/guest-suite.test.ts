@@ -49,6 +49,7 @@ import {
   trackedTreeHash,
   getTrackedDirtyPaths,
 } from "../../../dist/installer/matchlock/guest-suite-git.js";
+import { parseSuiteWireInstant } from "../../../dist/installer/matchlock/guest-protocol.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST_ENTRY = join(HERE, "..", "..", "..", "dist", "installer", "matchlock", "guest-suite-cli-entry.js");
@@ -1191,6 +1192,108 @@ describe("guest-suite git helper parity", () => {
     git(repo, ["checkout", "--", "README.md"]);
     writeFileSync(join(repo, "untracked-dirty.txt"), "u\n");
     assert.deepEqual(getTrackedDirtyPaths(repo), []);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// describe 7b: suite-wire instants are parsed UTC-pinned (TIME-RESIDUE 3)
+// ───────────────────────────────────────────────────────────────────────
+describe("suite-wire instant parsing is UTC-pinned and TZ-independent", () => {
+  const originalTz = process.env.TZ;
+
+  /** Run `fn` under a fixed TZ, always restoring the previous value. */
+  function withTz(tz: string, fn: () => void): void {
+    process.env.TZ = tz;
+    try {
+      fn();
+    } finally {
+      if (originalTz === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTz;
+    }
+  }
+
+  it("reads a naive value as UTC, leaves ISO-Z unchanged, and refuses junk", () => {
+    withTz("America/Sao_Paulo", () => {
+      // A naive value must be pinned to UTC, NOT read as guest/host local time.
+      // Under Sao Paulo (UTC-3) the old `new Date(value)` would return
+      // 04:00Z for this value; the UTC-pinned parse returns 01:00Z.
+      assert.equal(
+        parseSuiteWireInstant("2026-09-09 01:00:00"),
+        Date.parse("2026-09-09T01:00:00Z"),
+      );
+      assert.equal(
+        parseSuiteWireInstant("2026-09-09T01:00:00"),
+        Date.parse("2026-09-09T01:00:00Z"),
+      );
+      // ISO-Z input is unchanged by the TZ.
+      assert.equal(
+        parseSuiteWireInstant("2026-09-09T01:00:00.000Z"),
+        Date.parse("2026-09-09T01:00:00Z"),
+      );
+      // Anything the parser cannot read is unreadable (undefined), not NaN/Dates.
+      assert.equal(parseSuiteWireInstant("not-an-instant"), undefined);
+      assert.equal(parseSuiteWireInstant(""), undefined);
+      assert.equal(parseSuiteWireInstant("2026-09-09"), undefined);
+      // Non-ISO offset forms are not suite-wire shapes.
+      assert.equal(parseSuiteWireInstant("2026-09-09T01:00:00-03:00"), undefined);
+    });
+  });
+
+  it("a naive UTC ledger row older than the green TTL does not replay under a non-UTC TZ", async () => {
+    const repo = initRepo(FIXTURE_BASE, "repo-tz-naive");
+    const cmd = "echo tz-naive-pass";
+    const tree = committedTreeHash(repo)!;
+    const cmdHash = computeCmdHash(cmd);
+    const ttlGreenMs = 24 * 60 * 60 * 1000;
+    const freshIso = new Date().toISOString();
+    const oldNaiveUtc = new Date(Date.now() - 25 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 19)
+      .replace("T", " ");
+
+    const original = process.env.TZ;
+    process.env.TZ = "America/Sao_Paulo";
+    try {
+      // ISO-Z fixture: fresh (1h old) → replays.
+      const isoFake = new FakeSuiteTransport(NS_A);
+      isoFake.seedRow({
+        originRepo: repo,
+        treeHash: tree,
+        cmdHash,
+        exitCode: 0,
+        created_at: freshIso,
+      });
+      const isoRun = await runShim(
+        ["--repo", repo, "--run", "run-tz", "--step", "step-tz", "--", cmd],
+        isoFake,
+        { options: { ttlGreenMs } },
+      );
+      assert.equal(isoRun.exitCode, 0);
+      assert.match(isoRun.out, /^TAMANDUA-TEST CACHED: tree /);
+
+      // Naive fixture: 25h old UTC. A host-local (UTC-3) read would make it
+      // look 22h old and wrongly replay; the UTC-pinned read must execute.
+      const naiveFake = new FakeSuiteTransport(NS_A);
+      naiveFake.seedRow({
+        originRepo: repo,
+        treeHash: tree,
+        cmdHash,
+        exitCode: 0,
+        created_at: oldNaiveUtc,
+      });
+      const naiveRun = await runShim(
+        ["--repo", repo, "--run", "run-tz", "--step", "step-tz", "--", cmd],
+        naiveFake,
+        { options: { ttlGreenMs } },
+      );
+      assert.equal(naiveRun.exitCode, 0);
+      assert.doesNotMatch(naiveRun.out, /TAMANDUA-TEST CACHED/);
+      assert.match(naiveRun.out, /tz-naive-pass/);
+      assert.equal(naiveFake.opCalls("suite.record").length, 1, "expired naive row re-executes and records");
+    } finally {
+      if (original === undefined) delete process.env.TZ;
+      else process.env.TZ = original;
+    }
   });
 });
 

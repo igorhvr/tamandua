@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import {
   HOST_SUITE_STORE_VERSION,
   HostSuiteClaimOwnerMismatchError,
@@ -102,6 +103,91 @@ function claimInput(over: Record<string, unknown> = {}) {
     jobId: "job-1",
     ...over,
   };
+}
+
+/**
+ * Seed one host_suite_results row through a SECOND connection so the test can
+ * write `created_at` shapes `record()` never emits (legacy naive UTC, garbage).
+ */
+function rawSeedResult(
+  file: string,
+  over: {
+    exitCode: number;
+    createdAt: string;
+    invocationId: string;
+    startedAt: string;
+  },
+): void {
+  const db = new DatabaseSync(file);
+  try {
+    db.prepare(
+      `INSERT INTO host_suite_results
+         (namespace_id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms,
+          log_tail, run_id, step_id, invocation_id, agent_id, job_id, started_at, payload_digest, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      NS_A_ID,
+      ORIGIN,
+      TREE,
+      CMD_HASH,
+      "npm test",
+      over.exitCode,
+      1_000,
+      null,
+      "run-raw",
+      "step-raw",
+      over.invocationId,
+      "feature-dev-merge_developer",
+      "job-raw",
+      over.startedAt,
+      `digest-${over.invocationId}`,
+      over.createdAt,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+/** Column names of host_suite_claims read through a side connection (migration probe). */
+function claimColumnNames(file: string): string[] {
+  const db = new DatabaseSync(file);
+  try {
+    return (db.prepare("PRAGMA table_info(host_suite_claims)").all() as Array<{ name: unknown }>).map(
+      (col) => String(col.name),
+    );
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Raw-insert one host_suite_claims row through a second connection so a test
+ * can write a `claimed_at` shape claim() never emits.
+ */
+function rawSeedClaim(file: string, over: { claimedAt: string; ownerToken: string; invocationId: string }): void {
+  const db = new DatabaseSync(file);
+  try {
+    db.prepare(
+      `INSERT INTO host_suite_claims
+         (namespace_id, origin_repo, tree_hash, cmd_hash, owner_token, run_id, step_id,
+          invocation_id, agent_id, job_id, claimed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      NS_A_ID,
+      ORIGIN,
+      TREE,
+      CMD_HASH,
+      over.ownerToken,
+      "run-raw",
+      "step-raw",
+      over.invocationId,
+      null,
+      null,
+      over.claimedAt,
+    );
+  } finally {
+    db.close();
+  }
 }
 
 describe("host-suite-store: open, tables, namespace registration", () => {
@@ -240,6 +326,39 @@ describe("host-suite-store: record + lookup (native shapes, namespace axis)", ()
     assert.equal(aged.latest?.created_at, "2026-09-09T01:00:00.000Z", "created_at is the host commit instant, not guest started_at");
     assert.equal(aged.latest?.namespace_id, NS_A_ID);
   });
+
+  it("decides the 24h flake window numerically: legacy naive-UTC rows count, stale/unparseable do not", () => {
+    const file = tempFile("flake-window");
+    const c = clock(); // 2026-09-09T01:00:00.000Z
+    const store = openHostSuiteStore(file, { now: c.now });
+    try {
+      store.registerNamespace(NS_A);
+      // Legacy naive-UTC pass 2h before "now" — on the OLD ISO-Z cutoff's UTC
+      // date, so the old `created_at >= fmtIso(cutoff)` string bound drops it
+      // (space < "T"); the numeric window must count it.
+      rawSeedResult(file, { exitCode: 0, createdAt: "2026-09-08 23:00:00", invocationId: INV_1, startedAt: "2026-09-08T23:00:00.000Z" });
+      // Legacy naive-UTC fail 1h before "now".
+      rawSeedResult(file, { exitCode: 5, createdAt: "2026-09-09 00:00:00", invocationId: INV_2, startedAt: "2026-09-09T00:00:00.000Z" });
+      // Canonical ISO-Z fail inside the window (unchanged behavior).
+      rawSeedResult(file, { exitCode: 3, createdAt: "2026-09-08T20:00:00.000Z", invocationId: "33333333-3333-4333-8333-333333333333", startedAt: "2026-09-08T20:00:00.000Z" });
+      // Older than FLAKE_WINDOW_MS + tolerance (24h 3s): excluded.
+      rawSeedResult(file, { exitCode: 0, createdAt: "2026-09-08 00:59:57", invocationId: "44444444-4444-4444-8444-444444444444", startedAt: "2026-09-08T00:59:57.000Z" });
+      // Unparseable: never counted as fresh (excluded from both counts).
+      rawSeedResult(file, { exitCode: 5, createdAt: "not-an-instant", invocationId: "55555555-5555-4555-8555-555555555555", startedAt: "2026-09-08T22:00:00.000Z" });
+
+      // Red-arm: the OLD string bound lexically drops the naive pass row.
+      const oldCutoff = new Date(c.now() - 24 * 60 * 60 * 1000).toISOString();
+      assert.ok("2026-09-08 23:00:00" < oldCutoff, "legacy naive row sorts below the old ISO-Z cutoff");
+
+      const lookup = store.lookup(key());
+      assert.equal(lookup.passCount, 1, "only the naive-UTC pass inside the window counts");
+      assert.equal(lookup.failCount, 2, "naive-UTC and ISO-Z fails inside the window count; stale/unparseable do not");
+      assert.equal(lookup.flaky, true);
+    } finally {
+      store.close();
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
 });
 
 describe("host-suite-store: single-flight claims", () => {
@@ -262,6 +381,113 @@ describe("host-suite-store: single-flight claims", () => {
     const next = store.claim(claimInput({ ownerToken: "t-b", invocationId: INV_2 }));
     assert.equal(next.action, "run", "host-clock expiry frees the stale claim");
     assert.equal(store.claimCount(), 1);
+  });
+
+  it("drops the legacy claimed_at_ms column on open (idempotently) and still derives expiry from ISO claimed_at", () => {
+    const file = tempFile("claim-migrate");
+    const c = clock();
+    try {
+      // Establish a store with a live claim, then make it look LEGACY by adding
+      // the redundant integer companion through a second connection.
+      {
+        const store = openHostSuiteStore(file, { now: c.now, claimTimeoutMs: 1_000 });
+        store.registerNamespace(NS_A);
+        assert.equal(store.claim(claimInput({ ownerToken: "t-a" })).action, "run");
+        store.close();
+      }
+      {
+        const db = new DatabaseSync(file);
+        try {
+          db.exec("ALTER TABLE host_suite_claims ADD COLUMN claimed_at_ms INTEGER NOT NULL DEFAULT 0");
+        } finally {
+          db.close();
+        }
+      }
+      assert.ok(
+        claimColumnNames(file).includes("claimed_at_ms"),
+        "legacy claimed_at_ms column present before reopen",
+      );
+
+      // Reopen #1: migration drops the column, the pre-existing claim survives,
+      // and a live claim still answers "wait".
+      const reopened = openHostSuiteStore(file, { now: c.now, claimTimeoutMs: 1_000 });
+      try {
+        assert.equal(
+          claimColumnNames(file).includes("claimed_at_ms"),
+          false,
+          "migration drops claimed_at_ms from a legacy store",
+        );
+        assert.equal(
+          reopened.peekClaim(key())?.owner_token,
+          "t-a",
+          "the legacy-store claim row survived the column drop",
+        );
+        assert.equal(
+          reopened.claim(claimInput({ ownerToken: "t-b", invocationId: INV_2 })).action,
+          "wait",
+          "a live claim still waits after migration",
+        );
+        // Expiry cycle still derives numerically from the ISO claimed_at.
+        c.advance(1_001);
+        assert.equal(
+          reopened.claim(claimInput({ ownerToken: "t-c", invocationId: INV_2 })).action,
+          "run",
+          "host-clock expiry frees the migrated claim",
+        );
+        assert.equal(reopened.claimCount(), 1);
+      } finally {
+        reopened.close();
+      }
+
+      // Reopen #2: the migration is idempotent (no column, no error) and the
+      // post-migration claim cycle works unchanged.
+      const again = openHostSuiteStore(file, { now: c.now, claimTimeoutMs: 1_000 });
+      try {
+        assert.equal(
+          claimColumnNames(file).includes("claimed_at_ms"),
+          false,
+          "second reopen is an idempotent no-op",
+        );
+        assert.equal(again.peekClaim(key())?.owner_token, "t-c");
+        assert.equal(
+          again.claim(claimInput({ ownerToken: "t-d", invocationId: INV_2 })).action,
+          "wait",
+          "claim/expiry cycle still works after two migrates",
+        );
+      } finally {
+        again.close();
+      }
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it("an unreadable claimed_at is treated as EXPIRED so a corrupt row cannot block the key", () => {
+    const file = tempFile("claim-corrupt");
+    const c = clock();
+    try {
+      // Seed a corrupt claim directly: claimed_at is not a parseable instant and
+      // its (now removed) integer companion is absent.
+      {
+        const store = openHostSuiteStore(file, { now: c.now, claimTimeoutMs: 60_000 });
+        store.registerNamespace(NS_A);
+        store.close();
+      }
+      rawSeedClaim(file, { claimedAt: "not-an-instant", ownerToken: "t-corrupt", invocationId: INV_1 });
+      const reopened = openHostSuiteStore(file, { now: c.now, claimTimeoutMs: 60_000 });
+      try {
+        assert.equal(
+          reopened.claim(claimInput({ ownerToken: "t-b", invocationId: INV_2 })).action,
+          "run",
+          "an unreadable claimed_at is expired, never a live blocker",
+        );
+        assert.equal(reopened.claimCount(), 1);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 
   it("an explicitly-dead owner claim is swept (registry predicate, never a PID)", () => {

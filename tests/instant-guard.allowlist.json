@@ -1,10 +1,5 @@
 [
   {
-    "file": "src/medic/medic.ts",
-    "match": "datetime('now', '-24 hours')",
-    "reason": "SQLite comparison window for the medic 24h check (WHERE checked_at > ...), not a writer; SQL comparison rewrites are an explicitly skipped TIME item (4) and pinned by the coordinator audit."
-  },
-  {
     "file": "src/server/control-server.ts",
     "match": "new Date(existing.claimedAt)",
     "reason": "claimedAt is an in-memory epoch-millisecond number in the control plane's suite-claim map, not a stored instant string; new Date(number) is exact and deliberate."
@@ -13,10 +8,5 @@
     "file": "src/installer/matchlock/guest-protocol.ts",
     "match": "Date.parse(params.startedAt)",
     "reason": "This module ships inside the Node-core-only Matchlock guest pack, whose builder (guest-pack-builder.ts) refuses imports resolving outside installer/matchlock/ so lib/instant.ts cannot be bundled; startedAt is a suite-wire string already constrained by SUITE_WIRE_ISO_RE and Date.parse is only a finiteness check, not a reader of a Tamandua stored instant."
-  },
-  {
-    "file": "src/installer/matchlock/guest-suite-shim.ts",
-    "match": "new Date(createdAt)",
-    "reason": "Guest-pack module (same forbidden host import as guest-protocol.ts); createdAt is a suite-wire ISO string validated by the bridge protocol, and the parsed value is only used for an in-process human-readable age, never persisted."
   }
 ]

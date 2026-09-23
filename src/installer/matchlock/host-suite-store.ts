@@ -30,6 +30,17 @@
  * "owner dead" predicate supplied by the caller (the host invocation registry
  * — never a guest PID). Revocation/recovery is host-owned.
  *
+ * Claim-instant authority (TIME-RESIDUE item 4): the ISO-8601 UTC `claimed_at`
+ * column is the ONE authoritative claim instant. The redundant
+ * `claimed_at_ms INTEGER` companion was removed because the only thing it ever
+ * answered — whether the claim has outlived CLAIM_TIMEOUT_MS — is fully
+ * answerable from the ISO instant by parsing it (`parseInstant`) and comparing
+ * numerically. A duplicated epoch column can only drift from the value it
+ * duplicates, so `openHostSuiteStore()` drops it from a legacy store with an
+ * idempotent migration (a no-op when the column is already absent), and a
+ * `claimed_at` that cannot be parsed is treated as EXPIRED so a corrupt row can
+ * never block a key forever.
+ *
  * Node-core only + node:sqlite (the host store is NOT part of the portable RO
  * guest pack closure: guest-pack-builder walks only the guest-cli/service
  * entries, which never import this module).
@@ -37,6 +48,7 @@
 
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { instantAgeMs, isOlderThan, parseInstant } from "../../lib/instant.js";
 import {
   CLAIM_TIMEOUT_MS,
   FLAKE_WINDOW_MS,
@@ -50,6 +62,18 @@ import {
 
 /** Version of this store's table layout. */
 export const HOST_SUITE_STORE_VERSION = 1;
+
+/**
+ * Tolerance for the FLAKE_WINDOW_MS age comparison (TIME-RESIDUE item 2).
+ *
+ * The window is a coarse 24h bucket over a ledger written by multiple
+ * processes/hosts whose wall clocks may differ by sub-second amounts, so 1s
+ * of slack keeps a row written just inside the window from being dropped by
+ * skew. The comparison stays strict at the widened boundary
+ * (`age > FLAKE_WINDOW_MS + tolerance`). Mirrors dashboard.ts
+ * `flakyKeysWithinWindow` (commit 4204af63).
+ */
+const FLAKE_WINDOW_TOLERANCE_MS = 1_000;
 
 /** Bound on the number of duration-history rows returned by one query. */
 export const HOST_SUITE_DURATION_HISTORY_MAX_ROWS = 10_000;
@@ -144,7 +168,6 @@ export interface HostSuiteClaimRow {
   invocation_id: string;
   agent_id: string | null;
   job_id: string | null;
-  claimed_at_ms: number;
   claimed_at: string;
 }
 
@@ -324,7 +347,6 @@ CREATE TABLE IF NOT EXISTS host_suite_claims (
   invocation_id TEXT NOT NULL,
   agent_id TEXT,
   job_id TEXT,
-  claimed_at_ms INTEGER NOT NULL,
   claimed_at TEXT NOT NULL,
   PRIMARY KEY (namespace_id, origin_repo, tree_hash, cmd_hash)
 );
@@ -359,6 +381,26 @@ function assertOpen(db: DatabaseSync): void {
 }
 
 /**
+ * Idempotent claim-schema migration (TIME-RESIDUE item 4).
+ *
+ * The legacy `host_suite_claims` layout carried `claimed_at_ms INTEGER` next to
+ * the authoritative ISO-Z `claimed_at`. Expiry is answerable from the ISO
+ * instant alone (see the file header), so a store written by an older build is
+ * brought forward by dropping the redundant column. This is a NO-OP when the
+ * column is already absent (fresh stores and already-migrated stores), which is
+ * what makes it safe to run on every open. node:sqlite bundles SQLite 3.53,
+ * which supports `ALTER TABLE ... DROP COLUMN`.
+ */
+function migrateHostSuiteClaims(db: DatabaseSync): void {
+  const columns = db.prepare("PRAGMA table_info(host_suite_claims)").all() as Array<{
+    name: unknown;
+  }>;
+  const hasLegacyColumn = columns.some((col) => String(col.name) === "claimed_at_ms");
+  if (!hasLegacyColumn) return;
+  db.exec("ALTER TABLE host_suite_claims DROP COLUMN claimed_at_ms");
+}
+
+/**
  * Open (create when missing) an explicit host-owned Matchlock evidence store.
  *
  * `path` MUST be an explicit host-chosen location (a fresh isolated file in
@@ -379,6 +421,7 @@ export function openHostSuiteStore(path: string, opts: HostSuiteStoreOptions = {
   try {
     db.exec("PRAGMA busy_timeout = 10000");
     db.exec(DDL);
+    migrateHostSuiteClaims(db);
     db.prepare(
       "INSERT OR IGNORE INTO host_suite_meta (key, value) VALUES (?, ?)",
     ).run("schema_version", String(HOST_SUITE_STORE_VERSION));
@@ -531,6 +574,20 @@ export class HostSuiteStore {
 
   // ── suite.lookup ─────────────────────────────────────────────────────
 
+  /**
+   * Latest evidence row for the exact key plus the pass/fail counts inside the
+   * 24h flake window.
+   *
+   * The window is decided NUMERICALLY from parsed instants (TIME-RESIDUE item
+   * 2): the old `created_at >= ?` bound compared stored instants as strings
+   * against `fmtIso(now - FLAKE_WINDOW_MS)`, which is format-homogeneous but
+   * not the numeric rule and silently dropped legacy naive-UTC rows. Each row's
+   * `created_at` is parsed and aged via `instantAgeMs`/`isOlderThan` (mirrors
+   * dashboard.ts `flakyKeysWithinWindow`). An unparseable `created_at` is NEVER
+   * counted inside the window: `isOlderThan` alone treats an unknown instant as
+   * fresh, so the parseability check is explicit. exit_code 87 (interruption)
+   * remains neither a pass nor a fail.
+   */
   lookup(key: HostSuiteLedgerKey): HostSuiteLookupOutcome {
     assertOpen(this.db);
     const { namespaceId, originRepo, treeHash, cmdHash } = key;
@@ -544,19 +601,22 @@ export class HostSuiteStore {
          LIMIT 1`,
       ).get(namespaceId, originRepo, treeHash, cmdHash) as RowRecord | undefined,
     );
-    const cutoff = fmtIso(this.nowFn() - FLAKE_WINDOW_MS);
-    const passRow = this.db.prepare(
-      `SELECT COUNT(*) AS cnt FROM host_suite_results
-       WHERE namespace_id = ? AND origin_repo = ? AND tree_hash = ? AND cmd_hash = ?
-         AND exit_code = 0 AND exit_code != 87 AND created_at >= ?`,
-    ).get(namespaceId, originRepo, treeHash, cmdHash, cutoff) as { cnt: number };
-    const failRow = this.db.prepare(
-      `SELECT COUNT(*) AS cnt FROM host_suite_results
-       WHERE namespace_id = ? AND origin_repo = ? AND tree_hash = ? AND cmd_hash = ?
-         AND exit_code != 0 AND exit_code != 87 AND created_at >= ?`,
-    ).get(namespaceId, originRepo, treeHash, cmdHash, cutoff) as { cnt: number };
-    const passCount = Number(passRow.cnt);
-    const failCount = Number(failRow.cnt);
+    const nowMs = this.nowFn();
+    const rows = this.db.prepare(
+      `SELECT exit_code, created_at FROM host_suite_results
+       WHERE namespace_id = ? AND origin_repo = ? AND tree_hash = ? AND cmd_hash = ?`,
+    ).all(namespaceId, originRepo, treeHash, cmdHash) as Array<{
+      exit_code: number;
+      created_at: string;
+    }>;
+    let passCount = 0;
+    let failCount = 0;
+    for (const row of rows) {
+      if (instantAgeMs(row.created_at, nowMs) === undefined) continue;
+      if (isOlderThan(row.created_at, FLAKE_WINDOW_MS, nowMs, FLAKE_WINDOW_TOLERANCE_MS)) continue;
+      if (Number(row.exit_code) === 0) passCount++;
+      else if (Number(row.exit_code) !== 87) failCount++;
+    }
     return { latest: latest as HostSuiteLookupRow | null, passCount, failCount, flaky: passCount > 0 && failCount > 0 };
   }
 
@@ -582,15 +642,19 @@ export class HostSuiteStore {
       const existing = toRow(
         this.db.prepare(
           `SELECT namespace_id, origin_repo, tree_hash, cmd_hash, owner_token, run_id, step_id,
-                  invocation_id, agent_id, job_id, claimed_at_ms, claimed_at
+                  invocation_id, agent_id, job_id, claimed_at
            FROM host_suite_claims
            WHERE namespace_id = ? AND origin_repo = ? AND tree_hash = ? AND cmd_hash = ?`,
         ).get(namespaceId, originRepo, treeHash, cmdHash) as RowRecord | undefined,
       );
       if (existing !== null) {
-        const claimedAtMs = Number(existing.claimed_at_ms);
         const ownerInvocation = String(existing.invocation_id);
-        const expired = nowMs - claimedAtMs > this.claimTimeoutMs;
+        // Expiry is numeric from the authoritative ISO-Z claimed_at. An
+        // UNREADABLE claimed_at defaults to EXPIRED (TIME-RESIDUE item 4): an
+        // instant we cannot age is not evidence of a live claim, and treating it
+        // as live would let a corrupt row block the key forever.
+        const claimedAtMs = parseInstant(existing.claimed_at)?.getTime();
+        const expired = claimedAtMs === undefined || nowMs - claimedAtMs > this.claimTimeoutMs;
         const dead = isOwnerDead !== undefined && isOwnerDead(ownerInvocation);
         if (!expired && !dead) {
           return { action: "wait" as const, claimedAt: String(existing.claimed_at) };
@@ -604,8 +668,8 @@ export class HostSuiteStore {
       this.db.prepare(
         `INSERT INTO host_suite_claims
            (namespace_id, origin_repo, tree_hash, cmd_hash, owner_token, run_id, step_id,
-            invocation_id, agent_id, job_id, claimed_at_ms, claimed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            invocation_id, agent_id, job_id, claimed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         namespaceId,
         originRepo,
@@ -617,7 +681,6 @@ export class HostSuiteStore {
         input.invocationId,
         input.agentId,
         input.jobId,
-        nowMs,
         claimedAt,
       );
       return { action: "run" as const, claimedAt };
@@ -632,7 +695,7 @@ export class HostSuiteStore {
     const row = toRow(
       this.db.prepare(
         `SELECT namespace_id, origin_repo, tree_hash, cmd_hash, owner_token, run_id, step_id,
-                invocation_id, agent_id, job_id, claimed_at_ms, claimed_at
+                invocation_id, agent_id, job_id, claimed_at
          FROM host_suite_claims
          WHERE namespace_id = ? AND origin_repo = ? AND tree_hash = ? AND cmd_hash = ?`,
       ).get(key.namespaceId, key.originRepo, key.treeHash, key.cmdHash) as RowRecord | undefined,
