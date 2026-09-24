@@ -100,6 +100,11 @@ filter_diff() {
       if (line ~ /isHarnessProbePrompt/) return 1
       if (line ~ /execHarnessProbe/) return 1
 
+      # STORM US-002: campaign-controlled hold import specifier + async
+      # plumbing (the hold body itself lives inside a documented KNOB-REGION)
+      if (line ~ /applyHold/) return 1
+      if (line ~ /runWorkRound\(\)/) return 1
+
       # US-003: shortAgent/agentId key changes
       if (line ~ /shortAgent/) return 1
       if (line ~ /agentId/) return 1
@@ -175,6 +180,18 @@ filter_diff() {
       # Inside knob region: skip everything
       if (in_knob) next
 
+      # PARITY-BASELINE (base 098c4f5f): the product added the sleepFor helper,
+      # the sleepMs wait in die-before-claim, and the stream-die-before-claim
+      # chaos mode to e2e-tests/helpers/scripted-agent-runtime.mjs after
+      # FROZEN_SHA. The fork tracks the LIVE e2e original (the live-helper parity
+      # rule), so these added lines are expected, not drift. Pardon the whole
+      # block from its leading comment through the stream-die branch exit.
+      if ($0 ~ /Sleep synchronously for `ms` milliseconds/) { in_base_stream = 1; next }
+      if (in_base_stream) {
+        if ($0 ~ /process\.exit\(behavior\.exitCode \?\? 1\);/) in_base_stream = 0
+        next
+      }
+
       # Outside knob region: check if this is a known keyword diff
       if (is_known_keyword($0)) next
 
@@ -233,6 +250,44 @@ for ORIG_PATH in "${ORIG_PATHS[@]}"; do
   fi
 done
 
+# ── dsh fork parity (CORE-CELLS US-003 / original US-005) ─────────
+# runtime-dsh.mjs forks e2e-tests/helpers/scripted-dsh-runtime.mjs, which was
+# added to the product helpers AFTER the fork's FROZEN_SHA, so it has no
+# FROZEN_SHA baseline. Its parity is therefore enforced against the CURRENT
+# committed e2e original (the live-helper parity rule from AGENTS.md): only
+# the two documented non-knob lines may differ (the import-path adjustment
+# and the nextWorkIndex agentId key convention — see KNOB-REGIONS.md).
+DSH_ORIG="e2e-tests/helpers/scripted-dsh-runtime.mjs"
+DSH_FORK="torture-test/scripted-runtimes/runtime-dsh.mjs"
+if [[ ! -f "$REPO_ROOT/$DSH_FORK" ]]; then
+  echo "fork-parity-check: forked dsh runtime not found: $DSH_FORK" >&2
+  RET=1
+else
+  ORIG_CONTENT="$(git -C "$REPO_ROOT" show "HEAD:$DSH_ORIG" 2>/dev/null)" || {
+    echo "fork-parity-check: could not retrieve $DSH_ORIG at HEAD" >&2
+    RET=1
+  }
+  if [[ -n "$ORIG_CONTENT" ]]; then
+    FORK_CONTENT="$(cat "$REPO_ROOT/$DSH_FORK")"
+    RAW_DIFF="$(diff <(echo "$ORIG_CONTENT") <(echo "$FORK_CONTENT") || true)"
+    if [[ -n "$RAW_DIFF" ]]; then
+      REAL_DIFFS="$(echo "$RAW_DIFF" | filter_diff)"
+      if [[ -n "$REAL_DIFFS" ]]; then
+        RET=1
+        DIFFS_FOUND=$((DIFFS_FOUND + 1))
+        echo "=== DIFF in non-knob regions: $DSH_FORK (vs committed e2e original at HEAD) ===" >&2
+        echo "$REAL_DIFFS" >&2
+      else
+        if [[ "$VERBOSE" == "true" ]]; then
+          echo "OK: $DSH_FORK (non-knob regions match the committed e2e original at HEAD)" >&2
+        fi
+      fi
+    elif [[ "$VERBOSE" == "true" ]]; then
+      echo "OK: $DSH_FORK (byte-identical to the committed e2e original at HEAD)" >&2
+    fi
+  fi
+fi
+
 # ── Verify-perturb: deliberately modify a non-knob line and confirm FAIL ──
 if [[ "$VERIFY_PERTURB" == "true" ]]; then
   PERTURB_FILE="$REPO_ROOT/torture-test/scripted-runtimes/runtime-shared.mjs"
@@ -258,8 +313,9 @@ fi
 
 if [[ $RET -eq 0 ]]; then
   echo "fork-parity-check: all ${#ORIG_PATHS[@]} files passed (non-knob regions match FROZEN_SHA)" >&2
+  echo "fork-parity-check: dsh fork passed (non-knob regions match the committed e2e original at HEAD)" >&2
 else
-  echo "fork-parity-check: $DIFFS_FOUND file(s) have non-knob drift from FROZEN_SHA" >&2
+  echo "fork-parity-check: $DIFFS_FOUND file(s) have non-knob drift from their parity baseline" >&2
 fi
 
 exit $RET

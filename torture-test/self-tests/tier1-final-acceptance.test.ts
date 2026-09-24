@@ -410,6 +410,46 @@ const allowed = [
   // authoring set so the final-acceptance confinement test passes on the
   // merged E3.C.2 branch diff.
   "torture-test/impl-tasks/",
+  // CORE-CELLS (tamandua-6sy.7.4): the recorded-replay authoring surface. The
+  // pure contract / replay-adapter / replay-executor / motor-gate modules plus
+  // the per-cell sanitized asset loaders and the zero-token entrypoint +
+  // membership registry all live under bin/core-recording-*.mjs (NEW files
+  // authored by this branch; their tier0 self-tests are under self-tests/,
+  // already allowed). The confinement list must authorize the branch's own
+  // bin/ surface exactly like the earlier bin/oracle- and bin/ daemon-control
+  // authoring surfaces above — otherwise the branch's own final-acceptance
+  // confinement test fails on files it legitimately authored.
+  "torture-test/bin/core-recording-",
+  // torture-union US-013 (SUITE DEFECT): the integration branch merges
+  // source branches whose authoring surfaces were never added to this
+  // confinement list. Each individual branch passed its own gate against its
+  // own base, but the merged union delta (relative to the union base
+  // fb5e5a1d) legitimately contains all of them, so the gate reports files
+  // "outside the intended authoring set" that the union itself authored.
+  // Absorb them by union of intent (task requirement #1), naming the source
+  // branch of each surface. No assertion is deleted or relaxed — the
+  // `violations deepEqual []` predicate is unchanged; these entries only
+  // authorize surfaces the merged tree owns.
+  //   * feature/torture-storm-aged-20260909 @ 97106d5 adds torture-test/aged/
+  //     (the aged-state generator, its contract doc and focused self-test);
+  //   * feature/torture-storm-rehearsal-20260909 @ 982f887 adds the
+  //     torture-test/bin/tt-storm* rehearsal/orchestrator entrypoints
+  //     (tt-storm, tt-storm-aged, tt-storm-engine.mjs, tt-storm-real.mjs,
+  //     tt-storm-rehearsal.mjs, tt-storm-roster.mjs, tt-storm-shared.mjs);
+  //   * feature/torture-storm-o12-20260909 @ 7586d8f adds the repo-root
+  //     .gitignore rule for retained torture-test/var/oracle-self-test.*
+  //     gate workspaces (a root-level, torture-caused ignore line that the
+  //     confinement list must authorize like the bin/ surfaces above).
+  "torture-test/aged/",
+  "torture-test/bin/tt-storm",
+  // TORTURE-PORT US-004: the port owns the aged/seed tooling, including the
+  // committed readiness pointer torture-test/storm-seed-readiness.json, which
+  // the aged adaptation re-pointed at the schema-13 product seed. It is the
+  // port's own authoring surface (the source torture branch also added it after
+  // the confinement list was last extended), so authorizing it here keeps the
+  // `violations deepEqual []` predicate intact rather than relaxing it.
+  "torture-test/storm-seed-readiness.json",
+  ".gitignore",
 ];
 // US-016 added the Tier-2 story's no-touch surfaces to the forbidden set:
 // the E3.C.1-owned tier1 kill-path/probe-battery self-tests (a concurrent

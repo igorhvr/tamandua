@@ -1,0 +1,591 @@
+{
+  "kind": "o12-schema13-gate-evidence",
+  "contract_version": 1,
+  "generated_at": "2026-09-21T06:06:48.529Z",
+  "run_id": "be9d6fea-286f-4ef9-aa6a-fa6cacb82ee8",
+  "story": "US-006 - Gates: run the torture self-tests each alone under the guard and retain evidence",
+  "branch": "feature/o12-schema-13-support",
+  "base": "7fe9f258",
+  "head": "976289b0",
+  "gate": {
+    "worktree": "/tmp/o12s13-gate-e03281fa",
+    "head": "976289b00bc497488b2fc2f5c47a9f6fbf3bd925",
+    "expected_counts": {
+      "npf2": 2,
+      "aged": 4,
+      "o12": 8,
+      "qualification": 1
+    },
+    "expected_required_total": 14,
+    "gating_groups": [
+      "npf2",
+      "aged",
+      "o12"
+    ],
+    "commands": [
+      "git worktree add --detach /tmp/o12s13-gate-e03281fa e03281fa && git -C /tmp/o12s13-gate-e03281fa checkout --detach 976289b0",
+      "cd /tmp/o12s13-gate-e03281fa && npm run build",
+      "cd /tmp/o12s13-gate-e03281fa && TAMANDUA_O12_SEED_SNAPSHOT=/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/seed-snapshot-v13.sqlite flock --exclusive /tmp/vaivm-gate.lock node torture-test/self-tests/run-self-tests-alone.mjs --results-base /home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results --label o12s13-us006",
+      "cd /home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea && TAMANDUA_O12_SEED_SNAPSHOT=/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/seed-snapshot-v13.sqlite flock --exclusive /tmp/vaivm-gate.lock node torture-test/oracles/self-test/run-o12-gate-self-tests.mjs",
+      "node torture-test/oracles/self-test/o12-seed-snapshot.mjs --materialize-seed-snapshots /home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var",
+      "cd /home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea && TAMANDUA_TEST_GUARD=1 TAMANDUA_PI_BINARY=/usr/bin/false TAMANDUA_HERMES_BINARY=/usr/bin/false TAMANDUA_DSH_BINARY=/usr/bin/false node --test torture-test/self-tests/self-tests-alone.test.mjs",
+      "cd /home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea && TAMANDUA_TEST_GUARD=1 TAMANDUA_PI_BINARY=/usr/bin/false TAMANDUA_HERMES_BINARY=/usr/bin/false TAMANDUA_DSH_BINARY=/usr/bin/false node --test torture-test/self-tests/o12-schema13-gate-evidence.test.mjs",
+      "cd /home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea && TAMANDUA_TEST_GUARD=1 TAMANDUA_PI_BINARY=/usr/bin/false TAMANDUA_HERMES_BINARY=/usr/bin/false TAMANDUA_DSH_BINARY=/usr/bin/false node --test torture-test/oracles/self-test/o12-scratch.test.mjs"
+    ],
+    "substitutions": [
+      "gate_lock: host /home/kaladin/matchlock-work/vaivm-gate.lock is not visible in the Matchlock VM -> /tmp/vaivm-gate.lock (flock --exclusive)",
+      "seed_evidence: the immutable host seed /opt/tamandua-storm-seed.Hn3vQ8kL/... is not visible in the VM -> owned schema-13 store /home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/seed-snapshot-v13.sqlite (sha256 ac650e3c774977fcb984d5d5b724684454992aa7f54567f635701d360e222781) passed via TAMANDUA_O12_SEED_SNAPSHOT",
+      "o12_gate_seed_pass_through: run-o12-gate-self-tests.mjs builds every child env from o12ChildEnv, which dropped TAMANDUA_O12_SEED_SNAPSHOT -> US-006 forwards it (evidence location, never run/work authority)",
+      "jq: absent from the VM image; installed via apt as an environment repair for torture-test/bin/daemon-control provenance reads (no source change)",
+      "gate_worktree: /tmp/o12s13-gate-e03281fa (detached, outside /home/kaladin/.tamandua and /root/.tamandua); evidence routed back into the run worktree with --results-base"
+    ]
+  },
+  "self_tests_alone": {
+    "results_dir": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm",
+    "repo_root": "/tmp/o12s13-gate-e03281fa",
+    "git_head": "976289b00bc497488b2fc2f5c47a9f6fbf3bd925",
+    "environment": {
+      "guard_safe_repo_root": true,
+      "real_state_prefix": "/root/.tamandua",
+      "gate_env": {
+        "TAMANDUA_TEST_GUARD": "1",
+        "TAMANDUA_PI_BINARY": "/usr/bin/false",
+        "TAMANDUA_HERMES_BINARY": "/usr/bin/false",
+        "TAMANDUA_DSH_BINARY": "/usr/bin/false",
+        "tokens": "no ambient TAMANDUA_* authority; zero model tokens (false harnesses)"
+      }
+    },
+    "expected_counts": {
+      "npf2": 2,
+      "aged": 4,
+      "o12": 8,
+      "qualification": 1
+    },
+    "total_required": 14,
+    "passed_required": 14,
+    "failed_required": 0,
+    "red_files": [],
+    "verdict": "PASS",
+    "by_group": {
+      "npf2": {
+        "total": 2,
+        "passed": 2,
+        "failed": 0,
+        "red_files": [],
+        "verdict": "PASS",
+        "gating": true
+      },
+      "aged": {
+        "total": 4,
+        "passed": 4,
+        "failed": 0,
+        "red_files": [],
+        "verdict": "PASS",
+        "gating": true
+      },
+      "o12": {
+        "total": 8,
+        "passed": 8,
+        "failed": 0,
+        "red_files": [],
+        "verdict": "PASS",
+        "gating": true
+      },
+      "qualification": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "red_files": [],
+        "verdict": "PASS",
+        "gating": false
+      }
+    },
+    "entries": [
+      {
+        "name": "npf2-positive",
+        "group": "npf2",
+        "half": "positive",
+        "kind": "test",
+        "rel": "torture-test/self-tests/tier2-storm-rehearsal-suite-ledger-e2e.test.ts",
+        "test_name_pattern": "P0:|P1:",
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "--test-name-pattern=P0:|P1:",
+          "/tmp/o12s13-gate-e03281fa/torture-test/self-tests/tier2-storm-rehearsal-suite-ledger-e2e.test.ts"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 175804,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/npf2-positive.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/npf2-positive.stderr.log"
+      },
+      {
+        "name": "npf2-negative",
+        "group": "npf2",
+        "half": "negative",
+        "kind": "test",
+        "rel": "torture-test/self-tests/tier2-storm-rehearsal-suite-ledger-e2e.test.ts",
+        "test_name_pattern": "P2a:|P2:",
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "--test-name-pattern=P2a:|P2:",
+          "/tmp/o12s13-gate-e03281fa/torture-test/self-tests/tier2-storm-rehearsal-suite-ledger-e2e.test.ts"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 205406,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/npf2-negative.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/npf2-negative.stderr.log"
+      },
+      {
+        "name": "aged-core.test.mjs",
+        "group": "aged",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/aged/self-test/aged-core.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/aged/self-test/aged-core.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 16170,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/aged-core.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/aged-core.test.mjs.stderr.log"
+      },
+      {
+        "name": "origin-pins.test.mjs",
+        "group": "aged",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/aged/self-test/origin-pins.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/aged/self-test/origin-pins.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 2305,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/origin-pins.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/origin-pins.test.mjs.stderr.log"
+      },
+      {
+        "name": "o12-content-pin.test.mjs",
+        "group": "aged",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/aged/self-test/o12-content-pin.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/aged/self-test/o12-content-pin.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 913,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-content-pin.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-content-pin.test.mjs.stderr.log"
+      },
+      {
+        "name": "seed-root-copy.test.mjs",
+        "group": "aged",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/aged/self-test/seed-root-copy.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/aged/self-test/seed-root-copy.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 347,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/seed-root-copy.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/seed-root-copy.test.mjs.stderr.log"
+      },
+      {
+        "name": "o12.test.mjs",
+        "group": "o12",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/oracles/self-test/o12.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/oracles/self-test/o12.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 24748,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12.test.mjs.stderr.log"
+      },
+      {
+        "name": "o12-schema-version.test.mjs",
+        "group": "o12",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/oracles/self-test/o12-schema-version.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/oracles/self-test/o12-schema-version.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 6106,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-schema-version.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-schema-version.test.mjs.stderr.log"
+      },
+      {
+        "name": "o12-seed-snapshot.test.mjs",
+        "group": "o12",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/oracles/self-test/o12-seed-snapshot.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/oracles/self-test/o12-seed-snapshot.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 1356,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-seed-snapshot.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-seed-snapshot.test.mjs.stderr.log"
+      },
+      {
+        "name": "o12-gate-self-tests.test.mjs",
+        "group": "o12",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/oracles/self-test/o12-gate-self-tests.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/oracles/self-test/o12-gate-self-tests.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 304,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-gate-self-tests.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-gate-self-tests.test.mjs.stderr.log"
+      },
+      {
+        "name": "o12-reserved-key-probe.mjs",
+        "group": "o12",
+        "half": null,
+        "kind": "probe",
+        "rel": "torture-test/oracles/self-test/o12-reserved-key-probe.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/tmp/o12s13-gate-e03281fa/torture-test/oracles/self-test/o12-reserved-key-probe.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 1127,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-reserved-key-probe.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-reserved-key-probe.mjs.stderr.log"
+      },
+      {
+        "name": "o12-run-number-probe.mjs",
+        "group": "o12",
+        "half": null,
+        "kind": "probe",
+        "rel": "torture-test/oracles/self-test/o12-run-number-probe.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/tmp/o12s13-gate-e03281fa/torture-test/oracles/self-test/o12-run-number-probe.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 1523,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-run-number-probe.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-run-number-probe.mjs.stderr.log"
+      },
+      {
+        "name": "o12-run-number-allocator-calibration.mjs",
+        "group": "o12",
+        "half": null,
+        "kind": "probe",
+        "rel": "torture-test/oracles/self-test/o12-run-number-allocator-calibration.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/tmp/o12s13-gate-e03281fa/torture-test/oracles/self-test/o12-run-number-allocator-calibration.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 99,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-run-number-allocator-calibration.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/o12-run-number-allocator-calibration.mjs.stderr.log"
+      },
+      {
+        "name": "generate-o12-fixtures.mjs",
+        "group": "o12",
+        "half": null,
+        "kind": "generator",
+        "rel": "torture-test/oracles/self-test/generate-o12-fixtures.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/tmp/o12s13-gate-e03281fa/torture-test/oracles/self-test/generate-o12-fixtures.mjs",
+          "/tmp/o12s13-gate-e03281fa/torture-test/var/oracle-self-test.alone-generate-o12-fixtures.mjs.urUY9p"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 394,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/generate-o12-fixtures.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/generate-o12-fixtures.mjs.stderr.log"
+      },
+      {
+        "name": "seed-readiness.test.mjs",
+        "group": "qualification",
+        "half": null,
+        "kind": "test",
+        "rel": "torture-test/aged/self-test/seed-readiness.test.mjs",
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/tmp/o12s13-gate-e03281fa/torture-test/aged/self-test/seed-readiness.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 583,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/seed-readiness.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/self-tests-alone-o12s13-us006-20260921T055238Z.1MRFUm/seed-readiness.test.mjs.stderr.log"
+      }
+    ]
+  },
+  "o12_gate": {
+    "results_dir": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb",
+    "repo_root": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea",
+    "dist_dir": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/dist",
+    "gate_env": {
+      "TAMANDUA_TEST_GUARD": "1",
+      "TAMANDUA_PI_BINARY": "/usr/bin/false",
+      "TAMANDUA_HERMES_BINARY": "/usr/bin/false",
+      "TAMANDUA_DSH_BINARY": "/usr/bin/false",
+      "TAMANDUA_O12_PROBE_DIST": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/dist",
+      "authority": "explicit allow-list only; no ambient TAMANDUA_RUN_ID/worker/control-port forwarded"
+    },
+    "total": 7,
+    "passed": 7,
+    "failed": 0,
+    "red_files": [],
+    "verdict": "PASS",
+    "matrix_pass": true,
+    "overall_verdict": "PASS",
+    "fixture_matrix": {
+      "path": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-fixture-matrix.json",
+      "expected_fixture_count": 78,
+      "fixture_count": 78,
+      "all_match": true,
+      "all_correction_cases_green": true,
+      "snapshot_immutability_ok": true,
+      "validation_ok": true,
+      "validation_problems": []
+    },
+    "entries": [
+      {
+        "name": "o12.test.mjs",
+        "group": "o12-gate",
+        "half": null,
+        "kind": "test",
+        "rel": null,
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/oracles/self-test/o12.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 57591,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12.test.mjs.stderr.log"
+      },
+      {
+        "name": "o12-schema-version.test.mjs",
+        "group": "o12-gate",
+        "half": null,
+        "kind": "test",
+        "rel": null,
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "--test",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/oracles/self-test/o12-schema-version.test.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 19797,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-schema-version.test.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-schema-version.test.mjs.stderr.log"
+      },
+      {
+        "name": "o12-reserved-key-probe.mjs",
+        "group": "o12-gate",
+        "half": null,
+        "kind": "probe",
+        "rel": null,
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/oracles/self-test/o12-reserved-key-probe.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 1303,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-reserved-key-probe.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-reserved-key-probe.mjs.stderr.log"
+      },
+      {
+        "name": "o12-run-number-probe.mjs",
+        "group": "o12-gate",
+        "half": null,
+        "kind": "probe",
+        "rel": null,
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/oracles/self-test/o12-run-number-probe.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 1820,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-run-number-probe.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-run-number-probe.mjs.stderr.log"
+      },
+      {
+        "name": "o12-run-number-allocator-calibration.mjs",
+        "group": "o12-gate",
+        "half": null,
+        "kind": "probe",
+        "rel": null,
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/oracles/self-test/o12-run-number-allocator-calibration.mjs"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 117,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-run-number-allocator-calibration.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-run-number-allocator-calibration.mjs.stderr.log"
+      },
+      {
+        "name": "generate-o12-fixtures.mjs",
+        "group": "o12-gate",
+        "half": null,
+        "kind": "generator",
+        "rel": null,
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/oracles/self-test/generate-o12-fixtures.mjs",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/oracle-self-test.6hDHlK"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 10360,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/generate-o12-fixtures.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/generate-o12-fixtures.mjs.stderr.log"
+      },
+      {
+        "name": "o12-fixture-matrix.mjs",
+        "group": "o12-gate",
+        "half": null,
+        "kind": "matrix",
+        "rel": null,
+        "test_name_pattern": null,
+        "argv": [
+          "/usr/bin/node",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/oracles/self-test/o12-fixture-matrix.mjs",
+          "--base",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var",
+          "--out",
+          "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-fixture-matrix.json"
+        ],
+        "exit_code": 0,
+        "signal": null,
+        "duration_ms": 41576,
+        "verdict": "PASS",
+        "stdout_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-fixture-matrix.mjs.stdout.log",
+        "stderr_log": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/results/o12-gate-self-tests-20260921T060139Z.n4v6Lb/o12-fixture-matrix.mjs.stderr.log"
+      }
+    ]
+  },
+  "seed_snapshot": {
+    "receipt_path": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/owned-seed-snapshots-20260921T054345Z/owned-seed-snapshots-receipt.json",
+    "var_root": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var",
+    "kind": "o12-owned-seed-snapshots",
+    "supported_user_versions": [
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "snapshots": [
+      {
+        "label": "v13",
+        "case_id": "owned-store-current-v13",
+        "path": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/seed-snapshot-v13.sqlite",
+        "basename": "seed-snapshot-v13.sqlite",
+        "user_version": 13,
+        "lineage": "current",
+        "sha256": "ac650e3c774977fcb984d5d5b724684454992aa7f54567f635701d360e222781",
+        "bytes": 61440,
+        "mode": 292
+      },
+      {
+        "label": "legacy-v12-main",
+        "case_id": "owned-store-legacy-v12-main",
+        "path": "/home/kaladin/.tamandua/worktrees/tamandua-origin-o12-0ded2d74/54-be9d6fea/torture-test/var/seed-snapshot-legacy-v12.sqlite",
+        "basename": "seed-snapshot-legacy-v12.sqlite",
+        "user_version": 12,
+        "lineage": "main-v12",
+        "sha256": "682346b8a9e86f73f355aac5614e0ddbdf8130b6c63a99925f294af1b146c132",
+        "bytes": 61440,
+        "mode": 292
+      }
+    ]
+  }
+}

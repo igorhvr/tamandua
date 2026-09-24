@@ -53,11 +53,9 @@
 #     -d cwd -Fn` for the cwd, `ps -p <pid> -o command=` for the cmdline),
 #     so CLI-auto-daemon stop (stop_cli_auto_daemon, the W2.21 restart
 #     corridor) and the escalation paths still verify TT-ownership on the
-#     mac. The lsof evidence probe is BOUNDED (lsof_bounded, LSOF-EVTA
-#     US-006) so a stale FUSE/network mount can never wedge ownership
-#     verification. Unavailable evidence -> refuse, exactly as on linux. The
-#     cmdline arm does NOT require the literal 'tamandua' (S54): it accepts
-#     the CLI-wrapper argv OR this repo's built daemon entry
+#     mac. Unavailable evidence -> refuse, exactly as on linux. The cmdline
+#     arm does NOT require the literal 'tamandua' (S54): it accepts the
+#     CLI-wrapper argv OR this repo's built daemon entry
 #     ($TT_REPO_ROOT/dist/server/daemon.js — a checkout named e.g. by run
 #     id carries no 'tamandua' in argv).
 #   - Operator home: _tt_operator_home (REAL_TAMANDUA_STATE + the S24
@@ -114,76 +112,6 @@ export TT_ROOT="${TT_REPO_ROOT}/torture-test/var"
 # probe body; the helper is the single canonical definition for the
 # whole suite (also sourced by tt-daemon-up).
 . "$TT_DIR/lib/port-probe.sh"
-
-# ── bounded lsof probes (LSOF-EVTA US-006) ───────────────────────────
-#
-# lsof walks the kernel's process/file tables and can block FOREVER inside
-# the kernel on a host with a stale FUSE or network mount (the 2026 vaivm
-# incident left 24 lsof processes wedged for five days, hanging every
-# caller with them). macOS ships no GNU `timeout`, so EVERY lsof probe in
-# this tool goes through lsof_bounded: `lsof -b -w <args>` runs in the
-# BACKGROUND with its stdout redirected to a temp file, is polled for up
-# to TT_LSOF_TIMEOUT_S seconds (default 5), and is SIGKILLed AND reaped
-# (`wait`) when the bound expires. `-b` avoids blocking kernel calls and
-# `-w` suppresses warnings; both flags exist on the BSD (macOS) and GNU
-# lsof.
-#
-# Evidence contract: a completed probe prints lsof's stdout and returns 0.
-# A timed-out probe prints NOTHING (partial output is discarded, never
-# treated as evidence) and returns 1 AFTER the child is killed and reaped;
-# a host without lsof also returns 1. Callers MUST treat a non-zero return
-# as NO EVIDENCE (fail-closed) — never as "no open file" / "no listener".
-# The timeout also prints a degradation line to stderr so operators can
-# see the blocked probe.
-
-# tt_lsof_timeout_s: the bounded seconds a single lsof probe may run.
-# TT_LSOF_TIMEOUT_S overrides it; a blank / non-numeric / non-positive
-# value falls back to the default (an unbounded probe is impossible). The
-# default is a local literal so the function is self-contained (the
-# hermetic self-tests extract and run it in isolation).
-tt_lsof_timeout_s() {
-  local default_s=5
-  local v="${TT_LSOF_TIMEOUT_S:-}"
-  case "$v" in
-    ''|*[!0-9]*) v="$default_s" ;;
-  esac
-  if [ "$v" -lt 1 ] 2>/dev/null; then
-    v="$default_s"
-  fi
-  printf '%s' "$v"
-}
-
-# lsof_bounded <lsof-arg>...: run `lsof -b -w <args>` under the hard bound
-# and print its stdout. Prints nothing (and returns 1) when the probe times
-# out or lsof is unavailable — fail-closed for every caller.
-lsof_bounded() {
-  local timeout_s
-  timeout_s="$(tt_lsof_timeout_s)"
-  if ! command -v lsof >/dev/null 2>&1; then
-    return 1
-  fi
-  local out_file
-  out_file="$(mktemp "${TMPDIR:-/tmp}/tt-daemon-control-lsof.XXXXXX")" || return 1
-  lsof -b -w "$@" > "$out_file" 2>/dev/null &
-  local child_pid=$!
-  local max_ticks=$(( timeout_s * 10 ))
-  local ticks=0
-  while kill -0 "$child_pid" 2>/dev/null; do
-    if [ "$ticks" -ge "$max_ticks" ]; then
-      kill -KILL "$child_pid" 2>/dev/null || true
-      wait "$child_pid" 2>/dev/null || true
-      rm -f "$out_file"
-      echo "daemon-control: lsof probe timed out after ${timeout_s}s — no evidence (fail-closed)" >&2
-      return 1
-    fi
-    sleep 0.1
-    ticks=$(( ticks + 1 ))
-  done
-  wait "$child_pid" 2>/dev/null || true
-  cat "$out_file"
-  rm -f "$out_file"
-  return 0
-}
 
 # Process-start identity CLI (E3.C.1 US-001/US-004): the ONLY sanctioned
 # way to read/verify a pid's /proc starttime identity. Every signal
@@ -954,12 +882,6 @@ Environment:
     while a listener is still bound or a child is still alive: residue at
     the bound is classified INFRA with the holder pid/cmdline and fails the
     stop (exit 1), so the next start cannot collide with EADDRINUSE.
-  TT_LSOF_TIMEOUT_S: bounded seconds a single lsof probe may run before the
-    child is SIGKILLed and reaped (default 5 — LSOF-EVTA US-006). Every
-    lsof probe (the Darwin cwd ownership evidence and both port-listener
-    pid extractions) goes through lsof_bounded, which always passes -b -w;
-    a timed-out probe yields NO evidence (fail-closed) so a stale FUSE/
-    network mount can never wedge ownership verification or a stop.
   TT_FORCE_NO_SYSTEMD=1 (MACP4 US-001): force the plain-background fallback
     launch path even on a systemd host — has_systemd_scope() returns false
     so cmd_start uses the nohup spawn (marker: "systemd not available —
@@ -1068,29 +990,10 @@ verify_cgroup() {
 #   Darwin (MACP4 US-002): no procfs — PORTABLE evidence via `lsof -a -p
 #     <pid> -d cwd -Fn` (the cwd, BSD/linux lsof both emit the `n<path>`
 #     name row) and `ps -p <pid> -o command=` (the full command line,
-#     supported by both BSD ps on macOS and procps on linux). The lsof read
-#     is BOUNDED (lsof_bounded, LSOF-EVTA US-006). When the evidence is
-#     unavailable (lsof/ps absent, pid dead, a foreign pid lsof cannot
-#     introspect, or a timed-out lsof probe) the function REFUSES exactly
-#     as the linux path does — TT-ownership must be PROVEN, never assumed.
-#
-# Cmdline acceptance (S54): the cmdline must NOT require the literal
-# 'tamandua'. The real daemon's argv is `node <TT_REPO_ROOT>/dist/server/
-# daemon.js` (daemonctl.ts startDaemon) — under a checkout whose directory
-# name does not contain 'tamandua' (e.g. a worktree named by run id) that
-# argv carries no 'tamandua' at all, yet the process IS this repo's daemon
-# (cwd already proven under TT_REPO_ROOT). Two arms, either proves the
-# cmdline:
-#   (a) the literal 'tamandua' (the CLI wrapper argv — `tamandua daemon
-#       start`, `node .../bin/tamandua daemon ...` — and the fake scripted
-#       CLI shims, which embed 'tamandua' in argv), OR
-#   (b) a script path under THIS repo's built product
-#       ($TT_REPO_ROOT/dist/server/ — daemon.js, dashboard-standalone.js,
-#       mcp-standalone.js, control-standalone.js — the real daemon family).
-# A foreign cmdline (`node /usr/bin/server.js`, a bare `bash -c ...` with
-# no repo path) is REFUSED exactly as before — TT-ownership must be PROVEN,
-# never assumed; the 'tamandua' grep arm is unchanged and keeps every
-# pre-S54 acceptance intact.
+#     supported by both BSD ps on macOS and procps on linux). When the
+#     evidence is unavailable (lsof/ps absent, pid dead, or a foreign pid
+#     lsof cannot introspect) the function REFUSES exactly as the linux
+#     path does — TT-ownership must be PROVEN, never assumed.
 #
 # Cmdline acceptance (S54): the cmdline must NOT require the literal
 # 'tamandua'. The real daemon's argv is `node <TT_REPO_ROOT>/dist/server/
@@ -1128,11 +1031,8 @@ verify_process_tt_owned() {
       # -d cwd -Fn` prints the cwd as an `n<path>` row (the p<pid> row
       # and lsof fd-name row, if any, are ignored); `ps -p <pid>
       # -o command=` prints the full command line. Both are mechanical
-      # and present on macOS by default (/usr/sbin/lsof, /bin/ps). The
-      # lsof probe is BOUNDED (lsof_bounded, LSOF-EVTA US-006): a
-      # timeout yields no cwd evidence, and the empty actual_cwd below
-      # refuses ownership (fail-closed).
-      actual_cwd="$(lsof_bounded -a -p "$pid" -d cwd -Fn | sed -n 's/^n//p' | head -1 || true)"
+      # and present on macOS by default (/usr/sbin/lsof, /bin/ps).
+      actual_cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)"
       cmdline="$(ps -p "$pid" -o command= 2>/dev/null | head -1 || true)"
       ;;
     *)
@@ -1937,13 +1837,10 @@ stop_cli_auto_daemon() {
 # port <port>, or nothing when the port is free. lsof is the portable
 # source (linux + macOS); the netstat fallback is linux-only (the same pair
 # cmd_stop's lingering-listener cleanup and daemon-control's status use).
-# The lsof probe is BOUNDED (lsof_bounded, LSOF-EVTA US-006): a timeout
-# yields no lsof pid evidence and falls through to the netstat arm, so the
-# probe can never hang (fail-closed — no pid is ever fabricated).
 listener_pid_for_port() {
   local port="$1"
   local pid
-  pid="$(lsof_bounded -nP -iTCP:"$port" -sTCP:LISTEN -t | head -1 || true)"
+  pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
   if [ -z "$pid" ]; then
     pid="$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | grep -Eo '[0-9]+' | head -1 || true)"
   fi
@@ -2076,27 +1973,6 @@ wait_stop_gate() {
   echo "daemon-control: INFRA — $label: listeners/children still in use after ${wait_seconds}s:$detail (a later start on the $kind fixed ports would collide with EADDRINUSE; the holder is not a process this tool may stop — classified as infrastructure, never as a product fault)" >&2
   return 1
 }
-
-# cmd_stop — stop the kind's TT daemon through the identity-gated corridor
-# (graceful CLI stop -> identity-verified SIGTERM/SIGKILL escalation ->
-# lingering-listener cleanup -> systemd scope teardown -> the S56 bounded
-# final gate). Every signal is gated on the RECORDED process-start
-# identity; a stale/reused pid is refused, never signalled.
-#
-# Lingering-listener lsof probe (LSOF-EVTA US-006): the
-# `lsof -nP -iTCP:<port> -sTCP:LISTEN -t` pid extraction is BOUNDED via
-# lsof_bounded (always `-b -w`, hard TT_LSOF_TIMEOUT_S bound, SIGKILL +
-# reap on expiry) so a stale FUSE/network mount can never wedge a stop. A
-# timed-out probe is NO evidence, so an empty lingering_pid is never
-# killed (fail-closed).
-#
-# NOTE (harness context window): keep this doc block BEFORE the function.
-# torture-test/bin/daemon-control.test.sh asserts the first 301 lines of
-# cmd_stop's body with `grep -A 300 '^cmd_stop()' | grep -q ...`; on macOS
-# that pipeline is killed by SIGPIPE (rc=141 under `set -o pipefail`) once
-# the body window exceeds the 16 KiB pipe buffer and the downstream
-# `grep -q` exits on its first match. Adding comment bytes inside the
-# first 301 lines silently breaks those structural assertions.
 
 cmd_stop() {
   local kind="$1"
@@ -2322,7 +2198,7 @@ cmd_stop() {
       # (first wins), preserving the exact first-pid semantics on both
       # platforms. The netstat fallback keeps the linux-only path for hosts
       # without lsof.
-      lingering_pid=$(lsof_bounded -nP -iTCP:"$port" -sTCP:LISTEN -t | head -1 || true)
+      lingering_pid=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)
       if [ -z "$lingering_pid" ]; then
         lingering_pid=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | grep -Eo '[0-9]+' | head -1 || true)
       fi

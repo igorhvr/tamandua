@@ -69,8 +69,34 @@ function git(cwd: string, args: string[]): string {
 }
 
 function committedHarnessSource(): { pin: string; source: string } {
+  // The extraction IS current-HEAD content — never a historical blob — so it
+  // uses the literal `HEAD:<path>` form the tier0-history-independent-red-arms
+  // meta-lint (R3/R4) exempts; a `${resolvedPin}:${path}` template trips R4
+  // even though the rev is semantically HEAD. The resolved HEAD pin is
+  // retained only for identity evidence/assertions below.
   const pin = git(repoRoot, ["rev-parse", "HEAD"]).trim();
-  const source = git(repoRoot, ["show", `${pin}:${HARNESS_REL}`]);
+  const source = git(repoRoot, ["show", `HEAD:${HARNESS_REL}`]);
+  // Union of intent (torture-union US-005): both source branches edited this
+  // function. From fix/torture-battery-hermetic-20260909 @ 548aa1e we keep the
+  // pin/pinAfter HEAD-moved identity guard below; from
+  // input/aasylum/core-recorded-cells-20260909 @ f55e594e (ancestor
+  // input/aasylum/core-replay-adapter-20260909 @ c32e6378) we keep the
+  // literal-HEAD extraction rationale below. Both edits are retained; neither
+  // source is dropped.
+  // Extract via the literal HEAD rev, NOT the resolved `${pin}` SHA:
+  // tier0-history-independent-red-arms (MACP5.1) rule R4 rejects any non-HEAD
+  // `<rev>:<path>` git-show argument because it cannot prove a rev variable
+  // equals HEAD — and this file's own contract documents `git show HEAD:file`.
+  // `pin` is retained purely as the recorded evidence identity.
+  // Before/after HEAD identity check: if HEAD moved between the pin capture
+  // and the content read, the recorded pin would not describe the extracted
+  // source — refuse an ambiguous pair instead of recording a false identity.
+  const pinAfter = git(repoRoot, ["rev-parse", "HEAD"]).trim();
+  if (pin !== pinAfter) {
+    throw new Error(
+      `HEAD moved during committed-source extraction (${pin} -> ${pinAfter}); refusing an ambiguous pin`,
+    );
+  }
   return { pin, source };
 }
 

@@ -1,0 +1,63 @@
+{
+  "kind": "storm-product-events-negative-fixture",
+  "description": "Retained attempt-8/9 NPF-1 NEGATIVE fixture: the four real Round-B `merge.landed` product event lines from the retained attempt-8 STORM-REHEARSAL campaign, where every landing was `noop:true` with `checkoutRefresh: \"already-coherent\"` (the shared-branch shape of NPF-1 — the product landed NOTHING and never had to park around the B-park dirt). These lines pin the product contract that the engine's own state shape does NOT reproduce: the product (src/installer/events.ts) writes a BARE-uuid `runId` while the engine/state/report renders the same run as `run-<uuid>`. This directory is the retained NEGATIVE the tightened SF-15 gate must reject (parkLanding 0); the positive, non-noop parked fixture lives in torture-test/fixtures/storm-product-events/.",
+  "provenance": {
+    "attempt": 8,
+    "run_number": 73,
+    "retained_negative": true,
+    "campaign": "/opt/tamandua-storm-rehearsal-fix7.jagXJOb0/torture-test/var/results/storm-20260913T095916Z-527f6109-1c14-4585-9c83-9d58179ed856",
+    "source_events_dir": "/opt/tamandua-storm-rehearsal-fix7.jagXJOb0/torture-test/var/home/.tamandua/events",
+    "note": "The source worktree is retained READ-ONLY evidence; this fixture is a copy. Never write to the source. Retained by US-007 as the labelled negative (the attempt-8/9 already-coherent/noop shape)."
+  },
+  "bPark": {
+    "phaseId": "B-park",
+    "firedAt": "2026-09-13T11:07:04.159Z"
+  },
+  "runs": {
+    "B1": {
+      "stateRunId": "run-733db022-379b-4ce9-b728-ff77853cd2c3",
+      "bareRunId": "733db022-379b-4ce9-b728-ff77853cd2c3",
+      "rosterId": "B1",
+      "workflow": "feature-dev-merge-worktree",
+      "eventTs": "2026-09-13T11:08:27.130Z"
+    },
+    "B2": {
+      "stateRunId": "run-b4808acf-f8d6-4e54-8d1a-26d182d8c5e8",
+      "bareRunId": "b4808acf-f8d6-4e54-8d1a-26d182d8c5e8",
+      "rosterId": "B2",
+      "workflow": "feature-dev-merge-worktree",
+      "eventTs": "2026-09-13T11:08:27.197Z"
+    },
+    "B3": {
+      "stateRunId": "run-1815bb10-6045-4178-b1d5-b5e5aaf62cbe",
+      "bareRunId": "1815bb10-6045-4178-b1d5-b5e5aaf62cbe",
+      "rosterId": "B3",
+      "workflow": "bug-fix-merge-worktree",
+      "eventTs": "2026-09-13T11:08:27.392Z"
+    },
+    "B4": {
+      "stateRunId": "run-158a10ce-76ad-4f09-86bf-6a6a65c22b66",
+      "bareRunId": "158a10ce-76ad-4f09-86bf-6a6a65c22b66",
+      "rosterId": "B4",
+      "workflow": "bug-fix-merge-worktree",
+      "eventTs": "2026-09-13T11:08:27.204Z"
+    }
+  },
+  "productContract": {
+    "event": "merge.landed",
+    "target": "refs/heads/main",
+    "checkoutRefresh": "already-coherent",
+    "noop": true
+  },
+  "strictParking": {
+    "reader": "readProductMergeEvents (torture-test/bin/tt-storm-real.mjs)",
+    "note": "SF-15/US-005: every retained attempt-8/9 line is noop:true with checkoutRefresh already-coherent, so the strict reader classifies NONE of them as parkLanding. This directory is therefore the retained STRICT NEGATIVE fixture (the exact NPF-1 shape the gate must reject); the positive, non-noop parked fixture is torture-test/fixtures/storm-product-events/.",
+    "excludedRefresh": ["already-coherent", "refreshed", "not-applicable"],
+    "positiveRefreshPrefix": "parked:"
+  },
+  "expected": {
+    "targetMoved": 0,
+    "landed": 4,
+    "parkLanding": 0
+  }
+}

@@ -19,7 +19,9 @@
 // Confined to torture-test/. Zero tokens: the functional proof runs
 // run-w0.1 under a contained var home with a stub `npm` so the build/test
 // phases never actually run. The real ~/.gitconfig is only ever READ
-// (sha256 snapshot) and asserted unchanged after the run.
+// (sha256 snapshot when present) and asserted unchanged after the run;
+// an absent operator ~/.gitconfig (vaimetal) is truthfully recorded as
+// present:false with a null hash — absence stays absence, never ENOENT.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -52,6 +54,16 @@ const DOC_EXTENSIONS = new Set([
 
 function sha256(file: string): string {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+// Presence + sha256 of the REAL operator ~/.gitconfig (null hash when
+// absent). vaimetal ships no ~/.gitconfig, so a before() snapshot that
+// unconditionally sha256()s the path throws ENOENT and cancels the whole
+// suite; mirror tier0-hygiene-canary's truthfulness contract instead —
+// present:false → hash null, and absent-stays-absent is asserted.
+function gitconfigFingerprint(): { present: boolean; hash: string | null } {
+  if (!fs.existsSync(realGitconfig)) return { present: false, hash: null };
+  return { present: true, hash: sha256(realGitconfig) };
 }
 
 type CommandResult = { status: number | null; stdout: string; stderr: string };
@@ -149,21 +161,61 @@ function configGlobalAssignmentSites(): Array<{ rel: string; lines: Array<{ inde
 function assignmentValue(text: string): string | null {
   const match = /GIT_CONFIG_GLOBAL\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|([^\s,]+))/.exec(text);
   if (!match) return null;
-  return match[1] ?? match[2] ?? match[3] ?? null;
+  const raw = match[1] ?? match[2] ?? match[3] ?? null;
+  if (raw === null) return null;
+  // The fix chain's shell-export form is embedded inside a JS string literal:
+  //   lines.push('export GIT_CONFIG_GLOBAL=/dev/null');
+  // The greedy unquoted capture keeps the closing JS delimiters, yielding
+  // "/dev/null');" for that line. Strip trailing JS/shell delimiters so the
+  // value is classified by intent: /dev/null is a fail-closed pin (a non-file
+  // that leaks nothing), not a path that would need var containment.
+  return raw.replace(/["');]+$/g, "");
 }
 
 function guardSourceLine(lines: string[]): number {
   return lines.findIndex((line) => line.includes("containment-guard.sh"));
 }
 
-let gitconfigBefore = "";
+// Classify a single GIT_CONFIG_GLOBAL assignment. Returns null when the
+// assignment is accepted and a human-readable violation reason otherwise.
+//
+// Accepted forms:
+//   * /dev/null — the fail-closed pin, accepted ANYWHERE by intent. /dev/null
+//     is a non-file that leaks nothing, so it needs no var containment; the
+//     fix chain (bin/tt-storm-rehearsal.mjs) pins a hermetic git posture this
+//     way so a campaign git write can never inherit the host's ambient global
+//     identity.
+//   * $HOME/.gitconfig — allowed ONLY in cases/hooks/run-w0.1, and only after
+//     the containment guard is sourced (the guard's HOME containment is what
+//     makes $HOME resolve under var).
+function classifyConfigGlobal(siteRel: string, text: string, index: number): string | null {
+  const value = assignmentValue(text);
+  if (value === null) {
+    return `${siteRel}:${index + 1} has a GIT_CONFIG_GLOBAL assignment but no value:\n${text}`;
+  }
+  if (value === "/dev/null") return null; // fail-closed pin — nothing to guard.
+  if (siteRel !== "cases/hooks/run-w0.1") {
+    return `${siteRel}:${index + 1} assigns GIT_CONFIG_GLOBAL=${value} — only the guarded hook may resolve it under var`;
+  }
+  if (value !== "$HOME/.gitconfig") {
+    return `${siteRel}:${index + 1} must scope the write to $HOME/.gitconfig so the guard's HOME containment contains it`;
+  }
+  const lines = read(HOOK_W01).split(/\r?\n/);
+  const guardLine = guardSourceLine(lines);
+  if (!(guardLine >= 0 && guardLine < index)) {
+    return `the containment guard must be sourced BEFORE the GIT_CONFIG_GLOBAL assignment (line ${index + 1})`;
+  }
+  return null;
+}
+
+let gitconfigBefore: { present: boolean; hash: string | null } = { present: false, hash: null };
 describe("FIX10 US-006 grep-proof: no unguarded git config --global, canary section shown", () => {
   before(() => {
-    gitconfigBefore = sha256(realGitconfig);
+    gitconfigBefore = gitconfigFingerprint();
   });
   after(() => {
-    assert.equal(sha256(realGitconfig), gitconfigBefore,
-      "the real ~/.gitconfig hash changed during the test run — containment broke");
+    assert.deepEqual(gitconfigFingerprint(), gitconfigBefore,
+      "the real ~/.gitconfig presence/hash changed during the test run — containment broke");
   });
 
   it("the literal 'git config --global' appears ONLY in cases/hooks/run-w0.1 among executable files", () => {
@@ -210,17 +262,8 @@ describe("FIX10 US-006 grep-proof: no unguarded git config --global, canary sect
     assert.ok(sites.length > 0, "expected at least one GIT_CONFIG_GLOBAL assignment site");
     for (const site of sites) {
       for (const { index, text } of site.lines) {
-        const value = assignmentValue(text);
-        assert.ok(value !== null, `${site.rel}:${index + 1} has a GIT_CONFIG_GLOBAL assignment but no value:\n${text}`);
-        if (value === "/dev/null") continue; // fail-closed oracle/scenario pin — nothing to guard.
-        assert.equal(site.rel, "cases/hooks/run-w0.1",
-          `${site.rel}:${index + 1} assigns GIT_CONFIG_GLOBAL=${value} — only the guarded hook may resolve it under var`);
-        assert.equal(value, "$HOME/.gitconfig",
-          `${site.rel}:${index + 1} must scope the write to $HOME/.gitconfig so the guard's HOME containment contains it`);
-        const lines = read(HOOK_W01).split(/\r?\n/);
-        const guardLine = guardSourceLine(lines);
-        assert.ok(guardLine >= 0 && guardLine < index,
-          `the containment guard must be sourced BEFORE the GIT_CONFIG_GLOBAL assignment (line ${index + 1})`);
+        const violation = classifyConfigGlobal(site.rel, text, index);
+        if (violation !== null) assert.fail(violation);
       }
     }
     // Explicit inventory (kept in sync so a new /dev/null site is noticed):
@@ -229,12 +272,31 @@ describe("FIX10 US-006 grep-proof: no unguarded git config --global, canary sect
       "oracles/lib/git.mjs",
       "oracles/lib/o8.mjs",
       "bin/tt-verify-environment",
+      "bin/tt-storm-rehearsal.mjs",
       "scenarios/w4.25/run-upgrade.mjs",
       "scenarios/w4.25/prepare-fixture.mjs",
       "scenarios/w4.25/run-downgrade-reupgrade.mjs",
     ]) {
       assert.ok(byRel.has(expected), `expected a GIT_CONFIG_GLOBAL site in ${expected}`);
     }
+  });
+
+  it("red-arming: a NON-/dev/null, non-$HOME/.gitconfig assignment in a non-hook file still fails", () => {
+    // A synthetic site mirroring the fix chain's shell-export form, but with a
+    // real leak target. It must NOT be swallowed by the /dev/null-by-intent
+    // classification — only the literal /dev/null pin is fail-closed.
+    const synthetic = "  lines.push('export GIT_CONFIG_GLOBAL=/tmp/operator.gitconfig');";
+    const violation = classifyConfigGlobal("bin/tt-storm-rehearsal.mjs", synthetic, 2295);
+    assert.notEqual(violation, null,
+      "a non-/dev/null, non-$HOME assignment outside the hook must be a violation");
+    if (violation === null) return; // unreachable past the assertion; narrows for the typechecker
+    assert.match(violation, /only the guarded hook may resolve it under var/);
+    // The real fix-chain pin IS the fail-closed form, accepted by intent.
+    assert.equal(
+      classifyConfigGlobal("bin/tt-storm-rehearsal.mjs",
+        "  lines.push('export GIT_CONFIG_GLOBAL=/dev/null');", 2295),
+      null,
+      "the /dev/null pin in the fix chain must be accepted by intent");
   });
 
   it("functional: the guarded --global write lands in the contained var home, never the operator's", () => {
@@ -262,7 +324,7 @@ describe("FIX10 US-006 grep-proof: no unguarded git config --global, canary sect
       assert.ok(containedGitconfig.startsWith(path.resolve(varRoot)),
         `the write target must live under torture-test/var: ${containedGitconfig}`);
       // The operator home must be byte-identical after the contained run.
-      assert.equal(sha256(realGitconfig), gitconfigBefore,
+      assert.deepEqual(gitconfigFingerprint(), gitconfigBefore,
         "the real ~/.gitconfig must never be touched by the guarded write");
     } finally {
       fs.rmSync(containedHome, { recursive: true, force: true });

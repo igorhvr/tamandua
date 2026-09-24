@@ -236,7 +236,7 @@ run_recorded_campaign() {
   status=$?
   set -e
   printf '%s\n' "$output"
-  if [ "$status" -le 2 ] && printf '%s\n' "$output" | grep -Fq 'Campaign: '; then
+  if [ "$status" -le 2 ] && grep -Fq 'Campaign: ' <<<"$output"; then
     return 0
   fi
   return "$status"
@@ -245,7 +245,7 @@ run_recorded_campaign() {
 remember_campaign() {
   local output="$1"
   local campaign_id
-  campaign_id="$(printf '%s\n' "$output" | sed -n 's/^Campaign: //p' | tail -1)"
+  campaign_id="$(sed -n 's/^Campaign: //p' <<<"$output" | tail -1)"
   [ -n "$campaign_id" ] || fail "controller output did not identify its campaign: $output"
   printf '%s/%s\n' "$TT_DIR/var/results" "$campaign_id" >> "$CAMPAIGN_DIRS_FILE"
   printf '%s' "$campaign_id"
@@ -261,7 +261,7 @@ expect_usage_error() {
   status=$?
   set -e
   [ "$status" -eq 4 ] || fail "$name exited $status instead of 4: $output"
-  printf '%s' "$output" | grep -Fq 'Usage: tt-controller' || fail "$name did not print usage: $output"
+  grep -Fq 'Usage: tt-controller' <<<"$output" || fail "$name did not print usage: $output"
   pass "$name"
 }
 
@@ -412,7 +412,7 @@ expect_rejected() {
   status=$?
   set -e
   [ "$status" -eq 2 ] || fail "$name exited $status instead of 2: $output"
-  printf '%s' "$output" | grep -Fq "$expected" || fail "$name did not report '$expected': $output"
+  grep -Fq "$expected" <<<"$output" || fail "$name did not report '$expected': $output"
   pass "$name"
 }
 
@@ -437,7 +437,7 @@ run_fail_closed_profile_campaign() {
   status=$?
   set -e
   [ "$status" -eq 2 ] || fail "$name exited $status instead of 2 (INFRA): $output"
-  campaign_id=$(printf '%s\n' "$output" | sed -n 's/^Campaign: //p' | tail -1)
+  campaign_id=$(sed -n 's/^Campaign: //p' <<<"$output" | tail -1)
   [ -n "$campaign_id" ] || fail "$name did not create a campaign (aborted?): $output"
   state_path="$TT_DIR/var/results/$campaign_id/state.json"
   report_txt="$TT_DIR/var/results/$campaign_id/report.txt"
@@ -600,6 +600,7 @@ node --test "$TT_DIR/oracles/lib/runtime.test.mjs" "$TT_DIR/oracles/lib/evidence
   "$TT_DIR/oracles/self-test/o1.test.mjs" "$TT_DIR/oracles/self-test/o3z.test.mjs" \
   "$TT_DIR/oracles/self-test/o9.test.mjs" "$TT_DIR/oracles/self-test/o16.test.mjs" \
   "$TT_DIR/oracles/self-test/o4.test.mjs" \
+  "$TT_DIR/oracles/self-test/o7.test.mjs" \
   || fail "shared oracle runtime/self-test harness tests failed"
 "$TT_DIR/oracles/self-test/run.sh" || fail "shared oracle mutation harness failed"
 pass "shared oracle runtime enforces CONTRACT v1 and the mutation harness rejects result mismatches"
@@ -770,7 +771,12 @@ pass "unidentified launch intent is TEST_INFRA_FAIL and is never relaunched"
 
 scheduler_manifest="$TEST_ROOT/manifests/scheduler.jsonl"
 scheduler_events="$TEST_ROOT/scheduler-events.jsonl"
-write_scheduler_manifest "$scheduler_manifest" "$scheduler_events" 4 450
+# Per-command duration must stay well ABOVE the 400 ms stagger: the max-active
+# == 2 assertion needs a real overlap window. At the original 450 ms the window
+# was only 50 ms, so a loaded box whose stagger timer fired late (measured
+# start-to-start 541 ms under the port gate) produced no overlap at all and
+# flaked the scheduler assertion. 1800 ms keeps a ~1.4 s overlap margin.
+write_scheduler_manifest "$scheduler_manifest" "$scheduler_events" 4 1800
 # Stagger is set well above the 100 ms assertion floor so a loaded box (other
 # agents, parallel suites) cannot eat the margin and flake the deadline check.
 scheduler_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$scheduler_manifest" --concurrency 2 --stagger 400ms) || fail "bounded scheduler failed: $scheduler_output"
@@ -908,7 +914,7 @@ active_resume_output=$("$CONTROLLER" --resume "$interruption_id" 2>&1)
 active_resume_status=$?
 set -e
 [ "$active_resume_status" -eq 2 ] || fail "concurrent resume exited $active_resume_status instead of 2: $active_resume_output"
-printf '%s' "$active_resume_output" | grep -Fq 'campaign is already controlled' || fail "concurrent resume did not report campaign ownership: $active_resume_output"
+grep -Fq 'campaign is already controlled' <<<"$active_resume_output" || fail "concurrent resume did not report campaign ownership: $active_resume_output"
 kill -9 "$interruption_controller_pid"
 set +e
 wait "$interruption_pid" 2>/dev/null
@@ -5215,7 +5221,7 @@ wait "$decoupled_pid"
 decoupled_status=$?
 set -e
 decoupled_output="$(cat "$decoupled_output_file")"
-[ "$decoupled_status" -le 2 ] && printf '%s\n' "$decoupled_output" | grep -Fq 'Campaign: ' \
+[ "$decoupled_status" -le 2 ] && grep -Fq 'Campaign: ' <<<"$decoupled_output" \
   || fail "decoupled wall-cap enforcement failed: $decoupled_output"
 decoupled_id=$(remember_campaign "$decoupled_output")
 node --input-type=module - "$TT_DIR/var/results/$decoupled_id/state.json" <<'NODE'
@@ -5323,7 +5329,7 @@ wait "$discovery_cap_pid"
 discovery_cap_status=$?
 set -e
 discovery_cap_output="$(cat "$discovery_cap_output_file")"
-[ "$discovery_cap_status" -le 2 ] && printf '%s\n' "$discovery_cap_output" | grep -Fq 'Campaign: ' \
+[ "$discovery_cap_status" -le 2 ] && grep -Fq 'Campaign: ' <<<"$discovery_cap_output" \
   || fail "discovered-run wall-cap enforcement failed: $discovery_cap_output"
 discovery_cap_id=$(remember_campaign "$discovery_cap_output")
 node --input-type=module - "$TT_DIR/var/results/$discovery_cap_id/state.json" <<'NODE'
@@ -5756,7 +5762,7 @@ valid_case "MISSPELLED-KEY" | sed 's/"class":"verification"/"spec_refs":"oops","
 expect_rejected "misspelled top-level key spec_refs is rejected" "$misspelled_manifest" 'unknown property "spec_refs"'
 
 valid_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$CASES") || fail "cases.jsonl rejected: $valid_output"
-printf '%s' "$valid_output" | grep -Fq 'Validated ' || fail "valid manifest did not report validation success"
+grep -Fq 'Validated ' <<<"$valid_output" || fail "valid manifest did not report validation success"
 remember_campaign "$valid_output" > /dev/null
 pass "every cases.jsonl line validates"
 
@@ -6604,7 +6610,7 @@ validate_after_count=$(find "$TT_DIR/var/results" -mindepth 1 -maxdepth 1 -type 
 [ ! -e "$tier0_scripted_sentinel" ] && [ ! -e "$tier0_real_sentinel" ] \
   && [ ! -e "$tier0_legacy_real_sentinel" ] \
   || fail "validate-only launched a case hook"
-printf '%s' "$validate_output" | grep -Fq 'Validated 3 case(s)' \
+grep -Fq 'Validated 3 case(s)' <<<"$validate_output" \
   || fail "validate-only did not report every validated record: $validate_output"
 pass "validate-only checks every mixed-manifest record without creating or launching a campaign"
 
@@ -6619,7 +6625,7 @@ validate_malformed_status=$?
 set -e
 [ "$validate_malformed_status" -eq 2 ] \
   || fail "validate-only malformed manifest exited $validate_malformed_status instead of 2: $validate_malformed_output"
-printf '%s' "$validate_malformed_output" | grep -Fq 'line 2: invalid JSON' \
+grep -Fq 'line 2: invalid JSON' <<<"$validate_malformed_output" \
   || fail "validate-only malformed error was not line-numbered: $validate_malformed_output"
 pass "validate-only returns infrastructure exit 2 for malformed manifests"
 
@@ -6718,7 +6724,7 @@ NODE
   set -e
   [ "$corruption_status" -eq 2 ] \
     || fail "$corruption pending-real state exited $corruption_status instead of 2: $corruption_output"
-  printf '%s' "$corruption_output" | grep -Fq 'execution selection state is invalid' \
+  grep -Fq 'execution selection state is invalid' <<<"$corruption_output" \
     || fail "$corruption pending-real state was not rejected clearly: $corruption_output"
 done
 cp "$TEST_ROOT/tier0-selection-valid-state.json" "$tier0_selection_dir/state.json"
@@ -6726,7 +6732,7 @@ pass "resume rejects pending-real state with the wrong policy, case mode, or att
 
 help_output=$("$CONTROLLER" --help 2>&1) || fail "--help failed: $help_output"
 for text in '--manifest <path>' '--resume <campaign-id>' '--validate-only' '--scripted-only' '--concurrency <count>' '--stagger <duration>' 'Duration examples: 250ms, 5s, 2m, 1h'; do
-  printf '%s' "$help_output" | grep -Fq -- "$text" || fail "help omitted '$text': $help_output"
+  grep -Fq -- "$text" <<<"$help_output" || fail "help omitted '$text': $help_output"
 done
 pass "help documents campaign and duration options"
 
@@ -6753,9 +6759,9 @@ for cap_interval_value in abc 0 -5 1.5; do
   set -e
   [ "$cap_interval_status" -eq 2 ] \
     || fail "cap-check interval '$cap_interval_value' exited $cap_interval_status instead of 2: $cap_interval_output"
-  printf '%s' "$cap_interval_output" | grep -Fq 'TT_CONTROLLER_CAP_CHECK_INTERVAL_MS must be a positive integer' \
+  grep -Fq 'TT_CONTROLLER_CAP_CHECK_INTERVAL_MS must be a positive integer' <<<"$cap_interval_output" \
     || fail "cap-check interval '$cap_interval_value' was not rejected clearly: $cap_interval_output"
-  printf '%s' "$cap_interval_output" | grep -Fq 'Campaign: ' \
+  grep -Fq 'Campaign: ' <<<"$cap_interval_output" \
     && fail "cap-check interval '$cap_interval_value' launched a campaign despite failing validation"
   true
 done
@@ -6798,7 +6804,7 @@ for (const key of ['created_at', 'updated_at']) {
   }
 }
 NODE
-if find "$campaign_dir" -mindepth 1 -maxdepth 1 -name '*.tmp' | grep -q .; then
+if [ -n "$(find "$campaign_dir" -mindepth 1 -maxdepth 1 -name '*.tmp' -print -quit)" ]; then
   fail "atomic state writer left a temporary file behind"
 fi
 pass "new invocation atomically creates one versioned campaign state"
@@ -6816,13 +6822,13 @@ selection_mismatch_status=$?
 set -e
 [ "$selection_mismatch_status" -eq 2 ] \
   || fail "all-campaign scripted-only resume exited $selection_mismatch_status instead of 2: $selection_mismatch_output"
-printf '%s' "$selection_mismatch_output" | grep -Fq 'execution selection does not match campaign state' \
+grep -Fq 'execution selection does not match campaign state' <<<"$selection_mismatch_output" \
   || fail "all-campaign scripted-only resume mismatch was unclear: $selection_mismatch_output"
 pass "legacy all-policy state resumes as all and rejects scripted-only escalation"
 
 resume_before_count=$(find "$TT_DIR/var/results" -mindepth 1 -maxdepth 1 -type d | wc -l)
 resume_output=$(run_recorded_campaign "$CONTROLLER" --resume "$campaign_id" --manifest "$campaign_manifest") || fail "resume failed: $resume_output"
-printf '%s' "$resume_output" | grep -Fq "Resumed campaign: $campaign_id" || fail "resume did not report campaign identity: $resume_output"
+grep -Fq "Resumed campaign: $campaign_id" <<<"$resume_output" || fail "resume did not report campaign identity: $resume_output"
 resume_after_count=$(find "$TT_DIR/var/results" -mindepth 1 -maxdepth 1 -type d | wc -l)
 [ "$resume_after_count" -eq "$resume_before_count" ] || fail "resume created another campaign directory"
 node --input-type=module - "$state_file" <<'NODE'
@@ -6839,7 +6845,7 @@ missing_resume_output=$("$CONTROLLER" --resume "campaign-does-not-exist-$$" 2>&1
 missing_resume_status=$?
 set -e
 [ "$missing_resume_status" -eq 2 ] || fail "missing resume exited $missing_resume_status instead of 2: $missing_resume_output"
-printf '%s' "$missing_resume_output" | grep -Fq 'cannot load campaign state' || fail "missing resume error was unclear: $missing_resume_output"
+grep -Fq 'cannot load campaign state' <<<"$missing_resume_output" || fail "missing resume error was unclear: $missing_resume_output"
 pass "missing resume is rejected"
 
 corrupt_id="campaign-corrupt-$$"
@@ -6852,7 +6858,7 @@ corrupt_output=$("$CONTROLLER" --resume "$corrupt_id" 2>&1)
 corrupt_status=$?
 set -e
 [ "$corrupt_status" -eq 2 ] || fail "corrupt resume exited $corrupt_status instead of 2: $corrupt_output"
-printf '%s' "$corrupt_output" | grep -Fq 'cannot load campaign state' || fail "corrupt resume error was unclear: $corrupt_output"
+grep -Fq 'cannot load campaign state' <<<"$corrupt_output" || fail "corrupt resume error was unclear: $corrupt_output"
 pass "corrupt resume state is rejected"
 
 semantic_corrupt_id="campaign-semantic-corrupt-$$"
@@ -6872,7 +6878,7 @@ semantic_corrupt_output=$("$CONTROLLER" --resume "$semantic_corrupt_id" 2>&1)
 semantic_corrupt_status=$?
 set -e
 [ "$semantic_corrupt_status" -eq 2 ] || fail "semantic corruption exited $semantic_corrupt_status instead of 2: $semantic_corrupt_output"
-printf '%s' "$semantic_corrupt_output" | grep -Fq 'case ledger does not match immutable manifest metadata' || fail "semantic corruption error was unclear: $semantic_corrupt_output"
+grep -Fq 'case ledger does not match immutable manifest metadata' <<<"$semantic_corrupt_output" || fail "semantic corruption error was unclear: $semantic_corrupt_output"
 pass "resume rejects a case ledger inconsistent with immutable metadata"
 
 symlink_state_id="campaign-symlink-state-$$"
@@ -6885,7 +6891,7 @@ symlink_state_output=$("$CONTROLLER" --resume "$symlink_state_id" 2>&1)
 symlink_state_status=$?
 set -e
 [ "$symlink_state_status" -eq 2 ] || fail "symlinked state exited $symlink_state_status instead of 2: $symlink_state_output"
-printf '%s' "$symlink_state_output" | grep -Fq 'state.json is not a contained regular file' || fail "symlinked-state error was unclear: $symlink_state_output"
+grep -Fq 'state.json is not a contained regular file' <<<"$symlink_state_output" || fail "symlinked-state error was unclear: $symlink_state_output"
 pass "resume rejects a symlinked state file"
 
 printf '\n' >> "$campaign_manifest"
@@ -6894,7 +6900,7 @@ mismatch_output=$("$CONTROLLER" --resume "$campaign_id" 2>&1)
 mismatch_status=$?
 set -e
 [ "$mismatch_status" -eq 2 ] || fail "manifest mismatch exited $mismatch_status instead of 2: $mismatch_output"
-printf '%s' "$mismatch_output" | grep -Fq 'manifest does not match campaign state' || fail "manifest mismatch error was unclear: $mismatch_output"
+grep -Fq 'manifest does not match campaign state' <<<"$mismatch_output" || fail "manifest mismatch error was unclear: $mismatch_output"
 pass "resume rejects changed manifest bytes"
 
 node --test "$SCRIPT_DIR/tt-report.test.mjs" || fail "report unit tests failed"
@@ -7135,11 +7141,11 @@ for expected_status in 0 1 2; do
 done
 
 launcher_help=$("$launcher_root/bin/tt-run" --help)
-printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[available\]' \
+grep -Eq -- '--tier0 .*\[available\]' <<<"$launcher_help" \
   || fail "tt-run --help did not mark the validated Tier-0 assets available: $launcher_help"
-printf '%s' "$launcher_help" | grep -Fq -- '--include-real' \
+grep -Fq -- '--include-real' <<<"$launcher_help" \
   || fail "tt-run --help did not name the Tier-0 real-case opt-in: $launcher_help"
-printf '%s' "$launcher_help" | grep -Eq 'WARNING.*real.*tokens|real.*tokens.*WARNING' \
+grep -Eq 'WARNING.*real.*tokens|real.*tokens.*WARNING' <<<"$launcher_help" \
   || fail "tt-run --help did not prominently warn that the opt-in spends real tokens: $launcher_help"
 
 for expected_status in 0 1 2; do
@@ -7191,9 +7197,9 @@ done
 # validator's named reason on stderr.
 chmod -x "$launcher_root/scenarios/example/run.sh"
 launcher_help=$("$launcher_root/bin/tt-run" --help)
-printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[INVALID' \
+grep -Eq -- '--tier0 .*\[INVALID' <<<"$launcher_help" \
   || fail "tt-run --help must mark Tier-0 INVALID (assets present but gate red) with an invalid scenario library: $launcher_help"
-printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[NOT YET IMPLEMENTED\]' \
+grep -Eq -- '--tier0 .*\[NOT YET IMPLEMENTED\]' <<<"$launcher_help" \
   && fail "tt-run --help must NOT report an invalid scenario library as NOT YET IMPLEMENTED: $launcher_help"
 set +e
 TT_FAKE_CONTROLLER_LOG="$launcher_log" "$launcher_root/bin/tt-run" --tier0 \
@@ -7208,7 +7214,7 @@ chmod +x "$launcher_root/scenarios/example/run.sh"
 for required_asset in "$launcher_root/bin/tt-controller" "$launcher_root/cases/tier0.jsonl"; do
   mv "$required_asset" "$required_asset.missing"
   launcher_help=$("$launcher_root/bin/tt-run" --help)
-  printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[NOT YET IMPLEMENTED\]' \
+  grep -Eq -- '--tier0 .*\[NOT YET IMPLEMENTED\]' <<<"$launcher_help" \
     || fail "tt-run --help advertised Tier-0 without required asset $required_asset: $launcher_help"
   set +e
   TT_FAKE_CONTROLLER_LOG="$launcher_log" "$launcher_root/bin/tt-run" --tier0 \
@@ -7222,7 +7228,7 @@ pass "tt-run detects validated Tier-0 assets, defaults to zero-token routing, ga
 
 printf 'controller-generated newest report\n' > "$launcher_root/var/results/campaign-newest/report.txt"
 launcher_report=$("$launcher_root/bin/tt-run" --report)
-printf '%s' "$launcher_report" | grep -Fq 'controller-generated newest report' \
+grep -Fq 'controller-generated newest report' <<<"$launcher_report" \
   || fail "tt-run --report did not render controller report.txt: $launcher_report"
 pass "tt-run delegates smoke with unchanged verdict exits and reports newest controller output"
 

@@ -823,7 +823,13 @@ function projectSuiteObservations(input, suiteRows, events) {
       && row.tree_hash === key.tree_hash && row.cmd_hash === key.cmd_hash
       && row.run_id === eventRunId && row.step_id === eventStepId && row.created_at === event.ts
       && row.duration_ms === event.durationMs && row.exit_code === event.exitCode);
-    if (recorded === undefined || !Number.isSafeInteger(event.durationMs) || !Number.isSafeInteger(event.exitCode)) continue;
+    // TIME-CLOCKS (schema-13 product seam): the shim now reports a
+    // monotonic Stopwatch duration, which is a FRACTIONAL millisecond value
+    // (e.g. 7.269116...), not the old Date.now() integer. Accept any finite
+    // non-negative number; exit codes remain integers.
+    const finiteDuration = typeof event.durationMs === 'number'
+      && Number.isFinite(event.durationMs) && event.durationMs >= 0;
+    if (recorded === undefined || !finiteDuration || !Number.isSafeInteger(event.exitCode)) continue;
     const startedAt = new Date(new Date(event.ts).valueOf() - event.durationMs).toISOString();
     const prior = suiteRows.filter((row) => row.origin_repo === key.origin_repo
       && row.tree_hash === key.tree_hash && row.cmd_hash === key.cmd_hash && row.created_at < startedAt)

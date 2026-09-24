@@ -76,7 +76,10 @@ function suiteRowShape(raw, label) {
     created_at: row.created_at,
   };
   if (!Number.isSafeInteger(normalized.exit_code)) throw new OracleRuntimeError(`${label}.exit_code must be an integer`);
-  if (!Number.isSafeInteger(normalized.duration_ms) || normalized.duration_ms < 0) throw new OracleRuntimeError(`${label}.duration_ms must be a non-negative integer`);
+  // TIME-CLOCKS (schema-13 product seam): suite_results.duration_ms is written
+  // from the shim's monotonic Stopwatch and is FRACTIONAL (e.g. 7.269116...),
+  // not the old Date.now() integer. Accept any finite non-negative number.
+  if (typeof normalized.duration_ms !== 'number' || !Number.isFinite(normalized.duration_ms) || normalized.duration_ms < 0) throw new OracleRuntimeError(`${label}.duration_ms must be a finite non-negative number`);
   if (normalized.log_tail !== null && typeof normalized.log_tail !== 'string') throw new OracleRuntimeError(`${label}.log_tail must be null or string`);
   if (normalized.run_id !== null && typeof normalized.run_id !== 'string') throw new OracleRuntimeError(`${label}.run_id must be null or string`);
   if (normalized.step_id !== null && typeof normalized.step_id !== 'string') throw new OracleRuntimeError(`${label}.step_id must be null or string`);

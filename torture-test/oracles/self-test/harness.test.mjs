@@ -21,7 +21,11 @@ function run() {
     cwd: TT_ROOT,
     encoding: 'utf8',
     shell: false,
-    timeout: 300_000,
+    // The runner performs two full fixture rounds; a round measured ~167s on
+    // vaimetal (port F-002), so the old 300s spawn bound (sized for the old
+    // 140s round / 300s suite budget) would kill a now-legitimate suite. Keep
+    // it above run.sh's own 720s suite watchdog so run.sh reports first.
+    timeout: 900_000,
     env: { ...process.env, TT_SELF_TEST_KEEP_WORKSPACE: '0' },
   });
 }

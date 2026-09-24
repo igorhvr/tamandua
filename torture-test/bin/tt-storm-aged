@@ -1,0 +1,521 @@
+#!/usr/bin/env node
+// tt-storm-aged — zero-token aged-state generator for the W5 storm
+// (torture-only; owned by the STORM-AGED run; NOT part of the native product).
+//
+// Subcommands (explicit operations only — --help/plan/inspect never start a
+// daemon/model/campaign):
+//   tt-storm-aged --help | --version
+//   tt-storm-aged inspect <seed-root>          read-only manifest/census glance
+//   tt-storm-aged preflight [--root ROOT]      recording-only safety gate
+//   tt-storm-aged preflight-evidence <seed-root>  persist PASS + negative-trial
+//                                              gate receipts (zero-effects
+//                                              fingerprints) under
+//                                              <root>/evidence/preflight
+//   tt-storm-aged pilot    [--root ROOT] [--plan FILE]
+//                                              allocate+seed a small real-API
+//                                              pilot corpus (all dispositions)
+//   tt-storm-aged full     [--root ROOT] --origin <repo> [--recipe FILE]
+//                                              full 5000/500000/200 seed on a
+//                                              supplied owned/pinned origin
+//   tt-storm-aged resume   <seed-root>         continue a partial seed (idempotent)
+//   tt-storm-aged census   <seed-root>         read-only census receipt
+//   tt-storm-aged snapshot <seed-root>         immutable snapshots + sidecar
+//   tt-storm-aged validate <seed-root>         seed-validation routing + O12
+//   tt-storm-aged volume   <seed-root> --count N   volume-only synthetic events
+//
+// Environment: TAMANDUA_CLI (live step CLI, default /opt/tamandua/bin/tamandua),
+// TAMANDUA_PRODUCT_DIST (pinned product dist, default /opt/tamandua/dist).
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const AGED_DIR = path.resolve(__dirname, "..", "aged");
+const PHASES = path.join(AGED_DIR, "phases.mjs");
+const MANIFEST = path.join(AGED_DIR, "manifest.mjs");
+const ENV = path.join(AGED_DIR, "env.mjs");
+const PRODUCT = path.join(AGED_DIR, "product.mjs");
+const PREFLIGHT = path.join(AGED_DIR, "preflight.mjs");
+
+const USAGE = `tt-storm-aged — zero-token aged-state generator (torture-only)
+
+Usage: tt-storm-aged <command> [options]
+
+Commands:
+  --help, -h                 Show this help (no effects)
+  --version                  Show version (no effects)
+  inspect <seed-root>        Read-only manifest + status glance (no effects)
+  allocate [--kind KIND] [--root ROOT] [--recipe FILE] [--run-id ID] [--base DIR]
+                             Allocate an owned seed root and pin the executed
+                             generator identity (HEAD + cleanliness) BEFORE any
+                             effect (no phase runs)
+  preflight [--root ROOT]    Recording-only effect-adapter safety gate
+  preflight-evidence <seed-root>
+                             Persist PASS + negative-trial gate receipts with
+                             zero-effects fingerprints under
+                             <seed-root>/evidence/preflight
+  pilot [--root ROOT] [--plan FILE]
+                             Allocate + seed a small real-API pilot corpus
+  full --origin <repo> [--root ROOT] [--recipe FILE]
+                             Full 5000-run/500000-event/200-worktree seed on a
+                             supplied owned/pinned origin
+  resume <seed-root>         Continue a partial seed (reconcile; never duplicate)
+  census <seed-root>         Read-only census receipt
+  snapshot <seed-root>       Immutable DB/event/ref snapshots + baseline sidecar
+  validate <seed-root>       Seed-validation routing matrix + O12
+  volume <seed-root> --count N   Volume-only synthetic events (real emitEvent)
+
+Default entrypoint never starts a real daemon/model/campaign; aged-state
+creation and validation are explicit operations scoped by an owned manifest.
+`; 
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(USAGE);
+    return 0;
+  }
+  if (argv[0] === "--version") {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf-8"));
+    process.stdout.write(`tt-storm-aged ${pkg.version} (aged schema ${schemaVersion()})\n`);
+    return 0;
+  }
+
+  const cmd = argv[0];
+  const rest = argv.slice(1);
+  switch (cmd) {
+    case "inspect": return inspect(rest);
+    case "allocate": return allocate(rest);
+    case "preflight": return preflight(rest);
+    case "preflight-evidence": return preflightEvidence(rest);
+    case "pilot": return runSeed("pilot", rest);
+    case "full": return runSeed("full", rest);
+    case "resume": return resume(rest);
+    case "census": return census(rest);
+    case "snapshot": return snapshot(rest);
+    case "validate": return validate(rest);
+    case "volume": return volume(rest);
+    default:
+      process.stderr.write(`Unknown command: ${cmd}\n${USAGE}`);
+      return 2;
+  }
+}
+
+function schemaVersion() {
+  return 1;
+}
+
+function optValue(args, name) {
+  const i = args.indexOf(name);
+  if (i === -1) return null;
+  return args[i + 1] ?? null;
+}
+
+async function inspect(args) {
+  const root = args[0];
+  if (!root) {
+    process.stderr.write("usage: tt-storm-aged inspect <seed-root>\n");
+    return 2;
+  }
+  const { loadManifest, assertRootIdentity } = await import(MANIFEST);
+  try {
+    const manifest = loadManifest(path.resolve(root));
+    assertRootIdentity(path.resolve(root), manifest);
+    process.stdout.write(
+      JSON.stringify(
+        {
+          root,
+          kind: manifest.seed_kind,
+          allocated_at_utc: manifest.allocated_at_utc,
+          qualified: manifest.qualified ?? false,
+          phases: manifest.phases,
+          counts: manifest.counts,
+          disposition_counts: manifest.disposition_counts,
+          source_head: manifest.source?.head ?? null,
+          catalog_ids: manifest.catalog?.ids?.length ?? 0,
+          origin: manifest.origin?.path ?? null,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return 0;
+  } catch (err) {
+    process.stderr.write(`inspect: ${err.message}\n`);
+    return 1;
+  }
+}
+
+// allocate — owned seed-root allocation + executed-generator identity pinning
+// with NO phase effect.  The returned root is the root a later `full`/`pilot`
+// invocation resumes into via --root; the source pin records the code that
+// actually ran (HEAD + working-tree cleanliness) before any corpus effect.
+async function allocate(args) {
+  const {
+    allocateSeedRoot,
+    loadManifest,
+    saveManifest,
+    assertRootIdentity,
+    defaultResultsRoot,
+    pinExecutedSource,
+    journal,
+  } = await import(MANIFEST);
+
+  const kind = optValue(args, "--kind") ?? "full";
+  if (kind !== "pilot" && kind !== "full") {
+    process.stderr.write(`allocate: unknown kind "${kind}" (expected pilot|full)\n`);
+    return 2;
+  }
+
+  const recipe = parseRecipeFile(optValue(args, "--recipe"));
+  let root = optValue(args, "--root");
+  let manifest;
+  if (root) {
+    root = path.resolve(root);
+    manifest = loadManifest(root);
+    if (manifest.seed_kind !== kind) {
+      process.stderr.write(
+        `allocate: root is a ${manifest.seed_kind} seed; cannot adopt it as ${kind}\n`,
+      );
+      return 2;
+    }
+    assertRootIdentity(root, manifest);
+  } else {
+    const baseArg = optValue(args, "--base");
+    root = allocateSeedRoot({
+      baseDir: baseArg ? path.resolve(baseArg) : defaultResultsRoot(),
+      kind,
+      runId: optValue(args, "--run-id") ?? process.env.TAMANDUA_RUN_ID ?? null,
+    });
+    manifest = loadManifest(root);
+  }
+
+  // Pin the EXECUTED generator identity BEFORE any effect (the CLI itself is
+  // the generator: pin the checkout that owns this entrypoint, not an ambient
+  // cwd).  Never re-pin an existing pin — the identity of an allocated root is
+  // immutable.
+  const repoRoot = path.resolve(__dirname, "..", "..");
+  let changed = false;
+  if (!manifest.source?.head?.sha) {
+    manifest.source = pinExecutedSource(repoRoot);
+    changed = true;
+  }
+  if (recipe) {
+    manifest.recipe = recipe;
+    changed = true;
+  }
+  if (!manifest.phases || Object.keys(manifest.phases).length === 0) {
+    manifest.phases = { catalog: "pending", seed: "pending", census: "pending", validate: "pending" };
+    changed = true;
+  }
+  if (changed) saveManifest(root, manifest);
+
+  journal(root, { intent: "allocate", kind, executedSource: manifest.source, ts: new Date().toISOString() });
+  process.stdout.write(
+    JSON.stringify(
+      {
+        root,
+        kind: manifest.seed_kind,
+        allocated_at_utc: manifest.allocated_at_utc,
+        source: manifest.source,
+        recipe: manifest.recipe,
+        phases: manifest.phases,
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+  return 0;
+}
+
+async function preflight(args) {
+  const { allocateSeedRoot, loadManifest, defaultResultsRoot } = await import(MANIFEST);
+  const { preflightGate, writePreflightReceipt, dirTreeFingerprint } = await import(PREFLIGHT);
+  const { resolveProductDist } = await import(PRODUCT);
+
+  const rootArg = optValue(args, "--root");
+  let root;
+  let fresh = false;
+  try {
+    root = rootArg ? path.resolve(rootArg) : allocateSeedRoot({ baseDir: defaultResultsRoot(), kind: "pilot", runId: process.env.TAMANDUA_RUN_ID ?? null });
+    fresh = !rootArg;
+  } catch (err) {
+    process.stderr.write(`preflight: root allocation failed: ${err.message}\n`);
+    return 1;
+  }
+
+  const before = dirTreeFingerprint(root);
+  let manifest = null;
+  try {
+    manifest = loadManifest(root);
+  } catch {
+    manifest = null;
+  }
+  const originPin = manifest?.origin ?? null;
+  let productDist = null;
+  try {
+    productDist = resolveProductDist().dist;
+  } catch {
+    productDist = null;
+  }
+  const verdict = preflightGate({ candidateRoot: root, manifest, originPin, productDist });
+  const after = dirTreeFingerprint(root);
+  const effectsDetected = JSON.stringify(before) !== JSON.stringify(after);
+  verdict.effectsDetected = effectsDetected;
+  if (effectsDetected) {
+    verdict.result = "EFFECTS_DETECTED";
+    verdict.findings.push("preflight gate mutated the candidate root — gate is not recording-only");
+  }
+  if (!rootArg) {
+    // We allocated a fresh root solely to exercise the gate on a valid
+    // candidate; remove nothing (root is empty) but record the verdict in it.
+    const file = path.join(root, "receipts", "preflight-invalid-placeholder.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+  }
+  const receiptFile = fresh ? path.join(root, "receipts", `preflight-${verdict.result}.json`) : writePreflightReceipt(rootArg ? path.join(root, "receipts") : null, verdict, verdict.result);
+  if (receiptFile) fs.writeFileSync(receiptFile, JSON.stringify(verdict, null, 2) + "\n", "utf-8");
+  process.stdout.write(JSON.stringify(verdict, null, 2) + "\n");
+  return verdict.result === "PASS" ? 0 : 3;
+}
+
+async function preflightEvidence(args) {
+  // Persist the recording-only preflight battery for an owned seed root:
+  // PASS + negative trials, each with before/after zero-effects fingerprints
+  // and the CLI-equivalent exit code (REFUSE/INVALID → 3).  Receipts land
+  // under <seed-root>/evidence/preflight (owned evidence), never inside a
+  // trial candidate.  Journals before/after so the CLI path is durable.
+  const { loadManifest, journal, assertRootIdentity } = await import(MANIFEST);
+  const { runPreflightEvidenceBattery } = await import(PREFLIGHT);
+  const { resolveProductDist } = await import(PRODUCT);
+
+  const root = path.resolve(args[0] ?? "");
+  if (!root || !fs.existsSync(path.join(root, "manifest.json"))) {
+    process.stderr.write("usage: tt-storm-aged preflight-evidence <seed-root>\n");
+    return 2;
+  }
+  const manifest = loadManifest(root);
+  assertRootIdentity(root, manifest); // refuse foreign roots even for the battery
+  journal(root, { intent: "preflight-evidence", startedAt: new Date().toISOString() });
+
+  const productDist = resolveProductDist().dist;
+  const battery = runPreflightEvidenceBattery({ seedRoot: root, productDist });
+
+  // CLI-convention PASS receipt in the root receipts dir (mirrors the layout
+  // of the earlier pilot root evidence) — written only after the battery's own
+  // zero-effects fingerprint of the root was taken.
+  const pass = battery.results.find((r) => r.case === "pass");
+  if (pass && pass.result === "PASS") {
+    const recDir = path.join(root, "receipts");
+    fs.mkdirSync(recDir, { recursive: true });
+    fs.writeFileSync(path.join(recDir, "preflight-PASS.json"), JSON.stringify(pass, null, 2) + "\n", "utf-8");
+  }
+
+  journal(root, {
+    intent: "preflight-evidence",
+    finishedAt: new Date().toISOString(),
+    allExpected: battery.allExpected,
+    cases: battery.results.map((r) => `${r.case}:${r.result}:exit${r.exitCode}:zeroEffects=${r.zeroEffects}`),
+  });
+  process.stdout.write(JSON.stringify(battery, null, 2) + "\n");
+  return battery.allExpected ? 0 : 1;
+}
+
+async function runSeed(kind, args) {
+  const { allocateSeedRoot, loadManifest, assertRootIdentity, saveManifest, defaultResultsRoot, pinExecutedSource, journal } = await import(MANIFEST);
+  const { buildPhaseEnv, spawnPhase, reserveRandomPort } = await import(ENV);
+  const { recordsContainedPaths, ensureLayout } = await import(MANIFEST);
+
+  let root = optValue(args, "--root");
+  let manifest;
+  if (root) {
+    root = path.resolve(root);
+    manifest = loadManifest(root);
+    if (manifest.seed_kind !== kind) {
+      process.stderr.write(`runSeed: root is a ${manifest.seed_kind} seed; cannot run ${kind}\n`);
+      return 2;
+    }
+    assertRootIdentity(root, manifest);
+  } else {
+    if (kind === "full" && !optValue(args, "--origin") && !process.env.TT_POLY_ORIGIN) {
+      process.stderr.write("full mode requires --origin <repo> (owned/pinned tt-poly origin) or TT_POLY_ORIGIN\n");
+      return 2;
+    }
+    root = allocateSeedRoot({ baseDir: defaultResultsRoot(), kind, runId: process.env.TAMANDUA_RUN_ID ?? null });
+    manifest = loadManifest(root);
+    manifest.recipe = parseRecipeFile(optValue(args, "--recipe"));
+    manifest.phases = { catalog: "pending", seed: "pending", census: "pending", validate: "pending" };
+    // Pin the EXECUTED generator identity (HEAD + working-tree cleanliness)
+    // at allocation, BEFORE any effect — reproducibility needs the code that
+    // actually ran, not just the base HEAD (see Issue 4 reconciliation).
+    manifest.source = pinExecutedSource(process.cwd());
+    saveManifest(root, manifest);
+    journal(root, { intent: `runSeed:${kind}`, executedSource: manifest.source, ts: new Date().toISOString() });
+  }
+
+  const paths = recordsContainedPaths(root);
+  ensureLayout(root);
+  journal(root, { intent: `runSeed:${kind}`, args: restOf(args), ts: new Date().toISOString() });
+
+  const controlPort = await reserveRandomPort();
+  const env = buildPhaseEnv({ root, paths });
+  env.TAMANDUA_CONTROL_PORT = String(controlPort);
+  env.TAMANDUA_CLI = process.env.TAMANDUA_CLI ?? "/opt/tamandua/bin/tamandua";
+
+  const planFile = optValue(args, "--plan");
+  const originArg = kind === "full" ? (optValue(args, "--origin") ?? process.env.TT_POLY_ORIGIN ?? null) : null;
+
+  // 1. catalog
+  let res = await spawnPhase({ entry: PHASES, args: ["catalog", "--root", root], env, journal: (r) => journal(root, r), label: "catalog" });
+  await updateManifest(root, (m) => { m.phases.catalog = res.ok ? "done" : `failed:${res.status}`; });
+  if (!res.ok) return failAndReport(root, res, "catalog", process.cwd());
+  fs.writeFileSync(path.join(root, "evidence", "catalog-phase.out"), res.stdout + "\n" + res.stderr, "utf-8");
+
+  // 2. seed
+  const seedArgs = ["seed", "--root", root];
+  if (planFile) seedArgs.push("--plan", path.resolve(planFile));
+  if (originArg) seedArgs.push("--origin", originArg);
+  res = await spawnPhase({ entry: PHASES, args: seedArgs, env, journal: (r) => journal(root, r), label: "seed" });
+  await updateManifest(root, (m) => { m.phases.seed = res.ok ? "done" : `failed:${res.status}`; });
+  fs.writeFileSync(path.join(root, "evidence", "seed-phase.out"), res.stdout + "\n" + res.stderr, "utf-8");
+  if (!res.ok) return failAndReport(root, res, "seed", path.join(root, "evidence", "seed-phase.out"));
+
+  // 3. census + snapshot
+  res = await spawnPhase({ entry: PHASES, args: ["census-snapshot", "--root", root], env, journal: (r) => journal(root, r), label: "census-snapshot" });
+  await updateManifest(root, (m) => { m.phases.census = res.ok ? "done" : `failed:${res.status}`; });
+  if (!res.ok) return failAndReport(root, res, "census-snapshot", path.join(root, "evidence", "census-phase.out"));
+
+  // 4. validate
+  res = await spawnPhase({ entry: PHASES, args: ["validate", "--root", root], env, journal: (r) => journal(root, r), label: "validate" });
+  await updateManifest(root, (m) => { m.phases.validate = res.ok ? "done" : `failed:${res.status}`; });
+  fs.writeFileSync(path.join(root, "evidence", "validate-phase.out"), res.stdout + "\n" + res.stderr, "utf-8");
+
+  const finalManifest = loadManifest(root);
+  const summary = {
+    seed_root: root,
+    kind: finalManifest.seed_kind,
+    phases: finalManifest.phases,
+    counts: finalManifest.counts,
+    disposition_counts: finalManifest.disposition_counts,
+    qualified: finalManifest.qualified ?? false,
+  };
+  fs.writeFileSync(path.join(root, "evidence", "seed-summary.json"), JSON.stringify(summary, null, 2) + "\n", "utf-8");
+  process.stdout.write(JSON.stringify(summary, null, 2) + "\n");
+  return 0;
+}
+
+function restOf(args) {
+  return args.join(" ");
+}
+
+async function updateManifest(root, updater) {
+  const { loadManifest, saveManifest } = await import(MANIFEST);
+  const m = loadManifest(root);
+  updater(m);
+  saveManifest(root, m);
+  return m;
+}
+
+function parseRecipeFile(recipePath) {
+  if (!recipePath) return null;
+  const p = path.resolve(recipePath);
+  if (!fs.existsSync(p)) throw new Error(`recipe file not found: ${p}`);
+  return JSON.parse(fs.readFileSync(p, "utf-8"));
+}
+
+function failAndReport(root, res, phase, outFile) {
+  process.stderr.write(
+    `phase ${phase} failed (exit ${res.status}${res.signal ? `, signal ${res.signal}` : ""}).\n` +
+    `seed root retained: ${root}\nphase output: ${outFile}\n` +
+    (res.error ? `spawn error: ${res.error}\n` : "") +
+    `${res.stdout.slice(-2000)}\n${res.stderr.slice(-2000)}\n`,
+  );
+  return 1;
+}
+
+async function resume(args) {
+  const root = path.resolve(args[0] ?? "");
+  const { loadManifest, assertRootIdentity, recordsContainedPaths, saveManifest } = await import(MANIFEST);
+  const manifest = loadManifest(root);
+  assertRootIdentity(root, manifest);
+  const kind = manifest.seed_kind;
+  const paths = recordsContainedPaths(root);
+  const { journal } = await import(MANIFEST);
+  journal(root, { intent: "resume", ts: new Date().toISOString() });
+  // Resume re-runs seed (idempotent via cumulative receipts) then census+validate.
+  const { buildPhaseEnv, spawnPhase, reserveRandomPort } = await import(ENV);
+  const env = buildPhaseEnv({ root, paths });
+  env.TAMANDUA_CONTROL_PORT = String(await reserveRandomPort());
+  env.TAMANDUA_CLI = process.env.TAMANDUA_CLI ?? "/opt/tamandua/bin/tamandua";
+  let res = await spawnPhase({ entry: PHASES, args: ["seed", "--root", root], env, journal: (r) => journal(root, r), label: "seed-resume" });
+  if (!res.ok) return failAndReport(root, res, "seed-resume", path.join(root, "evidence", "seed-phase.out"));
+  res = await spawnPhase({ entry: PHASES, args: ["census-snapshot", "--root", root], env, journal: (r) => journal(root, r), label: "census-snapshot-resume" });
+  if (!res.ok) return failAndReport(root, res, "census-snapshot-resume", path.join(root, "evidence", "census-phase.out"));
+  res = await spawnPhase({ entry: PHASES, args: ["validate", "--root", root], env, journal: (r) => journal(root, r), label: "validate-resume" });
+  if (!res.ok) return failAndReport(root, res, "validate-resume", path.join(root, "evidence", "validate-phase.out"));
+  process.stdout.write(`resume complete: ${root}\n`);
+  return 0;
+}
+
+async function census(args) {
+  const { buildPhaseEnv, spawnPhase, reserveRandomPort } = await import(ENV);
+  const { loadManifest, recordsContainedPaths } = await import(MANIFEST);
+  const root = path.resolve(args[0] ?? "");
+  const manifest = loadManifest(root);
+  const paths = recordsContainedPaths(root);
+  const env = buildPhaseEnv({ root, paths });
+  env.TAMANDUA_CONTROL_PORT = String(await reserveRandomPort());
+  env.TAMANDUA_CLI = process.env.TAMANDUA_CLI ?? "/opt/tamandua/bin/tamandua";
+  const { journal } = await import(MANIFEST);
+  const res = await spawnPhase({ entry: PHASES, args: ["census-snapshot", "--root", root], env, journal: (r) => journal(root, r), label: "census-snapshot" });
+  if (!res.ok) return failAndReport(root, res, "census-snapshot", path.join(root, "evidence", "census-phase.out"));
+  const m2 = loadManifest(root);
+  process.stdout.write(JSON.stringify({ root, snapshot: m2.snapshot?.db, censusReceipt: m2.snapshot?.censusReceipt ?? null }, null, 2) + "\n");
+  return 0;
+}
+
+async function snapshot(args) {
+  // Same phase as census (writes immutable snapshots + sidecar).
+  return census(args);
+}
+
+async function validate(args) {
+  const { buildPhaseEnv, spawnPhase, reserveRandomPort } = await import(ENV);
+  const { loadManifest, recordsContainedPaths } = await import(MANIFEST);
+  const root = path.resolve(args[0] ?? "");
+  const manifest = loadManifest(root);
+  const paths = recordsContainedPaths(root);
+  const env = buildPhaseEnv({ root, paths });
+  env.TAMANDUA_CONTROL_PORT = String(await reserveRandomPort());
+  env.TAMANDUA_CLI = process.env.TAMANDUA_CLI ?? "/opt/tamandua/bin/tamandua";
+  const { journal } = await import(MANIFEST);
+  const res = await spawnPhase({ entry: PHASES, args: ["validate", "--root", root], env, journal: (r) => journal(root, r), label: "validate" });
+  if (!res.ok) return failAndReport(root, res, "validate", path.join(root, "evidence", "validate-phase.out"));
+  const m2 = loadManifest(root);
+  process.stdout.write(JSON.stringify({ root, validation: m2.validation?.matrix ?? [] }, null, 2) + "\n");
+  return 0;
+}
+
+async function volume(args) {
+  const count = Number(optValue(args, "--count") ?? "0");
+  const root = path.resolve(args[0] ?? "");
+  const { buildPhaseEnv, spawnPhase, reserveRandomPort } = await import(ENV);
+  const { loadManifest, recordsContainedPaths } = await import(MANIFEST);
+  const manifest = loadManifest(root);
+  const paths = recordsContainedPaths(root);
+  const env = buildPhaseEnv({ root, paths });
+  env.TAMANDUA_CONTROL_PORT = String(await reserveRandomPort());
+  env.TAMANDUA_CLI = process.env.TAMANDUA_CLI ?? "/opt/tamandua/bin/tamandua";
+  const { journal } = await import(MANIFEST);
+  const res = await spawnPhase({ entry: PHASES, args: ["volume", "--root", root, "--count", String(count)], env, journal: (r) => journal(root, r), label: "volume" });
+  if (!res.ok) return failAndReport(root, res, "volume", path.join(root, "evidence", "volume-phase.out"));
+  process.stdout.write(res.stdout);
+  return 0;
+}
+
+main()
+  .then((code) => process.exit(code ?? 0))
+  .catch((err) => {
+    process.stderr.write(`tt-storm-aged: ${err.stack ?? err.message}\n`);
+    process.exit(1);
+  });

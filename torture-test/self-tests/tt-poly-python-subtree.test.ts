@@ -228,9 +228,23 @@ describe("tt-poly python/ subtree integration (US-002)", () => {
     }
   });
 
-  it("python/ .gitignore is appropriate for Python project", () => {
-    const giPath = path.join(ttPolyPythonDir, ".gitignore");
-    assert.ok(fs.existsSync(giPath), "python/.gitignore should exist");
+  it("python/ tree has no redundant .gitignore — rules live in tt-poly/.gitignore", () => {
+    // TU2F NF-6: the per-subtree python/.gitignore was consolidated into the
+    // tt-poly root .gitignore — its unanchored rules (.venv/, *.egg-info/,
+    // dist/, build/) already applied at every depth below the root.
+    assert.ok(
+      !fs.existsSync(path.join(ttPolyPythonDir, ".gitignore")),
+      "python/.gitignore should be removed (consolidated into tt-poly/.gitignore)",
+    );
+
+    const giPath = path.join(
+      repoRoot,
+      "torture-test",
+      "fixtures-src",
+      "tt-poly",
+      ".gitignore",
+    );
+    assert.ok(fs.existsSync(giPath), "tt-poly/.gitignore should exist");
 
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = content
@@ -240,6 +254,9 @@ describe("tt-poly python/ subtree integration (US-002)", () => {
 
     // Must gitignore venv and build artifacts
     assert.ok(activeRules.includes(".venv/"), ".gitignore should exclude .venv/");
+    assert.ok(activeRules.includes("*.egg-info/"), ".gitignore should exclude *.egg-info/");
+    assert.ok(activeRules.includes("dist/"), ".gitignore should exclude dist/");
+    assert.ok(activeRules.includes("build/"), ".gitignore should exclude build/");
     // Must NOT gitignore junk probes
     assert.ok(
       !activeRules.includes("__pycache__/"),

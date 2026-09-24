@@ -133,6 +133,11 @@ function writeSynthesizedProfile(): void {
       dsh: { present: true, authenticated: null, skipReason: "synthesized" },
     },
   };
+  // The host-profile lives at var/w0/ (the tt-verify-environment output path).
+  // A fresh worktree may not have that directory yet, so create it (the same
+  // hygiene tier2-repeatability/tier2-roster-section-h already apply) instead
+  // of depending on a sibling test having run first.
+  fs.mkdirSync(path.dirname(hostProfilePath), { recursive: true });
   fs.writeFileSync(hostProfilePath, `${JSON.stringify(profile, null, 2)}\n`);
 }
 

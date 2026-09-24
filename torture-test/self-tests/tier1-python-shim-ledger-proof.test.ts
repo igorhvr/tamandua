@@ -303,7 +303,10 @@ describe("US-011 python shim ledger proof (S10)", () => {
         "the ledger row must carry the shim-submitted origin_repo");
       assert.equal(row.tree_hash, record.tree_hash,
         "the ledger row must carry the shim-submitted tree_hash");
-      assert.ok(Number.isInteger(Number(row.duration_ms)) && Number(row.duration_ms) >= 0,
+      // The schema-13 product shim derives duration_ms from a monotonic
+      // Stopwatch, so it is a FINITE non-negative number and may be fractional
+      // (the pre-schema-13 Date.now() integer shape is not required).
+      assert.ok(Number.isFinite(Number(row.duration_ms)) && Number(row.duration_ms) >= 0,
         "the ledger row must carry a non-negative duration");
 
       // Zero-token proof: the ONLY executed command was the explicit-path

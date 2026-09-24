@@ -115,7 +115,14 @@ regeneration, integrity checks (02).
 are forked from the repo's e2e fakes at a FROZEN SHA recorded in the
 manifest, extended with the fault knobs the scenarios need
 (`--delayed-trailer`, `--oversized-stdout`, absent/malformed trailer —
-W4.40; provider-error rounds — W4.46). A **fork-parity check** runs in
+W4.40; provider-error rounds — W4.46). Every merge-family scripted runtime
+also runs the shim-wrapped `{{input.TEST_CMD}}` from its TESTED_TREE-
+producing step — the same `tamandua-test` seam the real tester uses — so the
+rehearsal records a real suite-ledger row for the exact tested tree and the
+first `finalize_merge` attempt lands (NPF-2; spec 08 §A). Ledger evidence is
+never fabricated: only that shim execution may write `suite_results`, and the
+negative configuration omits the command from every behavior entry. A
+**fork-parity check** runs in
 W0.2: the unmodified code paths of the fork must byte-match the frozen
 SHA's fakes (diff of the non-knob regions) — a fork that silently drifts
 from the contract the product's own e2e suite pins would test a harness

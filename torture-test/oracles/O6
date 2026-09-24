@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+
+import { runPostBatchOracle } from './lib/post-batch.mjs';
+import { evaluateO6 } from './lib/o6.mjs';
+
+await runPostBatchOracle({ oracleId: 'O6', evaluate: evaluateO6 });

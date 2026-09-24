@@ -34,6 +34,16 @@ function sha256(file: string): string {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+// Presence + sha256 of the REAL operator ~/.gitconfig (null hash when
+// absent). vaimetal ships no ~/.gitconfig, so a before() snapshot that
+// unconditionally sha256()s the path throws ENOENT and cancels the whole
+// suite; mirror tier0-hygiene-canary's truthfulness contract instead —
+// present:false → hash null, and absent-stays-absent is asserted.
+function gitconfigFingerprint(): { present: boolean; hash: string | null } {
+  if (!fs.existsSync(realGitconfig)) return { present: false, hash: null };
+  return { present: true, hash: sha256(realGitconfig) };
+}
+
 type CommandResult = { status: number | null; stdout: string; stderr: string };
 
 function runBash(script: string, env: NodeJS.ProcessEnv, timeoutMs = 120_000): CommandResult {
@@ -58,14 +68,14 @@ function baseEnv(): NodeJS.ProcessEnv {
     Object.entries(process.env).filter(([key]) => key !== "NODE_TEST_CONTEXT"));
 }
 
-let gitconfigBefore = "";
+let gitconfigBefore: { present: boolean; hash: string | null } = { present: false, hash: null };
 describe("FIX10 US-002 tier0 hook HOME containment (fail closed)", () => {
   before(() => {
-    gitconfigBefore = sha256(realGitconfig);
+    gitconfigBefore = gitconfigFingerprint();
   });
   after(() => {
-    assert.equal(sha256(realGitconfig), gitconfigBefore,
-      "the real ~/.gitconfig hash changed during the test run — containment broke");
+    assert.deepEqual(gitconfigFingerprint(), gitconfigBefore,
+      "the real ~/.gitconfig presence/hash changed during the test run — containment broke");
   });
 
   it("run-w0.1 exits non-zero with an explicit containment error when $HOME is the real operator home", () => {
@@ -105,7 +115,7 @@ describe("FIX10 US-002 tier0 hook HOME containment (fail closed)", () => {
       assert.match(containedGitconfig, /Tamandua Tier-0/);
       assert.match(containedGitconfig, /tier0@tetradactyla\.invalid/);
       // The operator home must be byte-identical after the contained run.
-      assert.equal(sha256(realGitconfig), gitconfigBefore);
+      assert.deepEqual(gitconfigFingerprint(), gitconfigBefore);
     } finally {
       fs.rmSync(containedHome, { recursive: true, force: true });
       fs.rmSync(stubDir, { recursive: true, force: true });
@@ -205,7 +215,7 @@ describe("FIX10 US-002 tier0 hook HOME containment (fail closed)", () => {
         /not a regular file/);
       assert.equal(notAFile.status, 2, "a .gitconfig that is not a regular file must be refused");
       assert.match(notAFile.stderr, /not a regular file/);
-      assert.equal(sha256(realGitconfig), gitconfigBefore);
+      assert.deepEqual(gitconfigFingerprint(), gitconfigBefore);
     } finally {
       fs.rmSync(stubDir, { recursive: true, force: true });
     }

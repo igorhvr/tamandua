@@ -21,6 +21,10 @@ import {
   stringMarkerVocabularyError,
   workflowVocabularyFor,
 } from './tt-trigger-vocabulary.mjs';
+import {
+  classifyGitWriteFailure,
+  gitIdentityEnv,
+} from './tt-storm-shared.mjs';
 
 // ── Phase wait constants ─────────────────────────────────────────────
 
@@ -87,8 +91,8 @@ const ACTIONS = {
     desc: 'SIGSTOP the active harness process for --run, hold, then SIGCONT (3 chaos.log entries)',
   },
   'colleague-commit': {
-    args: '--repo <fixture-clone> --file <f> [--line <sentinel>]',
-    desc: 'Make a competing commit from a second clone perspective',
+    args: '--repo <fixture-clone> --file <f> [--line <sentinel>] [--push-origin <origin> [--ref <branch>]]',
+    desc: 'Make a competing commit from a second clone perspective; --push-origin fast-forwards the owned origin ref (default branch main)',
   },
   pause: {
     args: '',
@@ -116,7 +120,7 @@ const ACTIONS = {
   },
   'dirty-tree': {
     args: '--repo <path>',
-    desc: 'Dirty a tracked file in the repo to create PARK bait',
+    desc: 'Dirty a tracked file and write an untracked bait file in the repo to create PARK bait',
   },
   'move-branch': {
     args: '--repo <repo> --ref <r> [--repeat <n> --interval <s>] [--rearm --rearm-hold-s <s>]',
@@ -179,6 +183,19 @@ Options:
                        seconds before each re-armed move — long enough for the
                        merger's tip capture to precede the move (2-5s),
                        REQUIRED when --rearm.
+  --push-origin <path> colleague-commit only: after committing, land the
+                       colleague commit on the owned origin's ref (must already
+                       exist) via a fast-forward push of HEAD:refs/heads/<ref>.
+                       If the origin tip is not an ancestor of the colleague
+                       HEAD, the live origin ref is fetched into the clone and
+                       the colleague's own commits are rebased onto it first, so
+                       the push is a TRUE fast-forward (never --force). Refused
+                       (non-zero + structured outcome) when the origin path/ref
+                       is missing, the fetch/rebase fails (rebase_conflict), the
+                       push is non-fast-forward, or the push is rejected.
+                       Without it, behaviour is unchanged.
+  --ref <branch>       colleague-commit only: the origin branch to fast-forward
+                       (default: main).
   --help, -h           Print this usage and exit
 
 Phase markers:
@@ -834,11 +851,29 @@ function writeContext(opts) {
 /**
  * colleague-commit: Make a competing commit from a second clone perspective.
  * Uses plain git (git -C <repo>) to modify a file, stage it, and commit.
+ *
+ * SF-14 (US-002, US-004): with --push-origin <path> [--ref <branch>] the
+ * colleague commit is ALSO landed on the owned origin's target branch as a
+ * TRUE fast-forward push, so a live run's merge target actually moves.
+ *
+ * Real campaign shape (US-004): the owned origin/main may already have been
+ * advanced by earlier merges while the colleague clone still sits on the
+ * fixture seed, so the colleague HEAD is NOT a descendant of the origin tip.
+ * In that case the operator fetches the CURRENT owned origin ref into the
+ * clone and REBASES the colleague's own commits onto it, then pushes
+ * `HEAD:refs/heads/<ref>` as a fast-forward. It NEVER force-pushes; a rebase
+ * conflict is refused as a structured `rebase_conflict` outcome with the
+ * origin untouched. Every refusal (origin path/ref missing, fetch/rebase
+ * failure, still-non-fast-forward, rejected push, ref not advanced) is a
+ * structured logStructured outcome + non-zero exit. Without --push-origin the
+ * original local-commit-only behaviour is unchanged.
  */
 function colleagueCommit(opts) {
   const { run: runId, args } = opts;
   const repo = args.repo;
   const file = args.file;
+  const pushOrigin = args['push-origin'];
+  const pushRef = args.ref || 'main';
 
   if (!repo) {
     console.error('Error: --repo is required for colleague-commit');
@@ -866,11 +901,13 @@ function colleagueCommit(opts) {
     // Append the sentinel line to the file (create if absent)
     fs.appendFileSync(filePath, sentinel + '\n');
 
-    // Stage and commit
-    execSync(`git -C "${repoPath}" add -- "${file}"`, { encoding: 'utf-8', timeout: 10000 });
+    // Stage and commit. The fixture-scoped identity rides the CHILD ENV only,
+    // so the commit succeeds even when the clone has no user.name/user.email
+    // and no global git identity exists (never a global git config write).
+    execSync(`git -C "${repoPath}" add -- "${file}"`, { encoding: 'utf-8', timeout: 10000, env: gitIdentityEnv(process.env) });
     const result = execSync(
       `git -C "${repoPath}" commit -m "chaos: colleague commit — ${sentinel.slice(0, 72)}"`,
-      { encoding: 'utf-8', timeout: 10000, env: { ...process.env, GIT_AUTHOR_NAME: 'Chaos Operator', GIT_AUTHOR_EMAIL: 'chaos@tamandua.test', GIT_COMMITTER_NAME: 'Chaos Operator', GIT_COMMITTER_EMAIL: 'chaos@tamandua.test' } }
+      { encoding: 'utf-8', timeout: 10000, env: gitIdentityEnv(process.env) }
     );
     // Extract commit hash from output
     const match = result.match(/\[\S+\s+([a-f0-9]+)\]/);
@@ -882,19 +919,152 @@ function colleagueCommit(opts) {
     process.exit(1);
   }
 
+  // ── SF-14 (US-002): optional fast-forward landing on the owned origin ──
+  // Structured fail-closed helper: every refusal logs a distinct outcome and
+  // exits non-zero (never a partial success claim).
+  const failPush = (outcome, error, extra = {}) => {
+    logStructured({
+      ts: new Date().toISOString(), action: 'colleague-commit', runId,
+      target: `repo:${repoPath} file:${file}`, commit: commitHash || undefined,
+      outcome, error, ...extra,
+    });
+    console.error(`Error: colleague-commit --push-origin refused (${outcome}): ${error}`);
+    process.exit(1);
+  };
+
+  // Git ref-name safety: never interpolate an arbitrary string into a ref
+  // path (nor into a shell command) without validating it. Reject the
+  // dangerous spellings git itself rejects (leading '-', '..', '//', '@{',
+  // control chars, trailing '/' or '.lock', backslashes, spaces).
+  const REF_NAME_RE = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*@\{)(?!.*\\)[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+  if (pushRef.includes(' ') || pushRef.includes('\n') || !REF_NAME_RE.test(pushRef) || pushRef.endsWith('/') || pushRef.endsWith('.lock')) {
+    failPush('invalid_ref', `--ref "${pushRef}" is not a valid branch name`);
+  }
+
+  let pushEvidence = null;
+  if (pushOrigin) {
+    const originPath = path.resolve(pushOrigin);
+
+    // (1) the origin repo path must exist.
+    try { fs.accessSync(originPath); } catch {
+      failPush('push_target_not_found', `--push-origin path does not exist: ${originPath}`, { pushOrigin: originPath });
+    }
+
+    // (2) the colleague commit that will be pushed. This is the PRE-rebase
+    //     HEAD; a divergent origin triggers a rebase below and the final
+    //     pushed commit is re-resolved afterwards.
+    const headRes = spawnSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], { encoding: 'utf-8', timeout: 10000 });
+    const preRebaseHead = String(headRes.stdout ?? '').trim();
+    if (headRes.status !== 0 || !/^[0-9a-f]{40}$/.test(preRebaseHead)) {
+      failPush('head_unresolved', `cannot resolve colleague HEAD in ${repoPath}`, { pushOrigin: originPath });
+    }
+    let head = preRebaseHead;
+
+    // (3) the origin target ref must already exist (the rehearsal target is a
+    //     pre-existing branch such as main; a missing ref is fail-closed).
+    const tipRes = spawnSync('git', ['-C', originPath, 'rev-parse', '--verify', '--quiet', `refs/heads/${pushRef}`], { encoding: 'utf-8', timeout: 10000 });
+    const originTip = String(tipRes.stdout ?? '').trim();
+    if (tipRes.status !== 0 || !/^[0-9a-f]{40}$/.test(originTip)) {
+      failPush('origin_ref_missing', `origin ${originPath} has no refs/heads/${pushRef}`, { pushOrigin: originPath, pushRef });
+    }
+
+    // (4) explicit fast-forward check: the origin tip must be an ancestor of
+    //     the colleague HEAD. Run in the COLLEAGUE repo — the new commit object
+    //     does not exist in the origin until the push, but the clone holds the
+    //     origin tip. When the origin tip is NOT an ancestor (the real
+    //     campaign shape: origin/main already advanced by earlier merges while
+    //     the colleague clone still sits on the seed) fetch the CURRENT owned
+    //     origin ref into the clone and REBASE the colleague's own commits onto
+    //     it, then re-verify. NEVER force-push; a rebase conflict is refused
+    //     fail-closed with the origin untouched.
+    const isAncestorOfHead = (candidate) => spawnSync(
+      'git', ['-C', repoPath, 'merge-base', '--is-ancestor', originTip, candidate],
+      { encoding: 'utf-8', timeout: 10000 },
+    ).status === 0;
+
+    let rebased = false;
+    if (!isAncestorOfHead(head)) {
+      // (4a) fetch the CURRENT owned origin tip into the clone (argv form — no
+      //      shell interpolation of the origin path / ref). The fixture-scoped
+      //      identity rides the env for every write in this path.
+      const fetchRes = spawnSync('git', ['-C', repoPath, 'fetch', '--no-tags', originPath, `refs/heads/${pushRef}`], {
+        encoding: 'utf-8', timeout: 30000, env: gitIdentityEnv({ ...process.env, GIT_TERMINAL_PROMPT: '0' }),
+      });
+      if (fetchRes.status !== 0) {
+        failPush('rebase_fetch_failed', String(fetchRes.stderr ?? '').trim() || `git fetch exited ${fetchRes.status}`, { pushOrigin: originPath, pushRef, originBefore: originTip, preRebaseHead, rebased: false });
+      }
+
+      // (4b) replay the colleague's OWN commits (FETCH_HEAD is the live origin
+      //      tip) onto the fetched tip. The fixture-scoped identity env is what
+      //      lets `git rebase` create the replayed commits on a clone with no
+      //      configured identity (the real campaign shape).
+      const rebaseRes = spawnSync('git', ['-C', repoPath, 'rebase', 'FETCH_HEAD'], {
+        encoding: 'utf-8', timeout: 60000, env: gitIdentityEnv({ ...process.env, GIT_TERMINAL_PROMPT: '0' }),
+      });
+      if (rebaseRes.status !== 0) {
+        // Distinguish a missing-identity/environment failure from a real
+        // content conflict: an identity error is NEVER reported as
+        // rebase_conflict. Leave the clone clean (best effort) but NEVER touch
+        // the origin.
+        const failureKind = classifyGitWriteFailure(rebaseRes.stderr);
+        spawnSync('git', ['-C', repoPath, 'rebase', '--abort'], { encoding: 'utf-8', timeout: 30000, env: gitIdentityEnv(process.env) });
+        failPush(failureKind, String(rebaseRes.stderr ?? '').trim() || `git rebase exited ${rebaseRes.status}`, { pushOrigin: originPath, pushRef, originBefore: originTip, preRebaseHead, rebased: false });
+      }
+
+      // (4c) re-resolve the rebased HEAD and re-verify the ancestor relation
+      //      BEFORE any push (fail closed if the rebase did not produce a
+      //      fast-forwardable commit).
+      const rebasedRes = spawnSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], { encoding: 'utf-8', timeout: 10000 });
+      head = String(rebasedRes.stdout ?? '').trim();
+      if (rebasedRes.status !== 0 || !/^[0-9a-f]{40}$/.test(head)) {
+        failPush('head_unresolved', `cannot resolve rebased colleague HEAD in ${repoPath}`, { pushOrigin: originPath, pushRef, originBefore: originTip, preRebaseHead, rebased: false });
+      }
+      if (!isAncestorOfHead(head)) {
+        failPush('non_fast_forward', `origin refs/heads/${pushRef} (${originTip.slice(0, 12)}) is not an ancestor of rebased colleague HEAD (${head.slice(0, 12)})`, { pushOrigin: originPath, pushRef, originBefore: originTip, commit: head, preRebaseHead, rebased: true });
+      }
+      rebased = true;
+      commitHash = head;
+    }
+
+    // (5) the actual fast-forward push (argv form — no shell interpolation of
+    //     the origin path / ref). NEVER a --force / --force-with-lease push.
+    //     The fixture-scoped identity rides the env (never clone/global
+    //     config).
+    const pushRes = spawnSync('git', ['-C', repoPath, 'push', '--porcelain', originPath, `HEAD:refs/heads/${pushRef}`], {
+      encoding: 'utf-8', timeout: 30000, env: gitIdentityEnv({ ...process.env, GIT_TERMINAL_PROMPT: '0' }),
+    });
+    if (pushRes.status !== 0) {
+      failPush('push_rejected', String(pushRes.stderr ?? '').trim() || `git push exited ${pushRes.status}`, { pushOrigin: originPath, pushRef, originBefore: originTip, commit: head, preRebaseHead, rebased });
+    }
+
+    // (6) verify the ref ACTUALLY advanced to the colleague commit.
+    const afterRes = spawnSync('git', ['-C', originPath, 'rev-parse', `refs/heads/${pushRef}`], { encoding: 'utf-8', timeout: 10000 });
+    const originAfter = String(afterRes.stdout ?? '').trim();
+    if (afterRes.status !== 0 || originAfter !== head) {
+      failPush('push_mismatch', `origin refs/heads/${pushRef} is ${originAfter || '<unresolved>'}, expected ${head}`, { pushOrigin: originPath, pushRef, originBefore: originTip, originAfter, commit: head, preRebaseHead, rebased });
+    }
+
+    pushEvidence = { origin: originPath, ref: pushRef, before: originTip, after: originAfter, rebased, preRebaseHead };
+  }
+
   const entry = {
     ts: new Date().toISOString(), action: 'colleague-commit', runId,
     target: `repo:${repoPath} file:${file}`, sentinel,
     commit: commitHash || undefined, outcome: 'fired',
+    ...(pushEvidence
+      ? { pushOrigin: pushEvidence.origin, pushRef: pushEvidence.ref, originBefore: pushEvidence.before, originAfter: pushEvidence.after, rebased: pushEvidence.rebased, preRebaseHead: pushEvidence.preRebaseHead }
+      : {}),
   };
   logStructured(entry);
-  console.error(`colleague-commit: committed "${sentinel.slice(0, 60)}" to ${file} in ${repoPath} (${commitHash || 'unknown hash'})`);
+  console.error(`colleague-commit: committed "${sentinel.slice(0, 60)}" to ${file} in ${repoPath} (${commitHash || 'unknown hash'})${pushEvidence ? ` → pushed to ${pushEvidence.origin} refs/heads/${pushEvidence.ref} (${pushEvidence.before.slice(0, 7)}..${pushEvidence.after.slice(0, 7)})` : ''}`);
   process.exit(0);
 }
 
 /**
  * dirty-tree: Modify a tracked file without committing to create PARK bait.
- * Appends a sentinel line to the first tracked file in the repo.
+ * Appends a sentinel line to the first tracked file in the repo AND writes an
+ * untracked bait file, so the dirty working tree carries BOTH states the
+ * park-first landing path must preserve (modified tracked + untracked).
  */
 function dirtyTree(opts) {
   const { run: runId, args } = opts;
@@ -915,6 +1085,7 @@ function dirtyTree(opts) {
   }
 
   let targetFile = '';
+  let untrackedFile = '';
   let sentinel = '';
   try {
     // Find a tracked file to dirty
@@ -927,6 +1098,10 @@ function dirtyTree(opts) {
     sentinel = 'CHAOS DIRTY ' + new Date().toISOString();
 
     fs.appendFileSync(path.join(repoPath, targetFile), sentinel + '\n');
+    // Untracked PARK bait: a real dirty working tree may carry untracked
+    // files too, and the park-first landing must preserve them byte-for-byte.
+    untrackedFile = 'CHAOS_PARK_BAIT.txt';
+    fs.writeFileSync(path.join(repoPath, untrackedFile), 'CHAOS PARK BAIT (untracked) ' + new Date().toISOString() + '\n');
   } catch (e) {
     const entry = { ts: new Date().toISOString(), action: 'dirty-tree', runId, outcome: 'fire_failed', error: e.message };
     logStructured(entry);
@@ -936,11 +1111,11 @@ function dirtyTree(opts) {
 
   const entry = {
     ts: new Date().toISOString(), action: 'dirty-tree', runId,
-    target: `repo:${repoPath} file:${targetFile}`, sentinel,
+    target: `repo:${repoPath} file:${targetFile}`, untrackedFile, sentinel,
     outcome: 'fired',
   };
   logStructured(entry);
-  console.error(`dirty-tree: modified ${targetFile} in ${repoPath}`);
+  console.error(`dirty-tree: modified ${targetFile} and created untracked ${untrackedFile} in ${repoPath}`);
   process.exit(0);
 }
 
@@ -1086,13 +1261,7 @@ function moveBranch(opts) {
     }
     const deficit = Math.max(0, repeat - Math.max(0, depth - 1));
     if (deficit === 0) return true;
-    const gitEnv = {
-      ...process.env,
-      GIT_AUTHOR_NAME: 'Chaos Operator',
-      GIT_AUTHOR_EMAIL: 'chaos@tamandua.test',
-      GIT_COMMITTER_NAME: 'Chaos Operator',
-      GIT_COMMITTER_EMAIL: 'chaos@tamandua.test',
-    };
+    const gitEnv = gitIdentityEnv(process.env);
     let parentHash = '';
     try {
       parentHash = execSync(`git -C "${repoPath}" rev-parse --verify "${resolvedRef}^{commit}"`, {
@@ -1113,7 +1282,7 @@ function moveBranch(opts) {
           encoding: 'utf-8', timeout: 10000, env: gitEnv,
         }).trim();
         execSync(`git -C "${repoPath}" update-ref "${resolvedRef}" "${newHash}" "${parentHash}"`, {
-          encoding: 'utf-8', timeout: 10000,
+          encoding: 'utf-8', timeout: 10000, env: gitEnv,
         });
         parentHash = newHash;
       } catch (e) {
@@ -1163,7 +1332,7 @@ function moveBranch(opts) {
     }
     try {
       execSync(`git -C "${repoPath}" update-ref "${resolvedRef}" "${parentHash}"`, {
-        encoding: 'utf-8', timeout: 10000,
+        encoding: 'utf-8', timeout: 10000, env: gitIdentityEnv(process.env),
       });
     } catch (e) {
       const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, move_index: moveIndex, target: `repo:${repoPath} ref:${ref}`, outcome: 'fire_failed', error: e.message };
@@ -1542,6 +1711,16 @@ const dispatch = {
 // ── Helper: resolve TT DB path ──────────────────────────────────────
 
 function resolveDbPath() {
+  // US-009 (SF-4): the campaign exec context pins the EXACT campaign DB via
+  // TAMANDUA_DB_PATH. It MUST win over the state-dir derivation: the campaign
+  // DB is not necessarily <TAMANDUA_STATE_DIR>/tamandua.db (tt-storm prepare
+  // takes an explicit --db path), so the old order opened a DIFFERENT DB and a
+  // run-<uuid> target looked absent -> guard_miss ("Run ... not found in TT
+  // DB"). Precedence: TAMANDUA_DB_PATH -> TAMANDUA_STATE_DIR/tamandua.db ->
+  // TT_HOME/.tamandua/tamandua.db -> the torture-test default.
+  if (process.env.TAMANDUA_DB_PATH) {
+    return path.resolve(process.env.TAMANDUA_DB_PATH);
+  }
   if (process.env.TAMANDUA_STATE_DIR) {
     return path.resolve(process.env.TAMANDUA_STATE_DIR, 'tamandua.db');
   }
@@ -1794,9 +1973,15 @@ function classifyTarget(action, opts) {
     return { kind: 'process' };
   }
   if (fsActions.includes(action)) {
-    // Resolve the --repo path if present
+    // Resolve the --repo path if present. SF-14 (US-002): colleague-commit
+    // may also target a separate --push-origin repo; every filesystem path a
+    // fire mutates must satisfy the same TT_ROOT containment guard.
     const repoPath = opts.args.repo || '';
-    return { kind: 'filesystem', path: repoPath ? path.resolve(repoPath) : '' };
+    const pushOriginPath = opts.args['push-origin'] || '';
+    const paths = [];
+    if (repoPath) paths.push(path.resolve(repoPath));
+    if (pushOriginPath) paths.push(path.resolve(pushOriginPath));
+    return { kind: 'filesystem', path: repoPath ? path.resolve(repoPath) : '', paths };
   }
   if (dbActions.includes(action)) {
     return { kind: 'db', path: resolveDbPath() };
@@ -1879,9 +2064,13 @@ function guardFire(action, runId, opts) {
 
   // (c) Filesystem path check
   if (target.kind === 'filesystem') {
-    const resolvedPath = target.path;
-    if (!resolvedPath || !resolvedPath.startsWith(TT_ROOT + path.sep)) {
-      return { guarded: false, reason: `Path "${resolvedPath}" is not under ${TT_ROOT}` };
+    const paths = Array.isArray(target.paths) && target.paths.length > 0
+      ? target.paths
+      : (target.path ? [target.path] : ['']);
+    for (const p of paths) {
+      if (!p || !p.startsWith(TT_ROOT + path.sep)) {
+        return { guarded: false, reason: `Path "${p}" is not under ${TT_ROOT}` };
+      }
     }
   }
 

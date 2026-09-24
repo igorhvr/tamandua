@@ -1229,10 +1229,10 @@ else
   fail "verify_process_tt_owned missing TT_DC_PLATFORM seam"
 fi
 
-if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'lsof_bounded -a -p "\$pid" -d cwd -Fn'; then
-  pass "verify_process_tt_owned Darwin branch uses bounded lsof cwd evidence (portable)"
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'lsof -a -p "\$pid" -d cwd -Fn'; then
+  pass "verify_process_tt_owned Darwin branch uses lsof cwd evidence (portable)"
 else
-  fail "verify_process_tt_owned missing bounded lsof cwd evidence (Darwin)"
+  fail "verify_process_tt_owned missing lsof cwd evidence (Darwin)"
 fi
 
 if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'ps -p "\$pid" -o command='; then
@@ -3834,89 +3834,6 @@ else
   diff "$REAL_STATE_SNAPSHOT" "$REAL_STATE_AFTER" >&2 || true
 fi
 rm -f "$REAL_STATE_SNAPSHOT" "$REAL_STATE_AFTER"
-
-# ── Test 98: bounded lsof probes (LSOF-EVTA US-006) ────────────────────
-echo ""
-echo "--- Test: bounded lsof probes (LSOF-EVTA US-006) ---"
-
-if grep -q '^tt_lsof_timeout_s()' "$TOOL"; then
-  pass "tt_lsof_timeout_s helper exists"
-else
-  fail "tt_lsof_timeout_s helper missing"
-fi
-
-if grep -q '^lsof_bounded()' "$TOOL"; then
-  pass "lsof_bounded helper exists"
-else
-  fail "lsof_bounded helper missing"
-fi
-
-# The one raw lsof invocation always carries -b -w.
-if grep -A 30 '^lsof_bounded()' "$TOOL" | grep -q 'lsof -b -w "\$@"'; then
-  pass "lsof_bounded always passes -b -w to lsof"
-else
-  fail "lsof_bounded must pass -b -w to lsof"
-fi
-
-# Bounded by background + poll + SIGKILL + wait (no GNU timeout).
-if grep -A 30 '^lsof_bounded()' "$TOOL" | grep -q 'lsof -b -w "\$@" > "\$out_file" 2>/dev/null &'; then
-  pass "lsof_bounded runs lsof in the background"
-else
-  fail "lsof_bounded must background the lsof probe"
-fi
-
-if grep -A 30 '^lsof_bounded()' "$TOOL" | grep -q 'kill -KILL "\$child_pid"'; then
-  pass "lsof_bounded SIGKILLs a timed-out child"
-else
-  fail "lsof_bounded missing the SIGKILL escalation"
-fi
-
-if grep -A 30 '^lsof_bounded()' "$TOOL" | grep -q 'wait "\$child_pid"'; then
-  pass "lsof_bounded reaps the killed child with wait"
-else
-  fail "lsof_bounded missing the wait reap"
-fi
-
-if grep -A 30 '^tt_lsof_timeout_s()' "$TOOL" | grep -q 'TT_LSOF_TIMEOUT_S'; then
-  pass "tt_lsof_timeout_s honors the TT_LSOF_TIMEOUT_S bound"
-else
-  fail "tt_lsof_timeout_s missing the TT_LSOF_TIMEOUT_S bound"
-fi
-
-if grep -A 30 '^lsof_bounded()' "$TOOL" | grep -q 'timeout_s="\$(tt_lsof_timeout_s)"'; then
-  pass "lsof_bounded derives its bound from tt_lsof_timeout_s"
-else
-  fail "lsof_bounded must derive its bound from tt_lsof_timeout_s"
-fi
-
-# No GNU coreutils timeout anywhere in the tool (macOS ships none).
-if grep -qE '(^|[;&|[:space:]])timeout[[:space:]]+[0-9]' "$TOOL"; then
-  fail "daemon-control must not invoke the GNU timeout command"
-else
-  pass "daemon-control contains no GNU timeout command"
-fi
-
-# Every lsof call site is the bounded helper: exactly ONE raw lsof command
-# (inside lsof_bounded); all call sites go through lsof_bounded.
-raw_lsof_calls="$(grep -nE 'lsof -' "$TOOL" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v 'lsof_bounded' || true)"
-raw_lsof_count="$(printf '%s\n' "$raw_lsof_calls" | grep -c . || true)"
-if [ "$raw_lsof_count" -eq 1 ]; then
-  pass "exactly one raw lsof invocation (inside lsof_bounded)"
-else
-  fail "expected exactly one raw lsof invocation, found $raw_lsof_count: $raw_lsof_calls"
-fi
-
-if grep -q 'lsof_bounded -nP -iTCP:"\$port" -sTCP:LISTEN -t' "$TOOL"; then
-  pass "listener_pid_for_port/lingering cleanup use the bounded lsof port probe"
-else
-  fail "port-listener pid extraction must use lsof_bounded"
-fi
-
-if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'lsof_bounded -nP -iTCP:"\$port" -sTCP:LISTEN -t'; then
-  pass "cmd_stop lingering-listener cleanup uses the bounded lsof port probe"
-else
-  fail "cmd_stop lingering-listener cleanup must use lsof_bounded"
-fi
 
 echo ""
 echo "================================================"

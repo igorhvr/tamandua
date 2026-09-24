@@ -10,13 +10,16 @@ build/
 .mypy_cache/
 
 # NOTE: The following are deliberately NOT gitignored — they serve as
-# junk probes for the tamandua torture test suite:
-#   python/__pycache__/       — seeded/deterministic junk probe (python)
-#   python/.pytest_cache/     — regenerated junk probe (python)
-#   python/.flaky_counter     — regenerated junk probe (flaky alternator)
-#   ts/package-lock.json      — regenerated junk probe (ts)
-#   ts/node_modules/          — regenerated junk probe (ts)
-#   java/target/              — regenerated junk probe (java)
-#   rust/target/              — regenerated junk probe (rust)
+# junk probes for the tt-poly five-language storm monorepo:
+#   python/__pycache__/        — seeded/deterministic junk probe (python)
+#   python/.pytest_cache/      — regenerated junk probe (python)
+#   python/.flaky_counter      — regenerated junk probe (flaky alternator)
+#   ts/package-lock.json       — regenerated junk probe (ts)
+#   ts/node_modules/           — regenerated junk probe (ts)
+#   go/testdata/exec-bit-probe.sh — committed exec-bit probe (go)
+#   go/testdata/experiments/   — regenerated junk probe (go)
+#   java/target/               — regenerated junk probe (java)
+#   rust/target/               — regenerated junk probe (rust)
+#   operator-notes.local       — inert operator junk probe (root + per-subtree)
 # DO NOT add them to this file.
 # See JUNK-IS-INTENTIONAL.md for details.

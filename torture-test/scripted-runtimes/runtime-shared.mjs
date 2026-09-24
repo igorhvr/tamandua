@@ -212,6 +212,197 @@ export function execHarnessProbe(prompt) {
 // KNOB-REGION-END
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════
+// KNOB-REGION-BEGIN — STORM US-002 campaign-controlled mid-flight hold
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Campaign-controlled mid-flight hold ─────────────────────────────
+//
+// SCRIPTED_REHEARSAL runs a tiny fixture, so the scripted agent rounds would
+// otherwise finish in seconds — long before any Round-B chaos phase is due
+// (SF-8). To keep a roster run ACTIVE (step claimed, worker alive) while the
+// engine samples the concurrency window and fires chaos, a generated scripted
+// behavior may carry a `hold`:
+//
+//   behavior.hold = { id: "storm-midflight", timeoutMs?: <ms> }
+//
+// applyHold() writes `<holdDir>/<runId>.confirmed` and then blocks (async,
+// never the event loop) until the campaign writes `<holdDir>/<runId>.release`.
+// The hold directory resolves from an explicit `holdDir`, then
+// TAMANDUA_SCRIPTED_HOLD_DIR, then `<stateDir>/holds`. The engine releases
+// Round-A holds only after sampling the 8-concurrent window and releases each
+// Round-B target only after its chaos phase fired — so every phase predicate
+// observes a live target (requirement 1a).
+//
+// Fail-closed (requirement 1d): the wait is bounded by behavior.hold.timeoutMs
+// (then TAMANDUA_SCRIPTED_HOLD_TIMEOUT_MS, then DEFAULT_HOLD_TIMEOUT_MS). On
+// timeout we write `<holdDir>/<runId>.missed` with a JSON reason and return
+// outcome 'timeout' so the run is released and the phase is marked MISSED by
+// the engine. applyHold NEVER throws and NEVER blocks past the timeout.
+//
+// One-shot per run lifecycle (SF-10): a hold is armed at most once per
+// (campaign, runId) — the run-lifecycle checkpoint (one workflow execution,
+// one hold). Once a `<runId>.release` or `<runId>.missed` marker exists, a
+// later invocation of ANY agent in that same run (e.g. the second merger round
+// after a finalize_merge reroute, or a DRDV do-again) must NOT re-arm the hold:
+// it short-circuits with outcome 'already_released' / 'already_missed',
+// journaled as hold_already_released / hold_already_missed, WITHOUT writing
+// `.confirmed` and WITHOUT waiting on the bound. applyHold therefore NEVER
+// deletes a release/missed marker it did not write — those markers belong to
+// the engine. (Before SF-10 the entry code rmSync'd both markers, so every
+// later round re-armed the hold and burned the full 1800 s bound.)
+//
+// Honesty (requirement 1c): this is a real wait on an engine-owned checkpoint;
+// there is no canned chaos-recovery fallback anywhere in the scripted runtimes —
+// a killed/parked/rugpulled run must show the product's real recovery.
+
+export const HOLD_CONFIRMED_SUFFIX = ".confirmed";
+export const HOLD_RELEASE_SUFFIX = ".release";
+export const HOLD_MISSED_SUFFIX = ".missed";
+export const DEFAULT_HOLD_TIMEOUT_MS = 1_800_000;
+
+// Poll cadence for the release checkpoint. Small enough that the engine's
+// release is observed promptly, large enough to stay cheap for 8+ held runs.
+const HOLD_POLL_INTERVAL_MS = 250;
+
+/**
+ * Resolve the campaign-owned hold directory. Priority:
+ *   1. explicit `holdDir` argument
+ *   2. TAMANDUA_SCRIPTED_HOLD_DIR env var
+ *   3. `<stateDir>/holds`
+ * Returns null when none is configured (the hold then degrades to 'skipped').
+ */
+export function resolveHoldDir({ holdDir, stateDir } = {}) {
+  if (holdDir) return holdDir;
+  if (process.env.TAMANDUA_SCRIPTED_HOLD_DIR) {
+    return process.env.TAMANDUA_SCRIPTED_HOLD_DIR;
+  }
+  if (stateDir) return path.join(stateDir, "holds");
+  return null;
+}
+
+function holdSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+/**
+ * Apply a campaign-controlled mid-flight hold. See the KNOB-REGION comment
+ * above for the full contract.
+ *
+ * Returns (always, never rejects):
+ *   - { attempted: false }                              no behavior.hold
+ *   - { attempted: true, outcome: 'skipped', reason }   no hold dir configured
+ *   - { attempted: true, outcome: 'released', ... }     release checkpoint seen
+ *   - { attempted: true, outcome: 'timeout', reason }   bounded wait elapsed
+ *                                                       (or any unexpected error
+ *                                                       — fail-closed)
+ *   - { attempted: true, outcome: 'already_released', ... } an earlier
+ *                                                       invocation in this run
+ *                                                       already released it
+ *                                                       (SF-10 one-shot)
+ *   - { attempted: true, outcome: 'already_missed', ... } an earlier
+ *                                                       invocation in this run
+ *                                                       already missed it
+ *                                                       (SF-10 one-shot)
+ */
+export async function applyHold(
+  behavior,
+  { stateDir, holdDir, runId, log } = {},
+) {
+  const hold = behavior?.hold;
+  if (!hold) return { attempted: false };
+
+  const journal =
+    typeof log === "function"
+      ? log
+      : (entry) => logInvocation(stateDir, entry);
+
+  const dir = resolveHoldDir({ holdDir, stateDir });
+  if (!dir) {
+    const reason = "no hold dir configured (holdDir/env/stateDir all absent)";
+    journal({ phase: "hold_skipped", runId, holdId: hold.id ?? null, note: reason });
+    return { attempted: true, outcome: "skipped", reason };
+  }
+
+  const holdId = hold.id ?? "hold";
+  const behaviorTimeout = Number(hold.timeoutMs);
+  const envTimeout = Number(process.env.TAMANDUA_SCRIPTED_HOLD_TIMEOUT_MS);
+  const timeoutMs =
+    Number.isFinite(behaviorTimeout) && behaviorTimeout > 0
+      ? behaviorTimeout
+      : Number.isFinite(envTimeout) && envTimeout > 0
+        ? envTimeout
+        : DEFAULT_HOLD_TIMEOUT_MS;
+
+  const confirmedPath = path.join(dir, `${runId}${HOLD_CONFIRMED_SUFFIX}`);
+  const releasePath = path.join(dir, `${runId}${HOLD_RELEASE_SUFFIX}`);
+  const missedPath = path.join(dir, `${runId}${HOLD_MISSED_SUFFIX}`);
+
+  // ── SF-10 one-shot rule ──────────────────────────────────────────
+  // A hold is armed at most once per (campaign, runId). If the engine has
+  // already released or missed this run, a later invocation of any agent in
+  // the same run must not re-arm it: return immediately without writing
+  // `.confirmed`, without waiting, and WITHOUT deleting the engine's marker.
+  // Checked before mkdir/write so an existing marker is never touched.
+  if (fs.existsSync(releasePath)) {
+    journal({ phase: "hold_already_released", runId, holdId, holdDir: dir });
+    return { attempted: true, outcome: "already_released", holdId, holdDir: dir };
+  }
+  if (fs.existsSync(missedPath)) {
+    journal({ phase: "hold_already_missed", runId, holdId, holdDir: dir });
+    return { attempted: true, outcome: "already_missed", holdId, holdDir: dir };
+  }
+
+  const failClosed = (reason) => {
+    const missed = { runId, holdId, reason, ts: new Date().toISOString() };
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(missedPath, JSON.stringify(missed) + "\n", "utf-8");
+    } catch {
+      // never let diagnostics block the fail-closed return
+    }
+    journal({ phase: "hold_timeout", runId, holdId, reason });
+    return { attempted: true, outcome: "timeout", reason };
+  };
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+
+    // No stale-marker cleanup here: the one-shot checks above already returned
+    // when a release/missed marker existed, and deleting a marker we did not
+    // write would re-arm the hold for a later round (SF-10).
+    fs.writeFileSync(
+      confirmedPath,
+      JSON.stringify({ runId, holdId, ts: new Date().toISOString() }) + "\n",
+      "utf-8",
+    );
+    journal({ phase: "hold_wait", runId, holdId, holdDir: dir, timeoutMs });
+
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (fs.existsSync(releasePath)) {
+        journal({ phase: "hold_released", runId, holdId, how: "release" });
+        return { attempted: true, outcome: "released", holdId, holdDir: dir };
+      }
+      if (Date.now() >= deadline) {
+        return failClosed(
+          `hold timed out after ${timeoutMs}ms without a release checkpoint`,
+        );
+      }
+      const remaining = deadline - Date.now();
+      await holdSleep(Math.min(HOLD_POLL_INTERVAL_MS, Math.max(1, remaining)));
+    }
+  } catch (err) {
+    return failClosed(
+      `hold error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// KNOB-REGION-END
+// ═══════════════════════════════════════════════════════════════════
+
 // ── Behaviors config ────────────────────────────────────────────────
 
 const DEFAULT_CONFIG = { agents: {}, heartbeatTokens: 17, defaultTokens: 111 };

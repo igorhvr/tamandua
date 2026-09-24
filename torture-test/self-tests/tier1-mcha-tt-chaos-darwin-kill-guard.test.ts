@@ -112,10 +112,15 @@ const CAMPAIGN_GUARD_MISS_REASON =
 
 /** Env for everything this test spawns: strip NODE_TEST_CONTEXT (node:test
  *  auto-activates the isolation guard in every child) and disable the guard
- *  explicitly — the tools operate on temp dirs + test-spawned pids only. */
+ *  explicitly — the tools operate on temp dirs + test-spawned pids only.
+ *  Also drop any ambient TAMANDUA_DB_PATH: each kill-corridor child uses the
+ *  contained fake TT var DB at <TT_HOME>/tamandua.db, and an inherited gate DB
+ *  path (the battery runner owns one under its outer state dir) would take
+ *  precedence and make the guard fail-closed with 'Cannot open TT DB'. */
 function cleanEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
+  delete env.TAMANDUA_DB_PATH;
   env.TAMANDUA_TEST_GUARD = "0";
   if (extra) Object.assign(env, extra);
   return env;
@@ -253,8 +258,8 @@ describe("MCHA (US-014) — tt-chaos darwin kill guard uses portable pgid/owners
       "getProcessGroup must read `ps -o pgid=` on darwin (the portable pgid arm)");
     assert.match(identityText, /ps -p <pid> -o ppid=|'-p', String\(pid\), '-o', `ppid=`/,
       "getProcessParent must read `ps -o ppid=` on darwin (the portable ppid arm)");
-    assert.match(identityText, /lsof -b -w -a -p <pid> -d cwd -Fn|lsofBin, \['-b', '-w', '-a', '-p', String\(pid\), '-d', 'cwd', '-Fn'\]/,
-      "getProcessCwd must read a BOUNDED `lsof -b -w -a -p <pid> -d cwd -Fn` on darwin (the portable cwd arm)");
+    assert.match(identityText, /lsof -a -p <pid> -d cwd -Fn|lsofBin, \['-a', '-p', String\(pid\), '-d', 'cwd', '-Fn'\]/,
+      "getProcessCwd must read `lsof -a -p <pid> -d cwd -Fn` on darwin (the portable cwd arm)");
     assert.match(identityText, /ps -p <pid> -o command=|'-p', String\(pid\), '-o', `command=`/,
       "getProcessCmdline must read `ps -o command=` on darwin (the portable cmdline arm)");
     assert.match(identityText, /export function getProcessCwd/,

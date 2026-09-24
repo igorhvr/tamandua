@@ -176,7 +176,7 @@ function makeRecoveryScript(root, repo, name) {
   fs.chmodSync(script, 0o755);
   command('git', ['add', path.basename(script)], repo);
   command('git', ['commit', '-m', `add ${name} suite`], repo);
-  return { name, script, pidFile, stopFile, doneFile };
+  return { name, script, marker, pidFile, stopFile, doneFile };
 }
 
 test('cleanup force-terminates a wedged invocation-owned suite process group', { timeout: 10_000 }, async () => {
@@ -254,6 +254,13 @@ async function runRecovery({ kind, repo, root, env, port, databasePath, eventsPa
       () => eventRows(eventsPath).some((event) => event.event === 'suite.execute_started' && event.runId === ownerRun),
       `${kind} owner did not emit suite.execute_started`,
     );
+    // The shim emits suite.execute_started just BEFORE it spawns the detached
+    // suite script, so a dead-owner SIGKILL (or a reclaiming waiter) can race
+    // the script's marker creation: a waiter that starts first re-runs the
+    // script, becomes the new owner and wedges until cleanup, blowing the 10s
+    // bound (observed under load on vaimetal). Wait for the marker so the owner
+    // suite is provably running before recovery is driven.
+    await waitFor(() => fs.existsSync(suite.marker), `${kind} owner suite did not start`);
 
     if (kind === 'dead-owner') {
       // The control-plane claim records this exact shim PID. Wait for the

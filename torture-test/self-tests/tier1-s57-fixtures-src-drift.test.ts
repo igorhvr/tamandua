@@ -43,14 +43,16 @@
 // RED case (recorded in the progress log): point TT_S57_TOOL_TREE at a temp
 // tree holding the PRE-FIX files (git show HEAD blobs of
 // bin/tt-golden-bootstrap.mjs, bin/tt-verify-fixture-baselines and
-// fixtures-src/tt-python/build-golden.sh plus a copy of the fixture source):
+// fixtures-src/tt-python/build-golden.sh plus a copy of the fixture source).
+// TT_S57_TOOL_TREE names the torture-test dir of the tree under test, i.e. it
+// must mirror <repo>/torture-test/{bin,fixtures-src} (bin/ + fixtures-src/):
 //
 //   TMPD=$(mktemp -d)
-//   mkdir -p "$TMPD/bin" "$TMPD/torture-test/var"
+//   mkdir -p "$TMPD/bin" "$TMPD/fixtures-src/tt-python"
 //   git show HEAD:torture-test/bin/tt-golden-bootstrap.mjs > "$TMPD/bin/tt-golden-bootstrap.mjs"
 //   git show HEAD:torture-test/bin/tt-verify-fixture-baselines > "$TMPD/bin/tt-verify-fixture-baselines"
 //   chmod +x "$TMPD/bin/tt-verify-fixture-baselines"
-//   cp -r torture-test/fixtures-src/tt-python "$TMPD/fixtures-src/"
+//   cp -r torture-test/fixtures-src/tt-python/. "$TMPD/fixtures-src/tt-python/"
 //   git show HEAD:torture-test/fixtures-src/tt-python/build-golden.sh \
 //     > "$TMPD/fixtures-src/tt-python/build-golden.sh"
 //   TT_S57_TOOL_TREE="$TMPD" node --test \
@@ -155,15 +157,21 @@ function sourceHash(sourceDir: string): string {
 }
 
 // ── Shared hermetic scratch tree (built once per run) ──────────────────
-// Layout mirrors torture-test/ so the tool under test resolves its own
-// fixtures-src + builder: <scratch>/bin/{tt-golden-bootstrap.mjs,
-// tt-verify-fixture-baselines}, <scratch>/fixtures-src/tt-python/** (the
-// fixture SOURCE the golden is built from), <scratch>/torture-test/var (the
-// builders mktemp their work/scratch clones there).
-let scratch: string; // scratch tree root
-let toolBinDir: string; // <scratch>/bin (the tools under test)
-let fixtureSrc: string; // <scratch>/fixtures-src/tt-python (the drifted source)
-let goldenDir: string; // <scratch>/golden (built once in before())
+// The scratch root mirrors an OWNED REPO ROOT so every path the tool under
+// test derives resolves INSIDE the freshly created scratch (never the scratch
+// parent or any shared location): the bootstrap binary lives at
+// <scratch>/torture-test/bin (its TT_ROOT = <scratch>/torture-test), the
+// fixture SOURCE the golden is built from lives at
+// <scratch>/torture-test/fixtures-src/tt-python (the tt-python builder's
+// SCRIPT_DIR/../../.. = <scratch>), and the builders mktemp their
+// work/scratch clones under <scratch>/torture-test/var. This mirrors the real
+// <owned repo>/torture-test/{bin,fixtures-src,var} depth exactly; the golden
+// is built into <scratch>/torture-test/var/fixtures/golden (the bootstrap
+// default location) once in before().
+let scratch: string; // scratch REPO-ROOT mirror (owned, fresh, per-run)
+let toolBinDir: string; // <scratch>/torture-test/bin (the tools under test)
+let fixtureSrc: string; // <scratch>/torture-test/fixtures-src/tt-python (the drifted source)
+let goldenDir: string; // <scratch>/torture-test/var/fixtures/golden (built once in before())
 let ledgerPath: string;
 
 before(function (this: { timeout: number }) {
@@ -172,14 +180,17 @@ before(function (this: { timeout: number }) {
   // the TestContext as `this`, so the explicit this-param types this.timeout.
   this.timeout = 600_000;
   scratch = fs.mkdtempSync(path.join(os.tmpdir(), "tt-s57-scratch-"));
-  toolBinDir = path.join(scratch, "bin");
+  toolBinDir = path.join(scratch, "torture-test", "bin");
+  const varDir = path.join(scratch, "torture-test", "var");
   fs.mkdirSync(toolBinDir, { recursive: true });
-  fs.mkdirSync(path.join(scratch, "torture-test", "var"), { recursive: true });
-  goldenDir = path.join(scratch, "golden");
-  fs.mkdirSync(goldenDir, { recursive: true });
+  fs.mkdirSync(varDir, { recursive: true });
+  goldenDir = path.join(varDir, "fixtures", "golden");
 
   // Tool copies from the tree under test (default: the working tree; RED:
-  // pre-fix blobs staged by the operator — see header).
+  // pre-fix blobs staged by the operator — see header). Copying into
+  // <scratch>/torture-test/bin makes the copied bootstrap resolve its own
+  // TT_ROOT inside the scratch (torture-test/bin/..), exactly like the real
+  // repo layout.
   fs.copyFileSync(
     path.join(toolTree, "bin", "tt-golden-bootstrap.mjs"),
     path.join(toolBinDir, "tt-golden-bootstrap.mjs"),
@@ -187,8 +198,12 @@ before(function (this: { timeout: number }) {
   const verifierBlob = fs.readFileSync(path.join(toolTree, "bin", "tt-verify-fixture-baselines"));
   fs.writeFileSync(path.join(toolBinDir, "tt-verify-fixture-baselines"), verifierBlob, { mode: 0o755 });
 
-  // Fixture SOURCE copy (whole dir) from the tree under test.
-  fixtureSrc = path.join(scratch, "fixtures-src", "tt-python");
+  // Fixture SOURCE copy (whole dir) from the tree under test, placed at the
+  // real depth (<scratch>/torture-test/fixtures-src/tt-python) so the copied
+  // builder's REPO_ROOT (SCRIPT_DIR/../../..) resolves to <scratch> and its
+  // VAR_DIR to <scratch>/torture-test/var — every builder path stays inside
+  // the freshly owned root.
+  fixtureSrc = path.join(scratch, "torture-test", "fixtures-src", "tt-python");
   fs.cpSync(path.join(toolTree, "fixtures-src", "tt-python"), fixtureSrc, { recursive: true });
 
   // Build the golden ONCE from the scratch source with the bootstrap copy.

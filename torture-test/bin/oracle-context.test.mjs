@@ -260,6 +260,31 @@ test('E3.C registry: probe_evidence/chaos_log keys and O4/O16 gating wiring (US-
   }
 });
 
+test('Storm-O12: O12 is registered as a post-batch DB-integrity oracle, NOT a campaign gate', () => {
+  const data = fixture();
+  try {
+    // O12 must not join the nine campaign-gating hooks.
+    assert.ok(!GATING_ORACLE_IDS.includes('O12'), 'O12 is a post-batch hygiene oracle, never a tenth gate');
+    // Its only required shared evidence leg is the immutable DB snapshot; the
+    // reserved-key baseline rides as a separate host-owned sidecar input.
+    assert.deepEqual(REQUIRED_ORACLE_EVIDENCE.O12, ['database_snapshot']);
+    // A contract-valid O12 context (full key set supplied) validates cleanly.
+    const context = createOracleContext({ ...data, oracleId: 'O12' });
+    assert.deepEqual(validateOracleContext(context, data.campaignDir, { requireOracleEvidence: true }), [],
+      'O12 context must validate with the complete key set');
+    assert.equal(context.oracle_id, 'O12');
+    // Removing the snapshot must fail closed for O12 like any other oracle.
+    const withoutSnapshot = createOracleContext({ ...data, oracleId: 'O12' });
+    withoutSnapshot.mechanical_evidence.references.database_snapshot = null;
+    assert.match(
+      validateOracleContext(withoutSnapshot, data.campaignDir, { requireOracleEvidence: true }).join('\n'),
+      /database_snapshot is required for O12/,
+    );
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
 test('projection excludes prose fields, raw stream references, STATUS lines, and absolute provenance paths', () => {
   const data = fixture();
   try {

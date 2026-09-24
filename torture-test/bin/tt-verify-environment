@@ -1242,11 +1242,11 @@ function probePorts() {
     }
   } catch (_) { /* ss not available, try lsof */ }
 
-  // Fallback: bounded lsof -i -sTCP:LISTEN (works on linux and darwin).
-  // `-b` avoids blocking kernel calls and `-w` suppresses warnings; the hard
-  // SIGKILL timeout means a stale FUSE/network mount cannot wedge the gate
-  // (SIGTERM does not interrupt an lsof blocked inside the kernel).
+  // Fallback: lsof -i -sTCP:LISTEN (works on linux and darwin)
   try {
+    // Bounded like src/lib/lsof-probe.ts (LSOF-EVTA US-005; port F-001):
+    // -b avoids blocking kernel calls, -w suppresses warnings, SIGKILL
+    // guarantees a kernel-wedged child is reaped.
     const result = spawnSync('lsof', ['-b', '-w', '-i', '-sTCP:LISTEN', '-nP', '-Fnct'], {
       encoding: 'utf-8', timeout: 5000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -1283,12 +1283,10 @@ function probePorts() {
  *   linux (real or seam): /proc/<pid>/cwd readlink + /proc/<pid>/cmdline —
  *     the pre-MVPT linux evidence, unchanged (MACP3 US-003 linux-only).
  *   darwin (real or seam): NO procfs — the same PORTABLE evidence
- *     daemon-control's ownership check uses: the bounded `lsof -b -w -a -p
- *     <pid> -d cwd -Fn` (the cwd, first `n<path>` row — the p<pid>/c<cmd>
- *     rows are ignored) and `ps -p <pid> -o command=` (the full command
- *     line). Both are mechanical and present on macOS by default
- *     (/usr/sbin/lsof, /bin/ps); the lsof probe is BOUNDED (`-b -w` plus a
- *     hard SIGKILL timeout) so a stale FUSE mount cannot wedge the gate.
+ *     daemon-control's ownership check uses: `lsof -a -p <pid> -d cwd -Fn`
+ *     (the cwd, first `n<path>` row — the p<pid>/c<cmd> rows are ignored)
+ *     and `ps -p <pid> -o command=` (the full command line). Both are
+ *     mechanical and present on macOS by default (/usr/sbin/lsof, /bin/ps).
  * Unavailable evidence (tool absent, dead pid, foreign pid) returns null for
  * that field on EVERY host — TT ownership must be PROVEN, never assumed
  * (fail-closed, exactly like the linux arm; never a weak accept).
@@ -1304,6 +1302,7 @@ function readProcessEvidence(pid) {
     // <pid> -o command=` prints the full command line. Unavailable evidence
     // stays null (refuse) — never a weak accept.
     try {
+      // Bounded like src/lib/lsof-probe.ts (LSOF-EVTA US-005; port F-001).
       const lsof = spawnSync('lsof', ['-b', '-w', '-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
         encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'],
       });

@@ -3235,3 +3235,216 @@ rejections). Manifest/wiring pins: `self-tests/tier2-s44b-operator-seam-
 wiring.test.ts`. Execution proof: `self-tests/tier2-s44-operator-seam-
 corridors.test.ts` (HEAVY) + hermetic daemon-log fixtures in
 `bin/tt-controller.test.sh`.
+
+---
+
+## Addendum — STORM-W5 orchestrator machinery (2026-09-09, tamandua-6sy.6.2)
+
+The multi-run storm ORCHESTRATOR exclusion above (machinery gap, spec 12 P3)
+has an implemented first slice in this tree, recorded here so this
+traceability reflects the actual latest state rather than the pre-slice gap:
+
+- **`bin/tt-storm`** (+ `tt-storm-roster.mjs`, `tt-storm-shared.mjs`,
+  `tt-storm-engine.mjs`): durable storm-specific orchestration entrypoint —
+  `help/plan/prepare/run/resume/report/arm`. Timer counts are DERIVED from
+  the current actual workflow registrations (current catalog: fdmw=7,
+  bfmw=8, security-audit-mw=8, quarantine-mw=4, drdv=3, do-now=1 ⇒ active
+  cap **52**, S9=7/S10=1 queued demand), never hardcoded from spec 09's
+  historical 44. Round A S1..S8 90s stagger + S9/S10 immediately after S8's
+  registration (S8 slot 630s; S9=660s; S10=690s), daemon admission-response
+  snapshot observation, 15s queue pump, S10 10-min drain bound, 15s
+  simultaneity sampler (UNKNOWN-honest; the all-8 window additionally
+  requires every active-roster run present with a recorded id). Round B
+  B1..B5 + phase-gated chaos schedule (11 phases, earliest offsets;
+  phase_wait evidence required before each action; missed evidence ⇒ MISSED
+  recorded, never silently skipped). Resume never relaunches recorded
+  launches (re-attaches by recorded run id; re-invoke `run --round` to
+  continue). Read-path pounding (dashboard HTTP + 2 MCP probes/30s, no-5xx +
+  latency-bound assertions) is a REAL engine cadence through injected
+  transport adapters, first-class NOT_RUN when unconfigured. tt-chaos argv
+  (colleague-commit `--repo/--file`, dirty-tree `--repo`) is built from
+  orchestrator-owned fixture identity; missing identity ⇒ phase NOT_RUN,
+  never an empty-repo dispatch.
+- **`self-tests/tier2-storm-orchestrator-recording-gate.test.ts`**: the ONE
+  designated in-run recording-only conformance gate (injected
+  fs/process/CLI/clock/API adapters, synthetic records, observed planned
+  argv/API calls). G1..G18 (18 cases) passing twice consecutively (evidence
+  in `torture-test/var/review-logs/recording-gate-evidence-run.txt` —
+  contains BOTH runs' raw output; contract in
+  `torture-test/var/review-logs/storm-orchestrator-contract.json`).
+- **STORM-REAL stage (tamandua-6sy.6.6):** REAL effect adapters +
+  boundary/approval gates implemented and calibrated IN-PROCESS.
+  `bin/tt-storm-real.mjs` (new standalone): private immutable exec context
+  (HOME/STATE/DB/TMP under var, absolute binaries, parent
+  TAMANDUA_RUN_ID/worker/step authority stripped, TAMANDUA_TEST_GUARD=1,
+  dev/ino ownership), mode containment BEFORE state writes (prepare/run/
+  resume/report/arm/approve/rehearse), run-scope canonicalization at the DB
+  adapter boundary, real mcpTool transport seam, real DB-evidence phase
+  predicates, owned-resource cleanup inventory with positive shutdown
+  evidence, and coordinator-approval verification (approval must pin the
+  tested boundary/gate hashes — a synthetic receipt never authorizes real
+  execution). The CLI `run` has NO generic `--allow-unqualified` bypass.
+  Evidence: `self-tests/tier2-storm-real-calibration.test.ts` (R1..R10,
+  10/10 twice consecutively; `torture-test/var/review-logs/
+  storm-real-calibration-run{1,2}.txt`) + safety contract at
+  `/root/matchlock-work/storm-real-safety-contract.json`.
+- **NOT yet qualified (explicit, next gate):** real single-daemon scripted
+  rehearsal (executes after the coordinator writes the approval matching the
+  tested boundary/gate hashes) and the real campaign; aged-state seeding at
+  production scale (5k/500k/200) through REAL createRun/step-ops; O12/O5/O6/O7
+  executables (spec-only, tier1-oracle-hygiene pins the nine gating ids); the
+  seed-validation gate run; single-flight prelude and Round B operator
+  dispatch against a real contained daemon (which also wires the real
+  pounding transport + fixture repo/file identity). Until the coordinator
+  approval is present this stage reports PENDING_ROOT_SAFETY and never claims
+  the rehearsal obligation accomplished.
+- Detail: `impl-tasks/STORM-W5-orchestrator-machinery-slice.md`.
+- **STORM-REAL round-2 (DO-AGAIN) correction round (2026-09-09):** the
+  reviewer/root defects in the round-1 REAL slice were fixed in torture-owned
+  code and re-calibrated (R1..R16 in
+  `self-tests/tier2-storm-real-calibration.test.ts`, 16/16 twice; the W5
+  recording gate G1..G18 stays 18/18). Fixes:
+  1. **Authority strip at the REAL spawn boundary (reviewer CRITICAL A):**
+     `PARENT_AUTHORITY_VARS`/`AUTHORITY_VAR_RE` now live in
+     `tt-storm-shared.mjs` and `spawnCapture` applies `stripParentAuthorityEnv`
+     to the MERGED env (and supports `mergeParentEnv:false` for the private
+     exec path) — a private context that merely OMITS the vars can no longer
+     have them resurrected by `{ ...process.env, ...env }`. R6c spawns a REAL
+     child and asserts its process.env carries none of the authority family.
+  2. **Explicit-minimum child env + owned-root allocation (issue D / root #1):
+     `buildPrivateExecContext` inherits only a credential-free allowlist
+     (PATH/locale/...) instead of nearly all of process.env, and ALLOCATES the
+     private HOME/STATE/TMP roots (mkdir) BEFORE capturing dev/ino — the
+     launch cwd now exists and replaced-root detection is real, not vacuous.
+  3. **makeRealProc lockdown (root #2):** argv[0] must be one of the context's
+     absolute binaries (TT_UNKNOWN_BINARY otherwise), per-call cwd must be an
+     existing dir inside var, per-call env cannot override protected keys
+     (HOME/STATE/DB/TMPDIR/guard/authority), and `kill` only signals pids the
+     proc bundle owns (registered via its own spawns or the rehearsal gate) —
+     no generic process.kill endpoint.
+  4. **approve gate-hash pinning (reviewer HIGH B / root #5):** `tt-storm
+     approve` now routes through the SAME strict `verifyCoordinatorApproval`
+     as rehearse with the COMPLETE computed gate-hash set; a no-hash approval
+     can never qualify a campaign (R10 matrix + R11 CLI negative), `run`
+     re-verifies the on-disk approval file against the current source commit
+     + gate hashes on every invocation (a stale state boolean is not
+     authority), and missing/partial/superset hash pins are refused.
+  5. **Persisted allocation receipts (root #3):** prepare writes
+     `state.exec_identity` (dev/ino ownership captured at allocation);
+     run/resume/report/arm/approve/rehearse revalidate against the RECEIPT
+     (re-prepare refused when absent) and `assertModeContained` canonicalizes
+     the campaign dir so a lexically-nested symlink to a foreign destination
+     is refused.
+  6. **Per-marker phase predicates (issue E / root #6):** every Round B
+     marker now has an evidence-specific predicate over DB rows / product
+     step ids (`finalize_merge`, `fix`) / real git ref reads — B1-B4
+     pre-finalize requires ALL FOUR mid-flight and NONE at finalize,
+     pause-b3-acked requires the B3 run row paused AFTER B-pause fired,
+     cc1-landed requires origin main to advance past the pre-cc1 snapshot,
+     rugpull-recovered requires a child run row per pulled target — an
+     unrelated fired phase or a single active setup step can never satisfy a
+     marker (per-marker calibration in R8). UNKNOWN (evidence_error) is
+     distinct from not-yet at the wait loop (issue G1, R13).
+  7. **Cleanup positive evidence (root #4 / reviewer):** `runOwnedCleanup`
+     accepts ONLY explicit `{ evidenced:true }` results — undefined/{}/{ok:true}
+     results and absent handlers can never mean PASS (R9); the campaign
+     cleanup handler probes an explicit owned-pid inventory from the proc
+     bundle registry.
+  8. **updated_at on failure saves (issue G2, R14)** and parent/child run-row
+     matching that accepts BOTH the product bare-uuid and the recording
+     public-id forms (harvest + rugpull recovery, R15).
+- **Disclosure — pre-gate `run --round A` launch attempt at
+  2026-09-09T19:40:14Z (reviewer issue C):** retained evidence under
+  `torture-test/var/results/storm-20260909T193737Z-8df6ef12-...` (kept per
+  the no-removal policy) records prepare at 19:37:37 (source commit
+  21955fb), report at 19:37:46, then a REAL `tt-storm run --round A` at
+  19:40:14 that wrote `launch.intent` (S1 feature-dev-merge-worktree
+  --pi-as-harness) + `launch.result` (exit null, both streams empty), marked
+  round A `failed` / S1 `launch_failed` (TT_MISSING_RUN) and left
+  `updated_at` at the prepare timestamp (the issue-G2 bug). This happened
+  BEFORE the containment/approval commits (26b2f3e etc., 19:41+) and before
+  any coordinator approval existed. Code path: `bin/tt-storm run` →
+  `stormRunRoundA` (tt-storm-engine.mjs) → `ctx.proc.launchWorkflow` over
+  REAL_PROC.spawnCapture with the INTERMEDIATE uncommitted working-tree code
+  of that moment (git only pins commit 21955fb for that window; the exact
+  working-tree bytes are not reconstructable). Effect: no run row was created
+  in any DB (torture-test/var/home never existed → no campaign DB; a spawn
+  that returned exit null with empty streams never reached the tamandua
+  binary), no daemon/worktree/model/foreign effect occurred — the only writes
+  were the campaign's own state.json/ops.jsonl under gitignored var/. The
+  regression was fixed by the current design: `run` refuses unless a
+  coordinator approval whose gate hashes match this checkout is re-verified
+  on-disk, and every real child runs inside the private exec context.
+- **Rehearsal posture unchanged:** the real single-daemon scripted rehearsal
+  still requires the coordinator-owned approval
+  (`/root/matchlock-work/storm-real-safety-approval.json`, absent — reported
+  PENDING_ROOT_SAFETY); the coordinator root review of 2026-09-09T19:56Z
+  (storm-real-task.md) defect list is addressed in torture-owned code above;
+  no real daemon/harness/chaos was run in this round.
+- **STORM-REHEARSAL US-003 boundary/negative matrix (2026-09-09, tamandua-6sy.6.6.1):**
+  the complete boundary/negative/contract coverage of the REAL gate code + CLI
+  now runs inside an INDEPENDENTLY effect-recording AND effect-denying child
+  environment, so the 2026-09-09T19:40:14Z incident class (a fabricated
+  approval whose buggy validator entered REAL execution) is mechanically
+  impossible to repeat as a negative test. Evidence:
+  `self-tests/tier2-storm-rehearsal-boundary.test.ts` (N01..N19) with retained
+  per-attempt evidence under
+  `torture-test/var/rehearsal-boundary-evidence/` (journals, case states,
+  approvals, stdout/stderr, the negative symlink fixtures — never deleted).
+  Every child runs under a NODE_OPTIONS preload that journals AND denies every
+  non-git process spawn, every filesystem mutation outside the owned var root
+  and every real OS signal; each negative therefore asserts refusal AND a
+  zero-`effect` recorder journal AND byte-identical campaign state, so a
+  validator bug is caught by the recorder even when the exit code lies.
+  Coverage: approve/rehearse/run negatives (no-hash / partial / superset /
+  hash-mismatch / missing+wrong campaign+source ids, unreadable approval,
+  absent/foreign/replaced root+state, stale persisted boolean, missing on-disk
+  approval, run-time source re-validation, malformed qualification,
+  unknown-run resume, escape-symlink campaign fixture under a NEW name) plus
+  exported-gate negatives (verifyCoordinatorApproval strict matrix,
+  computeGateHashes REFUSES a missing gate file — code TT_GATE_FILE_MISSING,
+  non-owned/stale pid kill refused, cleanup without positive evidence refused,
+  child-env leak allowlist, ownership replaced/absent) and positive controls
+  (canonical-alias campaign path resolves as owned; fresh contained SQLite
+  run-id canonicalization at the real adapter boundary). The tested gate-file
+  set (`GATE_HASH_FILES`) now also pins the US-002 rehearsal-gate self-test
+  and this boundary self-test. **No root approval exists or is claimed**: the
+  coordinator file `/root/matchlock-work/storm-real-safety-approval.json` is
+  still absent; readiness is published to
+  `/root/matchlock-work/storm-rehearsal-readiness.json` (exact commit/tree/
+  gate hashes/descriptor/campaign/resource plan/runtime pins/preflight
+  evidence/exact authorized command); the real SCRIPTED_REHEARSAL remains
+  unexecuted/pending root approval (gate NOT_ACCOMPLISHED until it runs).
+- **STORM-REHEARSAL US-004 post-approval gate outcome (2026-09-09, tamandua-6sy.6.6.1):**
+  the final story checked for the coordinator-owned approval
+  (`/root/matchlock-work/storm-real-safety-approval.json`) and it was ABSENT at
+  the start and end of the story (never created/edited by this run), so the
+  real SCRIPTED_REHEARSAL was NOT executed — this is the UNAPPROVED branch:
+  explicit readiness with the EXACT matching descriptor (campaign
+  `storm-20260909T224330Z-19cac7e9-9d13-4dc0-8b8c-038f696528be`, same
+  paths/hashes/exact authorized command as the published readiness) is
+  reported and the gate stays unexecuted/pending root approval. No rehearsal
+  evidence was manufactured: `rehearse --round A` and `approve` against the
+  real campaign REFUSE with exit 3 (`approval file unreadable/invalid …
+  ENOENT`) before any state write — campaign state byte-identical before and
+  after (sha `c7a304bdb00f0e4138b4ebb9034da86f3f416d7365fc6d2682ed74a74ccefb62`),
+  results/ dir empty. Retained per-attempt refusal evidence under
+  `torture-test/var/rehearsal-us004-evidence/refusal-20260909T225415Z/`
+  (before-state copy + sha, both refusal stdout/stderr; never deleted).
+  Unblocked source work added WITHOUT changing gate behavior or the pinned
+  10-file gate-hash set (no GATE_HASH_FILES change, no gate-code change): ONE
+  new post-rehearsal consistency self-test FILE
+  (`self-tests/tier2-storm-rehearsal-consistency.test.ts`, 14/14) whose
+  exported validators prove (a) an executed rehearsal's report/state truthfully
+  covers the roster (10 Round A ids / 8 same-window / 2 queue decisions /
+  5 Round B ids + identical B5 relaunch / all 11 phase predicates / zero token
+  ledger / positive closure / nongreen distinctness) and REFUSE incomplete or
+  self-contradictory evidence, and (b) an unexecuted campaign is truthful
+  pending (qualification false, rounds planned, results/report.json never
+  manufactured, descriptor + state + fresh gate hashes coherent, approval
+  absent or refused by the SAME strict validator). Final contract:
+  `/root/matchlock-work/storm-rehearsal-contract.json` (gate unexecuted /
+  NOT_ACCOMPLISHED, evidence-or-missing status for every original obligation,
+  exact matching descriptor). **No root approval exists or is claimed** — the
+  real SCRIPTED_REHEARSAL remains unexecuted/pending root approval; a
+  calibration or recording pass is NOT relabelled as rehearsal completion.

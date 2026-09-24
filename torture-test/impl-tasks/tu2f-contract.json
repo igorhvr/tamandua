@@ -1,0 +1,162 @@
+{
+  "contract": "tu2f-contract",
+  "task": "TU2F - close the last torture-union leftover: the redundant .gitignore (NF-6) and any other still-open NF item",
+  "run_id": "run-c13d1de8-be66-40eb-80f3-f88e66b5083d",
+  "story": "US-005 - Publish the TU2F contract (NF-6 finding + proof, NF sweep table, gate verdict)",
+  "branch": "feature/tu2f-torture-union-leftovers-nf6",
+  "base": "0f305702 feat: NPF-2 scripted suite-ledger evidence and O12 content pin",
+  "head": "db4a7565f79c64f42e2bd83c4a38ac6853489025",
+  "generated_at": "2026-09-18T18:51:45Z",
+  "scope": "torture-only; no src/ edits. Torture-owned files only (torture-test/**).",
+  "host_path_substitution": {
+    "intended_host_path": "/home/kaladin/matchlock-work/tu2f-contract.json",
+    "intended_path_writable_in_vm": false,
+    "committed_path": "torture-test/impl-tasks/tu2f-contract.json",
+    "note": "The intended host contract path /home/kaladin/matchlock-work/tu2f-contract.json is not writable from inside the Matchlock VM, so the contract is committed to a tracked torture-test/ location and this substitution is recorded here. The pipeline finalize step performs the squash; no squash was performed in this story."
+  },
+  "vm_host_path_visibility": {
+    "audit_report": {
+      "path": "/home/kaladin/vaivm-archive/vaivm-audit/report.md",
+      "visible_in_vm": false,
+      "evidence": "No such file or directory (probed US-001)"
+    },
+    "npf2_fixture_contract": {
+      "path": "/home/kaladin/matchlock-work/npf2-fixture-contract.json",
+      "visible_in_vm": false,
+      "evidence": "No such file or directory (probed US-001)"
+    },
+    "gate_lock": {
+      "path": "/home/kaladin/matchlock-work/vaivm-gate.lock",
+      "visible_in_vm": false,
+      "substitution": "/tmp/vaivm-gate.lock",
+      "evidence": "parent dir absent (probed US-001); gate ran under flock --exclusive /tmp/vaivm-gate.lock (US-004)"
+    },
+    "bead_tamandua_6sy_68": {
+      "tool": "bd",
+      "visible_in_vm": false,
+      "evidence": "bd: command not found; no .beads issues export visible on PATH (probed US-001)"
+    },
+    "immutable_o12_seed_snapshot": {
+      "path": "/opt/tamandua-storm-seed.Hn3vQ8kL/torture-test/var/results/storm-aged.2026-09-15T05-25-19-366Z.8f48ed54.nVrXyi",
+      "visible_in_vm": false,
+      "substitution": "owned-copy v10 seed snapshot at torture-test/var/seed-snapshot-v10.sqlite, pointed at o12.test.mjs via TAMANDUA_O12_SEED_SNAPSHOT (US-004)"
+    },
+    "fallback": "Because the audit report and bead are unreachable in the VM, NF content was reconstructed from the task input, the pre-populated Story Plan, and direct tree analysis. NF-1..NF-3 are pinned to the torture-union2 lint-defects fix chain; NF-4/NF-5 are derived from the live tree; NF-6 was fixed in US-002."
+  },
+  "nf6": {
+    "finding": "The torture tree carried seven redundant nested .gitignore files under the tt-poly* fixtures that re-declared rules already effective from their parent .gitignore (unanchored patterns apply at every depth) or carried no effective patterns at all.",
+    "removed_files": [
+      "torture-test/fixtures-src/tt-poly/python/.gitignore",
+      "torture-test/fixtures-src/tt-poly/ts/.gitignore",
+      "torture-test/fixtures-src/tt-poly/go/.gitignore",
+      "torture-test/fixtures-src/tt-poly/java/.gitignore",
+      "torture-test/fixtures-src/tt-poly/rust/.gitignore",
+      "torture-test/fixtures-src/tt-poly-lite/python/.gitignore",
+      "torture-test/fixtures-src/tt-poly-lite/ts/.gitignore"
+    ],
+    "consolidation": "The duplicated rules (.venv/, *.egg-info/, dist/, build/) were folded into the parent tt-poly/.gitignore and tt-poly-lite/.gitignore, and the 'deliberately NOT gitignored' junk-probe documentation (go exec-bit probe, go experiments, operator-notes.local, target/ NOT gitignored notes) was preserved in the parent NOTE blocks.",
+    "fixing_commit": "009448fd",
+    "non_candidates": [
+      "torture-test/.gitignore (its single var/ rule is the runtime containment story, not redundant; untouched)",
+      "standalone fixture .gitignore files (tt-go, tt-java, tt-python, tt-rust, tt-ts) each have effective patterns not duplicated by any ancestor"
+    ],
+    "before_check_ignore": {
+      "torture-test/var/foo.txt": "torture-test/.gitignore:4:var/",
+      "torture-test/var/results/": "torture-test/.gitignore:4:var/",
+      "torture-test/var/results/bar.json": "torture-test/.gitignore:4:var/",
+      "torture-test/var/evidence/": "torture-test/.gitignore:4:var/",
+      "torture-test/var/evidence/blob.bin": "torture-test/.gitignore:4:var/",
+      "torture-test/fixtures-src/tt-poly/python/.venv/x": "torture-test/fixtures-src/tt-poly/python/.gitignore:2:.venv/",
+      "torture-test/fixtures-src/tt-poly/python/build/x": "torture-test/fixtures-src/tt-poly/python/.gitignore:17:build/",
+      "torture-test/fixtures-src/tt-poly/ts/dist/x": "torture-test/fixtures-src/tt-poly/ts/.gitignore:2:dist/"
+    },
+    "after_check_ignore": {
+      "torture-test/var/foo.txt": "torture-test/.gitignore:4:var/",
+      "torture-test/var/results/": "torture-test/.gitignore:4:var/",
+      "torture-test/var/results/bar.json": "torture-test/.gitignore:4:var/",
+      "torture-test/var/evidence/": "torture-test/.gitignore:4:var/",
+      "torture-test/var/evidence/blob.bin": "torture-test/.gitignore:4:var/",
+      "torture-test/fixtures-src/tt-poly/python/.venv/x": "torture-test/fixtures-src/tt-poly/.gitignore:2:.venv/",
+      "torture-test/fixtures-src/tt-poly/python/build/x": "torture-test/fixtures-src/tt-poly/.gitignore:7:build/",
+      "torture-test/fixtures-src/tt-poly/ts/dist/x": "torture-test/fixtures-src/tt-poly/.gitignore:6:dist/"
+    },
+    "proof": "Runtime-output ignore behaviour is byte-identical before and after consolidation: every var/ runtime path still resolves to torture-test/.gitignore:4:var/, and the tt-poly* fixture outputs still resolve to the parent .gitignore patterns (same effective rules, source line moved from the nested file to the parent). git status --ignored --short torture-test/ is empty in both cases.",
+    "note": "git check-ignore does NOT report the directory-only var/ pattern against the bare directory pathname; the canonical var/ proof uses an in-var/ path (e.g. torture-test/var/foo.txt)."
+  },
+  "nf_sweep": [
+    {
+      "item": "NF-1",
+      "content": "gitconfig-containment lint rejects the /dev/null GIT_CONFIG_GLOBAL pin and unconditionally sha256()s the operator ~/.gitconfig (ENOENT on a host with none)",
+      "status": "closed",
+      "citing_commit": "7762fdf8",
+      "evidence": "tier0-gitconfig-containment.test.ts passes alone: 5/5 (TAMANDUA_TEST_GUARD=1, false harnesses, verified in-run)"
+    },
+    {
+      "item": "NF-2",
+      "content": "procfs-portability lint flags the three torture-union fix-chain /proc files with no allowlist entry",
+      "status": "closed",
+      "citing_commit": "a1121686",
+      "evidence": "tier0-procfs-portability-lint.test.ts passes alone: 16/16 (verified in-run)"
+    },
+    {
+      "item": "NF-3",
+      "content": "three FIX10 containment gates (controller/hook/scenario) unconditionally sha256() the operator ~/.gitconfig",
+      "status": "closed",
+      "citing_commit": "bc535a44",
+      "evidence": "tier0-controller-home-containment 8/8, tier0-hook-home-containment 6/6, tier0-scenario-containment 7/7 (verified in-run)"
+    },
+    {
+      "item": "NF-4",
+      "content": "tier0-repeatability.test.ts double-gate snapshot unconditionally sha256(realGitconfig) (ENOENT on absent ~/.gitconfig) and asserts the hygiene canary status strictly UNCHANGED (vaimetal renders ABSENT)",
+      "status": "fixed",
+      "citing_commit": "b2b09b8e (US-003)",
+      "evidence": "presence-tolerant gitconfigFingerprint() + UNCHANGED|ABSENT canary assertions; doc gate passes alone; full double-gate deferred to US-004 gate env"
+    },
+    {
+      "item": "NF-5",
+      "content": "gnu-portability lint hard gate RED: storm-chain-runner.sh (date +%s.%N x4) and storm-chain-wrapper.sh (stat -c + date +%s.%N) carry GNU-isms with no allowlist entry",
+      "status": "fixed",
+      "citing_commit": "b2b09b8e (US-003)",
+      "evidence": "tier0-gnu-portability-lint.test.ts passes alone: 18/18 (was 17/18 before the fix)"
+    },
+    {
+      "item": "NF-6",
+      "content": "redundant nested .gitignore files under tt-poly* re-declaring parent rules / comment-only",
+      "status": "fixed",
+      "citing_commit": "009448fd (US-002)",
+      "evidence": "git check-ignore -v byte-identical to the US-001 baseline; affected self-tests pass"
+    }
+  ],
+  "gates": {
+    "verdict": "PASS",
+    "summary": "self-tests-alone: 14/14 required entries exited 0 (verdict PASS); npf2 2/2 gating, aged 4/4 gating, o12 8/8 gating, qualification 1/1 informational. by_group totals match EXPECTED_COUNTS.",
+    "gate_env": {
+      "TAMANDUA_TEST_GUARD": "1",
+      "TAMANDUA_PI_BINARY": "/usr/bin/false",
+      "TAMANDUA_HERMES_BINARY": "/usr/bin/false",
+      "TAMANDUA_DSH_BINARY": "/usr/bin/false",
+      "tokens": "no ambient TAMANDUA_* authority; zero model tokens (false harnesses)"
+    },
+    "gate_head": "0d3649b39df0fe8b08277896b08d20d24e4014ee",
+    "gate_worktree": "/opt/tu2f-gate-0d3649b3",
+    "guard_safe_repo_root": true,
+    "lock": "flock --exclusive /tmp/vaivm-gate.lock (substituted for host /home/kaladin/matchlock-work/vaivm-gate.lock)",
+    "summary_path": "torture-test/var/results/self-tests-alone-20260918T183855Z.SdwLBf/self-tests-alone-summary.json",
+    "results_tsv": "torture-test/var/results/self-tests-alone-20260918T183855Z.SdwLBf/results.tsv",
+    "seed_snapshot": "torture-test/var/seed-snapshot-v10.sqlite (owned-copy v10 seed snapshot)",
+    "retained_evidence_dir": "torture-test/var/results/self-tests-alone-20260918T183855Z.SdwLBf/ (summary + results.tsv + 15 stdout logs + 15 stderr logs; nothing disposed)",
+    "by_group": {
+      "npf2": {"total": 2, "passed": 2, "failed": 0, "verdict": "PASS", "gating": true},
+      "aged": {"total": 4, "passed": 4, "failed": 0, "verdict": "PASS", "gating": true},
+      "o12": {"total": 8, "passed": 8, "failed": 0, "verdict": "PASS", "gating": true},
+      "qualification": {"total": 1, "passed": 1, "failed": 0, "verdict": "PASS", "gating": false}
+    }
+  },
+  "substitutions_used": [
+    "Contract host path /home/kaladin/matchlock-work/tu2f-contract.json -> committed torture-test/impl-tasks/tu2f-contract.json",
+    "Gate lock /home/kaladin/matchlock-work/vaivm-gate.lock -> /tmp/vaivm-gate.lock",
+    "jq absent -> installed via apt (environment repair; not a source change)",
+    "Immutable /opt/tamandua-storm-seed.* snapshot absent -> owned-copy v10 seed snapshot at torture-test/var/seed-snapshot-v10.sqlite via TAMANDUA_O12_SEED_SNAPSHOT (runner pass-through added in US-004)"
+  ],
+  "scope_check": "No file outside torture-test/ is modified by the TU2F stories; the pipeline finalize step performs the squash (not performed here)."
+}

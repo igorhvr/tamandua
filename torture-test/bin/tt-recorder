@@ -277,76 +277,6 @@ _pid_cmdline() {
     fi
 }
 
-# ── bounded lsof probes (LSOF-EVTA US-007) ────────────────────────────
-#
-# lsof walks the kernel's process/file tables and can block FOREVER inside
-# the kernel on a host with a stale FUSE or network mount (the 2026 vaivm
-# incident left 24 lsof processes wedged for five days, hanging every
-# caller with them). macOS ships no GNU `timeout`, so the darwin lsof arm
-# below goes through lsof_bounded: `lsof -b -w <args>` runs in the
-# BACKGROUND with its stdout redirected to a temp file, is polled for up
-# to TT_LSOF_TIMEOUT_S seconds (default 5), and is SIGKILLed AND reaped
-# (`wait`) when the bound expires. `-b` avoids blocking kernel calls and
-# `-w` suppresses warnings; both flags exist on the BSD (macOS) and GNU
-# lsof.
-#
-# Evidence contract: a completed probe prints lsof's stdout and returns 0.
-# A timed-out probe prints NOTHING (partial output is discarded, never
-# treated as evidence) and returns 1 AFTER the child is killed and reaped;
-# a host without lsof also returns 1. Callers MUST treat a non-zero return
-# as NO EVIDENCE (fail-closed) — never as "no listener". The timeout also
-# prints a degradation line to stderr so operators can see the blocked
-# probe.
-
-# tt_lsof_timeout_s: the bounded seconds a single lsof probe may run.
-# TT_LSOF_TIMEOUT_S overrides it; a blank / non-numeric / non-positive
-# value falls back to the default (an unbounded probe is impossible). The
-# default is a local literal so the function is self-contained (the
-# hermetic self-tests extract and run it in isolation).
-tt_lsof_timeout_s() {
-    local default_s=5
-    local v="${TT_LSOF_TIMEOUT_S:-}"
-    case "$v" in
-        ''|*[!0-9]*) v="$default_s" ;;
-    esac
-    if [ "$v" -lt 1 ] 2>/dev/null; then
-        v="$default_s"
-    fi
-    printf '%s' "$v"
-}
-
-# lsof_bounded <lsof-arg>...: run `lsof -b -w <args>` under the hard bound
-# and print its stdout. Prints nothing (and returns 1) when the probe times
-# out or lsof is unavailable — fail-closed for every caller.
-lsof_bounded() {
-    local timeout_s
-    timeout_s="$(tt_lsof_timeout_s)"
-    if ! command -v lsof >/dev/null 2>&1; then
-        return 1
-    fi
-    local out_file
-    out_file="$(mktemp "${TMPDIR:-/tmp}/tt-recorder-lsof.XXXXXX")" || return 1
-    lsof -b -w "$@" > "$out_file" 2>/dev/null &
-    local child_pid=$!
-    local max_ticks=$(( timeout_s * 10 ))
-    local ticks=0
-    while kill -0 "$child_pid" 2>/dev/null; do
-        if [ "$ticks" -ge "$max_ticks" ]; then
-            kill -KILL "$child_pid" 2>/dev/null || true
-            wait "$child_pid" 2>/dev/null || true
-            rm -f "$out_file"
-            echo "tt-recorder: lsof probe timed out after ${timeout_s}s — no evidence (fail-closed)" >&2
-            return 1
-        fi
-        sleep 0.1
-        ticks=$(( ticks + 1 ))
-    done
-    wait "$child_pid" 2>/dev/null || true
-    cat "$out_file"
-    rm -f "$out_file"
-    return 0
-}
-
 # ── production exclusion (US-009) ──────────────────────────────────────
 
 # _resolve_real_home — resolve the REAL user home directory (NOT $HOME,
@@ -408,13 +338,11 @@ _is_production_cwd() {
 #
 # Two evidence arms, never name-only or env-based:
 #   * linux: /proc/net/tcp + /proc/<pid>/fd/ socket-inode matching (unchanged).
-#   * darwin: the bounded `lsof_bounded -nP -iTCP -sTCP:LISTEN` probe (always
-#     `-b -w`, hard TT_LSOF_TIMEOUT_S bound, SIGKILL + reap on expiry) matched
-#     by pid + port, when /proc is absent (the linux arm can produce no
-#     evidence there). When lsof is unavailable or yields no usable evidence,
-#     an explicit degradation line is printed to stderr and the function
-#     returns 1 (not production) — the start path never fails because of a
-#     missing /proc or lsof.
+#   * darwin: `lsof -nP -iTCP -sTCP:LISTEN` matched by pid + port, when /proc
+#     is absent (the linux arm can produce no evidence there). When lsof is
+#     unavailable or yields no usable evidence, an explicit degradation line is
+#     printed to stderr and the function returns 1 (not production) — the start
+#     path never fails because of a missing /proc or lsof.
 # linux-only /proc usage (MACP3 US-003): guarded for Darwin — Darwin has no
 # procfs, so the [ -d "$fd_dir" ] check skips the linux arm on a /proc-less
 # host and falls through to the darwin lsof arm below (no hard failure).
@@ -477,18 +405,16 @@ _is_production_ports() {
         return 1
     fi
 
-    # ── darwin lsof arm (US-005, bounded by LSOF-EVTA US-007) ───────────
+    # ── darwin lsof arm (US-005): production-port exclusion via lsof ────
     # macOS has no /proc, so the linux inode-matching arm above yields no
     # evidence. Fall back to lsof's numeric LISTEN socket table and match the
-    # pid and ports 3334/3338/3339 directly. The probe is BOUNDED
-    # (lsof_bounded: always `-b -w`, hard TT_LSOF_TIMEOUT_S bound, SIGKILL +
-    # reap on expiry) so a stale FUSE/network mount cannot wedge the recorder.
-    # Return 0 ONLY when lsof proves this pid listens on a production port.
-    # When lsof is unavailable, times out, or returns no usable evidence, log
-    # the explicit degradation line and return 1 (not production) — never fail
-    # the start path.
+    # pid and ports 3334/3338/3339 directly (bounded single query,
+    # 2>/dev/null). Return 0 ONLY when lsof proves this pid listens on a
+    # production port. When lsof is unavailable or returns no usable evidence,
+    # log the explicit degradation line and return 1 (not production) — never
+    # fail the start path.
     local lsof_out
-    lsof_out="$(lsof_bounded -nP -iTCP -sTCP:LISTEN || true)"
+    lsof_out="$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null || true)"
 
     if [ -n "$lsof_out" ]; then
         if printf '%s\n' "$lsof_out" | awk -v pid="$pid" '

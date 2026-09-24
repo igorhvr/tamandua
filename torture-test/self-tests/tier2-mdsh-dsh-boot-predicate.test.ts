@@ -41,6 +41,15 @@ const varRoot = path.join(ttRoot, "var");
 const hostProfilePath = path.join(varRoot, "w0", "host-profile.json");
 const realEnv = path.join(ttRoot, "env", "tt-env.sh");
 
+// The REAL operator home whose personal bin dir the daemon-PATH reconstruction
+// appends last. The reconstruction resolves it independently of $HOME
+// (resolve_operator_home: getent -> dscl -> tilde -> $HOME fallback, see
+// env/tt-env.sh and tt-harness-auth-probe), so the oracle must use the same
+// basis — os.userInfo().homedir on POSIX equals the getent passwd home —
+// never os.homedir() (which follows $HOME and would point at the gate's
+// private owned HOME, breaking the assertion outside a real-operator run).
+const realOperatorHome = os.userInfo().homedir;
+
 const CAMPAIGN_LINE = /^Campaign:\s+(campaign-[^\s]+)$/m;
 const GATED_ID = "W4.dsh-do-now";
 const LAUNCHER_ID = "T2-MDSH-LAUNCHER";
@@ -287,9 +296,9 @@ describe("Tier-2 MDSH dsh functional boot predicate (US-016)", () => {
       const adaptersBin = path.join(ttRoot, "var", "adapters-bin");
       assert.ok(recordedPath.startsWith(`${adaptersBin}:`),
         `smoke PATH must lead with var/adapters-bin (got: ${recordedPath.slice(0, 120)}...)`);
-      assert.ok(!recordedPath.startsWith(path.join(os.homedir(), ".local")),
+      assert.ok(!recordedPath.startsWith(path.join(realOperatorHome, ".local")),
         "operator bin dirs must NOT precede the contained dirs on the smoke PATH");
-      assert.ok(recordedPath.includes(path.join(os.homedir(), ".local", "bin")),
+      assert.ok(recordedPath.includes(path.join(realOperatorHome, ".local", "bin")),
         "operator bin dirs must still be present (moved last) on the smoke PATH");
     } finally {
       removeScratch(fakeDsh);

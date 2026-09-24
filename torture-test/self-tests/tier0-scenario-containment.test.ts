@@ -43,6 +43,16 @@ function sha256(file: string): string {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+// Presence + sha256 of the REAL operator ~/.gitconfig (null hash when
+// absent). vaimetal ships no ~/.gitconfig, so a before() snapshot that
+// unconditionally sha256()s the path throws ENOENT and cancels the whole
+// suite; mirror tier0-hygiene-canary's truthfulness contract instead —
+// present:false → hash null, and absent-stays-absent is asserted.
+function gitconfigFingerprint(): { present: boolean; hash: string | null } {
+  if (!fs.existsSync(realGitconfig)) return { present: false, hash: null };
+  return { present: true, hash: sha256(realGitconfig) };
+}
+
 function writeExecutable(file: string, content: string): void {
   fs.writeFileSync(file, content, { mode: 0o755 });
 }
@@ -274,18 +284,18 @@ function containmentProbe(envForKind: string, expectRefuse: boolean): CommandRes
   return result;
 }
 
-let gitconfigBefore = "";
+let gitconfigBefore: { present: boolean; hash: string | null } = { present: false, hash: null };
 describe("FIX10 US-004 scenario + daemon-control contained-HOME fail-closed", () => {
   before(() => {
     fs.mkdirSync(varRoot, { recursive: true });
-    gitconfigBefore = sha256(realGitconfig);
+    gitconfigBefore = gitconfigFingerprint();
   });
   after(() => {
     for (const dir of created.splice(0)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-    assert.equal(sha256(realGitconfig), gitconfigBefore,
-      "the real ~/.gitconfig hash changed during the test run — containment broke");
+    assert.deepEqual(gitconfigFingerprint(), gitconfigBefore,
+      "the real ~/.gitconfig presence/hash changed during the test run — containment broke");
   });
 
   it("scenario-containment-guard.sh refuses the operator HOME, var itself, and outside dirs; accepts a contained home", () => {

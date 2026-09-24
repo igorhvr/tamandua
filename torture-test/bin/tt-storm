@@ -1,0 +1,1424 @@
+#!/usr/bin/env node
+// tt-storm — STORM-W5 storm orchestration entrypoint (suite-only).
+//
+// The durable storm-specific orchestrator for one shared isolated tamandua
+// daemon, one fixture origin/main, Round A (S1-S8 + queued S9/S10) and
+// Round B (B1-B5 + phase-gated chaos schedule). This tool OWNS the exact
+// campaign, daemon, source/catalog and fixture identities; it records
+// intent BEFORE every launch, captures BOTH launch streams for early
+// run-id/short-id evidence, re-attaches after its own crash, never
+// launches duplicates because a waiter timed out, discovers rugpull
+// replacements/children and attributes tokens to roots, and rejects
+// ambiguous/missing provenance. All sequencing logic lives in
+// tt-storm-engine.mjs (imported here AND by the recording gate with
+// injected adapters); this file wires the REAL adapters + operator
+// surface.
+//
+// Modes (explicit):
+//   help            side-effect-free usage
+//   plan            derive roster/timer numbers from actual registrations +
+//                   print the launch plan (read-only)
+//   prepare         plan + record the full campaign intent in a fresh dir
+//                   under torture-test/var/results (no launches)
+//   run             execute a round (A|B) of a prepared campaign; REFUSES
+//                   real launches until the campaign is qualified (real
+//                   launch requires the coordinator safety approval whose
+//                   gate hashes match this checkout — see tt-storm-real.mjs
+//                   runOwnedCleanup/approval wiring). There is NO generic
+//                   --allow-unqualified reason-string bypass.
+//   resume          re-attach a prepared/running campaign by recorded run
+//                   id; never relaunches recorded launches.
+//   report          forensic bundle into the campaign's results dir
+//                   (report.json + report.txt), after owned cleanup
+//                   (cleanup failure propagates).
+//   arm <phase>     pre-storm arming step (single-flight-prelude |
+//                   aged-state | seed-validation) — executes only in the
+//                   real rehearsal gate; this run records pending.
+//
+// Safety posture (STORM-REAL):
+//   * EVERY real effect runs inside one admitted immutable PRIVATE exec
+//     context (tt-storm-real.mjs buildPrivateExecContext): explicit child
+//     env with private HOME/TAMANDUA_STATE_DIR/TAMANDUA_DB_PATH/TMPDIR,
+//     absolute binaries, parent TAMANDUA_RUN_ID/worker/step authority
+//     stripped, TAMANDUA_TEST_GUARD=1. No operator HOME/state fallback.
+//   * run/resume/report/arm perform mode containment (assertModeContained)
+//     BEFORE any state write — an escaped/replaced campaign dir or an
+//     ownership-changed context is refused.
+//   * writes ONLY under this checkout's torture-test/var; refuses path
+//     traversal / symlink escapes / destinations outside var; daemon
+//     lifecycle belongs to bin/daemon-control; real launch requires the
+//     coordinator approval matching the committed safety contract.
+//   * DB reads canonicalize run ids at the adapter boundary (public
+//     run-<uuid> <-> stored bare uuid) and reject malformed/ambiguous keys.
+//   * cleanup is an explicit owned-resource inventory with positive
+//     shutdown evidence (runOwnedCleanup); absent/failed/unsettled required
+//     cleanup can never mean PASS.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync, spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+
+import { computeGateHashes, DEFAULT_COORDINATOR_APPROVAL_FILE, DESCRIPTOR_NAME, REHEARSAL_LABEL } from './tt-storm-rehearsal.mjs';
+import { parseProfile, profileFromCampaignState, isRealProfile, REAL, daemonKindForProfile } from './tt-storm-profile.mjs';
+import { parseScale, isLiteScale, scaleFromState, LITE_FIXTURE_NAME } from './tt-storm-scale.mjs';
+import { resolveLaunchSpendCap, spendCapFromState } from './tt-storm-spend.mjs';
+import {
+  REHEARSAL_DAEMON_ENV_NAME,
+  REAL_DAEMON_ENV_NAME,
+  REHEARSAL_DAEMON_KIND,
+  allocRehearsalListenerPorts,
+  makeRehearsalDaemonCleanupHandler,
+  makeRehearsalDaemonControl,
+  rehearsalDaemonPathExtra,
+  renderRehearsalDaemonEnvScript,
+  renderRealDaemonEnvScript,
+} from './tt-storm-rehearsal.mjs';
+import { REAL_FS } from './tt-storm-roster.mjs';
+import { REAL_CLOCK, REAL_DB, REAL_GIT } from './tt-storm-shared.mjs';
+import { adoptAgedState, verifyAgedStateSeed } from './tt-storm-arm.mjs';
+import {
+  SEED_VALIDATION_ARMING_RULE,
+  TT_SEED_VALIDATION_NOT_ARMED,
+  buildSeedValidationArmReceipt,
+  evaluateSeedValidationGate,
+  runAdoptedSeedValidation,
+  sha256File as sha256InstalledFile,
+  writeSeedValidationArmReceipt,
+} from './tt-storm-seed-validation.mjs';
+import {
+  buildDetachedRunInvocation,
+  detachedRunLogPaths,
+  detachLauncherForPlatform,
+  resolveRoundWallBudget,
+} from './tt-storm-unattended.mjs';
+import {
+  assertModeContained,
+  buildPrivateExecContext,
+  makeCampaignCleanupHandlers,
+  makeRealProc,
+  probePhaseMarkerReal,
+  provisionProductExecDb,
+  revalidatePersistedExecIdentity,
+  resolveAbsoluteBinary,
+  runOwnedCleanup,
+  verifyCoordinatorApproval,
+} from './tt-storm-real.mjs';
+import {
+  assertPendingCandidateDest,
+  buildLaunchPlan,
+  makeRefsChannel,
+  recordPendingCandidate,
+  stormPrepare,
+  stormReportFull,
+  stormResume,
+  stormRunRehearsal,
+  stormRunRoundA,
+  stormRunRoundB,
+} from './tt-storm-engine.mjs';
+import { loadState, refusal, saveState } from './tt-storm-shared.mjs';
+
+const HERE = import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname);
+const TT_DIR = path.dirname(HERE);
+const REPO_ROOT = path.dirname(TT_DIR);
+// TT_VAR test seam (mirrors tt-catalog-install / tt-run): override the
+// contained var root so hermetic self-tests can run a real prepare under a
+// scratch var without touching the repo's shared torture-test/var. All
+// containment/ownership is relative to this root, so the override cannot
+// widen containment — it only relocates it.
+const VAR_ROOT = process.env.TT_VAR ? path.resolve(process.env.TT_VAR) : path.join(TT_DIR, 'var');
+const DEFAULT_CATALOG_ROOT = path.join(REPO_ROOT, 'workflows');
+const DEFAULT_INSTALLED_CATALOG_ROOT = path.join(VAR_ROOT, 'home', '.tamandua', 'workflows');
+
+// Real binaries: this checkout's own bin/tamandua + the suite operators. The
+// suite runs the CANDIDATE CLI (built dist) at the rehearsal; the exec
+// context resolves the absolute binary and refuses when absent.
+function resolveBinaries() {
+  const tamandua = path.join(REPO_ROOT, 'bin', 'tamandua');
+  const tamanduaTest = path.join(REPO_ROOT, 'bin', 'tamandua-test');
+  const ttChaos = path.join(HERE, 'tt-chaos');
+  const daemonControl = path.join(HERE, 'daemon-control');
+  const git = resolveGitBinary();
+  const binaries = { tamandua, ttChaos, daemonControl };
+  if (tamanduaTest) binaries.tamanduaTest = tamanduaTest;
+  if (git) binaries.git = git;
+  return binaries;
+}
+
+function resolveGitBinary() {
+  const candidates = (process.env.PATH ?? '').split(path.delimiter)
+    .map((d) => path.join(d, 'git'))
+    .filter(Boolean);
+  try {
+    return resolveAbsoluteBinary(candidates, { label: 'git' });
+  } catch {
+    return null; // git resolved lazily by the engine only when ref snapshots run
+  }
+}
+
+const USAGE = `Usage: tt-storm <command> [options]
+
+STORM-W5 storm orchestration entrypoint (suite-only; never touches the live
+daemon — daemon lifecycle is bin/daemon-control's).
+
+Commands:
+  help                Side-effect-free usage.
+  plan                Derive the storm roster + timer cap from the ACTUAL
+                      workflow registrations (installed catalog preferred,
+                      bundled fallback) and print the launch plan. Read-only.
+  prepare             plan + record full campaign intent + the US-001 rehearsal
+                      input/profile/behavior bundle (seeded private catalog,
+                      owned tiny git origin + sibling clones, per-run task
+                      files, owned-root receipts, runtime pins, source-pinned
+                      descriptor.json) under a fresh
+                      torture-test/var/results/<storm-...> dir. Optional
+                      --campaign <dir> pins the destination; a second prepare
+                      against the same destination REFUSES with a non-zero
+                      code and existing files are left untouched. NO launches
+                      (no daemon/harness/chaos).
+  run                 Execute round A or B of a prepared campaign. Real
+                      launches are REFUSED until the campaign is qualified
+                      by a coordinator-issued approval (see approve). No
+                      generic --allow-unqualified reason-string bypass exists.
+  approve             Consume a COORDINATOR-issued --approval-file and mark a
+                      prepared campaign real-launch-qualified ONLY when the
+                      file names the exact campaign id + current source
+                      commit with real_launch_allowed:true AND pins the
+                      COMPLETE gate-hash set this checkout computes (the same
+                      strict validator rehearse uses; a synthetic no-hash
+                      approval can never authorize real launch). This command
+                      never creates/alters the approval file.
+  rehearse            The single real-rehearsal entrypoint (Round A|B).
+                      REFUSES unless a coordinator-issued --approval-file
+                      matches this checkout's source commit AND the tested
+                      boundary/gate file hashes (changed gate code => fresh
+                      coordinator review; never automatic approval reuse).
+  resume              Re-attach a prepared/running campaign by recorded run
+                      id; NEVER relaunches a recorded launch. Resume only
+                      re-attaches — re-invoke run --round <A|B> afterwards
+                      to continue the round's observation/sequencing loop.
+  report              Forensic bundle: results/report.json + report.txt after
+                      owned cleanup (cleanup failure propagates).
+  arm <phase>         Pre-storm arming step against a campaign:
+                      single-flight-prelude | aged-state | seed-validation
+                      (executes in the real rehearsal gate; recorded here as
+                      the next-gate dependency).
+                      'arm aged-state --seed-root <dir>' ADOPTS an owned aged
+                      seed's immutable DB snapshot + event streams into the
+                      campaign's private state root (launch-free; the campaign
+                      stays prepared and unqualified). A foreign/mismatched
+                      root or a hash mismatch refuses before any write.
+                      'arm seed-validation' runs the seed tooling's routing
+                      matrix + O12 over the INSTALLED adopted state and applies
+                      Igor's 2026-09-23 rule: the gate blocks ONLY on FAIL rows
+                      of seed-integrity class, policy-class product findings
+                      are recorded with counts, and NOT_RUN/NOT_EVALUABLE rows
+                      are carried. Launch-free; records arming/seed-validation
+                      .json and leaves the campaign prepared/unqualified.
+
+Options:
+  -h, --help          Print this help.
+
+plan/prepare options:
+  --installed-catalog-root <dir>   Installed catalog (default
+                      torture-test/var/home/.tamandua/workflows).
+  --bundled-workflows-root <dir>   Bundled catalog (default <repo>/workflows).
+  --fixture <name>    tt-poly | tt-poly-lite (recorded identity).
+
+prepare options:
+  --profile <name>                 Campaign profile: SCRIPTED_REHEARSAL (default,
+                      the zero-model infrastructure rehearsal) or REAL (the real
+                      storm: real pi/hermes/dsh harnesses + the real product
+                      daemon). Recorded in descriptor.json,
+                      state.rehearsal.profile and resource_plan.daemon.kind.
+                      An unknown/empty value refuses TT_USAGE before any effect.
+                      REAL additionally resolves each roster harness binary
+                      (TAMANDUA_PI_BINARY/HERMES/DSH override, else PATH) and
+                      pins path+--version+sha256 into descriptor.runtime_pins;
+                      a missing/unresolvable roster harness refuses
+                      TT_UNRESOLVED_BINARY before any effect.
+  --spend-cap-tokens <n>           HARD token cap (STORM-REAL US-006). REQUIRED
+                      for --profile REAL (prepare/run/rehearse refuse without it)
+                      and recorded in state.rehearsal.spend_cap +
+                      descriptor.spend_cap. The cap is enforced on every
+                      observation tick: a crossing aborts the campaign with
+                      owned cleanup and an honest aborted report. Unused by
+                      SCRIPTED_REHEARSAL (a cap may still be supplied).
+  --spend-cap-scope paid|total     What the cap counts (default total). 'paid'
+                      counts ONLY paid-provider tokens (dsh) — local-endpoint
+                      pi/hermes tokens are counted/reported but never consume
+                      the paid cap. 'total' counts every counted token.
+  --scale <full|lite>              Campaign scale (STORM-REAL US-008). 'full'
+                      (default) prepares the complete storm roster. 'lite'
+                      prepares the spec's capacity-scaled tt-poly-lite pilot
+                      roster (fdmw pi ts, bfmw hermes python, quarantine-mw pi
+                      ts -> broken-tests, do-now agitator) with a timer cap
+                      RECOMPUTED from the actual lite roster's agent counts, a
+                      reduced Round B chaos plan (one colleague commit, one
+                      worker kill) and the tt-poly-lite fixture identity. An
+                      unknown/empty value refuses TT_USAGE before any effect.
+  --pending-candidate <dir>        Also prepare a DESIGNATED PENDING
+                      CANDIDATE: a second, fully-prepared
+                      SCRIPTED_REHEARSAL campaign (fresh private exec
+                      identity + product DB, same fixture/profile/catalog)
+                      that is NEVER executed, and record
+                      state.pending_candidate = {campaign_id, dir} in the
+                      PRIMARY campaign state.json + descriptor.json. The
+                      candidate keeps the SF-9 consistency gate honest by
+                      requiring a genuine on-disk unexecuted campaign (the
+                      readiness file may only LOCATE it). Refuses TT_EXISTS
+                      when <dir> already exists or lives inside the primary
+                      campaign dir; never overwrites. Launch-free.
+
+run/prepare options (orchestrator-owned fixture identity, STORM-W5 req 1):
+  --origin-repo <dir>    The fixture origin/work clone repo path (merge
+                         target; used for O2 ref snapshots and dirty-tree).
+  --colleague-repo <dir> The second clone a tt-chaos colleague-commit uses.
+  --cc1-file <rel>       Unrelated file for colleague commit #1.
+  --cc2-file <rel>       Same-line file for colleague commit #2 (B3's area).
+  --park-repo <dir>      Repo whose working tree dirty-tree dirties for PARK.
+  --seed-ref <ref>       Seed/storm composite ref (default seed/storm).
+  --task-file-root <dir> Where per-run task files are provisioned (default:
+                         <run>.task.md next to the campaign; recorded).
+
+run options (Round A/B read-path pounding, spec 09):
+  --round-wall-ms <n>  Explicit per-round wall bound in milliseconds
+                      (STORM-REAL US-012). For a REAL campaign it MUST be at
+                      least 6h (21600000); a smaller value refuses TT_USAGE
+                      (exit 4). Omitted for REAL, the campaign-level T+44h
+                      wedge bounds the round — never the scripted 3h Round-B
+                      corridor. SCRIPTED_REHEARSAL keeps its existing
+                      per-round defaults unchanged, and may set any positive
+                      value.
+  --detach            Launch tt-storm run in its own session (setsid on
+                      Linux, nohup elsewhere) with stdout/stderr captured under
+                      <campaign>/logs/run-<round>.detached.<stamp>.{out,err}.log,
+                      so the observation loop survives the operator's ssh
+                      session ending. All synchronous refusals (containment,
+                      spend cap, qualification, approval, budget) happen in
+                      the foreground BEFORE the child is spawned; the child
+                      re-validates and runs the round.
+  --pounding-dashboard-url <url>  Dashboard URL pounded every 30s.
+  --pounding-mcp-tools <a,b>      MCP tool names (up to 2) pounded each round.
+  --pounding-cadence-ms <n>       Pounding cadence (default 30000).
+  --pounding-latency-bound-ms <n> First-byte latency bound (default 2000).
+  (When no pounding options are given, read-path pounding is recorded
+   first-class NOT_RUN — never a fabricated fired.)
+
+run/resume/report options:
+  --campaign <dir>    Campaign directory (a tt-storm prepare output).
+  --round <A|B>       Round to run/resume (run/resume).
+  --db <path>         Campaign DB for observation (default:
+                      torture-test/var/home/.tamandua/tamandua.db).
+
+approve options:
+  --campaign <dir>    Prepared campaign to qualify.
+  --approval-file <path>
+                      Coordinator-issued approval JSON (read-only; never
+                      created or altered by this tool).
+
+rehearse options:
+  --campaign <dir>    Prepared campaign to rehearse.
+  --round <A|B>       Round to rehearse (default A).
+  --approval-file <path>
+                      Coordinator-issued approval JSON whose gate hashes match
+                      this checkout (read-only; never created by this tool).
+
+arm options:
+  --campaign <dir>    Prepared campaign to arm.
+  --seed-root <dir>   Owned tt-storm-aged seed root to ADOPT (aged-state
+                      phase). Its manifest/owned identity and every pinned
+                      snapshot/event sha256 are verified before any write; a
+                      foreign/mismatched root refuses without partial install.
+  --seed-validation-matrix <file>
+                      Offline replay for 'arm seed-validation': load a
+                      precomputed routing matrix (a rows array or {rows:[...]})
+                      instead of running the seed tooling over the installed
+                      DB, and skip the O12 leg. The classification/gate/rule
+                      are identical. Useful for re-classifying a recorded
+                      matrix without a live DB.
+`;
+
+function parseArgv(argv) {
+  const positionals = [];
+  const opts = {};
+  let help = false;
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '-h' || a === '--help') { help = true; continue; }
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      // Boolean flags never consume the next token.
+      if (key === 'detach') { opts[key] = true; continue; }
+      if (i + 1 >= argv.length) throw refusal(`missing value for ${a}`, 'TT_USAGE');
+      opts[key] = argv[i + 1];
+      i += 1;
+    } else {
+      positionals.push(a);
+    }
+  }
+  return { help, positionals, opts };
+}
+
+function fixtureOpts(opts) {
+  const collect = (k) => (opts[k] !== undefined ? opts[k] : null);
+  return {
+    originRepo: collect('origin-repo'),
+    colleagueRepo: collect('colleague-repo'),
+    cc1File: collect('cc1-file'),
+    cc2File: collect('cc2-file'),
+    parkRepo: collect('park-repo'),
+    seedRef: collect('seed-ref') ?? 'seed/storm',
+  };
+}
+
+function poundingOpts(opts) {
+  const url = opts['pounding-dashboard-url'];
+  const toolsRaw = opts['pounding-mcp-tools'];
+  if (!url && !toolsRaw) return null;
+  const tools = toolsRaw ? String(toolsRaw).split(',').map((s) => s.trim()).filter(Boolean) : ['runs.list', 'run.status'];
+  return {
+    dashboardUrl: url ?? null,
+    mcpToolNames: tools,
+    cadenceMs: opts['pounding-cadence-ms'] ? Number(opts['pounding-cadence-ms']) : 30_000,
+    latencyBoundMs: opts['pounding-latency-bound-ms'] ? Number(opts['pounding-latency-bound-ms']) : 2_000,
+  };
+}
+
+function baseOpts(opts) {
+  const fixtureIdentity = fixtureOpts(opts);
+  const pounding = poundingOpts(opts);
+  return {
+    installedCatalogRoot: opts['installed-catalog-root'] ?? DEFAULT_INSTALLED_CATALOG_ROOT,
+    bundledCatalogRoot: opts['bundled-workflows-root'] ?? DEFAULT_CATALOG_ROOT,
+    fixture: { name: opts.fixture ?? 'tt-poly', basis: 'operator-recorded identity at prepare time' },
+    // STORM-REAL US-001: the campaign profile identity. Left unparsed here so
+    // only launch/prepare paths validate it (plan/help stay side-effect free);
+    // the prepare path replaces it with the parsed canonical value.
+    profile: opts.profile ?? null,
+    // STORM-REAL US-008: the campaign scale identity. Left unparsed here (the
+    // prepare path validates/parses it) so plan/help stay side-effect free.
+    scale: opts.scale ?? null,
+    // STORM-REAL US-006: the hard spend cap. Left unparsed here (prepare/run
+    // validate it) so plan/help stay side-effect free.
+    spendCapTokens: opts['spend-cap-tokens'] ?? null,
+    spendCapScope: opts['spend-cap-scope'] ?? null,
+    // STORM-REAL US-012: the explicit per-round wall bound. Left unparsed here
+    // (the launching routes resolve/validate it against the persisted profile)
+    // so plan/help stay side-effect free.
+    roundWallMs: opts['round-wall-ms'] ?? null,
+    dbPath: opts.db ?? path.join(VAR_ROOT, 'home', '.tamandua', 'tamandua.db'),
+    fixtureIdentity,
+    pounding,
+    taskFileRoot: opts['task-file-root'] ?? null,
+  };
+}
+
+// Build the ONE admitted private exec context for an operator invocation. All
+// real modes (prepare/run/resume/report/arm) construct it FIRST; every later
+// state write is behind assertModeContained. plan/help stay side-effect free
+// and do NOT construct a context (nothing is spawned).
+function execCtxFor({ bopts, ownerRef }) {
+  return buildPrivateExecContext({
+    varRoot: VAR_ROOT,
+    binaries: resolveBinaries(),
+    dbPath: bopts.dbPath,
+    ownerRef,
+  });
+}
+
+// Source pins for plan/prepare/rehearse qualification: full commit sha
+// (git rev-parse HEAD), the committed TREE sha (rev-parse HEAD^{tree}) and
+// tree_dirty = whether the working tree carries uncommitted changes (git
+// status --porcelain non-empty). All three are the exact identity a
+// coordinator approval must match (source commit/tree + tree_dirty per the
+// rehearsal story), never a null placeholder. Failures surface nulls — the
+// caller then refuses anything that requires source pinning.
+async function gitProvenance() {
+  const runGit = (args) => spawnSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+  try {
+    const head = runGit(['rev-parse', 'HEAD']);
+    const tree = runGit(['rev-parse', 'HEAD^{tree}']);
+    const status = runGit(['status', '--porcelain']);
+    if (head.status !== 0 || tree.status !== 0 || status.status !== 0) {
+      return { commit: null, tree: null, tree_dirty: null };
+    }
+    const commit = String(head.stdout ?? '').trim();
+    const treeSha = String(tree.stdout ?? '').trim();
+    const porcelain = String(status.stdout ?? '').trimEnd();
+    return {
+      commit: /^[0-9a-f]{40}$/.test(commit) ? commit : null,
+      tree: /^[0-9a-f]{40}$/.test(treeSha) ? treeSha : null,
+      tree_dirty: porcelain !== '',
+    };
+  } catch {
+    return { commit: null, tree: null, tree_dirty: null };
+  }
+}
+
+// Real ctx bundle shared by run/resume/report/arm: REAL fs/clock/db/git +
+// the exec-context-bound real proc + real phase probe. db is REAL_DB (the
+// canonicalizing node:sqlite seam) — the engine opens it per read.
+//
+// US-002 (STORM-REHEARSAL-FIX5): exported so the hold-wiring self-test can
+// construct the engine EXACTLY as the CLI does (same opts injection path,
+// including the real probePhaseMarker override) instead of a hand-built ctx.
+// Importing this module is side-effect-free: main() is guarded by
+// `import.meta.url === pathToFileURL(process.argv[1]).href`.
+// FIX5 US-006: derive the private control-plane port from the campaign's
+// materialized control URL (state.daemon_ports.controlUrl). Pure; null when the
+// URL is absent/malformed.
+function controlPortForSpawn(controlUrl) {
+  if (typeof controlUrl !== 'string' || controlUrl.length === 0) return null;
+  try {
+    const port = Number(new URL(controlUrl).port);
+    return Number.isInteger(port) && port > 0 ? String(port) : null;
+  } catch {
+    return null;
+  }
+}
+
+// STORM-REAL US-006: a REAL campaign's launching routes (rehearse/run) REQUIRE
+// the hard spend cap. The cap persisted at prepare is the authority the
+// observation tick enforces; the operator must re-supply it here (and it must
+// match the persisted { scope, tokens } EXACTLY) so a REAL launch can never
+// proceed with a missing or silently-substituted cap. SCRIPTED_REHEARSAL is
+// unaffected (returns the persisted cap, normally null). Refuses with exit 4
+// (TT_USAGE) before any launch.
+function requireRealSpendCapOrRefuse(state, bopts, mode) {
+  const verdict = resolveLaunchSpendCap({
+    profile: profileFromCampaignState(state),
+    persisted: spendCapFromState(state),
+    rawTokens: bopts.spendCapTokens,
+    rawScope: bopts.spendCapScope,
+  });
+  if (!verdict.ok) {
+    process.stderr.write(`REFUSED: ${verdict.reason} (on ${mode}).\n`);
+    process.exit(4);
+  }
+  return verdict.cap;
+}
+
+// STORM-REAL US-012: resolve the per-round wall budget from the PERSISTED
+// campaign profile (never a CLI flag) plus an optional explicit
+// --round-wall-ms. A REAL campaign refuses a configured cap below the 6h
+// minimum with exit 4 BEFORE any round effect; with no configured cap its
+// effective round window is the campaign-level T+44h wedge (never the scripted
+// 3h Round-B corridor). SCRIPTED_REHEARSAL keeps its existing per-round
+// defaults unchanged. The caller threads the returned effective window into
+// ctx.opts.roundWindowMs.
+function resolveRoundWallBudgetOrRefuse(state, bopts, round) {
+  const verdict = resolveRoundWallBudget({
+    profile: profileFromCampaignState(state),
+    round,
+    configuredWallMs: bopts.roundWallMs,
+  });
+  if (!verdict.ok) {
+    process.stderr.write(`REFUSED: ${verdict.reason} (code ${verdict.code}).\n`);
+    process.exit(4);
+  }
+  return verdict;
+}
+
+// STORM-REAL US-012: re-exec `tt-storm run` in its own session so the round's
+// observation loop survives the operator's ssh session ending. The child
+// inherits this invocation's env and argv (minus --detach, so it never
+// recurses) and re-validates + runs the round. stdout/stderr are captured under
+// the campaign's logs dir (setsid/nohup launcher, platform-selected).
+function launchDetachedRun({ campaignDir, round, argv, at }) {
+  const logs = detachedRunLogPaths({ campaignDir, round, at });
+  fs.mkdirSync(logs.dir, { recursive: true });
+  const invocation = buildDetachedRunInvocation({
+    nodeBin: process.execPath,
+    cliPath: path.join(HERE, 'tt-storm'),
+    argv,
+    launcher: detachLauncherForPlatform(process.platform),
+    stdoutLog: logs.stdout,
+    stderrLog: logs.stderr,
+  });
+  const outFd = fs.openSync(logs.stdout, 'a');
+  const errFd = fs.openSync(logs.stderr, 'a');
+  let child;
+  try {
+    // NOTE: NOT Node's `detached: true` — the launcher must be the
+    // process-group leader so setsid(2) succeeds in-process and the reported
+    // pid is the actual round process (not a short-lived forked wrapper).
+    child = spawn(invocation.launcher, invocation.args, {
+      cwd: REPO_ROOT,
+      env: process.env,
+      stdio: ['ignore', outFd, errFd],
+    });
+  } finally {
+    fs.closeSync(outFd);
+    fs.closeSync(errFd);
+  }
+  child.unref();
+  return { ...invocation, ...logs, pid: child.pid ?? null };
+}
+
+export function realCtx({ bopts, execCtx, campaignDir }) {
+  // S1 (run #56): deliver the campaign's materialized daemon env
+  // ({ TT_DC_ENV_SCRIPTED, TT_FORCE_NO_SYSTEMD }) into the proc bundle so every
+  // daemon-control dispatch boots under the private roots/ports, not the
+  // default fixed 5334/5338/5339 under var/home-scripted.
+  const proc = makeRealProc({ execCtx, daemonEnv: bopts.daemonEnv ?? null, controlUrl: bopts.controlUrl ?? null });
+  // FIX5 US-006 (SF-8 wiring): the engine's `tamandua`/`chaos`/`daemon`
+  // channels spawn the product CLI with ctx.opts.spawnEnv (a plain env map the
+  // engine wraps as { env }). Under the private exec context
+  // TAMANDUA_TEST_GUARD=1 makes the control client REFUSE every control request
+  // when TAMANDUA_CONTROL_PORT is absent, so a stop/delete/pause/resume/nudge
+  // dispatched without it is a silent no-op (the CLI still updates the DB row
+  // and exits 0) and a stop/delete never tears down the daemon's scheduled
+  // harness workdir before the immediate B5 relaunch — the relaunch then fails
+  // with "harness workdir is already scheduled". Deliver the campaign's private
+  // control port so the control-plane verbs really reach the contained daemon.
+  const spawnPort = controlPortForSpawn(bopts.controlUrl);
+  const spawnEnv = bopts.spawnEnv ?? (spawnPort ? { TAMANDUA_CONTROL_PORT: spawnPort } : undefined);
+  return {
+    fs: REAL_FS,
+    clock: REAL_CLOCK,
+    proc,
+    db: REAL_DB,
+    git: REAL_GIT,
+    varRoot: VAR_ROOT,
+    campaignDir,
+    opts: {
+      ...bopts,
+      dbPath: execCtx.db_path,
+      // SF-12 (fix-6): an explicitly supplied launch cwd (e.g. an owned
+      // campaign dir) is honoured so a rehearsal can prove its launch argv is
+      // absolute without relying on the private HOME as the resolving cwd. The
+      // real CLI supplies none, so the default stays execCtx.home_root.
+      launchCwd: bopts.launchCwd ?? execCtx.home_root,
+      // SF-3: expose the campaign's private control-plane URL to the engine so
+      // each S9/S10 admission attempt can take a numeric freeSlots snapshot at
+      // decision time (from state.daemon_ports, materialized before realCtx).
+      controlUrl: bopts.controlUrl ?? null,
+      spawnEnv,
+      // NOTE: TAMANDUA_MAX_ACTIVE_TIMERS is deliberately NOT set here — the
+      // engine derives the cap from the campaign's recorded source
+      // (state.source.active_cap) per launch. A stray override here could
+      // silently weaken the queue assertion.
+      probePhaseMarker: async (ctx, state, ph) => {
+        // Full verdict (marker_satisfied | not_yet | evidence_error) — the
+        // engine's wait loop keeps UNKNOWN distinct from plain not-yet
+        // (reviewer issue G1) and feeds the real ref evidence channel so
+        // landing/ack markers read mechanical refs, never a recorded phase.
+        return probePhaseMarkerReal({
+          dbOpen: (p) => REAL_DB.open(p),
+          dbPath: execCtx.db_path,
+          state,
+          ph,
+          refs: makeRefsChannel(ctx, state),
+          // US-004: the product merge-event evidence channel under the
+          // campaign's private TAMANDUA_STATE_DIR.
+          stateRoot: execCtx.state_root,
+        });
+      },
+      // Real report finalization: an explicit owned-resource cleanup with
+      // positive evidence (absent/failed/unsettled required cleanup cannot
+      // mean PASS; files/worktrees/state retained). The owned-pid inventory
+      // comes from THIS proc bundle's own registry — no generic liveness
+      // guesses about processes this invocation never owned. US-002: when the
+      // campaign records an owned rehearsal daemon (state.daemon), the
+      // cleanup inventory additionally requires its POSITIVE shutdown
+      // evidence via daemon-control (the wrapper's recorded process-start
+      // identity gates the stop) — an absent/undefined/{}/timeout daemon
+      // shutdown can never mean PASS.
+      runOwnedCleanup: async (runCtx, state) => {
+        const handlers = makeCampaignCleanupHandlers(execCtx, { ownedPids: proc.ownedPids() });
+        const inventory = ['campaign-owned'];
+        const resources = { ownedPids: proc.ownedPids() };
+        const hadRunningDaemon = state?.daemon?.status === 'running';
+        const hasDaemon = Boolean(state?.daemon);
+        if (hasDaemon) {
+          const kind = state.daemon.kind ?? REHEARSAL_DAEMON_KIND;
+          const control = makeRehearsalDaemonControl({
+            proc,
+            kind,
+            fsx: REAL_FS,
+            provenanceDir: path.join(TT_DIR, 'var', 'daemon-control'),
+          });
+          // US-004 (S6): the handler also reaps the campaign's standalone
+          // dashboard/MCP children by provenance and verifies the campaign's
+          // OWN bind0-allocated ports are free, so it is wired even when the
+          // main daemon is already recorded stopped (the orphaned children can
+          // outlive it). privateStateDir/daemonPorts come from the persisted
+          // campaign state, never a re-derivation.
+          handlers['rehearsal-daemon'] = makeRehearsalDaemonCleanupHandler({
+            control,
+            record: state.daemon,
+            fsx: REAL_FS,
+            privateStateDir: execCtx.state_root,
+            daemonPorts: state.daemon_ports ?? null,
+          });
+          inventory.push('rehearsal-daemon');
+          resources.daemonControl = control;
+          resources.daemonRecord = state.daemon;
+          resources.privateStateDir = execCtx.state_root;
+          resources.daemonPorts = state.daemon_ports ?? null;
+        }
+        const res = await runOwnedCleanup({ execCtx, handlers, inventory, resources });
+        // Record the exact positive closure into campaign state so the report
+        // and forensics show the daemon stopped by THIS cleanup, never leave a
+        // stale 'running' claim after the process was closed.
+        if (res.ok && hadRunningDaemon && state?.daemon) {
+          state.daemon = { ...state.daemon, status: 'stopped', stopped_at: REAL_CLOCK.nowUtc() };
+          try { saveState({ fs: REAL_FS, campaignDir, state }); } catch { /* best-effort */ }
+        }
+        return res;
+      },
+    },
+  };
+}
+
+// Materialize the rehearsal daemon listener ports + per-campaign env script
+// (US-002; STORM-REAL US-004). Ports are bind0-allocated ONCE per campaign and
+// persisted into state.daemon_ports so Round A, Round B (incl. the daemon
+// bounce) and the report reuse the SAME listeners. The env script pins the
+// private roots, the allocated ports and the DERIVED plan cap; the PROFILE
+// selects the renderer + the daemon-control seam:
+//   * SCRIPTED_REHEARSAL -> renderRehearsalDaemonEnvScript (frozen scripted
+//     runtimes + guard=1), applied via TT_DC_ENV_SCRIPTED (byte-identical to
+//     the pre-US-004 behaviour);
+//   * REAL -> renderRealDaemonEnvScript (resolved real harness binaries, no
+//     forced guard), applied via TT_DC_ENV_REAL so daemon-control kind=real
+//     boots the private contained product daemon under the campaign roots.
+// Idempotent: re-runs with persisted ports/script change nothing. Returns
+// { ok, daemonKind, profile, ports, envScript, daemonEnv } or refuses.
+export async function materializeRehearsalDaemon({ state, campaignDir, execCtx, fsx = REAL_FS }) {
+  const daemonKind = state?.rehearsal?.resource_plan?.daemon?.kind ?? REHEARSAL_DAEMON_KIND;
+  // The persisted profile (or a real daemon kind) is the authority for which
+  // renderer/env-seam is materialized; it is never a CLI re-derivation.
+  const real = isRealProfile(state?.rehearsal?.profile) || daemonKind === daemonKindForProfile(REAL);
+  let ports = state.daemon_ports ?? null;
+  if (!ports) {
+    ports = await allocRehearsalListenerPorts({});
+    state.daemon_ports = ports;
+    saveState({ fs: fsx, campaignDir, state });
+  }
+  const envScript = path.join(campaignDir, real ? REAL_DAEMON_ENV_NAME : REHEARSAL_DAEMON_ENV_NAME);
+  if (!fsx.existsSync(envScript)) {
+    let content;
+    if (real) {
+      // The REAL env script carries exactly the harness binaries the campaign
+      // resolved/pinned at prepare (state.rehearsal.runtime_pins.harnesses) —
+      // never a PATH re-derivation at launch. Missing pins are a hard refusal
+      // (renderRealDaemonEnvScript throws), never a silently harness-less real
+      // env.
+      const harnessPins = state?.rehearsal?.runtime_pins?.harnesses ?? null;
+      const harnessBinaries = {};
+      for (const [harness, pin] of Object.entries(harnessPins ?? {})) {
+        if (pin && typeof pin.path === 'string' && pin.path.length > 0) harnessBinaries[harness] = pin.path;
+      }
+      content = renderRealDaemonEnvScript({
+        home: execCtx.home_root,
+        stateDir: execCtx.state_root,
+        dbPath: execCtx.db_path,
+        tmpDir: execCtx.tmp_root,
+        ports,
+        harnessBinaries,
+        nodeBinDir: path.dirname(process.execPath),
+        pathExtra: rehearsalDaemonPathExtra(REPO_ROOT),
+        repoRoot: REPO_ROOT,
+        ttRoot: path.join(TT_DIR, 'var'),
+        maxActiveTimers: state?.source?.active_cap ?? null,
+      });
+    } else {
+      const piBinary = path.join(TT_DIR, 'scripted-runtimes', 'bin', 'scripted-pi');
+      const hermesBinary = path.join(TT_DIR, 'scripted-runtimes', 'bin', 'scripted-hermes');
+      // US-002 (fix-2, S5/S8): deliver the COMPLETE per-campaign scripted-runtime
+      // contract (behaviors file + private state dir) and the DERIVED active cap
+      // into the daemon env. Attempt 2 rendered the script without either, so the
+      // frozen runtimes crashed on mkdir('') and the daemon ran its default cap
+      // (50) instead of the campaign's derived 52. The scripted state dir is
+      // (re)created here so the frozen runtime's first write cannot ENOENT.
+      const scriptedRuntime = state?.rehearsal?.scripted_runtime ?? null;
+      if (scriptedRuntime?.state_dir) {
+        try {
+          fsx.mkdirSync(scriptedRuntime.state_dir, { recursive: true });
+        } catch (err) {
+          return { ok: false, reason: `cannot create the campaign scripted state dir ${scriptedRuntime.state_dir}: ${err?.message ?? String(err)}`, ports, envScript };
+        }
+      }
+      content = renderRehearsalDaemonEnvScript({
+        home: execCtx.home_root,
+        stateDir: execCtx.state_root,
+        dbPath: execCtx.db_path,
+        tmpDir: execCtx.tmp_root,
+        ports,
+        piBinary,
+        hermesBinary,
+        nodeBinDir: path.dirname(process.execPath),
+        pathExtra: rehearsalDaemonPathExtra(REPO_ROOT),
+        repoRoot: REPO_ROOT,
+        ttRoot: path.join(TT_DIR, 'var'),
+        scriptedBehaviors: scriptedRuntime?.behaviors_file ?? null,
+        scriptedStateDir: scriptedRuntime?.state_dir ?? null,
+        maxActiveTimers: state?.source?.active_cap ?? null,
+      });
+    }
+    fsx.writeFileSync(envScript, content);
+  }
+  const daemonEnv = real
+    ? { TT_DC_ENV_REAL: envScript, TT_FORCE_NO_SYSTEMD: '1' }
+    : { TT_DC_ENV_SCRIPTED: envScript, TT_FORCE_NO_SYSTEMD: '1' };
+  return { ok: true, daemonKind, profile: state?.rehearsal?.profile ?? null, ports, envScript, daemonEnv };
+}
+
+// US-010 (SF-9) / STORM-REAL US-015: prepare the DESIGNATED PENDING
+// CANDIDATE alongside the primary campaign. The candidate is a SECOND
+// fully-prepared campaign of the SAME profile and scale as the primary
+// (SCRIPTED_REHEARSAL or REAL, full or lite) — fresh private exec identity +
+// product-schema DB, the same fixture/profile/catalog — that is NEVER
+// executed. It keeps a genuinely prepared, unexecuted campaign on disk so the
+// consistency gate does not depend on a coordinator-authored readiness file
+// alone (the readiness file may LOCATE it, but never substitutes for it).
+// The primary records {campaign_id, dir} in state.json + descriptor.json.
+//
+// US-015 makes the profile/scale carriage EXPLICIT and fail-closed: the
+// candidate's provenance is copied from the primary (never re-derived from a
+// flag that could drift), and after prepare the persisted candidate profile +
+// scale are asserted equal to the primary's so a --profile REAL --scale lite
+// pilot can never designate a scripted or full candidate (or vice versa).
+async function preparePendingCandidate({ primary, primaryCtx, prov, opts, bopts, scriptedRuntimes, argv }) {
+  const candidateDir = assertPendingCandidateDest(primary.campaignDir, opts['pending-candidate'], { varRoot: VAR_ROOT, fs: REAL_FS });
+  const candidateId = path.basename(candidateDir);
+  // Fresh private exec identity: distinct HOME/state/DB/TMP under the owned
+  // var root, so the product-schema DB is created fresh (never a stale reuse)
+  // and the candidate's scripted state dir cannot collide with the primary's.
+  const execRoot = path.join(VAR_ROOT, 'pending-exec', candidateId);
+  const candidateExecCtx = buildPrivateExecContext({
+    varRoot: VAR_ROOT,
+    binaries: resolveBinaries(),
+    homeRoot: path.join(execRoot, 'home'),
+    stateRoot: path.join(execRoot, 'state'),
+    dbPath: path.join(execRoot, 'state', 'tamandua.db'),
+    tmpRoot: path.join(execRoot, 'tmp'),
+    ownerRef: `pending-candidate ${candidateId}`,
+  });
+  const provisioned = await provisionProductExecDb({ execCtx: candidateExecCtx });
+  const candidateCtx = {
+    fs: REAL_FS,
+    clock: REAL_CLOCK,
+    proc: makeRealProc({ execCtx: candidateExecCtx }),
+    db: REAL_DB,
+    git: REAL_GIT,
+    varRoot: VAR_ROOT,
+    campaignDir: candidateDir,
+    opts: {
+      ...bopts,
+      dbPath: candidateExecCtx.db_path,
+      // US-015: SAME profile/scale/fixture identity as the primary (the
+      // candidate is a genuine prepared campaign of the same shape). The
+      // profile/scale are taken from the prepared primary, not re-derived
+      // from the raw flags, so they cannot drift from what the primary is.
+      profile: primaryCtx.opts.profile ?? null,
+      scale: primaryCtx.opts.scale ?? null,
+      spendCapTokens: primaryCtx.opts.spendCapTokens ?? null,
+      spendCapScope: primaryCtx.opts.spendCapScope ?? null,
+      fixture: primaryCtx.opts.fixture,
+      sourceCommit: prov.commit,
+      sourceTree: prov.tree,
+      sourceTreeDirty: prov.tree_dirty,
+      sourcePins: { commit: prov.commit, tree: prov.tree, tree_dirty: prov.tree_dirty },
+      execIdentity: provisioned.receipt,
+      rehearsalPrepare: true,
+      binaries: candidateExecCtx.binaries,
+      scriptedRuntimes,
+      gateHashes: computeGateHashes(),
+      coordinatorApprovalFile: opts['approval-file'] ?? DEFAULT_COORDINATOR_APPROVAL_FILE,
+      gitEnv: candidateExecCtx.child_env,
+      rehearseCommandCli: path.join(HERE, 'tt-storm'),
+      // A pending candidate is a LEAF: it never designates another candidate.
+    },
+    argv,
+  };
+  const candidateRes = await stormPrepare(candidateCtx);
+  // Fail-closed truthfulness check BEFORE recording the designation: the
+  // candidate must be a genuinely prepared, unexecuted campaign (never a
+  // fabricated/completed one we would then point the gate at).
+  const cs = candidateRes.state;
+  if (
+    cs.mode !== 'prepared' ||
+    cs.qualification?.real_launch_allowed === true ||
+    cs.report != null ||
+    Object.keys(cs.rounds?.A?.runs ?? {}).length > 0 ||
+    Object.keys(cs.rounds?.B?.runs ?? {}).length > 0
+  ) {
+    throw refusal(`pending candidate ${candidateDir} did not prepare as truthful pending`, 'TT_STATE');
+  }
+  // STORM-REAL US-015: the designated candidate MUST be the SAME profile and
+  // scale as the primary it backs — a REAL lite pilot can only ever point the
+  // consistency gate at a REAL lite candidate, never a scripted/full one.
+  const primaryProfile = primaryCtx.opts?.profile ?? null;
+  const candidateProfile = cs.rehearsal?.profile ?? null;
+  const primaryScale = scaleFromState(primary.state);
+  const candidateScale = scaleFromState(cs);
+  if (primaryProfile !== candidateProfile || primaryScale !== candidateScale) {
+    throw refusal(
+      `pending candidate ${candidateDir} prepared for profile ${candidateProfile}/${candidateScale} but the primary is ${primaryProfile}/${primaryScale} — same-profile candidate required`,
+      'TT_STATE',
+    );
+  }
+  return recordPendingCandidate({
+    ctx: primaryCtx,
+    campaignDir: primary.campaignDir,
+    state: primary.state,
+    descriptorName: DESCRIPTOR_NAME,
+    candidate: { campaign_id: candidateRes.campaignId, dir: candidateRes.campaignDir },
+  });
+}
+
+// Containment + persisted receipt revalidation shared by every mode that
+// writes campaign state. A campaign prepared without an exec-identity receipt
+// is refused (re-prepare) — unresolved ownership is never assumed.
+function requireContained({ mode, execCtx, campaignDir, state }) {
+  try {
+    assertModeContained({ mode, execCtx, campaignDir, fsx: REAL_FS });
+    if (state && state.exec_identity) {
+      revalidatePersistedExecIdentity({ execCtx, persisted: state.exec_identity, fsx: REAL_FS });
+    } else if (state) {
+      throw refusal(
+        `campaign ${campaignDir} carries no persisted exec-identity receipt (prepared before receipts existed) — re-prepare before ${mode}; unresolved ownership is refused`,
+        'TT_NOT_OWNED',
+      );
+    }
+    return { ok: true };
+  } catch (err) {
+    process.stderr.write(`REFUSED: ${err.message}\n`);
+    process.exit(err.code === 'TT_EXEC_ESCAPE' || err.code === 'TT_NOT_OWNED' ? 3 : 2);
+  }
+}
+
+async function main(argv) {
+  const { help, positionals, opts } = parseArgv(argv);
+  const cmd = positionals[0];
+  if (help || !cmd || cmd === 'help') {
+    process.stdout.write(USAGE);
+    process.exit(0);
+  }
+  const armPhase = positionals[1];
+  const bopts = baseOpts(opts);
+
+  if (cmd === 'plan') {
+    const prov = await gitProvenance();
+    const numbers = await deriveNumbers(bopts);
+    const plan = buildLaunchPlan(numbers);
+    process.stdout.write(JSON.stringify({
+      source_commit: prov.commit,
+      source_tree: prov.tree,
+      tree_dirty: prov.tree_dirty,
+      catalog: numbers.resolved,
+      per_workflow: Object.fromEntries(
+        Object.entries(numbers.counts).map(([wf, c]) => [wf, { stepAgents: c.distinctStepAgents, declared: c.declaredAgentsCount, agree: c.declaredVsStepsAgree, sourcePath: c.source?.path ?? null, sourceSha: c.source?.sha256 ?? null }]),
+      ),
+      active_cap: numbers.cap.total,
+      cap_detail: numbers.cap.perRun,
+      queued_demand: numbers.queued,
+      plan,
+    }, null, 2) + '\n');
+    return;
+  }
+
+  if (cmd === 'prepare') {
+    // STORM-REAL US-001: the campaign profile is an explicit identity. Parse
+    // and validate it FIRST so an unknown/empty --profile refuses TT_USAGE
+    // (exit 4) BEFORE any effect (no git spawn, no exec-context, no writes).
+    const profile = parseProfile(opts.profile);
+    bopts.profile = profile;
+    // STORM-REAL US-008: the campaign scale is an explicit identity, validated
+    // FIRST so an unknown/empty --scale refuses TT_USAGE (exit 4) BEFORE any
+    // effect. Absent a value the FULL default applies (unchanged).
+    const scale = parseScale(opts.scale);
+    bopts.scale = scale;
+    const prov = await gitProvenance();
+    const execCtx = execCtxFor({ bopts, ownerRef: `prepare ${new Date().toISOString()}` });
+    assertModeContained({ mode: 'prepare', execCtx, fsx: REAL_FS });
+    // S2 (run #56 abort): create the campaign's exec-identity DB FRESH through
+    // the PRODUCT schema path BEFORE anything is recorded. A pre-existing file
+    // at the private path (suite-provisioned hand-rolled runs DDL) refuses with
+    // TT_EXEC_DB_STALE instead of being captured and launched against; the
+    // returned receipt carries the freshly created DB's real dev/ino.
+    const provisioned = await provisionProductExecDb({ execCtx });
+    // US-001 rehearsal prepare: full fresh-owned input/profile/behavior
+    // provisioning (seeded catalog, owned fixture repos, per-run task files,
+    // owned roots + receipts, runtime pins, source-pinned descriptor). All of
+    // it stays launch-free (no daemon/harness/chaos). git children inherit the
+    // private exec context env (explicit minimum, authority stripped, guard1).
+    const scriptedRuntimes = {
+      pi: path.join(TT_DIR, 'scripted-runtimes', 'bin', 'scripted-pi'),
+      hermes: path.join(TT_DIR, 'scripted-runtimes', 'bin', 'scripted-hermes'),
+    };
+    const ctx = {
+      fs: REAL_FS, clock: REAL_CLOCK, proc: makeRealProc({ execCtx }), db: REAL_DB, git: REAL_GIT,
+      // Optional explicit destination: --campaign <dir> (absolute or relative)
+      // pins where the fresh campaign is created so a repeated prepare against
+      // the same destination refuses (TT_EXISTS, existing files untouched).
+      varRoot: VAR_ROOT,
+      campaignDir: opts.campaign ? path.resolve(opts.campaign) : null,
+      opts: {
+        ...bopts,
+        dbPath: execCtx.db_path,
+        // The requested campaign profile (STORM-REAL US-001); validated above
+        // and recorded in the descriptor/state by stormPrepare.
+        profile,
+        // STORM-REAL US-008: the requested scale; the lite pilot's fixture
+        // identity is tt-poly-lite and its roster is recorded in the plan.
+        scale,
+        // The rehearsal consumes an orchestrator-owned TINY fixture, never the
+        // full tt-poly corpus — labelled infrastructure rehearsal. The
+        // capacity-scaled lite pilot records the spec's tt-poly-lite fixture.
+        fixture: opts.fixture
+          ? bopts.fixture
+          : isLiteScale(scale)
+            ? { name: LITE_FIXTURE_NAME, basis: 'operator-recorded tt-poly-lite pilot identity at prepare time' }
+            : { name: 'tiny-owned-infrastructure-fixture', basis: REHEARSAL_LABEL },
+        sourceCommit: prov.commit,
+        sourceTree: prov.tree,
+        sourceTreeDirty: prov.tree_dirty,
+        sourcePins: { commit: prov.commit, tree: prov.tree, tree_dirty: prov.tree_dirty },
+        execIdentity: provisioned.receipt,
+        // US-001 rehearsal input builder options.
+        rehearsalPrepare: true,
+        binaries: execCtx.binaries,
+        scriptedRuntimes,
+        gateHashes: computeGateHashes(),
+        coordinatorApprovalFile: opts['approval-file'] ?? DEFAULT_COORDINATOR_APPROVAL_FILE,
+        gitEnv: execCtx.child_env,
+        rehearseCommandCli: path.join(HERE, 'tt-storm'),
+      },
+      argv,
+    };
+    const res = await stormPrepare(ctx);
+    process.stdout.write(`Campaign: ${res.campaignId}\nCampaign dir: ${res.campaignDir}\n`);
+    // STORM-REAL US-008: name the scale for a capacity-scaled campaign. The
+    // full default keeps its previous output byte-for-byte.
+    if (res.rehearsal && isLiteScale(scale)) {
+      process.stdout.write(`Campaign scale: ${res.state?.rehearsal?.roster_id ?? scale}\n`);
+    }
+    process.stdout.write(`Active timer cap (derived from actual registrations): ${res.numbers.cap.total}\n`);
+    const queuedDemand = res.numbers.queued ?? {};
+    if (Object.keys(queuedDemand).length > 0) {
+      process.stdout.write(`Queued demand: ${Object.entries(queuedDemand).map(([id, d]) => `${id}=${d}`).join(' ')}\n`);
+    }
+    if (res.rehearsal) {
+      process.stdout.write(`Rehearsal profile: ${res.rehearsal.descriptor.profile} — ${res.rehearsal.descriptor.label}\n`);
+      process.stdout.write(`Descriptor: ${path.join(res.campaignDir, 'descriptor.json')}\n`);
+      process.stdout.write(`Origin repo: ${res.rehearsal.fixture.originRepo}\n`);
+      process.stdout.write(`Task files: ${Object.keys(res.rehearsal.taskFiles).length} provisioned under ${res.rehearsal.inputRoots.tasksRoot}\n`);
+    }
+    process.stdout.write('Launch plan + intent recorded (intent.jsonl, state.json). NO launches performed.\n');
+    process.stdout.write(`Qualification: ${res.state.qualification.note}\n`);
+    // US-010 (SF-9): a designated pending candidate is prepared as a SECOND
+    // contained campaign alongside the primary and recorded in the primary
+    // state/descriptor. It is never executed by prepare (launch-free).
+    if (res.rehearsal && opts['pending-candidate']) {
+      const pending = await preparePendingCandidate({ primary: res, primaryCtx: ctx, prov, opts, bopts, scriptedRuntimes, argv });
+      process.stdout.write(`Pending candidate: ${pending.campaign_id} at ${pending.dir}\n`);
+    }
+    return;
+  }
+
+  if (cmd === 'arm') {
+    if (!armPhase) { process.stderr.write('arm requires a phase: single-flight-prelude | aged-state | seed-validation\n'); process.exit(4); }
+    if (!['single-flight-prelude', 'aged-state', 'seed-validation'].includes(armPhase)) {
+      process.stderr.write(`unknown arm phase: ${armPhase}\n`); process.exit(4);
+    }
+    if (!opts.campaign) { process.stderr.write('arm requires --campaign <dir>\n'); process.exit(4); }
+    const campaignDir = path.resolve(opts.campaign);
+    const st = loadState({ fs: REAL_FS, campaignDir });
+    if (!st.ok) { process.stderr.write(`arm: ${st.error}\n`); process.exit(2); }
+    const execCtx = execCtxFor({ bopts, ownerRef: `arm ${armPhase} ${st.state.campaign_id ?? campaignDir}` });
+    // Containment + persisted receipt BEFORE any write (STORM-REAL US-009).
+    requireContained({ mode: 'arm', execCtx, campaignDir, state: st.state });
+    if (armPhase === 'aged-state') {
+      // STORM-REAL US-009: adopt an owned aged seed's state into the
+      // campaign's private state root. The seed is verified (owned identity +
+      // snapshot/event hash pins) BEFORE any campaign write, so a foreign or
+      // mismatched root leaves the campaign untouched. Adoption is launch-free.
+      const seedRoot = opts['seed-root'];
+      if (!seedRoot) {
+        process.stderr.write('arm aged-state requires --seed-root <owned seed dir>\n');
+        process.exit(4);
+      }
+      let verified;
+      try {
+        verified = verifyAgedStateSeed({ seedRoot });
+      } catch (err) {
+        process.stderr.write(`REFUSED: ${err.message}\n`);
+        process.exit(err.code === 'TT_SEED_NOT_ARMABLE' ? 4 : 3);
+      }
+      let result;
+      try {
+        result = adoptAgedState({ campaignDir, execCtx, state: st.state, verified });
+      } catch (err) {
+        process.stderr.write(`REFUSED: ${err.message}\n`);
+        process.exit(err.code === 'TT_ARM_STATE_NOT_PREPARED' ? 3 : 2);
+      }
+      // Persist the re-pinned exec-identity ownership + arming record. The
+      // campaign mode/qualification are untouched (still prepared/unqualified).
+      saveState({ fs: REAL_FS, campaignDir, state: st.state });
+      const counts = result.receipt.adopted_counts;
+      process.stdout.write(`arm aged-state (campaign ${campaignDir}): armed\n`);
+      process.stdout.write(`Seed root: ${result.receipt.source_root}\n`);
+      process.stdout.write(`Snapshot sha256: ${result.receipt.snapshot_sha256}\n`);
+      process.stdout.write(`Adopted: ${counts.runs ?? '?'} runs, ${counts.steps ?? '?'} steps, ${counts.run_worktrees ?? '?'} run_worktrees, ${counts.event_files} event streams\n`);
+      process.stdout.write(`Campaign DB: ${result.receipt.db_destination}\n`);
+      process.stdout.write(`Campaign events: ${result.receipt.events_destination}\n`);
+      process.stdout.write(`Arming receipt: ${result.receipt_path}\n`);
+      process.stdout.write('Launch-free adoption: no daemon/harness was started; campaign remains prepared and unqualified.\n');
+      return;
+    }
+    if (armPhase === 'seed-validation') {
+      // STORM-REAL US-010: run the seed tooling's validation routing matrix +
+      // O12 over the INSTALLED adopted state and apply Igor's 2026-09-23 rule
+      // (blocks ONLY on seed-integrity FAIL rows; policy-class findings are
+      // counted; NOT_RUN/NOT_EVALUABLE rows are carried). Launch-free: no
+      // daemon/harness/model is started; the campaign stays prepared and
+      // unqualified. Validation is tied to the EXACT adopted DB bytes.
+      const agedReceipt = st.state.arming?.['aged-state'] ?? null;
+      const sourceRoot = agedReceipt?.source_root ?? null;
+      if (!sourceRoot) {
+        process.stderr.write('REFUSED: arm seed-validation requires a prior `arm aged-state` adoption (no aged-state receipt in campaign state)\n');
+        process.exit(3);
+      }
+      const installedDbPath = st.state.exec_identity?.db_path ?? execCtx.db_path;
+      if (!installedDbPath || !REAL_FS.existsSync(installedDbPath)) {
+        process.stderr.write(`REFUSED: installed campaign DB missing at ${installedDbPath ?? '(null)'}\n`);
+        process.exit(3);
+      }
+      const installedSha = sha256InstalledFile(installedDbPath);
+      if (agedReceipt?.snapshot_sha256 && installedSha !== agedReceipt.snapshot_sha256) {
+        process.stderr.write(`REFUSED: installed campaign DB sha256 ${installedSha} does not match the adopted snapshot ${agedReceipt.snapshot_sha256}; re-arm aged-state before validating\n`);
+        process.exit(3);
+      }
+      let matrix = null;
+      if (opts['seed-validation-matrix']) {
+        const mf = path.resolve(String(opts['seed-validation-matrix']));
+        let raw;
+        try {
+          raw = JSON.parse(REAL_FS.readFileSync(mf, 'utf8'));
+        } catch (err) {
+          process.stderr.write(`REFUSED: cannot read --seed-validation-matrix ${mf}: ${err.message}\n`);
+          process.exit(4);
+        }
+        const rows = Array.isArray(raw) ? raw : raw?.rows;
+        if (!Array.isArray(rows)) {
+          process.stderr.write(`REFUSED: --seed-validation-matrix ${mf} has no rows array\n`);
+          process.exit(4);
+        }
+        matrix = { rows };
+      }
+      let run;
+      try {
+        run = await runAdoptedSeedValidation({
+          campaignDir,
+          execCtx: { ...execCtx, db_path: installedDbPath },
+          sourceRoot,
+          repoRoot: REPO_ROOT,
+          matrix,
+          skipO12: Boolean(matrix),
+        });
+      } catch (err) {
+        process.stderr.write(`REFUSED: ${err.message}\n`);
+        process.exit(err.code === TT_SEED_VALIDATION_NOT_ARMED ? 3 : 2);
+      }
+      const gate = evaluateSeedValidationGate(run.classification);
+      const receipt = buildSeedValidationArmReceipt({
+        campaignDir,
+        sourceRoot,
+        installedDbPath,
+        installedDbSha256: installedSha,
+        snapshotSha256: agedReceipt?.snapshot_sha256 ?? null,
+        classification: run.classification,
+        o12: run.o12,
+      });
+      const written = writeSeedValidationArmReceipt({ campaignDir, receipt });
+      st.state.arming = {
+        ...(st.state.arming ?? {}),
+        'seed-validation': {
+          receipt_path: written.file,
+          source_root: receipt.source_root,
+          installed_db_sha256: receipt.installed_db_sha256,
+          gate: receipt.gate,
+          tally: receipt.tally,
+          armed_at_utc: receipt.armed_at_utc,
+        },
+      };
+      saveState({ fs: REAL_FS, campaignDir, state: st.state });
+      process.stdout.write(`arm seed-validation (campaign ${campaignDir}): ${gate.blocked ? 'BLOCKED' : 'armed'}\n`);
+      process.stdout.write(`Rule: ${SEED_VALIDATION_ARMING_RULE}\n`);
+      process.stdout.write(`Installed DB: ${installedDbPath}\n`);
+      process.stdout.write(`Installed DB sha256: ${installedSha}\n`);
+      process.stdout.write(`Matrix: PASS=${run.classification.matrix_tally.PASS} FAIL=${run.classification.matrix_tally.FAIL} NOT_RUN=${run.classification.matrix_tally.NOT_RUN} NOT_EVALUABLE=${run.classification.matrix_tally.NOT_EVALUABLE}\n`);
+      process.stdout.write(`Seed-integrity: pass=${run.classification.tally.seed_integrity.pass} fail=${run.classification.tally.seed_integrity.fail} blocking=${run.classification.tally.seed_integrity.blocking}\n`);
+      process.stdout.write(`Policy-class: pass=${run.classification.tally.policy_class.pass} fail=${run.classification.tally.policy_class.fail} findings=${run.classification.tally.policy_class.findings}\n`);
+      process.stdout.write(`Carried (NOT_RUN/NOT_EVALUABLE): ${gate.carried_count}\n`);
+      if (gate.blocked) {
+        process.stdout.write(`BLOCKED by seed-integrity FAIL rows: ${gate.blocked_oracles.join(', ')}\n`);
+      }
+      process.stdout.write(`Arming receipt: ${written.file}\n`);
+      process.stdout.write('Launch-free seed-validation: no daemon/harness was started; campaign remains prepared and unqualified.\n');
+      process.exit(gate.blocked ? 3 : 0);
+    }
+    process.stdout.write(`arm ${armPhase} (campaign ${campaignDir}): pending — executes in the real scripted rehearsal gate; NOT claimed complete in this run.\n`);
+    return;
+  }
+
+  if (cmd === 'rehearse') {
+    // The one real-rehearsal entrypoint. It REFUSES (TT_REHEARSAL_NOT_APPROVED)
+    // unless a coordinator-owned approval file matches this checkout's source
+    // commit AND the COMPLETE tested boundary/gate file hashes; changed
+    // safety/gate code requires fresh coordinator review, never automatic
+    // approval reuse (reviewer issue B / root defect #5: one strict validator
+    // for every launching route).
+    if (!opts.campaign) { process.stderr.write('rehearse requires --campaign <dir>\n'); process.exit(4); }
+    const approvalFile = opts['approval-file'];
+    if (!approvalFile) { process.stderr.write('rehearse requires --approval-file <path> (coordinator-issued)\n'); process.exit(4); }
+    const round = (opts.round ?? 'A').toUpperCase();
+    if (!['A', 'B'].includes(round)) { process.stderr.write(`rehearse --round must be A or B (got ${opts.round})\n`); process.exit(4); }
+    const campaignDir = path.resolve(opts.campaign);
+    const st = loadState({ fs: REAL_FS, campaignDir });
+    if (!st.ok) { process.stderr.write(`rehearse: ${st.error}\n`); process.exit(2); }
+    const prov = await gitProvenance();
+    const execCtx = execCtxFor({ bopts, ownerRef: `rehearse ${round} ${st.state.campaign_id ?? campaignDir}` });
+    requireContained({ mode: 'rehearse', execCtx, campaignDir, state: st.state });
+    // US-006: REAL requires the hard spend cap before any launch.
+    requireRealSpendCapOrRefuse(st.state, bopts, 'rehearse');
+    // US-012: resolve + apply the per-round wall budget (REAL cap >= 6h or the
+    // campaign-level wedge; SCRIPTED_REHEARSAL defaults unchanged).
+    const budget = resolveRoundWallBudgetOrRefuse(st.state, bopts, round);
+    bopts.roundWindowMs = budget.effectiveWindowMs;
+    let approval;
+    try {
+      approval = JSON.parse(REAL_FS.readFileSync(approvalFile));
+    } catch (err) {
+      process.stderr.write(`REFUSED: approval file unreadable/invalid: ${approvalFile} (${err.message})\n`);
+      process.exit(3);
+    }
+    const campaignId = st.state.campaign_id;
+    if (!campaignId) {
+      process.stderr.write(`REFUSED: campaign ${campaignDir} carries no campaign_id — cannot verify a campaign-scoped approval.\n`);
+      process.exit(3);
+    }
+    const gateHashes = computeGateHashes();
+    // STORM-REAL US-003: bind the approval to the profile THIS campaign was
+    // prepared for (from persisted state, never a CLI flag). An approval for
+    // the other profile — or one carrying no profile at all — is refused with
+    // TT_REHEARSAL_NOT_APPROVED, so the scripted rehearsal approval can never
+    // authorize a real storm and vice versa.
+    const expectedProfile = profileFromCampaignState(st.state);
+    const verdict = verifyCoordinatorApproval({ approval, campaignId, sourceCommit: prov.commit, gateHashes, expectedProfile });
+    if (!verdict.ok) {
+      process.stderr.write(`REFUSED: ${verdict.reason} (code ${verdict.code}). Campaign ${campaignId} stays unqualified; changed safety/gate code requires fresh coordinator review.\n`);
+      process.exit(3);
+    }
+    st.state.qualification = {
+      real_launch_allowed: true,
+      note: `coordinator rehearsal approval ${approvalFile} (kind ${approval?.approval_kind})`,
+      granted_at: REAL_CLOCK.nowUtc(),
+      approval_file: approvalFile,
+      source_commit: prov.commit,
+      profile: expectedProfile,
+      gate_hashes: gateHashes,
+    };
+    saveState({ fs: REAL_FS, campaignDir, state: st.state });
+    // US-002: materialize the ONE private daemon's bind0-allocated listeners +
+    // per-campaign env script, then drive the requested round through the
+    // rehearsal run driver (stormRunRehearsal) — the SAME engine round
+    // drivers (stormRunRoundA/B) with the prepared-campaign overlay (task
+    // files / fixture identity / worktree root) + daemon + pounding wiring.
+    const daemonRes = await materializeRehearsalDaemon({ state: st.state, campaignDir, execCtx });
+    if (!daemonRes.ok) {
+      process.stderr.write(`REFUSED: cannot materialize the rehearsal daemon: ${daemonRes.reason ?? 'unknown'}\n`);
+      process.exit(3);
+    }
+    const ctx = realCtx({ bopts: { ...bopts, daemonKind: daemonRes.daemonKind, daemonEnv: daemonRes.daemonEnv, daemonProvenanceDir: path.join(TT_DIR, 'var', 'daemon-control'), controlUrl: daemonRes.ports?.controlUrl ?? st.state.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
+    ctx.opts.rehearsalRun = true;
+    process.stdout.write(`Rehearsal approved for campaign ${campaignId} (round ${round}); gate hashes matched. Executing round ${round} with the real contained adapters.\n`);
+    await stormRunRehearsal(ctx, { round });
+    return;
+  }
+
+  if (cmd === 'approve') {
+    // Consume a COORDINATOR-OWNED approval file (never create/alter one).
+    // Reviewer issue B / root defect #5: approve routes through the SAME
+    // strict validator as rehearse (verifyCoordinatorApproval with the
+    // COMPLETE computed gate-hash set + exact non-empty campaign/source
+    // identity). An approval pinning NO gate hashes (the synthetic receipt
+    // R10 refuses) can therefore never authorize real launch through
+    // approve→run, and a stale approval after gate-code changes is refused.
+    if (!opts.campaign) { process.stderr.write('approve requires --campaign <dir>\n'); process.exit(4); }
+    const approvalFile = opts['approval-file'];
+    if (!approvalFile) { process.stderr.write('approve requires --approval-file <path> (coordinator-issued)\n'); process.exit(4); }
+    const campaignDir = path.resolve(opts.campaign);
+    const st = loadState({ fs: REAL_FS, campaignDir });
+    if (!st.ok) { process.stderr.write(`approve: ${st.error}\n`); process.exit(2); }
+    const prov = await gitProvenance();
+    const execCtx = execCtxFor({ bopts, ownerRef: `approve ${st.state.campaign_id ?? campaignDir}` });
+    requireContained({ mode: 'approve', execCtx, campaignDir, state: st.state });
+    let approval;
+    try {
+      approval = JSON.parse(REAL_FS.readFileSync(approvalFile));
+    } catch (err) {
+      process.stderr.write(`REFUSED: approval file unreadable/invalid: ${approvalFile} (${err.message})\n`);
+      process.exit(3);
+    }
+    const campaignId = st.state.campaign_id;
+    if (!campaignId) {
+      process.stderr.write(`REFUSED: campaign ${campaignDir} carries no campaign_id — cannot verify a campaign-scoped approval.\n`);
+      process.exit(3);
+    }
+    const gateHashes = computeGateHashes();
+    // STORM-REAL US-003: approve routes through the SAME profile-bound
+    // validator (persisted campaign profile), never a CLI flag.
+    const expectedProfile = profileFromCampaignState(st.state);
+    const verdict = verifyCoordinatorApproval({ approval, campaignId, sourceCommit: prov.commit, gateHashes, expectedProfile });
+    if (!verdict.ok) {
+      process.stderr.write(`REFUSED: ${verdict.reason} (code ${verdict.code}). Campaign ${campaignId} stays unqualified; changed safety/gate code requires fresh coordinator review.\n`);
+      process.exit(3);
+    }
+    st.state.qualification = {
+      real_launch_allowed: true,
+      note: `coordinator approval ${approvalFile} (kind ${approval?.approval_kind})`,
+      granted_at: REAL_CLOCK.nowUtc(),
+      approval_file: approvalFile,
+      source_commit: prov.commit,
+      profile: expectedProfile,
+      gate_hashes: gateHashes,
+    };
+    saveState({ fs: REAL_FS, campaignDir, state: st.state });
+    process.stdout.write(`Approved campaign ${campaignId} for real launch (approval ${approvalFile}).\n`);
+    return;
+  }
+
+  if (cmd === 'run') {
+    if (!opts.campaign) { process.stderr.write('run requires --campaign <dir>\n'); process.exit(4); }
+    const round = (opts.round ?? 'A').toUpperCase();
+    if (!['A', 'B'].includes(round)) { process.stderr.write(`run --round must be A or B (got ${opts.round})\n`); process.exit(4); }
+    const campaignDir = path.resolve(opts.campaign);
+    const st = loadState({ fs: REAL_FS, campaignDir });
+    if (!st.ok) { process.stderr.write(`run: ${st.error}\n`); process.exit(2); }
+    const execCtx = execCtxFor({ bopts, ownerRef: `run ${round} ${st.state.campaign_id ?? campaignDir}` });
+    // Containment + persisted receipt BEFORE any state write (STORM-REAL gap
+    // #1 / root defect #3: a stale state boolean can never be authority).
+    requireContained({ mode: 'run', execCtx, campaignDir, state: st.state });
+    // US-006: REAL requires the hard spend cap before any launch.
+    requireRealSpendCapOrRefuse(st.state, bopts, 'run');
+    // US-012: resolve + apply the per-round wall budget before any effect. A
+    // REAL cap below 6h (or a malformed one) refuses TT_USAGE here, in the
+    // foreground.
+    const budget = resolveRoundWallBudgetOrRefuse(st.state, bopts, round);
+    bopts.roundWindowMs = budget.effectiveWindowMs;
+    if (!(st.state.qualification?.real_launch_allowed === true)) {
+      process.stderr.write(`REFUSED: campaign ${st.state.campaign_id ?? campaignDir} is not-yet-qualified for real launch. Real launch requires the coordinator safety approval whose gate hashes match this checkout (no generic --allow-unqualified bypass exists).\n`);
+      process.exit(3);
+    }
+    // Root defect #5: run re-verifies the persisted qualification against the
+    // ON-DISK coordinator approval file + current source + current gate
+    // hashes on every invocation — a stale persisted boolean (or an approval
+    // file that no longer matches this checkout) refuses.
+    const q = st.state.qualification;
+    if (!q?.approval_file || !st.state.campaign_id) {
+      process.stderr.write(`REFUSED: campaign ${campaignDir} qualification lacks a recorded approval_file/campaign_id — stale state boolean cannot authorize real launch; run tt-storm approve/rehearse again with a current coordinator approval.\n`);
+      process.exit(3);
+    }
+    const provNow = await gitProvenance();
+    let approval;
+    try {
+      approval = JSON.parse(REAL_FS.readFileSync(q.approval_file));
+    } catch (err) {
+      process.stderr.write(`REFUSED: recorded approval file unreadable/invalid: ${q.approval_file} (${err.message}) — stale qualification cannot authorize real launch; fresh coordinator review required.\n`);
+      process.exit(3);
+    }
+    const runVerdict = verifyCoordinatorApproval({ approval, campaignId: st.state.campaign_id, sourceCommit: provNow.commit, gateHashes: computeGateHashes(), expectedProfile: profileFromCampaignState(st.state) });
+    if (!runVerdict.ok) {
+      process.stderr.write(`REFUSED: ${runVerdict.reason} (code ${runVerdict.code}) — stale/changed approval cannot authorize real launch; fresh coordinator review required.\n`);
+      process.exit(3);
+    }
+    // US-012: every synchronous refusal is behind us — detach now if asked.
+    // The child re-validates and runs the round in its own session; this
+    // invocation prints the pid + captured log paths and returns immediately.
+    if (opts.detach === true || opts.detach === 'true') {
+      const detached = launchDetachedRun({ campaignDir, round, argv, at: REAL_CLOCK.nowUtc() });
+      process.stdout.write(`Detached: tt-storm run --round ${round} launched in its own session (${detached.launcher}).\n`);
+      process.stdout.write(`  pid: ${detached.pid ?? 'unknown'}\n`);
+      process.stdout.write(`  stdout: ${detached.stdout}\n`);
+      process.stdout.write(`  stderr: ${detached.stderr}\n`);
+      process.stdout.write(`  round wall bound: ${budget.source} = ${budget.effectiveWindowMs}ms\n`);
+      return;
+    }
+    // A prepared rehearsal campaign is driven through stormRunRehearsal (the
+    // SAME engine round drivers + the private daemon + prepared overlay); a
+    // plain (non-rehearsal) campaign keeps the legacy round drivers.
+    if (st.state.rehearsal) {
+      const daemonRes = await materializeRehearsalDaemon({ state: st.state, campaignDir, execCtx });
+      if (!daemonRes.ok) {
+        process.stderr.write(`REFUSED: cannot materialize the rehearsal daemon: ${daemonRes.reason ?? 'unknown'}\n`);
+        process.exit(3);
+      }
+      const ctx = realCtx({ bopts: { ...bopts, daemonKind: daemonRes.daemonKind, daemonEnv: daemonRes.daemonEnv, daemonProvenanceDir: path.join(TT_DIR, 'var', 'daemon-control'), controlUrl: daemonRes.ports?.controlUrl ?? st.state.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
+      ctx.opts.rehearsalRun = true;
+      await stormRunRehearsal(ctx, { round });
+    } else {
+      const ctx = realCtx({ bopts: { ...bopts, controlUrl: st.state?.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
+      if (round === 'A') await stormRunRoundA(ctx);
+      else await stormRunRoundB(ctx);
+    }
+    return;
+  }
+
+  if (cmd === 'resume') {
+    if (!opts.campaign) { process.stderr.write('resume requires --campaign <dir>\n'); process.exit(4); }
+    const campaignDir = path.resolve(opts.campaign);
+    const st = loadState({ fs: REAL_FS, campaignDir });
+    if (!st.ok) { process.stderr.write(`resume: ${st.error}\n`); process.exit(2); }
+    const execCtx = execCtxFor({ bopts, ownerRef: `resume ${st.state.campaign_id ?? campaignDir}` });
+    requireContained({ mode: 'resume', execCtx, campaignDir, state: st.state });
+    const ctx = realCtx({ bopts: { ...bopts, controlUrl: st.state?.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
+    const res = await stormResume(ctx, { round: opts.round ? opts.round.toUpperCase() : undefined });
+    process.stdout.write(`Resumed campaign ${res.campaignId}: re-attached ${res.reattached} run(s) by recorded id; no relaunch.\n`);
+    process.stdout.write(`resume only re-attaches by recorded run id. To CONTINUE the round's observation/sequencing, invoke:\n  tt-storm run --campaign ${campaignDir} --round ${(opts.round ?? 'A').toUpperCase()}\n`);
+    return;
+  }
+
+  if (cmd === 'report') {
+    if (!opts.campaign) { process.stderr.write('report requires --campaign <dir>\n'); process.exit(4); }
+    const campaignDir = path.resolve(opts.campaign);
+    const st = loadState({ fs: REAL_FS, campaignDir });
+    if (!st.ok) { process.stderr.write(`report: ${st.error}\n`); process.exit(2); }
+    const execCtx = execCtxFor({ bopts, ownerRef: `report ${st.state.campaign_id ?? campaignDir}` });
+    requireContained({ mode: 'report', execCtx, campaignDir, state: st.state });
+    const ctx = realCtx({ bopts: { ...bopts, controlUrl: st.state?.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
+    const res = await stormReportFull(ctx);
+    process.stdout.write(`Campaign: ${res.campaignId}\n`);
+    process.stdout.write(res.txt + '\n');
+    return;
+  }
+
+  process.stderr.write(`unknown command: ${cmd}\n${USAGE}`);
+  process.exit(4);
+}
+
+async function deriveNumbers(bopts) {
+  const { deriveStormNumbers } = await import('./tt-storm-shared.mjs');
+  return deriveStormNumbers({
+    fs: REAL_FS,
+    installedCatalogRoot: bopts.installedCatalogRoot,
+    bundledCatalogRoot: bopts.bundledCatalogRoot,
+  });
+}
+
+// computeGateHashes is imported from ./tt-storm-rehearsal.mjs (single source
+// of truth for the tested boundary/gate file list — tt-storm-real/shared/
+// engine/roster/rehearsal/CLI + the calibration and rehearsal-prepare
+// self-test files). The coordinator approval pins these exact hashes; a
+// changed gate file therefore forces a fresh coordinator review.
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main(process.argv.slice(2)).catch((err) => {
+    process.stderr.write(`${err?.message ?? String(err)}\n`);
+    process.exit(err?.code === 'TT_USAGE' ? 4 : 2);
+  });
+}

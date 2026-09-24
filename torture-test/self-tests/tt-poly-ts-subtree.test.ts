@@ -297,9 +297,23 @@ describe("tt-poly ts/ subtree integration (US-003)", () => {
     }
   });
 
-  it("ts/ .gitignore is appropriate for TS/Node project", () => {
-    const giPath = path.join(ttPolyTsDir, ".gitignore");
-    assert.ok(fs.existsSync(giPath), "ts/.gitignore should exist");
+  it("ts/ tree has no redundant .gitignore — rules live in tt-poly/.gitignore", () => {
+    // TU2F NF-6: the per-subtree ts/.gitignore was consolidated into the
+    // tt-poly root .gitignore — its unanchored dist/ rule already applied at
+    // every depth below the root.
+    assert.ok(
+      !fs.existsSync(path.join(ttPolyTsDir, ".gitignore")),
+      "ts/.gitignore should be removed (consolidated into tt-poly/.gitignore)",
+    );
+
+    const giPath = path.join(
+      repoRoot,
+      "torture-test",
+      "fixtures-src",
+      "tt-poly",
+      ".gitignore",
+    );
+    assert.ok(fs.existsSync(giPath), "tt-poly/.gitignore should exist");
 
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = content

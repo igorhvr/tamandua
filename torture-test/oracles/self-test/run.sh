@@ -4,8 +4,13 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 TT_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
 VAR_ROOT=${TT_SELF_TEST_VAR_ROOT:-"$TT_ROOT/var"}
-SUITE_TIMEOUT_SECONDS=${TT_SELF_TEST_SUITE_TIMEOUT_SECONDS:-300}
-ROUND_TIMEOUT_SECONDS=${TT_SELF_TEST_ROUND_TIMEOUT_SECONDS:-140}
+# Budget (port F-002): a single full fixture round measured ~167s on vaimetal
+# (schema-13 product, gate env) — the pre-port 140s round / 300s suite budget
+# killed round 1 with 'command watchdog expired after 140s' even standalone.
+# The suite runs two rounds, so both bounds are raised with headroom while
+# staying finite (a genuinely wedged round is still reaped).
+SUITE_TIMEOUT_SECONDS=${TT_SELF_TEST_SUITE_TIMEOUT_SECONDS:-720}
+ROUND_TIMEOUT_SECONDS=${TT_SELF_TEST_ROUND_TIMEOUT_SECONDS:-300}
 COMMAND_TIMEOUT_SECONDS=${TT_SELF_TEST_COMMAND_TIMEOUT_SECONDS:-30}
 O9_TIMEOUT_SECONDS=${TT_SELF_TEST_O9_TIMEOUT_SECONDS:-60}
 GRACE_SECONDS=${TT_SELF_TEST_GRACE_SECONDS:-2}
@@ -403,6 +408,7 @@ run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o10-fixtures.m
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o11-fixtures.mjs" "$workspace"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o4-fixtures.mjs" "$workspace"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o16-fixtures.mjs" "$workspace"
+run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o12-fixtures.mjs" "$workspace"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/../calibration/generate-fixtures.mjs" "$workspace"
 run_bounded "$O9_TIMEOUT_SECONDS" node --test --test-timeout=45000 "$TT_ROOT/bin/o9-mechanical-harvest.integration.test.mjs"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node --test --test-timeout=12000 "$SCRIPT_DIR/watchdog.test.mjs"
@@ -445,7 +451,7 @@ for fixture in "$workspace"/o2-*; do
   fi
 done
 
-for oracle in O3z O4 O8 O9 O10 O11 O16; do
+for oracle in O3z O4 O8 O9 O10 O11 O16 O12; do
   prefix=$(printf '%s' "$oracle" | tr '[:upper:]' '[:lower:]')
   for fixture in "$workspace"/"$prefix"-*; do
     expected=$(run_bounded "$COMMAND_TIMEOUT_SECONDS" node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).expected)' "$fixture/expectation.json")
@@ -514,6 +520,7 @@ printf 'O10 FMIS decision-table mutations PASS\n'
 printf 'O11 output-contract/token-attribution mutations PASS\n'
 printf 'O4 claim-dispatch-hygiene mutations PASS\n'
 printf 'O16 lifecycle-probe mutations PASS\n'
+printf 'O12 DB-integrity mutations PASS\n'
 printf 'NOT_EVALUABLE result vocabulary PASS\n'
 printf 'informational non-failing findings on PASS PASS\n'
 printf 'O2/O9/O11 hard-case calibration pack PASS\n'

@@ -390,6 +390,16 @@ const ALLOWLIST: Record<string, AllowEntry> = {
       "Linux-side-only real-case probe for the tt-rust BUG-R3 cell: probes execute inside real-case launches, which are predicate-excluded on Darwin (MACP5 US-004 reachability verdict). GNU timeout guards `cargo test` (BUG-R3 hangs by design) — util-linux-only.",
     allowedClasses: ["GNU timeout cmd"],
   },
+  "torture-test/self-tests/storm-chain-runner.sh": {
+    reason:
+      "Linux-side-only O12-REPIN US-008 storm-chain inner runner: runs the 49-file storm self-test chain under the held vaivm gate lock on the linux campaign host only (invoked by storm-chain-wrapper.sh from the NPF-2/O12 gate battery — never by ./run-torture-test, so never on the Darwin campaign). `date +%s.%N` (GNU nanosecond) stamps the acquire/start/end/release epoch evidence for the chain summary; BSD date has no %N.",
+    allowedClasses: ["date %N (nanosecond)"],
+  },
+  "torture-test/self-tests/storm-chain-wrapper.sh": {
+    reason:
+      "Linux-side-only O12-REPIN US-008 storm-chain outer wrapper: acquires the shared vaivm gate lock and runs the 49-file chain on the linux campaign host only (part of the NPF-2/O12 gate battery — never on the Darwin campaign). GNU stat -c reads the lock file's size/mode/mtime/inode for the before/after fingerprint (BSD stat uses -f), and `date +%s.%N` (GNU nanosecond) stamps the submit epoch — both GNU/Linux-only.",
+    allowedClasses: ["stat -c (GNU format)", "date %N (nanosecond)"],
+  },
 };
 
 // ── the scanner ────────────────────────────────────────────────────────

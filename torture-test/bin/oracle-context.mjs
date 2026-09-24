@@ -65,6 +65,17 @@ export const REQUIRED_ORACLE_EVIDENCE = Object.freeze({
   // returns NOT_EVALUABLE on them; run_events + database_snapshot remain
   // required because the verdict must stay mechanically grounded.
   O16: Object.freeze(['run_events', 'database_snapshot']),
+  // O12 (spec 03, post-batch DB-integrity oracle): reads the whole immutable
+  // campaign database snapshot (integrity/orphans, run_number uniqueness,
+  // timestamp shape/order, context JSON, serial composite state). O12 is NOT a
+  // tenth campaign-gating hook — GATING_ORACLE_IDS is unchanged; the engine
+  // invokes it as a post-batch hygiene oracle. database_snapshot is its only
+  // required shared evidence key; the O12-specific host-owned reserved-key
+  // baseline input rides as a sidecar (o12-reserved-baseline.json in the
+  // evidence dir, or TT_O12_BASELINE) and is NOT part of the version-1
+  // mechanical_evidence key set (adding a key would need a contract-version
+  // change affecting the nine gating hooks).
+  O12: Object.freeze(['database_snapshot']),
 });
 
 const MECHANICAL_STEP_FIELDS = Object.freeze([

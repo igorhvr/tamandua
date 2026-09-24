@@ -1,0 +1,59 @@
+{
+  "kind": "storm-seed-readiness",
+  "schema_version": 1,
+  "task": "STORM-SEED-QUALIFY",
+  "bead": "tamandua-6sy.6.4.1",
+  "run_id": "run-4221985a-b990-4e5f-b61a-f663c8e78dc7",
+  "branch": "feature/storm-seed-regen-schema14",
+  "published_at_utc": "2026-09-23T09:32:34.737Z",
+  "source": {
+    "commit": "b3e3a62873ac168e25461f424fc581cac12d71c7",
+    "tree": "0f8825059184fde3231a54392759166c6fc30470",
+    "subject": "merge: main e9192f30 (alias fix + LEDGER-DIAG schema 14) into integration/torture-final",
+    "tree_dirty": false,
+    "provenance": "durable source pin: the stable branch-base/upstream commit recorded from git (never a pre-squash story commit); tree_dirty is tracked-modification only (--untracked-files=no)"
+  },
+  "qualification": {
+    "path": "/home/kaladin/matchlock-work/storm-seed-regen-20260922.json",
+    "kind": "storm-seed-qualification",
+    "qualified": false,
+    "blocker_count": 2,
+    "blocker_ids": [
+      "BLOCKER-ORACLES-NOT-RUN",
+      "BLOCKER-ORACLES-NOT-EVALUABLE"
+    ],
+    "igor_decision_blockers": [
+      "BLOCKER-ORACLES-NOT-RUN",
+      "BLOCKER-ORACLES-NOT-EVALUABLE"
+    ]
+  },
+  "seed": {
+    "root": "/opt/storm-seed-regen-4221985a/storm-aged.2026-09-23T03-32-35-304Z.4def63c0.vE1l40",
+    "kind": "full",
+    "counts": {
+      "runs": 5000,
+      "steps": 26526,
+      "run_worktrees": 200,
+      "logical_events": 505000
+    },
+    "manifest_qualified": false
+  },
+  "campaign": {
+    "id": "storm-20260923T072047Z-deeb2b31-16b4-4f13-83ad-7a53d51690bf",
+    "dir": "/opt/storm-seed-regen-4221985a/us007-var/results/storm-20260923T072047Z-deeb2b31-16b4-4f13-83ad-7a53d51690bf",
+    "profile": "SCRIPTED_REHEARSAL",
+    "mode": "prepared",
+    "pending_candidate": {
+      "campaign_id": "storm-us007-designated-pending",
+      "dir": "/opt/storm-seed-regen-4221985a/us007-var/results/storm-us007-designated-pending",
+      "recorded_at": "2026-09-23T07:20:47.978Z"
+    }
+  },
+  "gate_hashes": {
+    "count": 28,
+    "recompute_match": true,
+    "matches_prepared_campaign_descriptor": true,
+    "drifted_file_count": 0
+  },
+  "note": "Readiness pointer only: it locates the published storm-seed-qualification.json and the prepared SCRIPTED_REHEARSAL campaign. It carries no seed corpus and grants no launch authority."
+}

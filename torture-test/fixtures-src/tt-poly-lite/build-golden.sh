@@ -444,12 +444,6 @@ for junk_path in "python/.pytest_cache" "python/.flaky_counter"; do
                 echo "    $junk_path : FAIL — gitignored in root (must NOT be)!"
                 exit 1
             fi
-            if [ -f "$VERIFY_DIR/python/.gitignore" ]; then
-                if grep -v '^#' "$VERIFY_DIR/python/.gitignore" 2>/dev/null | grep -qF "$junk_name"; then
-                    echo "    $junk_path : FAIL — gitignored in python/.gitignore (must NOT be)!"
-                    exit 1
-                fi
-            fi
             echo "    $junk_path : OK (not gitignored)"
         fi
     else
@@ -459,27 +453,21 @@ for junk_path in "python/.pytest_cache" "python/.flaky_counter"; do
             echo "    $junk_path : FAIL — gitignored in root (must NOT be)!"
             exit 1
         fi
-        if [ -f "$VERIFY_DIR/python/.gitignore" ]; then
-            if grep -v '^#' "$VERIFY_DIR/python/.gitignore" 2>/dev/null | grep -qF "$junk_name"; then
-                echo "    $junk_path : FAIL — gitignored in python/.gitignore (must NOT be)!"
-                exit 1
-            fi
-        fi
         echo "    $junk_path : OK (not gitignored)"
     fi
 done
 
-# python/__pycache__ must NOT be gitignored (root or python/.gitignore) — a
+# python/__pycache__ must NOT be gitignored (root .gitignore) — a
 # gitignored junk probe is a distinct failure mode (spec 02: junk probes must
-# NOT be suppressed by .gitignore).
-for gi in "$VERIFY_DIR/.gitignore" "$VERIFY_DIR/python/.gitignore"; do
-    if [ -f "$gi" ]; then
-        if grep -v '^#' "$gi" 2>/dev/null | grep -qF '__pycache__'; then
-            echo "    python/__pycache__ : FAIL — gitignored in $(basename "$gi") (must NOT be)!"
-            JUNK_OK=false
-        fi
+# NOT be suppressed by .gitignore). The per-subtree .gitignore files were
+# consolidated into the root .gitignore (TU2F NF-6), so the root is the only
+# place a suppressing rule could live.
+if [ -f "$VERIFY_DIR/.gitignore" ]; then
+    if grep -v '^#' "$VERIFY_DIR/.gitignore" 2>/dev/null | grep -qF '__pycache__'; then
+        echo "    python/__pycache__ : FAIL — gitignored in .gitignore (must NOT be)!"
+        JUNK_OK=false
     fi
-done
+fi
 
 if ! $JUNK_OK; then
     exit 1
@@ -503,7 +491,7 @@ if [ -f "$VERIFY_DIR/ts/package-lock.json" ]; then
         exit 1
     else
         echo " status unclear — checking .gitignore..."
-        if grep -v '^#' "$VERIFY_DIR/ts/.gitignore" 2>/dev/null | grep -q 'package-lock.json'; then
+        if grep -v '^#' "$VERIFY_DIR/.gitignore" 2>/dev/null | grep -q 'package-lock.json'; then
             echo "    ts/package-lock.json : FAIL — gitignored (must NOT be)!"
             exit 1
         fi
@@ -511,7 +499,7 @@ if [ -f "$VERIFY_DIR/ts/package-lock.json" ]; then
     fi
 else
     # Check it's not gitignored
-    if grep -v '^#' "$VERIFY_DIR/ts/.gitignore" 2>/dev/null | grep -q 'package-lock.json'; then
+    if grep -v '^#' "$VERIFY_DIR/.gitignore" 2>/dev/null | grep -q 'package-lock.json'; then
         echo "    ts/package-lock.json : FAIL — gitignored (must NOT be)!"
         exit 1
     fi
@@ -531,14 +519,14 @@ if [ -d "$VERIFY_DIR/ts/node_modules" ]; then
         exit 1
     else
         echo "     status unclear — checking .gitignore..."
-        if grep -v '^#' "$VERIFY_DIR/ts/.gitignore" 2>/dev/null | grep -q 'node_modules'; then
+        if grep -v '^#' "$VERIFY_DIR/.gitignore" 2>/dev/null | grep -q 'node_modules'; then
             echo "    ts/node_modules/ : FAIL — gitignored (must NOT be)!"
             exit 1
         fi
         echo "    ts/node_modules/ : OK (not gitignored)"
     fi
 else
-    if grep -v '^#' "$VERIFY_DIR/ts/.gitignore" 2>/dev/null | grep -q 'node_modules'; then
+    if grep -v '^#' "$VERIFY_DIR/.gitignore" 2>/dev/null | grep -q 'node_modules'; then
         echo "    ts/node_modules/ : FAIL — gitignored (must NOT be)!"
         exit 1
     fi

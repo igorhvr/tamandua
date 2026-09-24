@@ -34,9 +34,12 @@
 //   convention this lint enforces: each guarded FILE carries, once, the
 //   marker string 'MACP3 US-003' (runtime tools) or 'MACP3 US-004' (test
 //   harnesses) adjacent to / in the sweep headers, declaring the file's
-//   linux-only procfs usage fully documented. The lint verifies that marker
-//   is present (Guard gate) and that every file with a '/proc' literal is
-//   covered by exactly one allowlist entry (Coverage + Staleness gates).
+//   linux-only procfs usage fully documented. The torture-union fix-chain
+//   storm-rehearsal files predate that sweep and carry the 'STORM-REHEARSAL'
+//   marker instead (category 'storm-rehearsal-guarded') — the same Guard-gate
+//   verification, only the marker string differs. The lint verifies that
+//   marker is present (Guard gate) and that every file with a '/proc' literal
+//   is covered by exactly one allowlist entry (Coverage + Staleness gates).
 //
 // ── Gates (a violation in any gate fails the suite) ─────────────────
 //   G1 Coverage:    every scanned file containing a '/proc' hit must have an
@@ -101,6 +104,7 @@ type AllowCategory =
   | "us002-proof" // US-002 proof harness: /proc references are assertions about the (intentionally legacy) /proc-based simulation
   | "us003-runtime-guarded" // runtime tools swept in US-003; every /proc marked 'MACP3 US-003' (Darwin branch or inline linux-only doc)
   | "us004-harness-guarded" // test harnesses swept in US-004; every /proc marked 'MACP3 US-004' (guard or graceful-degradation doc)
+  | "storm-rehearsal-guarded" // torture-union fix-chain storm-rehearsal engine/harness; every /proc guarded by the 'STORM-REHEARSAL' file marker (predates MACP3 US-003/US-004)
   | "t21-owned" // owned by the concurrent run T2.1 (daemon-control + tier2 scenario run files) — out of scope, documented
   | "documentation"; // prose only (.md / .txt / evidence artifacts) — no runtime procfs access
 
@@ -332,6 +336,25 @@ const ALLOWLIST: Record<string, AllowEntry> = {
       "MACP3 US-004: this recording-only ownership gate's ONLY '/proc' literal is the P6 escape-proof probe expression — fs.readFileSync('/proc/self/cmdline') is evaluated inside a hermetic vm context whose fs binding is the recording VIRTUAL filesystem (empty vfs: a read of a path with no virtual entry is recorded and raises fs ENOENT BEFORE any real host operation), and the gate asserts exactly that (P6 detail must match ENOENT) plus its prose; there is no runtime procfs access of any kind in the gate (zero real signals/spawns/waits/removals/live-pid reads — see the MACP3 US-004 header note).",
   },
 
+  // ── torture-union fix-chain storm-rehearsal (guarded — requiredMarker
+  //    'STORM-REHEARSAL' verified). The storm-rehearsal engine/harness landed
+  //    with the torture-union fix chain and predates the MACP3 US-003/US-004
+  //    sweep, so its files carry the STORM-REHEARSAL file marker instead of a
+  //    MACP3 marker; every /proc read is best-effort and null-degrades on a
+  //    /proc-less host (injectable fsx seam / try-catch). ────────────────
+  "bin/tt-storm-rehearsal.mjs": {
+    category: "storm-rehearsal-guarded",
+    requiredMarker: "STORM-REHEARSAL",
+    reason:
+      "torture-union storm-rehearsal engine: makeRehearsalProcessOps' /proc reads (alive's zombie-state stat, readCwd readlink, readCmdline/readEnviron, listPids readdir, ppidOf stat) are best-effort and null-degrade (try/catch → null/[]) on a /proc-less host, injectable via the fsx seam for the self-tests; guarded by the STORM-REHEARSAL file marker (the fix chain predates the MACP3 US-003/US-004 sweep, so no MACP3 marker is present).",
+  },
+  "self-tests/tier2-storm-rehearsal-cleanup.test.ts": {
+    category: "storm-rehearsal-guarded",
+    requiredMarker: "STORM-REHEARSAL",
+    reason:
+      "torture-union STORM-REHEARSAL US-004 (S6) cleanup self-test: its only /proc read is the alive() helper's best-effort /proc/<pid>/stat zombie check wrapped in try/catch (a /proc-less host falls through to the kill(pid,0) verdict); guarded by the STORM-REHEARSAL file marker.",
+  },
+
   // ── T2.1-owned (concurrent run owns daemon-control + tier2 scenario
   //    run files — no MACP3 markers required; out of scope for this branch,
   //    enumerated explicitly by the T2.1 coverage test below). ──────────
@@ -431,6 +454,30 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     reason:
       "RISO task/evidence doc — its '/proc' occurrences are prose in the US-003 proof and the Test 73/91 correction narrative ('/proc-or-ps NUL-to-space read', 'a /proc-less host (Darwin) skips it') plus the verbatim recorded harness line 'PASS: port guard uses /proc/net/tcp'; the doc performs no runtime procfs access.",
   },
+  // TORTURE-PORT US-011: the four entries below are /proc-bearing evidence and
+  // structural-assertion artifacts the port added or inherited after the last
+  // green battery (bc535a44). None performs runtime procfs access; allowlisted
+  // at documentation granularity (a genuine coverage gap, not a weakened lint).
+  "impl-tasks/torture-port-contract.json": {
+    category: "documentation",
+    reason:
+      "TORTURE-PORT evidence artifact — its '/proc' occurrences are prose in the US-007 adaptation evidence (the base-seam conformance test 'proves ... tt-controller never reads /proc/<pid>/cwd or /proc/<pid>/cmdline') and the outside-files disposition records; the JSON contract performs no runtime procfs access.",
+  },
+  "impl-tasks/tu2f-contract.json": {
+    category: "documentation",
+    reason:
+      "TU2F gate/evidence artifact — its single '/proc' occurrence is prose in the NF-2 finding ('procfs-portability lint flags the three torture-union fix-chain /proc files with no allowlist entry'); the contract JSON performs no runtime procfs access.",
+  },
+  "impl-tasks/tu2f-nf-sweep.md": {
+    category: "documentation",
+    reason:
+      "TU2F NF sweep doc — its single '/proc' occurrence is prose in the NF-2 row ('procfs-portability lint flags the three torture-union fix-chain /proc files with no allowlist entry'); the doc performs no runtime procfs access.",
+  },
+  "self-tests/tier2-storm-base-seams.test.ts": {
+    category: "documentation",
+    reason:
+      "TORTURE-PORT A-US007-3 base-seam conformance test — its '/proc' occurrences are the B7 structural assertion literals proving tt-controller reads claim/owned identity and never a /proc/<pid>/cwd or /proc/<pid>/cmdline sweep; the test performs no runtime procfs access of its own.",
+  },
   "self-tests/tier0-gnu-portability-lint.test.ts": {
     category: "documentation",
     reason:
@@ -480,6 +527,16 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     category: "documentation",
     reason:
       "US-007 darwin behavioral proof pin — its '/proc' occurrences are prose in the header narrative and structural-assert regex literals pinning daemon_path_has_adapters_bin's retained linux /proc/<pid>/environ arm (no runtime procfs access; the procfs read lives inside the sourced tt-daemon-up tool, guarded by MACP3 US-003).",
+  },
+  "self-tests/tier2-storm-rehearsal-gate.test.ts": {
+    category: "documentation",
+    reason:
+      "torture-union US-007: added by feature/torture-storm-rehearsal-20260909 @ 982f887b — its single '/proc' occurrence is prose in the header narrative ('fs/clock/db/proc adapters' naming the injectable adapter seams); the gate performs no runtime procfs access, so it is allowlisted at documentation granularity (a genuine coverage gap in the union, not a weakened lint).",
+  },
+  "self-tests/tier2-storm-rehearsal-roundb-abort.test.ts": {
+    category: "documentation",
+    reason:
+      "torture-union STORM-REHEARSAL US-005 (attempt-1 finding S4) Round-B fail-closed abort self-test: its single '/proc' occurrence is prose in the header comment ('fs/clock/proc adapters' naming the recording injectable seams); the test drives the committed stormRunRoundB through recording adapters with no runtime procfs access.",
   },
 };
 
@@ -960,7 +1017,9 @@ describe("tier0 procfs-portability lint", () => {
       assert.ok(entry.reason.length > 10, `allowlist entry ${rel} needs a real reason`);
       if (entry.requiredMarker) {
         assert.ok(
-          entry.requiredMarker === "MACP3 US-003" || entry.requiredMarker === "MACP3 US-004",
+          entry.requiredMarker === "MACP3 US-003" ||
+            entry.requiredMarker === "MACP3 US-004" ||
+            entry.requiredMarker === "STORM-REHEARSAL",
           `unexpected requiredMarker ${entry.requiredMarker} on ${rel}`,
         );
       }

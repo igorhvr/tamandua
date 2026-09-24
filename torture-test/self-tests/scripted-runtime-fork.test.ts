@@ -15,6 +15,7 @@ const expectedFiles = [
   "runtime-pi.mjs",
   "runtime-hermes.mjs",
   "runtime-shared.mjs",
+  "runtime-dsh.mjs",
   "database.mjs",
   "FROZEN_SHA",
 ];
@@ -66,7 +67,7 @@ describe("scripted-runtimes fork (US-001)", () => {
   });
 
   it("all .mjs files pass syntax check (node --check)", () => {
-    for (const file of ["runtime-pi.mjs", "runtime-hermes.mjs", "runtime-shared.mjs", "database.mjs"]) {
+    for (const file of ["runtime-pi.mjs", "runtime-hermes.mjs", "runtime-shared.mjs", "runtime-dsh.mjs", "database.mjs"]) {
       const filePath = path.join(runtimesDir, file);
       execSync(`${process.execPath} --check ${JSON.stringify(filePath)}`, {
         cwd: runtimesDir,
@@ -113,6 +114,36 @@ describe("scripted-runtimes fork (US-001)", () => {
     );
   });
 
+  it("runtime-dsh.mjs imports are adjusted (no old paths)", () => {
+    const content = fs.readFileSync(
+      path.join(runtimesDir, "runtime-dsh.mjs"),
+      "utf-8",
+    );
+    assert.ok(
+      !content.includes("scripted-agent-runtime-shared.mjs"),
+      "runtime-dsh.mjs must not reference old shared module path",
+    );
+    assert.ok(
+      content.includes("./runtime-shared.mjs"),
+      "runtime-dsh.mjs must import ./runtime-shared.mjs",
+    );
+    assert.ok(
+      content.includes("isHarnessProbePrompt") &&
+        content.includes("execHarnessProbe"),
+      "runtime-dsh.mjs must answer the launch-time harness probe",
+    );
+    // dsh plain-stdout contract pins: emit exactly the final text plus one
+    // newline and nothing on stderr (never a pi JSON relabel).
+    assert.ok(
+      content.includes("function emitOutput(text)"),
+      "runtime-dsh.mjs must emit plain-text output",
+    );
+    assert.ok(
+      !content.includes("message_end"),
+      "runtime-dsh.mjs must never emit pi-shaped JSON",
+    );
+  });
+
   it("runtime-shared.mjs exports all expected functions", async () => {
     const mod = await import(
       path.join(runtimesDir, "runtime-shared.mjs")
@@ -132,6 +163,8 @@ describe("scripted-runtimes fork (US-001)", () => {
       "parsePrompt",
       "peekStep",
       "substitute",
+      "isHarnessProbePrompt",
+      "execHarnessProbe",
     ];
     for (const name of expected) {
       assert.ok(
@@ -140,7 +173,6 @@ describe("scripted-runtimes fork (US-001)", () => {
       );
     }
   });
-
   it("database.mjs exports openE2eDatabase", async () => {
     const mod = await import(
       path.join(runtimesDir, "database.mjs")
@@ -207,6 +239,11 @@ describe("scripted-runtimes fork (US-001)", () => {
         // US-004 provider_error check (inserted before mode checks)
         if (trimmed.includes("provider_error") || trimmed.includes("handleProvider")) continue;
 
+        // STORM US-002: campaign-controlled hold import specifier + async
+        // plumbing (the hold body itself lives inside a documented KNOB-REGION)
+        if (trimmed.includes("applyHold")) continue;
+        if (trimmed.includes("runWorkRound()")) continue;
+
         // Import path adjustments (US-001)
         if (trimmed.includes("scripted-agent-runtime-shared.mjs")) continue;
         if (trimmed.includes("runtime-shared.mjs")) continue;
@@ -258,6 +295,11 @@ describe("scripted-runtimes fork (US-001)", () => {
         if (trimmed.includes("shortAgent")) continue;
         if (trimmed.includes("agentId")) continue;
 
+        // STORM US-002: campaign-controlled hold import specifier + async
+        // plumbing (the hold body itself lives inside a documented KNOB-REGION)
+        if (trimmed.includes("applyHold")) continue;
+        if (trimmed.includes("runWorkRound()")) continue;
+
         // US-005: baseline comment outside KNOB-REGION
         if (trimmed.includes("Baseline path")) continue;
 
@@ -307,6 +349,38 @@ describe("scripted-runtimes fork (US-001)", () => {
         nonBehaviorDiffs.length,
         0,
         `runtime-shared.mjs has unexpected diffs beyond behaviorForInvocation change:\n${nonBehaviorDiffs.join("\n")}`,
+      );
+    }
+
+    // runtime-dsh.mjs (CORE-CELLS US-003 / original US-005 BRUN) forks
+    // e2e-tests/helpers/scripted-dsh-runtime.mjs, which was added to the
+    // product helpers AFTER FROZEN_SHA (no FROZEN_SHA baseline). Its parity is
+    // enforced against the CURRENT committed e2e original (live-helper parity
+    // rule): only the documented import-path adjustment and the
+    // nextWorkIndex agentId key convention may differ.
+    const dshDiff = runDiff(
+      "e2e-tests/helpers/scripted-dsh-runtime.mjs",
+      "torture-test/scripted-runtimes/runtime-dsh.mjs",
+    );
+    if (dshDiff) {
+      const nonKnobDiffs = [];
+      for (const line of dshDiff.split("\n")) {
+        if (!line.startsWith("<") && !line.startsWith(">")) continue;
+        const trimmed = line.slice(2);
+        if (trimmed === "") continue;
+        if (trimmed.includes("KNOB-REGION") || trimmed.includes("═══")) continue;
+        // Import path adjustments (US-001 convention)
+        if (trimmed.includes("scripted-agent-runtime-shared.mjs")) continue;
+        if (trimmed.includes("runtime-shared.mjs")) continue;
+        // nextWorkIndex agentId key convention (US-003 convention)
+        if (trimmed.includes("shortAgent")) continue;
+        if (trimmed.includes("agentId")) continue;
+        nonKnobDiffs.push(line);
+      }
+      assert.equal(
+        nonKnobDiffs.length,
+        0,
+        `runtime-dsh.mjs has unexpected diffs beyond the documented import + agentId-key changes:\n${nonKnobDiffs.join("\n")}`,
       );
     }
 

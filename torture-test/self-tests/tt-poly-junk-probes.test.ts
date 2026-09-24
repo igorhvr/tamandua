@@ -115,61 +115,79 @@ describe("tt-poly Makefile and subtree junk probe markers (US-008)", () => {
     );
   });
 
+  // --- TU2F NF-6: per-subtree .gitignore files consolidated into root ---
+
+  it("per-subtree .gitignore files are consolidated into tt-poly/.gitignore (TU2F NF-6)", () => {
+    for (const sub of subtrees) {
+      const nested = path.join(ttPolyDir, sub, ".gitignore");
+      assert.ok(
+        !fs.existsSync(nested),
+        `${sub}/.gitignore should be removed (consolidated into tt-poly/.gitignore)`,
+      );
+    }
+    const root = fs.readFileSync(path.join(ttPolyDir, ".gitignore"), "utf-8");
+    // The junk-probe documentation that lived in the per-subtree files is now
+    // folded into the root note (load-bearing: do not lose it).
+    assert.ok(root.includes("operator-notes.local"), "root .gitignore should document operator-notes.local junk probe");
+    assert.ok(root.includes("exec-bit-probe"), "root .gitignore should document the go exec-bit probe");
+    assert.ok(root.includes(".flaky_counter"), "root .gitignore should document .flaky_counter junk probe");
+  });
+
   // --- Python junk probes: __pycache__/, .pytest_cache/, .flaky_counter NOT gitignored ---
 
   it("python/ __pycache__/ is NOT gitignored", () => {
-    const giPath = path.join(ttPolyDir, "python", ".gitignore");
-    assert.ok(fs.existsSync(giPath), "python/.gitignore should exist");
+    const giPath = path.join(ttPolyDir, ".gitignore");
+    assert.ok(fs.existsSync(giPath), "tt-poly/.gitignore should exist");
 
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = parseGitignoreRules(content);
     assert.ok(
       !activeRules.includes("__pycache__/"),
-      "python/.gitignore must NOT gitignore __pycache__/ (junk probe)",
+      "tt-poly/.gitignore must NOT gitignore __pycache__/ (junk probe)",
     );
   });
 
   it("python/ .pytest_cache/ is NOT gitignored", () => {
-    const giPath = path.join(ttPolyDir, "python", ".gitignore");
+    const giPath = path.join(ttPolyDir, ".gitignore");
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = parseGitignoreRules(content);
     assert.ok(
       !activeRules.includes(".pytest_cache/"),
-      "python/.gitignore must NOT gitignore .pytest_cache/ (junk probe)",
+      "tt-poly/.gitignore must NOT gitignore .pytest_cache/ (junk probe)",
     );
   });
 
   it("python/ .flaky_counter is NOT gitignored", () => {
-    const giPath = path.join(ttPolyDir, "python", ".gitignore");
+    const giPath = path.join(ttPolyDir, ".gitignore");
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = parseGitignoreRules(content);
     assert.ok(
       !activeRules.includes(".flaky_counter"),
-      "python/.gitignore must NOT gitignore .flaky_counter (junk probe)",
+      "tt-poly/.gitignore must NOT gitignore .flaky_counter (junk probe)",
     );
   });
 
   // --- TS junk probes: package-lock.json, node_modules/ NOT gitignored ---
 
   it("ts/ package-lock.json is NOT gitignored", () => {
-    const giPath = path.join(ttPolyDir, "ts", ".gitignore");
-    assert.ok(fs.existsSync(giPath), "ts/.gitignore should exist");
+    const giPath = path.join(ttPolyDir, ".gitignore");
+    assert.ok(fs.existsSync(giPath), "tt-poly/.gitignore should exist");
 
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = parseGitignoreRules(content);
     assert.ok(
       !activeRules.some((r) => r === "package-lock.json"),
-      "ts/.gitignore must NOT gitignore package-lock.json (junk probe)",
+      "tt-poly/.gitignore must NOT gitignore package-lock.json (junk probe)",
     );
   });
 
   it("ts/ node_modules/ is NOT gitignored", () => {
-    const giPath = path.join(ttPolyDir, "ts", ".gitignore");
+    const giPath = path.join(ttPolyDir, ".gitignore");
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = parseGitignoreRules(content);
     assert.ok(
       !activeRules.some((r) => r === "node_modules/" || r === "node_modules"),
-      "ts/.gitignore must NOT gitignore node_modules/ (junk probe)",
+      "tt-poly/.gitignore must NOT gitignore node_modules/ (junk probe)",
     );
   });
 
@@ -189,49 +207,49 @@ describe("tt-poly Makefile and subtree junk probe markers (US-008)", () => {
     assert.ok(isExecutable, "go/testdata/exec-bit-probe.sh must have exec bit set");
   });
 
-  // --- Go: .gitignore exists and does not suppress exec-bit-probe ---
+  // --- Go: .gitignore (root) does not suppress exec-bit-probe ---
 
-  it("go/ .gitignore does NOT suppress testdata/exec-bit-probe.sh or operator-notes.local", () => {
-    const giPath = path.join(ttPolyDir, "go", ".gitignore");
-    assert.ok(fs.existsSync(giPath), "go/.gitignore should exist");
+  it("root .gitignore does NOT suppress testdata/exec-bit-probe.sh or operator-notes.local", () => {
+    const giPath = path.join(ttPolyDir, ".gitignore");
+    assert.ok(fs.existsSync(giPath), "tt-poly/.gitignore should exist");
 
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = parseGitignoreRules(content);
     assert.ok(
       !activeRules.some((r) => r.includes("exec-bit-probe")),
-      "go/.gitignore must NOT gitignore exec-bit-probe (junk probe)",
+      "tt-poly/.gitignore must NOT gitignore exec-bit-probe (junk probe)",
     );
     assert.ok(
       !activeRules.some((r) => r.includes("operator-notes.local")),
-      "go/.gitignore must NOT gitignore operator-notes.local (inert junk probe)",
+      "tt-poly/.gitignore must NOT gitignore operator-notes.local (inert junk probe)",
     );
   });
 
   // --- Rust junk probe: target/ NOT gitignored ---
 
   it("rust/ target/ is NOT gitignored", () => {
-    const giPath = path.join(ttPolyDir, "rust", ".gitignore");
-    assert.ok(fs.existsSync(giPath), "rust/.gitignore should exist");
+    const giPath = path.join(ttPolyDir, ".gitignore");
+    assert.ok(fs.existsSync(giPath), "tt-poly/.gitignore should exist");
 
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = parseGitignoreRules(content);
     assert.ok(
       !activeRules.some((r) => r === "target/" || r === "target"),
-      "rust/.gitignore must NOT gitignore target/ (junk probe)",
+      "tt-poly/.gitignore must NOT gitignore target/ (junk probe)",
     );
   });
 
   // --- Java junk probes: target/ NOT gitignored and .gitattributes with text=auto ---
 
   it("java/ target/ is NOT gitignored", () => {
-    const giPath = path.join(ttPolyDir, "java", ".gitignore");
-    assert.ok(fs.existsSync(giPath), "java/.gitignore should exist");
+    const giPath = path.join(ttPolyDir, ".gitignore");
+    assert.ok(fs.existsSync(giPath), "tt-poly/.gitignore should exist");
 
     const content = fs.readFileSync(giPath, "utf-8");
     const activeRules = parseGitignoreRules(content);
     assert.ok(
       !activeRules.some((r) => r === "target/" || r === "target"),
-      "java/.gitignore must NOT gitignore target/ (junk probe)",
+      "tt-poly/.gitignore must NOT gitignore target/ (junk probe)",
     );
   });
 
@@ -273,25 +291,25 @@ describe("tt-poly Makefile and subtree junk probe markers (US-008)", () => {
     }
   });
 
-  // --- Each subtree .gitignore documents junk probes ---
+  // --- Root .gitignore documents junk probes (folded from per-subtree files) ---
 
-  it("python/ .gitignore documents .flaky_counter as NOT gitignored", () => {
-    const content = fs.readFileSync(path.join(ttPolyDir, "python", ".gitignore"), "utf-8");
+  it("root .gitignore documents .flaky_counter as NOT gitignored", () => {
+    const content = fs.readFileSync(path.join(ttPolyDir, ".gitignore"), "utf-8");
     assert.ok(
       content.includes(".flaky_counter"),
-      "python/.gitignore should mention .flaky_counter as a junk probe",
+      "tt-poly/.gitignore should mention .flaky_counter as a junk probe",
     );
   });
 
-  it("python/ .gitignore references tt-poly (not tt-poly-lite)", () => {
-    const content = fs.readFileSync(path.join(ttPolyDir, "python", ".gitignore"), "utf-8");
+  it("root .gitignore references tt-poly (not tt-poly-lite)", () => {
+    const content = fs.readFileSync(path.join(ttPolyDir, ".gitignore"), "utf-8");
     assert.ok(
       !content.includes("tt-poly-lite"),
-      "python/.gitignore should not reference tt-poly-lite",
+      "tt-poly/.gitignore should not reference tt-poly-lite",
     );
     assert.ok(
       content.includes("tt-poly"),
-      "python/.gitignore should reference tt-poly",
+      "tt-poly/.gitignore should reference tt-poly",
     );
   });
 

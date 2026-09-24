@@ -1,0 +1,5 @@
+#!/usr/bin/env node
+
+import { main } from './lib/o7.mjs';
+
+await main();

@@ -115,6 +115,16 @@ const STATUS_QUERY_RETRY_BACKOFF_MS = 500;
 const STATUS_QUERY_RAW_EVIDENCE_BYTES = 4 * 1024;
 const DEFAULT_CAP_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
+// US-007 port: the bounded post-stop `workflow wait` for a REATTACHED
+// discovered run must still give the hook process time to start and record its
+// invocation. A resumed discovered run can carry an already-elapsed deadline
+// (the case rewrites it), so the wait is bounded by the cleanup timeout; with
+// a tiny token-poll interval (the tests configure 20ms) the bound would collapse
+// to a few milliseconds and SIGTERM the wait before it can append its evidence
+// to CONTROLLER_WORKFLOW_EVENTS. That is a start-up race, not a cap decision —
+// floor the cleanup bound so every invoked wait is observable while staying
+// bounded.
+const DISCOVERED_CLEANUP_WAIT_FLOOR_MS = 1_000;
 // US-005: independent deadline-expiry sweep cadence. A case whose attempt
 // deadline_at expired is terminally recorded (TEST_INFRA_FAIL
 // 'deadline-expired') by a sweep that runs on ITS OWN cadence, decoupled from
@@ -5606,7 +5616,10 @@ async function stopDiscoveredRun(caseState, run, breach, childEnv, state, campai
 // straggler_capture.reason. The stop -> bounded-wait -> terminal-harvest
 // path (including the cleanupWaitTimeoutMs bound) is unchanged.
 async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, campaignDir) {
-  const cleanupWaitTimeoutMs = Math.min(state.options.token_poll_interval_ms, 60_000);
+  const cleanupWaitTimeoutMs = Math.max(
+    DISCOVERED_CLEANUP_WAIT_FLOOR_MS,
+    Math.min(state.options.token_poll_interval_ms, 60_000),
+  );
   const initialBreach = discoveredRunBreach(caseRecord, caseState, run);
   if (initialBreach !== null) {
     const detectedAt = utcTimestamp();

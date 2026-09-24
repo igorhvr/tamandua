@@ -1,0 +1,67 @@
+{
+  "kind": "o12-schema14-diff",
+  "task": "STORM-AGED-FULL US-002 (tamandua-6sy.6.4.1)",
+  "parent_bead": "tamandua-6sy.6.4",
+  "scope": "SUITE-only (torture-test/**); NO src/ edits",
+  "product_fact": {
+    "schema_version": 14,
+    "chain_step": "v13 -> v14",
+    "feature": "LEDGER-DIAG",
+    "column": "suite_results.log_path",
+    "declaration": "TEXT (nullable; no backfill)",
+    "core_universe_effect": "none: suite_results.log_path is NOT a runs/steps/stories core column, so the v14 runs/steps/stories core universe equals v13's",
+    "union_rule_unchanged": "a v14 store must still carry BOTH runs.matchlock_policy and steps.preclaim_death_count (the MATCHLOCK-UNION rule stays in force from v13 on)",
+    "source_of_truth": "the product's src/db.ts chain (read-only); the column is a product fact and is never edited by the torture tree"
+  },
+  "touched_files": [
+    "torture-test/oracles/lib/o12.mjs",
+    "torture-test/oracles/O12-CONTRACT.md",
+    "torture-test/oracles/self-test/o12-schema-version.test.mjs",
+    "torture-test/oracles/self-test/generate-o12-fixtures.mjs",
+    "torture-test/oracles/self-test/o12.test.mjs",
+    "torture-test/oracles/self-test/o12-fixture-matrix.mjs",
+    "torture-test/oracles/self-test/o12-seed-snapshot.mjs",
+    "torture-test/oracles/self-test/o12-seed-snapshot.test.mjs",
+    "torture-test/aged/validate.mjs",
+    "torture-test/aged/seed-root-copy.mjs",
+    "torture-test/aged/self-test/aged-core.test.mjs",
+    "torture-test/self-tests/o12-repin-contract.test.mjs",
+    "torture-test/self-tests/o12-schema13-contract.mjs",
+    "torture-test/self-tests/o12-schema13-contract.test.mjs"
+  ],
+  "oracle_consequences": {
+    "supported_versions_before": [9, 10, 11, 12, 13],
+    "supported_versions_after": [9, 10, 11, 12, 13, 14],
+    "descriptor_added": "O12_SCHEMA_DESCRIPTORS[14] (lineage 'current'; the v13 runs/steps core universes; the same union-column declarations)",
+    "resolution_change": "resolveO12SchemaExpectation applies the both-union-columns fail-closed rule to user_version 13 AND 14; a v14 stamp missing either column is a whole-oracle ERROR naming the observed version and the missing column",
+    "fixture_matrix_before_count": 78,
+    "fixture_matrix_after_count": 80,
+    "fixtures_added": [
+      "o12-schema-v14-native (PASS positive control)",
+      "o12-schema-v14-missing-preclaim (whole-oracle ERROR)"
+    ],
+    "unsupported_control_renamed": "o12-schema-version-unsupported-14 -> o12-schema-version-unsupported-15"
+  },
+  "content_pin": {
+    "before": "d50275466dcb76a1f809ac2321507ab195dc885be0f8347ae200ea1e9a29d75f",
+    "after": "fb542e7f94c9950fb6551eb5d3624d4bb6bb06870ed701798fbe3460135ae5a5",
+    "recomputed_with": "computeO12OracleContentHash({repoRoot: process.cwd()})",
+    "provenance_constants_kept_as_is": true,
+    "note": "the nine-path content set is unchanged; validate.mjs itself is not in the set, so embedding the new hash is stable"
+  },
+  "red_arm": {
+    "method": "temporarily revert O12_SUPPORTED_SCHEMA_VERSIONS to [9, 10, 11, 12, 13] (descriptor 14 left in place)",
+    "command": "TAMANDUA_TEST_GUARD=1 TAMANDUA_PI_BINARY=/usr/bin/false TAMANDUA_HERMES_BINARY=/usr/bin/false TAMANDUA_DSH_BINARY=/usr/bin/false node --test torture-test/oracles/self-test/o12-schema-version.test.mjs",
+    "exit_code": 1,
+    "failure": "AssertionError [ERR_ASSERTION]: supported set must be [9, 10, 11, 12, 13, 14]",
+    "evidence_path": "torture-test/var/results/storm-seed-regen-us002-red-arm.txt",
+    "restored": true
+  },
+  "gate_results": {
+    "o12_schema_version_self_test": "PASS (exit 0)",
+    "o12_full_calibration_self_test": "PASS (exit 0; 80 fixtures, expected==observed for every generated fixture)",
+    "o12_seed_snapshot_self_test": "PASS (exit 0)",
+    "o12_content_pin_self_test": "PASS (exit 0)",
+    "aged_core_self_test": "H2 materializes the pinned content from HEAD, so it is green once this story's edits are committed"
+  }
+}

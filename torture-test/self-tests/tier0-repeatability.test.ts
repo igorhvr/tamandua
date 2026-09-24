@@ -29,6 +29,17 @@ const realGitconfig = path.join(operatorHome, ".gitconfig");
 function sha256(file: string): string {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
+
+// Presence + sha256 of the REAL operator ~/.gitconfig (null hash when
+// absent). vaimetal ships no ~/.gitconfig, so the unconditional sha256()
+// snapshot the double-gate test previously took throws ENOENT and cancels the
+// suite (the same defect the FIX10 containment gates and
+// tier0-gitconfig-containment already fixed). Mirror the presence-tolerant
+// contract: present:false -> hash null, and absent-stays-absent is asserted.
+function gitconfigFingerprint(): { present: boolean; hash: string | null } {
+  if (!fs.existsSync(realGitconfig)) return { present: false, hash: null };
+  return { present: true, hash: sha256(realGitconfig) };
+}
 const blockedRealEnv: NodeJS.ProcessEnv = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "NODE_TEST_CONTEXT")),
   // node:test marks descendants as tests; these scenarios intentionally use
@@ -236,13 +247,15 @@ async function assertCampaign(runNumber: number): Promise<string> {
   // contamination like the 2026-08-05 ~/.gitconfig breach).
   assert.ok(Array.isArray(report.hygiene_canary?.files), `Tier-0 run ${runNumber} report lacks hygiene_canary`);
   const canaryGitconfig = report.hygiene_canary.files.find((entry: any) => entry.name === "gitconfig");
-  assert.equal(canaryGitconfig?.status, "UNCHANGED", `Tier-0 run ${runNumber}: canary gitconfig must be UNCHANGED`);
+  assert.ok(
+    ["UNCHANGED", "ABSENT"].includes(canaryGitconfig?.status),
+    `Tier-0 run ${runNumber}: canary gitconfig must be UNCHANGED (or ABSENT when the operator ships none, e.g. vaimetal); got ${canaryGitconfig?.status}`);
   assert.equal(canaryGitconfig?.before, canaryGitconfig?.after,
     `Tier-0 run ${runNumber}: canary gitconfig before/after hashes must match`);
   assert.deepEqual(report.hygiene_canary.diffs, [], `Tier-0 run ${runNumber}: canary reported hygiene diffs`);
   const text = fs.readFileSync(textPath, "utf8");
   assert.match(text, /HYGIENE CANARY/, `Tier-0 run ${runNumber}: report.txt must render the HYGIENE CANARY section`);
-  assert.match(text, /- gitconfig: UNCHANGED/, `Tier-0 run ${runNumber}: report.txt must show gitconfig UNCHANGED`);
+  assert.match(text, /- gitconfig: (UNCHANGED|ABSENT)/, `Tier-0 run ${runNumber}: report.txt must show gitconfig UNCHANGED (or ABSENT on a host with none)`);
   return campaignDir;
 }
 
@@ -302,10 +315,10 @@ describe("Tier-0 repeatability acceptance", () => {
     const validation = run(controller, ["--manifest", manifest, "--validate-only"]);
     assert.equal(validation.status, 0, `${validation.stdout}\n${validation.stderr}`);
     assert.match(validation.stdout, /Validated 35 case\(s\)/);
-    const gitconfigBefore = sha256(realGitconfig);
+    const gitconfigBefore = gitconfigFingerprint();
     const campaigns = [await assertCampaign(1), await assertCampaign(2)];
     assert.notEqual(campaigns[0], campaigns[1], "repeat executions must retain distinct campaign evidence");
-    assert.equal(sha256(realGitconfig), gitconfigBefore,
-      "the real ~/.gitconfig sha256 must be byte-identical after both Tier-0 gates");
+    assert.deepEqual(gitconfigFingerprint(), gitconfigBefore,
+      "the real ~/.gitconfig presence/hash must be unchanged after both Tier-0 gates");
   });
 });

@@ -35,6 +35,16 @@ function sha256(file: string): string {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+// Presence + sha256 of the REAL operator ~/.gitconfig (null hash when
+// absent). vaimetal ships no ~/.gitconfig, so a before() snapshot that
+// unconditionally sha256()s the path throws ENOENT and cancels the whole
+// suite; mirror tier0-hygiene-canary's truthfulness contract instead —
+// present:false → hash null, and absent-stays-absent is asserted.
+function gitconfigFingerprint(): { present: boolean; hash: string | null } {
+  if (!fs.existsSync(realGitconfig)) return { present: false, hash: null };
+  return { present: true, hash: sha256(realGitconfig) };
+}
+
 type CommandResult = { status: number | null; stdout: string; stderr: string };
 
 function run(file: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs = 60_000): CommandResult {
@@ -92,15 +102,15 @@ function functionSlice(source: string, name: string): string {
   return lines.slice(start, end).join("\n");
 }
 
-let gitconfigBefore = "";
+let gitconfigBefore: { present: boolean; hash: string | null } = { present: false, hash: null };
 describe("FIX10 US-003 controller + tt-hook-runner contained-HOME fail-closed", () => {
   before(() => {
     fs.mkdirSync(varRoot, { recursive: true });
-    gitconfigBefore = sha256(realGitconfig);
+    gitconfigBefore = gitconfigFingerprint();
   });
   after(() => {
-    assert.equal(sha256(realGitconfig), gitconfigBefore,
-      "the real ~/.gitconfig hash changed during the test run — containment broke");
+    assert.deepEqual(gitconfigFingerprint(), gitconfigBefore,
+      "the real ~/.gitconfig presence/hash changed during the test run — containment broke");
   });
 
   it("tt-hook-runner refuses with exit 2 when its process.env.HOME is the real operator home", () => {
@@ -149,7 +159,7 @@ describe("FIX10 US-003 controller + tt-hook-runner contained-HOME fail-closed", 
       const outcome = JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8"));
       assert.equal(outcome.exit_code, 0);
       assert.equal(outcome.error, undefined);
-      assert.equal(sha256(realGitconfig), gitconfigBefore);
+      assert.deepEqual(gitconfigFingerprint(), gitconfigBefore);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
       fs.rmSync(containedHome, { recursive: true, force: true });

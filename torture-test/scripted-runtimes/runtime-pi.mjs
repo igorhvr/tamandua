@@ -28,7 +28,8 @@
  * what each round observed.
  *
  * Chaos modes (behavior.mode): "work" (default), "hang", "hang-after-claim",
- * "die-before-claim", "die-after-claim", "no-status", "garbage".
+ * "die-before-claim", "stream-die-before-claim", "die-after-claim",
+ * "no-status", "garbage".
  */
 
 import { spawnSync } from "node:child_process";
@@ -52,6 +53,7 @@ import {
   applyBehaviorActions,
   isHarnessProbePrompt,
   execHarnessProbe,
+  applyHold,
 } from "./runtime-shared.mjs";
 
 const prompt = process.argv[process.argv.length - 1] ?? "";
@@ -66,6 +68,15 @@ function logInvocation(entry) {
 
 function fatal(note) {
   sharedFatal(stateDir, "scripted-agent", note);
+}
+
+// Sleep synchronously for `ms` milliseconds (the same spawnSync("sleep", …)
+// pattern used by the reportBeforeEmit path below). A non-positive/absent
+// value is a no-op, so existing die-* behaviors are unchanged.
+function sleepFor(ms) {
+  const n = Number(ms);
+  if (!(n > 0)) return;
+  spawnSync("sleep", [(n / 1000).toFixed(3)]);
 }
 
 // ── pi-shaped JSON event emission ───────────────────────────────────
@@ -365,16 +376,48 @@ if (mode === "hang") {
   setInterval(() => {}, 1 << 30); // hold the event loop; scheduler timeout kills us
 } else if (mode === "die-before-claim") {
   logInvocation({ ...work, note: "exiting before claim" });
+  sleepFor(behavior.sleepMs);
+  // ═══════════════════════════════════════════════════════════════════
+  // KNOB-REGION-BEGIN — CORE-REPLAY die-before-claim preserved stdout
+  // ═══════════════════════════════════════════════════════════════════
+
+  // CORE-REPLAY (replay.unclaimed_exit): when the canned behavior carries
+  // preserved public stdout bytes, write them VERBATIM to stdout before
+  // exiting. fs.writeSync(1, ...) never appends a newline and is
+  // synchronous, so the exact recorded bytes — including an empty payload
+  // or a payload with no final newline — reach the observable round stdout
+  // before exit instead of living only in metadata (an async
+  // process.stdout.write could drop queued bytes on an immediate exit
+  // through a pipe). Absent preservedStdout keeps the original zero-byte
+  // die-before-claim shape. See torture-test/scripted-runtimes/
+  // KNOB-REGIONS.md.
+  if (typeof behavior.preservedStdout === "string") {
+    fs.writeSync(1, behavior.preservedStdout);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // KNOB-REGION-END — CORE-REPLAY die-before-claim preserved stdout
+  // ═══════════════════════════════════════════════════════════════════
   process.exit(behavior.exitCode ?? 3);
+} else if (mode === "stream-die-before-claim") {
+  // Slow streaming pre-claim death: emit non-empty stdout, wait past the
+  // instant-fail wall threshold, then exit non-zero WITHOUT ever claiming a
+  // step (no claimStep / completeStep call). Modelled for OUTAGE-ROUNDS so
+  // the pre-claim death backoff/cap can be exercised end-to-end.
+  logInvocation({ ...work, note: "streaming then dying before claim" });
+  const streamText = behavior.streamOutput ?? "working...\n";
+  process.stdout.write(streamText.endsWith("\n") ? streamText : `${streamText}\n`);
+  sleepFor(behavior.sleepMs);
+  process.exit(behavior.exitCode ?? 1);
 } else if (mode === "garbage") {
   logInvocation({ ...work, note: "emitting garbage output" });
   process.stdout.write("%%% not json — scripted garbage output %%%\n{truncated\n");
   process.exit(0);
 } else {
-  runWorkRound();
+  await runWorkRound();
 }
 
-function runWorkRound() {
+async function runWorkRound() {
   const claim = claimStep(cli, agentId, runId);
   if (claim.status !== 0) {
     logInvocation({ ...work, phase: "error", note: `step claim exited ${claim.status}: ${claim.stderr.slice(0, 500)}` });
@@ -404,6 +447,25 @@ function runWorkRound() {
     setInterval(() => {}, 1 << 30);
     return;
   }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // KNOB-REGION-BEGIN — STORM US-002 campaign-controlled mid-flight hold
+  // ═══════════════════════════════════════════════════════════════════
+
+  // Default 'work' path only: after a successful claim and before any
+  // behavior command / step complete, park the round on the campaign's
+  // per-run checkpoint so the run stays ACTIVE (step claimed, worker alive)
+  // until the engine releases it. Chaos/hang/lost-step modes are deliberately
+  // excluded — they must show the product's own recovery, not a held round.
+  // applyHold is fail-closed: it never throws and never blocks past the
+  // bounded timeout, so a stuck engine cannot leave this round held forever.
+  if (mode === "work") {
+    await applyHold(behavior, { stateDir, runId, log: logInvocation });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // KNOB-REGION-END
+  // ═══════════════════════════════════════════════════════════════════
 
   const failThisStep = (reason) => {
     logInvocation({ ...work, phase: "result", stepId, ok: false, note: reason.slice(0, 500) });

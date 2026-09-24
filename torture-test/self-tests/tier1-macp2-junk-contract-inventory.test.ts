@@ -90,14 +90,12 @@ const DOC_SITES: string[] = [
   "fixtures-src/tt-poly/.gitignore",
   "fixtures-src/tt-poly/python/FIXTURE.md",
   "fixtures-src/tt-poly/python/README-JUNK.md",
-  "fixtures-src/tt-poly/python/.gitignore",
   // tt-poly-lite docs
   "fixtures-src/tt-poly-lite/README-JUNK.md",
   "fixtures-src/tt-poly-lite/JUNK-IS-INTENTIONAL.md",
   "fixtures-src/tt-poly-lite/README.md",
   "fixtures-src/tt-poly-lite/.gitignore",
   "fixtures-src/tt-poly-lite/python/FIXTURE.md",
-  "fixtures-src/tt-poly-lite/python/.gitignore",
   // Case prompts describing provisioning junk
   "cases/tier1-traceability.md",
   "cases/tasks/tier2/W5.storm-capacity-scaled.md",

@@ -15,6 +15,17 @@
 // the real operator identity is never read except by the read-only default
 // snapshot probe. The real ~/.gitconfig is only ever READ (sha256 snapshot)
 // and asserted unchanged after the run.
+//
+// Operator-home resolution contract (portable under a private outer $HOME):
+// the canary module resolves the REAL operator home via os.userInfo().homedir
+// — deliberately NOT $HOME — and this gate mirrors that exact resolution for
+// its read-only default probes. The gate therefore runs correctly under a
+// private owned outer HOME (the battery's environment): default real-home
+// resolution is tested separately from the owned synthetic present/absent/
+// change examples (which use the TT_HYGIENE_CANARY_HOME override), and a
+// genuinely missing real ~/.gitconfig is truthfully represented as
+// present:false (never synthesized to force a green). The real operator
+// identity stays strictly read-only in every arm.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -32,11 +43,24 @@ const CANARY_MODULE = path.join(ttRoot, "bin", "tt-hygiene-canary.mjs");
 const REPORT_MODULE = path.join(ttRoot, "bin", "tt-report.mjs");
 const TIER0_MANIFEST = path.join(ttRoot, "cases", "tier0.jsonl");
 
-const operatorHome = os.homedir();
-const realGitconfig = path.join(operatorHome, ".gitconfig");
+// The REAL operator home the canary deliberately targets (os.userInfo().
+// homedir, never $HOME) — mirror the module so the read-only default probes
+// agree with it under any outer $HOME (this gate runs under a private owned
+// HOME). The real operator identity is only ever READ.
+const realOperatorHome = os.userInfo().homedir;
+const realGitconfig = path.join(realOperatorHome, ".gitconfig");
 
 function sha256OfFile(file: string): string {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+/** Presence + sha256 of the REAL operator ~/.gitconfig (null hash when
+ *  absent). Absence is truthfully represented: the canary records
+ *  present:false when the operator has no .gitconfig and this gate must not
+ *  synthesize one to force a green. Strictly read-only. */
+function gitconfigFingerprint(): { present: boolean; hash: string | null } {
+  if (!fs.existsSync(realGitconfig)) return { present: false, hash: null };
+  return { present: true, hash: sha256OfFile(realGitconfig) };
 }
 
 type CommandResult = { status: number | null; stdout: string; stderr: string };
@@ -101,15 +125,15 @@ function functionSlice(source: string, name: string): string {
   return lines.slice(start, end).join("\n");
 }
 
-let gitconfigBefore = "";
+let gitconfigBefore: { present: boolean; hash: string | null } = { present: false, hash: null };
 describe("FIX10 US-005 operator-identity hygiene canary", () => {
   before(() => {
     fs.mkdirSync(varRoot, { recursive: true });
-    gitconfigBefore = sha256OfFile(realGitconfig);
+    gitconfigBefore = gitconfigFingerprint();
   });
   after(() => {
-    assert.equal(sha256OfFile(realGitconfig), gitconfigBefore,
-      "the real ~/.gitconfig hash changed during the test run — containment broke");
+    assert.deepEqual(gitconfigFingerprint(), gitconfigBefore,
+      "the real ~/.gitconfig presence/hash changed during the test run — containment broke");
   });
 
   // ── Module unit tests ────────────────────────────────────────────────────
@@ -153,22 +177,33 @@ describe("FIX10 US-005 operator-identity hygiene canary", () => {
     }
   });
 
-  it("resolves the REAL operator home via os.userInfo().homedir (never $HOME) and reads it read-only", async () => {
+  it("resolves the REAL operator home via os.userInfo().homedir (never $HOME) and reads it strictly read-only", async () => {
     const { resolveHygieneHome, snapshotHygieneCanary } = await import(CANARY_MODULE);
     const override = process.env.TT_HYGIENE_CANARY_HOME;
     delete process.env.TT_HYGIENE_CANARY_HOME;
     try {
-      assert.equal(resolveHygieneHome(), operatorHome,
+      // Default resolution targets the real passwd home — independent of the
+      // outer $HOME the gate runs under (a private owned HOME here).
+      assert.equal(resolveHygieneHome(), realOperatorHome,
         "default canary home must be os.userInfo().homedir — deliberately not $HOME");
-      const before = sha256OfFile(realGitconfig);
+      const before = gitconfigFingerprint();
       const snapshot = snapshotHygieneCanary();
-      assert.equal(snapshot.home, operatorHome);
+      assert.equal(snapshot.home, realOperatorHome);
       const gitconfig = snapshot.files.find((entry: any) => entry.name === "gitconfig");
       assert.ok(gitconfig, "default snapshot must watch ~/.gitconfig");
-      assert.equal(gitconfig.present, true, "the operator ~/.gitconfig exists and must be watched");
-      assert.equal(gitconfig.hash, crypto.createHash("sha256")
-        .update(fs.readFileSync(realGitconfig)).digest("hex"));
-      assert.equal(sha256OfFile(realGitconfig), before, "default snapshot must never modify ~/.gitconfig");
+      // Truthful presence: present exactly when the real file exists; absent
+      // (hash null) when the operator has no .gitconfig — never synthesized.
+      assert.equal(gitconfig.present, before.present,
+        "default snapshot must truthfully report the real ~/.gitconfig presence");
+      if (before.present) {
+        assert.equal(gitconfig.hash, sha256OfFile(realGitconfig),
+          "default snapshot must hash the real ~/.gitconfig read-only");
+      } else {
+        assert.equal(gitconfig.hash, null,
+          "an absent real ~/.gitconfig must record hash null");
+      }
+      assert.deepEqual(gitconfigFingerprint(), before,
+        "default snapshot must never modify the real ~/.gitconfig");
     } finally {
       if (override !== undefined) process.env.TT_HYGIENE_CANARY_HOME = override;
     }
@@ -433,7 +468,7 @@ describe("FIX10 US-005 operator-identity hygiene canary", () => {
       // S51 (R4a US-009): every S51-era controller campaign prints its
       // executed/expected verdict line after the VERDICT line.
       assert.match(text, /VERDICT\nFINDINGS \(exit 1\)\nexecuted\/expected: 1\/1\n$/);
-      assert.equal(sha256OfFile(realGitconfig), gitconfigBefore,
+      assert.deepEqual(gitconfigFingerprint(), gitconfigBefore,
         "the real ~/.gitconfig must never be touched by the simulated breach");
     } finally {
       fs.rmSync(mutator, { force: true });
