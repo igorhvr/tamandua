@@ -1,0 +1,345 @@
+{
+  "schema": "diag-prune-contract/1",
+  "task": "DIAG-PRUNE",
+  "title": "tamandua run diagnose (read-only bundle) + tamandua evidence prune (manual, dry-run)",
+  "beads": ["tamandua-6sy.35", "tamandua-6sy.69"],
+  "designApprovedBy": "Igor",
+  "designApprovedAt": "2026-09-22",
+  "approvedOption": "A on both commands",
+  "integrationBranch": "integration/diag-prune",
+  "baseCommit": "e9192f30",
+  "featureBranch": "feature/diag-prune-commands",
+  "hostContractCopy": "/home/kaladin/matchlock-work/diag-prune-contract.json",
+  "bundle": {
+    "command": "tamandua run diagnose <run-id|run-number> [--out <dir>] [--json]",
+    "module": "src/diagnostics/bundle.ts",
+    "export": "createDiagnosticsBundle",
+    "cliModule": "src/cli/commands/run.ts",
+    "readOnly": true,
+    "startsOrTouchesDaemon": false,
+    "worksWhileDaemonRunning": true,
+    "defaultBundlePath": "<state>/diagnostics/<bareRunId>-<sanitizedTimestamp>",
+    "outBundlePath": "<outRoot>/<bareRunId>",
+    "selector": {
+      "exactRunId": true,
+      "unambiguousIdPrefix": true,
+      "runNumberForms": ["#<N>", "<N>"],
+      "module": "src/diagnostics/run-target.ts",
+      "export": "resolveRunTarget",
+      "notFoundError": "RunNotFoundError",
+      "ambiguousError": "AmbiguousRunError"
+    },
+    "files": [
+      "run.json",
+      "steps.json",
+      "stories.json",
+      "story_abandonments.json",
+      "run_worktrees.json",
+      "events.jsonl",
+      "daemon-log.txt",
+      "session-paths.json",
+      "evidence.json",
+      "suite-ledger.json",
+      "matchlock.json",
+      "summary.json",
+      "SUMMARY.md"
+    ],
+    "collectors": [
+      {
+        "section": "db-rows",
+        "module": "src/diagnostics/collect-db.ts",
+        "export": "collectDbRows",
+        "content": "runs, steps, stories, story_abandonments, run_worktrees rows as explicitly projected JSON",
+        "absentPolicy": "status 'absent' with absenceReason; never throws",
+        "testFile": "src/diagnostics/collect-db.test.ts",
+        "lane": "parallel"
+      },
+      {
+        "section": "events",
+        "module": "src/diagnostics/collect-events.ts",
+        "export": "collectRunEvents",
+        "content": "run-scoped events/<bareRunId>.jsonl first, then global rotations oldest-to-newest, deduped, order preserved",
+        "absentPolicy": "explicit absent marker line; never throws",
+        "testFile": "src/diagnostics/collect-events.test.ts",
+        "lane": "parallel"
+      },
+      {
+        "section": "daemon-log",
+        "module": "src/diagnostics/collect-logs.ts",
+        "export": "collectDaemonLog",
+        "content": "tamandua.log plus .1..5 lines mentioning the run id or short id",
+        "absentPolicy": "explicit absent marker line; never throws",
+        "testFile": "src/diagnostics/collect-logs.test.ts",
+        "lane": "parallel"
+      },
+      {
+        "section": "session-paths",
+        "module": "src/diagnostics/collect-sessions.ts",
+        "export": "collectSessionPaths",
+        "content": "pi/dsh/hermes session-store PATHS only (resolved exactly like token attribution)",
+        "pathsOnly": true,
+        "readsSessionContents": false,
+        "absentPolicy": "status 'absent' with the candidate path; never throws",
+        "testFile": "src/diagnostics/collect-sessions.test.ts",
+        "lane": "serial"
+      },
+      {
+        "section": "evidence-and-ledger",
+        "module": "src/diagnostics/collect-evidence.ts",
+        "export": "collectEvidence",
+        "content": "per-run evidence directory listing (paths + sizes, no symlink escape) and suite_results rows with log_path",
+        "absentPolicy": "missing root -> 'absent' with totalBytes 0; missing table degrades to 'absent'; never throws",
+        "testFile": "src/diagnostics/collect-evidence.test.ts",
+        "lane": "parallel"
+      },
+      {
+        "section": "matchlock",
+        "module": "src/diagnostics/collect-matchlock.ts",
+        "export": "collectMatchlock",
+        "content": "VM ids, console/serial logs, invocation error records, stored mount-plan/policy JSON",
+        "secretHandling": "every host-owned JSON value passes through redactSecrets before it is written",
+        "absentPolicy": "malformed policy reports 'absent'; never throws",
+        "testFile": "src/diagnostics/collect-matchlock.test.ts",
+        "lane": "parallel"
+      },
+      {
+        "section": "summary",
+        "module": "src/diagnostics/summary.ts",
+        "export": "buildDiagnosticsSummary",
+        "content": "summary.json + SUMMARY.md (run status, step/story timeline, retries, force-fail reason, last failing round stderr tail)",
+        "absentPolicy": "every missing section is an explicit 'absent' note; never fabricated",
+        "testFile": "src/diagnostics/summary.test.ts",
+        "lane": "parallel"
+      }
+    ],
+    "redactionModule": "src/diagnostics/redact.ts",
+    "redactionKeysRegex": "token|secret|password|api[-_]?key|authorization|credential (case-insensitive)",
+    "absentPolicy": "any missing source is reported as 'absent' in the bundle; no collector or the orchestrator throws",
+    "userFacing": "the whole bundle directory is attachable to a bug report; no host-specific assumptions beyond the state dir",
+    "jsonShape": "{ runId, bundlePath, summary } on stdout, one JSON object",
+    "docs": ["README.md#diagnostics--evidence", "skills/tamandua-agents/SKILL.md#diagnostics-bundle--evidence-prune"]
+  },
+  "prune": {
+    "command": "tamandua evidence prune --older-than <days> [--yes] [--json]",
+    "module": "src/diagnostics/prune-plan.ts",
+    "export": "planEvidencePrune",
+    "executorModule": "src/diagnostics/prune-exec.ts",
+    "executorExport": "executePrunePlan",
+    "cliModule": "src/cli/commands/evidence.ts",
+    "manualOnly": true,
+    "scheduled": false,
+    "dryRunDefault": true,
+    "executeFlag": "--yes",
+    "withoutExecute": "lists items, sizes and totals; removes nothing",
+    "olderThanParsing": "bare integer days or <N>d suffix only; milliseconds converted before the age comparison",
+    "scope": [
+      {
+        "kind": "evidence-dir",
+        "path": "<state>/runs/<bareRunId>"
+      },
+      {
+        "kind": "diagnostics-bundle",
+        "path": "<state>/diagnostics/<bareRunId>-<ts>"
+      },
+      {
+        "kind": "suite-log",
+        "path": "<state>/suite-logs/<row id>.log"
+      },
+      {
+        "kind": "removed-worktree",
+        "path": "run_worktrees row with status 'removed' whose worktree_path still exists"
+      }
+    ],
+    "eligibility": {
+      "terminalInstant": "runs.updated_at must be STRICTLY older than the threshold",
+      "comparison": "isOlderThan(runs.updated_at, olderThanMs, now, 0) from src/lib/instant.ts — numeric, never a string compare",
+      "unparseableInstant": "never old (kept)",
+      "nonTerminalRunStatuses": ["running", "paused", "pending"],
+      "liveSchedulingStatuses": [
+        "pending_register",
+        "queued",
+        "waiting",
+        "draining_pause",
+        "active"
+      ],
+      "liveRunOutcome": "every artifact of a live run is refused/kept and listed"
+    },
+    "refusals": [
+      "run is running, paused or pending",
+      "run scheduling_status is pending_register, queued, waiting, draining_pause or active",
+      "artifact cannot be mapped to a known run (orphan diagnostics dir, suite-log without a ledger row, .pending-*.log leftover)",
+      "terminal instant is missing or unparseable",
+      "terminal instant is not numerically older than the threshold"
+    ],
+    "removedWorktreeRule": "only rows already marked status 'removed' whose path still exists are candidates; a missing path is skipped (idempotent)",
+    "neverTouches": [
+      "run/step/story rows",
+      "the suite ledger (suite_results rows)",
+      "the event stream",
+      "the daemon log"
+    ],
+    "executorContainment": {
+      "lexical": "isPathInside(stateDir, candidate)",
+      "physical": "the deepest existing ancestor's realpath must be inside realpathSync(stateDir)",
+      "symlinks": "a symlink target itself is unlinked, never followed",
+      "missingPath": "skipped, never an error",
+      "duplicatePath": "never touched twice",
+      "databaseAccess": "none"
+    },
+    "refusalReporting": "refusals are listed with a reason, never silently dropped",
+    "jsonShape": "{ dryRun, olderThanMs, items, refusals, totals } plus removed/skipped/failed in execute mode",
+    "docs": ["README.md#diagnostics--evidence", "skills/tamandua-agents/SKILL.md#diagnostics-bundle--evidence-prune"]
+  },
+  "tests": {
+    "unit": [
+      {
+        "file": "src/diagnostics/paths.test.ts",
+        "covers": "bundle/diagnostics/evidence/suite-logs path layout, sanitizeSegment",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/redact.test.ts",
+        "covers": "recursive secret-key redaction",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/types.test.ts",
+        "covers": "shared diagnostics/prune shapes",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/run-target.test.ts",
+        "covers": "exact id / prefix / #N / bare N resolution, not-found and ambiguous errors",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/collect-db.test.ts",
+        "covers": "projected run/step/story/worktree rows against an in-memory SQLite db",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/collect-events.test.ts",
+        "covers": "run-scoped + rotated global event collection, dedupe, corrupt/torn lines",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/collect-logs.test.ts",
+        "covers": "current and rotated daemon-log matching",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/collect-evidence.test.ts",
+        "covers": "evidence dir listing (no symlink escape) + suite ledger rows",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/collect-sessions.test.ts",
+        "covers": "pi/dsh/hermes session-store path resolution",
+        "lane": "serial"
+      },
+      {
+        "file": "src/diagnostics/collect-matchlock.test.ts",
+        "covers": "VM ids, logs, error records, redacted policy",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/summary.test.ts",
+        "covers": "summary.json/SUMMARY.md, absent sections, force-fail reason, stderr tail",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/bundle.test.ts",
+        "covers": "orchestrator file set, absent sources, Matchlock-shaped fixture, out-root layout",
+        "lane": "serial"
+      },
+      {
+        "file": "src/diagnostics/prune-plan.test.ts",
+        "covers": "dry-run plan, eligibility, refusals, unknown-artifact keeps",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/diagnostics/prune-exec.test.ts",
+        "covers": "filesystem-only removal, containment, idempotence, symlink handling",
+        "lane": "parallel"
+      },
+      {
+        "file": "src/cli/commands/run.test.ts",
+        "covers": "run diagnose argument parsing, --json output, exit codes",
+        "lane": "serial"
+      },
+      {
+        "file": "src/cli/commands/evidence.test.ts",
+        "covers": "evidence prune argument parsing, dry-run default, --json output",
+        "lane": "serial"
+      }
+    ],
+    "e2e": [
+      {
+        "file": "e2e-tests/run-diagnose.test.ts",
+        "covers": "CLI diagnose against a scripted run (present sources) and a synthetic absent-sources run",
+        "tier": "scripted"
+      },
+      {
+        "file": "e2e-tests/evidence-prune.test.ts",
+        "covers": "CLI prune dry-run then --yes against a terminal scripted run; live-run refusal",
+        "tier": "scripted"
+      }
+    ],
+    "guards": [
+      {
+        "file": "tests/diag-prune-contract.test.ts",
+        "covers": "this contract: required top-level keys, gate command set, no host-specific assumptions",
+        "lane": "parallel"
+      }
+    ],
+    "serialLaneRegistrations": [
+      "src/cli/commands/run.test.ts",
+      "src/cli/commands/evidence.test.ts",
+      "src/diagnostics/bundle.test.ts",
+      "src/diagnostics/collect-sessions.test.ts"
+    ],
+    "e2eRegistration": [
+      "run-all-scripted-e2e-tests",
+      "run-all-e2e-tests SCRIPTED_TIER_CMD"
+    ]
+  },
+  "gates": [
+    {
+      "kind": "build",
+      "command": "npm run build",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "build",
+      "note": "TypeScript compile + version injection; this is also the typecheck gate"
+    },
+    {
+      "kind": "new-tests",
+      "command": "node --test src/diagnostics/paths.test.ts src/diagnostics/redact.test.ts src/diagnostics/types.test.ts src/diagnostics/run-target.test.ts src/diagnostics/collect-db.test.ts src/diagnostics/collect-events.test.ts src/diagnostics/collect-logs.test.ts src/diagnostics/collect-evidence.test.ts src/diagnostics/collect-matchlock.test.ts src/diagnostics/summary.test.ts src/diagnostics/prune-plan.test.ts src/diagnostics/prune-exec.test.ts tests/diag-prune-contract.test.ts",
+      "serialCommand": "node --test --test-concurrency=1 src/diagnostics/collect-sessions.test.ts src/diagnostics/bundle.test.ts src/cli/commands/run.test.ts src/cli/commands/evidence.test.ts",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "new-tests",
+      "note": "the new diagnostics/prune/CLI/contract tests alone, split into their parallel and serial lanes"
+    },
+    {
+      "kind": "full-suite",
+      "command": "tamandua-test --repo '<repo>' --run '<run>' --step 'implement' -- 'npm test'",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "full-suite",
+      "note": "exact TEST_CMD for this run; both lanes must be green (documented host-load flakes re-run green alone)"
+    },
+    {
+      "kind": "e2e",
+      "command": "./run-all-e2e-tests",
+      "cwd": "<repo>",
+      "expectedExit": 0,
+      "lane": "e2e",
+      "note": "smoke + scripted tiers (includes e2e-tests/run-diagnose.test.ts and e2e-tests/evidence-prune.test.ts)"
+    }
+  ],
+  "notRun": {
+    "realE2eTier": "not run (./run-all-real-e2e-tests) — spends real tokens",
+    "matchlockVmGates": "not run — the run's own rounds execute inside VMs; the coordinator certifies on both machines"
+  }
+}

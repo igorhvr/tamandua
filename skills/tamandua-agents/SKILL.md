@@ -535,6 +535,8 @@ tamandua workflow cancel <run-id>        # Alias for stop
 tamandua workflow fail <run-id> --reason <text> [--force]
 tamandua workflow delete <run-id> [--force]
 tamandua nudge
+tamandua run diagnose <run-id|run-number> [--out <dir>] [--json]  # read-only diagnostics bundle for a run
+tamandua evidence prune --older-than <days> [--yes] [--json]      # remove old evidence; dry-run by default, manual only
 ```
 
 **Flag rejection:** `tamandua workflow run` now rejects unknown `--flags` and
@@ -1173,6 +1175,29 @@ status and on failure prints the **exact remedy command** to run.
 tamandua doctor
 tamandua doctor --help
 ```
+
+### Diagnostics bundle & evidence prune
+
+`tamandua run diagnose <run-id|run-number> [--out <dir>] [--json]` assembles one
+READ-ONLY diagnostics bundle per run (default `<state>/diagnostics/<run-id>-<ts>`;
+`--out` writes `<dir>/<run-id>`). It never starts or touches the daemon and works
+while it runs or when it is stopped. The bundle contains: (a) run/step/story/
+story-abandonment/worktree rows as JSON; (b) the run's full event stream across
+rotations, in order; (c) daemon-log lines mentioning the run id or short id; (d)
+harness session-store PATHS for each round (pi/dsh/hermes — paths only, never
+contents); (e) the evidence directory listing (paths + sizes) and suite-ledger rows
+with `log_path`; (f) Matchlock VM ids, console/serial logs, invocation error records
+and the redacted policy JSON; (g) `summary.json` + `SUMMARY.md` (status, timeline,
+retries, force-fail reason, last failing stderr tail). Missing sources are reported
+as `absent`, never as errors. Attach the whole bundle directory to a bug report.
+
+`tamandua evidence prune --older-than <days> [--yes] [--json]` is MANUAL ONLY and a
+DRY RUN by default: without `--yes` it only lists what it would remove (sizes and
+totals). It removes per-run evidence directories, per-run diagnostics bundles,
+suite-logs files and already-removed run worktrees for terminal runs older than the
+threshold; live runs (running/paused/pending) and unmapped artifacts are
+kept/refused. It never touches run/step/story rows, the suite ledger, the event
+stream or the daemon log.
 
 ### Review artifacts on changes
 

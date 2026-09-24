@@ -684,6 +684,42 @@ followed by a top-level command listing.
 **When adding or changing commands:** every new command or subcommand needs:
 - A corresponding `get<Thing>Help()` function
 - A `--help` dispatch if-block in `main()` (before the command execution path)
+- Its own module under `src/cli/commands/` imported by `cli.ts` (the
+  `src/cli/cli-thin.test.ts` and `tests/cli-structure.test.ts` guards pin the
+  command-module import set and the dispatcher handler order) and an entry in
+  `isTopLevelGroup`/`KNOWN_TOP_LEVEL` in `src/cli/shared.ts` for new groups
+
+### Diagnostics bundles & evidence prune (DIAG-PRUNE)
+
+`tamandua run diagnose <run-id|run-number> [--out <dir>] [--json]` is a
+READ-ONLY bundle assembler. Its modules live in `src/diagnostics/`
+(`paths.ts`, `redact.ts`, `collect-*.ts`, `summary.ts`, `bundle.ts`; the CLI
+group is `src/cli/commands/run.ts`). A bundle carries DB rows, the run event
+stream, matched daemon-log lines, harness session PATHS, the per-run evidence
+listing plus suite-ledger rows, Matchlock VM/console/error evidence (redacted
+via `redactSecrets`) and a `summary.json`/`SUMMARY.md`. Every absent source is
+an explicit `status: 'absent'` (never an exception). It never starts or
+touches the daemon.
+
+`tamandua evidence prune --older-than <days> [--yes] [--json]` is MANUAL ONLY
+and dry-run by default; nothing schedules it. The planner
+(`src/diagnostics/prune-plan.ts`) is read-only over `runs`/`run_worktrees`/
+`suite_results` and refuses any run that is live (`status IN
+running|paused|pending` or `scheduling_status IN pending_register|queued|
+waiting|draining_pause|active`) or whose terminal instant is not numerically
+older (`isOlderThan`; an unparseable instant is never old). The executor
+(`src/diagnostics/prune-exec.ts`) is filesystem-only (no DB access) and
+enforces state-dir containment twice: lexically via `isPathInside` and
+physically via the deepest existing ancestor's realpath inside
+`realpathSync(stateDir)`. It removes only `action: 'remove'` items, skips a
+missing path (idempotent), unlinks a symlink target rather than following it,
+never touches a path twice, and reports `failed` for a refusal/error.
+
+The tracked contract for both commands is
+`torture-test/impl-tasks/diag-prune-contract.json`, pinned by the pure-fs
+guard `tests/diag-prune-contract.test.ts` (it parses the repo copy and
+compares the contract-recorded `hostContractCopy` only when that path
+exists).
 
 ### Real-VM whole-path merge-workflow gate (US-009/US-010)
 
@@ -1491,6 +1527,13 @@ end-to-end, after major infrastructure changes, or when explicitly told to.
 - **None of these are included in `npm test`** — they live under `e2e-tests/`
 and are separate from the regular suite.
 - **None are compiled by `tsconfig.json`** — they live outside `src/`.
+- **Scripted e2e port handoff:** any `e2e-tests/*.test.ts` that calls
+  `startIsolatedDaemon(` must release the reserved ports first via
+  `releasePortReservations(env)` (enforced by `tests/e2e-infrastructure.test.ts`).
+  Register a new scripted-tier file in the SAME single `node --test` invocation
+  of `run-all-scripted-e2e-tests` and in the `SCRIPTED_TIER_CMD` of
+  `run-all-e2e-tests` — never a second invocation and never a
+  `--test-concurrency` flag in the scripted runner.
 
 ### Parallel Test Safety
 

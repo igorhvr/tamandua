@@ -105,7 +105,7 @@ export function isTopLevelGroup(word: string): boolean {
     "version", "skill-path", "source-path", "update", "get-ready",
     "uninstall", "status", "merge-branch", "mcp", "dashboard", "daemon",
     "control-plane", "step", "logs", "logs-tail", "worktree", "autoresearch",
-    "workflow", "restart", "nudge", "doctor",
+    "workflow", "restart", "nudge", "doctor", "run", "evidence",
   ];
   if (groups.includes(word)) return true;
   return false;
@@ -116,7 +116,7 @@ export const KNOWN_TOP_LEVEL = [
   "version", "skill-path", "source-path", "update", "get-ready",
   "uninstall", "status", "merge-branch", "mcp", "dashboard", "daemon",
   "control-plane", "step", "logs", "logs-tail", "worktree", "autoresearch",
-  "workflow", "restart", "nudge", "doctor",
+  "workflow", "restart", "nudge", "doctor", "run", "evidence",
 ];
 
 /**

@@ -13,11 +13,13 @@ src/cli/cli.unknown.test.ts
 src/cli/commands/autoresearch.test.ts
 src/cli/commands/daemon.test.ts
 src/cli/commands/dashboard.test.ts
+src/cli/commands/evidence.test.ts
 src/cli/commands/get-ready.test.ts
 src/cli/commands/logs.test.ts
 src/cli/commands/mcp.test.ts
 src/cli/commands/merge-branch.test.ts
 src/cli/commands/restart.test.ts
+src/cli/commands/run.test.ts
 src/cli/commands/status.test.ts
 src/cli/commands/step.test.ts
 src/cli/commands/wait.test.ts
@@ -30,6 +32,8 @@ src/cli/wizard-evaluator.test.ts
 src/cli/wizard-orchestrator.test.ts
 src/cli/wizard.test.ts
 src/db.test.ts
+src/diagnostics/bundle.test.ts
+src/diagnostics/collect-sessions.test.ts
 src/doctor.test.ts
 src/installer/agent-scheduler-binary-discovery.test.ts
 src/installer/agent-scheduler-drain-guard.test.ts

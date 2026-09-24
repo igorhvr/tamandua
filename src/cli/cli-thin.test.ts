@@ -87,6 +87,8 @@ describe("SPL2 thin CLI dispatcher", () => {
       "handleDaemon",
       "handleRestart",
       "handleStatus",
+      "handleRun",
+      "handleEvidence",
       "handleStep",
       "handleLogs",
       "handleWorktree",

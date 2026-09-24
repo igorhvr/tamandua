@@ -717,6 +717,40 @@ JSON endpoint is also useful for external integrations — see
 
 <p align="center"><img src="www/assets/dashboard-kanban.png" alt="Tamandua kanban board showing swim-lane workflow step cards colour-coded by status" width="800"></p>
 
+### Diagnostics & evidence
+
+| Command | Description |
+|---------|-------------|
+| `tamandua run diagnose <run-id\|run-number> [--out <dir>] [--json]` | Assemble a read-only diagnostics bundle for one run (default `<state>/diagnostics/<run-id>-<ts>`; `--out` writes `<dir>/<run-id>`). Prints the summary and the bundle path. |
+| `tamandua evidence prune --older-than <days> [--yes] [--json]` | Remove old run evidence artifacts for terminal runs. Manual only and a dry run by default; `--yes` executes. |
+
+#### Diagnostics bundle
+
+`tamandua run diagnose` is READ-ONLY: it never starts or contacts the daemon, and
+works whether the daemon is running or stopped. It writes one directory per run
+containing:
+
+- (a) the run, step, story, story-abandonment and worktree rows as JSON;
+- (b) the run's complete event stream across rotations, in order;
+- (c) daemon-log lines mentioning the run id or its short id (current and rotated logs);
+- (d) the harness session-store PATHS for each round (pi/dsh/hermes — paths only, never credentials or session contents);
+- (e) the run's evidence directory listing (paths and sizes) and its suite-ledger rows including `log_path`;
+- (f) for Matchlock-backed rounds: VM ids, their console/serial logs when present, invocation error records and the stored mount-plan/policy JSON (secret-bearing fields redacted);
+- (g) a `summary.json` and `SUMMARY.md` with run status, the step/story timeline, retries, the force-fail reason and the last stderr lines of the last failing round.
+
+A missing source is reported as `absent` inside the bundle, never as an error.
+Attach the whole bundle directory to a bug report.
+
+#### Evidence prune
+
+`tamandua evidence prune --older-than <days>` is MANUAL ONLY — nothing schedules
+it — and a DRY RUN by default: without `--yes` it only lists what it would remove,
+with sizes and totals. It covers per-run evidence directories, per-run diagnostics
+bundles, suite-logs files and already-removed run worktrees for runs whose terminal
+instant is older than the threshold. Runs that are running, paused or pending, and
+artifacts that cannot be mapped to a known run, are refused/kept. It never touches
+run/step/story rows, the suite ledger, the event stream or the daemon log.
+
 ### Harness Selection
 
 By default, Tamandua uses **pi** (`pi --print`) as its agent harness. You can

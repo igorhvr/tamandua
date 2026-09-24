@@ -19,7 +19,7 @@ const RETRY_DELAY_MS = 700;
  * Resolve the hermes home directory from the given env (falls back to
  * process.env, then ~/.hermes).
  */
-function resolveHermesHome(env?: NodeJS.ProcessEnv): string {
+export function resolveHermesHome(env?: NodeJS.ProcessEnv): string {
   return (
     env?.HERMES_HOME ??
     process.env.HERMES_HOME ??

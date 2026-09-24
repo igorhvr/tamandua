@@ -121,6 +121,16 @@ import {
   getWorkflowUninstallHelp,
   handleWorkflow,
 } from "./commands/workflow.js";
+import {
+  getRunDiagnoseHelp,
+  getRunHelp,
+  handleRun,
+} from "./commands/run.js";
+import {
+  getEvidenceGroupHelp,
+  getEvidencePruneHelp,
+  handleEvidence,
+} from "./commands/evidence.js";
 import { getWaitHelp } from "./commands/wait.js";
 import {
   getMergeBranchHelp,
@@ -140,6 +150,10 @@ function getUsageText(): string {
     "tamandua status [--json]              Show detailed system status (services, paths, runs, processes)",
     "tamandua merge-branch --origin <repo> --branch <branch> --into <target> --expect-tip <sha> --message <message>",
     "                                      Atomically land a plumbing-based squash merge",
+    "tamandua run diagnose <run-id|run-number> [--out <dir>] [--json]",
+    "                                      Assemble a read-only diagnostics bundle for a run",
+    "tamandua evidence prune --older-than <days> [--yes] [--json]",
+    "                                      Remove old evidence artifacts (dry-run by default)",
     "", "tamandua workflow list                List available workflows",
     "tamandua workflow install <name|--all>  Install a workflow (or all)",
     "tamandua workflow run <name> <task> [--no-hurry-please-save-tokens-mode]",
@@ -254,6 +268,14 @@ async function main() {
     }
     if (group === "merge-branch") {
       printHelp(getMergeBranchHelp());
+    }
+    if (group === "run") {
+      if (action === "diagnose") { printHelp(getRunDiagnoseHelp()); }
+      printHelp(getRunHelp());
+    }
+    if (group === "evidence") {
+      if (action === "prune") { printHelp(getEvidencePruneHelp()); }
+      printHelp(getEvidenceGroupHelp());
     }
     if (group === "mcp") {
       if (action === "start") { printHelp(getMcpStartHelp()); }
@@ -382,6 +404,10 @@ async function main() {
   if (await handleRestart(group, args)) { return; }
 
   if (await handleStatus(group, args)) { return; }
+
+  if (handleRun(group, args)) { return; }
+
+  if (handleEvidence(group, args)) { return; }
 
   if (await handleStep(group, args)) { return; }
 
