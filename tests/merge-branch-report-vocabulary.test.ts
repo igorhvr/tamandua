@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { scanRootsForContents } from "./helpers/robust-scan-walk.ts";
 
 /**
  * NPF-1 / REROUTE-BUDGET (US-007): the merge-branch landing report states only
@@ -12,38 +13,33 @@ import { describe, it } from "node:test";
  * The retired token is assembled at runtime so this guard file itself — which
  * lives under tests/ and is intentionally outside the scanned directories —
  * never becomes a false positive.
+ *
+ * TEST-HYGIENE-0923 item 3a (bead tamandua-6sy.88): the walk/read is done by
+ * tests/helpers/robust-scan-walk.ts, which prunes documented transient fixture
+ * paths and tolerates a file or directory that vanishes mid-walk (item 3b
+ * moved tests/e2e-syntax-check.test.ts's scratch dir out of `e2e-tests/`, but
+ * the tolerance stays as the general defence for any in-tree transient),
+ * while never dropping a file that still exists.
  */
 const RETIRED_LABEL = ["not", "applicable"].join("-");
 
 const SCANNED_ROOTS = ["src", "e2e-tests"];
 const SCANNED_EXTENSIONS = [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".md"];
 
-function collectFiles(root: string): string[] {
-  const files: string[] = [];
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === "node_modules" || entry.name === ".git") continue;
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-      } else if (entry.isFile() && SCANNED_EXTENSIONS.some((ext) => entry.name.endsWith(ext))) {
-        files.push(full);
-      }
-    }
-  };
-  if (statSync(root).isDirectory()) walk(root);
-  return files;
-}
-
 describe("merge-branch landing report vocabulary (NPF-1 / US-007)", () => {
   it("retires the unverified not-applicable checkout label everywhere under src/ and e2e-tests/", () => {
-    const offenders: string[] = [];
-    for (const root of SCANNED_ROOTS) {
-      for (const file of collectFiles(root)) {
-        const contents = readFileSync(file, "utf8");
-        if (contents.includes(RETIRED_LABEL)) offenders.push(file);
-      }
-    }
+    const scan = scanRootsForContents({
+      roots: SCANNED_ROOTS,
+      extensions: SCANNED_EXTENSIONS,
+      cwd: process.cwd(),
+    });
+
+    assert.ok(scan.contents.length > 0, `scan of ${SCANNED_ROOTS.join(", ")} returned no files`);
+
+    const offenders = scan.contents
+      .filter(({ text }) => text.includes(RETIRED_LABEL))
+      .map(({ path }) => path);
+
     assert.deepEqual(offenders, [], `retired checkout label still present in: ${offenders.join(", ")}`);
   });
 
