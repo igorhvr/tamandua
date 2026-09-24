@@ -3,7 +3,6 @@ import path from "node:path";
 import { fetchWorkflow } from "./workflow-fetch.js";
 import { loadWorkflowSpec } from "./workflow-spec.js";
 import { provisionAgents } from "./agent-provision.js";
-import { readPiConfig, type PiConfig } from "./pi-config.js";
 import { resolvePiStateDir, resolveSourcePath } from "./paths.js";
 import type { AgentRole, WorkflowInstallResult } from "./types.js";
 import { writeCatalogStamp } from "./catalog-version.js";
@@ -169,16 +168,6 @@ function buildToolsConfig(role: AgentRole): Record<string, unknown> {
   };
 }
 
-// ── Pi config helpers (simplified — pi doesn't need the same cron/session config) ──
-
-function ensureCronSessionRetention(_config: PiConfig): void {
-  // Pi doesn't have cron-based session management — no-op for compatibility
-}
-
-function ensureSessionMaintenance(_config: PiConfig): void {
-  // Pi doesn't have session maintenance config — no-op for compatibility
-}
-
 // ── Agent upsert ──
 
 function upsertAgent(
@@ -248,9 +237,6 @@ export async function installWorkflow(params: {
   for (const agent of workflow.agents) {
     roleMap.set(agent.id, agent.role ?? inferRole(agent.id));
   }
-
-  // Read pi config for reference (we don't modify pi's config, just read it)
-  await readPiConfig();
 
   // Load and update the tamandua agents list
   const list = await readAgentsList();

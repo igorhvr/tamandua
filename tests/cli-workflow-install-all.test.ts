@@ -81,14 +81,6 @@ const TMP_PREFIX = "tamandua-wf-install-all-";
 function setupTempHome(): string {
   const th = createTempHome(TMP_PREFIX);
   const homeDir = th.homeDir;
-  // Seed a minimal pi settings.json so installWorkflow's readPiConfig() succeeds
-  const piAgentDir = path.join(homeDir, ".pi", "agent");
-  fs.mkdirSync(piAgentDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(piAgentDir, "settings.json"),
-    JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-4o" }),
-    "utf-8",
-  );
   return homeDir;
 }
 

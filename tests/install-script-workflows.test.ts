@@ -24,13 +24,6 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 
 function createTempHome(): string {
   const dir = tamanduaTempDir("tamandua-inst-sh-");
-  const piAgentDir = path.join(dir, ".pi", "agent");
-  fs.mkdirSync(piAgentDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(piAgentDir, "settings.json"),
-    JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-4o" }),
-    "utf-8",
-  );
   return dir;
 }
 

@@ -89,17 +89,6 @@ async function safeClose(h: PortHandle | undefined): Promise<void> {
   }
 }
 
-/** Seed a minimal pi settings.json so installWorkflow's readPiConfig() succeeds. */
-function seedPiConfig(homeDir: string): void {
-  const piAgentDir = path.join(homeDir, ".pi", "agent");
-  fs.mkdirSync(piAgentDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(piAgentDir, "settings.json"),
-    JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-4o" }),
-    "utf-8",
-  );
-}
-
 /**
  * Create an isolated workflows source containing exactly one real bundled
  * workflow, so get-ready exercises install → services quickly without
@@ -215,8 +204,6 @@ describe("tamandua get-ready TAMANDUA_DASHBOARD_PORT", () => {
     };
 
     try {
-      seedPiConfig(tempEnv.homeDir);
-
       // Free the reserved ports just before get-ready binds them.
       await dashPortHandle.close();
       await controlPortHandle.close();
@@ -297,7 +284,6 @@ describe("tamandua get-ready TAMANDUA_DASHBOARD_PORT", () => {
       };
 
       try {
-        seedPiConfig(tempEnv.homeDir);
         await controlPortHandle.close();
 
         const result = await runCliOnce(["get-ready"], cliEnv);

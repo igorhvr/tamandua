@@ -127,15 +127,6 @@ describe("installWorkflow", () => {
     tempHome = tamanduaTempDir("tamandua-install-");
     process.env.HOME = tempHome;
     delete process.env.TAMANDUA_STATE_DIR;
-
-    // Create minimal pi config so readPiConfig doesn't fail on ENOENT
-    const piAgentDir = path.join(tempHome, ".pi", "agent");
-    fs.mkdirSync(piAgentDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(piAgentDir, "settings.json"),
-      JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-4" }),
-      "utf-8",
-    );
   });
 
   afterEach(() => {
@@ -190,6 +181,35 @@ describe("installWorkflow", () => {
       assert.ok(agent.agentDir, `agent ${agent.id} should have agentDir`);
       assert.ok(agent.config, `agent ${agent.id} should have config`);
     }
+  });
+
+  it("installs a workflow when no pi settings file exists", async () => {
+    // Regression guard: installWorkflow used to call readPiConfig()
+    // unconditionally, whose strict reader throws on ENOENT — so installing
+    // any workflow failed on a fresh machine / container / CI box where pi
+    // has never written ~/.pi/agent/settings.json. Nothing in the install
+    // path consumes the pi config; the read must be gone.
+    assert.ok(
+      !fs.existsSync(path.join(tempHome, ".pi")),
+      "fixture must not contain a .pi directory",
+    );
+
+    const result = await installWorkflow({ workflowId: "bug-fix" });
+
+    assert.equal(result.workflowId, "bug-fix");
+    assert.ok(
+      fs.existsSync(path.join(tempHome, ".tamandua", "agents.json")),
+      "agents.json should exist",
+    );
+    assert.ok(
+      fs.existsSync(path.join(result.workflowDir, "metadata.json")),
+      "metadata.json should exist",
+    );
+    // The install must not conjure a pi config into existence either.
+    assert.ok(
+      !fs.existsSync(path.join(tempHome, ".pi")),
+      "install must not create .pi",
+    );
   });
 
   it("installs feature-dev workflow successfully", async () => {

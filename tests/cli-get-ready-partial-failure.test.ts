@@ -72,14 +72,6 @@ function cleanStderr(stderr: string): string {
 function setupTempHome(): string {
   const th = createTempHome("tamandua-get-ready-");
   const homeDir = th.homeDir;
-  // Seed a minimal pi settings.json so installWorkflow's readPiConfig() succeeds
-  const piAgentDir = path.join(homeDir, ".pi", "agent");
-  fs.mkdirSync(piAgentDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(piAgentDir, "settings.json"),
-    JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-4o" }),
-    "utf-8",
-  );
   // Mark the daemon / dashboard / MCP services as already running in the
   // temp state: get-ready's tail section starts each service on its default
   // production port (control plane 3339, dashboard 3334, MCP 3338) when the
