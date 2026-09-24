@@ -1,0 +1,1 @@
+This provides an image that has the 3 supported harness for usage of tamandua with matchlock. It also provides a docker image. Any of them can be used to use tamandua itself from within containers too.
