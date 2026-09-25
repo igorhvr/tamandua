@@ -171,8 +171,26 @@ OBSERVED: <final harness message, at most 400 chars>
 EXIT_CODE: 1
 SIGNAL:
 DURATION_MS: 320
+IMAGE: <requested image tag — Matchlock (opted-in) runs only>
+IMAGE_DIGEST: <resolved image digest — Matchlock runs whose pinned policy carries one>
+HINT: <bounded, evidence-confidenced guidance — only when the captured failure classifies>
 STDERR_TAIL: <last 2000 chars of stderr>
 ```
+
+`IMAGE`, `IMAGE_DIGEST` and `HINT` are emitted only for a Matchlock
+(`--matchlock`) round, whose policy pins the image: the requested tag and
+its resolved digest are named so a guest boot/exec failure no longer
+requires JSONL forensics, and `IMAGE_DIGEST` is omitted entirely when the
+pinned policy carries no digest. `HINT` appears only when the captured
+evidence classifies with confidence — a complete guest-init
+exact-destination-mount refusal (the hint names the refused path and the
+remedy), an interleaved/truncated console capture at guest boot (the hint
+states that the specific cause is **not** established and mentions a
+non-empty-path collision only conditionally), or the guest shell failing to
+exec the selected harness (the hint names the harness and image and phrases
+the remedy conditionally). Unrelated panics, wall timeouts, wrong output
+and signatureless invocation failures get no hint. A native (non-Matchlock)
+probe failure renders the original nine keys, byte for byte.
 
 The probe's wall clock defaults to **180 seconds**
 (`TAMANDUA_HARNESS_PROBE_WALL_MS` overrides it). Set

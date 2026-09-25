@@ -56,6 +56,7 @@ import {
   harnessProbeObservedDisplay,
   harnessProbeStderrTailDisplay,
   isHarnessProbeEnabled,
+  matchlockProbeHint,
   readHarnessProbeStatus,
   recordHarnessProbeResult,
   reserveHarnessProbe,
@@ -3992,6 +3993,43 @@ async function runLaunchTimeHarnessProbe(params: {
  * A host-canceled probe returns `canceled: true` with no failure block — the
  * caller records nothing (the run is being torn down).
  */
+
+/**
+ * MTLK-DIAG: enrich one Matchlock probe failure's keyline fields with the
+ * identity of the image the round was pinned to and with bounded,
+ * evidence-confidenced guidance.
+ *
+ * Identity comes ONLY from the in-scope pinned policy (`requestedImage`, and
+ * `resolvedImageDigest` when the record carries one — never fabricated). The
+ * hint is classified from the FULL captured text value passed in
+ * `fields.stderrTail`; the display cap is applied later, by
+ * buildHarnessProbeFailureBlock, so a fragment near the end of the capture is
+ * still matchable here.
+ *
+ * This is the ONLY enrichment the Matchlock probe paths apply — every failure
+ * shape (cancel aside) already funnels through their local `fail()` helper, so
+ * no catch path is added or rerouted.
+ */
+function withMatchlockProbeFailureIdentity(
+  fields: HarnessProbeFailureFields,
+  policy: ExecutionIsolation,
+): HarnessProbeFailureFields {
+  const imageName = policy.requestedImage;
+  const imageDigest = policy.resolvedImageDigest?.trim();
+  return {
+    ...fields,
+    imageName,
+    ...(imageDigest ? { imageDigest } : {}),
+    hint: matchlockProbeHint({
+      harness: fields.harness,
+      imageName,
+      ...(imageDigest ? { imageDigest } : {}),
+      stderrTail: fields.stderrTail,
+      exitCode: fields.exitCode ?? null,
+    }),
+  };
+}
+
 async function runMatchlockLaunchTimeHarnessProbe(params: {
   job: CronJobInfo;
   context: Record<string, unknown>;
@@ -4017,20 +4055,28 @@ async function runMatchlockLaunchTimeHarnessProbe(params: {
   const fail = (
     fields: HarnessProbeFailureFields,
     canceled = false,
-  ): LaunchTimeProbeOutcome => ({
-    passed: false,
-    ...(canceled ? { canceled: true } : {}),
-    harness: fields.harness,
-    probeCmd: fields.probeCmd,
-    expected: fields.expected,
-    durationMs: fields.durationMs ?? Math.max(0, probeWatch.elapsedMs()),
-    tokens: 0,
-    failureBlock: canceled ? "" : buildHarnessProbeFailureBlock(fields),
-    observed: harnessProbeObservedDisplay(fields.observed),
-    exitCode: fields.exitCode ?? null,
-    signal: fields.signal ?? null,
-    stderrTail: harnessProbeStderrTailDisplay(fields.stderrTail),
-  });
+  ): LaunchTimeProbeOutcome => {
+    // MTLK-DIAG: a non-canceled Matchlock probe failure gains the pinned
+    // image identity and the bounded guidance classified from the FULL
+    // captured text in `fields.stderrTail` (the display cap is applied inside
+    // buildHarnessProbeFailureBlock, so the Case A fragments that sit at the
+    // END of the capture are still matchable here).
+    const enriched = canceled ? fields : withMatchlockProbeFailureIdentity(fields, policy);
+    return {
+      passed: false,
+      ...(canceled ? { canceled: true } : {}),
+      harness: enriched.harness,
+      probeCmd: enriched.probeCmd,
+      expected: enriched.expected,
+      durationMs: enriched.durationMs ?? Math.max(0, probeWatch.elapsedMs()),
+      tokens: 0,
+      failureBlock: canceled ? "" : buildHarnessProbeFailureBlock(enriched),
+      observed: harnessProbeObservedDisplay(enriched.observed),
+      exitCode: enriched.exitCode ?? null,
+      signal: enriched.signal ?? null,
+      stderrTail: harnessProbeStderrTailDisplay(enriched.stderrTail),
+    };
+  };
 
   if (signal.aborted) {
     return fail(
@@ -4236,20 +4282,26 @@ async function runDshLaunchTimeHarnessProbe(params: {
   const fail = (
     fields: HarnessProbeFailureFields,
     canceled = false,
-  ): LaunchTimeProbeOutcome => ({
-    passed: false,
-    ...(canceled ? { canceled: true } : {}),
-    harness: fields.harness,
-    probeCmd: fields.probeCmd,
-    expected: fields.expected,
-    durationMs: fields.durationMs ?? Math.max(0, probeWatch.elapsedMs()),
-    tokens: 0,
-    failureBlock: canceled ? "" : buildHarnessProbeFailureBlock(fields),
-    observed: harnessProbeObservedDisplay(fields.observed),
-    exitCode: fields.exitCode ?? null,
-    signal: fields.signal ?? null,
-    stderrTail: harnessProbeStderrTailDisplay(fields.stderrTail),
-  });
+  ): LaunchTimeProbeOutcome => {
+    // MTLK-DIAG: the dsh mirror applies the SAME enrichment as the pi/hermes
+    // route — pinned image identity plus the bounded guidance classified from
+    // the FULL captured text in `fields.stderrTail`.
+    const enriched = canceled ? fields : withMatchlockProbeFailureIdentity(fields, policy);
+    return {
+      passed: false,
+      ...(canceled ? { canceled: true } : {}),
+      harness: enriched.harness,
+      probeCmd: enriched.probeCmd,
+      expected: enriched.expected,
+      durationMs: enriched.durationMs ?? Math.max(0, probeWatch.elapsedMs()),
+      tokens: 0,
+      failureBlock: canceled ? "" : buildHarnessProbeFailureBlock(enriched),
+      observed: harnessProbeObservedDisplay(enriched.observed),
+      exitCode: enriched.exitCode ?? null,
+      signal: enriched.signal ?? null,
+      stderrTail: harnessProbeStderrTailDisplay(enriched.stderrTail),
+    };
+  };
 
   if (signal.aborted) {
     return fail(

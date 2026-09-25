@@ -33,6 +33,7 @@ import {
   DEFAULT_HARNESS_PROBE_WALL_MS,
   HARNESS_PROBE_OBSERVED_MAX_CHARS,
   HARNESS_PROBE_STDERR_TAIL_MAX_CHARS,
+  HARNESS_PROBE_HINT_MAX_CHARS,
   buildHarnessProbePrompt,
   buildHarnessProbeCommand,
   isHarnessProbeEnabled,
@@ -42,6 +43,7 @@ import {
   passesHarnessProbe,
   evaluateHarnessProbe,
   buildHarnessProbeFailureBlock,
+  matchlockProbeHint,
   reserveHarnessProbe,
   recordHarnessProbeResult,
   readHarnessProbeStatus,
@@ -314,6 +316,11 @@ describe("harness-probe failure keyline block (IFLB)", () => {
     "EXIT_CODE:",
     "SIGNAL:",
     "DURATION_MS:",
+    // MTLK-DIAG: the Matchlock-only identity + guidance keys, in the order
+    // they render for an opted-in (Matchlock) probe failure.
+    "IMAGE:",
+    "IMAGE_DIGEST:",
+    "HINT:",
     "STDERR_TAIL:",
   ];
 
@@ -332,7 +339,13 @@ describe("harness-probe failure keyline block (IFLB)", () => {
   }
 
   it("emits every key in order with STDERR_TAIL last", () => {
-    const block = buildHarnessProbeFailureBlock(fields());
+    const block = buildHarnessProbeFailureBlock(
+      fields({
+        imageName: "igorhvr/bedlam-ubuntu",
+        imageDigest: "sha256:" + "a".repeat(64),
+        hint: "bounded guidance",
+      }),
+    );
     const indexes = KEY_PREFIXES.map((prefix) => block.indexOf(prefix));
     for (let i = 0; i < indexes.length; i++) {
       assert.ok(indexes[i] >= 0, `key ${KEY_PREFIXES[i]} must be present in the block`);
@@ -382,6 +395,273 @@ describe("harness-probe failure keyline block (IFLB)", () => {
 
   it("starts with FAILURE_CLASS: harness_unavailable", () => {
     assert.ok(buildHarnessProbeFailureBlock(fields()).startsWith("FAILURE_CLASS: harness_unavailable\n"));
+  });
+
+  it("native (non-Matchlock) failure fields render the BYTE-IDENTICAL legacy block (no IMAGE/HINT keys)", () => {
+    // Nothing in the native probe path sets imageName/imageDigest/hint, so the
+    // optional keylines are absent entirely — not rendered empty.
+    assert.equal(
+      buildHarnessProbeFailureBlock(fields()),
+      [
+        "FAILURE_CLASS: harness_unavailable",
+        "HARNESS: dsh",
+        "PROBE_CMD: /abs/bin/tamandua skill-path",
+        "EXPECTED: /skills/SKILL.md",
+        "OBSERVED: boot error",
+        "EXIT_CODE: 1",
+        "SIGNAL: ",
+        "DURATION_MS: 250",
+        "STDERR_TAIL: stderr boom",
+      ].join("\n"),
+    );
+  });
+
+  it("omits IMAGE_DIGEST when the pinned policy carries no resolved digest (never fabricated)", () => {
+    const block = buildHarnessProbeFailureBlock(fields({ imageName: "igorhvr/bedlam-ubuntu" }));
+    assert.ok(block.includes("IMAGE: igorhvr/bedlam-ubuntu\n"), "IMAGE is present");
+    assert.ok(!block.includes("IMAGE_DIGEST:"), "no digest line when the digest is absent");
+    assert.ok(!block.includes("HINT:"), "no hint when none was classified");
+  });
+});
+
+// ── MTLK-DIAG matchlock probe guidance ──────────────────────────────
+
+describe("matchlock probe failure guidance (MTLK-DIAG)", () => {
+  const IMAGE = "igorhvr/bedlam-ubuntu";
+  const DIGEST = "sha256:" + "b".repeat(64);
+
+  /**
+   * Byte-faithful bounded excerpt of the RECORDED run #98 failure
+   * (~/.tamandua/events/e0383930-e458-4e1e-82f4-e4d41189b1df.jsonl): two
+   * interleaved console writers, so only the 9-char family prefix `prepare e`
+   * survives contiguously, immediately followed by the init panic.
+   */
+  const RECORDED_98_EXCERPT = [
+    "EXT4-fs (vdc): mounted filesystem bda37831-65a0-46bd-a529-b4d34e229924 r/w with ordered data mode. Quota mode: disabled.",
+    "FATAL: prepare eKernel panic - not syncing: Attempted to kill init! exitcode=0x00000100",
+    "xCaPcUt:  d7e sUtIiDn:a t0i oPnID: 83 Comm: init Not tainted 6.19.8 #1 PREEMPT(none) ",
+    "Call Trace:",
+    " <TASK>",
+    " vpanic+0x2dd/0x2f0",
+  ].join("\r\n");
+
+  /** Byte-faithful bounded excerpt of the RECORDED run #99 failure (same shape, different interleave). */
+  const RECORDED_99_EXCERPT = [
+    "EXT4-fs (vdc): mounted filesystem a887679c-6d91-4131-a7d9-c230b77c551a r/w with ordered data mode. Quota mode: disabled.",
+    "FATAL: prepare eKernel panic - not syncing: Attempted to kill init! exitcode=0x00000100",
+    "xaCcPtU :d e2s tUiInDa:t i0o nPID: 82 Comm: init Not tainted 6.19.8 #1 PREEMPT(none) ",
+    "Call Trace:",
+    " <TASK>",
+    " vpanic+0x2dd/0x2f0",
+  ].join("\r\n");
+
+  /**
+   * COMPLETE Case A evidence, synthetic-from-source: guest-init's
+   * errx.With(ErrExactMountPrep, " %s already exists and is not empty;
+   * refusing to shadow guest content") rendered through fatal()'s
+   * `FATAL: %v` (cmd/guest-init/main.go:218,1063).
+   */
+  const CLEAN_CASE_A = [
+    "EXT4-fs (vdc): mounted filesystem synthetic r/w with ordered data mode. Quota mode: disabled.",
+    "FATAL: prepare exact destination mount /opt/tamandua already exists and is not empty; refusing to shadow guest content",
+    "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100",
+  ].join("\r\n");
+
+  function hint(overrides: Partial<Parameters<typeof matchlockProbeHint>[0]> = {}) {
+    return matchlockProbeHint({
+      harness: "pi",
+      imageName: IMAGE,
+      imageDigest: DIGEST,
+      stderrTail: CLEAN_CASE_A,
+      exitCode: null,
+      ...overrides,
+    });
+  }
+
+  function failureFields(overrides: Partial<HarnessProbeFailureFields> = {}): HarnessProbeFailureFields {
+    return {
+      harness: "pi",
+      probeCmd: "/workspace/runtime/bin/tamandua skill-path",
+      expected: "/workspace/runtime/skills/tamandua-agents/SKILL.md",
+      observed: "",
+      exitCode: null,
+      signal: null,
+      durationMs: 12,
+      stderrTail: CLEAN_CASE_A,
+      imageName: IMAGE,
+      imageDigest: DIGEST,
+      hint: hint(),
+      ...overrides,
+    };
+  }
+
+  function keyLine(block: string, key: string): string | undefined {
+    return block.split("\n").find((l) => l.startsWith(`${key}:`));
+  }
+
+  it("complete Case A: block carries IMAGE, IMAGE_DIGEST and a HINT naming the exact-mount refusal + captured path", () => {
+    const block = buildHarnessProbeFailureBlock(failureFields());
+    assert.ok(block.startsWith("FAILURE_CLASS: harness_unavailable\n"), "FAILURE_CLASS unchanged");
+    assert.equal(keyLine(block, "IMAGE"), `IMAGE: ${IMAGE}`);
+    assert.equal(keyLine(block, "IMAGE_DIGEST"), `IMAGE_DIGEST: ${DIGEST}`);
+    const hintLine = keyLine(block, "HINT");
+    assert.ok(hintLine, "a HINT keyline must be present");
+    assert.match(hintLine!, /exact destination mount \/opt\/tamandua/, "the captured path is named");
+    assert.match(hintLine!, /already exists and is not empty/, "complete evidence may state the refusal");
+    assert.match(hintLine!, /use a working directory that does not exist inside/, "the remedy is given");
+    // Ordering + caps: the identity/hint keys precede the LAST key, and
+    // STDERR_TAIL keeps its existing cap and terminal position.
+    const order = ["DURATION_MS:", "IMAGE:", "IMAGE_DIGEST:", "HINT:", "STDERR_TAIL:"].map((k) =>
+      block.indexOf(k),
+    );
+    for (let i = 1; i < order.length; i++) {
+      assert.ok(order[i] > order[i - 1], "IMAGE/IMAGE_DIGEST/HINT must precede the final STDERR_TAIL key");
+    }
+    const tail = block.slice(block.indexOf("STDERR_TAIL: ") + "STDERR_TAIL: ".length);
+    assert.equal(tail, CLEAN_CASE_A, "STDERR_TAIL stays the final key, verbatim and uncapped below the cap");
+  });
+
+  it("recorded run #98 interleaved excerpt: IMAGE lines present + interleaved-style HINT that asserts no cause", () => {
+    const h = hint({ stderrTail: RECORDED_98_EXCERPT });
+    assert.ok(h, "the recorded #98 shape must classify");
+    assert.match(h!, /guest initialization failed at boot/);
+    assert.match(h!, /interleaved\/truncated/);
+    assert.match(h!, /specific cause is NOT established/);
+    assert.ok(
+      !h!.includes("already exists and is not empty"),
+      "interleaved evidence must not quote the complete-evidence refusal",
+    );
+    assert.match(
+      h!,
+      /if the round path collides with a non-empty path baked into image "igorhvr\/bedlam-ubuntu"/,
+      "a non-empty-leaf collision may be mentioned ONLY conditionally",
+    );
+    assert.ok(!h!.includes("/opt/tamandua"), "the interleaved hint never names a path it did not see");
+    assert.ok(!h!.includes("working directory is"), "no definitive-cause wording");
+
+    const block = buildHarnessProbeFailureBlock(failureFields({ hint: h, stderrTail: RECORDED_98_EXCERPT }));
+    assert.equal(keyLine(block, "IMAGE"), `IMAGE: ${IMAGE}`);
+    assert.equal(keyLine(block, "IMAGE_DIGEST"), `IMAGE_DIGEST: ${DIGEST}`);
+    assert.ok(keyLine(block, "HINT"));
+    assert.ok(
+      block.indexOf("HINT:") < block.indexOf("STDERR_TAIL:"),
+      "HINT precedes the final STDERR_TAIL key",
+    );
+  });
+
+  it("recorded run #99 interleaved variant (different interleave) classifies identically — not a lucky match", () => {
+    const h = hint({ stderrTail: RECORDED_99_EXCERPT });
+    assert.ok(h, "the recorded #99 shape must classify");
+    assert.match(h!, /guest initialization failed at boot/);
+    assert.match(h!, /specific cause is NOT established/);
+    assert.ok(!h!.includes("already exists and is not empty"));
+  });
+
+  it("other complete-evidence ErrExactMountPrep members (symlink / not-a-directory / protected runtime root) get NO hint", () => {
+    const variants: Record<string, string> = {
+      // synthetic-from-source: main.go:1050 / :1053 / :1030 (errx.With prefixes the sentinel).
+      symlink: "FATAL: prepare exact destination mount /opt/tamandua is a symlink; refusing an exact mount through a link",
+      notADirectory: "FATAL: prepare exact destination mount /opt/tamandua is not a directory",
+      protectedRuntimeRoot:
+        'FATAL: prepare exact destination mount "/workspace/runtime" shadows the trusted guest runtime /workspace',
+    };
+    for (const [name, stderrTail] of Object.entries(variants)) {
+      assert.equal(hint({ stderrTail }), undefined, `${name} must get no hint`);
+      const block = buildHarnessProbeFailureBlock(failureFields({ hint: undefined, stderrTail }));
+      assert.equal(keyLine(block, "IMAGE"), `IMAGE: ${IMAGE}`, `${name} still carries IMAGE`);
+      assert.equal(keyLine(block, "IMAGE_DIGEST"), `IMAGE_DIGEST: ${DIGEST}`);
+      assert.equal(keyLine(block, "HINT"), undefined, `${name} must not render a HINT key`);
+    }
+  });
+
+  it("negative: a different guest-init FATAL family (with the panic marker) gets NO hint", () => {
+    const stderrTail = [
+      "FATAL: invalid overlay root config", // errors.go:14 ErrInvalidOverlayCfg
+      "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100",
+    ].join("\r\n");
+    assert.equal(hint({ stderrTail }), undefined);
+  });
+
+  it("negative: a prepare-looking fragment WITHOUT the FATAL marker gets NO hint", () => {
+    const stderrTail = [
+      "prepare e",
+      "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100",
+    ].join("\r\n");
+    assert.equal(hint({ stderrTail }), undefined);
+  });
+
+  it("negative: a panic excerpt without any prepare fragment gets NO hint", () => {
+    const stderrTail = [
+      "random boot noise",
+      "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100",
+    ].join("\r\n");
+    assert.equal(hint({ stderrTail }), undefined);
+  });
+
+  it("negative: a wall-timeout / wrong-output failure (empty capture) gets NO hint", () => {
+    assert.equal(hint({ stderrTail: "" }), undefined);
+    assert.equal(hint({ stderrTail: "not the expected path" }), undefined);
+  });
+
+  it("Case B: `sh: 1: pi: not found` (exit 127) gets a HINT naming the harness and the image, phrased conditionally", () => {
+    const h = hint({ stderrTail: "sh: 1: pi: not found", exitCode: 127 });
+    assert.ok(h, "the Case B shape must classify");
+    assert.match(h!, /the selected harness "pi" did not start in image "igorhvr\/bedlam-ubuntu"/);
+    assert.ok(h!.includes(DIGEST), "the resolved digest is named");
+    assert.ok(h!.includes("sh: 1: pi: not found"), "the observed diagnostic is quoted");
+    assert.match(h!, /if this image does not ship pi, use one that does/);
+    assert.ok(!h!.includes("image lacks pi"), "the cause is phrased conditionally, never as fact");
+    const block = buildHarnessProbeFailureBlock(failureFields({ hint: h, stderrTail: "sh: 1: pi: not found" }));
+    assert.equal(keyLine(block, "IMAGE"), `IMAGE: ${IMAGE}`);
+    assert.equal(keyLine(block, "IMAGE_DIGEST"), `IMAGE_DIGEST: ${DIGEST}`);
+  });
+
+  it("negative: a different missing command (`sh: 1: wget: not found`) gets NO harness hint", () => {
+    assert.equal(hint({ stderrTail: "sh: 1: wget: not found", exitCode: 127 }), undefined);
+  });
+
+  it("invocation-failure catch path with no signature in the tail: IMAGE lines present, NO hint", () => {
+    for (const stderrTail of [
+      "matchlock probe invocation failed: transport closed",
+      "matchlock probe invocation failed: rpc deadline exceeded",
+    ]) {
+      assert.equal(hint({ stderrTail }), undefined, `${stderrTail} must get no hint`);
+      const block = buildHarnessProbeFailureBlock(failureFields({ hint: undefined, stderrTail }));
+      assert.equal(keyLine(block, "IMAGE"), `IMAGE: ${IMAGE}`);
+      assert.equal(keyLine(block, "HINT"), undefined);
+    }
+  });
+
+  it("sanitizes every new value: multi-line / control-character capture yields single-line, control-free keys", () => {
+    const stderrTail = `FATAL: prepare\u0007exact destination mount /opt/x\u0000 already exists and is not empty; refusing to shadow guest content\nKernel panic - not syncing: Attempted to kill init! exitcode=0x00000100\n`;
+    const h = hint({ stderrTail });
+    const block = buildHarnessProbeFailureBlock(
+      failureFields({
+        hint: h,
+        stderrTail,
+        imageName: "igorhvr/\r\nbedlam\u0007-ubuntu",
+        imageDigest: "sha256:aaa\tbbb",
+      }),
+    );
+    for (const key of ["IMAGE", "IMAGE_DIGEST", "HINT"]) {
+      const line = keyLine(block, key);
+      assert.ok(line, `${key} must render`);
+      assert.ok(
+        // eslint-disable-next-line no-control-regex
+        !/[\u0000-\u001F\u007F]/.test(line!.slice(key.length + 2)),
+        `${key} value must be control-character free`,
+      );
+      assert.ok(!line!.includes("\n"), `${key} value must stay on one line`);
+    }
+    assert.match(keyLine(block, "IMAGE")!, /^IMAGE: igorhvr\/ bedlam -ubuntu$/);
+    assert.ok(h, "the mangled family line still classifies");
+    assert.ok(h!.length <= HARNESS_PROBE_HINT_MAX_CHARS);
+  });
+
+  it("bounds the HINT value at its own cap", () => {
+    const block = buildHarnessProbeFailureBlock(failureFields({ hint: "x".repeat(HARNESS_PROBE_HINT_MAX_CHARS + 100) }));
+    const line = keyLine(block, "HINT")!;
+    assert.equal(line.slice("HINT: ".length).length, HARNESS_PROBE_HINT_MAX_CHARS);
   });
 });
 

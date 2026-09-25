@@ -2091,4 +2091,205 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     assert.match(surfaced, /firecracker: Failed to create VM: socket path too long/);
     assert.ok(!surfaced.includes("[object Object]"), "the surfaced probe evidence must never contain [object Object]");
   });
+
+  // ── MTLK-DIAG: image identity + bounded guidance on the failure block ──
+
+  /**
+   * COMPLETE Case A evidence, SYNTHETIC-FROM-SOURCE: guest-init's
+   * errx.With(ErrExactMountPrep, " %s already exists and is not empty;
+   * refusing to shadow guest content") (cmd/guest-init/main.go:1063) rendered
+   * through fatal()'s `FATAL: %v` (:218).
+   */
+  const SYNTHETIC_CASE_A_CONSOLE =
+    "FATAL: prepare exact destination mount /opt/tamandua already exists and is not empty; refusing to shadow guest content\r\n" +
+    "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100\r\n";
+
+  /**
+   * Byte-faithful bounded excerpt of the RECORDED run #98 probe failure — two
+   * interleaved console writers, so only the 9-char family prefix survives.
+   */
+  const RECORDED_INTERLEAVED_CONSOLE =
+    "EXT4-fs (vdc): mounted filesystem bda37831-65a0-46bd-a529-b4d34e229924 r/w with ordered data mode. Quota mode: disabled.\r\n" +
+    "FATAL: prepare eKernel panic - not syncing: Attempted to kill init! exitcode=0x00000100\r\n" +
+    "xCaPcUt:  d7e sUtIiDn:a t0i oPnID: 83 Comm: init Not tainted 6.19.8 #1 PREEMPT(none) \r\n" +
+    "Call Trace:\r\n <TASK>\r\n vpanic+0x2dd/0x2f0";
+
+  function probeFailure(fields: { runId: string; workflowId: string }): {
+    block: string;
+    forceReason: string;
+  } {
+    const failed = eventsFor(fields.runId).filter((e) => e.event === "run.harness_probe_failed");
+    assert.equal(failed.length, 1, "one run.harness_probe_failed event");
+    const forced = eventsFor(fields.runId).filter((e) => e.event === "run.force_failed");
+    assert.equal(forced.length, 1, "the enriched probe failure force-fails the run");
+    assert.equal(
+      String(forced[0].reason ?? forced[0].detail ?? ""),
+      String(failed[0].detail),
+      "the force-fail reason is the same enriched block",
+    );
+    return {
+      block: String(failed[0].detail),
+      forceReason: String(forced[0].reason ?? ""),
+    };
+  }
+
+  it("MTLK-DIAG pi route: the failure block carries IMAGE/IMAGE_DIGEST and a Case A HINT, and reaches run.harness_probe_failed", async () => {
+    const runId = "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1";
+    const workflowId = "do-now";
+    const workdir = path.join(tempHome, "work-diag-pi");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, policyJson(), { workflowId });
+    process.env.TAMANDUA_HARNESS_PROBE = "1";
+    setMatchlockSchedulerRoundRunnerForTest(async (round) => {
+      seamJournal.push({
+        kind: round.kind,
+        runId: round.identity.runId,
+        agentId: round.identity.agentId,
+        workflowId: round.identity.workflowId,
+        jobId: round.identity.jobId,
+        promptText: round.promptText,
+        workdir: round.workingDirectoryForHarness,
+        timeoutMs: round.timeoutMs,
+      });
+      if (round.kind === "probe") {
+        return {
+          output: "",
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          durationMs: 5,
+          stderrTail: SYNTHETIC_CASE_A_CONSOLE,
+        };
+      }
+      throw new Error("no work round may run after a failed probe");
+    });
+
+    await dispatchJob(runId, workdir, { workflowId });
+
+    const row = runRow(runId);
+    assert.ok(row);
+    assert.equal(row.status, "failed");
+    assert.equal(seamJournal.length, 1, "only the probe round ran; no host spawn");
+    assert.ok(!fs.existsSync(piLog), "the host probe/harness must never spawn");
+
+    const { block, forceReason } = probeFailure({ runId, workflowId });
+    assert.ok(block.startsWith("FAILURE_CLASS: harness_unavailable\n"), "FAILURE_CLASS unchanged");
+    assert.ok(block.includes("IMAGE: vic/ml:latest\n"), "the requested image is named");
+    assert.ok(
+      block.includes(`IMAGE_DIGEST: sha256:${"a".repeat(64)}\n`),
+      "the resolved digest from the pinned policy is rendered",
+    );
+    assert.match(block, /HINT: .*exact destination mount \/opt\/tamandua/);
+    assert.ok(forceReason.includes("IMAGE: vic/ml:latest"), "force-fail reason carries the enriched block");
+    // STDERR_TAIL is the LAST KEY: no other keyline may follow it (its own
+    // value legitimately spans the remaining lines of the console capture).
+    const stderrAt = block.indexOf("STDERR_TAIL:");
+    assert.ok(stderrAt > 0, "the block carries the STDERR_TAIL key");
+    for (const key of ["FAILURE_CLASS:", "HARNESS:", "IMAGE:", "IMAGE_DIGEST:", "HINT:"]) {
+      assert.equal(
+        block.indexOf(key, stderrAt + 1),
+        -1,
+        `${key} must not follow the final STDERR_TAIL key`,
+      );
+    }
+    assert.ok(
+      block.slice(stderrAt).includes("Kernel panic - not syncing: Attempted to kill init!"),
+      "STDERR_TAIL keeps the captured console text",
+    );
+  });
+
+  it("MTLK-DIAG hermes route: the SAME shared probe path enriches with the hermes image identity", async () => {
+    const runId = "d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2";
+    const workflowId = "do-now";
+    const workdir = path.join(tempHome, "work-diag-hermes");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, hermesPolicyJson(), { workflowId });
+    process.env.TAMANDUA_HARNESS_PROBE = "1";
+    setMatchlockSchedulerRoundRunnerForTest(async (round) => {
+      if (round.kind === "probe") {
+        return {
+          output: "",
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          durationMs: 4,
+          stderrTail: RECORDED_INTERLEAVED_CONSOLE,
+        };
+      }
+      throw new Error("no work round may run after a failed hermes probe");
+    });
+
+    await dispatchJob(runId, workdir, { workflowId, harnessType: "hermes" });
+
+    const { block } = probeFailure({ runId, workflowId });
+    assert.ok(block.includes("HARNESS: hermes\n"));
+    assert.ok(block.includes("IMAGE: vic/hermes:latest\n"), "the hermes image is named");
+    assert.ok(block.includes(`IMAGE_DIGEST: sha256:${"c".repeat(64)}\n`));
+    // The recorded interleaved shape gets the interleave-tolerant hint and
+    // never claims a definitive cause.
+    assert.match(block, /HINT: .*specific cause is NOT established/);
+    assert.ok(!block.split("HINT: ")[1].includes("already exists and is not empty"));
+  });
+
+  it("MTLK-DIAG dsh route: the dsh mirror probe enriches identically (image identity + Case A hint)", async () => {
+    const runId = "d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3";
+    const workflowId = "do-now";
+    const dshHome = path.join(tempHome, "dsh-home-diag");
+    fs.mkdirSync(dshHome, { recursive: true });
+    const workdir = path.join(tempHome, "work-diag-dsh");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, dshPolicyJson(dshHome), { workflowId });
+    process.env.TAMANDUA_HARNESS_PROBE = "1";
+    setDshSchedulerRoundRunnerForTest(async (round) => {
+      if (round.kind === "probe") {
+        return {
+          output: "not-a-path",
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          durationMs: 5,
+          stderrTail: SYNTHETIC_CASE_A_CONSOLE,
+        };
+      }
+      throw new Error("no work round may run after a failed dsh probe");
+    });
+
+    await dispatchJob(runId, workdir, { workflowId, harnessType: "dsh" });
+
+    const { block } = probeFailure({ runId, workflowId });
+    assert.ok(block.includes("HARNESS: dsh\n"));
+    assert.ok(block.includes("IMAGE: vic/dsh:latest\n"), "the dsh image is named");
+    assert.ok(block.includes(`IMAGE_DIGEST: sha256:${"a".repeat(64)}\n`));
+    assert.match(block, /HINT: .*exact destination mount \/opt\/tamandua/);
+  });
+
+  it("MTLK-DIAG Case B wire: a guest `sh: 1: pi: not found` probe failure yields the harness/image hint (no definitive cause)", async () => {
+    const runId = "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4";
+    const workflowId = "do-now";
+    const workdir = path.join(tempHome, "work-diag-caseb");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, policyJson("igorhvr/bedlam-ubuntu"), { workflowId });
+    process.env.TAMANDUA_HARNESS_PROBE = "1";
+    setMatchlockSchedulerRoundRunnerForTest(async (round) => {
+      if (round.kind === "probe") {
+        return {
+          output: "",
+          exitCode: 127,
+          signal: null,
+          timedOut: false,
+          durationMs: 6,
+          stderrTail: "sh: 1: pi: not found\n",
+        };
+      }
+      throw new Error("no work round may run after a failed probe");
+    });
+
+    await dispatchJob(runId, workdir, { workflowId });
+
+    const { block } = probeFailure({ runId, workflowId });
+    assert.ok(block.includes("IMAGE: igorhvr/bedlam-ubuntu\n"));
+    assert.match(block, /HINT: the selected harness "pi" did not start in image "igorhvr\/bedlam-ubuntu"/);
+    assert.match(block, /if this image does not ship pi, use one that does/);
+    assert.ok(block.includes("EXIT_CODE: 127\n"), "the observed exit code still renders");
+  });
 });

@@ -81,6 +81,10 @@ describe("README launch-time harness probe documentation (IFLB)", () => {
       "EXIT_CODE:",
       "SIGNAL:",
       "DURATION_MS:",
+      // MTLK-DIAG: the Matchlock-only identity + guidance keys.
+      "IMAGE:",
+      "IMAGE_DIGEST:",
+      "HINT:",
       "STDERR_TAIL:",
     ];
     const blockStart = readmeContent.indexOf("```\nFAILURE_CLASS: harness_unavailable\n");

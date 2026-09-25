@@ -56,6 +56,12 @@ export const HARNESS_PROBE_OBSERVED_MAX_CHARS = 400;
 /** STDERR_TAIL value cap (characters) in the failure keyline block. */
 export const HARNESS_PROBE_STDERR_TAIL_MAX_CHARS = 2000;
 
+/** IMAGE / IMAGE_DIGEST value cap (characters) in the failure keyline block. */
+export const HARNESS_PROBE_IMAGE_MAX_CHARS = 200;
+
+/** HINT value cap (characters) in the failure keyline block. */
+export const HARNESS_PROBE_HINT_MAX_CHARS = 512;
+
 /** Persisted once-per-run probe status on the runs row (runs.harness_probe_status). */
 export type HarnessProbeStatus = "probing" | "ok" | "failed";
 
@@ -239,6 +245,24 @@ export interface HarnessProbeFailureFields {
   signal: string | null | undefined;
   durationMs: number | undefined;
   stderrTail: string;
+  /**
+   * MTLK-DIAG: the operator-requested image tag of the Matchlock round the
+   * probe failed on. Set ONLY by the Matchlock probe paths (pi/hermes/dsh);
+   * a native (non-Matchlock) probe never sets it, so its block stays
+   * byte-identical.
+   */
+  imageName?: string;
+  /**
+   * MTLK-DIAG: the immutable resolved image digest from the pinned policy.
+   * Rendered only when non-empty — omitted (never fabricated) for legacy
+   * policies that carry no `resolvedImageDigest`.
+   */
+  imageDigest?: string;
+  /**
+   * MTLK-DIAG: bounded, evidence-confidenced single-line guidance
+   * (matchlockProbeHint). Optional: an unclassified failure renders none.
+   */
+  hint?: string;
 }
 
 export interface HarnessProbeEvalInput {
@@ -317,6 +341,12 @@ export function harnessProbeStderrTailDisplay(text: string): string {
  * collapsed to a single line and capped at HARNESS_PROBE_OBSERVED_MAX_CHARS;
  * STDERR_TAIL (the final key) may stay multi-line and is capped at
  * HARNESS_PROBE_STDERR_TAIL_MAX_CHARS.
+ *
+ * MTLK-DIAG: a Matchlock probe failure additionally renders IMAGE,
+ * IMAGE_DIGEST (only when the pinned policy carries a resolved digest) and
+ * HINT (only when the captured evidence classifies — see matchlockProbeHint)
+ * between DURATION_MS and the final STDERR_TAIL key. A native probe never sets
+ * those fields, so its block is byte-identical to before.
  */
 export function buildHarnessProbeFailureBlock(fields: HarnessProbeFailureFields): string {
   const observed = harnessProbeObservedDisplay(fields.observed);
@@ -330,9 +360,205 @@ export function buildHarnessProbeFailureBlock(fields: HarnessProbeFailureFields)
     `EXIT_CODE: ${fields.exitCode ?? ""}`,
     `SIGNAL: ${fields.signal ?? ""}`,
     `DURATION_MS: ${fields.durationMs ?? ""}`,
+    ...matchlockIdentityKeyLines(fields),
     `STDERR_TAIL: ${stderrTail}`,
   ];
   return lines.join("\n");
+}
+
+/**
+ * Render the optional MTLK-DIAG keylines (IMAGE / IMAGE_DIGEST / HINT) that
+ * precede the final STDERR_TAIL key. Every value passes the single-line,
+ * control-character-free sanitizer and its own cap; an absent/empty value
+ * renders NO line at all (never an empty `IMAGE:` placeholder, never a
+ * fabricated digest).
+ */
+function matchlockIdentityKeyLines(fields: HarnessProbeFailureFields): string[] {
+  const out: string[] = [];
+  const imageName = harnessProbeKeyValueDisplay(fields.imageName, HARNESS_PROBE_IMAGE_MAX_CHARS);
+  if (imageName.length > 0) out.push(`IMAGE: ${imageName}`);
+  const imageDigest = harnessProbeKeyValueDisplay(fields.imageDigest, HARNESS_PROBE_IMAGE_MAX_CHARS);
+  if (imageDigest.length > 0) out.push(`IMAGE_DIGEST: ${imageDigest}`);
+  const hint = harnessProbeKeyValueDisplay(fields.hint, HARNESS_PROBE_HINT_MAX_CHARS);
+  if (hint.length > 0) out.push(`HINT: ${hint}`);
+  return out;
+}
+
+/**
+ * Sanitize one optional keyline VALUE: strip ANSI escapes and control
+ * characters, collapse any whitespace run (incl. newlines) to a single space,
+ * trim, and cap. `undefined`/absent yields the empty string.
+ */
+function harnessProbeKeyValueDisplay(text: string | undefined, maxChars: number): string {
+  if (text === undefined) return "";
+  const controlFree = stripAnsi(text).replace(CONTROL_CHARS_RE, " ");
+  return singleLine(controlFree).slice(0, maxChars);
+}
+
+// ── Matchlock probe guidance (MTLK-DIAG) ────────────────────────────
+
+/**
+ * guest-init's exact-destination-mount error family (the ErrExactMountPrep
+ * sentinel in cmd/guest-init/errors.go, rendered by errx.With as
+ * `<family> <detail>`).
+ */
+const EXACT_MOUNT_PREP_FAMILY = "prepare exact destination mount";
+
+/** The non-empty-leaf detail guest-init appends for the shadowing refusal. */
+const EXACT_MOUNT_NON_EMPTY_MARKER = " already exists and is not empty";
+
+/**
+ * Shortest contiguous PREFIX of the family string that still counts as
+ * evidence of the family. The recorded interleaved captures retain only
+ * `prepare e` (9 chars); the floor keeps an unrelated word from qualifying.
+ */
+const MIN_INTERLEAVED_FAMILY_PREFIX_CHARS = 4;
+
+/**
+ * guest-init's `fatal()` prints `FATAL: %v` then os.Exit(1); an init exit
+ * panics the kernel with this marker (1 << 8 == the recorded 0x100 exit
+ * code). Corroborating evidence only — never a diagnosis on its own.
+ */
+const INIT_PANIC_MARKER = "Attempted to kill init";
+
+/** Inputs for the bounded Matchlock probe guidance classifier. */
+export interface MatchlockProbeHintInput {
+  /** The selected harness (pi | hermes | dsh). */
+  harness: string;
+  /** The operator-requested image tag from the pinned policy. */
+  imageName: string;
+  /** The resolved image digest when the pinned policy carries one. */
+  imageDigest?: string;
+  /** The captured failure text available at the probe call site (pre-display-cap). */
+  stderrTail: string;
+  /** The round's exit code, when one was observed (corroboration only). */
+  exitCode?: number | null;
+}
+
+/**
+ * Classify a Matchlock probe failure's captured evidence into ONE bounded,
+ * already-sanitized single-line HINT, or `undefined` when the evidence
+ * supports no guidance.
+ *
+ * Confidence tiers (never assert a definitive cause without complete
+ * evidence):
+ *  - COMPLETE Case A (`FATAL:` + the full exact-destination-mount family
+ *    string + `already exists and is not empty` on one line): the guest
+ *    refused the exact-destination mount over a non-empty destination; the
+ *    hint names the captured path and the remedy.
+ *  - INTERLEAVED/PARTIAL Case A (a `FATAL:` line carrying only a contiguous
+ *    PREFIX of the family string, plus the init-panic marker): the guest
+ *    failed at boot during exact-destination-mount preparation and the console
+ *    is interleaved/truncated, so the specific cause is NOT established. A
+ *    non-empty-leaf collision is mentioned strictly conditionally.
+ *  - Complete-evidence family members WITHOUT the non-empty leaf (symlink /
+ *    not-a-directory / protected guest-runtime root): NO hint.
+ *  - Case B (the guest shell's `<harness>: not found` for the SELECTED
+ *    harness): the harness did not start in the named image; the remedy is
+ *    phrased conditionally. A different missing command gets no hint.
+ *  - Everything else (other guest-init FATAL families, a prepare-looking
+ *    fragment without the FATAL marker, wall timeouts, wrong output,
+ *    signatureless invocation failures): NO hint.
+ */
+export function matchlockProbeHint(input: MatchlockProbeHintInput): string | undefined {
+  const raw = input.stderrTail ?? "";
+  if (raw.length === 0) return undefined;
+  // Case A hints name the image only (the IMAGE_DIGEST keyline right above the
+  // hint already carries the digest, and repeating it would eat the hint cap);
+  // Case B names the image AND its digest.
+  const imagePhrase = describeProbeImageName(input.imageName);
+  const lines = raw.split(/\r\n|\n|\r/);
+
+  if (raw.includes(EXACT_MOUNT_PREP_FAMILY)) {
+    // COMPLETE evidence: the refusal sentence survived intact.
+    for (const line of lines) {
+      if (!line.includes("FATAL:")) continue;
+      if (!line.includes(EXACT_MOUNT_NON_EMPTY_MARKER.trim())) continue;
+      const afterFamily = line.slice(
+        line.indexOf(EXACT_MOUNT_PREP_FAMILY) + EXACT_MOUNT_PREP_FAMILY.length,
+      );
+      const markerAt = afterFamily.indexOf(EXACT_MOUNT_NON_EMPTY_MARKER);
+      const path = (markerAt >= 0 ? afterFamily.slice(0, markerAt) : afterFamily).trim();
+      return harnessProbeKeyValueDisplay(
+        path.length > 0
+          ? `guest init refused the exact destination mount ${path}: that destination already exists and is not empty inside the image, so it would shadow baked guest content; use a working directory that does not exist inside ${imagePhrase} (e.g. a per-topic clone) or an image that does not bake that path`
+          : `guest init refused an exact destination mount because the destination already exists and is not empty inside the image; use a working directory that does not exist inside ${imagePhrase} (e.g. a per-topic clone) or an image that does not bake that path`,
+        HARNESS_PROBE_HINT_MAX_CHARS,
+      );
+    }
+    // The full family string is present but this member is not the
+    // non-empty-leaf refusal (symlink component / not-a-directory /
+    // protected guest-runtime root / non-absolute path): no hint to give.
+    return undefined;
+  }
+
+  // INTERLEAVED/PARTIAL evidence: only a contiguous prefix of the refusal
+  // sentence survived the two interleaved console writers.
+  for (const line of lines) {
+    if (!line.includes("FATAL:")) continue;
+    if (!hasContiguousFamilyPrefix(line)) continue;
+    if (!raw.includes(INIT_PANIC_MARKER)) continue;
+    return harnessProbeKeyValueDisplay(
+      `guest initialization failed at boot and the captured console is interleaved/truncated, so the specific cause is NOT established from this evidence; the FATAL fragment matches the exact-destination-mount preparation error family, and if the round path collides with a non-empty path baked into ${imagePhrase}, use a working directory that does not exist inside the image (e.g. a per-topic clone) or an image that does not bake that path`,
+      HARNESS_PROBE_HINT_MAX_CHARS,
+    );
+  }
+
+  // Case B: the guest shell could not exec the SELECTED harness. The harness
+  // token is bounded on both sides so another missing command (e.g.
+  // `sh: 1: wget: not found`) never matches.
+  const harness = input.harness.trim();
+  if (harness.length > 0) {
+    const notFound = raw.match(
+      new RegExp(`sh:\\s*\\d+:\\s*${escapeRegExp(harness)}:\\s*not found`),
+    );
+    if (notFound) {
+      const exitNote = input.exitCode === 127 ? " (exit 127)" : "";
+      return harnessProbeKeyValueDisplay(
+        `the selected harness "${harness}" did not start in ${describeProbeImage(input.imageName, input.imageDigest)}${exitNote}: the guest shell reported "${notFound[0]}"; if this image does not ship ${harness}, use one that does (e.g. igorhvr/tamandua)`,
+        HARNESS_PROBE_HINT_MAX_CHARS,
+      );
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * True when `line` carries a CONTIGUOUS PREFIX of the exact-destination-mount
+ * family string that is SHORTER than the whole string — i.e. the sentence was
+ * cut off mid-word by the interleaved console writers. The occurrence must sit
+ * on a token boundary so a prefix-looking run inside an unrelated word cannot
+ * qualify. Callers must only use this when the FULL family string is absent.
+ */
+function hasContiguousFamilyPrefix(line: string): boolean {
+  for (let i = 0; i < line.length; i++) {
+    if (i > 0 && /[A-Za-z0-9_]/.test(line[i - 1])) continue;
+    if (line[i] !== EXACT_MOUNT_PREP_FAMILY[0]) continue;
+    let n = 0;
+    while (n < EXACT_MOUNT_PREP_FAMILY.length && line[i + n] === EXACT_MOUNT_PREP_FAMILY[n]) n++;
+    if (n >= MIN_INTERLEAVED_FAMILY_PREFIX_CHARS && n < EXACT_MOUNT_PREP_FAMILY.length) return true;
+  }
+  return false;
+}
+
+/** `image "<tag>"` — the Case A hints name the image only (IMAGE_DIGEST is its own keyline). */
+function describeProbeImageName(imageName: string): string {
+  const name = (imageName ?? "").trim();
+  return name.length > 0 ? `image "${name}"` : "the selected image";
+}
+
+/** `image "<tag>" (digest <digest>)`, degrading honestly when either is absent. */
+function describeProbeImage(imageName: string, imageDigest: string | undefined): string {
+  const name = (imageName ?? "").trim();
+  const digest = (imageDigest ?? "").trim();
+  const digestPhrase = digest.length > 0 ? ` (digest ${digest})` : "";
+  if (name.length === 0) return digest.length > 0 ? `the selected image${digestPhrase}` : "the selected image";
+  return `image "${name}"${digestPhrase}`;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // ── Once-per-run DB helpers (runs.harness_probe_status / _at) ───────
@@ -485,6 +711,14 @@ export function resetFailedHarnessProbeForResume(runId: string): boolean {
 // ── Small text helpers ──────────────────────────────────────────────
 
 const ANSI_CSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+
+/**
+ * Control characters that `\s` does NOT cover (C0 minus \t/\n/\r/\f/\v, plus
+ * DEL). The optional keyline values (IMAGE/IMAGE_DIGEST/HINT) must be free of
+ * them: console captures carry stray CR/LF/NUL/BEL bytes that would otherwise
+ * survive into a single-line key.
+ */
+const CONTROL_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 function stripAnsi(text: string): string {
   return text.replace(ANSI_CSI_RE, "");
