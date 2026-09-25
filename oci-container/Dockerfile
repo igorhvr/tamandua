@@ -44,3 +44,24 @@ RUN git clone --depth 1 https://github.com/igorhvr/tamandua.git /opt/tamandua \
 
 # --- verify all four entrypoints resolve on PATH (fail the build if any is missing) ---
 RUN set -eu; for t in hermes pi dsh tamandua; do command -v "$t"; done
+
+# --- ssh hygiene: do not inherit the base's baked host identity / root grant ---
+# The base image deliberately bakes ssh host keys (/etc/ssh/ssh_host_*_key and
+# their .pub files) and a root /root/.ssh/authorized_keys for its own use. A
+# derived image otherwise inherits those bytes verbatim, so every consumer
+# would share the same "private" host key (shipping inside a public image) and
+# inherit a root access grant. Remove exactly those seven files — /root/.ssh
+# itself is legitimate and stays. Never generate keys here: build-time
+# generation would only re-bake the same class of problem; first-boot
+# generation is the caller's job. Removal and the fail-closed absence check
+# live in ONE layer so no intermediate layer can resurrect the files.
+RUN rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub \
+          /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub \
+          /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub \
+          /root/.ssh/authorized_keys \
+ && for f in /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub \
+             /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub \
+             /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub \
+             /root/.ssh/authorized_keys; do \
+      test ! -e "$f" || { echo "image hygiene: $f still present" >&2; exit 1; }; \
+    done
