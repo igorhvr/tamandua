@@ -1,0 +1,3 @@
+[submodule "matchlock"]
+	path = matchlock
+	url = https://github.com/igorhvr/matchlock.git
