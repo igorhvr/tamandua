@@ -4067,11 +4067,24 @@ function completeStepInternal(
       // {old, new, step, round}, and sets the run-context review flag
       // test_cmd_review_required so the conditional review primitive dispatches.
       //
-      // TSTX-PQ: reject test_cmd values that echo the tamandua-test shim wrapper
-      // (a misbehaving persona echoing its already-wrapped input).
-      if (value.startsWith("tamandua-test --repo")) {
+      // TSTX-PQ / TSTX-CAPTURE-FIX: reject test_cmd values that echo the
+      // tamandua-test shim wrapper — bare (the original guard), DECORATED with
+      // backticks/quotes, or embedded in multi-line prose. The original
+      // `value.startsWith("tamandua-test --repo")` check only caught the bare
+      // prefix; a backtick-wrapped echo plus "-> ..." narrative (run #125) was
+      // captured as a rewrite, could be accepted, and then became
+      // runs.test_cmd_established — breaking the finalize_merge ledger
+      // cmd_hash association. Reject BEFORE any establishment/review logic so
+      // neither the contract nor the review-state keys are touched.
+      const trimmedTestCmd = value.trim();
+      const strippedTestCmd = trimmedTestCmd.replace(/^[`'"\s]+/, "");
+      if (
+        trimmedTestCmd.includes("\n") ||
+        strippedTestCmd.startsWith("tamandua-test") ||
+        trimmedTestCmd.includes("tamandua-test --repo")
+      ) {
         logger.warn(
-          `Rejected TEST_CMD output that echoes the tamandua-test wrapper prefix (step ${step.step_id}), keeping existing context values unchanged.`,
+          `Rejected TEST_CMD output that is prose-shaped or echoes the tamandua-test wrapper (step ${step.step_id}), keeping existing context values unchanged.`,
           { runId: step.run_id, stepId: step.step_id }
         );
         continue;

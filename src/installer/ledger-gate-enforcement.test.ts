@@ -874,6 +874,82 @@ describe("finalize_merge ledger gate enforcement", () => {
     assert.equal(claim.stepId, seeded.finalizeId);
   });
 
+  // ─── TSTX-CAPTURE-FIX (bead tamandua-uw1) ───────────────────────────
+  // A prose-shaped TEST_CMD capture (the run #125 shape) must be refused by the
+  // capture branch BEFORE any review/establishment state is written, so the
+  // finalize_merge ledger gate keeps matching the REAL green suite evidence
+  // recorded for the established contract. This pins the end-to-end association
+  // on the same surface as the rest of the gate: if a decorated/multi-line prose
+  // value could become the contract (or open a review), the merger claim below
+  // would be refused and the landing would be annotated without evidence.
+  it("keeps finalize_merge ledger association when a prose TEST_CMD capture is refused", () => {
+    const seeded = seedRun("default", "green");
+    // The established contract is the bare TEST_CMD and its raw context copy
+    // matches; the green suite_results row seeded above is keyed by
+    // computeCmdHash(TEST_CMD) for TESTED_TREE.
+    const seededRun = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as {
+      context: string;
+    };
+    seeded.db
+      .prepare("UPDATE runs SET context = ?, test_cmd_established = ?, test_cmd_source = 'launch' WHERE id = ?")
+      .run(JSON.stringify({ ...JSON.parse(seededRun.context), test_cmd_raw: TEST_CMD }), TEST_CMD, seeded.runId);
+
+    // A running step whose report carries the EXACT run #125 prose payload: a
+    // backtick-wrapped wrapper echo followed by "-> ..." narrative and a
+    // following BUILD/VET/FMT line, so parseOutputKeyValues yields a MULTI-LINE
+    // value for TEST_CMD.
+    const verifyId = `verify-${Math.random().toString(16).slice(2)}`;
+    seeded.db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'verify', 'verifier', 0, 'Verify', 'STATUS: done', 'running',
+          'single', 0, 4, 0, ?, ?)`,
+    ).run(verifyId, seeded.runId, seeded.createdAt, seeded.createdAt);
+
+    const run125Payload = [
+      "STATUS: done",
+      "TEST_CMD: `tamandua-test --repo '/x' --run 'y' --step 'z' -- 'go test ./...'` -> TAMANDUA-TEST CACHED (tree bc262755f865, exit 0) for this exact tree; treated as a passing full-suite run per policy.",
+      "BUILD/VET/FMT: `go build ./...` OK; `go vet ./...` exit 0; `gofmt -l cmd/ pkg/` lists only pre-existing untouched files.",
+      "",
+    ].join("\n");
+
+    completeStep(verifyId, run125Payload);
+
+    // The refusal leaves the established contract and run context untouched and
+    // sets NO review state (state-level assertion, not just a log assertion).
+    const after = seeded.db.prepare(
+      "SELECT context, test_cmd_established FROM runs WHERE id = ?",
+    ).get(seeded.runId) as { context: string; test_cmd_established: string | null };
+    assert.equal(after.test_cmd_established, TEST_CMD, "the refused prose must not replace the established contract");
+    const context = JSON.parse(after.context) as Record<string, string>;
+    assert.equal(context.test_cmd, TEST_CMD, "context.test_cmd must stay at the established value");
+    assert.equal(context.test_cmd_raw, TEST_CMD, "context.test_cmd_raw must stay at the established value");
+    for (const key of [
+      "test_cmd_review_required",
+      "test_cmd_review_candidate",
+      "test_cmd_review_established",
+      "test_cmd_rewriter_step",
+    ]) {
+      assert.ok(!(key in context), `${key} must not be set by a refused prose capture`);
+    }
+
+    // With the contract intact, the ledger gate still finds the green shim
+    // evidence for TEST_CMD + TESTED_TREE: the merger claim succeeds and the
+    // step lands without the missing-evidence annotation.
+    const claim = claimStep("merger", seeded.runId);
+    assert.equal(claim.found, true, "the ledger gate must still find the matching suite evidence");
+    assert.equal(claim.stepId, seeded.finalizeId);
+    assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "completed");
+    assert.equal(
+      getRunEvents(seeded.runId).filter(
+        (event) => event.event === "merge.landed_without_suite_evidence",
+      ).length,
+      0,
+      "a refused prose capture must not force an evidence-less landing",
+    );
+  });
+
   it("emits merge.landed_without_suite_evidence when a strict gate lands without suite evidence (already-landed)", () => {
     // green mode is strict-missing: normally missing evidence refuses
     // permanently. But an already-landed merge completes via the C24 guard —

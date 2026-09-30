@@ -2,6 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import { claimStep, completeStep } from "../dist/installer/step-ops.js";
+import { getRunEvents } from "../dist/installer/events.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -233,5 +234,235 @@ exit 0
 
     // Cleanup the step
     completeStep(claim!.stepId!, "STATUS: done\nCHANGES: shell quoting verified\nTESTS: pass");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// TSTX-CAPTURE-FIX (bead tamandua-uw1): the TEST_CMD capture branch must
+// REFUSE prose-shaped values — a multi-line narrative (run #125), a
+// decorated/backtick- or quote-wrapped tamandua-test wrapper echo, and the
+// bare undecorated wrapper echo. A refused capture leaves
+// runs.test_cmd_established and context.test_cmd/test_cmd_raw untouched and
+// must NOT set any test_cmd_review_* state. Bare commands and the legitimate
+// rewrite-review flow keep working unchanged.
+//
+// These tests drive the REAL capture path (completeStep on a seeded running
+// step against the built dist/) — no private predicate copy.
+// ══════════════════════════════════════════════════════════════════════
+
+describe("TSTX-CAPTURE-FIX: refuse prose-shaped TEST_CMD captures", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const _savedHome = process.env.HOME;
+  const _savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
+  const th = createTempHome("tamandua-tstx-capture-fix-");
+
+  before(() => {
+    process.env.HOME = th.homeDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_CONTROL_PORT = "1";
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(async () => {
+    // Drain fire-and-forget teardown/rugpull continuations while the temp env
+    // is still active (they resolve DB/log/daemon-secret paths lazily).
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+    if (_savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = _savedHome;
+    if (_savedControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
+    else process.env.TAMANDUA_CONTROL_PORT = _savedControlPort;
+  });
+
+  // The exact run #125 verify report shape: the value parsed for TEST_CMD is a
+  // backtick-wrapped wrapper echo followed by ' -> ...' narrative, and the
+  // following BUILD/VET/FMT line (not a KEY: boundary) continues the value, so
+  // parseOutputKeyValues yields a MULTI-LINE prose value.
+  const RUN_125_PAYLOAD = [
+    "STATUS: done",
+    "TEST_CMD: `tamandua-test --repo '/x' --run 'y' --step 'z' -- 'go test ./...'` -> TAMANDUA-TEST CACHED (tree bc262755f865, exit 0) for this exact tree; treated as a passing full-suite run per policy.",
+    "BUILD/VET/FMT: `go build ./...` OK; `go vet ./...` exit 0; `gofmt -l cmd/ pkg/` lists only pre-existing untouched pkg/lifecycle/reconcile_dockeruser_test.go and pkg/state/subnet.go (neither in diff).",
+    "",
+  ].join("\n");
+
+  const SINGLE_LINE_DECORATED =
+    "STATUS: done\nTEST_CMD: `tamandua-test --repo '/x' --run 'y' --step 'z' -- 'go test ./...'`";
+  const UNDECORATED =
+    "STATUS: done\nTEST_CMD: tamandua-test --repo '/x' -- 'go test ./...'";
+
+  const REVIEW_KEYS = [
+    "test_cmd_review_required",
+    "test_cmd_review_candidate",
+    "test_cmd_review_established",
+    "test_cmd_rewriter_step",
+  ];
+
+  interface SeededRun {
+    runId: string;
+    stepDbId: string;
+  }
+
+  async function seedRun(opts: {
+    context?: Record<string, string>;
+    established?: string | null;
+    source?: string | null;
+  }): Promise<SeededRun> {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepDbId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, test_cmd_established, test_cmd_source, created_at, updated_at) VALUES (?, 1, 'test-wf', 'prose capture', 'running', ?, 0, ?, ?, ?, ?)"
+    ).run(runId, JSON.stringify(opts.context ?? {}), opts.established ?? null, opts.source ?? null, now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'verify', 'test-wf_verifier', 0, 'Verify', '', 'running', 0, 4, 'single', ?, ?)"
+    ).run(stepDbId, runId, now, now);
+    return { runId, stepDbId };
+  }
+
+  async function readState(runId: string): Promise<{
+    context: Record<string, string>;
+    established: string | null;
+    source: string | null;
+  }> {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const run = db.prepare(
+      "SELECT context, test_cmd_established, test_cmd_source FROM runs WHERE id = ?",
+    ).get(runId) as {
+      context: string;
+      test_cmd_established: string | null;
+      test_cmd_source: string | null;
+    };
+    return {
+      context: JSON.parse(run.context) as Record<string, string>,
+      established: run.test_cmd_established,
+      source: run.test_cmd_source,
+    };
+  }
+
+  function assertNoReviewState(context: Record<string, string>): void {
+    for (const key of REVIEW_KEYS) {
+      assert.ok(!(key in context), `${key} must not be set by a refused prose capture`);
+    }
+  }
+
+  it("refuses the exact run #125 multi-line backtick-wrapped payload", async () => {
+    const established = "go test ./...";
+    const { runId, stepDbId } = await seedRun({
+      context: { repo: "/x", test_cmd: established, test_cmd_raw: established },
+      established,
+      source: "launch",
+    });
+
+    completeStep(stepDbId, RUN_125_PAYLOAD);
+
+    const state = await readState(runId);
+    assert.equal(state.established, established, "test_cmd_established must be unchanged by a refused prose capture");
+    assert.equal(state.context.test_cmd, established, "context.test_cmd must be unchanged by a refused prose capture");
+    assert.equal(state.context.test_cmd_raw, established, "context.test_cmd_raw must be unchanged by a refused prose capture");
+    assertNoReviewState(state.context);
+    assert.ok(
+      !getRunEvents(runId).some((e) => e.event === "test_cmd.rewrite_detected"),
+      "a refused prose capture must not emit test_cmd.rewrite_detected",
+    );
+  });
+
+  it("refuses a single-line backtick-decorated wrapper echo", async () => {
+    const established = "npm test";
+    const { runId, stepDbId } = await seedRun({
+      context: { repo: "/x", test_cmd: established, test_cmd_raw: established },
+      established,
+      source: "launch",
+    });
+
+    completeStep(stepDbId, SINGLE_LINE_DECORATED);
+
+    const state = await readState(runId);
+    assert.equal(state.established, established, "test_cmd_established must be unchanged");
+    assert.equal(state.context.test_cmd, established, "context.test_cmd must be unchanged");
+    assert.equal(state.context.test_cmd_raw, established, "context.test_cmd_raw must be unchanged");
+    assertNoReviewState(state.context);
+    assert.ok(
+      !getRunEvents(runId).some((e) => e.event === "test_cmd.rewrite_detected"),
+      "a decorated wrapper echo must not be treated as a rewrite candidate",
+    );
+  });
+
+  it("keeps refusing the undecorated wrapper echo", async () => {
+    const established = "npm test -- --coverage";
+    const { runId, stepDbId } = await seedRun({
+      context: { repo: "/x", test_cmd: established, test_cmd_raw: established },
+      established,
+      source: "launch",
+    });
+
+    completeStep(stepDbId, UNDECORATED);
+
+    const state = await readState(runId);
+    assert.equal(state.established, established, "test_cmd_established must be unchanged");
+    assert.equal(state.context.test_cmd, established, "context.test_cmd must be unchanged");
+    assert.equal(state.context.test_cmd_raw, established, "context.test_cmd_raw must be unchanged");
+    assertNoReviewState(state.context);
+  });
+
+  it("still establishes bare commands when there is no contract", async () => {
+    for (const cmd of ["go test ./...", "npm test", "go test ./... -count=1", "cargo test --all"]) {
+      const { runId, stepDbId } = await seedRun({ context: { repo: "/x" } });
+      completeStep(stepDbId, `STATUS: done\nTEST_CMD: ${cmd}`);
+      const state = await readState(runId);
+      assert.equal(state.established, cmd, `bare command '${cmd}' must establish the contract`);
+      assert.equal(state.context.test_cmd, cmd, `context.test_cmd must be '${cmd}'`);
+      assert.equal(state.context.test_cmd_raw, cmd, `context.test_cmd_raw must be '${cmd}'`);
+      assertNoReviewState(state.context);
+    }
+  });
+
+  it("merges an identical bare command unchanged", async () => {
+    const cmd = "go test ./... -count=1";
+    const { runId, stepDbId } = await seedRun({
+      context: { repo: "/x", test_cmd: cmd, test_cmd_raw: cmd },
+      established: cmd,
+      source: "launch",
+    });
+
+    completeStep(stepDbId, `STATUS: done\nTEST_CMD: ${cmd}`);
+
+    const state = await readState(runId);
+    assert.equal(state.established, cmd, "an identical re-emit must not change the contract");
+    assert.equal(state.context.test_cmd, cmd);
+    assert.equal(state.context.test_cmd_raw, cmd);
+    assertNoReviewState(state.context);
+  });
+
+  it("still routes a different plausible bare command into the review flow", async () => {
+    const established = "npm test";
+    const candidate = "go test ./... -count=1";
+    const { runId, stepDbId } = await seedRun({
+      context: { repo: "/x", test_cmd: established, test_cmd_raw: established },
+      established,
+      source: "launch",
+    });
+
+    completeStep(stepDbId, `STATUS: done\nTEST_CMD: ${candidate}`);
+
+    const state = await readState(runId);
+    assert.equal(state.established, established, "the established contract must not be replaced by a rewrite");
+    assert.equal(state.context.test_cmd, established, "context.test_cmd must stay at the established value");
+    assert.equal(state.context.test_cmd_raw, established, "context.test_cmd_raw must stay at the established value");
+    assert.equal(state.context.test_cmd_review_required, "true", "a differing plausible bare command must set the review flag");
+    assert.equal(state.context.test_cmd_review_candidate, candidate);
+    assert.equal(state.context.test_cmd_review_established, established);
+    assert.equal(state.context.test_cmd_rewriter_step, "verify");
+    assert.ok(
+      getRunEvents(runId).some((e) => e.event === "test_cmd.rewrite_detected"),
+      "a plausible rewrite must still emit test_cmd.rewrite_detected",
+    );
   });
 });
