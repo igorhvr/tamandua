@@ -49,6 +49,18 @@ import {
   waitForHarnessStoreReconciliation,
   collectRunDiagnostics,
 } from "./helpers/e2e-helpers.ts";
+// HCANARY-CONTAM | LAUNCHER-SNAPSHOT: shared pure resolver + snapshot/restore net.
+// The brief names this as `../../src/lib/hermes-launcher-snapshot.ts` (the path
+// from `e2e-tests/helpers/`); this canary lives directly in `e2e-tests/`, so the
+// correct relative specifier is one level up (matching the other
+// `e2e-tests/*.test.ts` files that import `../src/lib/...`).
+import {
+  resolveRealHermesRoot,
+  resolveLauncherChain,
+  snapshotLaunchers,
+  restoreLaunchers,
+  verifyLaunchers,
+} from "../src/lib/hermes-launcher-snapshot.ts";
 
 const CANARY_TASK =
   "Canary check: do not modify any files or run any commands other than the " +
@@ -70,6 +82,30 @@ function isHermesAvailable(): boolean {
   }
 }
 
+/**
+ * Resolve the launcher entry path for the HCANARY-CONTAM guard.
+ *
+ * `command -v hermes` is authoritative; `TAMANDUA_HERMES_BINARY` is the
+ * documented fallback when the command resolves nothing. A null result is an
+ * explicit recorded no-op for the guard — it never skips the canary.
+ */
+function resolveHermesLauncherEntry(): string | null {
+  try {
+    const r = spawnSync("sh", ["-c", "command -v hermes"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (r.status === 0) {
+      const resolved = r.stdout.trim();
+      if (resolved.length > 0) return resolved;
+    }
+  } catch {
+    // fall through to the env fallback
+  }
+  const fallback = process.env.TAMANDUA_HERMES_BINARY?.trim();
+  return fallback && fallback.length > 0 ? fallback : null;
+}
+
 describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
   it(
     "do-now completes through real hermes pipeline and accounts its tokens",
@@ -84,6 +120,52 @@ describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
       }
 
       const env = await createTempHome({ linkRealAgentDirs: true });
+
+      // ── Launcher-contamination guard: pre-run snapshot (HCANARY-CONTAM) ──
+      // Runs AFTER the hermes-availability skip check and BEFORE the daemon
+      // starts, because hermes's profile-boot launcher publication is what
+      // rewrote the REAL source-install launchers through the temp HOME.
+      //
+      // Mechanism check (task item b) against the STAGED affected-host source
+      // (hermes HEAD 16c59d0e): `_launchers.py` sha256 d8e5d079... and
+      // `hermes_constants.py` sha256 1bef6b10... (both verified before use).
+      //
+      //   * HERMES_HOME does NOT verify: `get_default_hermes_root()`
+      //     (hermes_constants.py ~L216-233) returns `native_home`
+      //     (= Path.home()/".hermes") whenever the HERMES_HOME path resolves
+      //     under `native_home.resolve()`. createTempHome symlinks
+      //     <tempHome>/.hermes to the REAL ~/.hermes, so BOTH the unset case and
+      //     `HERMES_HOME=<realpath of the real hermes root>` resolve under the
+      //     temp native_home and still return the literal <tempHome>/.hermes —
+      //     the very temp path observed in the contamination. Setting it cannot
+      //     change the minted interpreter path, so it is deliberately NOT set.
+      //   * No explicit env switch in the two briefed, authoritative files
+      //     disables the boot-repair publication. The minted interpreter comes
+      //     from `resolve_store_python()` (_launchers.py), which delegates to
+      //     `store_root(repo_root)` in the `pm.environments` module — the brief
+      //     declares `pm.environments.store_root` UNSTAGED, and neither briefed
+      //     file resolves it. A later `environments.py` copy now sits beside the
+      //     brief and exposes an `HERMES_RUNTIME_DIR` override, but it is outside
+      //     the briefed authoritative pair and applying it would require guessing
+      //     the real store path while changing canary behavior beyond this story,
+      //     so no unverified mechanism is picked.
+      // NO mechanism is applied here: the required snapshot/restore net below is
+      // the guard. A resolution/entry failure is a recorded no-op and must NOT
+      // skip the canary.
+      const realHermesRoot = resolveRealHermesRoot(env.homeDir);
+      const launcherEntry = resolveHermesLauncherEntry();
+      const launcherChain = resolveLauncherChain({
+        entryPath: launcherEntry,
+        realHermesRoot: realHermesRoot.root,
+      });
+      const launcherSnapshot = snapshotLaunchers(launcherChain);
+      console.log(
+        `[hermes-canary launcher-guard] realRoot=${realHermesRoot.root ?? "(none)"} ` +
+          `entry=${launcherEntry ?? "(none)"} ` +
+          `snapshotted=${launcherSnapshot.entries.length} file(s) ` +
+          `noop=${launcherSnapshot.noop}`,
+      );
+
       let daemon: ChildProcess | undefined;
       try {
         cliMustSucceed(
@@ -214,6 +296,39 @@ describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
           }
         }
         cleanupTempHome(env);
+
+        // ── Launcher-contamination guard: restore + verify ─────────────────
+        // Runs AFTER the daemon stops and AFTER the temp home is cleaned, so
+        // the repair uses only the pre-run snapshot (the temp home is gone and
+        // can no longer influence resolution). Unchanged files are never
+        // rewritten. A restore failure OR any non-identical file FAILS the
+        // test loudly with the drifted paths — never a silent pass.
+        let restoreFailure: unknown;
+        try {
+          restoreLaunchers(launcherSnapshot);
+        } catch (err) {
+          restoreFailure = err;
+        }
+        const launcherVerification = verifyLaunchers(launcherSnapshot);
+        if (restoreFailure !== undefined || !launcherVerification.ok) {
+          const drift = launcherVerification.entries
+            .filter((entry) => !entry.identical)
+            .map(
+              (entry) =>
+                `  ${entry.path}: expected sha256=${entry.expectedSha256}, ` +
+                `actual sha256=${entry.actualSha256 ?? "(missing)"}`,
+            )
+            .join("\n");
+          throw new Error(
+            "[HCANARY-CONTAM] real hermes launcher(s) could not be confirmed " +
+              "byte-identical after the canary run; the real hermes install may " +
+              "be corrupted and must be repaired before use.\n" +
+              `restoreError=${restoreFailure instanceof Error ? restoreFailure.message : String(restoreFailure ?? "none")}\n` +
+              (drift.length > 0
+                ? `drifted launcher files:\n${drift}`
+                : "no per-file drift recorded"),
+          );
+        }
       }
     },
   );
