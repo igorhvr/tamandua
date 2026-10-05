@@ -163,7 +163,7 @@ export interface DoNowRunArgsInput {
 }
 
 /**
- * Build the exact `workflow run do-now --matchlock …` argv for one gate round.
+ * Build the exact `workflow run do-now --matchlock-image …` argv for one gate round.
  * Each allow-private entry emits its own repeatable `--matchlock-allow-private`
  * pair, in first-seen order; an empty list emits no flag at all.
  */
@@ -175,7 +175,7 @@ export function buildDoNowRunArgs(input: DoNowRunArgsInput): string[] {
     input.prompt,
     "--working-directory-for-harness",
     input.workDir,
-    "--matchlock",
+    "--matchlock-image",
     input.imageTag,
   ];
   for (const entry of input.allowPrivate ?? []) {

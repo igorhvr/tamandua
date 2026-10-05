@@ -225,7 +225,7 @@ describe("US-009 allow-private gate: argument + evidence logic (no VM)", () => {
       "do it",
       "--working-directory-for-harness",
       "/work/wd",
-      "--matchlock",
+      "--matchlock-image",
       "fixture:tag",
       ALLOW_PRIVATE_FLAG,
       ALLOW_PRIVATE_PROBE_URL,

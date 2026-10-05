@@ -15,6 +15,11 @@
  *   - memory = min(16384 MB, 50% of host MemTotal)
  *   - disk   = 20480 MB
  *
+ * MTLK-SWAP adds one field with deliberately different semantics: `swapMB`
+ * (0 = swap off) is `--matchlock-no-swap` > `--matchlock-swap` > env
+ * (`TAMANDUA_MATCHLOCK_SWAP_MB`, a size or `off`) > the built-in 8192 MB, with
+ * no host-derived clamp (swap is a sparse disk file, not reserved RAM).
+ *
  * Node-core only (`node:os`) — deliberately NO `node:child_process`, so this
  * module and its tests stay in the parallel lane.
  */
@@ -29,6 +34,13 @@ export const MATCHLOCK_DEFAULT_CPUS_CAP = 8;
 export const MATCHLOCK_DEFAULT_MEMORY_CAP_MB = 16384;
 /** Built-in default disk size in MB (20 GiB). */
 export const MATCHLOCK_DEFAULT_DISK_MB = 20480;
+/** Built-in default swap size in MB (8 GiB) for every Matchlock VM. */
+export const MATCHLOCK_DEFAULT_SWAP_MB = 8192;
+/**
+ * Hard maximum swap size in MB (64 GiB), mirroring matchlock's own `maxSwapMB`
+ * cap so an oversized value is rejected at launch, never at VM-create time.
+ */
+export const MATCHLOCK_MAX_SWAP_MB = 65536;
 /** Fraction of host MemTotal used for the default memory allowance. */
 export const MATCHLOCK_DEFAULT_MEMORY_HOST_FRACTION = 0.5;
 /** Maximum fraction of host MemTotal an explicit/env memory value may claim. */
@@ -40,12 +52,19 @@ export const MATCHLOCK_CPUS_ENV = "TAMANDUA_MATCHLOCK_CPUS";
 export const MATCHLOCK_MEMORY_ENV = "TAMANDUA_MATCHLOCK_MEMORY_MB";
 /** Operator env var supplying disk (MB, or `<n>g`) when the flag is absent. */
 export const MATCHLOCK_DISK_ENV = "TAMANDUA_MATCHLOCK_DISK_MB";
+/**
+ * Operator env var supplying swap when `--matchlock-swap` is absent: a size
+ * (MB or `<n>g`) or the literal `off` (case-insensitive) to disable swap.
+ */
+export const MATCHLOCK_SWAP_ENV = "TAMANDUA_MATCHLOCK_SWAP_MB";
 
 /** Resolved Matchlock VM resource limits. */
 export interface MatchlockResourceLimits {
   cpus: number;
   memoryMB: number;
   diskSizeMB: number;
+  /** Guest swap size in MB; `0` means swap is disabled for the run. */
+  swapMB: number;
 }
 
 /** Where a single resolved field's value came from. */
@@ -57,6 +76,7 @@ export interface ResolvedMatchlockResourceLimits extends MatchlockResourceLimits
     cpus: MatchlockResourceLimitSource;
     memoryMB: MatchlockResourceLimitSource;
     diskSizeMB: MatchlockResourceLimitSource;
+    swapMB: MatchlockResourceLimitSource;
   };
 }
 
@@ -85,6 +105,10 @@ export interface ResolveMatchlockResourceLimitsParams {
   memoryMB?: string | number;
   /** Explicit `--matchlock-disk` value (`MB` or `<n>g`), if any. */
   diskSizeMB?: string | number;
+  /** Explicit `--matchlock-swap` value (`MB` or `<n>g`), if any. */
+  swapMB?: string | number;
+  /** `--matchlock-no-swap`: disable swap, beating any size (flag or env). */
+  noSwap?: boolean;
   /**
    * Environment snapshot consulted per field after an explicit flag. Callers
    * that want the ambient process environment pass `process.env`; the default
@@ -145,6 +169,47 @@ function parseSizeMB(raw: string | number, flag: string): number {
     return gigabytes * 1024;
   }
   return parsePositiveInteger(text, flag);
+}
+
+/**
+ * Parse a swap size (MTLK-SWAP): the {@link parseSizeMB} grammar (a whole
+ * positive integer in MB or `<n>g`/`<n>G`), POSITIVE ONLY, and no larger than
+ * {@link MATCHLOCK_MAX_SWAP_MB} (matchlock's own cap). `0` is deliberately not
+ * a valid spelling — it is rejected with a message pointing at the real off
+ * switch (`--matchlock-no-swap`, or `TAMANDUA_MATCHLOCK_SWAP_MB=off` when the
+ * value came from the env var named by `flag`). Negatives, fractions and
+ * non-numerics are typed errors too.
+ */
+export function parseSwapMB(raw: string | number, flag: string): number {
+  const offSwitch = flag === MATCHLOCK_SWAP_ENV ? `${MATCHLOCK_SWAP_ENV}=off` : "--matchlock-no-swap";
+  const text = typeof raw === "number" ? String(raw) : raw.trim();
+  if (text === "0") {
+    throw new MatchlockResourceLimitError(
+      flag,
+      `Invalid Matchlock ${flag} value ${JSON.stringify(String(raw))}: 0 does not disable swap; use ${offSwitch}.`,
+    );
+  }
+  let value: number;
+  const giga = /^(\d+)[gG]$/.exec(text);
+  if (giga) {
+    const gigabytes = Number(giga[1]);
+    if (!Number.isSafeInteger(gigabytes) || gigabytes <= 0) {
+      throw new MatchlockResourceLimitError(
+        flag,
+        `Invalid Matchlock ${flag} value ${JSON.stringify(String(raw))}: expected a positive size in MB or '<n>g'.`,
+      );
+    }
+    value = gigabytes * 1024;
+  } else {
+    value = parsePositiveInteger(text, flag);
+  }
+  if (value > MATCHLOCK_MAX_SWAP_MB) {
+    throw new MatchlockResourceLimitError(
+      flag,
+      `Invalid Matchlock ${flag} value ${JSON.stringify(String(raw))}: exceeds matchlock's maximum swap of ${MATCHLOCK_MAX_SWAP_MB} MB.`,
+    );
+  }
+  return value;
 }
 
 /** A field is absent when it is undefined/null or whitespace-only. */
@@ -223,34 +288,86 @@ export function resolveMatchlockResourceLimits(
     diskSource = "default";
   }
 
+  // swap: --matchlock-no-swap > explicit flag > env (`off` or size) > 8192.
+  // There is deliberately NO host-derived clamp: swap is a sparse disk file,
+  // not reserved RAM, so the memory host-fractions do not apply.
+  let swapMB: number;
+  let swapSource: MatchlockResourceLimitSource;
+  if (params.noSwap === true) {
+    swapMB = 0;
+    swapSource = "flag";
+  } else if (!isAbsent(params.swapMB)) {
+    swapMB = parseSwapMB(params.swapMB as string | number, "--matchlock-swap");
+    swapSource = "flag";
+  } else if (!isAbsent(env[MATCHLOCK_SWAP_ENV])) {
+    const rawSwapEnv = env[MATCHLOCK_SWAP_ENV] as string;
+    swapMB = rawSwapEnv.trim().toLowerCase() === "off"
+      ? 0
+      : parseSwapMB(rawSwapEnv, MATCHLOCK_SWAP_ENV);
+    swapSource = "env";
+  } else {
+    swapMB = MATCHLOCK_DEFAULT_SWAP_MB;
+    swapSource = "default";
+  }
+
   return {
     cpus,
     memoryMB,
     diskSizeMB,
+    swapMB,
     sources: {
       cpus: cpusSource,
       memoryMB: memorySource,
       diskSizeMB: diskSource,
+      swapMB: swapSource,
     },
   };
 }
 
 /**
- * Canonical launch/status line for resolved limits:
- * `matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB`.
+ * The limits + optional display provenance the shared Matchlock summary line
+ * carries. `swapMB`/`imageSource` are optional so a caller that predates the
+ * slice-2 output contract (e.g. the `workflow status` renderer before its own
+ * story) keeps its previous line; the launch path always supplies both.
+ */
+export type MatchlockResourceSummaryLimits = Pick<
+  MatchlockResourceLimits,
+  "cpus" | "memoryMB" | "diskSizeMB"
+> & {
+  /** Guest swap size in MB; `0` renders `swap=off`. Omitted → no swap segment. */
+  swapMB?: number;
+  /** Effective image provenance; `"standard"` renders ` (standard image)`. */
+  imageSource?: "explicit" | "standard";
+};
+
+/**
+ * Canonical launch/status line for resolved limits (SHARED-V3 §4.6):
+ * `matchlock: <image>[ (standard image)] cpus=<n> memory=<MB>MB disk=<MB>MB
+ *  swap=<n>MB|off[ allow-private=<entry,...>]`.
+ *
+ * `(standard image)` is emitted only for `imageSource === "standard"`.
+ * `swapMB` renders as `swap=<n>MB` for a positive size and `swap=off` for 0.
+ * Byte-identity: only a caller that omits `swapMB`/`imageSource` (the
+ * not-yet-migrated status renderer) keeps the old narrower line; an opted-in
+ * launch always carries both, and a NATIVE run emits no `matchlock:` line at
+ * all.
  *
  * MTLK-ALLOW-PRIVATE (US-006): when the run admitted a non-empty allow-private
  * destination list, the resolved entries are appended as
  * ` allow-private=<comma-separated entries>`. An absent or empty list appends
- * nothing, so native runs and allow-private-free Matchlock runs keep the
- * byte-identical line they had before this field existed.
+ * nothing.
  */
 export function formatMatchlockResourceSummary(
   image: string,
-  limits: MatchlockResourceLimits,
+  limits: MatchlockResourceSummaryLimits,
   allowPrivate?: readonly string[],
 ): string {
-  let summary = `matchlock: ${image} cpus=${limits.cpus} memory=${limits.memoryMB}MB disk=${limits.diskSizeMB}MB`;
+  const standardSuffix = limits.imageSource === "standard" ? " (standard image)" : "";
+  const swapSegment =
+    limits.swapMB === undefined
+      ? ""
+      : ` swap=${limits.swapMB > 0 ? `${limits.swapMB}MB` : "off"}`;
+  let summary = `matchlock: ${image}${standardSuffix} cpus=${limits.cpus} memory=${limits.memoryMB}MB disk=${limits.diskSizeMB}MB${swapSegment}`;
   if (allowPrivate && allowPrivate.length > 0) {
     summary += ` allow-private=${allowPrivate.join(",")}`;
   }

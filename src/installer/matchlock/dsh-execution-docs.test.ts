@@ -140,7 +140,7 @@ describe("docs/matchlock-dsh-qualification.md production recipe (US-004)", () =>
 
   it("states the real opt-in recipe and the supported workflows", () => {
     assert.match(recipe, /tamandua workflow run do-now/);
-    assert.match(recipe, /--dsh-as-harness --matchlock <image>/);
+    assert.match(recipe, /--dsh-as-harness --matchlock-image <image>/);
     assert.match(recipe, /`do-now`, `do-review-do-verify`/);
   });
 

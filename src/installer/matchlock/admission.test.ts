@@ -19,12 +19,23 @@ import {
   MatchlockAdmissionError,
   MATCHLOCK_RPC_BIN_ENV,
   MATCHLOCK_RPC_ARGS_ENV,
+  MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
+  matchlockRootUsageRefusalText,
   pinFromPolicy,
   type MatchlockAllowPrivateSupportProbe,
 } from "../../../dist/installer/matchlock/admission.js";
-import { serializeMatchlockPolicy, parseMatchlockPolicy } from "../../../dist/installer/matchlock/policy.js";
+import {
+  MATCHLOCK_POLICY_VERSION,
+  serializeMatchlockPolicy,
+  parseMatchlockPolicy,
+} from "../../../dist/installer/matchlock/policy.js";
+import {
+  MATCHLOCK_DEFAULT_SWAP_MB,
+  MATCHLOCK_MAX_SWAP_MB,
+} from "../../../dist/installer/matchlock/resource-limits.js";
 import { buildMatchlockCreateConfig } from "../../../dist/installer/matchlock/mount-plan.js";
 import { writeFakeRpcDriver, tempTranscriptPath } from "../../../dist/installer/matchlock/fake-rpc-driver.js";
+import type { MatchlockSwapSupportProbe } from "../../../dist/installer/matchlock/swap-support.js";
 
 function git(args: string[], cwd: string): string {
   const result = spawnSync("git", args, {
@@ -132,6 +143,16 @@ describe("matchlock run-creation admission", () => {
     }
   }
 
+  /**
+   * MTLK-ISO-SLICE2 US-003: a deterministic supporting swap-capability probe so
+   * admissions never need a real matchlock binary. It echoes back the resolved
+   * rpc binary path. Tests that exercise the refusal paths override it.
+   */
+  const supportingSwapProbe: MatchlockSwapSupportProbe = (binaryPath) => ({
+    supported: true,
+    binaryPath,
+  });
+
   function admissionOpts(over: Record<string, unknown>): Record<string, unknown> {
     return {
       requestedImage: "vic/ml:latest",
@@ -139,6 +160,7 @@ describe("matchlock run-creation admission", () => {
       workingDirectory: nonRepoDir,
       rpcBinaryPath: process.execPath,
       rpcArgs: [fakeDriver],
+      swapSupportProbe: supportingSwapProbe,
       ...over,
     };
   }
@@ -158,7 +180,7 @@ describe("matchlock run-creation admission", () => {
     const result = await admitMatchlockRun(
       admissionOpts({}) as never,
     );
-    assert.equal(result.policy.version, 2);
+    assert.equal(result.policy.version, MATCHLOCK_POLICY_VERSION);
     assert.equal(result.policy.resolvedImageDigest, "sha256:fakedigest");
     assert.equal(result.policy.resolvedImageConfigDigest, "sha256:fakeconfigdigest");
     assert.equal(result.policy.requestedImage, "vic/ml:latest");
@@ -189,7 +211,12 @@ describe("matchlock run-creation admission", () => {
     const result = await admitMatchlockRun(
       admissionOpts({ resourceLimits: { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 } }) as never,
     );
-    assert.deepEqual(result.policy.resourceLimits, { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 });
+    assert.deepEqual(result.policy.resourceLimits, {
+      cpus: 4,
+      memoryMB: 4096,
+      diskSizeMB: 20480,
+      swapMB: MATCHLOCK_DEFAULT_SWAP_MB,
+    });
     // Still resolve-only: supplied limits never trigger a create.
     assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
   });
@@ -215,10 +242,145 @@ describe("matchlock run-creation admission", () => {
     );
     assert.deepEqual(
       replacement.policy.resourceLimits,
-      { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
-      "a rugpull replacement retains the failed run's admitted VM size",
+      { cpus: 4, memoryMB: 4096, diskSizeMB: 20480, swapMB: MATCHLOCK_DEFAULT_SWAP_MB },
+      "a rugpull replacement retains the failed run's admitted VM size and swap (INHERITANCE RULE: preserved VERBATIM)",
     );
     assert.equal(replacement.policy.requestedImage, fresh.policy.requestedImage);
+  });
+
+  // SHARED-V3 (MTLK-SWAP): the resolved swapMB rides the resourceLimits into
+  // the persisted v3 record. A fresh write keeps an explicit 0 (swap off) and
+  // a positive size verbatim; an INHERITED write preserves the inherited
+  // swapMB VERBATIM — never recomputed from the current environment.
+  it("SHARED-V3: a fresh admission persists the supplied swapMB (0 = off and positive) and an inherited write preserves it verbatim", async () => {
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
+      [MATCHLOCK_RPC_ARGS_ENV]: JSON.stringify([fakeDriver]),
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const off = await admitMatchlockRun(
+      admissionOpts({
+        resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 0 },
+      }) as never,
+    );
+    assert.equal(off.policy.resourceLimits.swapMB, 0, "an explicit 0 (swap off) is preserved on a fresh v3 write");
+    assert.equal(off.policy.requestedImageSource, "explicit");
+
+    const sized = await admitMatchlockRun(
+      admissionOpts({
+        resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: MATCHLOCK_MAX_SWAP_MB },
+      }) as never,
+    );
+    assert.equal(sized.policy.resourceLimits.swapMB, MATCHLOCK_MAX_SWAP_MB);
+
+    const replacement = await admitMatchlockRun(
+      admissionOpts({
+        inheritedPolicy: off.policy,
+        // Newly supplied limits must NOT recompute the inherited swap (0).
+        resourceLimits: { cpus: 8, memoryMB: 8192, diskSizeMB: 40960, swapMB: 32768 },
+      }) as never,
+    );
+    assert.deepEqual(
+      replacement.policy.resourceLimits,
+      { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 0 },
+      "an inherited write preserves swapMB verbatim (INHERITANCE RULE)",
+    );
+  });
+
+  // SHARED-V3 US-009: the parser's REAL provenance is threaded through
+  // admission into the persisted v3 record. A fresh write records the caller's
+  // source; absent defaults to "explicit"; an inherited write preserves the
+  // inherited source VERBATIM (never recomputed from the current environment).
+  it("SHARED-V3: a fresh admission persists the caller's requestedImageSource (standard/explicit) and an inherited write preserves it verbatim", async () => {
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
+      [MATCHLOCK_RPC_ARGS_ENV]: JSON.stringify([fakeDriver]),
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const standard = await admitMatchlockRun(
+      admissionOpts({ imageSource: "standard" }) as never,
+    );
+    assert.equal(standard.policy.requestedImageSource, "standard");
+    // The persisted record is a FULL valid v3 record: serialize/parse round-trips.
+    assert.equal(
+      parseMatchlockPolicy(serializeMatchlockPolicy(standard.policy)).requestedImageSource,
+      "standard",
+      "a fresh standard write is a complete v3 record",
+    );
+
+    const explicit = await admitMatchlockRun(
+      admissionOpts({ imageSource: "explicit" }) as never,
+    );
+    assert.equal(explicit.policy.requestedImageSource, "explicit");
+
+    const absent = await admitMatchlockRun(admissionOpts({}) as never);
+    assert.equal(absent.policy.requestedImageSource, "explicit", "absent provenance defaults to explicit");
+
+    const replacement = await admitMatchlockRun(
+      admissionOpts({
+        inheritedPolicy: standard.policy,
+        // A fresh "explicit" must NOT overwrite the inherited provenance.
+        imageSource: "explicit",
+      }) as never,
+    );
+    assert.equal(
+      replacement.policy.requestedImageSource,
+      "standard",
+      "an inherited write preserves requestedImageSource VERBATIM (INHERITANCE RULE)",
+    );
+  });
+
+  // SHARED-V3 US-009: R13 root-usage consent is a per-action fact: true only
+  // when the override was supplied to THIS (fresh) action. An inherited write
+  // preserves the persisted value verbatim and never recomputes it.
+  it("SHARED-V3: a fresh admission records rootUsageConsent true only with the override and an inherited write preserves it verbatim", async () => {
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
+      [MATCHLOCK_RPC_ARGS_ENV]: JSON.stringify([fakeDriver]),
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const consented = await admitMatchlockRun(
+      admissionOpts({ rootUsageConsent: true }) as never,
+    );
+    assert.equal(consented.policy.rootUsageConsent, true);
+
+    const plain = await admitMatchlockRun(admissionOpts({}) as never);
+    assert.equal(plain.policy.rootUsageConsent, false, "absent consent records false");
+
+    const explicitFalse = await admitMatchlockRun(
+      admissionOpts({ rootUsageConsent: false }) as never,
+    );
+    assert.equal(explicitFalse.policy.rootUsageConsent, false);
+
+    const replacement = await admitMatchlockRun(
+      admissionOpts({
+        inheritedPolicy: consented.policy,
+        // A fresh false must NOT revoke the inherited consent.
+        rootUsageConsent: false,
+      }) as never,
+    );
+    assert.equal(
+      replacement.policy.rootUsageConsent,
+      true,
+      "an inherited write preserves rootUsageConsent VERBATIM (INHERITANCE RULE)",
+    );
+    assert.equal(
+      parseMatchlockPolicy(serializeMatchlockPolicy(replacement.policy)).rootUsageConsent,
+      true,
+      "the inherited-consent write is a complete valid v3 record",
+    );
   });
 
   it("preserves the USER IMAGE's effective PATH (oci env PATH) on the persisted policy", async () => {
@@ -298,7 +460,9 @@ describe("matchlock run-creation admission", () => {
     assert.deepEqual(readTranscript(transcript), []);
   });
 
-  it("refuses when the image cannot be resolved (resolve_image error) — honest refusal, no create", async () => {
+  // R13 / spec C §2.3: an EXPLICIT provenance store miss keeps the
+  // import-and-retry guidance and never fetches or builds an image.
+  it("refuses when the image cannot be resolved (resolve_image error) — explicit provenance keeps the import-and-retry guidance, no create", async () => {
     transcript = tempTranscriptPath();
     setFake({
       PI_CODING_AGENT_DIR: configRoot,
@@ -306,14 +470,571 @@ describe("matchlock run-creation admission", () => {
       FAKE_RESOLVE_MISSING: "1",
     });
     await assert.rejects(
-      () => admitMatchlockRun(admissionOpts({}) as never),
-      (err: unknown) =>
-        err instanceof MatchlockAdmissionError &&
-        err.code === "image_unusable" &&
-        /could not resolve image/.test(err.message),
+      () => admitMatchlockRun(admissionOpts({ imageSource: "explicit" }) as never),
+      (err: unknown) => {
+        if (!(err instanceof MatchlockAdmissionError)) return false;
+        assert.equal(err.code, "image_unusable");
+        assert.match(err.message, /is not usable: image_unusable/);
+        assert.match(err.message, /Import it into the local matchlock store/);
+        assert.match(err.message, /matchlock pull vic\/ml:latest/);
+        assert.match(err.message, /nothing ran natively/);
+        assert.doesNotMatch(err.message, /tamandua matchlock setup/);
+        return true;
+      },
     );
     const methods = readTranscript(transcript).map((e) => e.method).filter(Boolean);
     assert.deepEqual(methods, ["resolve_image"]);
+  });
+
+  // R13 / spec C §2.3: a STANDARD provenance store miss names the
+  // `tamandua matchlock setup` remedy (no fetch, no build, no native fallback).
+  it("refuses a standard-provenance store miss with the `tamandua matchlock setup` remedy and no fetch/build", async () => {
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_RESOLVE_MISSING: "1",
+    });
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            requestedImage: "igorhvr/tamandua",
+            imageSource: "standard",
+          }) as never,
+        ),
+      (err: unknown) => {
+        if (!(err instanceof MatchlockAdmissionError)) return false;
+        assert.equal(err.code, "image_unusable");
+        assert.match(err.message, /the standard Matchlock image igorhvr\/tamandua is not in the local matchlock store/);
+        assert.match(err.message, /tamandua matchlock setup/);
+        assert.match(err.message, /--matchlock-image <image>/);
+        assert.match(err.message, /nothing ran natively/);
+        assert.doesNotMatch(err.message, /matchlock pull/);
+        return true;
+      },
+    );
+    // The only matchlock interaction is the store lookup — never a pull/build.
+    const methods = readTranscript(transcript).map((e) => e.method).filter(Boolean);
+    assert.deepEqual(methods, ["resolve_image"]);
+  });
+
+  // R13 (spec C §2.6): the effective-uid gate runs FIRST — an euid-0 process
+  // with no consent refuses before the allow-private probe, the image resolve
+  // and any policy construction, and never spawns a matchlock process.
+  it("R13: euid 0 with no consent refuses matchlock_root_usage_refused FIRST (no probe, no resolve, no policy) and spawns nothing", async () => {
+    const dir = path.join(tmpRoot, "r13-root-refusal");
+    fs.mkdirSync(dir, { recursive: true });
+    const isolatedTranscript = path.join(dir, "wire.jsonl");
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: isolatedTranscript,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    let allowPrivateProbed = 0;
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            effectiveUid: () => 0,
+            allowPrivate: ["192.168.107.74:8888"],
+            allowPrivateSupportProbe: () => {
+              allowPrivateProbed += 1;
+              return { supported: true, binaryPath: process.execPath };
+            },
+          }) as never,
+        ),
+      (err: unknown) => {
+        if (!(err instanceof MatchlockAdmissionError)) return false;
+        assert.equal(err.code, "matchlock_root_usage_refused");
+        assert.equal(err.message, matchlockRootUsageRefusalText());
+        assert.match(err.message, /refusing to execute a Matchlock run as root/);
+        assert.match(err.message, /documented to run unprivileged/);
+        assert.match(err.message, new RegExp(MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG));
+        assert.match(err.message, /nothing ran natively/);
+        return true;
+      },
+    );
+    assert.equal(allowPrivateProbed, 0, "the root gate precedes the allow-private capability probe");
+    assert.equal(
+      fs.existsSync(isolatedTranscript),
+      false,
+      "no matchlock RPC process may be spawned on a root refusal",
+    );
+  });
+
+  // R13: euid 0 WITH consent inherited from the persisted policy proceeds and
+  // preserves the inherited consent VERBATIM.
+  it("R13: euid 0 with inherited consent proceeds and the replacement preserves rootUsageConsent true", async () => {
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const consented = await admitMatchlockRun(
+      admissionOpts({ rootUsageConsent: true }) as never,
+    );
+    assert.equal(consented.policy.rootUsageConsent, true);
+    const replacement = await admitMatchlockRun(
+      admissionOpts({
+        inheritedPolicy: consented.policy,
+        effectiveUid: () => 0,
+        // No override supplied to THIS action: the inherited consent carries it.
+      }) as never,
+    );
+    assert.equal(
+      replacement.policy.rootUsageConsent,
+      true,
+      "inherited consent permits the root process and is preserved VERBATIM",
+    );
+  });
+
+  // R13: euid 0 + an override supplied to THIS action proceeds and the fresh
+  // policy records rootUsageConsent true (spec C §4.4/§4.5).
+  it("R13: euid 0 with the override supplied to this action proceeds and persists rootUsageConsent true", async () => {
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const result = await admitMatchlockRun(
+      admissionOpts({ effectiveUid: () => 0, rootUsageConsent: true }) as never,
+    );
+    assert.equal(result.policy.rootUsageConsent, true);
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
+  // R13: a fresh NON-root submission records the consent flag truthfully —
+  // false without the override and true with it.
+  it("R13: a fresh non-root admission records rootUsageConsent truthfully (false absent, true with the override)", async () => {
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const plain = await admitMatchlockRun(
+      admissionOpts({ effectiveUid: () => 1000 }) as never,
+    );
+    assert.equal(plain.policy.rootUsageConsent, false, "no override records consent false for a fresh submission");
+    const overridden = await admitMatchlockRun(
+      admissionOpts({ effectiveUid: () => 1000, rootUsageConsent: true }) as never,
+    );
+    assert.equal(overridden.policy.rootUsageConsent, true, "the override is recorded truthfully");
+  });
+
+  // R13: an override supplied to THIS action may set an inherited false to
+  // true (§4.5 authoritative rule) so the persisted gate value stays
+  // consistent with what the gate actually permitted.
+  it("R13: an override can set an inherited rootUsageConsent false to true", async () => {
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const without = await admitMatchlockRun(
+      admissionOpts({ effectiveUid: () => 1000 }) as never,
+    );
+    assert.equal(without.policy.rootUsageConsent, false);
+    const withOverride = await admitMatchlockRun(
+      admissionOpts({
+        inheritedPolicy: without.policy,
+        effectiveUid: () => 0,
+        rootUsageConsent: true,
+      }) as never,
+    );
+    assert.equal(withOverride.policy.rootUsageConsent, true);
+  });
+
+  // R13 parity: the hermes branch runs the SAME root gate with the same typed
+  // code and ordering, before its selection checks and any effect.
+  it("R13 parity: admitHermesMatchlockRun refuses euid 0 without consent with the same code and ordering", async () => {
+    const dir = path.join(tmpRoot, "r13-hermes-refusal");
+    fs.mkdirSync(dir, { recursive: true });
+    const isolatedTranscript = path.join(dir, "wire.jsonl");
+    const hermesRoot = path.join(tmpRoot, "r13-hermes-home");
+    fs.mkdirSync(hermesRoot, { recursive: true });
+    setFake({
+      PI_CODING_AGENT_DIR: undefined,
+      FAKE_TRANSCRIPT_FILE: isolatedTranscript,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    let allowPrivateProbed = 0;
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            harness: "hermes",
+            submission: { homeDir: path.join(tmpRoot, "operator"), cwd: nonRepoDir, hermesHomeEnv: hermesRoot },
+            effectiveUid: () => 0,
+            allowPrivate: ["registry.internal"],
+            allowPrivateSupportProbe: () => {
+              allowPrivateProbed += 1;
+              return { supported: true, binaryPath: process.execPath };
+            },
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "matchlock_root_usage_refused" &&
+        err.message === matchlockRootUsageRefusalText(),
+    );
+    assert.equal(allowPrivateProbed, 0, "the root gate precedes the allow-private probe on the hermes path too");
+    assert.equal(fs.existsSync(isolatedTranscript), false, "the hermes root refusal spawns no matchlock process");
+  });
+
+  // ── MTLK-ISO-SLICE2 US-003: swap-capability handshake at admission ──
+
+  /**
+   * US-003: a deterministic supporting probe is the default for these tests
+   * (admissionOpts injects it) so no real matchlock binary is needed. Each
+   * test here overrides it to exercise a refusal path.
+   */
+  function swapFakes(over: Record<string, string | undefined> = {}): void {
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      FAKE_RESOLVE_MISSING: undefined,
+      ...over,
+    });
+  }
+
+  it("US-003: a FRESH admission probes the binary resolved by resolveRpcInvocation for --swap and persists the policy when it supports the flag", async () => {
+    transcript = tempTranscriptPath();
+    swapFakes();
+    let probedBinary: string | undefined;
+    let probedCalls = 0;
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        swapSupportProbe: (binaryPath: string) => {
+          probedBinary = binaryPath;
+          probedCalls += 1;
+          return { supported: true, binaryPath, version: "9.9.9" };
+        },
+      }) as never,
+    );
+    assert.equal(probedCalls, 1, "the swap probe runs exactly once per admission");
+    assert.equal(probedBinary, process.execPath, "the probe runs against the resolved rpc binary");
+    assert.equal(result.policy.requestedImage, "vic/ml:latest");
+    assert.deepEqual(
+      readTranscript(transcript).map((e) => e.method).filter(Boolean),
+      ["resolve_image"],
+      "a supporting probe keeps admission resolve-only",
+    );
+  });
+
+  it("MTLK-ISO2-MEND: admission resolves the rpc executable ONCE and binds it across awaited probes (no re-resolution drift)", async () => {
+    // Owned fake driver A is the binary the swap probe qualifies. The swap
+    // probe is the first AWAITED operation; when it runs it mutates the ambient
+    // rpc env to a NON-EXISTENT binary B — exactly what an operator env flip
+    // between two awaits looks like. A build that re-resolves before the image
+    // transport launches B and dies with matchlock_unavailable; resolving once
+    // and binding A for both the probe and the launch keeps the action sound.
+    const driftDir = path.join(tmpRoot, "drift-driver");
+    const driverA = writeFakeRpcDriver({ dir: driftDir });
+    const driverB = path.join(driftDir, "gone-matchlock-binary");
+    assert.equal(fs.existsSync(driverB), false, "the drift target must not exist");
+    transcript = tempTranscriptPath();
+    swapFakes();
+    const savedBin = process.env[MATCHLOCK_RPC_BIN_ENV];
+    const savedArgs = process.env[MATCHLOCK_RPC_ARGS_ENV];
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: driverA,
+      [MATCHLOCK_RPC_ARGS_ENV]: undefined,
+      FAKE_TRANSCRIPT_FILE: transcript,
+    });
+    const probed: string[] = [];
+    try {
+      const result = await admitMatchlockRun(
+        admissionOpts({
+          rpcBinaryPath: undefined,
+          rpcArgs: undefined,
+          swapSupportProbe: (binaryPath: string) => {
+            probed.push(binaryPath);
+            process.env[MATCHLOCK_RPC_BIN_ENV] = driverB;
+            return { supported: true, binaryPath };
+          },
+        }) as never,
+      );
+      assert.equal(probed.length, 1, "the swap probe runs exactly once");
+      assert.equal(probed[0], driverA, "the swap probe qualified owned driver A");
+      assert.equal(result.policy.resolvedImageDigest, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      assert.deepEqual(
+        readTranscript(transcript).map((e) => e.method).filter(Boolean),
+        ["resolve_image"],
+        "the image transport launched the SAME binary the probe qualified",
+      );
+    } finally {
+      if (savedBin === undefined) delete process.env[MATCHLOCK_RPC_BIN_ENV];
+      else process.env[MATCHLOCK_RPC_BIN_ENV] = savedBin;
+      if (savedArgs === undefined) delete process.env[MATCHLOCK_RPC_ARGS_ENV];
+      else process.env[MATCHLOCK_RPC_ARGS_ENV] = savedArgs;
+    }
+  });
+
+  it("US-003: a binary that does not advertise --swap refuses with matchlock_swap_unsupported naming the resolved path + remedy, writes NO policy and resolves NO image", async () => {
+    const dir = path.join(tmpRoot, "swap-unsupported");
+    fs.mkdirSync(dir, { recursive: true });
+    const isolatedTranscript = path.join(dir, "wire.jsonl");
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: isolatedTranscript,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    let probedBinary: string | undefined;
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            swapSupportProbe: (binaryPath: string) => {
+              probedBinary = binaryPath;
+              return {
+                supported: false,
+                binaryPath,
+                version: "0.1.0",
+                reasonCode: "unsupported",
+                reason: '"matchlock run --help" does not list --swap',
+              };
+            },
+          }) as never,
+        ),
+      (err: unknown) => {
+        if (!(err instanceof MatchlockAdmissionError)) return false;
+        assert.equal(err.code, "matchlock_swap_unsupported");
+        assert.ok(err.message.includes(process.execPath), `names the resolved binary: ${err.message}`);
+        assert.match(err.message, /--swap/);
+        assert.match(err.message, /tamandua matchlock setup/);
+        return true;
+      },
+    );
+    assert.equal(probedBinary, process.execPath, "the refusal names the resolved rpc binary");
+    assert.equal(
+      fs.existsSync(isolatedTranscript),
+      false,
+      "a swap refusal writes no policy and issues no resolve_image",
+    );
+  });
+
+  it("US-003: a timeout/unparseable (probe_failed) result refuses with the same typed matchlock_swap_unsupported code", async () => {
+    swapFakes();
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            swapSupportProbe: (binaryPath: string) => ({
+              supported: false,
+              binaryPath,
+              reasonCode: "probe_failed",
+              reason: `"${binaryPath} run --help" did not exit (killed by a signal or timed out)`,
+            }),
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "matchlock_swap_unsupported" &&
+        /probe_failed|did not exit|timed out|killed/.test(err.message),
+    );
+  });
+
+  it("US-003: a missing matchlock binary (ENOENT) keeps the matchlock_unavailable classification", async () => {
+    swapFakes();
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            swapSupportProbe: (binaryPath: string) => ({
+              supported: false,
+              binaryPath,
+              reasonCode: "missing_binary",
+              reason: `matchlock binary not found: ${binaryPath}`,
+            }),
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "matchlock_unavailable" &&
+        err.message.includes(process.execPath),
+    );
+  });
+
+  it("US-003: a throwing probe fails closed with the typed matchlock_swap_unsupported refusal", async () => {
+    swapFakes();
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            swapSupportProbe: () => {
+              throw new Error("probe exploded");
+            },
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "matchlock_swap_unsupported" &&
+        /probe exploded/.test(err.message) &&
+        err.message.includes(process.execPath),
+    );
+  });
+
+  it("US-003: a swap-DISABLED (swapMB 0) admission still probes for --swap and persists swapMB 0", async () => {
+    transcript = tempTranscriptPath();
+    swapFakes();
+    let probedCalls = 0;
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        resourceLimits: { cpus: 1, memoryMB: 1024, diskSizeMB: 1024, swapMB: 0 },
+        swapSupportProbe: (binaryPath: string) => {
+          probedCalls += 1;
+          return { supported: true, binaryPath };
+        },
+      }) as never,
+    );
+    assert.equal(probedCalls, 1, "the qualified-runtime proxy runs even when swap is disabled");
+    assert.equal(result.policy.resourceLimits.swapMB, 0);
+  });
+
+  it("US-003: an inherited-policy replacement probes again before re-admitting", async () => {
+    transcript = tempTranscriptPath();
+    swapFakes();
+    const first = await admitMatchlockRun(admissionOpts({}) as never);
+    let replacementProbed = 0;
+    const replacement = await admitMatchlockRun(
+      admissionOpts({
+        inheritedPolicy: first.policy,
+        swapSupportProbe: (binaryPath: string) => {
+          replacementProbed += 1;
+          return { supported: true, binaryPath };
+        },
+      }) as never,
+    );
+    assert.equal(replacementProbed, 1, "a replacement re-runs the handshake before re-admitting");
+    assert.equal(replacement.policy.requestedImage, first.policy.requestedImage);
+  });
+
+  it("US-003: euid 0 with no consent never reaches the swap probe (R13 precedes it)", async () => {
+    const dir = path.join(tmpRoot, "swap-r13-refusal");
+    fs.mkdirSync(dir, { recursive: true });
+    const isolatedTranscript = path.join(dir, "wire.jsonl");
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: isolatedTranscript,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    let probed = 0;
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            effectiveUid: () => 0,
+            swapSupportProbe: (binaryPath: string) => {
+              probed += 1;
+              return { supported: true, binaryPath };
+            },
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError && err.code === "matchlock_root_usage_refused",
+    );
+    assert.equal(probed, 0, "the R13 root gate precedes the swap probe");
+    assert.equal(fs.existsSync(isolatedTranscript), false, "no matchlock process on a root refusal");
+  });
+
+  it("US-003 parity: the hermes path runs the same swap handshake (refusal taxonomy + supporting persist)", async () => {
+    const hermesRoot = path.join(tmpRoot, "swap-hermes");
+    fs.mkdirSync(hermesRoot, { recursive: true });
+    const hermesSubmission = {
+      homeDir: path.join(tmpRoot, "operator"),
+      cwd: nonRepoDir,
+      hermesHomeEnv: hermesRoot,
+    };
+    // Unsupported refuses with the same typed code/name before any effect.
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            harness: "hermes",
+            submission: hermesSubmission,
+            swapSupportProbe: (binaryPath: string) => ({
+              supported: false,
+              binaryPath,
+              reasonCode: "unsupported",
+              reason: "no --swap",
+            }),
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "matchlock_swap_unsupported" &&
+        err.message.includes(process.execPath) &&
+        /tamandua matchlock setup/.test(err.message),
+    );
+    // A supporting probe lets the hermes admission proceed and persist.
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: undefined,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/hermes:latest",
+      FAKE_IMAGE_DIGEST: "sha256:hermesdigest00000000000000000000000000000000000000000000000000000",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:hermesconfig0000000000000000000000000000000000000000000000000000",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    let probedCalls = 0;
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        harness: "hermes",
+        submission: hermesSubmission,
+        swapSupportProbe: (binaryPath: string) => {
+          probedCalls += 1;
+          return { supported: true, binaryPath };
+        },
+      }) as never,
+    );
+    assert.equal(probedCalls, 1, "the hermes path probes exactly once");
+    assert.equal(result.policy.harness, "hermes");
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
+  it("US-003: with no injected probe the DEFAULT probe runs against the resolved rpc binary and refuses typed when it is not a swap-capable matchlock", async () => {
+    const dir = path.join(tmpRoot, "swap-default-probe");
+    fs.mkdirSync(dir, { recursive: true });
+    const isolatedTranscript = path.join(dir, "wire.jsonl");
+    setFake({
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_TRANSCRIPT_FILE: isolatedTranscript,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          // `swapSupportProbe: undefined` deliberately exercises the production
+          // default; the resolved rpc binary here is node (process.execPath),
+          // which cannot answer `run --help`, so the default probe refuses.
+          admissionOpts({ swapSupportProbe: undefined }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError &&
+        err.code === "matchlock_swap_unsupported" &&
+        err.message.includes(process.execPath),
+    );
+    assert.equal(fs.existsSync(isolatedTranscript), false, "the default refusal issues no resolve_image");
   });
 
   it("refuses a replacement whose freshly resolved image does NOT match the inherited pin (moved tag; never re-pins)", async () => {
@@ -394,7 +1115,7 @@ describe("matchlock run-creation admission", () => {
         submission: { homeDir: path.join(tmpRoot, "operator"), cwd: nonRepoDir, hermesHomeEnv: hermesRoot },
       }) as never,
     );
-    assert.equal(result.policy.version, 2);
+    assert.equal(result.policy.version, MATCHLOCK_POLICY_VERSION);
     assert.equal(result.policy.harness, "hermes");
     assert.equal(result.policy.resolvedImageDigest, "sha256:hermesdigest00000000000000000000000000000000000000000000000000000");
     assert.equal(result.policy.configurationRoot, hermesRoot, "canonical host Hermes config root");
@@ -1100,7 +1821,7 @@ describe("matchlock run-creation admission", () => {
     assert.equal(fs.existsSync(isolatedTranscript), false, "no RPC child may be spawned when the probe refuses");
   });
 
-  it("ALLOW-PRIVATE unsupported (hermes): the refusal fires before the harness branch and any effect", async () => {
+  it("ALLOW-PRIVATE missing binary (hermes): the uniform matchlock_unavailable taxonomy fires for a missing binary", async () => {
     const hermesRoot = path.join(tmpRoot, "ap-hermes-unsupported");
     fs.mkdirSync(hermesRoot, { recursive: true });
     await assert.rejects(
@@ -1117,10 +1838,11 @@ describe("matchlock run-creation admission", () => {
             }),
           }) as never,
         ),
+      // MTLK-ISO2-CORRECTIVE (F6): a missing binary keeps the SAME
+      // matchlock_unavailable taxonomy regardless of the allow-private list.
       (err: unknown) =>
         err instanceof MatchlockAdmissionError &&
-        err.code === "matchlock_allow_private_unsupported" &&
-        /registry\.internal/.test(err.message),
+        err.code === "matchlock_unavailable",
     );
   });
 
@@ -1160,4 +1882,131 @@ describe("matchlock run-creation admission", () => {
     assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
   });
 
+  // ── MTLK-ISO2-CORRECTIVE F6: crossed allow-private × missing/unsupported ──
+
+  it("F6: allow-private × MISSING swap binary reports matchlock_unavailable and never runs the flag probe", async () => {
+    let flagProbeCalls = 0;
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            allowPrivate: ["registry.internal"],
+            swapSupportProbe: (binaryPath: string) => ({
+              supported: false,
+              binaryPath,
+              reasonCode: "missing_binary",
+              reason: `not found: ${binaryPath}`,
+            }),
+            allowPrivateSupportProbe: () => {
+              flagProbeCalls += 1;
+              return { supported: true, binaryPath: "x" };
+            },
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError && err.code === "matchlock_unavailable",
+    );
+    assert.equal(flagProbeCalls, 0, "the swap handshake precedes the flag probe");
+  });
+
+  it("F6: allow-private × UNSUPPORTED swap binary reports matchlock_swap_unsupported and never runs the flag probe", async () => {
+    let flagProbeCalls = 0;
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            allowPrivate: ["registry.internal"],
+            swapSupportProbe: (binaryPath: string) => ({
+              supported: false,
+              binaryPath,
+              reasonCode: "unsupported",
+            }),
+            allowPrivateSupportProbe: () => {
+              flagProbeCalls += 1;
+              return { supported: true, binaryPath: "x" };
+            },
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError && err.code === "matchlock_swap_unsupported",
+    );
+    assert.equal(flagProbeCalls, 0, "the swap handshake precedes the flag probe");
+  });
+
+  it("F6: NO allow-private × MISSING swap binary reports the SAME matchlock_unavailable taxonomy", async () => {
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            swapSupportProbe: (binaryPath: string) => ({
+              supported: false,
+              binaryPath,
+              reasonCode: "missing_binary",
+            }),
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError && err.code === "matchlock_unavailable",
+    );
+  });
+
+  it("F6: NO allow-private × UNSUPPORTED swap binary reports the SAME matchlock_swap_unsupported taxonomy", async () => {
+    await assert.rejects(
+      () =>
+        admitMatchlockRun(
+          admissionOpts({
+            swapSupportProbe: (binaryPath: string) => ({
+              supported: false,
+              binaryPath,
+              reasonCode: "unsupported",
+            }),
+          }) as never,
+        ),
+      (err: unknown) =>
+        err instanceof MatchlockAdmissionError && err.code === "matchlock_swap_unsupported",
+    );
+  });
+
+  it("F6: a default-PATH lookup passes the resolved ABSOLUTE path into the swap AND flag leaf probes", async () => {
+    const fakeDir = path.join(tmpRoot, "f6-default-path");
+    fs.mkdirSync(fakeDir, { recursive: true });
+    const fakeMatchlock = path.join(fakeDir, "matchlock");
+    fs.writeFileSync(fakeMatchlock, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const savedBin = process.env[MATCHLOCK_RPC_BIN_ENV];
+    const savedPath = process.env.PATH;
+    delete process.env[MATCHLOCK_RPC_BIN_ENV];
+    process.env.PATH = `${fakeDir}${path.delimiter}${savedPath ?? ""}`;
+    try {
+      let swapProbePath: string | undefined;
+      let flagProbePath: string | undefined;
+      await assert.rejects(
+        () =>
+          admitMatchlockRun(
+            admissionOpts({
+              rpcBinaryPath: undefined,
+              allowPrivate: ["registry.internal"],
+              swapSupportProbe: (binaryPath: string) => {
+                swapProbePath = binaryPath;
+                return { supported: true, binaryPath };
+              },
+              allowPrivateSupportProbe: (binaryPath: string) => {
+                flagProbePath = binaryPath;
+                return { supported: false, binaryPath, reasonCode: "unsupported", reason: "no flag" };
+              },
+            }) as never,
+          ),
+        (err: unknown) =>
+          err instanceof MatchlockAdmissionError &&
+          err.code === "matchlock_allow_private_unsupported",
+      );
+      assert.equal(swapProbePath, fakeMatchlock, "the swap leaf probe receives the absolute resolved path");
+      assert.equal(flagProbePath, fakeMatchlock, "the flag leaf probe receives the SAME absolute path");
+      assert.ok(path.isAbsolute(swapProbePath as string), "never the bare name `matchlock`");
+    } finally {
+      if (savedBin === undefined) delete process.env[MATCHLOCK_RPC_BIN_ENV];
+      else process.env[MATCHLOCK_RPC_BIN_ENV] = savedBin;
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+    }
+  });
 });

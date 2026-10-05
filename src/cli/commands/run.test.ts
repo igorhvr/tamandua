@@ -83,6 +83,7 @@ const FIXTURE_DDL = `
     test_cmd_established TEXT,
     test_cmd_source TEXT,
     matchlock_policy TEXT,
+    isolation_intent TEXT,
     created_at TEXT,
     updated_at TEXT
   );

@@ -87,6 +87,13 @@ export interface MatchlockResourcesConfig {
   cpus?: number;
   memory_mb?: number;
   disk_size_mb?: number;
+  /**
+   * MTLK-SWAP (spec B §4.5): per-VM swap in whole MB, matchlock's
+   * `resources.swap_mb` (omitempty). Omitted when swap is off (0); tamandua
+   * NEVER emits a kernel-args field (swap + custom kernel args is rejected by
+   * matchlock).
+   */
+  swap_mb?: number;
 }
 
 export interface MatchlockNetworkConfig {

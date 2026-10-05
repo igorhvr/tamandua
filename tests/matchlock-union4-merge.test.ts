@@ -186,8 +186,8 @@ describe("matchlock-union4 merge deliverable", () => {
     }
   });
 
-  it("tops out the one schema chain at SCHEMA_VERSION 14", () => {
-    assert.equal(SCHEMA_VERSION, 14);
+  it("tops out the one schema chain at SCHEMA_VERSION 15 (v14 union top plus the PREP-STATE v14->v15 step)", () => {
+    assert.equal(SCHEMA_VERSION, 15);
   });
 
   it("carries both guarded ALTERs in src/db.ts", () => {

@@ -1927,20 +1927,29 @@ describe("harness-probe failure block durable read + status surfacing (IFLB US-0
 describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
   const POLICY_IMAGE = "vic/matchlock-base:latest";
   const POLICY_LIMITS = { cpus: 8, memoryMB: 16384, diskSizeMB: 20480 };
+  // MTLK-ISO-SLICE2 US-012: the shared isolated JSON field set is uniform; the
+  // digest pair comes from the policy pin built below.
+  const POLICY_DIGEST =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+  const POLICY_CONFIG_DIGEST =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
   /** Build a valid, persisted-shape version-2 policy JSON string. */
   function matchlockPolicyJson(
     limits: { cpus: number; memoryMB: number; diskSizeMB: number } = POLICY_LIMITS,
     image: string = POLICY_IMAGE,
     networkAllowPrivate?: string[],
+    requestedImageSource?: "explicit" | "standard",
+    rootUsageConsent?: boolean,
   ): string {
     return serializeMatchlockPolicy(
       buildMatchlockPolicy({
         requestedImage: image,
+        requestedImageSource,
         networkAllowPrivate,
         identity: {
-          digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-          config_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          digest: POLICY_DIGEST,
+          config_digest: POLICY_CONFIG_DIGEST,
           tag: image,
         },
         harness: "pi",
@@ -1951,8 +1960,26 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
         ],
         gitMetadataRoots: ["/opt/project/.git"],
         resourceLimits: limits,
+        rootUsageConsent: rootUsageConsent === true,
       }),
     );
+  }
+
+  /**
+   * Build a GENUINE persisted-shape version-2 policy JSON string (no v3-only
+   * fields, no `swapMB`). It must read back through `parseMatchlockPolicy` and
+   * normalize to `requestedImageSource: "explicit"` + `swapMB: 0`.
+   */
+  function matchlockV2PolicyJson(
+    limits: { cpus: number; memoryMB: number; diskSizeMB: number } = POLICY_LIMITS,
+    image: string = POLICY_IMAGE,
+  ): string {
+    const v3 = JSON.parse(matchlockPolicyJson(limits, image)) as Record<string, unknown>;
+    delete v3.requestedImageSource;
+    delete v3.rootUsageConsent;
+    v3.version = 2;
+    delete (v3.resourceLimits as Record<string, unknown>).swapMB;
+    return JSON.stringify(v3);
   }
 
   /**
@@ -1964,6 +1991,7 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
     env: { tamanduaDir: string },
     runId: string,
     policyJson: string | null,
+    isolationIntent: string | null = null,
   ): string {
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
     seedDb(dbPath, runId, { workspace_mode: "direct" });
@@ -1972,12 +2000,74 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
     if (!cols.some((c) => c.name === "matchlock_policy")) {
       db.exec("ALTER TABLE runs ADD COLUMN matchlock_policy TEXT");
     }
+    if (!cols.some((c) => c.name === "isolation_intent")) {
+      db.exec("ALTER TABLE runs ADD COLUMN isolation_intent TEXT");
+    }
     if (policyJson !== null) {
       db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run(policyJson, runId);
+    }
+    if (isolationIntent !== null) {
+      db.prepare("UPDATE runs SET isolation_intent = ? WHERE id = ?").run(isolationIntent, runId);
     }
     db.close();
     return dbPath;
   }
+
+  it("US-013: a consented policy surfaces the shared root_usage_override warning in status JSON", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(
+      env,
+      runId,
+      matchlockPolicyJson(POLICY_LIMITS, POLICY_IMAGE, undefined, "explicit", true),
+    );
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      assert.equal(detail.matchlockRootUsageConsent, true);
+      const json = buildWorkflowStatusJson(detail);
+      const warnings = json.warnings as Array<{ code: string; message: string }>;
+      assert.equal(warnings.length, 1);
+      assert.equal(warnings[0].code, "root_usage_override");
+      assert.match(warnings[0].message, /AUTHORIZED/);
+      assert.doesNotMatch(warnings[0].message, /executed as root/);
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("US-013: a clean (unconsented) isolated run omits the warnings key entirely", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(env, runId, matchlockPolicyJson());
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      assert.equal(detail.matchlockRootUsageConsent, false);
+      const json = buildWorkflowStatusJson(detail);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(json, "warnings"),
+        false,
+        "a clean run must not carry the warnings key (absent, never [])",
+      );
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
 
   it("getWorkflowStatus returns matchlockResources and JSON includes them for a v2 policy run", async () => {
     const env = createTempEnv();
@@ -1994,16 +2084,104 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
       const detail = getWorkflowStatus(runId);
       assert.deepEqual(detail.matchlockResources, {
         image: POLICY_IMAGE,
+        imageSource: "explicit",
         cpus: 8,
         memoryMB: 16384,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
       });
       const json = buildWorkflowStatusJson(detail);
       assert.deepEqual(json.matchlockResources, {
         image: POLICY_IMAGE,
+        imageSource: "explicit",
         cpus: 8,
         memoryMB: 16384,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
+      });
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("US-012: a genuine v2 policy normalizes to imageSource explicit and swapMB 0 in matchlockResources", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(env, runId, matchlockV2PolicyJson());
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      // The v3-only fields did not exist on this record; the read-time
+      // projection resolves them conservatively (explicit provenance, swap
+      // OFF) while the digests are carried verbatim.
+      assert.deepEqual(detail.matchlockResources, {
+        image: POLICY_IMAGE,
+        imageSource: "explicit",
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+        swapMB: 0,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
+      });
+      const json = buildWorkflowStatusJson(detail);
+      assert.deepEqual(json.matchlockResources, {
+        image: POLICY_IMAGE,
+        imageSource: "explicit",
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+        swapMB: 0,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
+      });
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("US-012: a standard-provenance policy surfaces imageSource standard in matchlockResources", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(
+      env,
+      runId,
+      matchlockPolicyJson(POLICY_LIMITS, "igorhvr/tamandua", undefined, "standard"),
+    );
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
+        "../../dist/installer/status.js"
+      );
+      const detail = getWorkflowStatus(runId);
+      assert.equal(detail.matchlockResources?.imageSource, "standard");
+      assert.equal(detail.matchlockResources?.swapMB, 8192);
+      assert.equal(detail.matchlockResources?.imageDigest, POLICY_DIGEST);
+      const json = buildWorkflowStatusJson(detail);
+      assert.deepEqual(json.matchlockResources, {
+        image: "igorhvr/tamandua",
+        imageSource: "standard",
+        cpus: 8,
+        memoryMB: 16384,
+        diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
       });
     } finally {
       applyStickyEnv();
@@ -2032,16 +2210,24 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
       const detail = getWorkflowStatus(runId);
       assert.deepEqual(detail.matchlockResources, {
         image: POLICY_IMAGE,
+        imageSource: "explicit",
         cpus: 2,
         memoryMB: 2048,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
       });
       const json = buildWorkflowStatusJson(detail);
       assert.deepEqual(json.matchlockResources, {
         image: POLICY_IMAGE,
+        imageSource: "explicit",
         cpus: 2,
         memoryMB: 2048,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
       });
     } finally {
       applyStickyEnv();
@@ -2071,9 +2257,13 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
       const detail = getWorkflowStatus(runId);
       assert.deepEqual(detail.matchlockResources, {
         image: POLICY_IMAGE,
+        imageSource: "explicit",
         cpus: 8,
         memoryMB: 16384,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
         allowPrivate: ["192.168.107.74:8888", "box.internal"],
       });
       const json = buildWorkflowStatusJson(detail);
@@ -2116,9 +2306,13 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
       );
       assert.deepEqual(json.matchlockResources, {
         image: POLICY_IMAGE,
+        imageSource: "explicit",
         cpus: 8,
         memoryMB: 16384,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
       });
     } finally {
       applyStickyEnv();
@@ -2152,7 +2346,7 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
     }
   });
 
-  it("a legacy version-1 or malformed policy never throws and omits the limits", async () => {
+  it("a legacy version-1 or malformed policy never throws and renders the typed unusable state", async () => {
     const env = createTempEnv();
     const legacyRunId = crypto.randomUUID();
     const malformedRunId = crypto.randomUUID();
@@ -2167,18 +2361,113 @@ describe("MTLK-VM-SIZE US-004 matchlock resources in status", () => {
       const { getWorkflowStatus, buildWorkflowStatusJson } = await import(
         "../../dist/installer/status.js"
       );
-      for (const runId of [legacyRunId, malformedRunId]) {
+      const expected: Array<[string, string, string]> = [
+        [
+          legacyRunId,
+          "policy_legacy_unpinned",
+          "the persisted matchlock policy is a legacy unpinned record that must be recreated",
+        ],
+        [malformedRunId, "policy_json_invalid", "the persisted matchlock policy is not valid JSON"],
+      ];
+      for (const [runId, code, message] of expected) {
         const detail = getWorkflowStatus(runId);
         assert.equal(
           detail.matchlockResources,
           undefined,
           `unreadable policy must omit limits (${runId})`,
         );
+        // MTLK-ISO-SLICE2 US-014: the non-NULL unusable policy renders its
+        // typed code + allow-listed sanitized message, never native.
+        assert.deepEqual(detail.matchlockPolicyError, { code, message });
+        assert.equal(detail.matchlockState, undefined);
         // The rest of the run detail still renders (query did not fail closed).
         assert.equal(detail.id, runId);
         const json = buildWorkflowStatusJson(detail);
         assert.equal(Object.prototype.hasOwnProperty.call(json, "matchlockResources"), false);
+        assert.deepEqual(json.matchlockPolicyError, { code, message });
+        assert.equal(Object.prototype.hasOwnProperty.call(json, "matchlockState"), false);
       }
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("US-006 consumer audit: classifyStatusMatchlockPolicy is explicit non-NULL (an EMPTY-STRING policy is unusable, never native)", async () => {
+    const env = createTempEnv();
+    const emptyRunId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(env, emptyRunId, "");
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, classifyStatusMatchlockPolicy } = await import(
+        "../../dist/installer/status.js"
+      );
+
+      // Explicit non-NULL matrix: ONLY null/undefined is native.
+      assert.equal(classifyStatusMatchlockPolicy(null), "native");
+      assert.equal(classifyStatusMatchlockPolicy(undefined), "native");
+      assert.equal(classifyStatusMatchlockPolicy(""), "unusable");
+      assert.equal(classifyStatusMatchlockPolicy("   "), "unusable");
+      assert.equal(classifyStatusMatchlockPolicy("{not json"), "unusable");
+      assert.equal(
+        classifyStatusMatchlockPolicy(JSON.stringify({ version: 1, backend: "matchlock" })),
+        "unusable",
+      );
+      assert.equal(classifyStatusMatchlockPolicy(matchlockPolicyJson()), "isolated");
+
+      // The DB reader path agrees: an empty-string policy is never native and
+      // never produces a healthy isolated resource block.
+      const detail = getWorkflowStatus(emptyRunId);
+      assert.equal(detail.matchlockResources, undefined);
+      // MTLK-ISO-SLICE2 US-014: the empty-string policy is explicitly
+      // unusable and carries the typed sanitized error.
+      assert.deepEqual(detail.matchlockPolicyError, {
+        code: "policy_json_invalid",
+        message: "the persisted matchlock policy is not valid JSON",
+      });
+      assert.equal(classifyStatusMatchlockPolicy(""), "unusable");
+    } finally {
+      applyStickyEnv();
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("US-008 PREP-STATE: classifyStatusMatchlockPolicy is intent-aware (an intent-only row is preparing, never native)", async () => {
+    const env = createTempEnv();
+    const runId = crypto.randomUUID();
+    const dbPath = seedRunWithPolicy(env, runId, null, "true");
+
+    process.env.HOME = env.homeDir;
+    process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    try {
+      const { getWorkflowStatus, classifyStatusMatchlockPolicy } = await import(
+        "../../dist/installer/status.js"
+      );
+
+      // NULL policy + intent recorded => preparing (held). It is NEVER native.
+      assert.equal(classifyStatusMatchlockPolicy(null, true), "preparing");
+      assert.equal(classifyStatusMatchlockPolicy(undefined, true), "preparing");
+      // No intent + NULL policy stays native (byte-identical native path).
+      assert.equal(classifyStatusMatchlockPolicy(null, false), "native");
+      assert.equal(classifyStatusMatchlockPolicy(null), "native");
+      // A non-NULL policy ALWAYS wins over the intent (ordered classification).
+      assert.equal(classifyStatusMatchlockPolicy(matchlockPolicyJson(), true), "isolated");
+      assert.equal(classifyStatusMatchlockPolicy("", true), "unusable");
+
+      // The DB reader path must not resolve resources for an intent-only row
+      // and must carry the explicit held-state marker (US-014).
+      const detail = getWorkflowStatus(runId);
+      assert.equal(
+        detail.matchlockResources,
+        undefined,
+        "an intent-only row must never render isolated resources",
+      );
+      assert.equal(detail.matchlockState, "preparing");
+      assert.equal(detail.matchlockPolicyError, undefined);
     } finally {
       applyStickyEnv();
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }

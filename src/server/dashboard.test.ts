@@ -1821,6 +1821,90 @@ describe("dashboard run relaunch MATCHLOCK refusal (MTLK-ADMIT close)", () => {
     }
   });
 
+  it("POST /api/runs/:id/relaunch refuses an opted-in run whose persisted policy is an EMPTY STRING (US-006: non-NULL, never native)", async () => {
+    const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-relaunch-mtlk-empty-");
+    const db = getDb();
+    const runId = "run-failed-mtlk-empty";
+    const workDir = path.join(stateDir, "workdir");
+    fs.mkdirSync(workDir, { recursive: true });
+    insertFailedDirectRun(db, 31, runId, MTLK_WORKFLOW, {
+      workspace_mode: "direct",
+      working_directory_for_harness: workDir,
+      repo: workDir,
+    });
+    // An empty-string policy is non-NULL: the dashboard relaunch guard must
+    // classify it explicitly (never truthiness) and refuse it.
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run("", runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/relaunch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      assert.equal(response.status, 409,
+        "an empty-string persisted Matchlock policy must be refused (never silently native)");
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Matchlock/);
+      assert.match(body.error, /cannot be used/);
+      assert.match(body.error, /--matchlock/);
+
+      const rows = relaunchRows(db);
+      assert.equal(rows.length, 1, "an empty-string-policy refusal must create NO new run row");
+      assert.equal(rows[0].id, runId);
+      assert.equal(rows[0].status, "failed");
+    } finally {
+      await stopDashboard(server);
+      restore();
+    }
+  });
+
+  it("POST /api/runs/:id/relaunch refuses an INTENT-ONLY (PREP-STATE) run with a held/preparing remedy (US-008, never native)", async () => {
+    const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-relaunch-intent-");
+    const db = getDb();
+    const runId = "run-failed-intent-only";
+    const workDir = path.join(stateDir, "workdir");
+    fs.mkdirSync(workDir, { recursive: true });
+    insertFailedDirectRun(db, 32, runId, MTLK_WORKFLOW, {
+      workspace_mode: "direct",
+      working_directory_for_harness: workDir,
+      repo: workDir,
+    });
+    // PREP-STATE: isolation intent recorded, policy never persisted. The
+    // dashboard must refuse (it has no opt-in surface) with the held/preparing
+    // remedy rather than creating native work.
+    db.prepare("UPDATE runs SET isolation_intent = 'true', matchlock_policy = NULL WHERE id = ?")
+      .run(runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/relaunch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      assert.equal(response.status, 409,
+        "an intent-only (PREP-STATE) run must be refused, never relaunched natively");
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /isolation intent is recorded/i);
+      assert.match(body.error, /held non-schedulable/i);
+      assert.match(body.error, /retry preparation|recreate the run/i);
+
+      const rows = relaunchRows(db);
+      assert.equal(rows.length, 1, "an intent-only refusal must create NO new run row");
+      assert.equal(rows[0].id, runId);
+      assert.equal(rows[0].status, "failed");
+      assert.equal(rows[0].scheduling_status, null, "no scheduling admission on refusal");
+      assert.equal(rows[0].matchlock_policy, null, "the intent-only policy stays NULL");
+    } finally {
+      await stopDashboard(server);
+      restore();
+    }
+  });
+
   it("POST /api/runs/:id/relaunch refuses an opted-in run whose persisted policy is a LEGACY UNPINNED v1 record (never native)", async () => {
     const { stateDir, restore } = isolateDashboardState("tamandua-dashboard-relaunch-mtlk-legacy-");
     const db = getDb();

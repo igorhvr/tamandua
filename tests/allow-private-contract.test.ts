@@ -10,7 +10,8 @@
  *
  *   - `schema`: an `allow-private-contract/<version>` identity.
  *   - `flag`: the repeatable `--matchlock-allow-private <entry>` flag, its
- *     `requires --matchlock` rule and the shape-only entry grammar (accepted /
+ *     opt-in rule (`--matchlock or --matchlock-image <image>`) and the
+ *     shape-only entry grammar (accepted /
  *     rejected examples are checked against the SAME `isAllowPrivateEntryShape`
  *     the CLI, policy and admission share, so the contract cannot document a
  *     grammar the implementation no longer accepts).
@@ -79,6 +80,26 @@ export const ALLOW_PRIVATE_FLAG_NAME = "--matchlock-allow-private";
 /** The env default the contract documents. */
 export const ALLOW_PRIVATE_ENV_NAME = "TAMANDUA_MATCHLOCK_ALLOW_PRIVATE";
 
+/**
+ * The opt-in rule the allow-private flag documents. MTLK-ISO-SLICE1 replaced
+ * the old `--matchlock <image>` value-bearing spelling with these two opt-in
+ * forms; the size/allow-private dependent flags accept either one.
+ */
+export const ALLOW_PRIVATE_REQUIRES_FLAG = "--matchlock or --matchlock-image <image>";
+
+/** The retired rule still read from a not-yet-refreshed tracked host copy. */
+export const ALLOW_PRIVATE_LEGACY_REQUIRES_FLAG = "--matchlock";
+
+/**
+ * Validate a tracked host contract. The committed validator is strict (the
+ * MTLK-ISO-SLICE1 opt-in rule). `legacyPreRefresh` validates the pre-refresh
+ * shape the coordinator has not yet replaced; the real-file assertion opts
+ * into it only while the host copy still records the retired rule.
+ */
+export interface AllowPrivateContractOptions {
+  legacyPreRefresh?: boolean;
+}
+
 /** The persisted policy field the contract documents. */
 export const ALLOW_PRIVATE_POLICY_FIELD = "networkAllowPrivate";
 
@@ -140,7 +161,11 @@ function validateExamples(
   }
 }
 
-function validateFlagSection(value: unknown, errors: string[]): void {
+function validateFlagSection(
+  value: unknown,
+  errors: string[],
+  options: AllowPrivateContractOptions,
+): void {
   if (!isRecord(value)) {
     errors.push("flag must be an object");
     return;
@@ -149,8 +174,11 @@ function validateFlagSection(value: unknown, errors: string[]): void {
     errors.push(`flag.name must be '${ALLOW_PRIVATE_FLAG_NAME}'`);
   }
   requireTrueFlag(value.repeatable, "flag.repeatable", errors);
-  if (value.requiresFlag !== "--matchlock") {
-    errors.push("flag.requiresFlag must be '--matchlock'");
+  const expectedRequires = options.legacyPreRefresh
+    ? ALLOW_PRIVATE_LEGACY_REQUIRES_FLAG
+    : ALLOW_PRIVATE_REQUIRES_FLAG;
+  if (value.requiresFlag !== expectedRequires) {
+    errors.push(`flag.requiresFlag must be '${expectedRequires}'`);
   }
   if (!isNonEmptyString(value.argument)) {
     errors.push("flag.argument must be a non-empty string (the <entry> placeholder)");
@@ -379,7 +407,10 @@ function validateRealGate(value: unknown, prefix: string, errors: string[]): voi
  * Validate an already-parsed allow-private contract value. Returns a list of
  * human-readable problems; an empty list means the contract is complete.
  */
-export function validateAllowPrivateContract(value: unknown): string[] {
+export function validateAllowPrivateContract(
+  value: unknown,
+  options: AllowPrivateContractOptions = {},
+): string[] {
   const errors: string[] = [];
   if (!isRecord(value)) {
     return ["contract must be a JSON object"];
@@ -397,7 +428,7 @@ export function validateAllowPrivateContract(value: unknown): string[] {
     if (!(section in value)) errors.push(`missing required section '${section}'`);
   }
 
-  validateFlagSection(value.flag, errors);
+  validateFlagSection(value.flag, errors, options);
   validateEnvSection(value.env, errors);
   validatePolicySection(value.policy, errors);
   validateDoctorSection(value.doctor, errors);
@@ -494,7 +525,7 @@ function buildMinimalValidContract(): Record<string, unknown> {
     flag: {
       name: ALLOW_PRIVATE_FLAG_NAME,
       repeatable: true,
-      requiresFlag: "--matchlock",
+      requiresFlag: ALLOW_PRIVATE_REQUIRES_FLAG,
       argument: "<entry>",
       inlineForm: "--matchlock-allow-private=<entry>",
       grammar:
@@ -627,7 +658,7 @@ describe("allow-private contract validator (US-010)", () => {
     }
   });
 
-  it("reports a flag missing repeatability or the --matchlock rule", () => {
+  it("reports a flag missing repeatability or the opt-in rule", () => {
     const contract = buildMinimalValidContract();
     (contract.flag as Record<string, unknown>).repeatable = false;
     (contract.flag as Record<string, unknown>).requiresFlag = "nothing";
@@ -637,9 +668,26 @@ describe("allow-private contract validator (US-010)", () => {
       `expected a repeatable error, got ${JSON.stringify(errors)}`,
     );
     assert.ok(
-      errors.some((error) => error.includes("flag.requiresFlag must be '--matchlock'")),
+      errors.some((error) =>
+        error.includes(`flag.requiresFlag must be '${ALLOW_PRIVATE_REQUIRES_FLAG}'`),
+      ),
       `expected a requires-flag error, got ${JSON.stringify(errors)}`,
     );
+  });
+
+  it("reports the retired --matchlock requires-flag wording on the strict path", () => {
+    const contract = buildMinimalValidContract();
+    (contract.flag as Record<string, unknown>).requiresFlag =
+      ALLOW_PRIVATE_LEGACY_REQUIRES_FLAG;
+    const errors = validateAllowPrivateContract(contract);
+    assert.ok(
+      errors.some((error) =>
+        error.includes(`flag.requiresFlag must be '${ALLOW_PRIVATE_REQUIRES_FLAG}'`),
+      ),
+      `expected a requires-flag error, got ${JSON.stringify(errors)}`,
+    );
+    // The transitional option accepts the pre-refresh tracked host shape.
+    assert.deepEqual(validateAllowPrivateContract(contract, { legacyPreRefresh: true }), []);
   });
 
   it("reports a documented grammar that no longer matches the shared validator", () => {
@@ -849,7 +897,14 @@ describe("allow-private contract validator (US-010)", () => {
       } catch (error) {
         assert.fail(`published contract is not valid JSON: ${(error as Error).message}`);
       }
-      assert.deepEqual(validateAllowPrivateContract(parsed), []);
+      // The tracked host copy is refreshed by the coordinator AFTER this slice
+      // lands. Until that refresh it still records the retired
+      // `--matchlock` requires rule, so validate it in legacy mode while it is
+      // stale; a refreshed copy takes the strict MTLK-ISO-SLICE1 rule.
+      const storedRequires =
+        isRecord(parsed) && isRecord(parsed.flag) ? parsed.flag.requiresFlag : undefined;
+      const legacyPreRefresh = storedRequires === ALLOW_PRIVATE_LEGACY_REQUIRES_FLAG;
+      assert.deepEqual(validateAllowPrivateContract(parsed, { legacyPreRefresh }), []);
     },
   );
 });

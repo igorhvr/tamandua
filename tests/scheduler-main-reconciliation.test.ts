@@ -49,8 +49,8 @@ describe("US-007 core-motor reconciliation: union Matchlock seams", () => {
     );
     assert.match(
       scheduler,
-      /if \(row\.matchlock_policy\) \{[\s\S]*?matchlockDispatchDecision\(row\.matchlock_policy, \{/,
-      "the persisted policy must be checked at dispatch time",
+      /const isolationIntent = row\.isolation_intent === ISOLATION_INTENT_RECORDED;[\s\S]*?matchlockDispatchDecision\(row\.matchlock_policy \?\? null, \{[\s\S]*?isolationIntent,/,
+      "the persisted policy must be checked at dispatch time by explicit non-NULL, and an intent-recorded row with a NULL policy must be routed through the gate as held (MTLK-ISO-SLICE2 US-006/US-007)",
     );
     assert.match(
       scheduler,

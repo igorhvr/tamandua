@@ -44,7 +44,7 @@ function policy(over: Partial<ExecutionIsolation> = {}): ExecutionIsolation {
     gitMetadataRoots: ["/opt/project/.git"],
     mountPolicyVersion: 1,
     networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
-    resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
+    resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 0 },
   };
   return { ...base, ...over };
 }
@@ -92,6 +92,45 @@ describe("matchlock mount plan", () => {
     });
     const cfg = buildMatchlockCreateConfig(p, IDENTITY, { helperPackHostPath: helperPack });
     assert.deepEqual(cfg.resources, { cpus: 4, memory_mb: 4096, disk_size_mb: 20480 });
+  });
+
+  // MTLK-SWAP US-004 (spec B §4.5): the admitted swapMB reaches the create
+  // request as `resources.swap_mb` only when it is enabled (> 0); 0 (off) is
+  // omitted so the wire shape stays `omitempty`, and no kernel-args field is
+  // ever added (swap + custom kernel args is rejected by matchlock).
+  it("MTLK-SWAP: policy swapMB > 0 emits resources.swap_mb with the exact admitted value", () => {
+    const p = policy({
+      configurationRoot: tmp,
+      resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 },
+    });
+    const cfg = buildMatchlockCreateConfig(p, IDENTITY, { helperPackHostPath: helperPack });
+    assert.equal(cfg.resources?.swap_mb, 8192);
+    assert.deepEqual(cfg.resources, {
+      cpus: 2,
+      memory_mb: 2048,
+      disk_size_mb: 20480,
+      swap_mb: 8192,
+    });
+  });
+
+  it("MTLK-SWAP: policy swapMB 0 OMITS resources.swap_mb entirely (swap off)", () => {
+    const p = policy({
+      configurationRoot: tmp,
+      resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 0 },
+    });
+    const cfg = buildMatchlockCreateConfig(p, IDENTITY, { helperPackHostPath: helperPack });
+    assert.equal("swap_mb" in (cfg.resources ?? {}), false, "swap_mb must be absent when swap is off");
+    assert.deepEqual(cfg.resources, { cpus: 2, memory_mb: 2048, disk_size_mb: 20480 });
+  });
+
+  it("MTLK-SWAP: the create request never carries a kernel-args field", () => {
+    const p = policy({
+      configurationRoot: tmp,
+      resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 16384 },
+    });
+    const cfg = buildMatchlockCreateConfig(p, IDENTITY, { helperPackHostPath: helperPack });
+    const serialized = JSON.stringify(cfg);
+    assert.equal(/kernel[_-]?args/i.test(serialized), false, `create params must not mention kernel args: ${serialized}`);
   });
 
   // MTLK-ALLOW-PRIVATE US-003: the persisted per-run allow-private list must
@@ -640,7 +679,7 @@ describe("matchlock mount plan", () => {
       gitMetadataRoots: [],
       mountPolicyVersion: 1,
       networkPolicyVersion: MATCHLOCK_NETWORK_POLICY_VERSION,
-      resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
+      resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 0 },
       submissionHomeDir: "/home/operator",
       submissionCwd: "/home/operator/work",
       submissionDshHomeEnv: null,

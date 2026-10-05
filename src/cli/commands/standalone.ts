@@ -179,7 +179,17 @@ export async function handleStandalone(group: string, args: string[]): Promise<b
       process.stderr.write(`Unknown nudge option: ${args.slice(1).join(" ")}\nUsage: tamandua nudge\n`);
       process.exit(1);
     }
-    let response = await nudgeWithDaemon();
+    let response;
+    try {
+      response = await nudgeWithDaemon();
+    } catch (err) {
+      // MTLK-ISO2-CORRECTIVE (Finding D, D-enforce): the nudge path refuses a
+      // pre-PREP-STATE daemon (an intent-only row could be dispatched
+      // natively). Surface it as an actionable CLI error instead of a crash.
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`Failed to nudge: ${message}\n`);
+      process.exit(1);
+    }
     if (response === null) {
       process.stderr.write("Failed to nudge: control plane is not reachable.\n");
       process.exit(1);

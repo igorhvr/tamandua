@@ -580,7 +580,7 @@ async function runCanaryScenario(): Promise<void> {
           "run",
           WORKFLOW_ID,
           TASK,
-          "--matchlock",
+          "--matchlock-image",
           BEDLAM_TAG,
           "--hermes-as-harness",
           "--worktree-origin-repository",

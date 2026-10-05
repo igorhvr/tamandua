@@ -8,8 +8,22 @@ import { emitEvent, getRunEvents } from "./events.js";
 import { logger } from "../lib/logger.js";
 import { stripIdPrefix, prefixRunId, prefixStepId } from "../lib/id-prefix.js";
 import { displayStepStatus } from "../lib/step-display.js";
-import { parseMatchlockPolicy } from "./matchlock/policy.js";
+import {
+  describeUnusableMatchlockPolicy,
+  parseMatchlockPolicy,
+} from "./matchlock/policy.js";
+import {
+  classifyIsolationState,
+  readIsolationIntent,
+  type IsolationState,
+} from "./matchlock/prep-state.js";
+import type { MatchlockImageSource } from "./matchlock/standard-image.js";
+import {
+  buildWorkflowWarnings,
+  withWorkflowWarnings,
+} from "./matchlock/warnings.js";
 import type { HarnessType } from "./types.js";
+import { sanitizeSchedulingError } from "./scheduling-error.js";
 
 export interface RunInfo {
   id: string;
@@ -52,16 +66,44 @@ export interface RedLedgerLanding {
 
 /**
  * The resolved Matchlock VM resources surfaced to operator status surfaces
- * (MTLK-VM-SIZE US-004). Built ONLY from a persisted version-2
+ * (MTLK-VM-SIZE US-004). Built ONLY from a persisted version-2/3
  * `runs.matchlock_policy` that parses; a native run (NULL policy) or a
  * legacy/unreadable policy omits this entirely so status never throws.
+ *
+ * SHARED-V3 (MTLK-ISO-SLICE2 US-012): every isolated rendering carries the
+ * SAME field set — provenance (`imageSource`), the swap size (`swapMB`, 0 =
+ * off) and the immutable image pin (`imageDigest`/`imageConfigDigest`) — so
+ * the JSON contract is uniform. A v2 record normalizes at parse time to
+ * `imageSource: "explicit"` + `swapMB: 0`; the digests are required on both
+ * versions.
  */
 export interface MatchlockResourceInfo {
   /** Operator-supplied image from the persisted policy. */
   image: string;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-012): effective image provenance from the
+   * persisted policy. A v2 record normalizes to `"explicit"`.
+   */
+  imageSource: MatchlockImageSource;
   cpus: number;
   memoryMB: number;
   diskSizeMB: number;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-012): guest swap size in MB; `0` = off (a v2
+   * record normalizes to 0). The shared text formatter renders
+   * `swap=<n>MB|off`.
+   */
+  swapMB: number;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-012): immutable OCI content digest from the
+   * persisted policy (required on v2 and v3).
+   */
+  imageDigest: string;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-012): immutable OCI config digest from the
+   * persisted policy (required on v2 and v3).
+   */
+  imageConfigDigest: string;
   /**
    * MTLK-ALLOW-PRIVATE (US-006): the persisted per-run exception list of
    * private destinations from `networkAllowPrivate`. Omitted when the policy
@@ -95,6 +137,58 @@ export interface RunDetail extends RunInfo {
   /** Resolved Matchlock VM limits from a persisted v2 policy; undefined for
    *  native runs and legacy/unreadable policies. */
   matchlockResources?: MatchlockResourceInfo;
+  /**
+   * MTLK-ISO-SLICE2 US-014 (STATUS-UNUSABLE): the typed, sanitized description
+   * of a non-NULL unusable persisted policy. Present ONLY in the unusable
+   * state, where `matchlockResources` is absent. The message is an
+   * allow-listed explanation derived from the error category — never the raw
+   * parser message and never the raw stored JSON.
+   */
+  matchlockPolicyError?: MatchlockPolicyErrorInfo;
+  /**
+   * MTLK-ISO-SLICE2 US-014 (PREP-STATE): the explicit held-state marker for an
+   * intent-recorded run whose policy is still NULL. Present ONLY in the
+   * preparing/held state; the run's actual `status` is unchanged (a failed
+   * preparation keeps its failure status).
+   */
+  matchlockState?: "preparing";
+  /**
+   * MTLK-ISO-SLICE2 US-013 (R13): the persisted policy's `rootUsageConsent`,
+   * surfaced so the status surfaces can re-derive the shared
+   * `root_usage_override` warning. Undefined for a native/unusable run.
+   */
+  matchlockRootUsageConsent?: boolean;
+}
+
+/**
+ * MTLK-ISO-SLICE2 US-014 (STATUS-UNUSABLE): the typed code + allow-listed
+ * sanitized message rendered for a non-NULL unusable persisted policy.
+ */
+export interface MatchlockPolicyErrorInfo {
+  /** The typed {@link MatchlockPolicyError} code (or a bounded fallback). */
+  code: string;
+  /** The sanitized, allow-listed explanation (never the raw parser message). */
+  message: string;
+}
+
+/**
+ * MTLK-ISO-SLICE2 US-014: the bounded PREPARING/held status line. Rendered by
+ * `workflow status` for an intent-recorded run with a NULL policy; a warning
+ * cannot represent a state, so this is its own explicit line.
+ */
+export const MATCHLOCK_PREPARING_STATUS_LINE =
+  "matchlock: PREPARING (isolation intent recorded; policy pending)";
+
+/**
+ * MTLK-ISO-SLICE2 US-014: the bounded STATUS-UNUSABLE status line. Renders the
+ * typed code plus the sanitized allow-listed reason; never the raw parser
+ * message and never the raw policy JSON. Kept here (next to the classification
+ * it renders) so text and JSON surfaces share one vocabulary.
+ */
+export function formatMatchlockPolicyUnusableStatusLine(
+  error: MatchlockPolicyErrorInfo,
+): string {
+  return `matchlock: ISOLATION POLICY UNUSABLE (${error.code}): ${error.message}`;
 }
 
 export interface StepInfo {
@@ -200,7 +294,16 @@ export function buildWorkflowStatusJson(result: RunDetail): Record<string, unkno
   // WORKDIR-QUEUE US-004: expose the scheduling reason (e.g. the
   // workdir-busy wait text) so JSON consumers can tell waiting from
   // dead without reconstructing it.
-  if (result.schedulingError) jsonOutput.schedulingError = result.schedulingError;
+  //
+  // MTLK-ISO2-TRANSITION-CAS (Family C-1): the stored column is free-form and
+  // legacy builds could persist a raw Matchlock parser message in it. Only the
+  // allow-listed phrases are re-rendered; anything else is dropped so a raw
+  // stored fragment can never ride the status document.
+  const sanitizedSchedulingError = sanitizeSchedulingError(
+    result.schedulingStatus,
+    result.schedulingError,
+  );
+  if (sanitizedSchedulingError) jsonOutput.schedulingError = sanitizedSchedulingError;
   if (jsonStories) jsonOutput.stories = jsonStories;
   if (result.redLedgerLanding) {
     // TIME-OUTPUT US-005: the landing instant serializes as ISO-Z; when it is
@@ -225,7 +328,47 @@ export function buildWorkflowStatusJson(result: RunDetail): Record<string, unkno
   if (result.matchlockResources) {
     jsonOutput.matchlockResources = result.matchlockResources;
   }
-  return jsonOutput;
+  // MTLK-ISO-SLICE2 US-014 (STATUS-UNUSABLE): a non-NULL unusable policy
+  // carries the typed sanitized error while `matchlockResources` stays absent.
+  // This state must never render as native; the JSON consumer can act on the
+  // typed code.
+  if (result.matchlockPolicyError) {
+    jsonOutput.matchlockPolicyError = { ...result.matchlockPolicyError };
+  }
+  // MTLK-ISO-SLICE2 US-014 (PREP-STATE): the explicit held-state marker for an
+  // intent-recorded run with a NULL policy. The run's actual `status` is
+  // untouched (a failed preparation keeps its failure status).
+  if (result.matchlockState === "preparing") {
+    jsonOutput.matchlockState = "preparing";
+  }
+  // MTLK-ISO-SLICE2 US-013: the shared top-level warnings channel. It is
+  // PRESENT only when non-empty (absent — never `[]` — on a clean run); a
+  // consented Matchlock run re-derives `root_usage_override` from the
+  // persisted policy via `RunDetail.matchlockRootUsageConsent`.
+  return withWorkflowWarnings(
+    jsonOutput,
+    buildWorkflowWarnings({
+      rootUsageConsent: result.matchlockRootUsageConsent === true,
+    }),
+  );
+}
+
+/**
+ * MTLK-ISO-SLICE2 US-006 consumer audit: classify a persisted
+ * `runs.matchlock_policy` raw value for the status surface.
+ *
+ * The classification is by EXPLICIT non-NULL-ness (`!== null` /
+ * `!== undefined`), NEVER truthiness: an EMPTY STRING (or whitespace, or any
+ * other non-NULL value that does not parse) is a non-NULL — and therefore
+ * `unusable` — policy, not a native run. Only a NULL/absent value consults the
+ * recorded isolation intent: an intent-recorded row with no policy is
+ * `preparing` (held), NEVER native (MTLK-ISO-SLICE2 US-008).
+ */
+export function classifyStatusMatchlockPolicy(
+  policyRaw: string | null | undefined,
+  intentRecorded = false,
+): IsolationState {
+  return classifyIsolationState(intentRecorded, policyRaw);
 }
 
 /**
@@ -245,7 +388,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   // Try exact id match first (original)
   let row = db
     .prepare(
-      "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE id = ?",
+      "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, isolation_intent, matchlock_policy FROM runs WHERE id = ?",
     )
     .get(query) as unknown as (RunRow & { run_number: number | null }) | undefined;
 
@@ -253,7 +396,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row && useOriginal) {
     row = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE id = ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, isolation_intent, matchlock_policy FROM runs WHERE id = ?",
       )
       .get(stripped) as unknown as (RunRow & { run_number: number | null }) | undefined;
   }
@@ -262,7 +405,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let prefixRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE id LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, isolation_intent, matchlock_policy FROM runs WHERE id LIKE ?",
       )
       .all(`${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
@@ -270,7 +413,7 @@ export function getWorkflowStatus(query: string): RunDetail {
     if (prefixRows.length === 0 && useOriginal) {
       prefixRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE id LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, isolation_intent, matchlock_policy FROM runs WHERE id LIKE ?",
         )
         .all(`${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -291,7 +434,7 @@ export function getWorkflowStatus(query: string): RunDetail {
       const num = Number(nMatch[1]);
       row = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE run_number = ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, isolation_intent, matchlock_policy FROM runs WHERE run_number = ?",
         )
         .get(num) as unknown as (RunRow & { run_number: number | null }) | undefined;
       if (!row) {
@@ -304,14 +447,14 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let taskRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE task LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, isolation_intent, matchlock_policy FROM runs WHERE task LIKE ?",
       )
       .all(`%${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
     if (taskRows.length === 0 && useOriginal) {
       taskRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, matchlock_policy FROM runs WHERE task LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, scheduling_error, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count, (SELECT COALESCE(SUM(s.preclaim_death_count), 0) FROM steps s WHERE s.run_id = runs.id) AS preclaim_death_count, isolation_intent, matchlock_policy FROM runs WHERE task LIKE ?",
         )
         .all(`%${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -699,6 +842,8 @@ interface RunRow {
   preclaim_death_count: number;
   /** Persisted Matchlock v2 policy (NULL for native runs). */
   matchlock_policy: string | null;
+  /** MTLK-ISO-SLICE2 US-005/008: host-owned PREP-STATE isolation-intent marker. */
+  isolation_intent: string | null;
 }
 
 function getStepSummary(db: ReturnType<typeof getDb>, runId: string): string {
@@ -878,25 +1023,77 @@ function buildRunDetail(
   // parseMatchlockPolicy THROWS on a legacy version-1 unpinned record or a
   // malformed row; a status query must never break on one, so swallow the
   // error and omit the limits (the rest of the run detail is unaffected).
+  //
+  // MTLK-ISO-SLICE2 US-006 consumer audit: classify the persisted policy by
+  // EXPLICIT non-NULL-ness (never truthiness) through the shared ordered
+  // classification. An empty-string policy is `unusable`, never `native`, so
+  // it can never present as a healthy/absent isolation policy.
+  //
+  // MTLK-ISO-SLICE2 US-008 (PREP-STATE): the recorded isolation intent is
+  // consulted ONLY for a NULL/absent policy, so an intent-only row classifies
+  // `preparing` (held) and can never render native. The four-state status
+  // RENDERING (text line, `matchlockPolicyError` JSON, `matchlockState:
+  // "preparing"`) is US-014.
+  const matchlockState = classifyStatusMatchlockPolicy(
+    row.matchlock_policy ?? null,
+    readIsolationIntent(row),
+  );
   let matchlockResources: MatchlockResourceInfo | undefined;
-  if (row.matchlock_policy) {
+  // MTLK-ISO-SLICE2 US-014 (STATUS-UNUSABLE): a non-NULL unusable policy
+  // renders its typed sanitized error instead of resources.
+  let matchlockPolicyError: MatchlockPolicyErrorInfo | undefined;
+  // MTLK-ISO-SLICE2 US-014 (PREP-STATE): NULL policy + recorded intent.
+  let matchlockStateMarker: "preparing" | undefined;
+  // MTLK-ISO-SLICE2 US-013 (R13): the persisted consent bit surfaced so the
+  // status JSON can re-derive the shared `root_usage_override` warning.
+  let matchlockRootUsageConsent: boolean | undefined;
+  if (matchlockState === "isolated") {
     try {
-      const policy = parseMatchlockPolicy(row.matchlock_policy);
-      matchlockResources = {
-        image: policy.requestedImage,
-        cpus: policy.resourceLimits.cpus,
-        memoryMB: policy.resourceLimits.memoryMB,
-        diskSizeMB: policy.resourceLimits.diskSizeMB,
-        // MTLK-ALLOW-PRIVATE (US-006): surface the persisted exception list so
-        // `workflow status` can show which private destinations the run may
-        // reach. Omitted entirely when the policy carries none.
-        ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
-          ? { allowPrivate: [...policy.networkAllowPrivate] }
-          : {}),
-      };
+      const policy = parseMatchlockPolicy(row.matchlock_policy as string);
+      matchlockRootUsageConsent = policy.rootUsageConsent === true;
+      // SHARED-V3 (US-012): a parseable v2/v3 policy ALWAYS pins content+config,
+      // so every isolated rendering carries the same field set. `parse` already
+      // guarantees both are non-empty; guard anyway so a future change cannot
+      // fabricate `undefined` into the JSON contract.
+      const imageDigest = policy.resolvedImageDigest;
+      const imageConfigDigest = policy.resolvedImageConfigDigest;
+      if (imageDigest && imageConfigDigest) {
+        matchlockResources = {
+          image: policy.requestedImage,
+          // A v2 record normalizes to "explicit"; a v3 record carries its own
+          // provenance (the standard image marker reads from here).
+          imageSource: policy.requestedImageSource,
+          cpus: policy.resourceLimits.cpus,
+          memoryMB: policy.resourceLimits.memoryMB,
+          diskSizeMB: policy.resourceLimits.diskSizeMB,
+          // A v2 record normalizes to 0 (swap off — its original behaviour).
+          swapMB: policy.resourceLimits.swapMB,
+          imageDigest,
+          imageConfigDigest,
+          // MTLK-ALLOW-PRIVATE (US-006): surface the persisted exception list so
+          // `workflow status` can show which private destinations the run may
+          // reach. Omitted entirely when the policy carries none.
+          ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
+            ? { allowPrivate: [...policy.networkAllowPrivate] }
+            : {}),
+        };
+      }
     } catch {
       matchlockResources = undefined;
     }
+  } else if (matchlockState === "unusable") {
+    // MTLK-ISO-SLICE2 US-014 (STATUS-UNUSABLE): EVERY non-NULL policy that
+    // cannot be used — empty string, invalid JSON, legacy v1/unpinned,
+    // credential-bearing, unsupported version, structurally invalid — renders
+    // the typed code + an allow-listed sanitized reason. It never renders
+    // native and never as a healthy isolated run.
+    const described = describeUnusableMatchlockPolicy(row.matchlock_policy);
+    matchlockPolicyError = { code: described.code, message: described.reason };
+  } else if (matchlockState === "preparing") {
+    // MTLK-ISO-SLICE2 US-014 (PREP-STATE): NULL policy with the isolation
+    // intent recorded. The held state governs isolation semantics only; the
+    // run's actual `status` is untouched.
+    matchlockStateMarker = "preparing";
   }
 
   return {
@@ -917,6 +1114,11 @@ function buildRunDetail(
     preclaimDeathCount: row.preclaim_death_count,
     ...(redLedgerLanding ? { redLedgerLanding } : {}),
     ...(matchlockResources ? { matchlockResources } : {}),
+    ...(matchlockPolicyError ? { matchlockPolicyError } : {}),
+    ...(matchlockStateMarker ? { matchlockState: matchlockStateMarker } : {}),
+    ...(matchlockRootUsageConsent !== undefined
+      ? { matchlockRootUsageConsent }
+      : {}),
     steps: stepInfos,
     stories: storyInfos.length > 0 ? storyInfos : undefined,
     harnessType,

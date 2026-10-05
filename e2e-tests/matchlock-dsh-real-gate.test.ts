@@ -672,7 +672,7 @@ describe(
               TASK,
               "--working-directory-for-harness",
               fixtureRepo,
-              "--matchlock",
+              "--matchlock-image",
               BEDLAM_TAG,
               "--dsh-as-harness",
             ],

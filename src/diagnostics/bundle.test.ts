@@ -71,6 +71,7 @@ const FIXTURE_DDL = `
     test_cmd_established TEXT,
     test_cmd_source TEXT,
     matchlock_policy TEXT,
+    isolation_intent TEXT,
     created_at TEXT,
     updated_at TEXT
   );
@@ -395,7 +396,10 @@ describe("createDiagnosticsBundle — Matchlock-shaped run", () => {
     assert.ok(!raw.includes("s3cr3t"), "record secret must not leak");
     const matchlock = JSON.parse(raw) as Record<string, unknown>;
     assert.equal(matchlock.status, "present");
-    assert.equal(matchlock.policyStatus, "present");
+    // MTLK-ISO2-MEND (Family C-1): a credential-bearing policy is typed
+    // present-but-unusable, and its raw secret never reaches the bundle.
+    assert.equal(matchlock.policyStatus, "empty");
+    assert.doesNotMatch(String(matchlock.absenceReason ?? ""), /native run/);
     assert.equal((matchlock.policy as Record<string, unknown>).registryToken, "<redacted>");
     const vms = matchlock.vms as Array<Record<string, unknown>>;
     assert.equal(vms.length, 1);
@@ -407,6 +411,36 @@ describe("createDiagnosticsBundle — Matchlock-shaped run", () => {
       "<redacted>",
     );
     fixture.db.close();
+  });
+
+  it("carries a non-NULL empty policy as present-but-unusable through the bundle", () => {
+    // MTLK-ISO2-CORRECTIVE: the bundle handoff must not coerce '' to NULL.
+    for (const policyJson of ["", "   "]) {
+      const stateDir = makeTemp("diag-bundle-matchlock-empty-");
+      const fixture = makeFixture(policyJson);
+
+      const result = createDiagnosticsBundle({
+        runId: RUN_ID,
+        stateDir,
+        db: asBundleDb(fixture.db),
+        timestamp: TIMESTAMP,
+        homes: emptyHomes(),
+      });
+
+      const matchlock = readJson(path.join(result.bundlePath, "matchlock.json"));
+      assert.notEqual(
+        matchlock.policyStatus,
+        "absent",
+        `bundle policyStatus for ${JSON.stringify(policyJson)}`,
+      );
+      assert.doesNotMatch(String(matchlock.absenceReason ?? ""), /native run/);
+      assert.equal(
+        result.summary.run.matchlockPolicyPresent,
+        true,
+        `summary presence for ${JSON.stringify(policyJson)}`,
+      );
+      fixture.db.close();
+    }
   });
 });
 

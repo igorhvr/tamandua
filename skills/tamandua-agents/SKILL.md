@@ -639,19 +639,32 @@ before resuming.
 
 #### Matchlock VM resources
 
-`tamandua workflow run ... --matchlock <image>` accepts three VM-size flags:
-`--matchlock-cpus <n>` (a positive integer), `--matchlock-memory <MB|16g>` and
-`--matchlock-disk <MB|40g>` (MB, or a `<n>g` suffix). Any size flag requires
-`--matchlock`. An absent flag falls back to the env var
-`TAMANDUA_MATCHLOCK_CPUS`, `TAMANDUA_MATCHLOCK_MEMORY_MB` or
-`TAMANDUA_MATCHLOCK_DISK_MB`, then to the built-in defaults
+`tamandua workflow run ... --matchlock` (standard image `igorhvr/tamandua`,
+provisioned by `tamandua matchlock setup`) or
+`--matchlock-image <image>` (an explicit already-imported image) accepts four
+VM-size flags:
+`--matchlock-cpus <n>` (a positive integer), `--matchlock-memory <MB|16g>`,
+`--matchlock-disk <MB|40g>` and `--matchlock-swap <MB|8g>` (MB, or a `<n>g`
+suffix). Any size flag requires an opt-in (`--matchlock` or
+`--matchlock-image <image>`); without one the flag is a usage error. An absent
+flag falls back to the env var
+`TAMANDUA_MATCHLOCK_CPUS`, `TAMANDUA_MATCHLOCK_MEMORY_MB`,
+`TAMANDUA_MATCHLOCK_DISK_MB` or `TAMANDUA_MATCHLOCK_SWAP_MB`, then to the
+built-in defaults
 `cpus = min(8, host CPUs)`, `memory = min(16384 MB, 50% of host RAM)`,
-`disk = 20480 MB`. Explicit flags and env values are clamped by the caps:
+`disk = 20480 MB` and swap `= 8192 MB`. Swap defaults to 8192 MB on every
+Matchlock VM, with `--matchlock-no-swap` (or
+`TAMANDUA_MATCHLOCK_SWAP_MB=off`) turning it off; `--matchlock-swap 0` is
+rejected with a pointer at `--matchlock-no-swap`, and the matchlock cap is
+65536 MB. Explicit flags and env values are clamped by the caps:
 `cpus <= 16` ALWAYS and `cpus <= host online CPUs`,
-`memory <= 75% of host MemTotal`, and `disk` finite positive. A Matchlock
+`memory <= 75% of host MemTotal`, and `disk` finite positive (swap is a sparse
+disk file, not reserved RAM, so it has no host-derived clamp). A Matchlock
 launch prints
-`matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB` and
-`tamandua workflow status` shows the same limits.
+`matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB swap=<n>MB|off` (with a
+` (standard image)` suffix for the bare standard-image opt-in) and reports the
+admitted pin on a separate `matchlock pinned: digest=… config=…` line after
+admission; `tamandua workflow status` shows the same limits.
 
 Every real-VM Matchlock gate refuses a hollow green: the driver writes an
 `observed-rounds.json` evidence file and `scripts/observed-rounds-guard.mjs`
@@ -798,7 +811,7 @@ or any user executable or symlink. Tamandua does not own or manage a
 `~/.local/bin/hermes` symlink. The only Hermes-related operation is resolving
 and running an existing binary.
 
-#### Hermes under Matchlock (`--hermes-as-harness --matchlock <image>`)
+#### Hermes under Matchlock (`--hermes-as-harness --matchlock-image <image>`)
 
 An opted-in Hermes run executes the **image's** Hermes inside a **fresh
 Matchlock VM for each launch probe and each work round**; the host Hermes
@@ -806,7 +819,7 @@ binary resolution above does not apply to these runs (no host install, no host
 lookup, no native fallback).
 
 ```bash
-tamandua workflow run <workflow-id> "<task>" --hermes-as-harness --matchlock <image>
+tamandua workflow run <workflow-id> "<task>" --hermes-as-harness --matchlock-image <image>
 ```
 
 All three harnesses are admitted with `--matchlock` and all three carry the
@@ -964,7 +977,7 @@ rows that override the injected permission mode.
 
 #### dsh under Matchlock (opt-in, MTLK-DSH-EXEC)
 
-`--dsh-as-harness --matchlock <image>` runs **every** launch probe and work
+`--dsh-as-harness --matchlock-image <image>` runs **every** launch probe and work
 round as the image's own `dsh` inside a **fresh Matchlock VM**. The host dsh
 binary/resolver is never used for an opted-in run and there is no native
 fallback.

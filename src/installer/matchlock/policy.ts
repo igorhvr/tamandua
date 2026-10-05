@@ -16,6 +16,17 @@
  * code path may silently re-pin a moved tag or fall back to a native harness.
  * A NULL `runs.matchlock_policy` remains the native (no Matchlock) case.
  *
+ * MTLK-ISO-SLICE1 / SHARED-V3: version 3 is the SINGLE coordinated schema
+ * shared by the standard-image and swap-default changes. It adds the image
+ * provenance (`requestedImageSource`), the per-run swap size
+ * (`resourceLimits.swapMB`, 0 = swap off) and the explicit root-usage
+ * override consent (`rootUsageConsent`) as REQUIRED fields. There is no
+ * 3→4 path: a pre-v3 binary refuses a v3 record fail-closed. A valid v2
+ * record keeps reading (normalized in memory to the v3 shape at parse time
+ * — a read-time projection that never rewrites the stored JSON); a v2 record
+ * carrying v3-only fields, or a v3 record missing a required field, is
+ * refused (version/field-set agreement).
+ *
  * The policy pins *authorized roots, the requested image AND its resolved
  * immutable identity*, not a snapshot of mounted bytes. The mounted
  * configuration directory remains mutable by design (credential refresh,
@@ -39,9 +50,12 @@ import {
 } from "./dsh-adapter-contract.js";
 import { resolveDshHostHome } from "./dsh-home.js";
 import {
+  MATCHLOCK_DEFAULT_SWAP_MB,
+  MATCHLOCK_MAX_SWAP_MB,
   resolveMatchlockResourceLimits,
   type MatchlockResourceHostProbe,
 } from "./resource-limits.js";
+import type { MatchlockImageSource } from "./standard-image.js";
 import {
   MATCHLOCK_ALLOW_PRIVATE_GRAMMAR,
   MATCHLOCK_ALLOW_PRIVATE_MAX_ENTRIES,
@@ -54,9 +68,15 @@ import {
  * Current policy record version. Bump when the field set changes
  * incompatible-ly. Version 2 added the REQUIRED immutable image content+config
  * pin (resolvedImageDigest / resolvedImageConfigDigest) — version 1 records
- * are legacy/unpinned and fail closed on read.
+ * are legacy/unpinned and fail closed on read. Version 3 (MTLK-ISO-SLICE1,
+ * SHARED-V3) adds the REQUIRED image provenance
+ * (`requestedImageSource`), the per-run swap size
+ * (`resourceLimits.swapMB`, integer 0..65536, 0 = swap off) and the explicit
+ * root-usage override consent (`rootUsageConsent`). Version 3 is the single
+ * coordinated schema for both the standard-image and swap-default changes —
+ * there is deliberately no 3→4 path.
  */
-export const MATCHLOCK_POLICY_VERSION = 2;
+export const MATCHLOCK_POLICY_VERSION = 3;
 /** Current mount-planning policy version (host/guest path rules). */
 export const MATCHLOCK_MOUNT_POLICY_VERSION = 1;
 /**
@@ -110,6 +130,14 @@ export interface ExecutionIsolationResourceLimits {
   cpus: number;
   memoryMB: number;
   diskSizeMB: number;
+  /**
+   * Guest swap size in MB (MTLK-SWAP / SHARED-V3): an integer in
+   * 0..{@link MATCHLOCK_MAX_SWAP_MB} where `0` explicitly means swap is
+   * OFF. Required on a version-3 record with its OWN predicate — 0 is valid
+   * for this field alone, while cpus/memoryMB/diskSizeMB keep
+   * `isFinitePositive`. There is no absence semantics.
+   */
+  swapMB: number;
 }
 
 /**
@@ -145,7 +173,7 @@ export interface ExecutionIsolationHermesSubmission {
  *
  * `resolvedImageDigest` / `resolvedImageConfigDigest` are OPTIONAL at the
  * TypeScript level only so that in-memory version-1-shaped fixtures used by
- * unrelated module tests still compile. For a CURRENT (version 2) record —
+ * unrelated module tests still compile. For a CURRENT (version 3) record —
  * i.e. anything produced by `buildMatchlockPolicy` or accepted by
  * `parseMatchlockPolicy` — both are REQUIRED and non-empty: a persisted
  * record without them fails closed on read. No dispatch/create path may run
@@ -166,6 +194,24 @@ export interface ExecutionIsolation {
   backend: "matchlock";
   /** Operator-supplied mandatory image; no host fallback is implied. */
   requestedImage: string;
+  /**
+   * How the effective image reference was chosen (SHARED-V3): `"explicit"`
+   * when the operator named an image (`--matchlock-image`), `"standard"`
+   * when the bare opt-in resolved the standard image (or its env override).
+   * REQUIRED on a version-3 record; a version-2 record has no such field and
+   * is normalized to `"explicit"` at read time. Display-only provenance:
+   * the authenticated identity is the content+config pin below.
+   */
+  requestedImageSource: MatchlockImageSource;
+  /**
+   * R13 root-usage consent (SHARED-V3): `true` ONLY when the operator
+   * explicitly supplied the root-usage override to THIS action (or an
+   * inherited record already carried `true`). `false` otherwise — including
+   * every normalized version-2 record, where the value is a conservative
+   * reading of missing information, not a claim about the run's history.
+   * Strict boolean; REQUIRED on a version-3 record.
+   */
+  rootUsageConsent: boolean;
   /**
    * The USER IMAGE's effective guest PATH (its OCI config env PATH), preserved
    * at admission from the resolved image so dispatch never re-resolves. The
@@ -288,6 +334,19 @@ export interface MatchlockPinnedImage {
 export interface BuildMatchlockPolicyParams {
   requestedImage: string;
   /**
+   * Image provenance captured at run creation (SHARED-V3). Defaults to
+   * `"explicit"` for a caller that predates the standard-image opt-in; the
+   * standard-image path threads the parser's real `matchlockImageSource`.
+   */
+  requestedImageSource?: MatchlockImageSource;
+  /**
+   * R13 root-usage override consent for THIS action (default `false`). A
+   * caller/action that did not explicitly exercise the override supplies
+   * nothing; an inherited-policy write preserves the inherited value in
+   * admission, never re-deriving it here.
+   */
+  rootUsageConsent?: boolean;
+  /**
    * The REQUIRED persisted immutable image identity (content + config) that
    * admission resolved over its owned RPC. There is no implicit re-pin
    * convenience path: building a policy without a validated pin throws.
@@ -399,11 +458,40 @@ function resolveDefaultResourceLimits(
   hostProbe?: MatchlockResourceHostProbe,
 ): ExecutionIsolationResourceLimits {
   const resolved = resolveMatchlockResourceLimits(hostProbe ? { hostProbe } : {});
-  return { cpus: resolved.cpus, memoryMB: resolved.memoryMB, diskSizeMB: resolved.diskSizeMB };
+  return {
+    cpus: resolved.cpus,
+    memoryMB: resolved.memoryMB,
+    diskSizeMB: resolved.diskSizeMB,
+    // SHARED-V3: fresh writes carry the effective swap size from the shared
+    // resolver (default 8192; 0 only when swap is explicitly disabled).
+    swapMB: resolved.swapMB,
+  };
 }
 
 /**
- * Build a well-formed, host-owned ExecutionIsolation policy (version 2).
+ * Complete a caller-supplied resource-limits object with the v3 swap field.
+ *
+ * A caller that predates the swap surface (or a fixture) may omit `swapMB`;
+ * the persisted record is ALWAYS a complete v3 record, so the missing field
+ * resolves to the shared built-in default (8192). An explicit `0` (swap off)
+ * is preserved verbatim. This is the FRESH-write path only: an inherited
+ * policy's limits are spread verbatim by admission and never pass here (the
+ * INHERITANCE RULE: swapMB, provenance and consent are never recomputed from
+ * the current environment on an inherited write).
+ */
+function completeResourceLimits(
+  limits: ExecutionIsolationResourceLimits,
+): ExecutionIsolationResourceLimits {
+  return {
+    cpus: limits.cpus,
+    memoryMB: limits.memoryMB,
+    diskSizeMB: limits.diskSizeMB,
+    swapMB: typeof limits.swapMB === "number" ? limits.swapMB : MATCHLOCK_DEFAULT_SWAP_MB,
+  };
+}
+
+/**
+ * Build a well-formed, host-owned ExecutionIsolation policy (version 3).
  * Requires the immutable identity pin resolved at admission; throws when the
  * pin is missing or does not pin content+config (no silent unpinned policy,
  * no implicit re-pin).
@@ -564,6 +652,14 @@ export function buildMatchlockPolicy(params: BuildMatchlockPolicyParams): Execut
     version: MATCHLOCK_POLICY_VERSION,
     backend: "matchlock",
     requestedImage,
+    // SHARED-V3 provenance: every fresh write is truthful. The standard-image
+    // opt-in threads the parser's real source; every pre-existing caller and
+    // every inherited-policy write (handled in admission) stays "explicit".
+    requestedImageSource: params.requestedImageSource ?? "explicit",
+    // SHARED-V3 R13 consent: true only when THIS action explicitly exercised
+    // the root-usage override. An inherited-policy write preserves the
+    // inherited value in admission, so this default never clobbers consent.
+    rootUsageConsent: params.rootUsageConsent === true,
     ...(imagePath !== undefined ? { imagePath } : {}),
     resolvedImageDigest: digest,
     resolvedImageConfigDigest: configDigest,
@@ -597,7 +693,7 @@ export function buildMatchlockPolicy(params: BuildMatchlockPolicyParams): Execut
     // when empty so an unset list stays absent.
     ...(networkAllowPrivate.length > 0 ? { networkAllowPrivate: [...networkAllowPrivate] } : {}),
     resourceLimits: params.resourceLimits
-      ? { ...params.resourceLimits }
+      ? completeResourceLimits(params.resourceLimits)
       : resolveDefaultResourceLimits(params.resourceHostProbe),
   };
 }
@@ -605,6 +701,102 @@ export function buildMatchlockPolicy(params: BuildMatchlockPolicyParams): Execut
 /** Serialize a policy to the string stored in runs.matchlock_policy. */
 export function serializeMatchlockPolicy(policy: ExecutionIsolation): string {
   return JSON.stringify(policy);
+}
+
+/**
+ * MTLK-ISO-SLICE2 US-009 (spec C §4.4/§4.5): the ONE sanctioned in-place
+ * policy update — the R13 consent-granting resume. Parse a persisted policy
+ * and return a fresh v3 record with `rootUsageConsent: true`.
+ *
+ * The image identity and pin, resource limits, harness submission block, work
+ * mounts and network restrictions are preserved VERBATIM; the only shape
+ * change is the v2→v3 normalization `parseMatchlockPolicy` already performs
+ * on a valid v2 record (version stamp plus defaulted `requestedImageSource` /
+ * `swapMB`). A record that is already consented is returned byte-for-byte
+ * unchanged. Throws {@link MatchlockPolicyError} on an unusable record: the
+ * consent flag never rescues an unusable policy (the caller refuses on the
+ * STATUS-UNUSABLE path BEFORE consulting consent).
+ */
+export function withGrantedRootUsageConsent(policyJson: string): string {
+  const policy = parseMatchlockPolicy(policyJson);
+  if (policy.rootUsageConsent === true) return policyJson;
+  return serializeMatchlockPolicy({ ...policy, rootUsageConsent: true });
+}
+
+/** A typed, sanitized description of a non-NULL unusable policy. */
+export interface UnusableMatchlockPolicyDescription {
+  /** The typed {@link MatchlockPolicyError} code (or a fallback). */
+  code: string;
+  /** The allow-listed, sanitized explanation — never the raw parser message. */
+  reason: string;
+}
+
+/**
+ * MTLK-ISO-SLICE2 US-014 (spec C §4.6 sanitization rule): the ALLOW-LISTED,
+ * sanitized operator explanation for a {@link MatchlockPolicyError} code.
+ *
+ * The parser's own message can embed fragments of the stored input (an
+ * `unknown field "…"` name, the `JSON.parse` error snippet, the offending
+ * version value) and the raw stored JSON must never be rendered by an
+ * operator surface. Every consumer of the STATUS-UNUSABLE vocabulary derives
+ * its reason from the error CATEGORY through this map; an unknown code falls
+ * back to a bounded generic explanation. The strings are static: no parser
+ * text, no stored input, no secrets.
+ */
+const SANITIZED_UNUSABLE_POLICY_REASONS: Readonly<Record<string, string>> = {
+  policy_json_invalid: "the persisted matchlock policy is not valid JSON",
+  policy_credential_field: "the persisted matchlock policy carries a credential-bearing field",
+  policy_legacy_unpinned:
+    "the persisted matchlock policy is a legacy unpinned record that must be recreated",
+  policy_unsupported_version: "the persisted matchlock policy version is not supported by this build",
+  policy_invalid_record: "the persisted matchlock policy is structurally invalid",
+  policy_missing: "no persisted matchlock policy",
+  policy_unusable: "the persisted matchlock policy could not be used",
+};
+
+/**
+ * Map a typed unusable-policy code to its allow-listed, sanitized explanation.
+ * Unknown codes (and any future code not yet allow-listed) degrade to a
+ * bounded generic message rather than leaking parser text.
+ */
+export function sanitizeUnusableMatchlockPolicyReason(code: string): string {
+  return (
+    SANITIZED_UNUSABLE_POLICY_REASONS[code] ??
+    "the persisted matchlock policy could not be used"
+  );
+}
+
+/**
+ * MTLK-ISO-SLICE2 US-010/US-014: the shared typed code + sanitized reason for a
+ * non-NULL unusable persisted policy (spec C §4.6 sanitization rule). The
+ * reason is an allow-listed explanation derived from the error CATEGORY —
+ * never the raw parser message (which can embed stored-input fragments) and
+ * never the raw policy JSON. Used by the control-plane resume handler, the
+ * failed-run `resumeWorkflow` and `workflow status` so the STATUS-UNUSABLE
+ * vocabulary cannot drift between the display surfaces.
+ *
+ * The null/undefined branch is defensive: callers reach here only for an
+ * explicit non-NULL value.
+ */
+export function describeUnusableMatchlockPolicy(
+  raw: string | null | undefined,
+): UnusableMatchlockPolicyDescription {
+  if (raw === null || raw === undefined) {
+    return {
+      code: "policy_missing",
+      reason: sanitizeUnusableMatchlockPolicyReason("policy_missing"),
+    };
+  }
+  try {
+    parseMatchlockPolicy(raw);
+    return {
+      code: "policy_unusable",
+      reason: sanitizeUnusableMatchlockPolicyReason("policy_unusable"),
+    };
+  } catch (err) {
+    const code = err instanceof MatchlockPolicyError ? err.code : "policy_invalid_record";
+    return { code, reason: sanitizeUnusableMatchlockPolicyReason(code) };
+  }
 }
 
 // ── Validation ──
@@ -631,6 +823,10 @@ const EXECUTION_ISOLATION_KEYS = new Set([
   "version",
   "backend",
   "requestedImage",
+  // SHARED-V3 provenance + R13 consent (defaulting this pair's absence only
+  // applies to a version-2 record; on v3 they are REQUIRED).
+  "requestedImageSource",
+  "rootUsageConsent",
   "imagePath",
   "resolvedImageDigest",
   "resolvedImageConfigDigest",
@@ -757,6 +953,16 @@ function isFinitePositive(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v) && v > 0;
 }
 
+/**
+ * SHARED-V3 swap-size predicate: an INTEGER in 0..MATCHLOCK_MAX_SWAP_MB.
+ * `0` is valid for this field alone (swap off), so it does NOT use
+ * `isFinitePositive`. Rejects 65537, negatives, fractions, non-numbers and
+ * NaN/Infinity.
+ */
+export function isSwapMB(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= MATCHLOCK_MAX_SWAP_MB;
+}
+
 function isExecutionIsolationWorkMount(v: unknown): v is ExecutionIsolationWorkMount {
   if (!isRecord(v)) return false;
   return (
@@ -767,30 +973,81 @@ function isExecutionIsolationWorkMount(v: unknown): v is ExecutionIsolationWorkM
   );
 }
 
-function isExecutionIsolationResourceLimits(v: unknown): v is ExecutionIsolationResourceLimits {
+/**
+ * Version-aware resource-limits validator. `requireSwap` is true for a v3
+ * record (swapMB REQUIRED and 0..65536) and false for a v2 record (swapMB is
+ * a v3-only field and must be ABSENT — version/field-set agreement).
+ */
+function isExecutionIsolationResourceLimits(
+  v: unknown,
+  requireSwap: boolean,
+): v is ExecutionIsolationResourceLimits {
   if (!isRecord(v)) return false;
-  return (
-    isFinitePositive(v.cpus) &&
-    isFinitePositive(v.memoryMB) &&
-    isFinitePositive(v.diskSizeMB)
-  );
+  if (
+    !isFinitePositive(v.cpus) ||
+    !isFinitePositive(v.memoryMB) ||
+    !isFinitePositive(v.diskSizeMB)
+  ) {
+    return false;
+  }
+  return requireSwap ? isSwapMB(v.swapMB) : v.swapMB === undefined;
 }
 
-/** Collect every structural validation failure for a candidate record. */
-export function matchlockPolicyValidationErrors(v: unknown): string[] {
+/**
+ * Collect every structural validation failure for a candidate record.
+ *
+ * `expectedVersion` selects the record shape being validated: the current
+ * (v3) shape by default, or the v2 shape when checking an inherited v2
+ * record's ORIGINAL stored shape before normalization (version/field-set
+ * agreement: a v2 record carrying v3-only fields is refused here).
+ */
+export function matchlockPolicyValidationErrors(
+  v: unknown,
+  expectedVersion: 2 | 3 = 3,
+): string[] {
   if (!isRecord(v)) return ["policy record is not an object"];
   const errors: string[] = [];
+  const requireV3Fields = expectedVersion === 3;
   for (const key of Object.keys(v)) {
     if (!EXECUTION_ISOLATION_KEYS.has(key)) {
-      errors.push(`unknown field "${key}"`);
+      // MTLK-ISO2-CORRECTIVE (F5): a field NAME is caller-controlled input.
+      // Name it only when it is a safe identifier so a sentinel cannot ride
+      // the refusal/status output.
+      errors.push(
+        /^[A-Za-z0-9_]{1,64}$/.test(key)
+          ? `unknown field "${key}"`
+          : "unknown field (unsafe name withheld)",
+      );
     }
   }
-  if (v.version !== MATCHLOCK_POLICY_VERSION) {
-    errors.push(`version must be ${MATCHLOCK_POLICY_VERSION} (got ${String(v.version)})`);
+  if (v.version !== expectedVersion) {
+    // MTLK-ISO2-CORRECTIVE (F5): never echo a non-numeric version verbatim.
+    const observed =
+      typeof v.version === "number" ? ` (got ${v.version})` : "";
+    errors.push(`version must be ${expectedVersion}${observed}`);
   }
   if (v.backend !== "matchlock") errors.push('backend must be "matchlock"');
   if (!isNonEmptyBoundedString(v.requestedImage, MATCHLOCK_MAX_IMAGE_LENGTH)) {
     errors.push("requestedImage must be a non-empty bounded string");
+  }
+  if (!requireV3Fields) {
+    // Version/field-set agreement: the two top-level v3-only fields must be
+    // ABSENT on a v2 record.
+    if (v.requestedImageSource !== undefined) {
+      errors.push("requestedImageSource is a version-3 field; a version-2 record must not carry it");
+    }
+    if (v.rootUsageConsent !== undefined) {
+      errors.push("rootUsageConsent is a version-3 field; a version-2 record must not carry it");
+    }
+  } else {
+    // REQUIRED v3 image provenance.
+    if (v.requestedImageSource !== "explicit" && v.requestedImageSource !== "standard") {
+      errors.push('requestedImageSource must be "explicit" or "standard"');
+    }
+    // REQUIRED v3 R13 consent: a STRICT boolean (never truthy/falsy coercion).
+    if (typeof v.rootUsageConsent !== "boolean") {
+      errors.push("rootUsageConsent must be a boolean");
+    }
   }
   if (v.imagePath !== undefined && !isImagePathLike(v.imagePath)) {
     errors.push("imagePath must be a colon-separated list of absolute directories when present");
@@ -892,13 +1149,24 @@ export function matchlockPolicyValidationErrors(v: unknown): string[] {
       errors.push(`every networkAllowPrivate entry must be ${MATCHLOCK_ALLOW_PRIVATE_GRAMMAR}`);
     }
   }
-  if (!isExecutionIsolationResourceLimits(v.resourceLimits)) {
-    errors.push("resourceLimits must be finite positive numbers");
+  if (!isExecutionIsolationResourceLimits(v.resourceLimits, requireV3Fields)) {
+    if (isRecord(v.resourceLimits) &&
+        isFinitePositive(v.resourceLimits.cpus) &&
+        isFinitePositive(v.resourceLimits.memoryMB) &&
+        isFinitePositive(v.resourceLimits.diskSizeMB)) {
+      // The base trio is valid, so the only way the version-aware check failed
+      // is the version-specific swapMB agreement.
+      errors.push(requireV3Fields
+        ? `resourceLimits.swapMB must be an integer between 0 and ${MATCHLOCK_MAX_SWAP_MB}`
+        : "resourceLimits.swapMB is a version-3 field; a version-2 record must not carry it");
+    } else {
+      errors.push("resourceLimits must be finite positive numbers");
+    }
   }
   return errors;
 }
 
-/** Structural type guard for a CURRENT (version-2) persisted ExecutionIsolation record. */
+/** Structural type guard for a CURRENT (version-3) persisted ExecutionIsolation record. */
 export function isExecutionIsolationPolicy(v: unknown): v is ExecutionIsolation {
   return matchlockPolicyValidationErrors(v).length === 0;
 }
@@ -941,11 +1209,47 @@ export function assertNoCredentialValues(v: unknown): void {
 }
 
 /**
+ * Normalize a VALID version-2 record to the current v3 shape for consumers.
+ *
+ * This is a READ-TIME projection: it returns a NEW in-memory object and never
+ * mutates or rewrites the stored JSON. The v3 fields that did not exist on
+ * v2 resolve conservatively:
+ *  - `requestedImageSource: "explicit"` (only explicit references existed),
+ *  - `resourceLimits.swapMB: 0` (swap OFF — the run's ORIGINAL behaviour,
+ *    never the new 8192 default),
+ *  - `rootUsageConsent: false` (a conservative reading of missing
+ *    information, not a claim that the run never executed as root).
+ *
+ * The caller must have already validated the v2 original shape
+ * (`matchlockPolicyValidationErrors(record, 2)`), so the v3-only fields are
+ * guaranteed absent here.
+ */
+function normalizeV2PolicyToV3(record: Record<string, unknown>): ExecutionIsolation {
+  const resourceLimits = {
+    ...(record.resourceLimits as ExecutionIsolationResourceLimits),
+    swapMB: 0,
+  };
+  return {
+    ...(record as unknown as ExecutionIsolation),
+    version: MATCHLOCK_POLICY_VERSION,
+    requestedImageSource: "explicit",
+    rootUsageConsent: false,
+    resourceLimits,
+  };
+}
+
+/**
  * Parse and validate a persisted policy string. Throws a MatchlockPolicyError
  * on malformed JSON, credential-bearing fields, legacy (version-1, unpinned)
  * records, unknown versions, or a structurally invalid record — a stored
  * policy that fails validation must fail closed, never be silently coerced or
  * treated as native.
+ *
+ * Reader rule (SHARED-V3): versions {2, 3} are accepted. The ORIGINAL stored
+ * shape is validated FIRST (version/field-set agreement). A valid v2 record
+ * is then normalized to the v3 shape for consumers (a read-time projection;
+ * the stored string is never rewritten). A v3 record must carry every
+ * required v3 field.
  */
 export function parseMatchlockPolicy(json: string): ExecutionIsolation {
   let parsed: unknown;
@@ -968,14 +1272,32 @@ export function parseMatchlockPolicy(json: string): ExecutionIsolation {
         "Matchlock policy version 1 is a legacy UNPINNED record (no immutable image content/config identity). It must never look like a working isolated run: recreate the run with --matchlock so admission resolves and persists the content+config pin.",
       );
     }
+    if (parsed.version === 2) {
+      // Validate the ORIGINAL v2 shape first (v3-only fields must be absent),
+      // then project it to v3 for consumers.
+      const v2Errors = matchlockPolicyValidationErrors(parsed, 2);
+      if (v2Errors.length > 0) {
+        throw new MatchlockPolicyError(
+          "policy_invalid_record",
+          `Invalid matchlock policy: ${v2Errors.join("; ")}.`,
+        );
+      }
+      return normalizeV2PolicyToV3(parsed);
+    }
     if (typeof parsed.version !== "number" || parsed.version !== MATCHLOCK_POLICY_VERSION) {
+      // MTLK-ISO2-CORRECTIVE (F5): never embed the raw version value — it is
+      // caller-controlled input that must not leak through scheduling_error
+      // into the status document. A numeric version is safe to name; any other
+      // type is reported by category only.
+      const observed =
+        typeof parsed.version === "number" ? ` (got ${parsed.version})` : "";
       throw new MatchlockPolicyError(
         "policy_unsupported_version",
-        `Matchlock policy version ${String(parsed.version)} is not supported by this build (expected ${MATCHLOCK_POLICY_VERSION}); refusing to treat it as an isolated run.`,
+        `Matchlock policy version is not supported by this build (expected ${MATCHLOCK_POLICY_VERSION})${observed}; refusing to treat it as an isolated run.`,
       );
     }
   }
-  const errors = matchlockPolicyValidationErrors(parsed);
+  const errors = matchlockPolicyValidationErrors(parsed, 3);
   if (errors.length > 0) {
     throw new MatchlockPolicyError(
       "policy_invalid_record",

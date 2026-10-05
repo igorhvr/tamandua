@@ -36,7 +36,29 @@ import { getDb } from "../db.js";
 import { emitEvent } from "../installer/events.js";
 import type { TamanduaEvent } from "../installer/events.js";
 import { validateRunHarnessForScheduling } from "../installer/run-harness.js";
-import { parseRunContext, setRunContextKey, removeRunContextKey } from "../installer/step-ops.js";
+import {
+  ISOLATION_INTENT_RECORDED,
+  PREPARING_SCHEDULING_STATUS,
+  PREP_STATE_CAPABILITY,
+  isolationPreparingHeldText,
+  readIsolationState,
+} from "../installer/matchlock/prep-state.js";
+import {
+  describeUnusableMatchlockPolicy,
+  parseMatchlockPolicy,
+  withGrantedRootUsageConsent,
+} from "../installer/matchlock/policy.js";
+import { matchlockRootUsageRefusalText } from "../installer/matchlock/admission.js";
+import {
+  runMatchlockResumePreflight,
+  type InheritedImageVerifier,
+} from "../installer/matchlock/resume-preflight.js";
+import type { MatchlockSwapSupportProbe } from "../installer/matchlock/swap-support.js";
+import {
+  buildWorkflowWarnings,
+  withWorkflowWarnings,
+} from "../installer/matchlock/warnings.js";
+import { parseRunContext, setRunContextKey } from "../installer/step-ops.js";
 import {
   resolveWorkdirCollisionPolicy,
   formatWorkdirRefusalMessage,
@@ -78,6 +100,56 @@ export function _setRunMidTeardownForTest(runId: string, mid: boolean): void {
   if (mid) runsMidTeardown.add(runId);
   else runsMidTeardown.delete(runId);
 }
+
+/**
+ * MTLK-ISO-SLICE2 US-009 (R13): effective-uid seam for the resume consent
+ * path. Production consults the EXECUTING (daemon) process's `process.geteuid()`
+ * — the host process identity only, never a guest workload's uid; a platform
+ * without `geteuid` reports the non-root sentinel -1. Tests inject a fixed
+ * value through {@link _setResumeEffectiveUidForTest}.
+ */
+let resumeEffectiveUidOverride: number | null = null;
+
+/** @internal test hook: pin (or clear) the effective uid used by resume. */
+export function _setResumeEffectiveUidForTest(uid: number | null): void {
+  resumeEffectiveUidOverride = uid;
+}
+
+function currentDaemonEffectiveUid(): number {
+  if (resumeEffectiveUidOverride !== null) return resumeEffectiveUidOverride;
+  return typeof process.geteuid === "function" ? process.geteuid() : -1;
+}
+
+/**
+ * MTLK-ISO2-CORRECTIVE (Family B1): test seams for the shared consented-resume
+ * preflight (swap probe + inherited-image verifier). Production leaves this
+ * null so the real probe/RPC resolve runs; tests inject deterministic fakes so
+ * no real binary or VM is ever used.
+ */
+let resumeMatchlockPreflightSeamsForTest: {
+  swapSupportProbe?: MatchlockSwapSupportProbe;
+  verifyInheritedImage?: InheritedImageVerifier;
+} | null = null;
+
+/** @internal test hook: pin (or clear) the resume preflight seams. */
+export function _setResumeMatchlockPreflightForTest(
+  seams: {
+    swapSupportProbe?: MatchlockSwapSupportProbe;
+    verifyInheritedImage?: InheritedImageVerifier;
+  } | null,
+): void {
+  resumeMatchlockPreflightSeamsForTest = seams;
+}
+
+/** One step/story row's tracked fields (prior or post image). */
+interface ResumeRowSnapshot {
+  id: string;
+  status: string;
+  retry_count: number;
+  output: string | null;
+  resume_reset_count?: number;
+}
+
 
 // Read at module load so dist/version is sampled once at daemon startup,
 // not on every health request.
@@ -183,6 +255,8 @@ export interface RunRow {
   context: string;
   created_at?: string;
   matchlock_policy?: string | null;
+  /** MTLK-ISO-SLICE2 PREP-STATE host-owned marker (`"true"` only). */
+  isolation_intent?: string | null;
 }
 
 function getRun(runId: string): RunRow | null {
@@ -190,7 +264,7 @@ function getRun(runId: string): RunRow | null {
     const db = getDb();
     const row = db
       .prepare(
-        "SELECT id, workflow_id, status, scheduling_status, context, created_at, matchlock_policy FROM runs WHERE id = ?",
+        "SELECT id, workflow_id, status, scheduling_status, context, created_at, matchlock_policy, isolation_intent FROM runs WHERE id = ?",
       )
       .get(runId) as RunRow | undefined;
     return row ?? null;
@@ -369,7 +443,67 @@ function warnSharedWorkdirOnce(runId: string, heldByRunId: string, dir: string):
   });
 }
 
+/**
+ * MTLK-ISO-SLICE2 US-007 (PREP-STATE): true when the row records the
+ * host-owned isolation intent but no pinned Matchlock policy has been
+ * persisted yet. Such a row is mid-preparation and must be HELD (non-
+ * schedulable), never admitted natively. Explicit non-NULL classification: an
+ * empty-string policy is a present (unusable) policy, not an absent one.
+ */
+function isIntentOnlyHeldRun(run: RunRow): boolean {
+  return (
+    run.isolation_intent === ISOLATION_INTENT_RECORDED &&
+    (run.matchlock_policy === null || run.matchlock_policy === undefined)
+  );
+}
+
+/**
+ * Record and return the typed preparing-held registration response for an
+ * intent-only row. Creates no scheduling timers and never resolves a native
+ * harness. The conditional update is a no-op if admission persisted the policy
+ * concurrently (the atomic release to `pending_register` must never be
+ * clobbered back to `preparing`).
+ */
+function holdIntentOnlyRun(run: RunRow): JsonResponse {
+  try {
+    getDb()
+      .prepare(
+        `UPDATE runs SET scheduling_status = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO}
+         WHERE id = ? AND isolation_intent = ? AND matchlock_policy IS NULL`,
+      )
+      .run(PREPARING_SCHEDULING_STATUS, run.id, ISOLATION_INTENT_RECORDED);
+  } catch (err) {
+    logger.warn("control-server: register-run held-state update failed", {
+      runId: run.id,
+      error: String(err),
+    });
+  }
+  logger.info(
+    "control-server: register-run held — Matchlock isolation intent recorded, policy pending",
+    { runId: run.id, state: PREPARING_SCHEDULING_STATUS },
+  );
+  return ok(
+    {
+      state: PREPARING_SCHEDULING_STATUS,
+      isolationIntent: true,
+      message:
+        "Run is an isolation-preparation (PREP-STATE) run: the isolation intent is recorded but no pinned " +
+        "Matchlock policy has been persisted yet. Held non-schedulable; no native dispatch timers were created.",
+    },
+    202,
+  );
+}
+
 async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
+  // ── MTLK-ISO-SLICE2 US-007 (PREP-STATE) held guard ───────────────
+  // An isolation-intent row whose pinned policy has not been persisted yet is
+  // mid-preparation: it must NEVER be admitted natively (no host harness
+  // resolution, no scheduling timers). Record the typed preparing/held state
+  // and return a retriable 202. The policy write is atomic and flips the row
+  // to pending_register, so this hold releases as soon as admission completes.
+  // No consent can make this row runnable.
+  if (isIntentOnlyHeldRun(run)) return holdIntentOnlyRun(run);
+
   const requiredTimers = requiredTimersForRun(run.id);
   const maxActiveTimers = getMaxActiveTimers();
 
@@ -506,11 +640,15 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
   if (requiredTimers > maxActiveTimers) {
     const message =
       `Run requires ${requiredTimers} scheduler timer(s), but TAMANDUA_MAX_ACTIVE_TIMERS is ${maxActiveTimers}.`;
+    // MTLK-ISO2-TRANSITION-CAS (Family B): CAS-guard the capacity/admission
+    // failure write on the status this admission decision was made from. A
+    // concurrent cancellation/completion (or any other status move) WINS: the
+    // refusal writes NOTHING and the caller resolves its own transition.
     getDb()
       .prepare(
-        `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+        `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND status = ?`,
       )
-      .run(message, run.id);
+      .run(message, run.id, run.status);
     logger.error("control-server: register-run unschedulable", {
       runId: run.id,
       requiredTimers,
@@ -584,7 +722,7 @@ async function admitQueuedRuns(): Promise<void> {
   const db = getDb();
   const queued = db
     .prepare(
-      `SELECT id, workflow_id, status, scheduling_status, context, created_at
+      `SELECT id, workflow_id, status, scheduling_status, context, created_at, matchlock_policy, isolation_intent
        FROM runs
        WHERE status = 'running' AND scheduling_status IN ('queued', 'waiting')
        ORDER BY scheduling_requested_at ASC, created_at ASC`,
@@ -1352,6 +1490,12 @@ async function handleRegisterRun(runId: string): Promise<JsonResponse> {
   if (runsMidTeardown.has(runId)) {
     return { status: 503, body: { error: "run teardown in progress, retry" } };
   }
+  // MTLK-ISO2-MEND (Family D): an intent-only row is classified BEFORE the
+  // paused/drain checks. The opted-in initial hold now rides the legacy-honored
+  // pause_drain marker (scheduling_status='draining_pause' + context
+  // pause_drain='true'), so the drain guard below would otherwise claim it. The
+  // host-owned intent marker is the authority; record the typed preparing hold.
+  if (isIntentOnlyHeldRun(run)) return holdIntentOnlyRun(run);
   if (run.status === "paused" || run.scheduling_status === "paused") {
     return ok({ state: "paused" });
   }
@@ -1375,6 +1519,10 @@ async function handleRegisterRun(runId: string): Promise<JsonResponse> {
     });
     return ok({ state: "draining_pause" });
   }
+  // PREP-STATE (US-007): an intent-only row is mid-preparation and must never
+  // be reported admitted — including via the `active` fast-path below, which
+  // would otherwise report "active" for a zero-step held row.
+  if (isIntentOnlyHeldRun(run)) return holdIntentOnlyRun(run);
   if (run.scheduling_status === "active") {
     const { _scheduledJobCountForRun } = await import("../installer/agent-scheduler.js");
     if (_scheduledJobCountForRun(run.id) >= requiredTimersForRun(run.id)) {
@@ -1565,12 +1713,42 @@ async function handlePauseRun(
   return ok({ state: "paused" });
 }
 
-async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<JsonResponse> {
+async function handleResumeRun(
+  runId: string,
+  requestedBy = "unknown",
+  rootUsageOverride = false,
+): Promise<JsonResponse> {
   const run = getRun(runId);
   if (!run) return notFound(`Run not found: ${runId}`);
   if (isTerminal(run.status)) return conflict(`Run is terminal: ${run.status}`);
   if (run.status === "running" && run.scheduling_status === "active") {
     return ok({ state: "active" });
+  }
+  // MTLK-ISO2-MEND (Family D): classify the intent-only hold BEFORE the
+  // drain/paused checks. An opted-in run is inserted with the legacy-honored
+  // pause_drain hold, so a new-binary resume must key off the host-owned intent
+  // marker (never treat its own initial hold as a cancellable drain).
+  // (Classification is inlined via readIsolationState so this handler stays
+  // consumable by the AST-extracted acceptance battery.)
+  if (readIsolationState(run) === "preparing") {
+    try {
+      getDb()
+        .prepare(
+          `UPDATE runs SET scheduling_status = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND isolation_intent = ? AND matchlock_policy IS NULL`,
+        )
+        .run(PREPARING_SCHEDULING_STATUS, runId, ISOLATION_INTENT_RECORDED);
+    } catch {
+      /* best-effort */
+    }
+    return ok(
+      {
+        state: "preparing",
+        isolationIntent: true,
+        held: true,
+        message: `Cannot resume run: ${isolationPreparingHeldText()}`,
+      },
+      202,
+    );
   }
   // PAUS US-003: a pending drain (pause --drain in progress) leaves the run
   // status 'running' with scheduling_status 'draining_pause'. A plain resume
@@ -1600,47 +1778,243 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
     workflowId: run.workflow_id,
     detail: JSON.stringify({ requestedBy }),
   });
+  // ── MTLK-ISO-SLICE2 US-009 (R13): Matchlock resume-consent ordering ──────
+  // Spec C §4.4/§2.5/§2.6. Executable order:
+  //   (1) classify/validate the persisted policy (no matchlock interaction);
+  //   (2) determine effective root permission;
+  //   (3) run the permitted checks (the harness/policy validation below);
+  //   (4) commit the consent change + scheduling transition in ONE short
+  //       synchronous DB section (no transaction spans RPC/subprocess work).
+  // Every refusal returns BEFORE any state write, so a refused resume leaves
+  // the run's prior state untouched (paused stays paused; draining stays
+  // draining).
+  const isolationState = readIsolationState(run);
+
+  if (isolationState === "preparing") {
+    // PREP-STATE: an intent-only row is held, never native; consent never
+    // rescues it (spec C §10 item 7). Record the typed preparing-held state
+    // without inventing a policy, admitting natively, or recording consent.
+    try {
+      getDb()
+        .prepare(
+          `UPDATE runs SET scheduling_status = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ? AND isolation_intent = ? AND matchlock_policy IS NULL`,
+        )
+        .run(PREPARING_SCHEDULING_STATUS, runId, ISOLATION_INTENT_RECORDED);
+    } catch {
+      /* best-effort */
+    }
+    return ok(
+      {
+        state: "preparing",
+        isolationIntent: true,
+        held: true,
+        message: `Cannot resume run: ${isolationPreparingHeldText()}`,
+      },
+      202,
+    );
+  }
+
+  if (isolationState === "unusable") {
+    // STATUS-UNUSABLE refusal BEFORE consent is consulted: the R13 override
+    // never rescues a malformed/legacy record. No state write.
+    const { code, reason } = describeUnusableMatchlockPolicy(run.matchlock_policy);
+    return unprocessable(
+      `Cannot resume run: matchlock: ISOLATION POLICY UNUSABLE (${code}): ${reason}. ` +
+        "The run's state was left unchanged; recreate the run with --matchlock " +
+        "(or provision this host with `tamandua matchlock setup`).",
+    );
+  }
+
+  if (rootUsageOverride && isolationState === "native") {
+    // A truly native run (no intent, no policy) has nothing for the override
+    // to consent to: passing it is refused and names that fact (spec C §4.4).
+    return unprocessable(
+      "Cannot resume run: --force-matchlock-usage-as-root-not-recommended-per-matchlock-docs " +
+        "applies only to Matchlock runs, but this run carries no isolation intent and no " +
+        "persisted Matchlock policy (a truly native run). The run's state was left unchanged.",
+    );
+  }
+
+  // Effective root permission + permitted Matchlock checks: BOTH resume forms
+  // use the ONE shared preflight (spec C §4.4's order). All probe/RPC work
+  // finishes BEFORE any state write, so no transaction spans subprocess work.
+  let inheritedRootConsent = false;
+  let grantConsent = false;
+  if (isolationState === "isolated") {
+    const policy = parseMatchlockPolicy(run.matchlock_policy as string);
+    inheritedRootConsent = policy.rootUsageConsent === true;
+    const preflight = await runMatchlockResumePreflight({
+      policy,
+      effectiveUid: currentDaemonEffectiveUid,
+      inheritedRootConsent,
+      rootUsageOverride,
+      ...(resumeMatchlockPreflightSeamsForTest?.swapSupportProbe
+        ? { swapSupportProbe: resumeMatchlockPreflightSeamsForTest.swapSupportProbe }
+        : {}),
+      ...(resumeMatchlockPreflightSeamsForTest?.verifyInheritedImage
+        ? { verifyInheritedImage: resumeMatchlockPreflightSeamsForTest.verifyInheritedImage }
+        : {}),
+    });
+    if (!preflight.ok) {
+      return unprocessable(`Cannot resume run: ${preflight.message}`);
+    }
+    // Family F8: only a genuinely-granting override is a newly granted consent.
+    grantConsent = preflight.grantConsent;
+  }
+
   try {
     await validateRunHarnessForScheduling(run.id, run.context, {
       matchlockPolicy: run.matchlock_policy ?? null,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    try {
-      getDb()
-        .prepare(
-          `UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
-        )
-        .run(message, runId);
-    } catch {
-      /* best-effort */
+    // MTLK-ISO2-CORRECTIVE (Family B3): a Matchlock resume validation refusal
+    // PRESERVES the run's prior scheduling state (spec C §4.4). The historical
+    // native behavior (record scheduling_status='error') is unchanged.
+    if (isolationState === "native") {
+      try {
+        getDb()
+          .prepare(
+            `UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+          )
+          .run(message, runId);
+      } catch {
+        /* best-effort */
+      }
     }
     return unprocessable(`Cannot resume run: ${message}`);
   }
+
+  // MTLK-ISO2-MEND (Family A/B): capture the EXACT before image of every
+  // durable artifact this request may write, then ship the consent bytes, the
+  // scheduling transition AND the context edits through ONE expected-state
+  // compare-and-swap commit. A conflict performs NO write.
+  const priorRunRow = getDb()
+    .prepare(
+      `SELECT status, scheduling_status, scheduling_requested_at, scheduling_error,
+              matchlock_policy, harness_probe_status, harness_probe_at, context
+       FROM runs WHERE id = ?`,
+    )
+    .get(runId) as
+    | {
+        status: string;
+        scheduling_status: string | null;
+        scheduling_requested_at: string | null;
+        scheduling_error: string | null;
+        matchlock_policy: string | null;
+        harness_probe_status: string | null;
+        harness_probe_at: string | null;
+        context: string;
+      }
+    | undefined;
+  const priorSteps = getDb()
+    .prepare("SELECT id, status, retry_count, output FROM steps WHERE run_id = ?")
+    .all(runId) as unknown as ResumeRowSnapshot[];
+  const priorStories = getDb()
+    .prepare(
+      "SELECT id, status, retry_count, output, resume_reset_count FROM stories WHERE run_id = ?",
+    )
+    .all(runId) as unknown as ResumeRowSnapshot[];
+
+  const loadedPolicy = run.matchlock_policy ?? null;
+  const grantedPolicy =
+    grantConsent && loadedPolicy !== null
+      ? withGrantedRootUsageConsent(loadedPolicy)
+      : loadedPolicy;
+  const transitionedAt = new Date().toISOString();
+  const priorContext = priorRunRow?.context ?? run.context ?? "";
+  // Build the atomic post-context: clear the pending/finalized drain marker and
+  // stamp attribution in the SAME guarded commit as the consent bytes.
+  let resumeContextObj: Record<string, unknown> = {};
   try {
-    getDb()
-      .prepare(
-        `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
-      )
-      .run(new Date().toISOString(), runId);
-    if (cancelledDrain || staleDrainMarker) {
-      // Cancel the pending drain / clear the historical marker in the same
-      // synchronous DB section as the status flip (no awaits between the
-      // UPDATE and this context rewrite), so the marker can never half-exist
-      // with scheduling_status already flipped out of draining_pause.
-      removeRunContextKey(runId, "pause_drain");
+    const parsed = JSON.parse(priorContext) as unknown;
+    if (parsed && typeof parsed === "object") {
+      resumeContextObj = parsed as Record<string, unknown>;
     }
   } catch {
-    /* best-effort */
+    resumeContextObj = {};
   }
+  if (cancelledDrain || staleDrainMarker) delete resumeContextObj["pause_drain"];
+  resumeContextObj["resumed_by"] = requestedBy;
+  resumeContextObj["resumed_at"] = transitionedAt;
+  const postContext = JSON.stringify(resumeContextObj);
 
-  // Persist attribution context keys
-  const now = new Date().toISOString();
+  // MTLK-ISO2-TRANSITION-CAS (Family A): the exact BEFORE values and the exact
+  // AFTER values of every durable write this request owns. A late registration
+  // refusal resolves each of its OWN columns individually (never a whole row,
+  // never a competing writer's value); there is no post-commit compensator.
+  const ownControlWrite =
+    isolationState !== "native"
+      ? {
+          prior: {
+            status: priorRunRow?.status ?? run.status,
+            schedulingStatus: priorRunRow?.scheduling_status ?? run.scheduling_status,
+            schedulingRequestedAt: priorRunRow?.scheduling_requested_at ?? null,
+            schedulingError: priorRunRow?.scheduling_error ?? null,
+            policy: priorRunRow?.matchlock_policy ?? loadedPolicy,
+            probeStatus: priorRunRow?.harness_probe_status ?? null,
+            probeAt: priorRunRow?.harness_probe_at ?? null,
+            context: priorContext,
+          },
+          after: {
+            status: "running",
+            schedulingStatus: "pending_register" as string | null,
+            schedulingRequestedAt: transitionedAt as string | null,
+            schedulingError: null as string | null,
+            policy: grantedPolicy,
+            probeStatus: priorRunRow?.harness_probe_status ?? null,
+            probeAt: priorRunRow?.harness_probe_at ?? null,
+            context: postContext,
+          },
+        }
+      : null;
+
+  // Step 4: ONE short synchronous CAS commit — consent + status/scheduling +
+  // context. No await, RPC or subprocess work inside. A rejected consent/state
+  // write FAILS the resume (no success result, no `run.resumed`); prior owned
+  // writes are compensated.
   try {
-    setRunContextKey(runId, "resumed_by", requestedBy);
-    setRunContextKey(runId, "resumed_at", now);
+    const db = getDb();
+    db.exec("BEGIN IMMEDIATE");
+    const guard = db
+      .prepare(
+        "SELECT id FROM runs WHERE id = ? AND status = ? AND scheduling_status IS ? AND matchlock_policy IS ? AND context IS ?",
+      )
+      .get(runId, run.status, run.scheduling_status, loadedPolicy, priorContext);
+    if (!guard) {
+      db.exec("ROLLBACK");
+      return conflict(
+        "Cannot resume run: the run's state changed concurrently (cancellation, pause/drain or a competing resume); retry the resume.",
+      );
+    }
+    if (grantConsent && loadedPolicy !== null) {
+      db.prepare(
+        `UPDATE runs SET matchlock_policy = ?, status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, context = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      ).run(grantedPolicy, transitionedAt, postContext, runId);
+    } else {
+      db.prepare(
+        `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, context = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      ).run(transitionedAt, postContext, runId);
+    }
+    db.exec("COMMIT");
   } catch (err) {
-    logger.warn("control-server: resume context attribution failed", { runId, error: String(err) });
+    try {
+      getDb().exec("ROLLBACK");
+    } catch {
+      /* best effort */
+    }
+    logger.error("control-server: resume consent/state commit failed", {
+      runId,
+      error: String(err),
+    });
+    return {
+      status: 500,
+      body: {
+        error: `Cannot resume run: the consent/state commit failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      },
+    };
   }
 
   // Determine the workflow_id for the event. When the run was previously
@@ -1649,24 +2023,6 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
   // workflow_id we have.
   const wfId = run.workflow_id ||
     (getRun(runId)?.workflow_id ?? undefined);
-
-  // PAUS US-003: audit a cancelled pending drain before run.resumed.
-  if (cancelledDrain) {
-    emitEvent({
-      ts: new Date().toISOString(),
-      event: "run.drain_cancelled_by_resume",
-      runId,
-      workflowId: wfId,
-      detail: JSON.stringify({ requestedBy }),
-    });
-  }
-
-  emitEvent({
-    ts: new Date().toISOString(),
-    event: "run.resumed",
-    runId,
-    workflowId: wfId,
-  });
 
   // US-002: Recover orphaned running steps before re-creating scheduler timers.
   // Pause-without-drain kills the pi process, leaving steps status='running'.
@@ -1692,20 +2048,315 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
     });
   }
 
+  // MTLK-ISO2-TRANSITION-CAS (Family A): capture the AFTER images (run + steps
+  // + stories) of THIS request's writes — including orphan recovery — so a late
+  // registration refusal can resolve exactly its own columns. Nothing here is a
+  // whole-row snapshot restore; the resolver below compares before/own-after/
+  // current per column.
+  let ownAfterSteps: ResumeRowSnapshot[] = [];
+  let ownAfterStories: ResumeRowSnapshot[] = [];
+  if (ownControlWrite) {
+    const postRunRow = getDb()
+      .prepare(
+        `SELECT status, scheduling_status, scheduling_requested_at, scheduling_error,
+                matchlock_policy, harness_probe_status, harness_probe_at, context
+         FROM runs WHERE id = ?`,
+      )
+      .get(runId) as typeof priorRunRow;
+    if (postRunRow) {
+      ownControlWrite.after = {
+        status: postRunRow.status,
+        schedulingStatus: postRunRow.scheduling_status,
+        schedulingRequestedAt: postRunRow.scheduling_requested_at,
+        schedulingError: postRunRow.scheduling_error,
+        policy: postRunRow.matchlock_policy,
+        probeStatus: postRunRow.harness_probe_status,
+        probeAt: postRunRow.harness_probe_at,
+        context: postRunRow.context,
+      };
+    }
+    ownAfterSteps = getDb()
+      .prepare("SELECT id, status, retry_count, output FROM steps WHERE run_id = ?")
+      .all(runId) as unknown as ResumeRowSnapshot[];
+    ownAfterStories = getDb()
+      .prepare(
+        "SELECT id, status, retry_count, output, resume_reset_count FROM stories WHERE run_id = ?",
+      )
+      .all(runId) as unknown as ResumeRowSnapshot[];
+  }
+
+  // Per-key context inverse: only the keys THIS request moved are reverted, and
+  // only while the current value still equals what this request wrote. Any key
+  // a competing writer added/changed is preserved.
+  const inverseControlContext = (
+    priorStr: string,
+    postStr: string,
+    currentStr: string,
+  ): string => {
+    if (currentStr === postStr) return priorStr;
+    const has = (o: Record<string, unknown>, k: string): boolean =>
+      Object.prototype.hasOwnProperty.call(o, k);
+    const eq = (a: unknown, b: unknown): boolean =>
+      a === undefined ? b === undefined : b !== undefined && a === b;
+    let prior: Record<string, unknown> = {};
+    let post: Record<string, unknown> = {};
+    let current: Record<string, unknown> = {};
+    try {
+      prior = (JSON.parse(priorStr) ?? {}) as Record<string, unknown>;
+    } catch {
+      prior = {};
+    }
+    try {
+      post = (JSON.parse(postStr) ?? {}) as Record<string, unknown>;
+    } catch {
+      return currentStr;
+    }
+    try {
+      current = (JSON.parse(currentStr) ?? {}) as Record<string, unknown>;
+    } catch {
+      return currentStr;
+    }
+    if (typeof prior !== "object" || prior === null) prior = {};
+    if (typeof post !== "object" || post === null) return currentStr;
+    if (typeof current !== "object" || current === null) current = {};
+    const out: Record<string, unknown> = { ...current };
+    const keys = new Set([...Object.keys(prior), ...Object.keys(post)]);
+    for (const key of keys) {
+      const p = has(prior, key) ? prior[key] : undefined;
+      const q = has(post, key) ? post[key] : undefined;
+      if (eq(p, q)) continue; // this request did not move the key
+      const c = has(current, key) ? current[key] : undefined;
+      if (!eq(c, q)) continue; // a competing writer moved it; that value wins
+      if (has(prior, key)) out[key] = prior[key];
+      else delete out[key];
+    }
+    return JSON.stringify(out);
+  };
+
+  // Resolve this request's OWN durable writes after a late registration refusal.
+  // Inline and narrow: it never runs a module-level helper the AST-extraction
+  // acceptance instrument cannot resolve. MTLK-ISO2-SUPERSEDED-RESUME: the
+  // ownership pivot is this request's own IMMUTABLE MINTED TOKEN, compared
+  // inside the resolution transaction BEFORE any write — a competing committed
+  // successor (distinct token) is left entirely untouched. Only a token-owned
+  // row is resolved: a competing terminal (completed/canceled) wins, otherwise
+  // each owned column returns to its prior value. Step/story rows use their
+  // `status` as the ownership pivot: a row whose status no longer equals this
+  // request's after image is foreign and is left entirely untouched.
+  const resolveControlResumeWrites = (): void => {
+    if (!ownControlWrite) return;
+    try {
+      const db = getDb();
+      db.exec("BEGIN IMMEDIATE");
+      const cur = db
+        .prepare(
+          `SELECT status, scheduling_status, scheduling_requested_at, scheduling_error,
+                  matchlock_policy, harness_probe_status, harness_probe_at, context
+           FROM runs WHERE id = ?`,
+        )
+        .get(runId) as
+        | {
+            status: string;
+            scheduling_status: string | null;
+            scheduling_requested_at: string | null;
+            scheduling_error: string | null;
+            matchlock_policy: string | null;
+            harness_probe_status: string | null;
+            harness_probe_at: string | null;
+            context: string;
+          }
+        | undefined;
+      // MTLK-ISO2-SUPERSEDED-RESUME (ownership pivot): ownership is the
+      // REQUEST'S OWN IMMUTABLE MINTED TOKEN, compared inside this short
+      // transaction and BEFORE any field is changed. A competing committed
+      // successor holds a DISTINCT non-null token, so it is not this request's
+      // row: skip ALL owned-column writes (run AND step/story loops) and close
+      // the transaction cleanly. The after-image is NOT a safe pivot — it is
+      // re-read after awaited work and may already be contaminated by the
+      // successor. A missing row has nothing to resolve. A same-token terminal
+      // (completed/canceled) is handled below by `competingTerminal`.
+      if (!cur || cur.scheduling_requested_at !== transitionedAt) {
+        db.exec("COMMIT");
+        return;
+      }
+      const competingTerminal =
+        cur.status === "completed" || cur.status === "canceled";
+      db.prepare(
+        `UPDATE runs
+         SET status = ?, scheduling_status = ?, scheduling_requested_at = ?,
+             scheduling_error = ?, matchlock_policy = ?, context = ?,
+             harness_probe_status = ?, harness_probe_at = ?
+         WHERE id = ?`,
+      ).run(
+        competingTerminal ? cur.status : ownControlWrite.prior.status,
+        competingTerminal ? cur.scheduling_status : ownControlWrite.prior.schedulingStatus,
+        competingTerminal
+          ? cur.scheduling_requested_at
+          : ownControlWrite.prior.schedulingRequestedAt,
+        competingTerminal ? cur.scheduling_error : ownControlWrite.prior.schedulingError,
+        cur.matchlock_policy === ownControlWrite.after.policy
+          ? ownControlWrite.prior.policy
+          : cur.matchlock_policy,
+        inverseControlContext(
+          ownControlWrite.prior.context,
+          ownControlWrite.after.context,
+          cur.context ?? "",
+        ),
+        cur.harness_probe_status === ownControlWrite.after.probeStatus
+          ? ownControlWrite.prior.probeStatus
+          : cur.harness_probe_status,
+        cur.harness_probe_at === ownControlWrite.after.probeAt
+          ? ownControlWrite.prior.probeAt
+          : cur.harness_probe_at,
+        runId,
+      );
+      const step = db.prepare(
+        "UPDATE steps SET status = ?, retry_count = ?, output = ? WHERE id = ? AND run_id = ?",
+      );
+      for (const before of priorSteps) {
+        const after = ownAfterSteps.find((s) => s.id === before.id);
+        if (!after) continue;
+        const current = db
+          .prepare("SELECT status, retry_count, output FROM steps WHERE id = ? AND run_id = ?")
+          .get(before.id, runId) as
+          | { status: string; retry_count: number; output: string | null }
+          | undefined;
+        // A row whose ownership pivot (`status`) no longer equals this request's
+        // after image is foreign and is left byte-exactly alone.
+        if (!current || current.status !== after.status) continue;
+        const nextStatus = before.status === after.status ? current.status : before.status;
+        const nextRetry =
+          before.retry_count === after.retry_count
+            ? current.retry_count
+            : current.retry_count === after.retry_count
+              ? before.retry_count
+              : current.retry_count;
+        const nextOutput =
+          before.output === after.output
+            ? current.output
+            : current.output === after.output
+              ? before.output
+              : current.output;
+        step.run(nextStatus, nextRetry, nextOutput, before.id, runId);
+      }
+      const story = db.prepare(
+        "UPDATE stories SET status = ?, retry_count = ?, output = ?, resume_reset_count = ? WHERE id = ? AND run_id = ?",
+      );
+      for (const before of priorStories) {
+        const after = ownAfterStories.find((s) => s.id === before.id);
+        if (!after) continue;
+        const current = db
+          .prepare(
+            "SELECT status, retry_count, output, resume_reset_count FROM stories WHERE id = ? AND run_id = ?",
+          )
+          .get(before.id, runId) as
+          | {
+              status: string;
+              retry_count: number;
+              output: string | null;
+              resume_reset_count: number;
+            }
+          | undefined;
+        if (!current || current.status !== after.status) continue; // foreign row
+        const nextStatus = before.status === after.status ? current.status : before.status;
+        const nextRetry =
+          before.retry_count === after.retry_count
+            ? current.retry_count
+            : current.retry_count === after.retry_count
+              ? before.retry_count
+              : current.retry_count;
+        const nextOutput =
+          before.output === after.output
+            ? current.output
+            : current.output === after.output
+              ? before.output
+              : current.output;
+        const nextReset =
+          (before.resume_reset_count ?? 0) === (after.resume_reset_count ?? 0)
+            ? current.resume_reset_count
+            : current.resume_reset_count === (after.resume_reset_count ?? 0)
+              ? (before.resume_reset_count ?? 0)
+              : current.resume_reset_count;
+        story.run(nextStatus, nextRetry, nextOutput, nextReset, before.id, runId);
+      }
+      db.exec("COMMIT");
+    } catch {
+      try {
+        getDb().exec("ROLLBACK");
+      } catch {
+        /* best effort */
+      }
+    }
+  };
+
   // PAUS US-003: extend the register result so callers can tell a pending
   // drain was cancelled. Only draining_pause resumes carry the flag, and only
   // on success (2xx) — a failed admission keeps its error body untouched.
+  //
+  // MTLK-ISO2-CORRECTIVE (Family F4/B3): a MATCHLOCK resume emits run.resumed
+  // only AFTER a successful registration — a refused resume must never be
+  // reported as resumed. The historical NATIVE behavior (emit before
+  // registration) is unchanged, so a native registration refusal keeps its
+  // documented audit semantics.
+  const deferResumeEvent = isolationState !== "native";
+  const emitResumeAudit = (): void => {
+    if (cancelledDrain) {
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "run.drain_cancelled_by_resume",
+        runId,
+        workflowId: wfId,
+        detail: JSON.stringify({ requestedBy }),
+      });
+    }
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.resumed",
+      runId,
+      workflowId: wfId,
+    });
+  };
+  if (!deferResumeEvent) emitResumeAudit();
+
   const registered = await handleRegisterRun(runId);
-  if (
+
+  // A failed registration must not leave the consented / running state behind.
+  // MTLK-ISO2-TRANSITION-CAS (Family A): resolve this request's OWN writes
+  // per column — there is no whole-row compensator. A competing terminal
+  // (completed / canceled) and any foreign step/story writer always win.
+  if (registered.status < 200 || registered.status >= 300) {
+    resolveControlResumeWrites();
+    return registered;
+  }
+
+  if (deferResumeEvent) emitResumeAudit();
+
+  // MTLK-ISO-SLICE2 US-013: the shared advisory warnings channel rides the
+  // resume JSON body ONLY when non-empty (absent — never `[]` — otherwise).
+  // A consent-granting resume reports `consent_granted_on_resume`; a resume
+  // that only inherited recorded consent reports `root_usage_override`.
+  const resumeWarnings = buildWorkflowWarnings({
+    consentGrantedOnResume: grantConsent,
+    rootUsageConsent: inheritedRootConsent,
+  });
+  const drainCancelledBody =
     cancelledDrain
     && registered.status >= 200
     && registered.status < 300
     && typeof registered.body.error === "undefined"
-  ) {
-    return ok({ ...registered.body, drainCancelled: true }, registered.status);
-  }
-  return registered;
+      ? { ...registered.body, drainCancelled: true }
+      : registered.body;
+  const responseBody = withWorkflowWarnings(drainCancelledBody, resumeWarnings);
+  if (responseBody === registered.body) return registered;
+  return ok(responseBody, registered.status);
 }
+
+/**
+ * @internal — test hook for the MTLK-ISO-SLICE2 US-009 resume-consent path.
+ * Exercises the exact production handler in-process (the daemon HTTP tests
+ * spawn a separate process and cannot toggle {@link _setResumeEffectiveUidForTest}).
+ */
+export const _handleResumeRunForTest = handleResumeRun;
 
 async function handleNudge(): Promise<JsonResponse> {
   const db = getDb();
@@ -1899,6 +2550,10 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
         pid: process.pid,
         timestamp: new Date().toISOString(),
         buildVersion,
+        // MTLK-ISO2-CORRECTIVE (Finding D): the PREP-STATE capability token.
+        // Its ABSENCE marks a pre-PREP-STATE daemon; the control client refuses
+        // to create/register/resume an intent-recorded run against it.
+        prepStateCapability: PREP_STATE_CAPABILITY,
         // Effective state dir of the serving process (DPID scoping): lets a
         // CLI prove a discovered control plane is OURS, not a foreign daemon.
         stateDir: resolveStateDir(),
@@ -1998,7 +2653,10 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
         }
         if (pathname === "/control/resume-run") {
           const requestedBy = typeof body.requestedBy === "string" ? body.requestedBy : "unknown";
-          const r = await handleResumeRun(runId, requestedBy);
+          // MTLK-ISO-SLICE2 US-009 (R13): the explicit per-action root-usage
+          // override, sent only by the CLI when the operator passed the flag.
+          const rootUsageOverride = body.matchlockRootUsageOverride === true;
+          const r = await handleResumeRun(runId, requestedBy, rootUsageOverride);
           respond(r.status, r.body);
           return;
         }

@@ -14,6 +14,11 @@ import { testGuardActive, assertStatePathIsolation } from "../lib/test-guard.js"
 import { resolveStateDir } from "../lib/tamandua-config.js";
 import { Deadline } from "../lib/instant.js";
 import { getControlPort, readDaemonSecret } from "./control-server.js";
+import {
+  ISOLATION_INTENT_RECORDED,
+  PREP_STATE_CAPABILITY,
+} from "../installer/matchlock/prep-state.js";
+import { getDb } from "../db.js";
 import { startDaemon } from "./daemonctl.js";
 
 export interface ControlPlaneResponse {
@@ -140,6 +145,41 @@ export async function ensureDaemonControlAvailable(timeoutMs: number = 30_000): 
 }
 
 /**
+ * MTLK-ISO2-CORRECTIVE (Finding D, D-enforce): shared body check for the
+ * PREP-STATE capability handshake. A null/unreachable peer, a non-200 health
+ * response, or a missing/foreign capability token is refused with a typed,
+ * actionable error. Extracted so the nudge/reconcile path can apply the exact
+ * same check without a second round trip.
+ */
+function assertPrepStateCapabilityResponse(r: ControlPlaneResponse | null): void {
+  const advertised = r?.body?.prepStateCapability;
+  if (r === null || r.status !== 200 || advertised !== PREP_STATE_CAPABILITY) {
+    throw new Error(
+      `The running Tamandua daemon does not advertise the ${PREP_STATE_CAPABILITY} capability ` +
+        "(a pre-PREP-STATE binary). Refusing to create, register, nudge or resume a Matchlock " +
+        "isolation-intent run against it: an older daemon would treat the held run as natively " +
+        "schedulable. Restart the daemon on this build (`tamandua daemon restart`), then retry.",
+    );
+  }
+}
+
+/**
+ * MTLK-ISO2-CORRECTIVE (Finding D, D-enforce): refuse to create, register,
+ * nudge or resume an isolation-intent (PREP-STATE) run against a daemon that
+ * does not advertise the {@link PREP_STATE_CAPABILITY} token. This is the real
+ * runtime enforcement of the deployment restriction: a pre-PREP-STATE daemon
+ * would treat an intent-only row as an ordinary runnable run, so the new client
+ * must never let the two coexist. Throws a typed, actionable error.
+ */
+export async function assertDaemonPrepStateCapability(
+  timeoutMs: number = 5_000,
+): Promise<void> {
+  assertPrepStateCapabilityResponse(
+    await controlRequest("GET", "/control/health", undefined, timeoutMs),
+  );
+}
+
+/**
  * Notify the daemon that a new run has been created and should be admitted
  * into the scheduler. Returns the parsed response on success, null when the
  * daemon is unreachable (caller should fall back to in-process scheduling).
@@ -168,14 +208,60 @@ export async function pauseRunWithDaemon(runId: string, drain = false, requested
   return controlRequest("POST", "/control/pause-run", body);
 }
 
-/** Resume a paused run (re-enters admission). */
-export async function resumeRunWithDaemon(runId: string, requestedBy?: string): Promise<ControlPlaneResponse | null> {
+/**
+ * Resume a paused run (re-enters admission).
+ *
+ * MTLK-ISO-SLICE2 US-009 (R13): `rootUsageOverride` carries the explicit
+ * `--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` consent
+ * from the CLI to the daemon's resume handler. It is sent ONLY when true, so
+ * the automatic/bulk callers (resume-all, MCP, dashboard) never manufacture
+ * consent: they call with the default false and the daemon inherits only the
+ * consent already recorded on the policy.
+ */
+export async function resumeRunWithDaemon(
+  runId: string,
+  requestedBy?: string,
+  rootUsageOverride = false,
+): Promise<ControlPlaneResponse | null> {
+  // MTLK-ISO2-TRANSITION-CAS (Family D): an intent-only (held/preparing) row
+  // must never be natively admitted by an older peer that cannot honor the
+  // PREP-STATE hold. Before a plain resume POST for such a row, assert the peer
+  // advertises the capability; a peer that cannot is refused locally instead of
+  // silently activating the held row natively. A missing row/db (or a native /
+  // isolated row) leaves the resume behavior byte-identical.
+  let intentOnlyHeld = false;
+  try {
+    const row = getDb()
+      .prepare("SELECT isolation_intent, matchlock_policy FROM runs WHERE id = ?")
+      .get(runId) as
+      | { isolation_intent: string | null; matchlock_policy: string | null }
+      | undefined;
+    intentOnlyHeld =
+      !!row &&
+      row.isolation_intent === ISOLATION_INTENT_RECORDED &&
+      (row.matchlock_policy === null || row.matchlock_policy === undefined);
+  } catch {
+    intentOnlyHeld = false;
+  }
+  if (intentOnlyHeld) await assertDaemonPrepStateCapability();
   const body: Record<string, unknown> = { runId };
   if (requestedBy) body.requestedBy = requestedBy;
+  if (rootUsageOverride === true) body.matchlockRootUsageOverride = true;
   return controlRequest("POST", "/control/resume-run", body);
 }
 
-/** Request the daemon to nudge all scheduled agents for all running runs. */
+/**
+ * Request the daemon to nudge all scheduled agents for all running runs.
+ *
+ * MTLK-ISO2-MEND (Family D): the capability gate is deliberately NOT applied
+ * globally here. Runs WITHOUT isolation intent (native-only, and older peers on
+ * native rows) must be behaviorally UNCHANGED, and the mixed-version exclusion
+ * for an intent-only row is structural: the opted-in initial hold rides the
+ * legacy-honored pause_drain marker, so an older daemon's nudge loop
+ * (`handleNudge` → `handleRegisterRun`) returns `{state:'draining_pause'}`
+ * without admission. Capability gating is scoped to the registration /
+ * paused-resume entry paths for intent-bearing rows only.
+ */
 export async function nudgeWithDaemon(timeoutMs?: number): Promise<ControlPlaneResponse | null> {
   return controlRequest("POST", "/control/nudge", {}, timeoutMs);
 }

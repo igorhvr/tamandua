@@ -152,7 +152,7 @@ async function startFakeControlPlane(response: {
     req.on("end", () => {
       if (req.method === "GET" && req.url === "/control/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
         return;
       }
       if (req.method === "POST" && req.url === "/control/register-run") {
@@ -759,7 +759,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
           "Size the VM",
           "--working-directory-for-harness",
           workDir,
-          "--matchlock",
+          "--matchlock-image",
           "vic/matchlock-base:latest",
           "--matchlock-cpus",
           "4",
@@ -771,8 +771,11 @@ describe("CLI workflow run working-directory-for-harness", () => {
         {
           HOME: env.homeDir,
           TAMANDUA_CONTROL_PORT: String(fake.port),
-          TAMANDUA_MATCHLOCK_RPC_BIN: process.execPath,
-          TAMANDUA_MATCHLOCK_RPC_ARGS: JSON.stringify([fakeDriver]),
+          // MTLK-ISO-SLICE2 US-003: the fake rpc driver doubles as the matchlock
+          // CLI and advertises the exact --swap token, so the swap handshake
+          // (which probes `<bin> run --help`) passes without a real binary.
+          TAMANDUA_MATCHLOCK_RPC_BIN: fakeDriver,
+          TAMANDUA_MATCHLOCK_RPC_ARGS: JSON.stringify(["rpc"]),
           FAKE_TRANSCRIPT_FILE: transcript,
           FAKE_IMAGE_TAG: "vic/matchlock-base:latest",
           FAKE_IMAGE_DIGEST: `sha256:${"a".repeat(64)}`,
@@ -787,8 +790,24 @@ describe("CLI workflow run working-directory-for-harness", () => {
       );
       assert.match(
         result.stdout,
-        /matchlock: vic\/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB/,
+        /matchlock: vic\/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB swap=8192MB/,
         `the launch output must echo the admitted VM size:\n${result.stdout}`,
+      );
+      // MTLK-ISO-SLICE2 US-011: the admitted pin is reported after admission
+      // with its own DISTINCT prefix, never as a second matchlock: line.
+      assert.match(
+        result.stdout,
+        new RegExp(
+          `matchlock pinned: digest=sha256:${"a".repeat(64)} config=sha256:${"b".repeat(64)}`,
+        ),
+        `the launch output must report the admitted pin:\n${result.stdout}`,
+      );
+      assert.equal(
+        result.stdout
+          .split("\n")
+          .filter((line) => line.startsWith("matchlock:")).length,
+        1,
+        `exactly one matchlock: line must remain:\n${result.stdout}`,
       );
 
       const db = new DatabaseSync(path.join(env.tamanduaDir, "tamandua.db"));
@@ -799,7 +818,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       assert.ok(row?.matchlock_policy, "the run must carry a persisted Matchlock policy");
       assert.deepEqual(
         parseMatchlockPolicy(row!.matchlock_policy!).resourceLimits,
-        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
+        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480, swapMB: 8192 },
       );
     } finally {
       try { await fake.close(); } catch {}
@@ -826,7 +845,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
           "run",
           workflowId,
           "Bad VM size",
-          "--matchlock",
+          "--matchlock-image",
           "vic/matchlock-base:latest",
           "--matchlock-cpus",
           "0",
@@ -840,6 +859,118 @@ describe("CLI workflow run working-directory-for-harness", () => {
         `expected exit code 1, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
       );
       assert.match(result.stderr, /--matchlock-cpus/, `stderr must name the invalid flag:\n${result.stderr}`);
+      assert.ok(!result.stdout.includes("Run:"), "no successful run output may be printed");
+
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      if (fs.existsSync(dbPath)) {
+        const db = new DatabaseSync(dbPath);
+        const hasRuns = db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runs'")
+          .get();
+        if (hasRuns) {
+          const row = db.prepare("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
+          assert.equal(row.n, 0, "no run row may exist after a resolution error");
+        }
+        db.close();
+      }
+    } finally {
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  // MTLK-ISO-SLICE1 US-008: an invalid swap value is a hard launch error that
+  // exits non-zero BEFORE runWorkflow creates any run row. The env form is
+  // resolved at launch (the flag form is already rejected at parse time).
+  it("rejects an invalid TAMANDUA_MATCHLOCK_SWAP_MB before creating any run row (US-008)", async () => {
+    const env = await createTempEnv();
+
+    try {
+      const workflowId = "cli-run-mtlk-swap-invalid-env";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Bad swap env",
+          "--matchlock-image",
+          "vic/matchlock-base:latest",
+        ],
+        {
+          HOME: env.homeDir,
+          TAMANDUA_CONTROL_PORT: String(env.controlPort),
+          TAMANDUA_MATCHLOCK_SWAP_MB: "999999",
+        },
+      );
+
+      assert.equal(
+        result.code,
+        1,
+        `expected exit code 1, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.match(
+        result.stderr,
+        /TAMANDUA_MATCHLOCK_SWAP_MB/,
+        `stderr must name the invalid swap env var:\n${result.stderr}`,
+      );
+      assert.match(result.stderr, /65536/, `stderr must name matchlock's cap:\n${result.stderr}`);
+      assert.ok(!result.stdout.includes("Run:"), "no successful run output may be printed");
+
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      if (fs.existsSync(dbPath)) {
+        const db = new DatabaseSync(dbPath);
+        const hasRuns = db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runs'")
+          .get();
+        if (hasRuns) {
+          const row = db.prepare("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
+          assert.equal(row.n, 0, "no run row may exist after a resolution error");
+        }
+        db.close();
+      }
+    } finally {
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+  });
+
+  it("rejects `--matchlock-swap 0` before creating any run row (US-008)", async () => {
+    const env = await createTempEnv();
+
+    try {
+      const workflowId = "cli-run-mtlk-swap-invalid-flag";
+      writeMinimalWorkflow(env.homeDir, workflowId);
+      await Promise.all(env.portHandles.map(h => h.close()));
+
+      const result = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Bad swap flag",
+          "--matchlock-image",
+          "vic/matchlock-base:latest",
+          "--matchlock-swap",
+          "0",
+        ],
+        { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(env.controlPort) },
+      );
+
+      assert.equal(
+        result.code,
+        1,
+        `expected exit code 1, got ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.match(
+        result.stderr,
+        /--matchlock-no-swap/,
+        `stderr must point at the off switch:\n${result.stderr}`,
+      );
       assert.ok(!result.stdout.includes("Run:"), "no successful run output may be printed");
 
       const dbPath = path.join(env.tamanduaDir, "tamandua.db");

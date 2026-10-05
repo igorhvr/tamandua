@@ -1,6 +1,19 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { parseWorkflowRunArgs, parseWorkdirCollisionPolicyFlags } from "../../dist/cli/workflow-run-args.js";
+import {
+  parseWorkflowRunArgs,
+  parseWorkdirCollisionPolicyFlags,
+  parseMatchlockRootUsageOverrideFlag,
+  MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
+} from "../../dist/cli/workflow-run-args.js";
+import {
+  MATCHLOCK_IMAGE_ENV,
+  STANDARD_MATCHLOCK_IMAGE,
+} from "../../dist/installer/matchlock/standard-image.js";
+import {
+  MatchlockResourceLimitError,
+  resolveMatchlockResourceLimits,
+} from "../../dist/installer/matchlock/resource-limits.js";
 import { writeFileSync, unlinkSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -510,72 +523,249 @@ describe("parseWorkflowRunArgs", () => {
     });
   });
 
-  // MTLK-PI US-001: `--matchlock` opt-in parsing.
-  describe("--matchlock", () => {
-    it("parses --matchlock IMAGE (space form)", () => {
-      const result = parseWorkflowRunArgs(["Build feature", "--matchlock", "vic/ml:latest"]);
-      assert.equal(result.matchlockImage, "vic/ml:latest");
+  // MTLK-ISO-SLICE1 (spec C §4.2): the opt-in grammar. `--matchlock` is a pure
+  // boolean selecting the standard image; `--matchlock-image` names an explicit
+  // image; the equals form of the boolean is a hard parse error.
+  describe("--matchlock opt-in grammar (MTLK-ISO-SLICE1)", () => {
+    function withImageEnv<T>(value: string | undefined, fn: () => T): T {
+      const previous = process.env[MATCHLOCK_IMAGE_ENV];
+      if (value === undefined) delete process.env[MATCHLOCK_IMAGE_ENV];
+      else process.env[MATCHLOCK_IMAGE_ENV] = value;
+      try {
+        return fn();
+      } finally {
+        if (previous === undefined) delete process.env[MATCHLOCK_IMAGE_ENV];
+        else process.env[MATCHLOCK_IMAGE_ENV] = previous;
+      }
+    }
+
+    it("bare --matchlock resolves the standard image with 'standard' provenance", () => {
+      withImageEnv(undefined, () => {
+        const result = parseWorkflowRunArgs(["Build feature", "--matchlock"]);
+        assert.equal(result.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
+        assert.equal(result.matchlockImageSource, "standard");
+        assert.equal(result.matchlockRequested, true);
+        assert.equal(result.taskTitle, "Build feature");
+      });
+    });
+
+    it("bare --matchlock NEVER consumes the following token (flag before a flag)", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock", "--pi-as-harness"]);
+      assert.equal(result.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
+      assert.equal(result.harnessAs, "pi");
+      assert.equal(result.taskTitle, "task");
+    });
+
+    it("bare --matchlock before -- leaves the remaining tokens as task text", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock", "--", "vic/ml"]);
+      assert.equal(result.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
+      assert.equal(result.taskTitle, "task vic/ml");
+    });
+
+    it("bare --matchlock adjacent to task text keeps the text positional", () => {
+      const result = parseWorkflowRunArgs(["--matchlock", "Build feature"]);
+      assert.equal(result.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
       assert.equal(result.taskTitle, "Build feature");
     });
 
-    it("parses --matchlock=IMAGE (equals form)", () => {
-      const result = parseWorkflowRunArgs(["Build feature", "--matchlock=vic/ml:latest"]);
+    it("a repeated bare --matchlock is idempotent", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock", "--matchlock"]);
+      assert.equal(result.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
+      assert.equal(result.matchlockImageSource, "standard");
+      assert.equal(result.matchlockRequested, true);
+    });
+
+    it("parses --matchlock-image IMAGE (space form) with 'explicit' provenance", () => {
+      const result = parseWorkflowRunArgs(["Build feature", "--matchlock-image", "vic/ml:latest"]);
       assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.matchlockImageSource, "explicit");
+      assert.equal(result.matchlockRequested, true);
       assert.equal(result.taskTitle, "Build feature");
     });
 
-    it("matchlockImage is undefined when --matchlock is absent", () => {
+    it("parses --matchlock-image=IMAGE (equals form) with 'explicit' provenance", () => {
+      const result = parseWorkflowRunArgs(["Build feature", "--matchlock-image=vic/ml:latest"]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.matchlockImageSource, "explicit");
+      assert.equal(result.matchlockRequested, true);
+      assert.equal(result.taskTitle, "Build feature");
+    });
+
+    it("trims an explicit image", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock-image", "  vic/ml:latest  "]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+    });
+
+    it("--matchlock --matchlock-image IMG is accepted and the explicit image wins", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-image", "vic/ml:latest"]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.matchlockImageSource, "explicit");
+      assert.equal(result.matchlockRequested, true);
+    });
+
+    it("--matchlock-image IMG --matchlock is accepted and the explicit image wins (order independent)", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock-image=vic/ml:latest", "--matchlock"]);
+      assert.equal(result.matchlockImage, "vic/ml:latest");
+      assert.equal(result.matchlockImageSource, "explicit");
+    });
+
+    it("TAMANDUA_MATCHLOCK_IMAGE overrides the built-in for a bare opt-in", () => {
+      withImageEnv(" registry.acme/mirror:2 ", () => {
+        const result = parseWorkflowRunArgs(["task", "--matchlock"]);
+        assert.equal(result.matchlockImage, "registry.acme/mirror:2");
+        assert.equal(result.matchlockImageSource, "standard");
+      });
+    });
+
+    it("an empty TAMANDUA_MATCHLOCK_IMAGE falls back to the built-in", () => {
+      withImageEnv("   ", () => {
+        const result = parseWorkflowRunArgs(["task", "--matchlock"]);
+        assert.equal(result.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
+      });
+    });
+
+    it("an explicit image beats the env override", () => {
+      withImageEnv("registry.acme/mirror:2", () => {
+        const result = parseWorkflowRunArgs(["task", "--matchlock-image", "vic/ml:latest"]);
+        assert.equal(result.matchlockImage, "vic/ml:latest");
+        assert.equal(result.matchlockImageSource, "explicit");
+      });
+    });
+
+    it("a native run never consults TAMANDUA_MATCHLOCK_IMAGE", () => {
+      withImageEnv("registry.acme/mirror:2", () => {
+        const result = parseWorkflowRunArgs(["Build feature"]);
+        assert.equal(result.matchlockImage, undefined);
+        assert.equal(result.matchlockImageSource, undefined);
+        assert.equal(result.matchlockRequested, undefined);
+        assert.equal(result.taskTitle, "Build feature");
+      });
+    });
+
+    it("matchlockImage is undefined when no opt-in flag is present", () => {
       const result = parseWorkflowRunArgs(["Build feature"]);
       assert.equal(result.matchlockImage, undefined);
+      assert.equal(result.matchlockImageSource, undefined);
     });
 
-    it("rejects --matchlock with a missing value (flag at end)", () => {
+    it("rejects --matchlock=<anything> with the hard error naming --matchlock-image", () => {
       assert.throws(
-        () => parseWorkflowRunArgs(["Build feature", "--matchlock"]),
-        /Missing value for --matchlock/,
+        () => parseWorkflowRunArgs(["Build feature", "--matchlock=vic/ml:latest"]),
+        /--matchlock takes no value\. Use --matchlock-image <image> to name an image\./,
+      );
+      assert.throws(
+        () => parseWorkflowRunArgs(["--matchlock="]),
+        /--matchlock takes no value\. Use --matchlock-image <image> to name an image\./,
       );
     });
 
-    it("rejects --matchlock= (empty value)", () => {
+    it("never absorbs the --matchlock= form into the task title", () => {
+      // The hard error fires before the unknown-option/task-text fallthrough,
+      // so no run is created with the image silently in its task title.
       assert.throws(
-        () => parseWorkflowRunArgs(["Build feature", "--matchlock="]),
-        /Missing value for --matchlock/,
+        () => parseWorkflowRunArgs(["Build feature", "--matchlock=vic/ml"]),
+        /--matchlock takes no value/,
       );
     });
 
-    it("rejects a duplicate --matchlock", () => {
+    it("rejects a missing --matchlock-image value (flag at end)", () => {
       assert.throws(
-        () => parseWorkflowRunArgs(["--matchlock", "a", "--matchlock", "b"]),
-        /Duplicate --matchlock/,
+        () => parseWorkflowRunArgs(["Build feature", "--matchlock-image"]),
+        /Missing value for --matchlock-image/,
       );
     });
 
-    it("rejects a duplicate via mixed forms", () => {
+    it("rejects an empty or whitespace --matchlock-image value", () => {
       assert.throws(
-        () => parseWorkflowRunArgs(["--matchlock=a", "--matchlock=b"]),
-        /Duplicate --matchlock/,
+        () => parseWorkflowRunArgs(["Build feature", "--matchlock-image="]),
+        /Missing value for --matchlock-image/,
+      );
+      assert.throws(
+        () => parseWorkflowRunArgs(["Build feature", "--matchlock-image", "   "]),
+        /Missing value for --matchlock-image/,
+      );
+      assert.throws(
+        () => parseWorkflowRunArgs(["Build feature", "--matchlock-image=   "]),
+        /Missing value for --matchlock-image/,
       );
     });
 
-    it("rejects a value that is another recognized --flag (never consumes it)", () => {
+    it("never consumes a recognized flag as the --matchlock-image value", () => {
       assert.throws(
-        () => parseWorkflowRunArgs(["--matchlock", "--pi-as-harness"]),
+        () => parseWorkflowRunArgs(["--matchlock-image", "--pi-as-harness"]),
+        /is an option, not an image/,
+      );
+      assert.throws(
+        () => parseWorkflowRunArgs(["--matchlock-image=--pi-as-harness"]),
         /is an option, not an image/,
       );
     });
 
-    it("allows --matchlock with explicit --pi-as-harness", () => {
+    it("rejects a duplicate --matchlock-image (space and equals forms)", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["--matchlock-image", "a", "--matchlock-image", "b"]),
+        /Duplicate --matchlock-image/,
+      );
+      assert.throws(
+        () => parseWorkflowRunArgs(["--matchlock-image=a", "--matchlock-image", "b"]),
+        /Duplicate --matchlock-image/,
+      );
+    });
+
+    it("the root-usage override is a pure boolean that sets the field only with an opt-in", () => {
+      const override = "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs";
+      const withBare = parseWorkflowRunArgs(["task", "--matchlock", override]);
+      assert.equal(withBare.matchlockRootUsageOverride, true);
+      assert.equal(withBare.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
+      assert.equal(withBare.taskTitle, "task");
+
+      const withExplicit = parseWorkflowRunArgs(["task", "--matchlock-image", "vic/ml", override]);
+      assert.equal(withExplicit.matchlockRootUsageOverride, true);
+      assert.equal(withExplicit.matchlockImage, "vic/ml");
+    });
+
+    it("the root-usage override alone is a dependent-flag usage error", () => {
+      assert.throws(
+        () =>
+          parseWorkflowRunArgs([
+            "task",
+            "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs",
+          ]),
+        /--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs requires --matchlock or --matchlock-image <image>/,
+      );
+    });
+
+    it("a run without the override leaves matchlockRootUsageOverride undefined", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock"]);
+      assert.equal(result.matchlockRootUsageOverride, undefined);
+    });
+
+    it("a dependent flag succeeds with EITHER opt-in form", () => {
+      for (const optIn of [["--matchlock"], ["--matchlock-image", "vic/ml"]] as const) {
+        const result = parseWorkflowRunArgs(["task", ...optIn, "--matchlock-cpus", "4"]);
+        assert.equal(result.matchlockCpus, "4");
+      }
+    });
+
+    it("a dependent flag fails without any opt-in with the new message", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock-cpus", "4"]),
+        /--matchlock-cpus requires --matchlock or --matchlock-image <image>\./,
+      );
+    });
+
+    it("allows --matchlock-image with explicit --pi-as-harness", () => {
       const result = parseWorkflowRunArgs([
         "task",
-        "--matchlock", "vic/ml:latest",
+        "--matchlock-image", "vic/ml:latest",
         "--pi-as-harness",
       ]);
       assert.equal(result.matchlockImage, "vic/ml:latest");
       assert.equal(result.harnessAs, "pi");
     });
 
-    it("allows --matchlock combined with --hermes-as-harness", () => {
-      const result = parseWorkflowRunArgs(["task", "--matchlock", "vic/ml", "--hermes-as-harness"]);
+    it("allows --matchlock-image combined with --hermes-as-harness", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock-image", "vic/ml", "--hermes-as-harness"]);
       assert.equal(result.matchlockImage, "vic/ml");
       assert.equal(result.harnessAs, "hermes");
     });
@@ -585,7 +775,7 @@ describe("parseWorkflowRunArgs", () => {
       // --hermes-as-harness with --matchlock ("only supported with
       // --pi-as-harness or --dsh-as-harness"). The three-harness union admits
       // all three, so the losing rejection assertion is rewritten to accept.
-      const result = parseWorkflowRunArgs(["task", "--hermes-as-harness", "--matchlock", "vic/ml"]);
+      const result = parseWorkflowRunArgs(["task", "--hermes-as-harness", "--matchlock-image", "vic/ml"]);
       assert.equal(result.matchlockImage, "vic/ml");
       assert.equal(result.harnessAs, "hermes");
     });
@@ -596,41 +786,41 @@ describe("parseWorkflowRunArgs", () => {
       // pairwise refusals (dsh in the pi+hermes slice, hermes in the pi+dsh
       // slice) are superseded by this explicit acceptance assertion.
       for (const harness of ["pi", "hermes", "dsh"] as const) {
-        const result = parseWorkflowRunArgs(["task", `--${harness}-as-harness`, "--matchlock", "vic/ml"]);
+        const result = parseWorkflowRunArgs(["task", `--${harness}-as-harness`, "--matchlock-image", "vic/ml"]);
         assert.equal(result.matchlockImage, "vic/ml");
         assert.equal(result.harnessAs, harness);
       }
     });
 
-    it("allows --matchlock IMAGE with --dsh-as-harness (MTLK-DSH-EXEC US-002)", () => {
+    it("allows --matchlock-image IMAGE with --dsh-as-harness (MTLK-DSH-EXEC US-002)", () => {
       const result = parseWorkflowRunArgs([
         "task",
-        "--matchlock", "vic/ml:latest",
+        "--matchlock-image", "vic/ml:latest",
         "--dsh-as-harness",
       ]);
       assert.equal(result.matchlockImage, "vic/ml:latest");
       assert.equal(result.harnessAs, "dsh");
     });
 
-    it("allows --matchlock=IMAGE with --dsh-as-harness (order independent)", () => {
+    it("allows --matchlock-image=IMAGE with --dsh-as-harness (order independent)", () => {
       const result = parseWorkflowRunArgs([
         "--dsh-as-harness",
-        "--matchlock=vic/ml:latest",
+        "--matchlock-image=vic/ml:latest",
         "task",
       ]);
       assert.equal(result.matchlockImage, "vic/ml:latest");
       assert.equal(result.harnessAs, "dsh");
     });
 
-    it("still parses --dsh-as-harness WITHOUT --matchlock (native dsh unchanged)", () => {
+    it("still parses --dsh-as-harness WITHOUT an opt-in (native dsh unchanged)", () => {
       const result = parseWorkflowRunArgs(["task", "--dsh-as-harness"]);
       assert.equal(result.matchlockImage, undefined);
       assert.equal(result.harnessAs, "dsh");
     });
 
-    it("rejects --matchlock where the value is another recognized option even for dsh", () => {
+    it("rejects --matchlock-image where the value is another recognized option even for dsh", () => {
       assert.throws(
-        () => parseWorkflowRunArgs(["--matchlock", "--dsh-as-harness"]),
+        () => parseWorkflowRunArgs(["--matchlock-image", "--dsh-as-harness"]),
         /is an option, not an image/,
       );
     });
@@ -645,7 +835,7 @@ describe("parseWorkflowRunArgs", () => {
   // MTLK-VM-SIZE US-002: the three raw VM-size overrides.
   describe("--matchlock size flags", () => {
     const parseWithImage = (sizeArgs: string[]) =>
-      parseWorkflowRunArgs(["Build feature", "--matchlock", "vic/ml", ...sizeArgs]);
+      parseWorkflowRunArgs(["Build feature", "--matchlock-image", "vic/ml", ...sizeArgs]);
 
     it("parses all three space forms into raw strings", () => {
       const result = parseWithImage([
@@ -670,7 +860,7 @@ describe("parseWorkflowRunArgs", () => {
     });
 
     it("size fields are undefined when the flags are absent", () => {
-      const result = parseWorkflowRunArgs(["Build feature", "--matchlock", "vic/ml"]);
+      const result = parseWorkflowRunArgs(["Build feature", "--matchlock-image", "vic/ml"]);
       assert.equal(result.matchlockCpus, undefined);
       assert.equal(result.matchlockMemory, undefined);
       assert.equal(result.matchlockDisk, undefined);
@@ -690,7 +880,7 @@ describe("parseWorkflowRunArgs", () => {
         assert.throws(
           () =>
             parseWorkflowRunArgs([
-              "task", "--matchlock", "img",
+              "task", "--matchlock-image", "img",
               header, value, header, value,
             ]),
           new RegExp(`Duplicate ${header}`),
@@ -725,7 +915,7 @@ describe("parseWorkflowRunArgs", () => {
         "--matchlock-disk",
       ] as const) {
         assert.throws(
-          () => parseWorkflowRunArgs(["task", "--matchlock", "img", `${header}=`]),
+          () => parseWorkflowRunArgs(["task", "--matchlock-image", "img", `${header}=`]),
           new RegExp(`Missing value for ${header}`),
         );
       }
@@ -737,25 +927,23 @@ describe("parseWorkflowRunArgs", () => {
         /is an option, not a value/,
       );
       assert.throws(
-        () => parseWorkflowRunArgs(["task", "--matchlock", "img", "--matchlock-disk=--pi-as-harness"]),
+        () => parseWorkflowRunArgs(["task", "--matchlock-image", "img", "--matchlock-disk=--pi-as-harness"]),
         /is an option, not a value/,
       );
     });
 
-    it("'--matchlock --matchlock-cpus 4' does not consume the flag as the image and reports the missing-image error", () => {
-      assert.throws(
-        () => parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-cpus", "4"]),
-        /Missing value for --matchlock/,
-      );
-      // The partial-run guard: the size flag is treated as an option, never
-      // as the image.
-      assert.throws(
-        () => parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-cpus=4"]),
-        /Missing value for --matchlock/,
-      );
+    it("'--matchlock --matchlock-cpus 4' treats --matchlock as a boolean (never consumes the size flag)", () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-cpus", "4"]);
+      assert.equal(result.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
+      assert.equal(result.matchlockImageSource, "standard");
+      assert.equal(result.matchlockCpus, "4");
+      assert.equal(result.taskTitle, "task");
+
+      const equals = parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-cpus=4"]);
+      assert.equal(equals.matchlockCpus, "4");
     });
 
-    it("rejects a size flag supplied without --matchlock", () => {
+    it("rejects a size flag supplied without an opt-in", () => {
       for (const [header, value] of [
         ["--matchlock-cpus", "4"],
         ["--matchlock-memory", "4096"],
@@ -763,15 +951,15 @@ describe("parseWorkflowRunArgs", () => {
       ] as const) {
         assert.throws(
           () => parseWorkflowRunArgs(["task", header, value]),
-          new RegExp(`${header} requires --matchlock <image>`),
+          new RegExp(`${header} requires --matchlock or --matchlock-image <image>`),
         );
       }
     });
 
-    it("rejects an equals-form size flag supplied without --matchlock", () => {
+    it("rejects an equals-form size flag supplied without an opt-in", () => {
       assert.throws(
         () => parseWorkflowRunArgs(["task", "--matchlock-memory=4096"]),
-        /--matchlock-memory requires --matchlock <image>/,
+        /--matchlock-memory requires --matchlock or --matchlock-image <image>/,
       );
     });
 
@@ -783,11 +971,11 @@ describe("parseWorkflowRunArgs", () => {
       assert.equal(result.taskTitle, "task --matchlock-cpus 4");
     });
 
-    it("size flags combine with a harness opt-in and --matchlock", () => {
+    it("size flags combine with a harness opt-in and --matchlock-image", () => {
       const result = parseWorkflowRunArgs([
         "task",
         "--dsh-as-harness",
-        "--matchlock", "vic/ml",
+        "--matchlock-image", "vic/ml",
         "--matchlock-cpus", "4",
         "--matchlock-memory=8g",
       ]);
@@ -795,6 +983,188 @@ describe("parseWorkflowRunArgs", () => {
       assert.equal(result.matchlockImage, "vic/ml");
       assert.equal(result.matchlockCpus, "4");
       assert.equal(result.matchlockMemory, "8g");
+    });
+  });
+
+  // MTLK-SWAP US-006: `--matchlock-swap <MB|Ng>` (value-bearing, validated at
+  // parse time) and `--matchlock-no-swap` (pure boolean off switch).
+  describe("--matchlock swap flags (MTLK-SWAP)", () => {
+    const parseWithImage = (swapArgs: string[]) =>
+      parseWorkflowRunArgs(["Build feature", "--matchlock-image", "vic/ml", ...swapArgs]);
+
+    const hostProbe = {
+      onlineCpus: () => 8,
+      totalMemoryMB: () => 32768,
+    };
+
+    it("parses the space form with an opt-in and stores the raw value", () => {
+      const result = parseWithImage(["--matchlock-swap", "16384"]);
+      assert.equal(result.matchlockSwap, "16384");
+      assert.equal(result.matchlockNoSwap, undefined);
+    });
+
+    it("parses the equals form with an opt-in and stores the raw value", () => {
+      const result = parseWithImage(["--matchlock-swap=16384"]);
+      assert.equal(result.matchlockSwap, "16384");
+    });
+
+    it("accepts a <n>g value and the resolver reports 32768 MB", () => {
+      const result = parseWithImage(["--matchlock-swap", "32g"]);
+      assert.equal(result.matchlockSwap, "32g");
+      const resolved = resolveMatchlockResourceLimits({
+        swapMB: result.matchlockSwap,
+        env: {},
+        hostProbe,
+      });
+      assert.equal(resolved.swapMB, 32768);
+      assert.equal(resolved.sources.swapMB, "flag");
+    });
+
+    it("accepts the swap size with EITHER opt-in form", () => {
+      for (const optIn of [["--matchlock"], ["--matchlock-image", "vic/ml"]] as const) {
+        const result = parseWorkflowRunArgs(["task", ...optIn, "--matchlock-swap", "1024"]);
+        assert.equal(result.matchlockSwap, "1024");
+      }
+    });
+
+    it("rejects --matchlock-swap 0 with a message naming --matchlock-no-swap", () => {
+      for (const swapArgs of [
+        ["--matchlock-swap", "0"],
+        ["--matchlock-swap=0"],
+      ] as const) {
+        assert.throws(
+          () => parseWithImage([...swapArgs]),
+          (err: unknown) => {
+            assert.ok(err instanceof MatchlockResourceLimitError);
+            assert.match(err.message, /--matchlock-no-swap/);
+            return true;
+          },
+        );
+      }
+    });
+
+    it("rejects over-cap, negative, fractional and non-numeric values as typed errors", () => {
+      for (const [value, needle] of [
+        ["65537", /maximum swap of 65536 MB/],
+        ["-1", /expected a positive/],
+        ["1.5", /expected a positive/],
+        ["lots", /expected a positive/],
+      ] as const) {
+        assert.throws(
+          () => parseWithImage(["--matchlock-swap", value]),
+          (err: unknown) => {
+            assert.ok(err instanceof MatchlockResourceLimitError);
+            assert.match(err.message, needle);
+            return true;
+          },
+        );
+      }
+    });
+
+    it("accepts the 65536 MB cap exactly", () => {
+      const result = parseWithImage(["--matchlock-swap", "65536"]);
+      assert.equal(result.matchlockSwap, "65536");
+    });
+
+    it("rejects a duplicate --matchlock-swap (space, equals and mixed)", () => {
+      assert.throws(
+        () => parseWithImage(["--matchlock-swap", "1024", "--matchlock-swap", "2048"]),
+        /Duplicate --matchlock-swap/,
+      );
+      assert.throws(
+        () => parseWithImage(["--matchlock-swap=1024", "--matchlock-swap=2048"]),
+        /Duplicate --matchlock-swap/,
+      );
+      assert.throws(
+        () => parseWithImage(["--matchlock-swap", "1024", "--matchlock-swap=2048"]),
+        /Duplicate --matchlock-swap/,
+      );
+    });
+
+    it("rejects a missing and an empty --matchlock-swap value", () => {
+      assert.throws(
+        () => parseWithImage(["--matchlock-swap"]),
+        /Missing value for --matchlock-swap/,
+      );
+      assert.throws(
+        () => parseWithImage(["--matchlock-swap="]),
+        /Missing value for --matchlock-swap/,
+      );
+    });
+
+    it("never consumes a recognized flag as the --matchlock-swap value", () => {
+      assert.throws(
+        () => parseWithImage(["--matchlock-swap", "--wait"]),
+        /is an option, not a value/,
+      );
+      assert.throws(
+        () => parseWithImage(["--matchlock-swap=--wait"]),
+        /is an option, not a value/,
+      );
+    });
+
+    it("--matchlock-no-swap is a pure boolean yielding matchlockNoSwap true", () => {
+      const result = parseWithImage(["--matchlock-no-swap"]);
+      assert.equal(result.matchlockNoSwap, true);
+      assert.equal(result.matchlockSwap, undefined);
+      assert.equal(result.taskTitle, "Build feature");
+    });
+
+    it("--matchlock-no-swap NEVER consumes the following token", () => {
+      const result = parseWorkflowRunArgs([
+        "--matchlock",
+        "--matchlock-no-swap",
+        "do",
+        "the",
+        "thing",
+      ]);
+      assert.equal(result.matchlockNoSwap, true);
+      assert.equal(result.taskTitle, "do the thing");
+    });
+
+    it("rejects --matchlock-no-swap together with --matchlock-swap naming BOTH flags", () => {
+      for (const argv of [
+        ["Build feature", "--matchlock-image", "vic/ml", "--matchlock-swap", "1024", "--matchlock-no-swap"],
+        ["Build feature", "--matchlock-image", "vic/ml", "--matchlock-no-swap", "--matchlock-swap", "1024"],
+        ["Build feature", "--matchlock-image", "vic/ml", "--matchlock-swap=1024", "--matchlock-no-swap"],
+        ["Build feature", "--matchlock-image", "vic/ml", "--matchlock-no-swap", "--matchlock-swap=1024"],
+      ] as const) {
+        assert.throws(
+          () => parseWorkflowRunArgs([...argv]),
+          (err: unknown) => {
+            assert.match((err as Error).message, /--matchlock-swap/);
+            assert.match((err as Error).message, /--matchlock-no-swap/);
+            return true;
+          },
+        );
+      }
+    });
+
+    it("rejects each swap flag without an opt-in with the dependent-flag message", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock-swap", "1024"]),
+        /--matchlock-swap requires --matchlock or --matchlock-image <image>/,
+      );
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock-no-swap"]),
+        /--matchlock-no-swap requires --matchlock or --matchlock-image <image>/,
+      );
+    });
+
+    it("swap flags after the -- separator are task text, not flags", () => {
+      const result = parseWorkflowRunArgs([
+        "task", "--", "--matchlock-swap", "1024", "--matchlock-no-swap",
+      ]);
+      assert.equal(result.matchlockSwap, undefined);
+      assert.equal(result.matchlockNoSwap, undefined);
+      assert.equal(result.taskTitle, "task --matchlock-swap 1024 --matchlock-no-swap");
+    });
+
+    it("names the first supplied dependent flag when the opt-in is missing", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock-swap", "1024", "--matchlock-cpus", "4"]),
+        /--matchlock-swap requires --matchlock or --matchlock-image <image>/,
+      );
     });
   });
 
@@ -814,11 +1184,11 @@ describe("parseWorkflowRunArgs", () => {
       }
     }
 
-    it("parses repeated space-form entries alongside --matchlock", () => {
+    it("parses repeated space-form entries alongside --matchlock-image", () => {
       withEnv(undefined, () => {
         const result = parseWorkflowRunArgs([
           "Build feature",
-          "--matchlock", "vic/ml",
+          "--matchlock-image", "vic/ml",
           "--matchlock-allow-private", "192.168.107.74:8888",
           "--matchlock-allow-private", "registry.internal.example",
         ]);
@@ -835,7 +1205,7 @@ describe("parseWorkflowRunArgs", () => {
       withEnv(undefined, () => {
         const result = parseWorkflowRunArgs([
           "task",
-          "--matchlock=vic/ml",
+          "--matchlock-image=vic/ml",
           "--matchlock-allow-private=10.0.0.0/8",
           "--matchlock-allow-private=[2001:db8::1]:443",
         ]);
@@ -847,7 +1217,7 @@ describe("parseWorkflowRunArgs", () => {
       withEnv(undefined, () => {
         const result = parseWorkflowRunArgs([
           "task",
-          "--matchlock", "vic/ml",
+          "--matchlock-image", "vic/ml",
           "--matchlock-allow-private", "  example.com ",
           "--matchlock-allow-private", "example.com",
           "--matchlock-allow-private", "10.0.0.0/8",
@@ -858,14 +1228,14 @@ describe("parseWorkflowRunArgs", () => {
 
     it("is absent when neither the flag nor the env var is set", () => {
       withEnv(undefined, () => {
-        const result = parseWorkflowRunArgs(["task", "--matchlock", "vic/ml"]);
+        const result = parseWorkflowRunArgs(["task", "--matchlock-image", "vic/ml"]);
         assert.equal(result.matchlockAllowPrivate, undefined);
       });
     });
 
     it("falls back to the comma-separated env default when the flag is absent", () => {
       withEnv(" 192.168.107.74:8888 , registry.internal.example ,, ", () => {
-        const result = parseWorkflowRunArgs(["task", "--matchlock", "vic/ml"]);
+        const result = parseWorkflowRunArgs(["task", "--matchlock-image", "vic/ml"]);
         assert.deepEqual(result.matchlockAllowPrivate, [
           "192.168.107.74:8888",
           "registry.internal.example",
@@ -877,14 +1247,14 @@ describe("parseWorkflowRunArgs", () => {
       withEnv("env-only.example", () => {
         const result = parseWorkflowRunArgs([
           "task",
-          "--matchlock", "vic/ml",
+          "--matchlock-image", "vic/ml",
           "--matchlock-allow-private", "flag-only.example",
         ]);
         assert.deepEqual(result.matchlockAllowPrivate, ["flag-only.example"]);
       });
     });
 
-    it("ignores the env default (even an invalid one) without --matchlock", () => {
+    it("ignores the env default (even an invalid one) without an opt-in", () => {
       withEnv("10.0.0.0/99", () => {
         const result = parseWorkflowRunArgs(["task"]);
         assert.equal(result.matchlockAllowPrivate, undefined);
@@ -897,7 +1267,7 @@ describe("parseWorkflowRunArgs", () => {
           () =>
             parseWorkflowRunArgs([
               "task",
-              "--matchlock", "vic/ml",
+              "--matchlock-image", "vic/ml",
               "--matchlock-allow-private", "10.0.0.0/99",
             ]),
           (err: unknown) => {
@@ -912,7 +1282,7 @@ describe("parseWorkflowRunArgs", () => {
           () =>
             parseWorkflowRunArgs([
               "task",
-              "--matchlock", "vic/ml",
+              "--matchlock-image", "vic/ml",
               "--matchlock-allow-private", "host:70000",
             ]),
           /host:70000/,
@@ -923,7 +1293,7 @@ describe("parseWorkflowRunArgs", () => {
     it("rejects an invalid env entry, naming the entry and the env var", () => {
       withEnv("ok.example,10.0.0.0/99", () => {
         assert.throws(
-          () => parseWorkflowRunArgs(["task", "--matchlock", "vic/ml"]),
+          () => parseWorkflowRunArgs(["task", "--matchlock-image", "vic/ml"]),
           (err: unknown) => {
             const message = (err as Error).message;
             return message.includes("TAMANDUA_MATCHLOCK_ALLOW_PRIVATE") &&
@@ -933,22 +1303,22 @@ describe("parseWorkflowRunArgs", () => {
       });
     });
 
-    it("rejects the flag without --matchlock, naming the flag", () => {
+    it("rejects the flag without an opt-in, naming the flag", () => {
       withEnv(undefined, () => {
         assert.throws(
           () => parseWorkflowRunArgs(["task", "--matchlock-allow-private", "10.0.0.0/8"]),
-          /--matchlock-allow-private requires --matchlock <image>/,
+          /--matchlock-allow-private requires --matchlock or --matchlock-image <image>/,
         );
-        // The requires---matchlock usage error wins even when the entry is
-        // itself malformed, so no shape error masks the real problem.
+        // The requires-opt-in usage error wins even when the entry is itself
+        // malformed, so no shape error masks the real problem.
         assert.throws(
           () => parseWorkflowRunArgs(["task", "--matchlock-allow-private", "10.0.0.0/99"]),
-          /--matchlock-allow-private requires --matchlock <image>/,
+          /--matchlock-allow-private requires --matchlock or --matchlock-image <image>/,
         );
       });
     });
 
-    it("names the first supplied --matchlock-dependent flag when --matchlock is missing", () => {
+    it("names the first supplied --matchlock-dependent flag when the opt-in is missing", () => {
       withEnv(undefined, () => {
         assert.throws(
           () =>
@@ -957,7 +1327,7 @@ describe("parseWorkflowRunArgs", () => {
               "--matchlock-allow-private", "10.0.0.0/8",
               "--matchlock-cpus", "4",
             ]),
-          /--matchlock-allow-private requires --matchlock <image>/,
+          /--matchlock-allow-private requires --matchlock or --matchlock-image <image>/,
         );
         assert.throws(
           () =>
@@ -966,7 +1336,7 @@ describe("parseWorkflowRunArgs", () => {
               "--matchlock-cpus", "4",
               "--matchlock-allow-private", "10.0.0.0/8",
             ]),
-          /--matchlock-cpus requires --matchlock <image>/,
+          /--matchlock-cpus requires --matchlock or --matchlock-image <image>/,
         );
       });
     });
@@ -974,11 +1344,11 @@ describe("parseWorkflowRunArgs", () => {
     it("rejects a missing or empty value", () => {
       withEnv(undefined, () => {
         assert.throws(
-          () => parseWorkflowRunArgs(["task", "--matchlock", "vic/ml", "--matchlock-allow-private"]),
+          () => parseWorkflowRunArgs(["task", "--matchlock-image", "vic/ml", "--matchlock-allow-private"]),
           /Missing value for --matchlock-allow-private/,
         );
         assert.throws(
-          () => parseWorkflowRunArgs(["task", "--matchlock", "vic/ml", "--matchlock-allow-private="]),
+          () => parseWorkflowRunArgs(["task", "--matchlock-image", "vic/ml", "--matchlock-allow-private="]),
           /Missing value for --matchlock-allow-private/,
         );
       });
@@ -990,7 +1360,7 @@ describe("parseWorkflowRunArgs", () => {
           () =>
             parseWorkflowRunArgs([
               "task",
-              "--matchlock", "vic/ml",
+              "--matchlock-image", "vic/ml",
               "--matchlock-allow-private", "--wait",
             ]),
           /is an option, not an entry/,
@@ -999,7 +1369,7 @@ describe("parseWorkflowRunArgs", () => {
           () =>
             parseWorkflowRunArgs([
               "task",
-              "--matchlock", "vic/ml",
+              "--matchlock-image", "vic/ml",
               "--matchlock-allow-private=--pi-as-harness",
             ]),
           /is an option, not an entry/,
@@ -1007,12 +1377,16 @@ describe("parseWorkflowRunArgs", () => {
       });
     });
 
-    it("--matchlock does not consume --matchlock-allow-private as its image", () => {
+    it("'--matchlock --matchlock-allow-private ENTRY' is accepted (the boolean never consumes a value)", () => {
       withEnv(undefined, () => {
-        assert.throws(
-          () => parseWorkflowRunArgs(["task", "--matchlock", "--matchlock-allow-private", "10.0.0.0/8"]),
-          /Missing value for --matchlock/,
-        );
+        const result = parseWorkflowRunArgs([
+          "task",
+          "--matchlock",
+          "--matchlock-allow-private",
+          "10.0.0.0/8",
+        ]);
+        assert.equal(result.matchlockImage, STANDARD_MATCHLOCK_IMAGE);
+        assert.deepEqual(result.matchlockAllowPrivate, ["10.0.0.0/8"]);
       });
     });
 
@@ -1025,5 +1399,41 @@ describe("parseWorkflowRunArgs", () => {
         assert.equal(result.taskTitle, "task --matchlock-allow-private 10.0.0.0/8");
       });
     });
+  });
+});
+
+// MTLK-ISO-SLICE2 US-009 (R13): `workflow resume` shares only the
+// workdir-collision parser with `workflow run`, so the root-usage override
+// needs its OWN standalone pure-boolean parser there.
+describe("parseMatchlockRootUsageOverrideFlag (workflow resume)", () => {
+  it("is a standalone pure boolean: presence => true, absence => false", () => {
+    assert.equal(parseMatchlockRootUsageOverrideFlag([]), false);
+    assert.equal(parseMatchlockRootUsageOverrideFlag(["run-abc12345"]), false);
+    assert.equal(
+      parseMatchlockRootUsageOverrideFlag(["run-abc12345", MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG]),
+      true,
+    );
+  });
+
+  it("never consumes a following token and is idempotent on repeats", () => {
+    const next = "run-abc12345";
+    assert.equal(parseMatchlockRootUsageOverrideFlag([MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG, next]), true);
+    assert.equal(
+      parseMatchlockRootUsageOverrideFlag([
+        MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
+        MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
+      ]),
+      true,
+    );
+  });
+
+  it("does not match a lookalike flag token", () => {
+    assert.equal(
+      parseMatchlockRootUsageOverrideFlag([
+        "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs-nope",
+      ]),
+      false,
+    );
+    assert.equal(parseMatchlockRootUsageOverrideFlag(["--force-matchlock-usage-as-root"]), false);
   });
 });

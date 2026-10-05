@@ -64,6 +64,10 @@ import {
   resolveMatchlockHomeAliasWithOwner,
   type MatchlockOwnerResolverDeps,
 } from "./home-alias-owner.js";
+import {
+  assertMatchlockExecutionBoundary,
+  type MatchlockExecutionBoundarySeams,
+} from "./execution-boundary.js";
 
 // ── guest-path constants (probe gate + guest work prompt) ────────────────
 
@@ -164,6 +168,13 @@ export interface MatchlockSchedulerRound {
    */
   rpcEnv?: Record<string, string>;
   /**
+   * MTLK-ISO2-CORRECTIVE: the ONE resolved absolute matchlock binary path the
+   * execution-boundary probe verified for this round. Production sets it from
+   * `assertMatchlockExecutionBoundary` so the RPC transport launches EXACTLY
+   * the probed executable; tests may pin a fake path.
+   */
+  rpcBinaryPath?: string;
+  /**
    * US-008: host-attested merge context for an opted-in merge workflow's work
    * round. Built by the scheduler from immutable run scope (persisted policy
    * original root + the run's original branch + the run's finalize_merge step
@@ -171,6 +182,15 @@ export interface MatchlockSchedulerRound {
    * the `merge-branch` capability BEFORE any VM create.
    */
   merge?: HostMergeContext;
+  /**
+   * MTLK-ISO-SLICE2 US-004: execution-boundary seams (R13 effective-uid +
+   * fresh swap-capability probe). Production omits this — the boundary gate
+   * then consults the real executing-process `process.geteuid()` and the real
+   * US-001 probe against the resolved matchlock binary. Tests inject a
+   * deterministic uid and/or a journaling supporting/refusing probe so no real
+   * binary is spawned and no VM is created.
+   */
+  executionBoundary?: MatchlockExecutionBoundarySeams;
 }
 
 /**
@@ -293,6 +313,7 @@ function toDshSchedulerRound(round: MatchlockSchedulerRound): DshSchedulerRound 
     ...(round.suite ? { suite: round.suite } : {}),
     ...(round.merge ? { merge: round.merge } : {}),
     ...(round.rpcEnv ? { rpcEnv: round.rpcEnv } : {}),
+    ...(round.rpcBinaryPath ? { rpcBinaryPath: round.rpcBinaryPath } : {}),
   };
 }
 
@@ -364,7 +385,12 @@ export function buildMatchlockRoundRpcEnv(
  *     `setDshSchedulerRoundRunnerForTest` seam and the DSH_HOME/headless
  *     profile behavior).
  *
- * Every round first resolves the verified short-HOME alias and threads it as
+ * Every round first re-verifies the DAEMON execution boundary (MTLK-ISO-SLICE2
+ * US-004): the executing process's effective uid (R13 root gate) and a FRESH
+ * swap-capability probe against the same resolved matchlock binary the round
+ * will launch — before ANY VM, for pi, hermes and dsh alike (work AND probe
+ * rounds). A refusal throws a typed MatchlockRunnerError the scheduler
+ * force-fails. It then resolves the verified short-HOME alias and threads it as
  * `rpcEnv.HOME` into the Matchlock control child (item 1a). The daemon, the
  * harness process and the guest create-config env keep the REAL HOME.
  *
@@ -375,17 +401,41 @@ export function buildMatchlockRoundRpcEnv(
 export function runMatchlockSchedulerRound(
   round: MatchlockSchedulerRound,
 ): Promise<MatchlockSchedulerRoundResult> {
-  const kind = matchlockProductionRunnerKind(round.policy);
-  const rpcEnv = buildMatchlockRoundRpcEnv(round.rpcEnv);
-  const roundWithAliasHome: MatchlockSchedulerRound = { ...round, rpcEnv };
-  const routeOverride = productionRouteRunners.get(kind);
-  if (routeOverride) {
-    return routeOverride(roundWithAliasHome);
-  }
-  if (kind === "dsh") {
-    return runDshSchedulerRound(toDshSchedulerRound(roundWithAliasHome));
-  }
-  return (testRoundRunner ?? runProductionMatchlockRound)(roundWithAliasHome);
+  // MTLK-ISO-SLICE2 US-004: re-check the execution boundary BEFORE any VM. The
+  // probe runs afresh for every round; the persisted policy's recorded consent
+  // is the only thing that lets a root daemon proceed. Host process identity
+  // only — never a guest workload's uid.
+  return assertMatchlockExecutionBoundary(
+    round.policy,
+    round.identity,
+    {
+      ...(round.executionBoundary ?? {}),
+      // MTLK-ISO2-CORRECTIVE: resolve/probe for the EXACT environment of the
+      // round's RPC child so an RPC-specific PATH cannot diverge from the
+      // admission/default PATH.
+      env:
+        round.executionBoundary?.env ??
+        ({ ...process.env, ...(round.rpcEnv ?? {}) } as NodeJS.ProcessEnv),
+    },
+  ).then((resolvedBinaryPath) => {
+    const kind = matchlockProductionRunnerKind(round.policy);
+    const rpcEnv = buildMatchlockRoundRpcEnv(round.rpcEnv);
+    // Thread the ONE probed absolute path into the transport seam; the runners
+    // must never re-resolve it.
+    const roundWithAliasHome: MatchlockSchedulerRound = {
+      ...round,
+      rpcEnv,
+      rpcBinaryPath: resolvedBinaryPath,
+    };
+    const routeOverride = productionRouteRunners.get(kind);
+    if (routeOverride) {
+      return routeOverride(roundWithAliasHome);
+    }
+    if (kind === "dsh") {
+      return runDshSchedulerRound(toDshSchedulerRound(roundWithAliasHome));
+    }
+    return (testRoundRunner ?? runProductionMatchlockRound)(roundWithAliasHome);
+  });
 }
 
 // ── guest helper pack (host path for the RO /workspace/runtime mount) ────
@@ -705,6 +755,7 @@ async function runProductionMatchlockRound(
     // Item 1a: the matchlock CONTROL child runs with the verified short-HOME
     // alias; the guest create-config env and the harness keep the real HOME.
     ...(round.rpcEnv ? { rpcEnv: round.rpcEnv } : {}),
+    ...(round.rpcBinaryPath ? { rpcBinaryPath: round.rpcBinaryPath } : {}),
     // Bounded production stage budgets for cold real-VM invocation: a first
     // create/boot may legitimately exceed the generic 60s RPC deadline and a
     // cold guest bridge HELLO can exceed the default handshake window.
@@ -759,6 +810,7 @@ async function runProductionHermesRound(
     // alias; the FROZEN submission/homeDir and the guest harness keep the
     // real HOME.
     ...(round.rpcEnv ? { rpcEnv: round.rpcEnv } : {}),
+    ...(round.rpcBinaryPath ? { rpcBinaryPath: round.rpcBinaryPath } : {}),
     // FROZEN submission inputs (homeDir + HERMES_HOME snapshot + cwd
     // captured at run creation) — never daemon HOME/ambient state.
     submission: hermesSubmissionFromPolicy(round.policy),

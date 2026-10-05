@@ -7,6 +7,7 @@ import { getDb } from "../db.js";
 import { resolveHermesBinary } from "./hermes-resolver.js";
 import { resolveDshBinary } from "./dsh-resolver.js";
 import { parseRunContext as safeParseRunContext } from "./step-ops.js";
+import { parseMatchlockPolicy, MatchlockPolicyError, type ExecutionIsolation } from "./matchlock/policy.js";
 
 export const RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY = "working_directory_for_harness";
 
@@ -38,19 +39,37 @@ function readNonEmptyString(record: Record<string, unknown>, key: string): strin
 }
 
 /**
- * True when a persisted `runs.matchlock_policy` raw value parses as a
- * harness:"hermes" policy (the guest image supplies hermes inside the VM).
- * Malformed/unparseable values return false (fail closed — the strict policy
- * parser at dispatch refuses them anyway).
+ * Classify a persisted `runs.matchlock_policy` raw value for the failed-run
+ * resume / registration validation input (spec C §4.6 consumer audit).
+ *
+ * The classification is by EXPLICIT non-NULL-ness — `raw === null ||
+ * raw === undefined` is the ONLY native case — never truthiness. An
+ * empty-string (or whitespace, or any non-NULL value that does not parse as a
+ * usable policy) is a non-NULL Matchlock policy, NOT a native run.
+ *
+ * True is returned only for a usable harness:"hermes" policy (the guest image
+ * supplies hermes inside the VM, so no host hermes binary is required). A
+ * non-NULL value that cannot be parsed as a usable policy THROWS: the run
+ * fails closed instead of falling through to native host-harness resolution.
  */
 function isMatchlockHermesPolicy(raw: string | null | undefined): boolean {
-  if (!raw || raw.trim() === "") return false;
+  if (raw === null || raw === undefined) return false;
+  let policy: ExecutionIsolation;
   try {
-    const parsed = JSON.parse(raw) as { harness?: unknown };
-    return parsed?.harness === "hermes";
-  } catch {
-    return false;
+    policy = parseMatchlockPolicy(raw);
+  } catch (err) {
+    // MTLK-ISO2-CORRECTIVE (F5): never propagate the raw parser message — it
+    // can embed fragments of the stored policy, and this error reaches
+    // `scheduling_error` and the status/refusal output. The typed code is the
+    // only safe, allow-listed detail; the dedicated STATUS-UNUSABLE field
+    // derives the sanitized explanation separately.
+    const code =
+      err instanceof MatchlockPolicyError ? err.code : "policy_json_invalid";
+    throw new Error(
+      `stored Matchlock policy is present but unusable (${code}); refusing to treat the run as native`,
+    );
   }
+  return policy.harness === "hermes";
 }
 
 function readCurrentGitBranch(workdir: string): string {

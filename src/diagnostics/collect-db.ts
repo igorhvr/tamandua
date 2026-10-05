@@ -230,9 +230,12 @@ export function collectDbRows(
     runParams,
     (row) => {
       const projected = projectRow(row, RUN_COLUMNS);
+      // MTLK-ISO2-CORRECTIVE: classify by explicit non-NULL-ness. A
+      // non-NULL empty/whitespace policy is an isolation record that is
+      // unusable, never a native (absent) run.
       const policyPresent =
-        typeof projected.matchlock_policy === "string" &&
-        projected.matchlock_policy.length > 0;
+        projected.matchlock_policy !== null &&
+        projected.matchlock_policy !== undefined;
       delete projected.matchlock_policy;
       projected.matchlock_policy_present = policyPresent;
       return projected;

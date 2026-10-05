@@ -726,6 +726,12 @@ export function buildMatchlockCreateConfig(
       cpus: policy.resourceLimits.cpus,
       memory_mb: policy.resourceLimits.memoryMB,
       disk_size_mb: policy.resourceLimits.diskSizeMB,
+      // MTLK-SWAP (spec B §4.5): forward the admitted swap size ONLY when swap
+      // is enabled. 0 means off and matchlock's `resources.swap_mb` is
+      // omitempty, so the key must be absent (never `swap_mb: 0`). tamandua
+      // NEVER emits kernel args (swap + custom kernel args is rejected by
+      // matchlock).
+      ...(policy.resourceLimits.swapMB > 0 ? { swap_mb: policy.resourceLimits.swapMB } : {}),
     },
     // Network boundary: public destinations are allowed; private, loopback,
     // link-local, CGNAT and Yggdrasil destinations (including IPv6) stay

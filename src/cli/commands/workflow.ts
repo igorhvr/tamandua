@@ -7,12 +7,35 @@
 
 import { installWorkflow } from "../../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../../installer/uninstall.js";
-import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, forceFailRun, readHarnessProbeFailureBlock, buildWorkflowStatusJson } from "../../installer/status.js";
+import {
+  getWorkflowStatus,
+  listRuns,
+  stopWorkflow,
+  deleteWorkflow,
+  forceFailRun,
+  readHarnessProbeFailureBlock,
+  buildWorkflowStatusJson,
+  formatMatchlockPolicyUnusableStatusLine,
+  MATCHLOCK_PREPARING_STATUS_LINE,
+} from "../../installer/status.js";
 import { runWorkflow, resumeWorkflow, type ResumeResult, type RunWorkflowResult } from "../../installer/run.js";
 import {
   resolveMatchlockResourceLimits,
   formatMatchlockResourceSummary,
+  MATCHLOCK_DEFAULT_SWAP_MB,
+  MATCHLOCK_MAX_SWAP_MB,
+  MATCHLOCK_SWAP_ENV,
 } from "../../installer/matchlock/resource-limits.js";
+import {
+  STANDARD_MATCHLOCK_IMAGE,
+  MATCHLOCK_IMAGE_ENV,
+} from "../../installer/matchlock/standard-image.js";
+import {
+  buildWorkflowWarnings,
+  parseWorkflowWarnings,
+  withWorkflowWarnings,
+  writeWorkflowWarningsToStderr,
+} from "../../installer/matchlock/warnings.js";
 import { listBundledWorkflows } from "../../installer/workflow-fetch.js";
 import { loadWorkflowSpec } from "../../installer/workflow-spec.js";
 import { resolveBundledWorkflowDir } from "../../installer/paths.js";
@@ -21,7 +44,7 @@ import os from "node:os";
 import { pauseRunWithDaemon, resumeRunWithDaemon } from "../../server/control-client.js";
 import { buildAbandonReasonAggregate } from "../../installer/step-ops.js";
 import { checkCatalogStalenessWarning } from "../../installer/catalog-version.js";
-import { parseWorkflowRunArgs, parseWorkdirCollisionPolicyFlags } from "../workflow-run-args.js";
+import { parseWorkflowRunArgs, parseWorkdirCollisionPolicyFlags, parseMatchlockRootUsageOverrideFlag } from "../workflow-run-args.js";
 import { reportUnknownCommand } from "../shared.js";
 import { logger } from "../../lib/logger.js";
 import type { HarnessType } from "../../installer/types.js";
@@ -42,6 +65,7 @@ import {
   formatSharedWorkdirWarning,
   type WorkdirCollisionPolicy,
 } from "../../installer/workdir-collision.js";
+import { sanitizeSchedulingError } from "../../installer/scheduling-error.js";
 
 export function getWorkflowListHelp(): string {
   return `tamandua workflow list — List available bundled workflows with descriptions
@@ -195,7 +219,7 @@ Options:
   --hermes-as-harness
       Use hermes as the agent harness instead of pi.
       Mutually exclusive with --pi-as-harness and --dsh-as-harness.
-      With --matchlock <image>, the run executes the IMAGE's hermes inside a
+      Under a Matchlock opt-in, the run executes the IMAGE's hermes inside a
       fresh Matchlock VM. The effective Hermes config root/profile (default,
       named or custom HERMES_HOME) is resolved from the SUBMISSION
       environment (HOME / HERMES_HOME / cwd at run creation) — never the
@@ -220,14 +244,46 @@ Options:
       ~/.dsh, or the explicit DSH_HOME with relative/tilde semantics),
       mounts the WHOLE frozen home read-write at /workspace/config/dsh and
       runs the image's dsh headless in a fresh VM per probe/work round.
-  --matchlock <image>
-      Run the workflow inside a Matchlock VM using the given image
-      (also accepted as --matchlock=<image>). The image is MANDATORY and
-      operator-supplied: there is no default image, no host fallback, and
-      passing the flag is the ONLY way to opt in. No env var, workflow YAML,
-      agent output, or MCP/API default activates Matchlock; without
-      --matchlock the run uses the native path and performs zero Matchlock
-      actions.
+  Matchlock (VM isolation):
+    --matchlock                     Run isolated with the standard image
+                                    (igorhvr/tamandua, multi-arch; provisioned
+                                    by tamandua matchlock setup)
+    --matchlock-image <image>       Run isolated with an explicit image
+                                    (must already be in the local matchlock
+                                    store; tamandua never fetches at launch)
+  --matchlock
+      Opt in to Matchlock with the standard image ${STANDARD_MATCHLOCK_IMAGE}.
+      A pure boolean: it never consumes a following token, so it can appear
+      anywhere on the command line with zero ambiguity. The standard image is
+      multi-arch; "tamandua matchlock setup" provisions this host by pulling
+      the host-architecture variant, and admission pins the resolved
+      variant's content+config identity before the run can be scheduled.
+      --matchlock and --matchlock-image <image> are the ONLY two opt-in
+      forms; nothing is implicit. No other flag, env var, workflow YAML,
+      agent output, or MCP/API default activates Matchlock, and there is no
+      host fallback; without an opt-in the run uses the native path and
+      performs zero Matchlock actions.
+      A bare --matchlock resolves no image at launch: if the standard image
+      (or the ${MATCHLOCK_IMAGE_ENV} override) is absent from the local
+      matchlock store, admission refuses the run and marks it failed with the
+      "tamandua matchlock setup" remedy (or pass an explicit already-imported
+      image with --matchlock-image <image>); nothing runs natively. NO code
+      path fetches or builds an image at launch.
+      ${MATCHLOCK_IMAGE_ENV} overrides the standard reference for a host
+      (e.g. a registry mirror or a hardened internal rebuild). It is
+      consulted only when an opt-in is present and no explicit image was
+      given: set without an opt-in it is ignored, exactly like the existing
+      TAMANDUA_MATCHLOCK_CPUS / _MEMORY_MB / _DISK_MB / _ALLOW_PRIVATE /
+      _SWAP_MB env defaults. Precedence is
+      --matchlock-image <image> > ${MATCHLOCK_IMAGE_ENV} > built-in
+      ${STANDARD_MATCHLOCK_IMAGE}.
+      Matchlock runs refuse to execute as root by default: matchlock is
+      documented to run unprivileged (sudo is for its one-time host
+      preparation only, never for running matchlock itself) and "tamandua
+      matchlock setup" exists precisely so matchlock never needs root later.
+      If you insist, re-run with
+      --force-matchlock-usage-as-root-not-recommended-per-matchlock-docs
+      (a dependent flag: it also requires an opt-in).
       Supported harnesses under --matchlock: pi-as-harness (default) and --dsh-as-harness,
       and hermes with --hermes-as-harness; all three are admitted with --matchlock.
       An opted-in run is admitted and pinned at submission: the selected
@@ -286,22 +342,36 @@ Options:
       missing capability or mechanism, never a blanket allow-list message;
       custom/unknown workflow ids fail closed. There is no blanket allow-list.
       This is not completed overall workflow support.
+  --matchlock-image <image>
+      Opt in to Matchlock with an explicit, operator-supplied image
+      (also accepted as --matchlock-image=<image>). The value must be a
+      non-empty image reference; a following recognized flag is never
+      consumed as the value. The image must already be present in the local
+      matchlock store: tamandua never fetches or builds an image at launch,
+      and a store miss refuses the run with the import or
+      "tamandua matchlock setup" remedy (nothing runs natively).
+      --matchlock-image always wins over a bare --matchlock when both are
+      given (passing just one is recommended). The Matchlock semantics
+      documented under --matchlock above (harnesses, admitted workflows, VM
+      freshness, guest helper pack, pinning and refusals) apply to both
+      opt-in forms.
   --matchlock-cpus <n>
       VM vCPU count for an opted-in Matchlock run. A positive integer.
-      Requires --matchlock <image>; without it the flag is a usage error.
+      Requires --matchlock or --matchlock-image <image>; without an opt-in
+      the flag is a usage error.
       Built-in default: min(8, host online CPUs). Explicit values (flag or
       env) are ALWAYS clamped to at most 16 vCPUs (a standing project rule)
       and at most the host's online CPU count.
   --matchlock-memory <MB|Ng>
       VM memory for an opted-in Matchlock run. A positive integer number of
       MB, or a '<n>g' suffix meaning n*1024 MB (e.g. 16g = 16384 MB).
-      Requires --matchlock <image>. Built-in default: min(16384 MB, 50% of
+      Requires --matchlock or --matchlock-image <image>. Built-in default: min(16384 MB, 50% of
       host MemTotal); explicit values are ALWAYS clamped to at most 75% of
       host MemTotal.
   --matchlock-disk <MB|Ng>
       VM disk size for an opted-in Matchlock run. A positive integer number
       of MB, or a '<n>g' suffix meaning n*1024 MB (e.g. 40g = 40960 MB).
-      Requires --matchlock <image>. Built-in default: 20480 MB; the value
+      Requires --matchlock or --matchlock-image <image>. Built-in default: 20480 MB; the value
       must be a finite positive number.
       Env defaults (read at launch, only when the flag is absent):
       TAMANDUA_MATCHLOCK_CPUS, TAMANDUA_MATCHLOCK_MEMORY_MB and
@@ -309,6 +379,26 @@ Options:
       built-in default; env values are clamped by the same caps as flags.
       The resolved limits are printed at launch and recorded in the run
       policy.
+  --matchlock-swap <MB|Ng>
+      Swap size for every VM of an opted-in Matchlock run. A positive integer
+      number of MB, or a '<n>g' suffix meaning n*1024 MB (e.g. 8g = 8192 MB).
+      Built-in default: ${MATCHLOCK_DEFAULT_SWAP_MB} MB on every Matchlock VM.
+      Maximum: ${MATCHLOCK_MAX_SWAP_MB} MB (matchlock's cap). 0 is not a valid
+      value — swap is disabled with --matchlock-no-swap, and the error for 0
+      points at that off switch.
+      Requires --matchlock or --matchlock-image <image>; without an opt-in
+      the flag is a usage error. Env default (read at launch, only when the
+      flag is absent): ${MATCHLOCK_SWAP_ENV}, a size or the literal "off"
+      (case-insensitive) meaning swap disabled. Precedence:
+      --matchlock-no-swap > --matchlock-swap > ${MATCHLOCK_SWAP_ENV} >
+      built-in ${MATCHLOCK_DEFAULT_SWAP_MB} MB. Without an opt-in the env var
+      is ignored too.
+  --matchlock-no-swap
+      Disable swap entirely for the opted-in Matchlock run (the persisted
+      policy records swapMB 0). A pure boolean: it never consumes a following
+      token. Mutually exclusive with --matchlock-swap. Requires --matchlock
+      or --matchlock-image <image>. Env equivalent:
+      ${MATCHLOCK_SWAP_ENV}=off.
   --matchlock-allow-private <entry>
       Per-run exception list of private destinations the opted-in Matchlock
       VM may reach; mapped to the Matchlock network.allow_private policy.
@@ -316,7 +406,8 @@ Options:
       occurrence appends one entry, duplicates are deduped, and the resolved
       list is persisted in the run's Matchlock policy so every round, retry
       and resume of the run reaches the same destinations.
-      Requires --matchlock <image>; without it the flag is a usage error.
+      Requires --matchlock or --matchlock-image <image>; without an opt-in
+      the flag is a usage error.
       An entry is a host name, an IPv4/IPv6 literal or CIDR, optionally
       suffixed with :port (a bracketed IPv6 destination uses [addr]:port; a
       bare IPv6 literal carries no port). Entries are validated by SHAPE at
@@ -351,6 +442,8 @@ Options:
       object after the run completes.
 
 Examples:
+  tamandua workflow run feature-dev-merge "Add dark mode toggle" --matchlock
+  tamandua workflow run feature-dev-merge "Add dark mode toggle" --matchlock-image registry.acme/jail:2
   tamandua workflow run feature-dev-merge "Add dark mode toggle"
   tamandua workflow run feature-dev-merge "Refactor DB layer" \\
       --no-hurry-please-save-tokens-mode
@@ -521,13 +614,27 @@ Options:
       this flag.
       Worktree workflow variants (-worktree) never collide: each run gets
       its own worktree.
+  --force-matchlock-usage-as-root-not-recommended-per-matchlock-docs
+      R13 root-usage override (Matchlock runs only). A STANDALONE pure
+      boolean: it never consumes a following token. Matchlock is documented
+      to run unprivileged, so a root process resumes a consent-less
+      Matchlock run only when this override was passed to THIS resume (or
+      when the run's persisted policy already records rootUsageConsent).
+      The override is honored only when the target run carries a non-NULL
+      persisted Matchlock policy: passing it for a truly native run (no
+      isolation intent, no policy) is refused, an intent-only row is routed
+      to preparation recovery (never native), and a present-but-unusable
+      policy refuses on the STATUS-UNUSABLE path before consent is
+      consulted. A refused resume preserves the run's prior state.
 
 Examples:
   tamandua workflow resume run-abc12345   # Resume a paused run
   tamandua workflow resume run-abc12345   # Cancel a pending drain / re-start a failed run
   tamandua workflow resume run-abc12345 --queue-behind-holder
   tamandua workflow resume run-abc12345 \\
-      --allow-multiple-runs-in-one-working-directory`;
+      --allow-multiple-runs-in-one-working-directory
+  tamandua workflow resume run-abc12345 \\
+      --force-matchlock-usage-as-root-not-recommended-per-matchlock-docs`;
 }
 
 export function getWorkflowPauseAllHelp(): string {
@@ -699,6 +806,25 @@ function buildWorkflowRunJsonOutput(
         cpus: result.matchlockResourceLimits.cpus,
         memoryMB: result.matchlockResourceLimits.memoryMB,
         diskSizeMB: result.matchlockResourceLimits.diskSizeMB,
+        // SHARED-V3 (MTLK-ISO-SLICE2 US-012): the swap size and provenance also
+        // come from the ADMITTED policy (the launch-resolved values are the same
+        // for a fresh opt-in, but the admitted policy is authoritative).
+        swapMB: result.matchlockResourceLimits.swapMB,
+        ...(result.matchlockImageSource
+          ? { imageSource: result.matchlockImageSource }
+          : {}),
+      };
+    }
+    // SHARED-V3 (MTLK-ISO-SLICE2 US-012): fold the admitted immutable pin into
+    // the SAME post-admission JSON document so `matchlockResources` carries the
+    // full uniform field set (imageSource, swapMB, imageDigest,
+    // imageConfigDigest) for an isolated run. The pre-admission launch block
+    // cannot know the digests; this document is printed after run creation.
+    if (resolution.matchlockResources && result.matchlockPin) {
+      resolution.matchlockResources = {
+        ...resolution.matchlockResources,
+        imageDigest: result.matchlockPin.digest,
+        imageConfigDigest: result.matchlockPin.configDigest,
       };
     }
     jsonOutput.resolution = resolution;
@@ -717,7 +843,16 @@ function buildWorkflowRunJsonOutput(
   }
   if (result.captureWarnings) jsonOutput.captureWarnings = result.captureWarnings;
 
-  return jsonOutput;
+  // MTLK-ISO-SLICE2 US-013: the shared top-level warnings channel is PRESENT
+  // only when non-empty (absent — never `[]` — on a clean launch). A launch
+  // whose admitted policy records root-usage consent gets `root_usage_override`,
+  // re-derived from the ADMITTED policy (an inherited replacement included).
+  return withWorkflowWarnings(
+    jsonOutput,
+    buildWorkflowWarnings({
+      rootUsageConsent: result.matchlockRootUsageConsent === true,
+    }),
+  );
 }
 
 export async function handleWorkflow(
@@ -908,10 +1043,26 @@ export async function handleWorkflow(
     // are simply paused follow the same daemon path; all other 'running'
     // runs stay refused below.
     const drainPending = runStatus === "running" && schedulingStatus === "draining_pause";
+    // MTLK-ISO-SLICE2 US-009 (R13): the deliberate root-usage override is a
+    // STANDALONE pure boolean for resume. It is threaded to the control plane
+    // for the paused/draining form; the failed-run form's consent is the
+    // follow-on story (US-010) and is not silently claimed here.
+    const rootUsageOverride = parseMatchlockRootUsageOverrideFlag(args);
     if (runStatus === "paused" || drainPending) {
-      const response = await resumeRunWithDaemon(fullId, cliIdentity);
+      const response = await resumeRunWithDaemon(fullId, cliIdentity, rootUsageOverride);
       if (response === null) {
         process.stderr.write("Daemon is unreachable. Is the daemon running? Try: tamandua daemon start\n");
+        process.exit(1);
+      }
+      // PREP-STATE: an intent-only row is held mid-preparation. The daemon
+      // returns the typed preparing-held 202; surface the shared remedy and
+      // fail instead of printing a false "Resumed run".
+      const body = response.body ?? {};
+      if (body.held === true || body.state === "preparing") {
+        const message = typeof body.message === "string"
+          ? body.message
+          : `Run run-${fullId.slice(0, 8)} is held mid-preparation and cannot be resumed natively.`;
+        process.stderr.write(`${message}\n`);
         process.exit(1);
       }
       if (response.status !== 200 && response.status !== 202) {
@@ -925,6 +1076,10 @@ export async function handleWorkflow(
       if (drainPending && response.body && response.body.drainCancelled === true) {
         process.stderr.write(`Warning: run run-${fullId.slice(0, 8)} had a pending drain in progress; plain resume cancels the drain.\n`);
       }
+      // MTLK-ISO-SLICE2 US-013: the shared advisory warnings channel the
+      // control plane returned in its resume JSON body (e.g.
+      // consent_granted_on_resume / root_usage_override). Advisory only.
+      writeWorkflowWarningsToStderr(parseWorkflowWarnings(response.body.warnings));
       console.log(`Resumed run run-${fullId.slice(0, 8)}.`);
       printNonDoneStepStates(fullId);
       return true;
@@ -948,13 +1103,31 @@ export async function handleWorkflow(
       // the throw escape to the top-level handler.
       let result: ResumeResult;
       try {
-        result = await resumeWorkflow(fullId, { workdirCollisionPolicy });
+        result = await resumeWorkflow(fullId, {
+          workdirCollisionPolicy,
+          ...(rootUsageOverride ? { matchlockRootUsageOverride: true } : {}),
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         process.stderr.write(`Failed to resume run: ${message}\n`);
         process.exit(1);
       }
       if (result.status === "not_found") { console.log(`No failed run found matching "${target}".`); return true; }
+      // MTLK-ISO-SLICE2 US-010 (R13): a typed Matchlock refusal on the
+      // failed-run path (truly-native + override, STATUS-UNUSABLE, root gate or
+      // the swap-capability handshake) preserves the run's prior state. The
+      // message already names the fact and the remedy.
+      if (result.status === "refused" && result.matchlockRefused) {
+        process.stderr.write(result.matchlockRefused.message + "\n");
+        process.exit(1);
+      }
+      // MTLK-ISO-SLICE2 US-008 (PREP-STATE): an intent-only run is held
+      // mid-preparation, never resumed natively. Surface the shared
+      // held/preparing remedy instead of the "Resumed run" confirmation.
+      if (result.status === "preparing" && result.preparingHeld) {
+        process.stderr.write(result.preparingHeld.message + "\n");
+        process.exit(1);
+      }
       // WORKDIR-FLAGS US-005: a refused harness-workdir collision is a typed,
       // distinct outcome. Write the daemon's actionable message (it already
       // names the holder and the three ways out) to stderr and exit with the
@@ -978,6 +1151,9 @@ export async function handleWorkflow(
       if (result.resetCount !== undefined && result.resetCount > 0) {
         console.log(`Reset ${result.resetCount} failed ${result.resetCount === 1 ? "story" : "stories"} to pending for resume.`);
       }
+      // MTLK-ISO-SLICE2 US-013: the shared advisory warnings channel from the
+      // failed-run resume (consent_granted_on_resume / root_usage_override).
+      writeWorkflowWarningsToStderr(result.warnings ?? []);
       printNonDoneStepStates(result.runId!);
       return true;
     }
@@ -1117,22 +1293,36 @@ export async function handleWorkflow(
           }
         : undefined;
 
-    // MTLK-VM-SIZE US-003: resolve + validate the VM resource limits at LAUNCH
-    // (flag > TAMANDUA_MATCHLOCK_* env > host-derived default, all capped). An
-    // invalid value exits non-zero BEFORE runWorkflow creates any run row.
-    let matchlockResourceLimits: { cpus: number; memoryMB: number; diskSizeMB: number } | undefined;
+    // MTLK-VM-SIZE US-003 / MTLK-SWAP US-008: resolve + validate the VM
+    // resource limits at LAUNCH (flag > TAMANDUA_MATCHLOCK_* env >
+    // host-derived default, all capped). The swap size rides the same
+    // resolver: `--matchlock-no-swap` > `--matchlock-swap` >
+    // TAMANDUA_MATCHLOCK_SWAP_MB (a size or `off`) > 8192. An invalid value
+    // (including an out-of-range/invalid swap env value) exits non-zero BEFORE
+    // runWorkflow creates any run row.
+    let matchlockResourceLimits:
+      | { cpus: number; memoryMB: number; diskSizeMB: number; swapMB: number }
+      | undefined;
     if (runArgs.matchlockImage !== undefined) {
       try {
         const resolved = resolveMatchlockResourceLimits({
           cpus: runArgs.matchlockCpus,
           memoryMB: runArgs.matchlockMemory,
           diskSizeMB: runArgs.matchlockDisk,
+          // MTLK-SWAP: raw `--matchlock-swap` value / `--matchlock-no-swap`
+          // boolean; both are validated here before any run row exists.
+          swapMB: runArgs.matchlockSwap,
+          noSwap: runArgs.matchlockNoSwap,
           env: process.env,
         });
         matchlockResourceLimits = {
           cpus: resolved.cpus,
           memoryMB: resolved.memoryMB,
           diskSizeMB: resolved.diskSizeMB,
+          // SHARED-V3 (MTLK-ISO-SLICE2 US-011): the resolved swap size (0 = off)
+          // is persisted on the run's policy AND rendered as `swap=<n>MB|off`
+          // on the combined launch line.
+          swapMB: resolved.swapMB,
         };
       } catch (err) {
         process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
@@ -1166,7 +1356,18 @@ export async function handleWorkflow(
     if (launchInfo && runArgs.matchlockImage !== undefined && matchlockResourceLimits) {
       launchInfo.matchlockResources = {
         image: runArgs.matchlockImage,
-        ...matchlockResourceLimits,
+        // SHARED-V3 (MTLK-ISO-SLICE2 US-011): the parser's REAL provenance
+        // ("explicit" | "standard") drives the ` (standard image)` marker, and
+        // the resolved swap size (0 = off) drives `swap=<n>MB|off` on the SAME
+        // combined line. The line describes the resolved LAUNCH configuration;
+        // the admitted pin is reported separately after admission succeeds.
+        ...(runArgs.matchlockImageSource
+          ? { imageSource: runArgs.matchlockImageSource }
+          : {}),
+        cpus: matchlockResourceLimits.cpus,
+        memoryMB: matchlockResourceLimits.memoryMB,
+        diskSizeMB: matchlockResourceLimits.diskSizeMB,
+        swapMB: matchlockResourceLimits.swapMB,
         // MTLK-ALLOW-PRIVATE (US-006): show the launch-resolved (flag > env)
         // exception list in the SAME resolved-launch block. Omitted entirely
         // when empty so the line/JSON stay byte-identical for a run that
@@ -1193,6 +1394,12 @@ export async function handleWorkflow(
       harnessType,
       workdirCollisionPolicy: runArgs.workdirCollisionPolicy,
       matchlockImage: runArgs.matchlockImage,
+      // MTLK-ISO-SLICE1 SHARED-V3: the parser's REAL image provenance
+      // ("explicit" | "standard") and the per-action root-usage override
+      // consent reach run creation so the persisted v3 policy is truthful
+      // (admission persists them; this slice adds no other behavior).
+      matchlockImageSource: runArgs.matchlockImageSource,
+      matchlockRootUsageOverride: runArgs.matchlockRootUsageOverride,
       matchlockHarness: runArgs.matchlockImage !== undefined && harnessType === "dsh" ? "dsh" : "pi",
       dshSubmission,
       matchlockResourceLimits,
@@ -1222,6 +1429,16 @@ export async function handleWorkflow(
         process.stderr.write(warning + "\n");
       }
     }
+    // MTLK-ISO-SLICE2 US-013: text mode prints the shared warnings channel to
+    // stderr as bounded one-liners (JSON mode carries the same entries inside
+    // its single stdout document instead).
+    if (!runArgs.jsonFlag) {
+      writeWorkflowWarningsToStderr(
+        buildWorkflowWarnings({
+          rootUsageConsent: result.matchlockRootUsageConsent === true,
+        }),
+      );
+    }
     // Build wait args for post-run blocking, if --wait is set
     let waitArgs: string[] | null = null;
     if (runArgs.wait) {
@@ -1233,12 +1450,23 @@ export async function handleWorkflow(
     // SKILL-UX S3 (US-003): --json emits ONE JSON document to stdout (the run
     // fields below plus the resolved launch facts, and the wait result merged
     // in when --wait is also given) instead of the human-readable Run: block.
-    // Text mode is byte-for-byte unchanged.
+    // Text mode keeps the resolved-launch block byte-identical for a native
+    // run; an opted-in run additionally prints the admitted pin below.
     const runJson = runArgs.jsonFlag
       ? buildWorkflowRunJsonOutput(result, launchInfo)
       : undefined;
 
     if (!runJson) {
+      // MTLK-ISO-SLICE2 US-011: the launch block prints BEFORE runWorkflow, so
+      // the admitted pin can only be reported now, AFTER admission succeeded.
+      // The DISTINCT `matchlock pinned:` prefix keeps the exactly-one
+      // `matchlock:` line invariant intact. --json folds the digests into its
+      // single post-creation document instead of emitting a text line.
+      if (result.matchlockPin) {
+        console.log(
+          `matchlock pinned: digest=${result.matchlockPin.digest} config=${result.matchlockPin.configDigest}`,
+        );
+      }
       if (result.daemonWarning) {
         let dashboardLine = "";
         try {
@@ -1304,13 +1532,29 @@ export async function handleWorkflow(
         console.log(JSON.stringify(jsonOutput));
         return true;
       }
+      // MTLK-ISO-SLICE2 US-013: text mode prints the shared warnings channel to
+      // stderr as bounded one-liners; the JSON branch above carries the same
+      // entries in the document instead.
+      writeWorkflowWarningsToStderr(
+        buildWorkflowWarnings({
+          rootUsageConsent: result.matchlockRootUsageConsent === true,
+        }),
+      );
       console.log(`Run: ${prefixRunId(result.id)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}`);
       // WORKDIR-QUEUE US-004: a run queued behind a busy harness workdir keeps
       // status 'running' with schedulingStatus 'waiting'. Print the stored
       // scheduling reason verbatim (e.g. "waiting for harness workdir held by
       // run <id>: <dir>") so the operator can tell waiting from dead.
-      if (result.schedulingStatus === "waiting" && result.schedulingError) {
-        console.log(`Scheduling: ${result.schedulingError}`);
+      //
+      // MTLK-ISO2-TRANSITION-CAS (Family C-1): the column is free-form, so the
+      // line is allow-listed through the shared classifier — a legacy raw
+      // parser fragment is dropped, never printed.
+      const sanitizedSchedulingError = sanitizeSchedulingError(
+        result.schedulingStatus,
+        result.schedulingError,
+      );
+      if (result.schedulingStatus === "waiting" && sanitizedSchedulingError) {
+        console.log(`Scheduling: ${sanitizedSchedulingError}`);
       }
       if (result.harnessType !== "pi") {
         const harnessLabel = result.harnessType === "dsh" ? "dsh (alpha)" : result.harnessType;
@@ -1318,6 +1562,12 @@ export async function handleWorkflow(
       }
       // MTLK-VM-SIZE US-004: show the resolved VM size for Matchlock runs using
       // the SAME formatter as the launch line so the two can never drift.
+      //
+      // MTLK-ISO-SLICE2 US-014 (four-state vocabulary): a non-NULL unusable
+      // policy renders its bounded typed STATUS-UNUSABLE line (never native,
+      // never a healthy isolated line); an intent-recorded run with a NULL
+      // policy renders its bounded PREPARING/held line. Native runs print
+      // neither (byte-identical).
       if (result.matchlockResources) {
         console.log(
           formatMatchlockResourceSummary(
@@ -1326,6 +1576,22 @@ export async function handleWorkflow(
             result.matchlockResources.allowPrivate,
           ),
         );
+        // MTLK-ISO2-CORRECTIVE (F7 / spec C §4.6): the isolated status display
+        // renders the resource line AND the persisted pinned digests. The
+        // distinct `matchlock pinned:` prefix keeps the exactly-one
+        // `matchlock:` line invariant intact.
+        if (
+          result.matchlockResources.imageDigest &&
+          result.matchlockResources.imageConfigDigest
+        ) {
+          console.log(
+            `matchlock pinned: digest=${result.matchlockResources.imageDigest} config=${result.matchlockResources.imageConfigDigest}`,
+          );
+        }
+      } else if (result.matchlockPolicyError) {
+        console.log(formatMatchlockPolicyUnusableStatusLine(result.matchlockPolicyError));
+      } else if (result.matchlockState === "preparing") {
+        console.log(MATCHLOCK_PREPARING_STATUS_LINE);
       }
       console.log(`Tokens: ${result.tokensSpent.toLocaleString()}`);
       if (result.redLedgerLanding) {

@@ -5,13 +5,18 @@
  * The run deliverable `/home/kaladin/matchlock-work/matchlock-vm-size-contract.json`
  * lives OUTSIDE the repository on purpose (it is never committed). This file
  * carries the validator the story's acceptance criterion 5 asks for:
- * `validateMatchlockVmSizeContract(value): string[]` parses the contract as
- * JSON and asserts it records the three `--matchlock-*` size flags and their
- * syntax, the three `TAMANDUA_MATCHLOCK_*` env defaults, the built-in defaults
- * (min(8, host CPUs) / min(16384 MB, 50% host RAM) / 20480 MB), the caps (16
- * vCPUs ALWAYS and host online CPUs; 75% host MemTotal; disk finite positive),
- * the explicit-flag/env clamping semantics, the persisted policy field
- * (`ExecutionIsolation.resourceLimits`, policy version stays 2), the launch
+ * `validateMatchlockVmSizeContract(value, options?): string[]` parses the
+ * contract as JSON and asserts it records the `--matchlock-*` size flags
+ * (including the MTLK-ISO-SLICE1 `--matchlock-swap` row) and their syntax, the
+ * `TAMANDUA_MATCHLOCK_*` env defaults (including `TAMANDUA_MATCHLOCK_SWAP_MB`),
+ * the built-in defaults
+ * (min(8, host CPUs) / min(16384 MB, 50% host RAM) / 20480 MB / swap 8192 MB),
+ * the caps (16
+ * vCPUs ALWAYS and host online CPUs; 75% host MemTotal; disk finite positive;
+ * the 65536 MB matchlock swap cap), the explicit-flag/env clamping semantics,
+ * the persisted policy field
+ * (`ExecutionIsolation.resourceLimits`, policy version 3 after the coordinated
+ * SHARED-V3 bump), the new opt-in `requires` wording, the launch
  * line and the workflow-status display, and the one-VM gate commands/exits
  * with the in-guest `nproc=4` / `MemTotal` evidence plus positive VM removal.
  *
@@ -29,6 +34,14 @@ export const MTLK_VM_SIZE_FLAGS = [
   "--matchlock-cpus",
   "--matchlock-memory",
   "--matchlock-disk",
+  "--matchlock-swap",
+] as const;
+
+/** The pre-MTLK-ISO-SLICE1 flag set (no swap row). */
+export const MTLK_VM_SIZE_LEGACY_FLAGS = [
+  "--matchlock-cpus",
+  "--matchlock-memory",
+  "--matchlock-disk",
 ] as const;
 
 export const MTLK_VM_SIZE_ENV_VARS = [
@@ -37,10 +50,38 @@ export const MTLK_VM_SIZE_ENV_VARS = [
   "TAMANDUA_MATCHLOCK_DISK_MB",
 ] as const;
 
+/** The swap env default MTLK-ISO-SLICE1 adds to every v3 contract. */
+export const MTLK_VM_SIZE_SWAP_ENV = "TAMANDUA_MATCHLOCK_SWAP_MB";
+
 export const MTLK_VM_SIZE_POLICY_FIELD = "ExecutionIsolation.resourceLimits";
-export const MTLK_VM_SIZE_POLICY_VERSION = 2;
+export const MTLK_VM_SIZE_POLICY_VERSION = 3;
+/** The pre-MTLK-ISO-SLICE1 policy version (swap-off v2 records). */
+export const MTLK_VM_SIZE_LEGACY_POLICY_VERSION = 2;
+/** The MTLK-ISO-SLICE1 opt-in grammar every `requires` field must carry. */
+export const MTLK_VM_SIZE_REQUIRES = "--matchlock or --matchlock-image <image>";
+/** The retired opt-in grammar still read from a not-yet-refreshed host copy. */
+export const MTLK_VM_SIZE_LEGACY_REQUIRES = "--matchlock <image>";
 export const MTLK_VM_SIZE_LAUNCH_LINE =
+  "matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB swap=<n>MB|off";
+/**
+ * The pre-MTLK-ISO-SLICE2 launch line (no swap segment). The tracked host copy
+ * keeps it until the coordinator refreshes the contract after slice 3, so
+ * legacyPreRefresh accepts it while a refreshed (v3) copy must carry the
+ * combined swap grammar above.
+ */
+export const MTLK_VM_SIZE_LEGACY_LAUNCH_LINE =
   "matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB";
+
+/**
+ * Validate a tracked host contract. The committed validator is strict
+ * (MTLK-ISO-SLICE1 policy version 3 + the swap row + the new opt-in grammar).
+ * `legacyPreRefresh` validates the pre-refresh shape the coordinator has not
+ * yet replaced; the real-file assertion opts into it only while the host copy
+ * still records policy version 2 (it never weakens the pure validator tests).
+ */
+export interface MatchlockVmSizeContractOptions {
+  legacyPreRefresh?: boolean;
+}
 
 /** The exact gate VM size (cpus=4 / 4096 MB / 20480 MB). */
 export const MTLK_VM_SIZE_GATE_LIMITS = {
@@ -65,7 +106,23 @@ function includesAll(haystack: string, needles: readonly string[]): boolean {
  * Validate an already-parsed MTLK-VM-SIZE contract value. Returns a list of
  * human-readable problems; an empty list means the contract is complete.
  */
-export function validateMatchlockVmSizeContract(value: unknown): string[] {
+export function validateMatchlockVmSizeContract(
+  value: unknown,
+  options: MatchlockVmSizeContractOptions = {},
+): string[] {
+  const legacy = options.legacyPreRefresh === true;
+  const expectedPolicyVersion = legacy
+    ? MTLK_VM_SIZE_LEGACY_POLICY_VERSION
+    : MTLK_VM_SIZE_POLICY_VERSION;
+  const requiredFlags = legacy ? MTLK_VM_SIZE_LEGACY_FLAGS : MTLK_VM_SIZE_FLAGS;
+  const requiredEnvVars = legacy
+    ? MTLK_VM_SIZE_ENV_VARS
+    : ([...MTLK_VM_SIZE_ENV_VARS, MTLK_VM_SIZE_SWAP_ENV] as const);
+  const expectedRequires = legacy ? MTLK_VM_SIZE_LEGACY_REQUIRES : MTLK_VM_SIZE_REQUIRES;
+  const expectedLaunchLine = legacy
+    ? MTLK_VM_SIZE_LEGACY_LAUNCH_LINE
+    : MTLK_VM_SIZE_LAUNCH_LINE;
+
   const errors: string[] = [];
   if (!isRecord(value)) {
     return ["contract must be a JSON object"];
@@ -98,13 +155,16 @@ export function validateMatchlockVmSizeContract(value: unknown): string[] {
           errors.push(`flag '${flag}'.${field} must be a non-empty string`);
         }
       }
+      if (isNonEmptyString(rawFlag.requires) && rawFlag.requires !== expectedRequires) {
+        errors.push(`flag '${flag}'.requires must be '${expectedRequires}'`);
+      }
       if (!Array.isArray(rawFlag.caps) || rawFlag.caps.length === 0) {
         errors.push(`flag '${flag}'.caps must be a non-empty array`);
       } else if (!rawFlag.caps.every((cap) => isNonEmptyString(cap))) {
         errors.push(`flag '${flag}'.caps entries must be non-empty strings`);
       }
     }
-    for (const required of MTLK_VM_SIZE_FLAGS) {
+    for (const required of requiredFlags) {
       if (!seen.has(required)) {
         errors.push(`missing flag '${required}'`);
       }
@@ -115,7 +175,7 @@ export function validateMatchlockVmSizeContract(value: unknown): string[] {
   if (!isRecord(value.envDefaults)) {
     errors.push("envDefaults must be an object");
   } else {
-    for (const envVar of MTLK_VM_SIZE_ENV_VARS) {
+    for (const envVar of requiredEnvVars) {
       if (!isNonEmptyString(value.envDefaults[envVar])) {
         errors.push(`envDefaults.${envVar} must be a non-empty string`);
       }
@@ -138,6 +198,12 @@ export function validateMatchlockVmSizeContract(value: unknown): string[] {
     }
     if (!isNonEmptyString(disk) || !disk.includes("20480")) {
       errors.push("builtInDefaults.disk must record 20480 MB");
+    }
+    if (!legacy) {
+      const swap = d.swap;
+      if (!isNonEmptyString(swap) || !swap.includes("8192")) {
+        errors.push("builtInDefaults.swap must record 8192 MB");
+      }
     }
   }
 
@@ -171,14 +237,14 @@ export function validateMatchlockVmSizeContract(value: unknown): string[] {
     if (value.policy.field !== MTLK_VM_SIZE_POLICY_FIELD) {
       errors.push(`policy.field must be '${MTLK_VM_SIZE_POLICY_FIELD}'`);
     }
-    if (value.policy.version !== MTLK_VM_SIZE_POLICY_VERSION) {
-      errors.push(`policy.version must stay ${MTLK_VM_SIZE_POLICY_VERSION}`);
+    if (value.policy.version !== expectedPolicyVersion) {
+      errors.push(`policy.version must stay ${expectedPolicyVersion}`);
     }
   }
 
   // ── launch line + workflow status display ───────────────────────────────
-  if (value.launchLine !== MTLK_VM_SIZE_LAUNCH_LINE) {
-    errors.push(`launchLine must be '${MTLK_VM_SIZE_LAUNCH_LINE}'`);
+  if (value.launchLine !== expectedLaunchLine) {
+    errors.push(`launchLine must be '${expectedLaunchLine}'`);
   }
   if (!isNonEmptyString(value.statusDisplay)) {
     errors.push("statusDisplay must be a non-empty string");
@@ -260,37 +326,47 @@ function buildMinimalValidContract(): Record<string, unknown> {
         syntax: "--matchlock-cpus <n>",
         builtInDefault: "min(8, host online CPUs)",
         caps: ["<= 16 ALWAYS", "<= host online CPUs"],
-        requires: "--matchlock <image>",
+        requires: MTLK_VM_SIZE_REQUIRES,
       },
       {
         flag: "--matchlock-memory",
         syntax: "--matchlock-memory <MB|Ng>",
         builtInDefault: "min(16384 MB, 50% of host MemTotal)",
         caps: ["<= 75% of host MemTotal"],
-        requires: "--matchlock <image>",
+        requires: MTLK_VM_SIZE_REQUIRES,
       },
       {
         flag: "--matchlock-disk",
         syntax: "--matchlock-disk <MB|Ng>",
         builtInDefault: "20480 MB",
         caps: ["finite positive"],
-        requires: "--matchlock <image>",
+        requires: MTLK_VM_SIZE_REQUIRES,
+      },
+      {
+        flag: "--matchlock-swap",
+        syntax: "--matchlock-swap <MB|Ng>",
+        builtInDefault: "8192 MB",
+        caps: ["<= 65536 MB (matchlock cap)", "0 rejected; use --matchlock-no-swap"],
+        requires: MTLK_VM_SIZE_REQUIRES,
       },
     ],
     envDefaults: {
       TAMANDUA_MATCHLOCK_CPUS: "cpus when --matchlock-cpus is absent",
       TAMANDUA_MATCHLOCK_MEMORY_MB: "memory when --matchlock-memory is absent",
       TAMANDUA_MATCHLOCK_DISK_MB: "disk when --matchlock-disk is absent",
+      TAMANDUA_MATCHLOCK_SWAP_MB: "swap when --matchlock-swap is absent (a size or off)",
     },
     builtInDefaults: {
       cpus: "min(8, host online CPUs)",
       memory: "min(16384 MB, 50% of host MemTotal)",
       disk: "20480 MB",
+      swap: "8192 MB",
     },
     caps: {
       cpus: "min(value, 16 ALWAYS, host online CPUs)",
       memory: "min(value, 75% of host MemTotal)",
       disk: "finite positive",
+      swap: "min(value, 65536 MB matchlock cap); no host-derived clamp",
     },
     clamping: "flag > env > built-in default; explicit flag and env values are clamped",
     policy: { field: MTLK_VM_SIZE_POLICY_FIELD, version: MTLK_VM_SIZE_POLICY_VERSION },
@@ -323,13 +399,25 @@ describe("MTLK-VM-SIZE contract validator (US-007)", () => {
     assert.deepEqual(validateMatchlockVmSizeContract(buildMinimalValidContract()), []);
   });
 
-  it("reports a missing size flag", () => {
+  it("reports a missing swap flag row", () => {
     const contract = buildMinimalValidContract();
     (contract.flags as unknown[]).pop();
     const errors = validateMatchlockVmSizeContract(contract);
     assert.ok(
-      errors.some((error) => error.includes("missing flag '--matchlock-disk'")),
+      errors.some((error) => error.includes("missing flag '--matchlock-swap'")),
       `expected a missing-flag error, got ${JSON.stringify(errors)}`,
+    );
+  });
+
+  it("reports a retired --matchlock <image> requires wording", () => {
+    const contract = buildMinimalValidContract();
+    (contract.flags as Array<Record<string, unknown>>)[0].requires = MTLK_VM_SIZE_LEGACY_REQUIRES;
+    const errors = validateMatchlockVmSizeContract(contract);
+    assert.ok(
+      errors.some((error) =>
+        error.includes(`flag '--matchlock-cpus'.requires must be '${MTLK_VM_SIZE_REQUIRES}'`),
+      ),
+      `expected a requires-wording error, got ${JSON.stringify(errors)}`,
     );
   });
 
@@ -343,13 +431,51 @@ describe("MTLK-VM-SIZE contract validator (US-007)", () => {
     );
   });
 
-  it("reports a policy version bump", () => {
+  it("reports a missing swap env default", () => {
     const contract = buildMinimalValidContract();
-    (contract.policy as Record<string, unknown>).version = 3;
+    delete (contract.envDefaults as Record<string, unknown>)[MTLK_VM_SIZE_SWAP_ENV];
     const errors = validateMatchlockVmSizeContract(contract);
     assert.ok(
-      errors.some((error) => error.includes("policy.version must stay 2")),
+      errors.some((error) => error.includes(`envDefaults.${MTLK_VM_SIZE_SWAP_ENV}`)),
+      `expected a missing-swap-env error, got ${JSON.stringify(errors)}`,
+    );
+  });
+
+  it("reports a policy version bump (v3 is the only accepted new version)", () => {
+    const contract = buildMinimalValidContract();
+    (contract.policy as Record<string, unknown>).version = 4;
+    const errors = validateMatchlockVmSizeContract(contract);
+    assert.ok(
+      errors.some((error) => error.includes("policy.version must stay 3")),
       `expected a policy-version error, got ${JSON.stringify(errors)}`,
+    );
+  });
+
+  it("legacyPreRefresh accepts the pre-refresh v2 host shape (no swap row)", () => {
+    const contract = buildMinimalValidContract();
+    contract.flags = (contract.flags as Array<Record<string, unknown>>).filter(
+      (flag) => flag.flag !== "--matchlock-swap",
+    );
+    for (const flag of contract.flags as Array<Record<string, unknown>>) {
+      flag.requires = MTLK_VM_SIZE_LEGACY_REQUIRES;
+    }
+    delete (contract.envDefaults as Record<string, unknown>)[MTLK_VM_SIZE_SWAP_ENV];
+    delete (contract.builtInDefaults as Record<string, unknown>).swap;
+    delete (contract.caps as Record<string, unknown>).swap;
+    (contract.policy as Record<string, unknown>).version = MTLK_VM_SIZE_LEGACY_POLICY_VERSION;
+    contract.launchLine = MTLK_VM_SIZE_LEGACY_LAUNCH_LINE;
+    assert.deepEqual(validateMatchlockVmSizeContract(contract, { legacyPreRefresh: true }), []);
+    // The strict validator still refuses that same pre-refresh shape.
+    assert.notDeepEqual(validateMatchlockVmSizeContract(contract), []);
+  });
+
+  it("reports a launch line that predates the combined swap grammar", () => {
+    const contract = buildMinimalValidContract();
+    contract.launchLine = MTLK_VM_SIZE_LEGACY_LAUNCH_LINE;
+    const errors = validateMatchlockVmSizeContract(contract);
+    assert.ok(
+      errors.some((error) => error.includes(`launchLine must be '${MTLK_VM_SIZE_LAUNCH_LINE}'`)),
+      `expected a launchLine error, got ${JSON.stringify(errors)}`,
     );
   });
 
@@ -408,7 +534,16 @@ describe("MTLK-VM-SIZE contract validator (US-007)", () => {
       } catch (error) {
         assert.fail(`published contract is not valid JSON: ${(error as Error).message}`);
       }
-      assert.deepEqual(validateMatchlockVmSizeContract(parsed), []);
+      // The tracked host copy is refreshed by the coordinator AFTER this slice
+      // lands. Until that refresh it still records the pre-MTLK-ISO-SLICE1
+      // shape (policy version 2, no swap row, the retired requires wording), so
+      // validate it in legacy mode while it is stale. A refreshed copy takes
+      // the strict (v3 + swap) path.
+      const storedVersion = isRecord(parsed) && isRecord(parsed.policy)
+        ? parsed.policy.version
+        : undefined;
+      const legacyPreRefresh = storedVersion === MTLK_VM_SIZE_LEGACY_POLICY_VERSION;
+      assert.deepEqual(validateMatchlockVmSizeContract(parsed, { legacyPreRefresh }), []);
     },
   );
 });

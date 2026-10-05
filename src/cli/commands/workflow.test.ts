@@ -168,6 +168,34 @@ describe("SPL2 workflow command module", () => {
     assert.match(resumeHelp, /never collide/);
   });
 
+  // MTLK-ISO-SLICE2 US-009 (R13): the resume help documents the standalone
+  // root-usage override, and the resume action threads it to the control
+  // plane while treating a preparing-held response as a failure.
+  it("documents and threads the R13 root-usage override on workflow resume", () => {
+    const resumeHelp = getWorkflowResumeHelp();
+    assert.match(
+      resumeHelp,
+      /--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs/,
+    );
+    assert.match(resumeHelp, /STANDALONE/);
+    assert.match(resumeHelp, /truly native run/);
+    assert.match(resumeHelp, /preparation recovery/);
+    assert.match(resumeHelp, /STATUS-UNUSABLE/);
+
+    const builtWorkflowModule = readFileSync(
+      new URL("../../../dist/cli/commands/workflow.js", import.meta.url),
+      "utf-8",
+    );
+    const start = builtWorkflowModule.indexOf('if (action === "resume")');
+    assert.ok(start >= 0, "the resume action must exist in the built module");
+    const end = builtWorkflowModule.indexOf('if (action === "pause-all")', start);
+    assert.ok(end > start, "the resume action block must be bounded");
+    const block = builtWorkflowModule.slice(start, end);
+    assert.match(block, /parseMatchlockRootUsageOverrideFlag\(args\)/);
+    assert.match(block, /resumeRunWithDaemon\(fullId, cliIdentity, rootUsageOverride\)/);
+    assert.match(block, /body\.held === true/);
+  });
+
   it("advertises the workdir-collision flags in the top-level workflow usage", () => {
     const dispatcher = readFileSync(join(process.cwd(), "src/cli/cli.ts"), "utf8");
     assert.match(
@@ -220,7 +248,7 @@ Examples:
   describe("--matchlock workflow-run help (integrated semantics)", () => {
     it("documents the explicit per-shape capability-closed workflows under --matchlock (US-004)", () => {
       const help = getWorkflowRunHelp();
-      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
       assert.match(
         matchlockSection,
         /Supported workflows under --matchlock in this build are exactly the/,
@@ -256,22 +284,23 @@ Examples:
       // The whole help carries the hermes flag documentation (before the
       // --matchlock option header), including the --matchlock interaction.
       assert.match(help, /--hermes-as-harness\n\s+Use hermes as the agent harness instead of pi\./);
-      assert.match(help, /With --matchlock <image>, the run executes the IMAGE's hermes/);
+      assert.match(help, /Under a Matchlock opt-in, the run executes the IMAGE's hermes/);
       assert.match(help, /SUBMISSION\s+environment/);
       // The --matchlock option section documents the harness axis. MTLK-
       // HERMES-EXEC asserted "--dsh-as-harness fails" here; MTLK-DSH-EXEC
       // admits dsh, so the union (MTLK-INTEGRATE US-003) rewrites the losing
       // refusal assertion to the union's three-harness acceptance.
-      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
       assert.match(matchlockSection, /hermes with --hermes-as-harness/);
       assert.match(matchlockSection, /all three are\s+admitted with --matchlock/);
       assert.match(matchlockSection, /guest HERMES_HOME/);
     });
 
-    it("documents image-required, fresh VM per invocation, guest pack CLI, no native fallback and refusal shapes", () => {
+    it("documents explicit opt-in, the standard image, fresh VM per invocation, guest pack CLI, no native fallback and refusal shapes", () => {
       const help = getWorkflowRunHelp();
-      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
-      assert.match(matchlockSection, /The image is MANDATORY/);
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
+      assert.match(matchlockSection, /--matchlock and --matchlock-image <image> are the ONLY two opt-in/);
+      assert.match(matchlockSection, /standard image igorhvr\/tamandua/);
       assert.match(matchlockSection, /FRESH Matchlock VM/);
       assert.match(matchlockSection, /guest\s+reporting CLI at \/workspace\/runtime\/bin\/tamandua/);
       assert.match(matchlockSection, /NO host\/native fallback/);
@@ -290,7 +319,7 @@ Examples:
 
     it("documents the dsh Matchlock opt-in (--matchlock IMAGE --dsh-as-harness) with the whole-home mount, supported workflows and refused capabilities (MTLK-DSH-EXEC US-002)", () => {
       const help = getWorkflowRunHelp();
-      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
       assert.match(matchlockSection, /--dsh-as-harness/);
       assert.match(matchlockSection, /pi-as-harness \(default\) and --dsh-as-harness/);
       assert.match(matchlockSection, /DSH_HOME/);
@@ -308,7 +337,7 @@ Examples:
     // closure and the precise refusals; every harness carries the same set.
     it("lists the exact three-harness supported/refused workflow matrix (US-003/US-004 parity)", () => {
       const help = getWorkflowRunHelp();
-      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
 
       // Accepted: every harness carries the full capability-closed set.
       for (const id of [
@@ -362,7 +391,7 @@ Examples:
     // env defaults, the built-in host-derived defaults and the clamp caps.
     it("documents --matchlock-cpus/--matchlock-memory/--matchlock-disk with defaults, env vars and caps (US-002)", () => {
       const help = getWorkflowRunHelp();
-      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
 
       // All three flags are listed in the --matchlock option section.
       assert.match(matchlockSection, /--matchlock-cpus <n>/);
@@ -382,11 +411,11 @@ Examples:
       assert.match(matchlockSection, /at most 75% of\s+host MemTotal/);
       assert.match(matchlockSection, /finite positive number/);
 
-      // The three env defaults and that each flag requires --matchlock.
+      // The three env defaults and that each flag requires an opt-in.
       assert.match(help, /TAMANDUA_MATCHLOCK_CPUS/);
       assert.match(help, /TAMANDUA_MATCHLOCK_MEMORY_MB/);
       assert.match(help, /TAMANDUA_MATCHLOCK_DISK_MB/);
-      assert.match(matchlockSection, /Requires --matchlock <image>/);
+      assert.match(matchlockSection, /Requires --matchlock or --matchlock-image <image>/);
     });
 
     // MTLK-ALLOW-PRIVATE US-004: the help documents the repeatable
@@ -394,7 +423,7 @@ Examples:
     // requires --matchlock.
     it("documents --matchlock-allow-private and TAMANDUA_MATCHLOCK_ALLOW_PRIVATE (US-004)", () => {
       const help = getWorkflowRunHelp();
-      const matchlockSection = help.slice(help.indexOf("--matchlock <image>"));
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
 
       // The option header and its required value placeholder.
       assert.match(matchlockSection, /--matchlock-allow-private <entry>/);
@@ -408,11 +437,89 @@ Examples:
       assert.match(matchlockSection, /\[addr\]:port/);
       assert.match(matchlockSection, /DNS resolution is Matchlock's job/);
 
-      // Env fallback + precedence and the requires---matchlock rule.
+      // Env fallback + precedence and the requires-an-opt-in rule.
       assert.match(help, /TAMANDUA_MATCHLOCK_ALLOW_PRIVATE/);
       assert.match(matchlockSection, /comma-separated list/);
-      assert.match(matchlockSection, /Requires --matchlock <image>/);
+      assert.match(matchlockSection, /Requires --matchlock or --matchlock-image <image>/);
       assert.match(matchlockSection, /network\.allow_private/);
+    });
+
+    // MTLK-ISO-SLICE1 US-007: the quickstart names both opt-in forms and the
+    // standard image; the prose states the env precedence and its opt-in gate
+    // and retires the old image-MANDATORY grammar.
+    it("documents the standard-image quickstart, both opt-in forms and TAMANDUA_MATCHLOCK_IMAGE precedence (US-007)", () => {
+      const help = getWorkflowRunHelp();
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
+
+      // Quickstart block: both forms, standard image name, provisioning.
+      assert.match(matchlockSection, /--matchlock\s+Run isolated with the standard image/);
+      assert.match(matchlockSection, /igorhvr\/tamandua, multi-arch; provisioned/);
+      assert.match(matchlockSection, /--matchlock-image <image>\s+Run isolated with an explicit image/);
+      assert.match(matchlockSection, /tamandua matchlock setup/);
+      assert.match(matchlockSection, /tamandua never fetches at launch/);
+
+      // The prose names the standard image, the multi-arch provisioning and
+      // the admission-time pin.
+      assert.match(matchlockSection, /standard image igorhvr\/tamandua/);
+      assert.match(matchlockSection, /host-architecture variant/);
+      assert.match(matchlockSection, /pins the resolved\s+variant's content\+config identity/);
+
+      // The env override, its precedence and its opt-in gate.
+      assert.match(matchlockSection, /TAMANDUA_MATCHLOCK_IMAGE/);
+      assert.match(
+        matchlockSection,
+        /--matchlock-image <image> > TAMANDUA_MATCHLOCK_IMAGE > built-in/,
+      );
+      assert.match(matchlockSection, /set without an opt-in it is ignored/);
+
+      // The absent-image refusal and the never-fetch/no-native guarantee.
+      assert.match(matchlockSection, /absent from the local\s+matchlock store/);
+      assert.match(matchlockSection, /NO code\s+path fetches or builds an image at launch/);
+      assert.match(matchlockSection, /nothing runs natively/);
+
+      // The old grammar is retired from the help.
+      assert.doesNotMatch(help, /The image is MANDATORY/);
+      assert.doesNotMatch(help, /Requires --matchlock <image>/);
+    });
+
+    // MTLK-ISO-SLICE1 US-007: root-usage refusal (R13) with the verbatim
+    // deliberately-long override flag, and the swap grammar (MTLK-SWAP).
+    it("documents the root-usage refusal + override and the swap default/off switch (US-007)", () => {
+      const help = getWorkflowRunHelp();
+      const matchlockSection = help.slice(help.indexOf("Matchlock (VM isolation):"));
+
+      // Root refusal and the override flag shown verbatim.
+      assert.match(matchlockSection, /refuse to execute as root by default/);
+      assert.match(matchlockSection, /documented to run unprivileged/);
+      assert.match(
+        matchlockSection,
+        /--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs/,
+      );
+
+      // Swap size flag: default, cap, env, precedence, opt-in requirement.
+      assert.match(matchlockSection, /--matchlock-swap <MB\|Ng>/);
+      assert.match(matchlockSection, /default: 8192 MB on every Matchlock VM/);
+      assert.match(matchlockSection, /Maximum: 65536 MB \(matchlock's cap\)/);
+      assert.match(matchlockSection, /TAMANDUA_MATCHLOCK_SWAP_MB/);
+      assert.match(
+        matchlockSection,
+        /--matchlock-no-swap > --matchlock-swap > TAMANDUA_MATCHLOCK_SWAP_MB >/,
+      );
+      assert.match(matchlockSection, /0 is not a valid\s+value/);
+      assert.match(matchlockSection, /points at that off switch/);
+      assert.match(matchlockSection, /--matchlock-no-swap\n/);
+
+      // Examples carry both opt-in forms.
+      assert.ok(
+        help.includes('feature-dev-merge "Add dark mode toggle" --matchlock\n'),
+        "help examples must show the bare --matchlock opt-in",
+      );
+      assert.ok(
+        help.includes(
+          'feature-dev-merge "Add dark mode toggle" --matchlock-image registry.acme/jail:2',
+        ),
+        "help examples must show the --matchlock-image opt-in",
+      );
     });
   });
 
@@ -783,6 +890,13 @@ Examples:
       try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     });
 
+    // MTLK-ISO-SLICE2 US-012: the persisted policy pin the status JSON must
+    // report for every isolated rendering.
+    const POLICY_DIGEST =
+      "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const POLICY_CONFIG_DIGEST =
+      "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
     function seedRun(runId: string, harnessType?: string): void {
       const context = harnessType ? JSON.stringify({ harness_type: harnessType }) : "{}";
       db.prepare(
@@ -804,23 +918,51 @@ Examples:
       return output;
     }
 
+    /** Capture the stdout AND stderr of one status invocation. */
+    async function captureStatusOutputAndStderr(
+      runId: string,
+      extraArgs: string[] = [],
+    ): Promise<{ stdout: string; stderr: string }> {
+      let stdout = "";
+      let stderr = "";
+      const origLog = console.log;
+      const origWrite = process.stderr.write;
+      console.log = (...chunks: unknown[]) => {
+        stdout += chunks.map((c) => String(c)).join(" ") + "\n";
+      };
+      process.stderr.write = ((chunk: unknown) => {
+        stderr += String(chunk);
+        return true;
+      }) as typeof process.stderr.write;
+      try {
+        await handleWorkflow("workflow", ["workflow", "status", runId, ...extraArgs], () => {});
+      } finally {
+        console.log = origLog;
+        process.stderr.write = origWrite;
+      }
+      return { stdout, stderr };
+    }
+
     /** Build a valid persisted-shape version-2 Matchlock policy JSON. */
     function matchlockPolicyJson(
-      limits: { cpus: number; memoryMB: number; diskSizeMB: number } = {
+      limits: { cpus: number; memoryMB: number; diskSizeMB: number; swapMB?: number } = {
         cpus: 8,
         memoryMB: 16384,
         diskSizeMB: 20480,
       },
       image = "vic/matchlock-base:latest",
       networkAllowPrivate?: string[],
+      rootUsageConsent?: boolean,
+      imageSource?: "explicit" | "standard",
     ): string {
       return serializeMatchlockPolicy(
         buildMatchlockPolicy({
           requestedImage: image,
+          requestedImageSource: imageSource,
           networkAllowPrivate,
           identity: {
-            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-            config_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            digest: POLICY_DIGEST,
+            config_digest: POLICY_CONFIG_DIGEST,
             tag: image,
           },
           harness: "pi",
@@ -830,7 +972,8 @@ Examples:
             { hostPath: "/opt/project", hostRealPath: "/opt/project", guestPath: "/opt/project" },
           ],
           gitMetadataRoots: ["/opt/project/.git"],
-          resourceLimits: limits,
+          resourceLimits: limits as never,
+          rootUsageConsent: rootUsageConsent === true,
         }),
       );
     }
@@ -842,6 +985,18 @@ Examples:
         db.exec("ALTER TABLE runs ADD COLUMN matchlock_policy TEXT");
       }
       db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run(policyJson, runId);
+    }
+
+    /**
+     * MTLK-ISO-SLICE2 US-014: record the host-owned PREP-STATE isolation intent
+     * on a seeded run (adds the column if absent), leaving the policy NULL.
+     */
+    function setIsolationIntent(runId: string, intent: string): void {
+      const cols = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "isolation_intent")) {
+        db.exec("ALTER TABLE runs ADD COLUMN isolation_intent TEXT");
+      }
+      db.prepare("UPDATE runs SET isolation_intent = ? WHERE id = ?").run(intent, runId);
     }
 
     it("getWorkflowStatus exposes harnessType 'dsh' from context", async () => {
@@ -898,7 +1053,9 @@ Examples:
 
     // MTLK-VM-SIZE US-004: `workflow status` shows the resolved Matchlock VM
     // size (human line + --json matchlockResources) only for Matchlock runs.
-    it("workflow status text output prints the matchlock VM size line for Matchlock runs", async () => {
+    // MTLK-ISO2-CORRECTIVE (F7): the isolated text display ALSO renders both
+    // persisted pinned digests, with the distinct `matchlock pinned:` prefix.
+    it("workflow status text output prints the matchlock VM size line and the pinned digests for Matchlock runs", async () => {
       const runId = crypto.randomUUID();
       seedRun(runId);
       setMatchlockPolicy(runId, matchlockPolicyJson());
@@ -907,6 +1064,16 @@ Examples:
       assert.match(
         output,
         /matchlock: vic\/matchlock-base:latest cpus=8 memory=16384MB disk=20480MB/,
+      );
+      assert.match(
+        output,
+        new RegExp(`matchlock pinned: digest=${POLICY_DIGEST} config=${POLICY_CONFIG_DIGEST}`),
+        "both persisted digests must render",
+      );
+      // The distinct prefix preserves the exactly-one `matchlock:`-line rule.
+      assert.equal(
+        output.split("\n").filter((line) => line.startsWith("matchlock:")).length,
+        1,
       );
     });
 
@@ -927,9 +1094,13 @@ Examples:
       const matchlockJson = JSON.parse(matchlockOut.trim());
       assert.deepEqual(matchlockJson.matchlockResources, {
         image: "vic/matchlock-base:latest",
+        imageSource: "explicit",
         cpus: 8,
         memoryMB: 16384,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
       });
 
       const nativeRunId = crypto.randomUUID();
@@ -960,7 +1131,7 @@ Examples:
       const output = await captureStatusOutput(runId);
       assert.match(
         output,
-        /matchlock: vic\/matchlock-base:latest cpus=8 memory=16384MB disk=20480MB allow-private=192\.168\.107\.74:8888,box\.internal/,
+        /matchlock: vic\/matchlock-base:latest cpus=8 memory=16384MB disk=20480MB swap=8192MB allow-private=192\.168\.107\.74:8888,box\.internal/,
       );
     });
 
@@ -976,9 +1147,13 @@ Examples:
       const parsed = JSON.parse(output.trim());
       assert.deepEqual(parsed.matchlockResources, {
         image: "vic/matchlock-base:latest",
+        imageSource: "explicit",
         cpus: 8,
         memoryMB: 16384,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
         allowPrivate: ["192.168.107.74:8888"],
       });
     });
@@ -999,10 +1174,228 @@ Examples:
       );
       assert.deepEqual(json.matchlockResources, {
         image: "vic/matchlock-base:latest",
+        imageSource: "explicit",
         cpus: 8,
         memoryMB: 16384,
         diskSizeMB: 20480,
+        swapMB: 8192,
+        imageDigest: POLICY_DIGEST,
+        imageConfigDigest: POLICY_CONFIG_DIGEST,
       });
+    });
+
+    // MTLK-ISO-SLICE2 US-013: the shared warnings channel on the status
+    // surfaces. `root_usage_override` is re-derived from the persisted policy's
+    // rootUsageConsent; a clean run omits the key (absent, never []).
+    it("workflow status --json carries the shared root_usage_override warning only when consent is recorded", async () => {
+      const consentRunId = crypto.randomUUID();
+      seedRun(consentRunId);
+      setMatchlockPolicy(consentRunId, matchlockPolicyJson(undefined, undefined, undefined, true));
+
+      const consentJson = JSON.parse((await captureStatusOutput(consentRunId, ["--json"])).trim());
+      assert.equal(consentJson.warnings.length, 1);
+      assert.equal(consentJson.warnings[0].code, "root_usage_override");
+      assert.match(consentJson.warnings[0].message, /AUTHORIZED/);
+      assert.doesNotMatch(consentJson.warnings[0].message, /executed as root/);
+
+      const cleanRunId = crypto.randomUUID();
+      seedRun(cleanRunId);
+      setMatchlockPolicy(cleanRunId, matchlockPolicyJson());
+      const cleanJson = JSON.parse((await captureStatusOutput(cleanRunId, ["--json"])).trim());
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(cleanJson, "warnings"),
+        false,
+        "a clean status must not carry the warnings key (absent, never [])",
+      );
+    });
+
+    it("workflow status text mode prints the shared warning to stderr as a bounded one-liner", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      setMatchlockPolicy(runId, matchlockPolicyJson(undefined, undefined, undefined, true));
+
+      const { stderr } = await captureStatusOutputAndStderr(runId);
+      assert.match(stderr, /warning\[root_usage_override\]: /);
+      assert.match(stderr, /AUTHORIZED/);
+      assert.doesNotMatch(stderr, /executed as root/);
+    });
+
+    // ══════════════════════════════════════════════════════════════════
+    // MTLK-ISO-SLICE2 US-014: STATUS-UNUSABLE four-state vocabulary.
+    // Ordered classification: a non-NULL policy is inspected first (parses →
+    // isolated, does not parse → unusable); only a NULL policy consults the
+    // recorded isolation intent (present → preparing/held, absent → native).
+    // ══════════════════════════════════════════════════════════════════
+
+    it("workflow status text renders the typed STATUS-UNUSABLE line with an allow-listed sanitized reason", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      // A malformed record that ALSO embeds raw text the renderer must not leak.
+      const raw = '{"version": 3, apiToken-present-but-broken';
+      setMatchlockPolicy(runId, raw);
+
+      const { stdout, stderr } = await captureStatusOutputAndStderr(runId);
+      assert.match(
+        stdout,
+        /matchlock: ISOLATION POLICY UNUSABLE \(policy_json_invalid\): the persisted matchlock policy is not valid JSON/,
+      );
+      assert.ok(!stdout.includes(raw), "the raw stored policy must never render");
+      assert.doesNotMatch(stdout, /Invalid matchlock policy JSON/);
+      assert.doesNotMatch(stdout, /matchlock: .*cpus=/);
+      assert.doesNotMatch(stderr, /warning\[/);
+    });
+
+    it("workflow status --json carries matchlockPolicyError and omits matchlockResources for the unusable state", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      setMatchlockPolicy(runId, "not json");
+
+      const json = JSON.parse((await captureStatusOutput(runId, ["--json"])).trim());
+      assert.deepEqual(json.matchlockPolicyError, {
+        code: "policy_json_invalid",
+        message: "the persisted matchlock policy is not valid JSON",
+      });
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(json, "matchlockResources"),
+        false,
+        "the unusable state carries matchlockPolicyError instead of matchlockResources",
+      );
+      assert.equal(Object.prototype.hasOwnProperty.call(json, "matchlockState"), false);
+    });
+
+    it("workflow status renders the unusable line for every non-NULL unusable policy shape", async () => {
+      const cases: Array<{ policy: string; code: string }> = [
+        { policy: "", code: "policy_json_invalid" },
+        { policy: "   ", code: "policy_json_invalid" },
+        {
+          policy: JSON.stringify({ version: 1, backend: "matchlock" }),
+          code: "policy_legacy_unpinned",
+        },
+        {
+          policy: JSON.stringify({ version: 99, backend: "matchlock" }),
+          code: "policy_unsupported_version",
+        },
+        {
+          policy: JSON.stringify({ version: 3, backend: "matchlock", apiToken: "x" }),
+          code: "policy_credential_field",
+        },
+        {
+          policy: JSON.stringify({ version: 3, backend: "matchlock" }),
+          code: "policy_invalid_record",
+        },
+      ];
+      for (const { policy, code } of cases) {
+        const runId = crypto.randomUUID();
+        seedRun(runId);
+        setMatchlockPolicy(runId, policy);
+
+        const output = await captureStatusOutput(runId);
+        assert.match(
+          output,
+          new RegExp(`matchlock: ISOLATION POLICY UNUSABLE \\(${code}\\): `),
+          `expected the unusable line for code ${code}`,
+        );
+        assert.doesNotMatch(output, /matchlock: .*cpus=/, "unusable never renders as isolated");
+
+        const json = JSON.parse((await captureStatusOutput(runId, ["--json"])).trim());
+        assert.equal(json.matchlockPolicyError.code, code);
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(json, "matchlockResources"),
+          false,
+        );
+      }
+    });
+
+    it("workflow status renders the PREPARING held state for an intent-only row, keeping the run status", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      setIsolationIntent(runId, "true");
+
+      const output = await captureStatusOutput(runId);
+      assert.match(output, /matchlock: PREPARING \(isolation intent recorded; policy pending\)/);
+      assert.match(output, /Status: running/);
+
+      const json = JSON.parse((await captureStatusOutput(runId, ["--json"])).trim());
+      assert.equal(json.matchlockState, "preparing");
+      assert.equal(json.status, "running");
+      assert.equal(Object.prototype.hasOwnProperty.call(json, "matchlockResources"), false);
+      assert.equal(Object.prototype.hasOwnProperty.call(json, "matchlockPolicyError"), false);
+    });
+
+    it("a FAILED intent-only preparation keeps the failure status while rendering the held line", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      db.prepare("UPDATE runs SET status = 'failed' WHERE id = ?").run(runId);
+      setIsolationIntent(runId, "true");
+
+      const output = await captureStatusOutput(runId);
+      assert.match(output, /matchlock: PREPARING \(isolation intent recorded; policy pending\)/);
+      assert.match(output, /Status: failed/);
+      assert.doesNotMatch(output, /Status: preparing/);
+    });
+
+    it("workflow status renders the standard-image marker and swap=off from the persisted policy", async () => {
+      const standardRunId = crypto.randomUUID();
+      seedRun(standardRunId);
+      setMatchlockPolicy(
+        standardRunId,
+        matchlockPolicyJson(undefined, undefined, undefined, false, "standard"),
+      );
+      const standardOutput = await captureStatusOutput(standardRunId);
+      assert.match(
+        standardOutput,
+        /matchlock: vic\/matchlock-base:latest \(standard image\) cpus=8 memory=16384MB disk=20480MB swap=8192MB/,
+      );
+
+      const offRunId = crypto.randomUUID();
+      seedRun(offRunId);
+      setMatchlockPolicy(
+        offRunId,
+        matchlockPolicyJson({ cpus: 8, memoryMB: 16384, diskSizeMB: 20480, swapMB: 0 }),
+      );
+      const offOutput = await captureStatusOutput(offRunId);
+      assert.match(offOutput, /cpus=8 memory=16384MB disk=20480MB swap=off/);
+      assert.doesNotMatch(offOutput, /\(standard image\)/);
+    });
+
+    it("workflow status normalizes a genuine v2 policy to explicit provenance and swap=off", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+      const v2 = JSON.parse(matchlockPolicyJson()) as Record<string, unknown>;
+      delete v2.requestedImageSource;
+      delete v2.rootUsageConsent;
+      v2.version = 2;
+      delete (v2.resourceLimits as Record<string, unknown>).swapMB;
+      setMatchlockPolicy(runId, JSON.stringify(v2));
+
+      const output = await captureStatusOutput(runId);
+      assert.match(
+        output,
+        /matchlock: vic\/matchlock-base:latest cpus=8 memory=16384MB disk=20480MB swap=off/,
+      );
+      assert.doesNotMatch(output, /\(standard image\)/);
+    });
+
+    it("native status carries no matchlock key or line", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+
+      const output = await captureStatusOutput(runId);
+      assert.doesNotMatch(output, /matchlock/);
+
+      const json = JSON.parse((await captureStatusOutput(runId, ["--json"])).trim());
+      for (const key of [
+        "matchlockResources",
+        "matchlockPolicyError",
+        "matchlockState",
+        "matchlockRootUsageConsent",
+      ]) {
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(json, key),
+          false,
+          `native status must omit ${key}`,
+        );
+      }
     });
   });
 
@@ -1556,9 +1949,11 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
       baseLaunchInfo({
         matchlockResources: {
           image: "vic/matchlock-base:latest",
+          imageSource: "explicit",
           cpus: 4,
           memoryMB: 4096,
           diskSizeMB: 20480,
+          swapMB: 4096,
         },
       }),
     );
@@ -1567,12 +1962,39 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
       "working-directory: /srv/work clean",
       "harness: pi /usr/bin/pi (1.2.3)",
       "daemon: http://127.0.0.1:3334 ok",
-      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB",
+      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB swap=4096MB",
     ]);
     assert.equal(
       lines.filter((l) => l.startsWith("matchlock:")).length,
       1,
       "the matchlock line must appear exactly once",
+    );
+  });
+
+  // MTLK-ISO-SLICE2 US-011: only standard provenance adds the marker; a 0
+  // swap size renders `swap=off`.
+  it("marks the standard image and renders swap=off on the launch line", () => {
+    const lines = formatWorkflowRunLaunchLines(
+      baseLaunchInfo({
+        matchlockResources: {
+          image: "igorhvr/tamandua",
+          imageSource: "standard",
+          cpus: 4,
+          memoryMB: 4096,
+          diskSizeMB: 20480,
+          swapMB: 0,
+        },
+      }),
+    );
+
+    assert.equal(
+      lines[3],
+      "matchlock: igorhvr/tamandua (standard image) cpus=4 memory=4096MB disk=20480MB swap=off",
+    );
+    assert.equal(
+      lines.filter((l) => l.startsWith("matchlock:")).length,
+      1,
+      "the standard marker must not add a second matchlock line",
     );
   });
 
@@ -1591,18 +2013,22 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
       baseLaunchInfo({
         matchlockResources: {
           image: "vic/matchlock-base:latest",
+          imageSource: "explicit",
           cpus: 4,
           memoryMB: 4096,
           diskSizeMB: 20480,
+          swapMB: 4096,
         },
       }),
     );
 
     assert.deepEqual(json.matchlockResources, {
       image: "vic/matchlock-base:latest",
+      imageSource: "explicit",
       cpus: 4,
       memoryMB: 4096,
       diskSizeMB: 20480,
+      swapMB: 4096,
     });
   });
 
@@ -1628,6 +2054,7 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
           cpus: 4,
           memoryMB: 4096,
           diskSizeMB: 20480,
+          swapMB: 4096,
           allowPrivate: ["192.168.107.74:8888", "box.internal"],
         },
       }),
@@ -1635,7 +2062,7 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
 
     assert.equal(
       lines[3],
-      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB allow-private=192.168.107.74:8888,box.internal",
+      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB swap=4096MB allow-private=192.168.107.74:8888,box.internal",
     );
   });
 
@@ -1647,6 +2074,7 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
           cpus: 4,
           memoryMB: 4096,
           diskSizeMB: 20480,
+          swapMB: 4096,
           allowPrivate: ["192.168.107.74:8888"],
         },
       }),
@@ -1656,6 +2084,7 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
       cpus: 4,
       memoryMB: 4096,
       diskSizeMB: 20480,
+      swapMB: 4096,
       allowPrivate: ["192.168.107.74:8888"],
     });
   });
@@ -1666,9 +2095,10 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
       cpus: 4,
       memoryMB: 4096,
       diskSizeMB: 20480,
+      swapMB: 4096,
     };
     const expectedLine =
-      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB";
+      "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB swap=4096MB";
 
     for (const matchlockResources of [base, { ...base, allowPrivate: [] }]) {
       const lines = formatWorkflowRunLaunchLines(baseLaunchInfo({ matchlockResources }));
@@ -1681,5 +2111,49 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
       );
       assert.deepEqual(json.matchlockResources, base);
     }
+  });
+});
+
+// MTLK-ISO-SLICE1 US-008: the run action must resolve the swap size through
+// the shared resolver and hand the parser's real image provenance plus the
+// per-action root-usage consent to run creation. The fields are consumed by
+// admission in US-009; these guards pin the launch wiring so it cannot
+// silently drop them, while the output contract stays unchanged (pinned
+// end-to-end against the fake JSON-RPC driver in
+// tests/cli-workflow-run-resolution.test.ts).
+describe("MTLK-ISO-SLICE1 US-008: CLI launch wiring", () => {
+  const builtWorkflowModule = readFileSync(
+    new URL("../../../dist/cli/commands/workflow.js", import.meta.url),
+    "utf-8",
+  );
+
+  it("resolves the swap size from the CLI flags through the shared resolver", () => {
+    assert.match(builtWorkflowModule, /swapMB:\s*runArgs\.matchlockSwap/);
+    assert.match(builtWorkflowModule, /noSwap:\s*runArgs\.matchlockNoSwap/);
+    assert.match(builtWorkflowModule, /env:\s*process\.env/);
+  });
+
+  it("passes matchlockImage, matchlockImageSource and matchlockRootUsageOverride to runWorkflow", () => {
+    const start = builtWorkflowModule.indexOf("await runWorkflow({");
+    assert.ok(start >= 0, "the run action must call runWorkflow");
+    const end = builtWorkflowModule.indexOf("});", start);
+    assert.ok(end > start, "the runWorkflow call must be a balanced object literal");
+    const call = builtWorkflowModule.slice(start, end);
+    assert.match(call, /matchlockImage:\s*runArgs\.matchlockImage,/);
+    assert.match(call, /matchlockImageSource:\s*runArgs\.matchlockImageSource,/);
+    assert.match(call, /matchlockRootUsageOverride:\s*runArgs\.matchlockRootUsageOverride,/);
+    assert.match(call, /matchlockResourceLimits,/);
+  });
+
+  // MTLK-ISO-SLICE2 US-011: the shared output contract now DOES render the
+  // resolved provenance and swap size into the resolved-launch block.
+  it("renders the resolved provenance and swap size into the launch block", () => {
+    const start = builtWorkflowModule.indexOf("launchInfo.matchlockResources = {");
+    assert.ok(start >= 0, "the run action must build the launch matchlockResources block");
+    const end = builtWorkflowModule.indexOf("};", start);
+    assert.ok(end > start, "the launch block must be a balanced object literal");
+    const block = builtWorkflowModule.slice(start, end);
+    assert.match(block, /imageSource:\s*runArgs\.matchlockImageSource/);
+    assert.match(block, /swapMB:\s*matchlockResourceLimits\.swapMB/);
   });
 });

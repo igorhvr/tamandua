@@ -13,6 +13,10 @@ import path from "node:path";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
+  buildMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../dist/installer/matchlock/policy.js";
+import {
   collectMatchlock,
   MAX_MATCHLOCK_ERROR_RECORDS,
 } from "../../dist/diagnostics/collect-matchlock.js";
@@ -42,6 +46,34 @@ function matchlockDir(stateDir: string): string {
   return path.join(stateDir, "runs", RUN_ID, "matchlock");
 }
 
+/** A genuinely VALID (strict-parser-accepted) pinned Matchlock policy. */
+function validPolicyJson(): string {
+  return serializeMatchlockPolicy(
+    buildMatchlockPolicy({
+      requestedImage: "fixture/image",
+      requestedImageSource: "standard",
+      identity: {
+        digest: "sha256:" + "a".repeat(64),
+        config_digest: "sha256:" + "b".repeat(64),
+        tag: "fixture/image",
+      },
+      harness: "pi",
+      workingDirectory: "/opt/owned-fixture",
+      originalRepositoryRoot: "/opt/owned-fixture",
+      workMounts: [
+        {
+          hostPath: "/opt/owned-fixture",
+          hostRealPath: "/opt/owned-fixture",
+          guestPath: "/opt/owned-fixture",
+        },
+      ],
+      gitMetadataRoots: [],
+      resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 },
+      rootUsageConsent: false,
+    }),
+  );
+}
+
 describe("collectMatchlock — Matchlock-shaped run", () => {
   it("lists VM evidence dirs and console/serial logs with sizes", () => {
     const stateDir = makeStateDir("diag-matchlock-vm-");
@@ -51,12 +83,7 @@ describe("collectMatchlock — Matchlock-shaped run", () => {
     writeFile(path.join(vmDir, "serial.log"), "serial-bytes-longer");
     writeFile(path.join(vmDir, "logs", "firecracker.log"), "fc");
 
-    const policyJson = JSON.stringify({
-      version: 2,
-      harness: "pi",
-      requestedImage: "igorhvr/bedlam-ubuntu",
-      mounts: [{ hostPath: "/work", guestPath: "/work" }],
-    });
+    const policyJson = validPolicyJson();
 
     const result = collectMatchlock({
       stateDir,
@@ -205,7 +232,10 @@ describe("collectMatchlock — secret redaction", () => {
     const result = collectMatchlock({ stateDir, runId: RUN_ID, policyJson });
 
     const policy = result.policy as Record<string, unknown>;
-    assert.equal(result.policyStatus, "present");
+    // MTLK-ISO2-MEND (Family C-1): a credential-bearing policy is a typed
+    // present-but-unusable record, never a usable/isolated one.
+    assert.equal(result.policyStatus, "empty");
+    assert.match(result.absenceReason ?? "", /unusable \(policy_credential_field\)/);
     assert.equal(policy.requestedImage, "igorhvr/bedlam-ubuntu");
     assert.equal(policy.registryToken, "<redacted>");
     assert.deepEqual(policy.nested, { apiKey: "<redacted>", region: "eu" });
@@ -276,7 +306,7 @@ describe("collectMatchlock — native and malformed policies", () => {
     assert.match(result.absenceReason ?? "", /native run/);
   });
 
-  it("returns absent for a malformed policy without throwing", () => {
+  it("returns a typed present-but-unusable state for a malformed policy without throwing", () => {
     const stateDir = makeStateDir("diag-matchlock-malformed-");
 
     const result = collectMatchlock({
@@ -285,19 +315,56 @@ describe("collectMatchlock — native and malformed policies", () => {
       policyJson: "{definitely not json",
     });
 
-    assert.equal(result.status, "absent");
-    assert.equal(result.policyStatus, "absent");
+    // MTLK-ISO2-MEND (Family C-1): a malformed non-NULL policy is NEVER native.
+    assert.notEqual(result.policyStatus, "absent");
+    assert.equal(result.policyStatus, "empty");
     assert.equal(result.policy, null);
-    assert.match(result.absenceReason ?? "", /malformed matchlock policy/);
+    assert.doesNotMatch(result.absenceReason ?? "", /native run/);
+    assert.match(result.absenceReason ?? "", /unusable \(policy_malformed_json\)/);
   });
 
-  it("returns absent for an empty policy string", () => {
-    const stateDir = makeStateDir("diag-matchlock-empty-policy-");
+  it("does not classify a non-NULL empty/whitespace policy as native/absent", () => {
+    for (const policyJson of ["", "   "]) {
+      const stateDir = makeStateDir("diag-matchlock-empty-policy-");
 
-    const result = collectMatchlock({ stateDir, runId: RUN_ID, policyJson: "   " });
+      const result = collectMatchlock({ stateDir, runId: RUN_ID, policyJson });
+
+      // MTLK-ISO2-CORRECTIVE: every non-NULL policy is inspected explicitly;
+      // an empty/whitespace value is present-but-unusable, never native.
+      assert.notEqual(result.policyStatus, "absent", `policyStatus for ${JSON.stringify(policyJson)}`);
+      assert.equal(result.policyStatus, "empty");
+      assert.notEqual(result.status, "absent");
+      assert.doesNotMatch(result.absenceReason ?? "", /native run/);
+    }
+  });
+
+  it("keeps a NULL policy native (control)", () => {
+    const stateDir = makeStateDir("diag-matchlock-null-policy-");
+
+    const result = collectMatchlock({ stateDir, runId: RUN_ID, policyJson: null });
 
     assert.equal(result.status, "absent");
     assert.equal(result.policyStatus, "absent");
+    assert.match(result.absenceReason ?? "", /native run/);
+  });
+
+  it("classifies a NULL-policy intent-only row as preparing, never native", () => {
+    const stateDir = makeStateDir("diag-matchlock-intent-only-");
+
+    const result = collectMatchlock({
+      stateDir,
+      runId: RUN_ID,
+      policyJson: null,
+      isolationIntent: "true",
+    });
+
+    // MTLK-ISO2-MEND (Family C-1): the recorded isolation intent is consulted
+    // only for a NULL policy; the row is held/preparing, never native.
+    assert.notEqual(result.policyStatus, "absent");
+    assert.equal(result.policyStatus, "empty");
+    assert.equal(result.policy, null);
+    assert.doesNotMatch(result.absenceReason ?? "", /native run/);
+    assert.match(result.absenceReason ?? "", /preparing/);
   });
 
   it("keeps status present for a valid policy with no Matchlock evidence dir", () => {
@@ -306,7 +373,7 @@ describe("collectMatchlock — native and malformed policies", () => {
     const result = collectMatchlock({
       stateDir,
       runId: RUN_ID,
-      policyJson: JSON.stringify({ version: 2, harness: "pi" }),
+      policyJson: validPolicyJson(),
     });
 
     assert.equal(result.status, "present");

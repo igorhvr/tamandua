@@ -1238,7 +1238,7 @@ describe(
               "Synthetic hermes gate: execute the harmless owned fixture action and report.",
               "--working-directory-for-harness", repoDir,
               "--hermes-as-harness",
-              "--matchlock", FIXTURE_TAG,
+              "--matchlock-image", FIXTURE_TAG,
             ],
           });
           runNowId = now.runId;
@@ -1265,7 +1265,7 @@ describe(
               "Synthetic hermes gate: execute the harmless owned fixture action, review it, refine it and verify it.",
               "--working-directory-for-harness", repoDir,
               "--hermes-as-harness",
-              "--matchlock", FIXTURE_TAG,
+              "--matchlock-image", FIXTURE_TAG,
             ],
           });
           runReviewId = review.runId;

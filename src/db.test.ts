@@ -1391,11 +1391,11 @@ console.log(JSON.stringify({ version, rows }));
     }
   });
 
-  it("SCHEMA_VERSION is 14 (9->10 instants -> 10->11 target-moved reroute budget -> 11->12 preclaim death counter -> 12->13 matchlock policy -> 13->14 suite_results.log_path)", () => {
+  it("SCHEMA_VERSION is 15 (9->10 instants -> 10->11 target-moved reroute budget -> 11->12 preclaim death counter -> 12->13 matchlock policy -> 13->14 suite_results.log_path -> 14->15 PREP-STATE isolation_intent)", () => {
     assert.equal(
       SCHEMA_VERSION,
-      14,
-      "SCHEMA_VERSION must be 14 after the union folds runs.matchlock_policy in as the v12->v13 step and LEDGER-DIAG adds suite_results.log_path as the v13->v14 step; the full chain is 9->10 instants, 10->11 target_moved_reroute_count, 11->12 preclaim_death_count, 12->13 matchlock_policy, 13->14 suite_results.log_path",
+      15,
+      "SCHEMA_VERSION must be 15 after the union folds runs.matchlock_policy in as the v12->v13 step and LEDGER-DIAG adds suite_results.log_path as the v13->v14 step and MTLK-ISO-SLICE2 PREP-STATE adds runs.isolation_intent as the v14->v15 step; the full chain is 9->10 instants, 10->11 target_moved_reroute_count, 11->12 preclaim_death_count, 12->13 matchlock_policy, 13->14 suite_results.log_path, 14->15 isolation_intent",
     );
   });
 
@@ -4256,7 +4256,7 @@ describe("OUTAGE-ROUNDS steps.preclaim_death_count migration (v12 step)", () => 
     assert.equal(parsed.col.type, "INTEGER");
     assert.equal(parsed.col.notnull, 1, "preclaim_death_count is NOT NULL");
     assert.equal(parsed.col.dflt_value, "0", "preclaim_death_count should default to 0");
-    assert.equal(parsed.schemaVersion, 14, "SCHEMA_VERSION is 14 after the LEDGER-DIAG 13->14 log_path bump");
+    assert.equal(parsed.schemaVersion, SCHEMA_VERSION, "SCHEMA_VERSION is the current chain top after the LEDGER-DIAG 13->14 log_path and MTLK-ISO-SLICE2 14->15 isolation_intent bumps");
     assert.equal(parsed.user_version, SCHEMA_VERSION,
       `user_version should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
     assert.equal(parsed.step.preclaim_death_count, 0,
@@ -4760,7 +4760,168 @@ describe("MTLK matchlock_policy column migration", () => {
   });
 });
 
-describe("MIGV union4 v14 schema chain (every starting state)", () => {
+describe("MTLK-ISO-SLICE2 isolation_intent column migration (PREP-STATE)", () => {
+  // US-005: runs.isolation_intent (TEXT, "true" = opted-in Matchlock run,
+  // NULL = native) is the host-owned PREP-STATE marker written atomically with
+  // the first INSERT. Nullable with no backfill, added via the guarded
+  // idempotent ALTER pattern (the runs CREATE TABLE keeps its explicit column
+  // list unchanged), with SCHEMA_VERSION bumped (v14 → v15) so existing v14
+  // installs actually run the migration (the WLST5.1 failure mode). Existing
+  // rows read back NULL and are classified native.
+
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  const LEGACY_V9_DDL = `
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      run_number INTEGER,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      notify_url TEXT,
+      scheduling_status TEXT,
+      scheduling_requested_at TEXT,
+      scheduling_error TEXT,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      parent_run_id TEXT,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      test_cmd_established TEXT,
+      test_cmd_source TEXT,
+      harness_probe_status TEXT,
+      harness_probe_at TEXT,
+      matchlock_policy TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO runs (
+      id, run_number, workflow_id, task, status, context, tokens_spent,
+      scheduling_status, created_at, updated_at
+    ) VALUES (
+      'legacy-run', 1, 'workflow', 'task', 'running', '{}', 42,
+      'pending_register', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+  `;
+
+  function runInSubprocess(
+    th: { homeDir: string },
+    dbPath: string,
+    script: string,
+  ): string {
+    return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    }).trim();
+  }
+
+  before(() => {
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  it("fresh DB: runs has isolation_intent at SCHEMA_VERSION (TEXT, nullable, no default)", () => {
+    const th = createTempHome("tamandua-prep-fresh-");
+    const dbPath = path.join(th.root, "fresh.db");
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const col = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "isolation_intent");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      "console.log(JSON.stringify({ col, user_version: ver.user_version }));",
+    ].join("\n");
+
+    const result = runInSubprocess(th, dbPath, script);
+    const parsed = JSON.parse(result) as {
+      col?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+    };
+
+    assert.equal(parsed.user_version, SCHEMA_VERSION,
+      `fresh DB should be stamped at ${SCHEMA_VERSION}`);
+    assert.ok(parsed.col, "isolation_intent column should exist on a fresh DB");
+    assert.equal(parsed.col.type, "TEXT", "isolation_intent should be TEXT");
+    assert.equal(parsed.col.notnull, 0, "isolation_intent should be nullable");
+    assert.equal(parsed.col.dflt_value, null, "isolation_intent should have no default");
+  });
+
+  it("migrates a pre-PREP-STATE DB: adds the column, re-stamps version, existing rows read NULL", () => {
+    const PRE_PREP_STATE_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-prep-migrate-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V9_DDL}
+      PRAGMA user_version = ${PRE_PREP_STATE_SCHEMA_VERSION};
+    `);
+    const preCols = legacyDb.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    assert.ok(preCols.some((c) => c.name === "matchlock_policy"), "precondition: legacy runs has matchlock_policy");
+    assert.ok(!preCols.some((c) => c.name === "isolation_intent"), "precondition: legacy runs lacks isolation_intent");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, PRE_PREP_STATE_SCHEMA_VERSION, "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const col = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "isolation_intent");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      'const row = db.prepare("SELECT id, scheduling_status, isolation_intent, matchlock_policy FROM runs WHERE id = ?").get("legacy-run");',
+      "console.log(JSON.stringify({ col, user_version: ver.user_version, row }));",
+    ].join("\n");
+
+    const result = runInSubprocess(th, dbPath, script);
+    const migrated = JSON.parse(result) as {
+      col?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+      row: {
+        id: string;
+        scheduling_status: string | null;
+        isolation_intent: string | null;
+        matchlock_policy: string | null;
+      };
+    };
+
+    assert.ok(migrated.col, "isolation_intent column should be added by migration");
+    assert.equal(migrated.col.type, "TEXT", "isolation_intent should be TEXT");
+    assert.equal(migrated.col.notnull, 0, "isolation_intent should be nullable");
+    assert.equal(migrated.col.dflt_value, null, "isolation_intent should have no default");
+    assert.equal(migrated.user_version, SCHEMA_VERSION,
+      `legacy DB should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
+    assert.equal(migrated.row.isolation_intent, null,
+      "existing runs keep NULL isolation_intent (native path) after migration");
+    assert.equal(migrated.row.scheduling_status, "pending_register",
+      "the migration must not mutate an existing run's scheduling state");
+  });
+});
+
+describe("MIGV union4 v14 + PREP-STATE v15 schema chain (every starting state)", () => {
   // MATCHLOCK-UNION-4 US-002 + LEDGER-DIAG US-001. The union keeps ONE schema
   // chain with five guarded, idempotent steps:
   //   9  -> 10  migrateInstantsToIsoZ(): rewrite naive `YYYY-MM-DD HH:MM:SS`
@@ -5102,8 +5263,8 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.schemaVersion, 14, "chain must converge on SCHEMA_VERSION 14");
-    assert.equal(parsed.user_version, 14, "v9 must be re-stamped to 14");
+    assert.equal(parsed.schemaVersion, SCHEMA_VERSION, "chain must converge on the current SCHEMA_VERSION");
+    assert.equal(parsed.user_version, SCHEMA_VERSION, "v9 must be re-stamped to the current SCHEMA_VERSION");
     assert.equal(parsed.fullRuns, 1, "v9 must take the slow migration path exactly once");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "12->13 must add runs.matchlock_policy exactly once");
@@ -5153,7 +5314,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 14, "v10 MAIN must be re-stamped to 14");
+    assert.equal(parsed.user_version, SCHEMA_VERSION, "v10 MAIN must be re-stamped to the current SCHEMA_VERSION");
     assert.equal(parsed.fullRuns, 1, "v10 MAIN must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1);
     assert.equal(countOf(parsed.stepCols, "target_moved_reroute_count"), 1);
@@ -5191,7 +5352,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 14, "a Matchlock-lineage v10 DB must reach v14");
+    assert.equal(parsed.user_version, SCHEMA_VERSION, "a Matchlock-lineage v10 DB must reach the current SCHEMA_VERSION");
     assert.equal(parsed.fullRuns, 1, "v10 MATCHLOCK must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "the existing matchlock_policy column must not be duplicated");
@@ -5234,7 +5395,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 14, "v11 must be re-stamped to 14");
+    assert.equal(parsed.user_version, SCHEMA_VERSION, "v11 must be re-stamped to the current SCHEMA_VERSION");
     assert.equal(parsed.fullRuns, 1, "v11 must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "12->13 must add exactly one matchlock_policy column");
@@ -5273,7 +5434,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 14, "v11 MATCHLOCK must be re-stamped to 14");
+    assert.equal(parsed.user_version, SCHEMA_VERSION, "v11 MATCHLOCK must be re-stamped to the current SCHEMA_VERSION");
     assert.equal(parsed.fullRuns, 1, "v11 MATCHLOCK must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "the pre-existing matchlock_policy column must not be duplicated");
@@ -5317,7 +5478,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
     });
 
     const first = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
-    assert.equal(first.user_version, 14);
+    assert.equal(first.user_version, SCHEMA_VERSION);
 
     // Rewind only user_version (the columns stay at the v14 shape) and force
     // applySchema() over an already-current schema. Every guarded step must
@@ -5328,7 +5489,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
     raw.close();
 
     const again = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
-    assert.equal(again.user_version, 14, "forced slow path re-stamps to 14");
+    assert.equal(again.user_version, SCHEMA_VERSION, "forced slow path re-stamps to 14");
     assert.equal(again.fullRuns, 1, "forced slow path runs applySchema exactly once");
     assert.equal(countOf(again.runCols, "matchlock_policy"), 1,
       "12->13 guard must not duplicate runs.matchlock_policy");
@@ -5401,8 +5562,8 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
         `${fixture.name}: the version-only probe must see the raw user_version`);
       assert.equal(parsed.after, "current",
         `${fixture.name}: after getDb() the shape must be current`);
-      assert.equal(parsed.schemaVersion, 14, "the chain terminates at 14");
-      assert.equal(parsed.user_version, 14,
+      assert.equal(parsed.schemaVersion, SCHEMA_VERSION, "the chain terminates at the current SCHEMA_VERSION");
+      assert.equal(parsed.user_version, SCHEMA_VERSION,
         `${fixture.name}: migrate() must re-stamp to 14`);
       assert.ok(parsed.runCols.includes("matchlock_policy"),
         `${fixture.name}: runs.matchlock_policy must exist after the chain`);
@@ -5429,7 +5590,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 14, "v12 MAIN must be re-stamped to 14");
+    assert.equal(parsed.user_version, SCHEMA_VERSION, "v12 MAIN must be re-stamped to the current SCHEMA_VERSION");
     assert.equal(parsed.fullRuns, 1, "v12 MAIN must take the slow migration path");
     assert.equal(countOf(parsed.runCols, "matchlock_policy"), 1,
       "12->13 must add runs.matchlock_policy exactly once to a main-v12 DB");
@@ -5468,7 +5629,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 14, "v12 UNION must be re-stamped to 14");
+    assert.equal(parsed.user_version, SCHEMA_VERSION, "v12 UNION must be re-stamped to the current SCHEMA_VERSION");
     assert.equal(parsed.fullRuns, 1, "v12 UNION must take the slow migration path");
     assert.equal(countOf(parsed.stepCols, "preclaim_death_count"), 1,
       "11->12 must add steps.preclaim_death_count exactly once to a union-v12 DB");
@@ -5524,7 +5685,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
 
     const parsed = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
 
-    assert.equal(parsed.user_version, 14, "a v13 DB must be re-stamped to 14");
+    assert.equal(parsed.user_version, SCHEMA_VERSION, "a v13 DB must be re-stamped to the current SCHEMA_VERSION");
     assert.equal(parsed.fullRuns, 1, "v13 must take the slow migration path exactly once");
     assert.equal(countOf(parsed.suiteCols, "log_path"), 1,
       "13->14 must add suite_results.log_path exactly once");
@@ -5557,12 +5718,12 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
       }));
 
       const first = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
-      assert.equal(first.user_version, 14, `${lineage}: first open stamps v14`);
+      assert.equal(first.user_version, SCHEMA_VERSION, `${lineage}: first open stamps the current SCHEMA_VERSION`);
 
       // Second open: getDb() sees user_version === 14 and must early-return
       // without running the DDL path or throwing.
       const second = JSON.parse(runInSubprocess(th, dbPath, inspectScript())) as InspectResult;
-      assert.equal(second.user_version, 14, `${lineage}: second open keeps v14`);
+      assert.equal(second.user_version, SCHEMA_VERSION, `${lineage}: second open keeps the current SCHEMA_VERSION`);
       assert.equal(second.fullRuns, 0, `${lineage}: second open early-returns (no DDL)`);
       assert.deepEqual(second.run, first.run, `${lineage}: run values unchanged`);
       assert.deepEqual(second.step, first.step, `${lineage}: step values unchanged`);
@@ -5570,14 +5731,14 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
     }
   });
 
-  it("already at v14: migrate() fast-path is a no-op (no DDL, no re-stamp churn)", () => {
+  it("already at the current SCHEMA_VERSION: migrate() fast-path is a no-op (no DDL, no re-stamp churn)", () => {
     const th = createTempHome("tamandua-union4-v14-noop-");
     const dbPath = path.join(th.root, "current.db");
 
     const first = JSON.parse(runInSubprocess(th, dbPath, freshInspectScript())) as FreshInspectResult;
-    assert.equal(first.schemaVersion, 14);
-    assert.equal(first.user_version, 14, "a fresh DB starts at the current version");
-    assert.equal(first.fullRuns, 1, "first open stamps v14 through the full DDL path");
+    assert.equal(first.schemaVersion, SCHEMA_VERSION);
+    assert.equal(first.user_version, SCHEMA_VERSION, "a fresh DB starts at the current version");
+    assert.equal(first.fullRuns, 1, "first open stamps the current SCHEMA_VERSION through the full DDL path");
     assert.equal(countOf(first.runCols, "matchlock_policy"), 1,
       "a v14 DB must have runs.matchlock_policy exactly once");
     assert.equal(countOf(first.stepCols, "preclaim_death_count"), 1,
@@ -5588,7 +5749,7 @@ describe("MIGV union4 v14 schema chain (every starting state)", () => {
       "a v14 DB must have suite_results.log_path exactly once");
 
     const second = JSON.parse(runInSubprocess(th, dbPath, freshInspectScript())) as FreshInspectResult;
-    assert.equal(second.user_version, 14, "second open keeps user_version at 14");
+    assert.equal(second.user_version, SCHEMA_VERSION, "second open keeps user_version at the current SCHEMA_VERSION");
     assert.equal(second.fullRuns, 0,
       "second open must early-return without running the DDL path");
     assert.deepEqual(second.runCols, first.runCols, "no DDL: runs columns unchanged");

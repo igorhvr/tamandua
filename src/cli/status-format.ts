@@ -10,6 +10,7 @@ import { execSync } from "node:child_process";
 import { getDaemonStatus, getDashboardStatus, getMcpStatus, getControlPlaneStatus, getMcpStatusAsync, getControlPlaneStatusAsync, isRunning } from "../server/daemonctl.js";
 import { ABANDONED_THRESHOLD_MS } from "../installer/step-ops.js";
 import { parseInstant, formatInstant, isOlderThan } from "../lib/instant.js";
+import { sanitizeSchedulingError } from "../installer/scheduling-error.js";
 import {
   acknowledgeDaemonDeath,
   getLastDaemonDeath,
@@ -394,9 +395,17 @@ export function formatRunsSummary(opts?: {
       // scheduling_error verbatim (e.g. "waiting for harness workdir held by
       // run <id>: <dir>") so an operator can tell "waiting" from "dead". This
       // is a distinct annotation from the stale/dead marker above.
+      //
+      // MTLK-ISO2-TRANSITION-CAS (Family C-1): the column is free-form, so the
+      // annotation is allow-listed through the shared classifier — a legacy raw
+      // parser fragment is dropped, never printed.
+      const sanitizedSchedulingError = sanitizeSchedulingError(
+        r.schedulingStatus,
+        r.schedulingError,
+      );
       const waitingMarker =
-        r.schedulingStatus === "waiting" && r.schedulingError
-          ? `  WAITING: ${r.schedulingError}`
+        r.schedulingStatus === "waiting" && sanitizedSchedulingError
+          ? `  WAITING: ${sanitizedSchedulingError}`
           : "";
       lines.push(
         `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}${redLedgerMarker}${instantFailMarker}${preclaimDeathMarker}${waitingMarker}`,

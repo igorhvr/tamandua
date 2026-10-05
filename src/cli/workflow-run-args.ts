@@ -9,6 +9,11 @@ import {
   assertAllowPrivateEntries,
   parseAllowPrivateEnv,
 } from "../installer/matchlock/allow-private.js";
+import {
+  resolveMatchlockImageReference,
+  type MatchlockImageSource,
+} from "../installer/matchlock/standard-image.js";
+import { parseSwapMB } from "../installer/matchlock/resource-limits.js";
 
 export interface WorkflowRunArgs {
   taskTitle: string;
@@ -27,25 +32,57 @@ export interface WorkflowRunArgs {
    */
   workdirCollisionPolicy: WorkdirCollisionPolicy;
   /**
-   * MTLK-PI US-001 / MTLK-HERMES-EXEC US-003 / MTLK-DSH-EXEC US-002: the
-   * explicitly requested Matchlock image (--matchlock IMAGE /
-   * --matchlock=IMAGE). Present only when the operator opted in; absent means
-   * the run uses the native path and performs zero Matchlock actions. With
-   * --matchlock the run executes the pi (default), hermes
-   * (--hermes-as-harness) or dsh (--dsh-as-harness) harness inside a fresh VM;
-   * all three harness selections are admitted.
+   * MTLK-ISO-SLICE1 (SHARED-V3 / CLI-CUTOVER): the effective Matchlock image
+   * reference for an opted-in run. `--matchlock` (a pure boolean) selects the
+   * standard image; `--matchlock-image <image>` / `--matchlock-image=<image>`
+   * names an explicit one and wins when both appear. Absent means the run uses
+   * the native path and performs zero Matchlock actions. With an opt-in the run
+   * executes the pi (default), hermes (--hermes-as-harness) or dsh
+   * (--dsh-as-harness) harness inside a fresh VM; all three harness selections
+   * are admitted.
    */
   matchlockImage?: string;
+  /**
+   * MTLK-ISO-SLICE1: persisted provenance for {@link matchlockImage} —
+   * `"explicit"` when `--matchlock-image` named it, `"standard"` when the
+   * standard opt-in (or its TAMANDUA_MATCHLOCK_IMAGE override) resolved it.
+   * Undefined for a native run.
+   */
+  matchlockImageSource?: MatchlockImageSource;
+  /** True when an opt-in flag (`--matchlock` or `--matchlock-image`) was seen. */
+  matchlockRequested?: boolean;
+  /**
+   * MTLK-ISO-SLICE1: true only when
+   * `--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` was
+   * explicitly supplied to this action. Consumed by the root-usage gate in
+   * slice 2; parsed and plumbed here.
+   */
+  matchlockRootUsageOverride?: boolean;
   /**
    * MTLK-VM-SIZE US-002: raw (unvalidated) VM size overrides for an opted-in
    * Matchlock run. Kept as raw strings here on purpose — the resolver
    * (`src/installer/matchlock/resource-limits.ts`) owns parsing, host-derived
    * defaults and clamping at launch time. Present only when the flag was
-   * supplied; each of the three requires --matchlock <image>.
+   * supplied; each of the three requires an opt-in (`--matchlock` or
+   * `--matchlock-image <image>`).
    */
   matchlockCpus?: string;
   matchlockMemory?: string;
   matchlockDisk?: string;
+  /**
+   * MTLK-SWAP US-006: raw (unvalidated here) `--matchlock-swap` value (a whole
+   * number of MB or `<n>g`/`<n>G`). Accepted only alongside a Matchlock opt-in.
+   * The value IS validated at parse time (via `parseSwapMB`) so `0` and
+   * over-cap values fail before run creation; the launch-time resolver owns the
+   * effective size. Absent when the flag was not supplied.
+   */
+  matchlockSwap?: string;
+  /**
+   * MTLK-SWAP US-006: true when `--matchlock-no-swap` (a pure boolean) was
+   * supplied. Disables swap for the run and is mutually exclusive with
+   * `--matchlock-swap`; requires a Matchlock opt-in.
+   */
+  matchlockNoSwap?: boolean;
   /**
    * MTLK-ALLOW-PRIVATE US-004: the launch-resolved per-run exception list of
    * private destinations the Matchlock VM may reach (repeatable
@@ -54,7 +91,7 @@ export interface WorkflowRunArgs {
    * Entries are shape-validated and deduped here; DNS resolution stays
    * matchlock's job. Present only for an opted-in Matchlock run with a
    * non-empty effective list — a native run never carries one, and the env
-   * default is ignored without --matchlock.
+   * default is ignored without an opt-in.
    */
   matchlockAllowPrivate?: string[];
   /** Key-value pairs injected as run template context */
@@ -65,6 +102,28 @@ export interface WorkflowRunArgs {
   timeout?: string;
   /** Output JSON after wait completes — only meaningful with --wait */
   jsonFlag: boolean;
+}
+
+/**
+ * R13: the deliberately long root-usage override flag. Kept in lockstep with
+ * the admission spelling (`MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG` in
+ * `src/installer/matchlock/admission.ts`) so the refusal text always names a
+ * flag that actually exists. For `workflow run` it is a dependent flag
+ * (requires an opt-in); for `workflow resume` it is a standalone pure boolean
+ * (see {@link parseMatchlockRootUsageOverrideFlag}).
+ */
+export const MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG =
+  "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs";
+
+/**
+ * MTLK-ISO-SLICE2 US-009: parse the R13 root-usage override for `workflow
+ * resume`, which does NOT go through the full `workflow run` parser. A
+ * STANDALONE pure boolean: it never consumes a following token, and repeated
+ * occurrences are idempotent. Presence means the operator explicitly supplied
+ * the override to this resume action.
+ */
+export function parseMatchlockRootUsageOverrideFlag(args: readonly string[]): boolean {
+  return args.includes(MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG);
 }
 
 const KNOWN_FLAGS = new Set([
@@ -84,27 +143,42 @@ const KNOWN_FLAGS = new Set([
   "--queue-behind-holder",
   "--allow-multiple-runs-in-one-working-directory",
   "--matchlock",
+  "--matchlock-image",
   "--matchlock-cpus",
   "--matchlock-memory",
   "--matchlock-disk",
+  "--matchlock-swap",
+  "--matchlock-no-swap",
   "--matchlock-allow-private",
+  MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
 ]);
 
 // MTLK-ALLOW-PRIVATE US-004: the repeatable allow-private flag. Its entry
 // grammar lives in the shared validator module (allow-private.ts).
 const MATCHLOCK_ALLOW_PRIVATE_FLAG = "--matchlock-allow-private";
 
-// MTLK-VM-SIZE US-002: the three raw VM-size overrides and the
-// WorkflowRunArgs field each populates. The without---matchlock error names
-// the FIRST supplied --matchlock-dependent flag, tracked while parsing.
-const MATCHLOCK_SIZE_FLAG_TO_FIELD: Record<
-  string,
-  "matchlockCpus" | "matchlockMemory" | "matchlockDisk"
-> = {
+// MTLK-VM-SIZE US-002 / MTLK-SWAP US-006: the raw VM-size overrides (plus the
+// swap size) and the WorkflowRunArgs field each populates. The without-opt-in
+// error names the FIRST supplied --matchlock-dependent flag, tracked while
+// parsing. `--matchlock-swap` rides this map so it shares the space/`=` forms
+// and the duplicate / missing-value / next-token-is-an-option error shapes; its
+// value is additionally validated by `parseSwapMB` at parse time.
+type MatchlockSizeField =
+  | "matchlockCpus"
+  | "matchlockMemory"
+  | "matchlockDisk"
+  | "matchlockSwap";
+
+const MATCHLOCK_SIZE_FLAG_TO_FIELD: Record<string, MatchlockSizeField> = {
   "--matchlock-cpus": "matchlockCpus",
   "--matchlock-memory": "matchlockMemory",
   "--matchlock-disk": "matchlockDisk",
+  "--matchlock-swap": "matchlockSwap",
 };
+
+// MTLK-SWAP US-006: the pure boolean off switch, mutually exclusive with the
+// size flag.
+const MATCHLOCK_NO_SWAP_FLAG = "--matchlock-no-swap";
 
 const HARNESS_FLAG_TO_TYPE: Record<string, "pi" | "hermes" | "dsh"> = {
   "--pi-as-harness": "pi",
@@ -168,13 +242,20 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   let harnessFlagName: string | undefined;
   let queueBehindHolder = false;
   let allowMultipleRunsInOneWorkingDirectory = false;
-  let matchlockImage: string | undefined;
-  const matchlockSizeValues: Partial<
-    Record<"matchlockCpus" | "matchlockMemory" | "matchlockDisk", string>
-  > = {};
+  // MTLK-ISO-SLICE1: `--matchlock` is a pure boolean opt-in; the image is named
+  // only through `--matchlock-image` (explicit) or resolved from the standard
+  // constant/env. `matchlockRequested` is the opt-in; `matchlockExplicitImage`
+  // is the raw explicit reference.
+  let matchlockRequested = false;
+  let matchlockExplicitImage: string | undefined;
+  let matchlockRootUsageOverrideSeen = false;
+  const matchlockSizeValues: Partial<Record<MatchlockSizeField, string>> = {};
+  // MTLK-SWAP US-006: the pure boolean off switch; mutually exclusive with a
+  // swap size (flag or equals form).
+  let matchlockNoSwapSeen = false;
   // MTLK-ALLOW-PRIVATE US-004: raw repeatable allow-private entries (validated
-  // and deduped after the loop) plus the first --matchlock-dependent flag
-  // supplied, so a missing --matchlock names the flag the operator wrote first.
+  // and deduped after the loop) plus the first opt-in-dependent flag supplied,
+  // so a missing opt-in names the flag the operator wrote first.
   const matchlockAllowPrivateEntries: string[] = [];
   let matchlockAllowPrivateSupplied = false;
   let firstMatchlockDependentFlag: string | undefined;
@@ -197,55 +278,110 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     }
 
     if (token === "--matchlock") {
-      // Image value is mandatory and must NEVER consume a following option:
-      // a missing value, an empty value, a duplicate occurrence, or a value
-      // that is actually another recognized --flag all fail clearly.
-      if (matchlockImage !== undefined) {
+      // MTLK-ISO-SLICE1: a PURE BOOLEAN opt-in with the standard image. It
+      // NEVER consumes a following token, so it can appear anywhere with zero
+      // ambiguity; a repeated occurrence is idempotent.
+      matchlockRequested = true;
+      continue;
+    }
+
+    // MTLK-ISO-SLICE1: the boolean takes no value. A token in its equals form
+    // must be a HARD ERROR — never silently absorbed into the task text — and
+    // the error names the value-bearing replacement. This check precedes the
+    // unknown-option/task-text fallthrough on purpose.
+    if (token.startsWith("--matchlock=")) {
+      throw new Error(
+        "--matchlock takes no value. Use --matchlock-image <image> to name an image.",
+      );
+    }
+
+    if (token === "--matchlock-image") {
+      // MTLK-ISO-SLICE1: explicit image, space form. The value must never
+      // consume a recognized --flag (same guard as the size/allow-private
+      // flags); a duplicate occurrence is a usage error.
+      if (matchlockExplicitImage !== undefined) {
         throw new Error(
-          "Duplicate --matchlock. Specify the Matchlock image at most once.",
+          "Duplicate --matchlock-image. Specify the Matchlock image at most once.",
         );
       }
       const value = args[i + 1];
       if (value === undefined || value.trim() === "") {
         throw new Error(
-          "Missing value for --matchlock. Use --matchlock <image>.",
+          "Missing value for --matchlock-image. Use --matchlock-image <image>.",
         );
       }
-      // A value that is actually another recognized --flag must not be
-      // consumed as the image (e.g. `--matchlock --pi-as-harness`).
       if (value.startsWith("--") && KNOWN_FLAGS.has(value.split("=")[0])) {
         throw new Error(
-          `Missing value for --matchlock. The next token "${value}" is an option, not an image.`,
+          `Missing value for --matchlock-image. The next token "${value}" is an option, not an image.`,
         );
       }
-      matchlockImage = value;
+      matchlockExplicitImage = value.trim();
+      matchlockRequested = true;
       i++;
       continue;
     }
 
-    const inlineMatchlockPrefix = "--matchlock=";
-    if (token.startsWith(inlineMatchlockPrefix)) {
-      if (matchlockImage !== undefined) {
+    const inlineMatchlockImagePrefix = "--matchlock-image=";
+    if (token.startsWith(inlineMatchlockImagePrefix)) {
+      if (matchlockExplicitImage !== undefined) {
         throw new Error(
-          "Duplicate --matchlock. Specify the Matchlock image at most once.",
+          "Duplicate --matchlock-image. Specify the Matchlock image at most once.",
         );
       }
-      const value = token.slice(inlineMatchlockPrefix.length).trim();
+      const value = token.slice(inlineMatchlockImagePrefix.length).trim();
       if (value === "") {
         throw new Error(
-          "Missing value for --matchlock (--matchlock= must be followed by an image).",
+          "Missing value for --matchlock-image (--matchlock-image= must be followed by an image).",
         );
       }
-      matchlockImage = value;
+      if (value.startsWith("--") && KNOWN_FLAGS.has(value.split("=")[0])) {
+        throw new Error(
+          `Missing value for --matchlock-image. The value "${value}" is an option, not an image.`,
+        );
+      }
+      matchlockExplicitImage = value;
+      matchlockRequested = true;
+      continue;
+    }
+
+    if (token === MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG) {
+      // MTLK-ISO-SLICE1 R13: the deliberate long root-execution override. A
+      // pure boolean and a dependent flag (usage error without an opt-in).
+      matchlockRootUsageOverrideSeen = true;
+      if (firstMatchlockDependentFlag === undefined) {
+        firstMatchlockDependentFlag = token;
+      }
+      continue;
+    }
+
+    if (token === MATCHLOCK_NO_SWAP_FLAG) {
+      // MTLK-SWAP US-006: a PURE BOOLEAN off switch (never consumes a token).
+      // It is a dependent flag (usage error without an opt-in) and is mutually
+      // exclusive with `--matchlock-swap`; the error names BOTH flags.
+      if (matchlockSizeValues.matchlockSwap !== undefined) {
+        throw new Error(
+          `Cannot specify both --matchlock-swap and ${MATCHLOCK_NO_SWAP_FLAG}. Choose one swap policy.`,
+        );
+      }
+      matchlockNoSwapSeen = true;
+      if (firstMatchlockDependentFlag === undefined) {
+        firstMatchlockDependentFlag = token;
+      }
       continue;
     }
 
     // MTLK-VM-SIZE US-002: raw `--matchlock-*` size overrides. The parser
     // stores them verbatim (the launch-time resolver validates); it only
     // enforces syntax-independent rules: at most once, a non-empty value,
-    // and a value that is not itself a recognized option.
+    // and a value that is not itself a recognized option. MTLK-SWAP US-006:
+    // `--matchlock-swap` rides this path but IS validated at parse time.
     const matchlockSizeField = MATCHLOCK_SIZE_FLAG_TO_FIELD[token];
     if (matchlockSizeField !== undefined) {
+      if (matchlockSizeField === "matchlockSwap" && matchlockNoSwapSeen) {
+        throw new Error(
+          `Cannot specify both --matchlock-swap and ${MATCHLOCK_NO_SWAP_FLAG}. Choose one swap policy.`,
+        );
+      }
       if (matchlockSizeValues[matchlockSizeField] !== undefined) {
         throw new Error(
           `Duplicate ${token}. Specify ${token} at most once.`,
@@ -262,7 +398,14 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
           `Missing value for ${token}. The next token "${value}" is an option, not a value.`,
         );
       }
-      matchlockSizeValues[matchlockSizeField] = value.trim();
+      // MTLK-SWAP US-006: validate the swap size at parse time so `0`,
+      // over-cap, negative, fractional and non-numeric values exit non-zero
+      // before any run row is created. The raw accepted value is stored.
+      const trimmed = value.trim();
+      if (matchlockSizeField === "matchlockSwap") {
+        parseSwapMB(trimmed, token);
+      }
+      matchlockSizeValues[matchlockSizeField] = trimmed;
       if (firstMatchlockDependentFlag === undefined) firstMatchlockDependentFlag = token;
       i++;
       continue;
@@ -273,6 +416,11 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     );
     if (inlineMatchlockSizeFlag !== undefined) {
       const field = MATCHLOCK_SIZE_FLAG_TO_FIELD[inlineMatchlockSizeFlag];
+      if (field === "matchlockSwap" && matchlockNoSwapSeen) {
+        throw new Error(
+          `Cannot specify both --matchlock-swap and ${MATCHLOCK_NO_SWAP_FLAG}. Choose one swap policy.`,
+        );
+      }
       if (matchlockSizeValues[field] !== undefined) {
         throw new Error(
           `Duplicate ${inlineMatchlockSizeFlag}. Specify ${inlineMatchlockSizeFlag} at most once.`,
@@ -288,6 +436,9 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
         throw new Error(
           `Missing value for ${inlineMatchlockSizeFlag}. The value "${value}" is an option, not a value.`,
         );
+      }
+      if (field === "matchlockSwap") {
+        parseSwapMB(value, inlineMatchlockSizeFlag);
       }
       matchlockSizeValues[field] = value;
       if (firstMatchlockDependentFlag === undefined) {
@@ -590,13 +741,33 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   // at CLI-parse time.
   const workdirCollisionPolicy = parseWorkdirCollisionPolicyFlags(flagArgs);
 
-  // MTLK-VM-SIZE US-002 / MTLK-ALLOW-PRIVATE US-004: the size overrides and
-  // the allow-private list only make sense for an opted-in Matchlock run, so
-  // any of them without --matchlock is a usage error naming the first supplied
-  // flag (`--matchlock-allow-private` is repeatable, so its first occurrence
-  // is the one named).
-  if (matchlockImage === undefined && firstMatchlockDependentFlag !== undefined) {
-    throw new Error(`${firstMatchlockDependentFlag} requires --matchlock <image>.`);
+  // MTLK-VM-SIZE US-002 / MTLK-ALLOW-PRIVATE US-004 / MTLK-ISO-SLICE1: the
+  // size overrides, the allow-private list and the root-usage override only
+  // make sense for an opted-in Matchlock run, so any of them without an opt-in
+  // (`--matchlock` or `--matchlock-image <image>`) is a usage error naming the
+  // first supplied flag (`--matchlock-allow-private` is repeatable, so its
+  // first occurrence is the one named).
+  if (!matchlockRequested && firstMatchlockDependentFlag !== undefined) {
+    throw new Error(
+      `${firstMatchlockDependentFlag} requires --matchlock or --matchlock-image <image>.`,
+    );
+  }
+
+  // MTLK-ISO-SLICE1: resolve the effective image ONLY when an opt-in occurred.
+  // A native run leaves both fields undefined and never consults the
+  // environment (the run stays byte-identical to the pre-Matchlock path). An
+  // explicit `--matchlock-image` always wins over the standard opt-in (and its
+  // TAMANDUA_MATCHLOCK_IMAGE override).
+  let matchlockImage: string | undefined;
+  let matchlockImageSource: MatchlockImageSource | undefined;
+  if (matchlockRequested) {
+    const resolved = resolveMatchlockImageReference({
+      requested: true,
+      explicitImage: matchlockExplicitImage,
+      env: process.env,
+    });
+    matchlockImage = resolved?.image;
+    matchlockImageSource = resolved?.source;
   }
 
   // MTLK-ALLOW-PRIVATE US-004 precedence: explicit repeated flags win, and the
@@ -612,7 +783,7 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
       matchlockAllowPrivateEntries,
       MATCHLOCK_ALLOW_PRIVATE_FLAG,
     );
-  } else if (matchlockImage !== undefined) {
+  } else if (matchlockRequested) {
     const envEntries = parseAllowPrivateEnv(process.env[MATCHLOCK_ALLOW_PRIVATE_ENV]);
     if (envEntries.length > 0) {
       matchlockAllowPrivate = assertAllowPrivateEntries(envEntries, MATCHLOCK_ALLOW_PRIVATE_ENV);
@@ -629,9 +800,14 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     harnessAs,
     workdirCollisionPolicy,
     matchlockImage,
+    matchlockImageSource,
+    matchlockRequested: matchlockRequested || undefined,
+    matchlockRootUsageOverride: matchlockRootUsageOverrideSeen || undefined,
     matchlockCpus: matchlockSizeValues.matchlockCpus,
     matchlockMemory: matchlockSizeValues.matchlockMemory,
     matchlockDisk: matchlockSizeValues.matchlockDisk,
+    matchlockSwap: matchlockSizeValues.matchlockSwap,
+    matchlockNoSwap: matchlockNoSwapSeen || undefined,
     matchlockAllowPrivate,
     context,
     wait,

@@ -38,6 +38,8 @@ import {
   VM_ORPHAN_MATCHLOCK_DIR_NAME,
   VM_ORPHAN_STORE_FILE_NAME,
 } from "../installer/matchlock/vm-orphans.js";
+import { parseMatchlockPolicy } from "../installer/matchlock/policy.js";
+import { classifyIsolationState } from "../installer/matchlock/prep-state.js";
 import { isPathInside, resolveRunEvidenceDir } from "./paths.js";
 import { redactSecrets } from "./redact.js";
 import type {
@@ -68,6 +70,12 @@ export interface CollectMatchlockOptions {
   bareRunId?: string;
   /** Raw `runs.matchlock_policy` value (NULL for a native run). */
   policyJson?: string | null;
+  /**
+   * MTLK-ISO2-MEND (Family C-1): raw `runs.isolation_intent` value. When the
+   * row records the isolation intent but carries no pinned policy, the row is
+   * `preparing` (held), never native.
+   */
+  isolationIntent?: string | null;
 }
 
 function errorMessage(error: unknown): string {
@@ -99,42 +107,88 @@ interface PolicyResult {
 }
 
 /**
- * Parse the persisted policy and redact it. NULL/empty/malformed/oversized
- * policies are `status: 'absent'` with a reason — never a thrown exception.
+ * MTLK-ISO2-MEND (Family C-1): the typed, non-leaking unusable reason code for
+ * a non-NULL policy the strict parser rejects. Never returns raw parser text.
  */
-function parsePolicy(policyJson: string | null | undefined): PolicyResult {
-  if (policyJson === null || policyJson === undefined || policyJson.trim() === "") {
+function unusablePolicyCode(policyJson: string): string {
+  if (Buffer.byteLength(policyJson, "utf8") > MAX_MATCHLOCK_POLICY_BYTES) {
+    return "policy_oversized";
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(policyJson);
+  } catch {
+    return "policy_malformed_json";
+  }
+  if (parsed === null) return "policy_json_null";
+  try {
+    parseMatchlockPolicy(policyJson);
+    return "policy_unusable";
+  } catch (err) {
+    const code = (err as { code?: unknown }).code;
+    return typeof code === "string" && code.length > 0 ? code : "policy_unusable";
+  }
+}
+
+/**
+ * Parse the persisted policy and redact it. The strict four-state classifier is
+ * authoritative: NULL (no intent) is native; NULL + recorded intent is
+ * `preparing` (held, never native); a non-NULL policy that the strict parser
+ * accepts is `present`/isolated; every other non-NULL value (empty/whitespace,
+ * malformed, oversized, JSON-null, unsupported version, credential-bearing) is
+ * present-but-unusable. Never throws and never leaks raw parser text.
+ */
+function parsePolicy(
+  policyJson: string | null | undefined,
+  isolationIntent?: string | null,
+): PolicyResult {
+  const intentRecorded = isolationIntent === "true";
+  const state = classifyIsolationState(intentRecorded, policyJson ?? null);
+  if (state === "native") {
     return {
       status: "absent",
       policy: null,
       reason: "no matchlock policy (native run)",
     };
   }
-  if (Buffer.byteLength(policyJson, "utf8") > MAX_MATCHLOCK_POLICY_BYTES) {
+  if (state === "preparing") {
     return {
-      status: "absent",
+      status: "empty",
       policy: null,
-      reason: `matchlock policy exceeds ${MAX_MATCHLOCK_POLICY_BYTES} bytes`,
+      reason:
+        "matchlock isolation intent is recorded but no pinned policy exists " +
+        "(preparing; held non-schedulable, never native)",
     };
   }
-  let parsed: unknown;
+  if (state === "isolated") {
+    try {
+      return { status: "present", policy: redactSecrets(JSON.parse(policyJson as string)) };
+    } catch {
+      // Defensive: classify said isolated, so this is unreachable.
+      return {
+        status: "empty",
+        policy: null,
+        reason: "matchlock isolation policy is present but unusable (policy_malformed_json)",
+      };
+    }
+  }
+  // Present-but-unusable non-NULL policy. A parseable value is still returned
+  // REDACTED (so a credential-bearing record never leaks), but it is never
+  // reported as a usable/isolated policy.
+  let redactedParsed: unknown = null;
   try {
-    parsed = JSON.parse(policyJson);
-  } catch (error) {
-    return {
-      status: "absent",
-      policy: null,
-      reason: `malformed matchlock policy: ${errorMessage(error)}`,
-    };
+    const parsed = JSON.parse(policyJson as string) as unknown;
+    if (parsed !== null) redactedParsed = redactSecrets(parsed);
+  } catch {
+    redactedParsed = null;
   }
-  if (parsed === null) {
-    return {
-      status: "absent",
-      policy: null,
-      reason: "matchlock policy is null",
-    };
-  }
-  return { status: "present", policy: redactSecrets(parsed) };
+  return {
+    status: "empty",
+    policy: redactedParsed,
+    reason: `matchlock isolation policy is present but unusable (${unusablePolicyCode(
+      policyJson as string,
+    )})`,
+  };
 }
 
 /**
@@ -299,7 +353,7 @@ export function collectMatchlock(
   const rawId = (options.bareRunId ?? options.runId ?? "").trim();
   const bare = rawId.startsWith("run-") ? rawId.slice(4) : rawId;
 
-  const policy = parsePolicy(options.policyJson);
+  const policy = parsePolicy(options.policyJson, options.isolationIntent);
 
   let evidenceRoot: string;
   try {
@@ -373,7 +427,7 @@ export function collectMatchlock(
   }
 
   const hasEvidence =
-    policy.status === "present" ||
+    policy.status !== "absent" ||
     vms.length > 0 ||
     errorRecords.some((record) => record.status === "present");
   const status: SourceStatus = hasEvidence ? "present" : "absent";

@@ -5,7 +5,10 @@ import { writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  describeUnusableMatchlockPolicy,
+  parseMatchlockPolicy,
   serializeMatchlockPolicy,
+  withGrantedRootUsageConsent,
   type ExecutionIsolation,
   type ExecutionIsolationResourceLimits,
 } from "./matchlock/policy.js";
@@ -15,22 +18,45 @@ import {
 } from "./matchlock/resource-limits.js";
 import {
   admitMatchlockRun,
+  assertMatchlockSwapSupport,
+  MatchlockAdmissionError,
+  matchlockRootUsageRefusalText,
+  MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
   type HermesAdmissionSubmission,
   type MatchlockAllowPrivateSupportProbe,
 } from "./matchlock/admission.js";
+import type { MatchlockSwapSupportProbe } from "./matchlock/swap-support.js";
+import {
+  runMatchlockResumePreflight,
+  type InheritedImageVerifier,
+} from "./matchlock/resume-preflight.js";
+import {
+  ISOLATION_INTENT_RECORDED,
+  PREPARING_SCHEDULING_STATUS,
+  initialRunIsolationState,
+  isolationPreparingHeldText,
+  readIsolationState,
+} from "./matchlock/prep-state.js";
 import type { DshSubmissionContext } from "./matchlock/dsh-adapter-contract.js";
+import type { MatchlockImageSource } from "./matchlock/standard-image.js";
+import {
+  buildWorkflowWarnings,
+  type WorkflowWarning,
+} from "./matchlock/warnings.js";
 import { getDb } from "../db.js";
 import { SQL_NOW_ISO } from "../lib/instant.js";
 import { loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir, resolvePiStateDir } from "./paths.js";
 import {
+  assertDaemonPrepStateCapability,
   ensureDaemonControlAvailable,
+  isDaemonControlReachable,
   registerRunWithDaemon,
   nudgeWithDaemon,
 } from "../server/control-client.js";
 import { emitEvent } from "./events.js";
 import { resetFailedHarnessProbeForResume } from "./harness-probe.js";
-import { advancePipeline, resetFailedStoriesForResume, scheduleRunCronTeardown, setRunContextKey, removeRunContextKey } from "./step-ops.js";
+import { advancePipeline, resetFailedStoriesForResume, scheduleRunCronTeardown } from "./step-ops.js";
 import {
   RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY,
   validateRunHarnessForScheduling,
@@ -87,6 +113,22 @@ export interface RunWorkflowParams {
    */
   matchlockImage?: string;
   /**
+   * MTLK-ISO-SLICE1 SHARED-V3: the REAL provenance of the resolved
+   * `matchlockImage` — "explicit" (`--matchlock-image [=]<image>`) or
+   * "standard" (bare `--matchlock`, resolving to the built-in standard image
+   * or TAMANDUA_MATCHLOCK_IMAGE). Threaded to admission so the persisted v3
+   * policy's `requestedImageSource` is truthful instead of a placeholder.
+   * Absent for a native run and for callers that predate the field.
+   */
+  matchlockImageSource?: MatchlockImageSource;
+  /**
+   * MTLK-ISO-SLICE1 SHARED-V3: true ONLY when the operator explicitly supplied
+   * `--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` to
+   * THIS action. Threaded to admission so the persisted v3 policy's
+   * `rootUsageConsent` records the per-action consent; false/absent otherwise.
+   */
+  matchlockRootUsageOverride?: boolean;
+  /**
    * MTLK-DSH-EXEC US-002: the harness running inside the Matchlock VM when
    * --matchlock is present. "dsh" (with --dsh-as-harness) persists the frozen
    * submission context and resolved effective DSH_HOME; "pi" is the default.
@@ -139,6 +181,14 @@ export interface RunWorkflowParams {
    * it and admission probes the resolved rpc binary itself.
    */
   matchlockAllowPrivateSupportProbe?: MatchlockAllowPrivateSupportProbe;
+  /**
+   * MTLK-ISO-SLICE2 US-003: injectable swap-capability support probe threaded to
+   * admission so tests never need a real matchlock binary. Production omits it
+   * and admission probes the resolved rpc binary itself. The probe runs for
+   * every Matchlock admission (fresh opt-in or inherited-policy replacement),
+   * including swap-disabled runs.
+   */
+  matchlockSwapSupportProbe?: MatchlockSwapSupportProbe;
   /** When true, suppresses automatic replacement-run launch after a rugpull is detected */
   noRelaunchUponRugpull?: boolean;
   /**
@@ -197,6 +247,31 @@ export interface RunWorkflowResult {
    * admitted VM size in the launch output.
    */
   matchlockResourceLimits?: ExecutionIsolationResourceLimits;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-011): the immutable image pin read from the
+   * persisted (possibly inherited) Matchlock policy after admission succeeds.
+   * Undefined for a native run. The CLI prints it as its own line with the
+   * distinct `matchlock pinned:` prefix, so it never collides with the single
+   * `matchlock:` launch line.
+   */
+  matchlockPin?: {
+    digest: string;
+    configDigest: string;
+  };
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-012): the effective image provenance read
+   * from the admitted (possibly inherited) Matchlock policy. Undefined for a
+   * native run. The CLI folds it into `workflow run --json`'s
+   * `matchlockResources.imageSource`, so the post-admission JSON reports the
+   * ADMITTED provenance rather than only the launch-resolved one.
+   */
+  matchlockImageSource?: MatchlockImageSource;
+  /**
+   * MTLK-ISO-SLICE2 US-013 (R13): the ADMITTED policy's `rootUsageConsent`,
+   * surfaced so `workflow run --json` can re-derive the shared
+   * `root_usage_override` warning. Undefined for a native run.
+   */
+  matchlockRootUsageConsent?: boolean;
 }
 
 /**
@@ -208,7 +283,13 @@ function resolveDefaultMatchlockResourceLimits(
   hostProbe?: MatchlockResourceHostProbe,
 ): ExecutionIsolationResourceLimits {
   const resolved = resolveMatchlockResourceLimits(hostProbe ? { hostProbe } : {});
-  return { cpus: resolved.cpus, memoryMB: resolved.memoryMB, diskSizeMB: resolved.diskSizeMB };
+  return {
+    cpus: resolved.cpus,
+    memoryMB: resolved.memoryMB,
+    diskSizeMB: resolved.diskSizeMB,
+    // SHARED-V3: fresh writes always carry the effective swap size.
+    swapMB: resolved.swapMB,
+  };
 }
 
 function failPersistedRunLaunch(params: {
@@ -354,6 +435,8 @@ export async function runWorkflow(
     noHurrySaveTokensMode,
     harnessType,
     matchlockImage,
+    matchlockImageSource,
+    matchlockRootUsageOverride,
     matchlockHarness,
     dshSubmission,
     matchlockPolicy,
@@ -361,6 +444,7 @@ export async function runWorkflow(
     matchlockResourceHostProbe,
     matchlockAllowPrivate,
     matchlockAllowPrivateSupportProbe,
+    matchlockSwapSupportProbe,
     noRelaunchUponRugpull,
     parentRunId,
     workdirCollisionPolicy,
@@ -396,9 +480,31 @@ export async function runWorkflow(
   // MTLK-VM-SIZE US-003: the limits persisted in the run's Matchlock policy,
   // surfaced on RunWorkflowResult for the CLI launch line.
   let persistedMatchlockResourceLimits: ExecutionIsolationResourceLimits | undefined;
+  // MTLK-ISO-SLICE2 US-011: the admitted immutable image pin read from the
+  // persisted (possibly inherited) policy, surfaced for the `matchlock pinned:`
+  // line the CLI prints after admission succeeds.
+  let persistedMatchlockPin: { digest: string; configDigest: string } | undefined;
+  // MTLK-ISO-SLICE2 US-012: the admitted image provenance, read from the SAME
+  // persisted policy and surfaced for `workflow run --json`.
+  let persistedMatchlockImageSource: MatchlockImageSource | undefined;
+  // MTLK-ISO-SLICE2 US-013: the admitted policy's root-usage consent bit,
+  // surfaced so `workflow run --json` can re-derive the shared
+  // `root_usage_override` warning.
+  let persistedMatchlockRootUsageConsent: boolean | undefined;
 
   const workspaceMode = workflow.run?.workspace ?? "direct";
   const warnings: string[] = [];
+
+  // ── MTLK-ISO-SLICE2 US-005 (PREP-STATE) ────────────────────────────────
+  // The isolation INTENT is host-controlled: it derives ONLY from the run's
+  // own opt-in (a `--matchlock` image or an inherited replacement policy),
+  // never from `context`/`--context` or step output. An opted-in run is
+  // inserted with the intent marker AND the initial non-schedulable hold
+  // (`scheduling_status = 'preparing'`) in the SAME first INSERT; a native run
+  // keeps the exact pre-PREP-STATE shape. The hold is what makes the
+  // invariant structural across an interrupted admission (spec C §10 item 7).
+  const isMatchlockOptIn = Boolean(matchlockImage || matchlockPolicy);
+  const initialIsolation = initialRunIsolationState(isMatchlockOptIn, now);
 
   let workingDirectoryForHarness: string;
   // BCAP (US-001): whether the resolved harness working directory is a git
@@ -425,6 +531,21 @@ export async function runWorkflow(
   // Fresh launches only — resume/replacement set the policy separately.
   if (workdirCollisionPolicy && workdirCollisionPolicy !== "refuse") {
     seededContext[WORKDIR_COLLISION_POLICY_KEY] = workdirCollisionPolicy;
+  }
+
+  // MTLK-ISO2-MEND (Family D, D-MARKER): the host-controlled, legacy-honored
+  // pause_drain hold is seeded ATOMICALLY with the first INSERT. It is applied
+  // LAST so it wins over any operator `--context` value.
+  Object.assign(seededContext, initialIsolation.contextSeed);
+
+  // MTLK-ISO2-CORRECTIVE (Finding D, D-enforce): an OPTED-IN run would insert
+  // an isolation-intent row that a pre-PREP-STATE daemon could treat as
+  // natively schedulable. Before the FIRST intent-bearing INSERT, require any
+  // REACHABLE control plane to advertise the PREP-STATE capability; a native
+  // run, and a launch with no daemon running at all, are unaffected. The
+  // register/nudge/resume paths re-check the peer they actually talk to.
+  if (isMatchlockOptIn && (await isDaemonControlReachable(500))) {
+    await assertDaemonPrepStateCapability();
   }
 
   try {
@@ -588,15 +709,31 @@ export async function runWorkflow(
 
     // Insert the run record. New runs start with
     // scheduling_status='pending_register' so the daemon control plane
-    // (and/or reconciler) can admit them.
+    // (and/or reconciler) can admit them. An OPTED-IN Matchlock run instead
+    // starts HELD (scheduling_status='preparing') with its isolation intent
+    // recorded in the SAME statement — admission flips it to
+    // 'pending_register' only after it persists the validated policy
+    // (MTLK-ISO-SLICE2 PREP-STATE, spec C §10 item 7).
     // run_number is allocated atomically via subquery to prevent duplicate
     // numbers under concurrent launches.
     db.prepare(
       `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent,
-                         scheduling_status, scheduling_requested_at, notify_url,
-                         parent_run_id, created_at, updated_at)
-       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?, ?)`,
-    ).run(runId, workflowId, taskTitle, contextJson, now, notifyUrl ?? null, parentRunId ?? null, now, now);
+                         scheduling_status, scheduling_requested_at, isolation_intent,
+                         notify_url, parent_run_id, created_at, updated_at)
+       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      workflowId,
+      taskTitle,
+      contextJson,
+      initialIsolation.schedulingStatus,
+      initialIsolation.schedulingRequestedAt,
+      initialIsolation.isolationIntent,
+      notifyUrl ?? null,
+      parentRunId ?? null,
+      now,
+      now,
+    );
     runPersisted = true;
 
     // Read back the atomically allocated run_number.
@@ -632,10 +769,22 @@ export async function runWorkflow(
 
     db.prepare(
       `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent,
-                         scheduling_status, scheduling_requested_at, notify_url,
-                         parent_run_id, created_at, updated_at)
-       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?, ?)`,
-    ).run(runId, workflowId, taskTitle, initialContextJson, now, notifyUrl ?? null, parentRunId ?? null, now, now);
+                         scheduling_status, scheduling_requested_at, isolation_intent,
+                         notify_url, parent_run_id, created_at, updated_at)
+       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      workflowId,
+      taskTitle,
+      initialContextJson,
+      initialIsolation.schedulingStatus,
+      initialIsolation.schedulingRequestedAt,
+      initialIsolation.isolationIntent,
+      notifyUrl ?? null,
+      parentRunId ?? null,
+      now,
+      now,
+    );
     runPersisted = true;
 
     // Read back the atomically allocated run_number.
@@ -774,6 +923,13 @@ export async function runWorkflow(
         : undefined;
     const admission = await admitMatchlockRun({
       requestedImage: image,
+      // SHARED-V3 provenance + R13 consent for a FRESH opt-in. An inherited
+      // policy (matchlockPolicy) carries its own persisted values and admission
+      // preserves them VERBATIM — these fresh inputs are never consulted for a
+      // replacement.
+      ...(!matchlockPolicy
+        ? { imageSource: matchlockImageSource, rootUsageConsent: matchlockRootUsageOverride === true }
+        : {}),
       harness: effectiveHarness,
       // FROZEN submission inputs for a FRESH hermes/dsh opt-in. A replacement
       // (inheritedPolicy) carries its own frozen inputs on the inherited
@@ -796,10 +952,43 @@ export async function runWorkflow(
       ...(matchlockAllowPrivateSupportProbe
         ? { allowPrivateSupportProbe: matchlockAllowPrivateSupportProbe }
         : {}),
+      ...(matchlockSwapSupportProbe
+        ? { swapSupportProbe: matchlockSwapSupportProbe }
+        : {}),
     });
     persistedMatchlockResourceLimits = { ...admission.policy.resourceLimits };
-    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run(
+    // MTLK-ISO-SLICE2 US-012: the admitted provenance is read from the SAME
+    // policy that is persisted below, so `workflow run --json` reports the
+    // admitted value (a v2 inheritance normalizes to "explicit").
+    persistedMatchlockImageSource = admission.policy.requestedImageSource;
+    persistedMatchlockRootUsageConsent = admission.policy.rootUsageConsent === true;
+    // MTLK-ISO-SLICE2 US-011: read the admitted immutable image pin from the
+    // SAME policy that is persisted below (an inherited replacement preserves
+    // the failed run's pin). Both digests are required on a current (v3)
+    // record; a legacy fixture without them simply omits the pin line.
+    if (
+      admission.policy.resolvedImageDigest &&
+      admission.policy.resolvedImageConfigDigest
+    ) {
+      persistedMatchlockPin = {
+        digest: admission.policy.resolvedImageDigest,
+        configDigest: admission.policy.resolvedImageConfigDigest,
+      };
+    }
+    // MTLK-ISO-SLICE2 PREP-STATE: persist the validated policy AND release the
+    // initial non-schedulable hold in ONE short DB statement (a single SQLite
+    // UPDATE is atomic; no transaction spans the resolve RPC/subprocess work
+    // above). Only now may the reconciler/registration treat the run as
+    // schedulable (spec C §10 item 7).
+    db.prepare(
+      `UPDATE runs SET matchlock_policy = ?,
+             scheduling_status = 'pending_register',
+             scheduling_requested_at = ?,
+             scheduling_error = NULL
+       WHERE id = ?`,
+    ).run(
       serializeMatchlockPolicy(admission.policy),
+      new Date().toISOString(),
       runId,
     );
   }
@@ -1050,11 +1239,14 @@ export async function runWorkflow(
     schedulingState,
     captureWarnings: warnings.length > 0 ? warnings : undefined,
     matchlockResourceLimits: persistedMatchlockResourceLimits,
+    matchlockPin: persistedMatchlockPin,
+    matchlockImageSource: persistedMatchlockImageSource,
+    matchlockRootUsageConsent: persistedMatchlockRootUsageConsent,
   };
 }
 
 export interface ResumeResult {
-  status: "not_found" | "resumed" | "refused";
+  status: "not_found" | "resumed" | "refused" | "preparing";
   runId?: string;
   workflowId?: string;
   stepId?: string;
@@ -1070,6 +1262,27 @@ export interface ResumeResult {
   /** The daemon admission state that queuedBehindRunId corresponds to ('waiting'). */
   schedulingState?: string;
   /**
+   * MTLK-ISO-SLICE2 US-008 (PREP-STATE): set when the target carries the
+   * isolation intent but no pinned Matchlock policy yet. The failed-run resume
+   * is routed to preparation recovery (held): it is never admitted natively,
+   * never resolves a native harness and never records root consent. `message`
+   * names the held/preparing state and the retry/recreate remedy.
+   */
+  preparingHeld?: {
+    message: string;
+  };
+  /**
+   * MTLK-ISO-SLICE2 US-010 (R13): a typed Matchlock refusal on the failed-run
+   * resume path — a truly-native run given the override, a non-NULL unusable
+   * policy (STATUS-UNUSABLE), the root-usage gate, or the swap-capability
+   * handshake. `code` is the typed vocabulary; `message` is the operator-facing
+   * refusal. A refusal always preserves the run's prior state.
+   */
+  matchlockRefused?: {
+    code: string;
+    message: string;
+  };
+  /**
    * WORKDIR-FLAGS US-005: set when the daemon REFUSED the resume because the
    * harness working directory is held by a live run and the collision policy
    * is the default `refuse`. Typed, non-throwing: the CLI renders `message`
@@ -1082,103 +1295,671 @@ export interface ResumeResult {
     holder?: WorkdirCollisionHolder;
     workingDirectoryForHarness: string;
   };
+  /**
+   * MTLK-ISO-SLICE2 US-013 (R13): the shared advisory warnings channel. An
+   * array of `{ code, message }` entries, present ONLY when non-empty. A
+   * `consent_granted_on_resume` entry means THIS resume granted root consent;
+   * inherited consent surfaces `root_usage_override`. Advisory only — it never
+   * changes the resume outcome, status or exit code.
+   */
+  warnings?: WorkflowWarning[];
 }
+
+/**
+ * MTLK-ISO-SLICE2 US-010: options for the failed-run `resumeWorkflow` form.
+ * Mirrors the executable order of spec C §4.4: the root-usage override is
+ * honored only for a run with a non-NULL persisted policy; the swap-capability
+ * handshake seam is injectable so tests journal the probe and never spawn a
+ * real binary.
+ */
+export interface ResumeWorkflowOptions {
+  /** WORKDIR-FLAGS US-005: the collision policy to apply on this resume. */
+  workdirCollisionPolicy?: WorkdirCollisionPolicy;
+  /**
+   * R13: true ONLY when the operator explicitly supplied
+   * `--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` to
+   * THIS resume. Grants root consent on a non-NULL usable policy; refused for a
+   * truly native run. Absent/false never manufactures consent.
+   */
+  matchlockRootUsageOverride?: boolean;
+  /**
+   * US-001 probe seam: re-run the swap-capability handshake for a Matchlock run
+   * before re-registering. Production omits it and probes the resolved
+   * matchlock binary itself.
+   */
+  matchlockSwapSupportProbe?: MatchlockSwapSupportProbe;
+  /**
+   * MTLK-ISO2-CORRECTIVE (Family B1): inherited-image resolve + re-verify seam.
+   * Production omits it and re-resolves/verifies the persisted pin over an
+   * owned RPC before any state write; tests inject a moved/absent/supporting
+   * verifier so no real binary or VM is used.
+   */
+  matchlockInheritedImageVerifier?: InheritedImageVerifier;
+  /**
+   * MTLK-ISO2-CORRECTIVE (Family A): the ONE absolute matchlock binary path
+   * for this resume's transport. Tests pin a fake driver; production lets the
+   * preflight resolve it.
+   */
+  rpcBinaryPath?: string;
+  /** MTLK-ISO2-CORRECTIVE (Family A): explicit rpc args (tests). */
+  rpcArgs?: string[];
+  /**
+   * R13 seam: effective-uid of the process performing THIS resume. Production
+   * omits it (the real `process.geteuid()` is consulted); tests inject a
+   * deterministic value. Host process identity only.
+   */
+  effectiveUid?: () => number;
+}
+
+/** Default effective-uid probe for the resume root gate (non-root sentinel). */
+function defaultResumeEffectiveUid(): number {
+  return typeof process.geteuid === "function" ? process.geteuid() : -1;
+}
+
+/**
+ * MTLK-ISO2-CORRECTIVE: test-only default for the failed-run resume
+ * inherited-image verifier. Production leaves this null (the real owned-RPC
+ * resolve/re-verify runs); tests set a deterministic verifier so no real
+ * binary or VM is used.
+ */
+let resumeInheritedImageVerifierForTest: InheritedImageVerifier | null = null;
+
+/** @internal test hook: pin (or clear) the failed-run image verifier. */
+export function _setResumeInheritedImageVerifierForTest(
+  verifier: InheritedImageVerifier | null,
+): void {
+  resumeInheritedImageVerifierForTest = verifier;
+}
+
+/** One step/story row's tracked fields (prior or post image). */
+interface ResumeRowSnapshot {
+  id: string;
+  status: string;
+  retry_count: number;
+  output: string | null;
+  resume_reset_count?: number;
+}
+
 
 export async function resumeWorkflow(
   runId: string,
-  opts?: { workdirCollisionPolicy?: WorkdirCollisionPolicy },
+  opts?: ResumeWorkflowOptions,
 ): Promise<ResumeResult> {
   const db = getDb();
   const run = db.prepare(
-    "SELECT id, workflow_id, status, context, matchlock_policy FROM runs WHERE id = ? AND status = 'failed'",
-  ).get(runId) as { id: string; workflow_id: string; status: string; context: string; matchlock_policy: string | null } | undefined;
+    "SELECT id, workflow_id, status, context, isolation_intent, matchlock_policy, scheduling_status, scheduling_requested_at, scheduling_error, harness_probe_status, harness_probe_at FROM runs WHERE id = ? AND status = 'failed'",
+  ).get(runId) as {
+    id: string;
+    workflow_id: string;
+    status: string;
+    context: string;
+    matchlock_policy: string | null;
+    isolation_intent: string | null;
+    scheduling_status: string | null;
+    scheduling_requested_at: string | null;
+    scheduling_error: string | null;
+    harness_probe_status: string | null;
+    harness_probe_at: string | null;
+  } | undefined;
 
   if (!run) return { status: "not_found" };
 
+  // ── MTLK-ISO-SLICE2 US-008 (PREP-STATE) held guard ───────────────
+  // An intent-only row (isolation intent recorded, no pinned policy yet) is
+  // mid-preparation, NOT native. Route it to preparation recovery: keep it in
+  // the non-schedulable `preparing` hold, resolve no native harness, register
+  // no native scheduling and record no root consent. The shared classification
+  // is explicit non-NULL-ness, so a non-NULL (even empty-string) policy always
+  // wins and follows the normal path below. Remedy: retry preparation or
+  // recreate the run (spec C §4.4 / §10 item 7).
+  if (readIsolationState(run) === "preparing") {
+    const heldMessage = isolationPreparingHeldText();
+    try {
+      // Conditional: a concurrent admission that persisted the policy must
+      // never be clobbered back into the hold.
+      db.prepare(
+        `UPDATE runs SET scheduling_status = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO}
+         WHERE id = ? AND isolation_intent = ? AND matchlock_policy IS NULL`,
+      ).run(PREPARING_SCHEDULING_STATUS, run.id, ISOLATION_INTENT_RECORDED);
+    } catch {
+      // Best effort only; the typed held result is returned regardless.
+    }
+    return {
+      status: "preparing",
+      runId: run.id,
+      workflowId: run.workflow_id,
+      schedulingState: PREPARING_SCHEDULING_STATUS,
+      preparingHeld: { message: heldMessage },
+    };
+  }
+
+  // ── MTLK-ISO-SLICE2 US-010 (R13): failed-run resume consent ordering ─────
+  // Spec C §4.4. The failed-run resume form of the executable order:
+  //   (1) load and structurally validate the persisted policy (no matchlock
+  //       interaction yet);
+  //   (2) determine effective root permission — valid inherited consent OR the
+  //       explicit override supplied to THIS action;
+  //   (3) run the permitted checks (the swap-capability handshake and the
+  //       harness/policy validation below);
+  //   (4) commit the consent change + scheduling transition in ONE short
+  //       synchronous DB section (no transaction spans RPC/subprocess work).
+  // Every refusal returns BEFORE any state write, so a refused resume leaves
+  // the run's prior (failed) state untouched.
+  const isolationState = readIsolationState(run);
+  const rootUsageOverride = opts?.matchlockRootUsageOverride === true;
+
+  if (isolationState === "unusable") {
+    // STATUS-UNUSABLE refusal BEFORE consent is consulted: the override never
+    // rescues a malformed/legacy record. No state write.
+    const { code, reason } = describeUnusableMatchlockPolicy(run.matchlock_policy);
+    return {
+      status: "refused",
+      runId: run.id,
+      workflowId: run.workflow_id,
+      matchlockRefused: {
+        code,
+        message:
+          `Cannot resume run: matchlock: ISOLATION POLICY UNUSABLE (${code}): ${reason}. ` +
+          "The run's state was left unchanged; recreate the run with --matchlock " +
+          "(or provision this host with `tamandua matchlock setup`).",
+      },
+    };
+  }
+
+  if (rootUsageOverride && isolationState === "native") {
+    // A truly native run (no intent, no policy) has nothing for the override
+    // to consent to: passing it is refused and names that fact (spec C §4.4).
+    return {
+      status: "refused",
+      runId: run.id,
+      workflowId: run.workflow_id,
+      matchlockRefused: {
+        code: "matchlock_root_usage_override_not_applicable",
+        message:
+          `Cannot resume run: ${MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG} applies only to Matchlock runs, ` +
+          "but this run carries no isolation intent and no persisted Matchlock policy (a truly native run). " +
+          "The run's state was left unchanged.",
+      },
+    };
+  }
+
+  let grantConsent = false;
+  let inheritedRootConsent = false;
+  // MTLK-ISO2-CORRECTIVE (Family B1): BOTH resume forms share ONE ordered
+  // preflight — effective root permission, then the swap-capability handshake
+  // AND the inherited-image resolve/re-verify, ALL before any state write.
+  if (isolationState === "isolated") {
+    const matchlockPolicy = parseMatchlockPolicy(run.matchlock_policy as string);
+    inheritedRootConsent = matchlockPolicy.rootUsageConsent === true;
+
+    const preflight = await runMatchlockResumePreflight({
+      policy: matchlockPolicy,
+      effectiveUid: opts?.effectiveUid ?? defaultResumeEffectiveUid,
+      inheritedRootConsent,
+      rootUsageOverride,
+      ...(opts?.matchlockSwapSupportProbe
+        ? { swapSupportProbe: opts.matchlockSwapSupportProbe }
+        : {}),
+      ...((opts?.matchlockInheritedImageVerifier ?? resumeInheritedImageVerifierForTest)
+        ? {
+            verifyInheritedImage:
+              opts?.matchlockInheritedImageVerifier ??
+              (resumeInheritedImageVerifierForTest as InheritedImageVerifier),
+          }
+        : {}),
+      ...(opts?.rpcBinaryPath ? { rpcBinaryPath: opts.rpcBinaryPath } : {}),
+      ...(opts?.rpcArgs ? { rpcArgs: opts.rpcArgs } : {}),
+    });
+    if (!preflight.ok) {
+      return {
+        status: "refused",
+        runId: run.id,
+        workflowId: run.workflow_id,
+        matchlockRefused: { code: preflight.code, message: preflight.message },
+      };
+    }
+    grantConsent = preflight.grantConsent;
+  }
+
   await ensureDaemonControlAvailable();
+  // MTLK-ISO2-CORRECTIVE (Finding D): never resume an intent-recorded run
+  // against a daemon that cannot honor the PREP-STATE hold.
+  if (isolationState === "isolated") {
+    try {
+      await assertDaemonPrepStateCapability();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        status: "refused",
+        runId: run.id,
+        workflowId: run.workflow_id,
+        matchlockRefused: { code: "matchlock_daemon_prep_state_unsupported", message },
+      };
+    }
+  }
   const harnessValidation = await validateRunHarnessForScheduling(run.id, run.context, {
     matchlockPolicy: run.matchlock_policy,
   });
 
+  // MTLK-ISO2-MEND (Family A/B): capture the before image, then ship the
+  // consent bytes, the scheduling transition AND the collision-policy context
+  // edit through ONE expected-state compare-and-swap commit. A conflict writes
+  // NOTHING, so a pre-commit cancellation can never have already lost a
+  // preexisting context key. Only a Matchlock (non-native) resume needs the
+  // write-set; the native behavior is unchanged.
+  const priorSteps = db
+    .prepare("SELECT id, status, retry_count, output FROM steps WHERE run_id = ?")
+    .all(run.id) as unknown as ResumeRowSnapshot[];
+  const priorStories = db
+    .prepare(
+      "SELECT id, status, retry_count, output, resume_reset_count FROM stories WHERE run_id = ?",
+    )
+    .all(run.id) as unknown as ResumeRowSnapshot[];
+
   // WORKDIR-FLAGS US-005: resume/replacement runs apply the same collision rule
   // as a fresh launch. The default (`refuse`) CLEARS any persisted policy so a
   // resume that would collide is refused; an explicit queue/allow choice is
-  // persisted into the run context BEFORE registration so daemon admission
-  // honors it. setRunContextKey/removeRunContextKey are synchronous, so the
-  // context is settled before the async register call below.
+  // persisted into the run context. The context edit rides the SAME guarded
+  // commit as the status/policy transition below.
   const collisionPolicy = opts?.workdirCollisionPolicy ?? "refuse";
-  if (collisionPolicy === "refuse") {
-    removeRunContextKey(run.id, WORKDIR_COLLISION_POLICY_KEY);
-  } else {
-    setRunContextKey(run.id, WORKDIR_COLLISION_POLICY_KEY, collisionPolicy);
+  const priorContext = run.context ?? "";
+  let resumeContextObj: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(priorContext) as unknown;
+    if (parsed && typeof parsed === "object") {
+      resumeContextObj = parsed as Record<string, unknown>;
+    }
+  } catch {
+    resumeContextObj = {};
   }
-
-  // Reset the run to running and request fresh scheduling admission.
-  const resumeNow = new Date().toISOString();
-  db.prepare(
-    `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
-  ).run(resumeNow, run.id);
-
-  // RPRB (6sy.37): an explicit resume must re-probe a run whose launch-time
-  // harness probe recorded a definitive 'failed' outcome — the operator has
-  // presumably repaired the harness since. The conditional helper clears ONLY
-  // 'failed' (with its timestamp); 'ok' stays passed and an in-flight
-  // 'probing' reservation is left to the existing staleness protocol. This is
-  // deliberately scoped to the explicit-resume path only; the daemon's
-  // automatic recovery paths must never call it.
-  resetFailedHarnessProbeForResume(run.id);
-
-  // Find the first failed step and reset it + subsequent steps
-  const failedStep = db.prepare(
-    "SELECT id, step_id, step_index FROM steps WHERE run_id = ? AND status = 'failed' ORDER BY step_index ASC LIMIT 1",
-  ).get(run.id) as { id: string; step_id: string; step_index: number } | undefined;
-
-  // The step the resumed run restarts from (surfaced to the CLI).
-  let restartStepId: string | undefined = failedStep?.step_id;
-
-  if (failedStep) {
-    // Reset this step and all subsequent steps back to waiting
-    db.prepare(
-      `UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND step_index >= ?`,
-    ).run(run.id, failedStep.step_index);
+  if (collisionPolicy === "refuse") {
+    delete resumeContextObj[WORKDIR_COLLISION_POLICY_KEY];
   } else {
-    // Force-failed shape: forceFailRun leaves the run 'failed' with ALL
-    // non-done steps 'canceled' — there is no 'failed' step to restart
-    // from. Repair the interrupted pipeline by resetting from the first
-    // non-'done' step onward so the canceled work returns to 'waiting'
-    // and the dispatch motor can reclaim it. (Without this repair,
-    // advancePipeline below would see an "empty" pipeline of canceled
-    // steps and spuriously complete the run.)
-    const firstNonDone = db.prepare(
-      "SELECT step_id, step_index FROM steps WHERE run_id = ? AND status != 'done' ORDER BY step_index ASC LIMIT 1",
-    ).get(run.id) as { step_id: string; step_index: number } | undefined;
-    if (firstNonDone) {
+    resumeContextObj[WORKDIR_COLLISION_POLICY_KEY] = collisionPolicy;
+  }
+  const postContext = JSON.stringify(resumeContextObj);
+
+  // MTLK-ISO2-TRANSITION-CAS (Family A): the exact BEFORE values and the exact
+  // AFTER values of every durable write this request owns. A late registration
+  // refusal resolves each of its OWN columns individually — there is no
+  // post-commit compensator.
+  const resumeNow = new Date().toISOString();
+  const grantedPolicy =
+    grantConsent && run.matchlock_policy !== null && run.matchlock_policy !== undefined
+      ? withGrantedRootUsageConsent(run.matchlock_policy)
+      : run.matchlock_policy;
+  const ownFailedWrite =
+    isolationState !== "native"
+      ? {
+          prior: {
+            status: run.status,
+            schedulingStatus: run.scheduling_status,
+            schedulingRequestedAt: run.scheduling_requested_at,
+            schedulingError: run.scheduling_error,
+            policy: run.matchlock_policy,
+            probeStatus: run.harness_probe_status,
+            probeAt: run.harness_probe_at,
+            context: priorContext,
+          },
+          after: {
+            status: "running",
+            schedulingStatus: "pending_register" as string | null,
+            schedulingRequestedAt: resumeNow as string | null,
+            schedulingError: null as string | null,
+            policy: grantedPolicy,
+            probeStatus: run.harness_probe_status,
+            probeAt: run.harness_probe_at,
+            context: postContext,
+          },
+        }
+      : null;
+
+  // The step the resumed run restarts from (surfaced to the CLI) and the
+  // failed-story reset count are computed INSIDE the one CAS transaction so a
+  // step/story write fault rolls the whole transition back.
+  let restartStepId: string | undefined;
+  let storyReset: { resetCount: number } = { resetCount: 0 };
+
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    const guard = db
+      .prepare(
+        "SELECT id FROM runs WHERE id = ? AND status = 'failed' AND scheduling_status IS ? AND matchlock_policy IS ? AND context IS ?",
+      )
+      .get(run.id, run.scheduling_status, run.matchlock_policy, priorContext);
+    if (!guard) {
+      db.exec("ROLLBACK");
+      return {
+        status: "refused",
+        runId: run.id,
+        workflowId: run.workflow_id,
+        matchlockRefused: {
+          code: "matchlock_run_state_changed",
+          message:
+            "Cannot resume run: the run's state changed concurrently (cancellation, pause/drain or a competing resume); retry the resume.",
+        },
+      };
+    }
+    if (grantConsent && run.matchlock_policy !== null && run.matchlock_policy !== undefined) {
+      db.prepare(
+        `UPDATE runs SET matchlock_policy = ?, status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, context = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      ).run(grantedPolicy, resumeNow, postContext, run.id);
+    } else {
+      db.prepare(
+        `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, context = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      ).run(resumeNow, postContext, run.id);
+    }
+
+    // RPRB (6sy.37): an explicit resume must re-probe a run whose launch-time
+    // harness probe recorded a definitive 'failed' outcome — the operator has
+    // presumably repaired the harness since. The conditional helper clears ONLY
+    // 'failed' (with its timestamp). Inside the same transaction so a later
+    // fault rolls it back.
+    resetFailedHarnessProbeForResume(run.id);
+
+    // Find the first failed step and reset it + subsequent steps.
+    const failedStep = db.prepare(
+      "SELECT id, step_id, step_index FROM steps WHERE run_id = ? AND status = 'failed' ORDER BY step_index ASC LIMIT 1",
+    ).get(run.id) as { id: string; step_id: string; step_index: number } | undefined;
+
+    restartStepId = failedStep?.step_id;
+
+    if (failedStep) {
+      // Reset this step and all subsequent steps back to waiting
       db.prepare(
         `UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND step_index >= ?`,
-      ).run(run.id, firstNonDone.step_index);
-      restartStepId = firstNonDone.step_id;
+      ).run(run.id, failedStep.step_index);
+    } else {
+      // Force-failed shape: forceFailRun leaves the run 'failed' with ALL
+      // non-done steps 'canceled' — there is no 'failed' step to restart
+      // from. Repair the interrupted pipeline by resetting from the first
+      // non-'done' step onward so the canceled work returns to 'waiting'
+      // and the dispatch motor can reclaim it. (Without this repair,
+      // advancePipeline below would see an "empty" pipeline of canceled
+      // steps and spuriously complete the run.)
+      const firstNonDone = db.prepare(
+        "SELECT step_id, step_index FROM steps WHERE run_id = ? AND status != 'done' ORDER BY step_index ASC LIMIT 1",
+      ).get(run.id) as { step_id: string; step_index: number } | undefined;
+      if (firstNonDone) {
+        db.prepare(
+          `UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = ${SQL_NOW_ISO} WHERE run_id = ? AND step_index >= ?`,
+        ).run(run.id, firstNonDone.step_index);
+        restartStepId = firstNonDone.step_id;
+      }
     }
+
+    // YSE US-002: re-queue every FAILED story of a loop-over-stories run as
+    // PENDING with a fresh verification retry budget. Runs without a
+    // loop-over-stories step or without failed stories are unaffected.
+    storyReset = resetFailedStoriesForResume(run.id);
+
+    // Advance the pipeline ONLY when there is work to advance. An
+    // interrupted/empty pipeline must never be completed during resume.
+    const pendingWork = db.prepare(
+      "SELECT id FROM steps WHERE run_id = ? AND status = 'waiting' LIMIT 1",
+    ).get(run.id) as { id: string } | undefined;
+    if (pendingWork) {
+      // Promote the next eligible waiting step to 'pending' so the dispatch motor can claim it.
+      advancePipeline(run.id);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* best effort */
+    }
+    // A fault inside the transition (e.g. a step-write trigger) must surface to
+    // the caller: the whole transaction is rolled back, so no half-transition
+    // survives. Do NOT swallow it into a typed refusal.
+    throw err;
   }
 
-  // YSE US-002: re-queue every FAILED story of a loop-over-stories run as
-  // PENDING with a fresh verification retry budget (story.resume_reset_count
-  // records the prior-failure count). Runs without a loop-over-stories step
-  // or without failed stories are unaffected (resetCount = 0). Must run
-  // BEFORE the advancePipeline/pendingWork block below so a re-queued story
-  // is claimable on the first loop claim after resume.
-  const storyReset = resetFailedStoriesForResume(run.id);
-
-  // Advance the pipeline ONLY when there is work to advance. An
-  // interrupted/empty pipeline (e.g. every step already 'done') must never
-  // be completed by advancePipeline's completion branch during resume — a
-  // force-failed run must not emit a spurious run.completed.
-  const pendingWork = db.prepare(
-    "SELECT id FROM steps WHERE run_id = ? AND status = 'waiting' LIMIT 1",
-  ).get(run.id) as { id: string } | undefined;
-  if (pendingWork) {
-    // Promote the next eligible waiting step to 'pending' so the dispatch motor can claim it.
-    advancePipeline(run.id);
+  // MTLK-ISO2-TRANSITION-CAS (Family A): capture the AFTER images (run + steps
+  // + stories) of THIS request's transition. A late registration refusal
+  // resolves exactly its own columns; nothing is a whole-row restore.
+  let ownAfterSteps: ResumeRowSnapshot[] = [];
+  let ownAfterStories: ResumeRowSnapshot[] = [];
+  if (ownFailedWrite) {
+    const postRunRow = db
+      .prepare(
+        `SELECT status, scheduling_status, scheduling_requested_at, scheduling_error,
+                matchlock_policy, harness_probe_status, harness_probe_at, context
+         FROM runs WHERE id = ?`,
+      )
+      .get(run.id) as
+      | {
+          status: string;
+          scheduling_status: string | null;
+          scheduling_requested_at: string | null;
+          scheduling_error: string | null;
+          matchlock_policy: string | null;
+          harness_probe_status: string | null;
+          harness_probe_at: string | null;
+          context: string;
+        }
+      | undefined;
+    if (postRunRow) {
+      ownFailedWrite.after = {
+        status: postRunRow.status,
+        schedulingStatus: postRunRow.scheduling_status,
+        schedulingRequestedAt: postRunRow.scheduling_requested_at,
+        schedulingError: postRunRow.scheduling_error,
+        policy: postRunRow.matchlock_policy,
+        probeStatus: postRunRow.harness_probe_status,
+        probeAt: postRunRow.harness_probe_at,
+        context: postRunRow.context,
+      };
+    }
+    ownAfterSteps = db
+      .prepare("SELECT id, status, retry_count, output FROM steps WHERE run_id = ?")
+      .all(run.id) as unknown as ResumeRowSnapshot[];
+    ownAfterStories = db
+      .prepare(
+        "SELECT id, status, retry_count, output, resume_reset_count FROM stories WHERE run_id = ?",
+      )
+      .all(run.id) as unknown as ResumeRowSnapshot[];
   }
+
+  // Per-key context inverse: only keys THIS request moved are reverted, and only
+  // while the current value still equals what this request wrote.
+  const inverseFailedContext = (
+    priorStr: string,
+    postStr: string,
+    currentStr: string,
+  ): string => {
+    if (currentStr === postStr) return priorStr;
+    const has = (o: Record<string, unknown>, k: string): boolean =>
+      Object.prototype.hasOwnProperty.call(o, k);
+    const eq = (a: unknown, b: unknown): boolean =>
+      a === undefined ? b === undefined : b !== undefined && a === b;
+    let prior: Record<string, unknown> = {};
+    let post: Record<string, unknown> = {};
+    let current: Record<string, unknown> = {};
+    try {
+      prior = (JSON.parse(priorStr) ?? {}) as Record<string, unknown>;
+    } catch {
+      prior = {};
+    }
+    try {
+      post = (JSON.parse(postStr) ?? {}) as Record<string, unknown>;
+    } catch {
+      return currentStr;
+    }
+    try {
+      current = (JSON.parse(currentStr) ?? {}) as Record<string, unknown>;
+    } catch {
+      return currentStr;
+    }
+    if (typeof prior !== "object" || prior === null) prior = {};
+    if (typeof post !== "object" || post === null) return currentStr;
+    if (typeof current !== "object" || current === null) current = {};
+    const out: Record<string, unknown> = { ...current };
+    const keys = new Set([...Object.keys(prior), ...Object.keys(post)]);
+    for (const key of keys) {
+      const p = has(prior, key) ? prior[key] : undefined;
+      const q = has(post, key) ? post[key] : undefined;
+      if (eq(p, q)) continue; // this request did not move the key
+      const c = has(current, key) ? current[key] : undefined;
+      if (!eq(c, q)) continue; // a competing writer moved it; that value wins
+      if (has(prior, key)) out[key] = prior[key];
+      else delete out[key];
+    }
+    return JSON.stringify(out);
+  };
+
+  // Resolve this request's OWN durable writes after a late registration
+  // refusal. Inline and narrow (the AST-extraction instrument resolves no new
+  // module-level helper). MTLK-ISO2-SUPERSEDED-RESUME: the ownership pivot is
+  // this request's own IMMUTABLE MINTED TOKEN, compared inside the resolution
+  // transaction BEFORE any write — a competing committed successor (distinct
+  // token) is left entirely untouched. Only a token-owned row is resolved: a
+  // competing terminal (completed/canceled) wins; otherwise each owned column
+  // returns to its prior value. A step/story row whose ownership pivot
+  // (`status`) no longer equals this request's after image is foreign and is
+  // left byte-exactly alone.
+  const resolveFailedResumeWrites = (): void => {
+    if (!ownFailedWrite) return;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const cur = db
+        .prepare(
+          `SELECT status, scheduling_status, scheduling_requested_at, scheduling_error,
+                  matchlock_policy, harness_probe_status, harness_probe_at, context
+           FROM runs WHERE id = ?`,
+        )
+        .get(run.id) as
+        | {
+            status: string;
+            scheduling_status: string | null;
+            scheduling_requested_at: string | null;
+            scheduling_error: string | null;
+            matchlock_policy: string | null;
+            harness_probe_status: string | null;
+            harness_probe_at: string | null;
+            context: string;
+          }
+        | undefined;
+      // MTLK-ISO2-SUPERSEDED-RESUME (ownership pivot): ownership is the
+      // REQUEST'S OWN IMMUTABLE MINTED TOKEN, compared inside this short
+      // transaction and BEFORE any field is changed. A competing committed
+      // successor holds a DISTINCT non-null token, so it is not this request's
+      // row: skip ALL owned-column writes (run AND step/story loops) and close
+      // the transaction cleanly. The after-image is NOT a safe pivot — it is
+      // re-read after awaited work and may already be contaminated by the
+      // successor. A missing row has nothing to resolve. A same-token terminal
+      // (completed/canceled) is handled below by `competingTerminal`.
+      if (!cur || cur.scheduling_requested_at !== resumeNow) {
+        db.exec("COMMIT");
+        return;
+      }
+      const competingTerminal =
+        cur.status === "completed" || cur.status === "canceled";
+      db.prepare(
+        `UPDATE runs
+         SET status = ?, scheduling_status = ?, scheduling_requested_at = ?,
+             scheduling_error = ?, matchlock_policy = ?, context = ?,
+             harness_probe_status = ?, harness_probe_at = ?
+         WHERE id = ?`,
+      ).run(
+        competingTerminal ? cur.status : ownFailedWrite.prior.status,
+        competingTerminal ? cur.scheduling_status : ownFailedWrite.prior.schedulingStatus,
+        competingTerminal
+          ? cur.scheduling_requested_at
+          : ownFailedWrite.prior.schedulingRequestedAt,
+        competingTerminal ? cur.scheduling_error : ownFailedWrite.prior.schedulingError,
+        cur.matchlock_policy === ownFailedWrite.after.policy
+          ? ownFailedWrite.prior.policy
+          : cur.matchlock_policy,
+        inverseFailedContext(
+          ownFailedWrite.prior.context,
+          ownFailedWrite.after.context,
+          cur.context ?? "",
+        ),
+        cur.harness_probe_status === ownFailedWrite.after.probeStatus
+          ? ownFailedWrite.prior.probeStatus
+          : cur.harness_probe_status,
+        cur.harness_probe_at === ownFailedWrite.after.probeAt
+          ? ownFailedWrite.prior.probeAt
+          : cur.harness_probe_at,
+        run.id,
+      );
+      const step = db.prepare(
+        "UPDATE steps SET status = ?, retry_count = ?, output = ? WHERE id = ? AND run_id = ?",
+      );
+      for (const before of priorSteps) {
+        const after = ownAfterSteps.find((s) => s.id === before.id);
+        if (!after) continue;
+        const current = db
+          .prepare("SELECT status, retry_count, output FROM steps WHERE id = ? AND run_id = ?")
+          .get(before.id, run.id) as
+          | { status: string; retry_count: number; output: string | null }
+          | undefined;
+        if (!current || current.status !== after.status) continue; // foreign row
+        const nextStatus = before.status === after.status ? current.status : before.status;
+        const nextRetry =
+          before.retry_count === after.retry_count
+            ? current.retry_count
+            : current.retry_count === after.retry_count
+              ? before.retry_count
+              : current.retry_count;
+        const nextOutput =
+          before.output === after.output
+            ? current.output
+            : current.output === after.output
+              ? before.output
+              : current.output;
+        step.run(nextStatus, nextRetry, nextOutput, before.id, run.id);
+      }
+      const story = db.prepare(
+        "UPDATE stories SET status = ?, retry_count = ?, output = ?, resume_reset_count = ? WHERE id = ? AND run_id = ?",
+      );
+      for (const before of priorStories) {
+        const after = ownAfterStories.find((s) => s.id === before.id);
+        if (!after) continue;
+        const current = db
+          .prepare(
+            "SELECT status, retry_count, output, resume_reset_count FROM stories WHERE id = ? AND run_id = ?",
+          )
+          .get(before.id, run.id) as
+          | {
+              status: string;
+              retry_count: number;
+              output: string | null;
+              resume_reset_count: number;
+            }
+          | undefined;
+        if (!current || current.status !== after.status) continue; // foreign row
+        const nextStatus = before.status === after.status ? current.status : before.status;
+        const nextRetry =
+          before.retry_count === after.retry_count
+            ? current.retry_count
+            : current.retry_count === after.retry_count
+              ? before.retry_count
+              : current.retry_count;
+        const nextOutput =
+          before.output === after.output
+            ? current.output
+            : current.output === after.output
+              ? before.output
+              : current.output;
+        const nextReset =
+          (before.resume_reset_count ?? 0) === (after.resume_reset_count ?? 0)
+            ? current.resume_reset_count
+            : current.resume_reset_count === (after.resume_reset_count ?? 0)
+              ? (before.resume_reset_count ?? 0)
+              : current.resume_reset_count;
+        story.run(nextStatus, nextRetry, nextOutput, nextReset, before.id, run.id);
+      }
+      db.exec("COMMIT");
+    } catch {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* best effort */
+      }
+    }
+  };
 
   const registration = await registerRunWithDaemon(run.id, 5000);
   if (!registration || registration.status < 200 || registration.status >= 300) {
@@ -1202,16 +1983,22 @@ export async function resumeWorkflow(
         typeof registration.body.message === "string"
           ? registration.body.message
           : message;
-      try {
-        db.prepare(
-          `UPDATE runs
-           SET status = 'failed', scheduling_status = 'error',
-               scheduling_requested_at = NULL, scheduling_error = ?,
-               updated_at = ${SQL_NOW_ISO}
-           WHERE id = ?`,
-        ).run(refusalMessage, run.id);
-      } catch {
-        // Best effort only; the typed refusal is returned regardless.
+      if (ownFailedWrite) {
+        // MTLK-ISO2-TRANSITION-CAS (Family A): resolve this request's OWN
+        // writes per column — a competing terminal/foreign writer wins.
+        resolveFailedResumeWrites();
+      } else {
+        try {
+          db.prepare(
+            `UPDATE runs
+             SET status = 'failed', scheduling_status = 'error',
+                 scheduling_requested_at = NULL, scheduling_error = ?,
+                 updated_at = ${SQL_NOW_ISO}
+             WHERE id = ?`,
+          ).run(refusalMessage, run.id);
+        } catch {
+          // Best effort only; the typed refusal is returned regardless.
+        }
       }
 
       const heldByRunId =
@@ -1238,9 +2025,15 @@ export async function resumeWorkflow(
       };
     }
 
-    db.prepare(
-      `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
-    ).run(message, run.id);
+    if (ownFailedWrite) {
+      // MTLK-ISO2-TRANSITION-CAS (Family A): every non-2xx registration
+      // refusal on a Matchlock resume resolves this request's own columns.
+      resolveFailedResumeWrites();
+    } else {
+      db.prepare(
+        `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      ).run(message, run.id);
+    }
     // Retriable teardown: the daemon is still draining the run's in-flight
     // workers (e.g. an immediate resume right after force-fail). The run's
     // truthful terminal event (run.force_failed / run.failed) was already
@@ -1279,6 +2072,13 @@ export async function resumeWorkflow(
   // Same as runWorkflow: dispatch the re-pended step now, not on the sweep.
   nudgeWithDaemon().catch(() => {});
 
+  // MTLK-ISO-SLICE2 US-013: the shared advisory warning for a consented resume
+  // (advisory only — it never changes the outcome above).
+  const resumeWarnings = buildWorkflowWarnings({
+    consentGrantedOnResume: grantConsent,
+    rootUsageConsent: inheritedRootConsent,
+  });
+
   return {
     status: "resumed",
     runId: run.id,
@@ -1287,5 +2087,6 @@ export async function resumeWorkflow(
     resetCount: storyReset.resetCount,
     queuedBehindRunId,
     schedulingState,
+    ...(resumeWarnings.length > 0 ? { warnings: resumeWarnings } : {}),
   };
 }

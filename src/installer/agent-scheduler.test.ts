@@ -50,6 +50,7 @@ import {
   serializeMatchlockPolicy,
 } from "../../dist/installer/matchlock/policy.js";
 import { setMatchlockSchedulerRoundRunnerForTest } from "../../dist/installer/matchlock/scheduler-matchlock.js";
+import { setMatchlockExecutionBoundarySeamsForTest } from "../../dist/installer/matchlock/execution-boundary.js";
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 import { emitRunTerminalEvent } from "../../dist/installer/step-ops.js";
@@ -5045,10 +5046,17 @@ describe("Matchlock dispatch admission log noise (observation 4)", () => {
         durationMs: 5,
       };
     });
+    // US-004: the admission-log observation is not about the execution
+    // boundary; install a supporting swap probe so the gate passes without a
+    // real matchlock binary.
+    setMatchlockExecutionBoundarySeamsForTest({
+      swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+    });
   });
 
   afterEach(() => {
     setMatchlockSchedulerRoundRunnerForTest(null);
+    setMatchlockExecutionBoundarySeamsForTest(null);
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

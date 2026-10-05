@@ -202,6 +202,19 @@ describe("collectDbRows — fixture database", () => {
     db.close();
   });
 
+  it("reports matchlock_policy_present true for a non-NULL empty policy (not native)", () => {
+    // MTLK-ISO2-CORRECTIVE: presence is explicit non-NULL, not truthiness.
+    const db = makeFixtureDb();
+    db.exec(`UPDATE runs SET matchlock_policy = '' WHERE id = '${RUN_ID}'`);
+    const result = collectDbRows({
+      db: asInjected(db),
+      runId: RUN_ID,
+      bareRunId: RUN_ID,
+    });
+    assert.equal(result.runs[0].matchlock_policy_present, true);
+    db.close();
+  });
+
   it("returns an empty collection when the run has no child rows", () => {
     const db = makeFixtureDb();
     const other = "bbbbbbbb-2222-4222-8222-222222222222";

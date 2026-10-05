@@ -465,7 +465,7 @@ async function runWholePathScenario(): Promise<void> {
       const runArgs = [
         "workflow", "run", WORKFLOW_ID,
         "Synthetic whole-path hermes gate: implement the tiny owned fixture story and land it through the scoped guest merge path.",
-        "--matchlock", FIXTURE_IMAGE_TAG,
+        "--matchlock-image", FIXTURE_IMAGE_TAG,
         "--hermes-as-harness",
         "--worktree-origin-repository", originDir,
         "--worktree-origin-ref", originalBranch,

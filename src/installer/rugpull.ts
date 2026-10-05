@@ -3,9 +3,15 @@ import { getDb } from "../db.js";
 import { emitEvent } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
 import {
+  describeUnusableMatchlockPolicy,
   parseMatchlockPolicy,
   type ExecutionIsolation,
 } from "./matchlock/policy.js";
+import type { MatchlockSwapSupportProbe } from "./matchlock/swap-support.js";
+import {
+  isolationPreparingHeldText,
+  readIsolationIntent,
+} from "./matchlock/prep-state.js";
 import type { HarnessType } from "./types.js";
 
 /**
@@ -273,6 +279,21 @@ export interface RelaunchResult {
 }
 
 /**
+ * Optional seams for {@link relaunchRunAfterRugpull}. These do NOT change the
+ * replacement behavior or inheritance rules; they exist so tests can drive the
+ * replacement's admission without spawning a real matchlock binary.
+ */
+export interface RelaunchRunOptions {
+  /**
+   * MTLK-ISO-SLICE2 US-003: injectable swap-capability support probe threaded
+   * to the replacement's admission. Production omits it and admission probes
+   * the resolved rpc binary itself; the replacement (an inherited-policy
+   * admission) still runs the handshake in production.
+   */
+  matchlockSwapSupportProbe?: MatchlockSwapSupportProbe;
+}
+
+/**
  * Launch a replacement run with the same parameters as the original failed run.
  *
  * Reads the original run's workflow_id, task, and context from the DB.
@@ -290,13 +311,14 @@ export interface RelaunchResult {
  */
 export async function relaunchRunAfterRugpull(
   failedRunId: string,
+  options: RelaunchRunOptions = {},
 ): Promise<RelaunchResult> {
   const db = getDb();
 
   // Read the failed run's parameters
   const run = db
     .prepare(
-      "SELECT workflow_id, task, context, notify_url, matchlock_policy FROM runs WHERE id = ?",
+      "SELECT workflow_id, task, context, notify_url, isolation_intent, matchlock_policy FROM runs WHERE id = ?",
     )
     .get(failedRunId) as
     | {
@@ -305,6 +327,7 @@ export async function relaunchRunAfterRugpull(
         context: string;
         notify_url: string | null;
         matchlock_policy: string | null;
+        isolation_intent: string | null;
       }
     | undefined;
 
@@ -321,23 +344,47 @@ export async function relaunchRunAfterRugpull(
   // runWorkflow admission. The replacement must NEVER silently become native.
   // A stored policy that cannot be re-admitted (malformed/legacy/unpinned)
   // refuses the relaunch instead of launching a native replacement.
+  //
+  // MTLK-ISO-SLICE2 US-006 consumer audit: classify by EXPLICIT non-NULL-ness,
+  // never truthiness. An empty-string stored policy is a non-NULL (unusable)
+  // policy — parseMatchlockPolicy refuses it, so the replacement is refused
+  // rather than silently inheriting no policy and launching native.
   let inheritedMatchlockPolicy: ExecutionIsolation | undefined;
-  if (run.matchlock_policy) {
+  if (run.matchlock_policy !== null && run.matchlock_policy !== undefined) {
     try {
       inheritedMatchlockPolicy = parseMatchlockPolicy(run.matchlock_policy);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+    } catch {
+      // MTLK-ISO2-TRANSITION-CAS (Family C-1): the parser message can embed
+      // fragments of the stored input; the replacement-failure event renders
+      // the typed code plus the allow-listed reason, never the raw detail.
+      const described = describeUnusableMatchlockPolicy(run.matchlock_policy);
       emitEvent({
         ts: new Date().toISOString(),
         event: "run.rugpull_relaunch_failed",
         runId: failedRunId,
         workflowId: run.workflow_id,
         detail:
-          `Rugpull relaunch not attempted: stored Matchlock policy is not reusable (${detail}). ` +
+          `Rugpull relaunch not attempted: stored Matchlock policy is not reusable (${described.code}): ${described.reason}. ` +
           "A replacement must never become native; recreate the run with --matchlock.",
       });
       return { relaunched: false };
     }
+  } else if (readIsolationIntent(run)) {
+    // MTLK-ISO-SLICE2 US-008 (PREP-STATE): the failed run records the
+    // isolation intent but no pinned policy exists yet — it is mid-
+    // preparation. A replacement must never be launched natively (which is
+    // exactly what inheriting `undefined` would do), so refuse the relaunch
+    // before any runWorkflow call and name the retry/recreate remedy.
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.rugpull_relaunch_failed",
+      runId: failedRunId,
+      workflowId: run.workflow_id,
+      detail:
+        `Rugpull relaunch not attempted: ${isolationPreparingHeldText()} ` +
+        `(make sure the run's Matchlock policy is persisted before replacing it).`,
+    });
+    return { relaunched: false };
   }
 
   // Check no_relaunch_upon_rugpull suppression flag
@@ -393,6 +440,9 @@ export async function relaunchRunAfterRugpull(
         worktreeOriginRef,
         context: userContext,
         matchlockPolicy: inheritedMatchlockPolicy,
+        ...(options.matchlockSwapSupportProbe
+          ? { matchlockSwapSupportProbe: options.matchlockSwapSupportProbe }
+          : {}),
       });
     } else {
       const workingDir =
@@ -419,6 +469,9 @@ export async function relaunchRunAfterRugpull(
         workingDirectoryForHarness: workingDir,
         context: userContext,
         matchlockPolicy: inheritedMatchlockPolicy,
+        ...(options.matchlockSwapSupportProbe
+          ? { matchlockSwapSupportProbe: options.matchlockSwapSupportProbe }
+          : {}),
       });
     }
   } catch (err) {

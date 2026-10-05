@@ -1,0 +1,2216 @@
+/**
+ * Tamandua Daemon Control Plane
+ *
+ * Provides idempotent HTTP endpoints for run-scoped scheduling. Bound to a
+ * separate localhost port (default 3339; overridable via TAMANDUA_CONTROL_PORT).
+ *
+ * Endpoints:
+ *   GET  /control/health          – liveness
+ *   GET  /control/jobs            – currently scheduled jobs
+ *   GET  /control/limits          – effective MAX_ACTIVE_TIMERS
+ *   POST /control/register-run    – admit a run for scheduling
+ *   POST /control/terminate-run   – tear down a run's scheduling
+ *   POST /control/pause-run       – pause a run (clear timers, set paused)
+ *   POST /control/resume-run      – resume a paused run
+ *   POST /control/nudge           – nudge all scheduled agents for running runs
+ *
+ * Authentication: header `x-tamandua-secret: <token>` matches the token in
+ * `~/.tamandua/daemon-secret` (mode 0600). Localhost-only binding is the
+ * primary defense; the secret is a defense-in-depth measure.
+ */
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
+import { logger } from "../lib/logger.js";
+import { SQL_NOW_ISO, formatInstant, monotonicNow, instantAgeMs, isOlderThan } from "../lib/instant.js";
+import {
+  compareProcessStartIdentities,
+  getProcessStartIdentity,
+} from "../lib/process-start-identity.js";
+import { getBuildVersion } from "../lib/version.js";
+import { assertPortIsolation, assertStatePathIsolation, testGuardActive } from "../lib/test-guard.js";
+import { resolveStateDir } from "../lib/tamandua-config.js";
+import { getDb } from "../db.js";
+import { emitEvent } from "../installer/events.js";
+import type { TamanduaEvent } from "../installer/events.js";
+import { validateRunHarnessForScheduling } from "../installer/run-harness.js";
+import { parseRunContext, setRunContextKey, removeRunContextKey } from "../installer/step-ops.js";
+import {
+  resolveWorkdirCollisionPolicy,
+  formatWorkdirRefusalMessage,
+  formatSharedWorkdirWarning,
+  WORKDIR_SHARED_WARNING_MARKER,
+  WORKDIR_REFUSAL_STATE,
+  type WorkdirCollisionHolder,
+} from "../installer/workdir-collision.js";
+
+export const DEFAULT_CONTROL_PORT = 3339;
+const DEFAULT_MAX_ACTIVE_TIMERS = 50;
+
+// Runs currently mid-teardown in this daemon process. handleTerminateRun
+// marks a run here while it removes scheduling crons and settles in-flight
+// rounds; handleRegisterRun refuses admission for marked runs with a
+// retriable 503 ("run teardown in progress, retry") instead of admitting a
+// run whose fresh crons the in-flight teardown would immediately wipe, or
+// misreading a concurrently-resumed run's row. This is process-local
+// (daemon-resident) state: the CLI's force-fail path tears down via the
+// control plane, so the flag is set exactly while that teardown is live.
+const runsMidTeardown = new Set<string>();
+
+/**
+ * True while the daemon is actively tearing down the given run (scheduling
+ * crons removed / in-flight rounds settling). Exported for the
+ * resume-vs-teardown regression tests.
+ */
+export function _isRunMidTeardown(runId: string): boolean {
+  return runsMidTeardown.has(runId);
+}
+
+/**
+ * @internal — test hook for the resume-vs-teardown retriable-gate
+ * regression: force-mark (or unmark) a run as mid-teardown so the
+ * register-run gate can be exercised deterministically without racing a
+ * real teardown. Only used by tests.
+ */
+export function _setRunMidTeardownForTest(runId: string, mid: boolean): void {
+  if (mid) runsMidTeardown.add(runId);
+  else runsMidTeardown.delete(runId);
+}
+
+// Read at module load so dist/version is sampled once at daemon startup,
+// not on every health request.
+const buildVersion = getBuildVersion();
+
+function defaultDaemonSecretFile(): string {
+  return path.join(resolveStateDir(), "daemon-secret");
+}
+
+export function getControlPort(): number {
+  const raw = process.env.TAMANDUA_CONTROL_PORT;
+  if (!raw) return DEFAULT_CONTROL_PORT;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1 || n > 65535) return DEFAULT_CONTROL_PORT;
+  return n;
+}
+
+export function getMaxActiveTimers(): number {
+  const raw = process.env.TAMANDUA_MAX_ACTIVE_TIMERS;
+  if (!raw) return DEFAULT_MAX_ACTIVE_TIMERS;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_ACTIVE_TIMERS;
+  return n;
+}
+
+/** Race-safe secret creation. The first process to create the file wins. */
+export function ensureDaemonSecret(secretPath: string = defaultDaemonSecretFile()): string {
+  if (testGuardActive()) {
+    assertStatePathIsolation(secretPath, "ensureDaemonSecret()");
+  }
+  const dir = path.dirname(secretPath);
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    return fs.readFileSync(secretPath, "utf-8").trim();
+  } catch {
+    // Fall through to creation
+  }
+  const token = crypto.randomBytes(32).toString("hex");
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(secretPath, "wx", 0o600);
+    fs.writeFileSync(fd, token);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      return fs.readFileSync(secretPath, "utf-8").trim();
+    }
+    throw err;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+  try {
+    fs.chmodSync(secretPath, 0o600);
+  } catch {
+    /* best-effort */
+  }
+  return token;
+}
+
+export function readDaemonSecret(secretPath: string = defaultDaemonSecretFile()): string | null {
+  if (testGuardActive()) {
+    try {
+      assertStatePathIsolation(secretPath, "readDaemonSecret()");
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const value = fs.readFileSync(secretPath, "utf-8").trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+interface JsonResponse {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+function ok(body: Record<string, unknown> = {}, status = 200): JsonResponse {
+  return { status, body };
+}
+
+function notFound(message: string): JsonResponse {
+  return { status: 404, body: { error: message } };
+}
+
+function conflict(message: string): JsonResponse {
+  return { status: 409, body: { error: message } };
+}
+
+function unprocessable(message: string): JsonResponse {
+  return { status: 422, body: { error: message } };
+}
+
+export interface RunRow {
+  id: string;
+  workflow_id: string;
+  status: string;
+  scheduling_status: string | null;
+  context: string;
+  created_at?: string;
+  matchlock_policy?: string | null;
+}
+
+function getRun(runId: string): RunRow | null {
+  try {
+    const db = getDb();
+    const row = db
+      .prepare(
+        "SELECT id, workflow_id, status, scheduling_status, context, created_at, matchlock_policy FROM runs WHERE id = ?",
+      )
+      .get(runId) as RunRow | undefined;
+    return row ?? null;
+  } catch (err) {
+    logger.warn("control-server: getRun failed", { runId, error: String(err) });
+    return null;
+  }
+}
+
+/**
+ * Terminal run-status predicate shared by every control-plane operation
+ * gate (terminate/pause/resume/run-start admission). `canceled` is a
+ * terminal status on par with `completed`/`failed` — a canceled run must
+ * reject control operations with 409 instead of being treated as live.
+ * Exported for the canceled-as-terminal regression tests.
+ */
+export function isTerminal(status: string): boolean {
+  return status === "completed" || status === "failed" || status === "canceled";
+}
+
+/**
+ * Warn-throttle state for the "harness workdir busy" retriable admission
+ * condition. Maps runId -> monotonic ms of the last WARN emitted for that run
+ * (TIME-CLOCKS rule 1: this is an in-process throttle, so it is measured on
+ * the monotonic clock and a wall-clock jump cannot suppress or force a WARN).
+ * The condition is NOT an error: a run whose harness working directory is
+ * already held by a live scheduled run waits until the holder releases it.
+ * We warn once on the first refusal and then at most once per interval
+ * (default 60s) while the wait persists.
+ */
+const workdirWaitWarnState = new Map<string, number>();
+
+/** Default cadence for repeated workdir-wait WARN lines. */
+export const DEFAULT_WORKDIR_WAIT_WARN_INTERVAL_MS = 60_000;
+
+/**
+ * Daemon WARN marker for a launch REFUSED under the default `refuse` policy
+ * because a live run already holds the harness workdir. Deliberately distinct
+ * from both the retriable queue WARN and the allow-policy shared-workdir WARN;
+ * it is a WARN (never ERROR) because the refusal is expected behavior.
+ */
+export const WORKDIR_REFUSED_WARNING_MARKER =
+  "control-server: register-run workdir collision refused";
+
+/**
+ * Shared-workdir allow-policy warn guard: runId -> holder runId already
+ * warned about. An admitted collision must log exactly ONE uniform WARN per
+ * (run, holder) pair even if admission is retried (e.g. a resumed run with
+ * pre-existing crons).
+ */
+const sharedWorkdirWarnState = new Map<string, string>();
+
+function getWorkdirWaitWarnIntervalMs(): number {
+  const raw = process.env.TAMANDUA_WORKDIR_WAIT_WARN_INTERVAL_MS;
+  if (!raw) return DEFAULT_WORKDIR_WAIT_WARN_INTERVAL_MS;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_WORKDIR_WAIT_WARN_INTERVAL_MS;
+  return n;
+}
+
+/**
+ * @internal — test hook: clear the workdir-wait and shared-workdir
+ * warn-throttle state so a refusal after a reset is treated as a first one.
+ */
+export function _resetWorkdirWaitWarnState(): void {
+  workdirWaitWarnState.clear();
+  sharedWorkdirWarnState.clear();
+}
+
+/** @internal — test hook: the current warn-throttle map size. */
+export function _workdirWaitWarnStateSize(): number {
+  return workdirWaitWarnState.size;
+}
+
+/**
+ * Decide whether to emit the workdir-wait WARN for `runId` now: first
+ * refusal always logs; subsequent refusals log at most once per interval.
+ * Records the emission timestamp when it returns true.
+ *
+ * `nowMs` defaults to the monotonic clock (TIME-CLOCKS rule 1): the throttle
+ * is an in-process interval, so it must not be driven by `Date.now()`. The
+ * injectable `nowMs` parameter is retained so tests can drive the boundary
+ * directly with a monotonic value.
+ */
+function shouldWarnWorkdirWait(runId: string, nowMs: number = monotonicNow()): boolean {
+  const last = workdirWaitWarnState.get(runId);
+  if (last !== undefined && nowMs - last < getWorkdirWaitWarnIntervalMs()) {
+    return false;
+  }
+  workdirWaitWarnState.set(runId, nowMs);
+  return true;
+}
+
+/**
+ * @internal — direct test seam for the monotonic workdir-wait throttle: calls
+ * `shouldWarnWorkdirWait` with an injected monotonic `nowMs` (defaulting to the
+ * same monotonic clock production uses). Production code calls the private
+ * function directly; this alias exists only so unit tests can exercise the
+ * interval boundary deterministically.
+ */
+export function _shouldWarnWorkdirWaitForTest(runId: string, nowMs?: number): boolean {
+  return nowMs === undefined
+    ? shouldWarnWorkdirWait(runId)
+    : shouldWarnWorkdirWait(runId, nowMs);
+}
+
+function requiredTimersForRun(runId: string): number {
+  const row = getDb()
+    .prepare("SELECT COUNT(DISTINCT agent_id) AS cnt FROM steps WHERE run_id = ?")
+    .get(runId) as { cnt: number } | undefined;
+  return row?.cnt ?? 0;
+}
+
+/**
+ * Shared post-admission bookkeeping: clear the workdir-wait warn throttle for
+ * the run and, when the run had been parked in the retriable 'waiting' state,
+ * emit one INFO line announcing the admission-after-wait. The INFO line is the
+ * operator's signal that a queued run drained (distinct from the WARN emitted
+ * while it waited).
+ */
+function markActiveAfterAdmission(runId: string, requiredTimers: number, wasWaiting: boolean): void {
+  workdirWaitWarnState.delete(runId);
+  if (wasWaiting) {
+    logger.info("control-server: register-run admitted after workdir wait", {
+      runId,
+      requiredTimers,
+    });
+  }
+}
+
+/**
+ * Load the identity of the live run currently holding a harness working
+ * directory, for the refusal message. Falls back to the raw id with unknown
+ * metadata when the row is missing (the holder came from in-memory job
+ * metadata, so a deleted row must not crash the refusal). `run_number` is
+ * nullable and surfaces as `null`, which the formatter renders as the run id.
+ */
+function buildWorkdirCollisionHolder(runId: string): WorkdirCollisionHolder {
+  try {
+    const row = getDb()
+      .prepare("SELECT run_number, workflow_id, status, created_at FROM runs WHERE id = ?")
+      .get(runId) as
+      | { run_number: number | null; workflow_id: string; status: string; created_at: string }
+      | undefined;
+    if (row) {
+      return {
+        runId,
+        runNumber: typeof row.run_number === "number" ? row.run_number : null,
+        workflowId: row.workflow_id,
+        status: row.status,
+        since: row.created_at,
+      };
+    }
+  } catch (err) {
+    logger.warn("control-server: workdir collision holder lookup failed", {
+      runId,
+      error: String(err),
+    });
+  }
+  return { runId, runNumber: null, workflowId: "unknown", status: "unknown", since: "unknown" };
+}
+
+/**
+ * Emit the single uniform shared-workdir WARN for an admitted collision under
+ * the `allow` policy (no stronger warning for merge workflows). Guarded per
+ * (run, holder) so repeat admissions of the same pair log at most once.
+ */
+function warnSharedWorkdirOnce(runId: string, heldByRunId: string, dir: string): void {
+  if (sharedWorkdirWarnState.get(runId) === heldByRunId) return;
+  sharedWorkdirWarnState.set(runId, heldByRunId);
+  logger.warn(WORKDIR_SHARED_WARNING_MARKER, {
+    runId,
+    heldByRunId,
+    workingDirectoryForHarness: dir,
+    warning: formatSharedWorkdirWarning(dir),
+  });
+}
+
+async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
+  const requiredTimers = requiredTimersForRun(run.id);
+  const maxActiveTimers = getMaxActiveTimers();
+
+  const {
+    _scheduledJobCount,
+    _scheduledJobCountForRun,
+    _runIdForScheduledHarnessWorkdir,
+    removeRunCrons,
+    setupAgentCrons,
+  } = await import("../installer/agent-scheduler.js");
+
+  const harness = await validateRunHarnessForScheduling(run.id, run.context, {
+    matchlockPolicy: run.matchlock_policy ?? null,
+  });
+
+  const contextParsed = parseRunContext(run.id, run.context);
+  const isSaveTokensMode = contextParsed.no_hurry_save_tokens_mode === 'true';
+  // WORKDIR-FLAGS: the persisted context (the run's explicit choice) wins;
+  // only when it is absent/invalid does TAMANDUA_ALLOW_SHARED_HARNESS_WORKDIR=1
+  // select `allow`. Everything else is the default `refuse`.
+  const collisionPolicy = resolveWorkdirCollisionPolicy(contextParsed, process.env);
+
+  const duplicateRunId = _runIdForScheduledHarnessWorkdir(
+    harness.workingDirectoryForHarness,
+    run.id,
+  );
+  // Set when a collision exists and the `allow` policy admits it; drives both
+  // the response's sharedWorkdir flag and the single uniform WARN.
+  let sharedWorkdirAdmitted = false;
+  if (duplicateRunId) {
+    if (collisionPolicy === "refuse") {
+      // Default policy: a live scheduled run already holds this harness
+      // working directory. This is a terminal refusal for the launch (the CLI
+      // exits WORKDIR_REFUSAL_EXIT_CODE), NOT a validation failure and NOT a
+      // retriable wait: record the error state, warn (never ERROR) with a
+      // distinct marker, and hand the caller the actionable message naming the
+      // holder and the three ways out.
+      const holder = buildWorkdirCollisionHolder(duplicateRunId);
+      const message = formatWorkdirRefusalMessage(holder, harness.workingDirectoryForHarness);
+      try {
+        getDb()
+          .prepare(
+            `UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+          )
+          .run(message, run.id);
+      } catch (err) {
+        logger.warn("control-server: workdir refusal db update failed", {
+          runId: run.id,
+          error: String(err),
+        });
+      }
+      logger.warn(WORKDIR_REFUSED_WARNING_MARKER, {
+        runId: run.id,
+        heldByRunId: duplicateRunId,
+        workingDirectoryForHarness: harness.workingDirectoryForHarness,
+      });
+      return {
+        status: 409,
+        body: {
+          state: WORKDIR_REFUSAL_STATE,
+          error: message,
+          message,
+          heldByRunId: duplicateRunId,
+          holder,
+          workingDirectoryForHarness: harness.workingDirectoryForHarness,
+        },
+      };
+    }
+
+    if (collisionPolicy === "queue") {
+      // Retriable admission condition, not a validation failure: a live
+      // scheduled run already holds this harness working directory. Keep the
+      // run status 'running' and record a 'waiting' scheduling state so the
+      // reconciler admits it once the holder releases the directory. Never
+      // 'error' — the wait is expected behavior, not a failure.
+      const reason = `waiting for harness workdir held by run ${duplicateRunId}: ${harness.workingDirectoryForHarness}`;
+      getDb()
+        .prepare(
+          `UPDATE runs
+           SET scheduling_status = 'waiting',
+               scheduling_error = ?,
+               scheduling_requested_at = COALESCE(scheduling_requested_at, ?),
+               updated_at = ${SQL_NOW_ISO}
+           WHERE id = ?`,
+        )
+        .run(reason, new Date().toISOString(), run.id);
+      if (shouldWarnWorkdirWait(run.id)) {
+        logger.warn("control-server: register-run waiting for harness workdir", {
+          runId: run.id,
+          heldByRunId: duplicateRunId,
+          workingDirectoryForHarness: harness.workingDirectoryForHarness,
+        });
+      }
+      return ok(
+        {
+          state: "waiting",
+          heldByRunId: duplicateRunId,
+          workingDirectoryForHarness: harness.workingDirectoryForHarness,
+        },
+        202,
+      );
+    }
+
+    // `allow`: run concurrently now; concurrent git writes are the caller's
+    // responsibility. Admit as usual and warn once below.
+    sharedWorkdirAdmitted = true;
+  }
+
+  const wasWaiting = run.scheduling_status === "waiting";
+
+  const existingForRun = _scheduledJobCountForRun(run.id);
+  if (requiredTimers > 0 && existingForRun >= requiredTimers) {
+    getDb()
+      .prepare(
+        `UPDATE runs SET scheduling_status = 'active', scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      )
+      .run(run.id);
+    markActiveAfterAdmission(run.id, requiredTimers, wasWaiting);
+    if (sharedWorkdirAdmitted) {
+      warnSharedWorkdirOnce(run.id, duplicateRunId!, harness.workingDirectoryForHarness);
+    }
+    return ok({
+      state: "active",
+      requiredTimers,
+      maxActiveTimers,
+      ...(sharedWorkdirAdmitted ? { sharedWorkdir: true } : {}),
+    });
+  }
+
+  if (existingForRun > 0 && existingForRun < requiredTimers) {
+    await removeRunCrons(run.id);
+  }
+
+  if (requiredTimers > maxActiveTimers) {
+    const message =
+      `Run requires ${requiredTimers} scheduler timer(s), but TAMANDUA_MAX_ACTIVE_TIMERS is ${maxActiveTimers}.`;
+    getDb()
+      .prepare(
+        `UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      )
+      .run(message, run.id);
+    logger.error("control-server: register-run unschedulable", {
+      runId: run.id,
+      requiredTimers,
+      maxActiveTimers,
+    });
+    return unprocessable(message);
+  }
+
+  const freeSlots = maxActiveTimers - _scheduledJobCount();
+  if (requiredTimers > freeSlots) {
+    getDb()
+      .prepare(
+        `UPDATE runs
+         SET scheduling_status = 'queued',
+             scheduling_requested_at = COALESCE(scheduling_requested_at, ?),
+             scheduling_error = NULL,
+             updated_at = ${SQL_NOW_ISO}
+         WHERE id = ?`,
+      )
+      .run(new Date().toISOString(), run.id);
+    logger.info("control-server: register-run queued", {
+      runId: run.id,
+      requiredTimers,
+      freeSlots,
+      maxActiveTimers,
+    });
+    return ok({ state: "queued", requiredTimers, freeSlots, maxActiveTimers }, 202);
+  }
+
+  const { loadWorkflowSpec } = await import("../installer/workflow-spec.js");
+  const { resolveWorkflowDir } = await import("../installer/paths.js");
+  const workflow = await loadWorkflowSpec(resolveWorkflowDir(run.workflow_id));
+
+  try {
+    await setupAgentCrons(workflow, run.id, {
+      workingDirectoryForHarness: harness.workingDirectoryForHarness,
+      noHurrySaveTokensMode: isSaveTokensMode,
+    });
+    const scheduledForRun = _scheduledJobCountForRun(run.id);
+    if (scheduledForRun < requiredTimers) {
+      await removeRunCrons(run.id);
+      throw new Error(
+        `Only scheduled ${scheduledForRun}/${requiredTimers} timer(s) for run ${run.id}.`,
+      );
+    }
+  } catch (err) {
+    await removeRunCrons(run.id);
+    throw err;
+  }
+
+  getDb()
+    .prepare(
+      `UPDATE runs SET scheduling_status = 'active', scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+    )
+    .run(run.id);
+
+  markActiveAfterAdmission(run.id, requiredTimers, wasWaiting);
+  if (sharedWorkdirAdmitted) {
+    warnSharedWorkdirOnce(run.id, duplicateRunId!, harness.workingDirectoryForHarness);
+  }
+  logger.info("control-server: register-run admitted", { runId: run.id, requiredTimers });
+  return ok({
+    state: "active",
+    requiredTimers,
+    maxActiveTimers,
+    ...(sharedWorkdirAdmitted ? { sharedWorkdir: true } : {}),
+  }, 202);
+}
+
+async function admitQueuedRuns(): Promise<void> {
+  const db = getDb();
+  const queued = db
+    .prepare(
+      `SELECT id, workflow_id, status, scheduling_status, context, created_at
+       FROM runs
+       WHERE status = 'running' AND scheduling_status IN ('queued', 'waiting')
+       ORDER BY scheduling_requested_at ASC, created_at ASC`,
+    )
+    .all() as unknown as RunRow[];
+
+  for (const run of queued) {
+    const result = await admitOrQueueRun(run).catch((err) => {
+      logger.warn("control-server: queued admission failed", {
+        runId: run.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    });
+    if (!result) continue;
+    // A run still waiting on a busy harness workdir must not stop the drain:
+    // its holder will release the directory later. A capacity 'queued' result
+    // still breaks so FIFO ordering across the queued lane is preserved.
+    if (result.body.state === "waiting") continue;
+    if (result.body.state === "queued") break;
+  }
+}
+
+/** @internal — deterministic one-pass queue-drain seam for tests. */
+export async function _admitQueuedRunsOnce(): Promise<void> {
+  await admitQueuedRuns();
+}
+
+// ── TSTX suite endpoints ──────────────────────────────────────────────
+
+import { FLAKE_WINDOW_MS, CLAIM_TIMEOUT_MS } from "../suite/config.js";
+
+interface SuiteClaim {
+  claimedAt: number;
+  ownerToken?: string;
+  ownerPid?: number;
+  ownerStartTime?: string;
+  runId?: string;
+  stepId?: string;
+  originRepo: string;
+  treeHash: string;
+  cmdHash: string;
+}
+
+const suiteClaims = new Map<string, SuiteClaim>();
+// A dead claim may be discovered while sweeping for an unrelated request.
+// Keep its owner metadata until the first same-key caller is actually granted,
+// so the reclaim event attributes the real reclaimer rather than the request
+// that happened to trigger housekeeping.
+const sweptDeadSuiteClaims = new Map<string, SuiteClaim>();
+
+function suiteClaimKey(originRepo: string, treeHash: string, cmdHash: string): string {
+  // JSON array encoding is injective for string tuples; delimiter joining is not
+  // because repository identifiers and hashes are accepted as opaque strings.
+  return JSON.stringify([originRepo, treeHash, cmdHash]);
+}
+
+const SUITE_ORIGIN_MAX_LENGTH = 2048;
+const SUITE_HASH_MAX_LENGTH = 128;
+const SUITE_OWNER_MAX_LENGTH = 128;
+
+interface ValidSuiteClaimFields {
+  originRepo: string;
+  treeHash: string;
+  cmdHash: string;
+  ownerToken?: string;
+  ownerPid?: number;
+  ownerStartTime?: string;
+  runId?: string;
+  stepId?: string;
+}
+
+function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClaimFields | null {
+  const originRepo = typeof body.origin_repo === "string" ? body.origin_repo : "";
+  const treeHash = typeof body.tree_hash === "string" ? body.tree_hash : "";
+  const cmdHash = typeof body.cmd_hash === "string" ? body.cmd_hash : "";
+  const hasOwnerToken = Object.prototype.hasOwnProperty.call(body, "owner_token");
+  const ownerToken = hasOwnerToken && typeof body.owner_token === "string"
+    ? body.owner_token
+    : undefined;
+  const ownerPid = Number.isSafeInteger(body.owner_pid) && (body.owner_pid as number) > 0
+    ? body.owner_pid as number
+    : undefined;
+  const hasOwnerStartTime = Object.prototype.hasOwnProperty.call(body, "owner_start_time");
+  const ownerStartTime = hasOwnerStartTime && typeof body.owner_start_time === "string"
+    ? body.owner_start_time
+    : undefined;
+  const runId = typeof body.run_id === "string" && body.run_id.length > 0
+    && body.run_id.length <= SUITE_OWNER_MAX_LENGTH ? body.run_id : undefined;
+  const stepId = typeof body.step_id === "string" && body.step_id.length > 0
+    && body.step_id.length <= SUITE_OWNER_MAX_LENGTH ? body.step_id : undefined;
+  if (
+    !originRepo || originRepo.length > SUITE_ORIGIN_MAX_LENGTH
+    || !treeHash || treeHash.length > SUITE_HASH_MAX_LENGTH
+    || !cmdHash || cmdHash.length > SUITE_HASH_MAX_LENGTH
+    || (hasOwnerToken && (!ownerToken || ownerToken.length > SUITE_OWNER_MAX_LENGTH))
+    || (hasOwnerStartTime && (!ownerStartTime || ownerStartTime.length > SUITE_OWNER_MAX_LENGTH))
+  ) {
+    return null;
+  }
+  return { originRepo, treeHash, cmdHash, ownerToken, ownerPid, ownerStartTime, runId, stepId };
+}
+
+export type SuiteOwnerLiveness = "alive" | "dead" | "indeterminate";
+
+/**
+ * Probe a suite claim's recorded owner PID and start identity.
+ *
+ * The start identity is compared with `compareProcessStartIdentities`, never
+ * with string equality, so the result is format-aware:
+ *   - `same`   → `alive` (two well-formed v2 values, same pid, |Δstart| within
+ *                the documented tolerance),
+ *   - `different` → `dead` (same pid but beyond tolerance, or a pid mismatch),
+ *   - `unknown` → `indeterminate` (legacy `ps:`/`proc:`, the `v2u:` fallback,
+ *                malformed/empty values, or no value at all).
+ *
+ * Legacy and malformed identities are therefore NEVER treated as dead: a
+ * mismatch we cannot prove is not a licence to reclaim a live owner. A
+ * null/undefined *actual* identity (process absent or unreadable) is likewise
+ * `indeterminate`. Only an ESRCH from the signal-0 probe is `dead` without an
+ * identity comparison.
+ */
+export function probeSuiteOwnerPid(
+  pid: number,
+  signalZero: (targetPid: number, signal: 0) => unknown = (targetPid, signal) => process.kill(targetPid, signal),
+  expectedStartTime?: string,
+  readStartTime: (targetPid: number) => string | null | undefined = getProcessStartIdentity,
+): SuiteOwnerLiveness {
+  try {
+    signalZero(pid, 0);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "indeterminate";
+  }
+  if (expectedStartTime === undefined) return "alive";
+  const actualStartTime = readStartTime(pid);
+  if (actualStartTime == null) return "indeterminate";
+  switch (compareProcessStartIdentities(expectedStartTime, actualStartTime)) {
+    case "same":
+      return "alive";
+    case "different":
+      return "dead";
+    default:
+      return "indeterminate";
+  }
+}
+
+interface SuiteClaimRuntime {
+  now: () => number;
+  probePid: (pid: number, expectedStartTime?: string) => SuiteOwnerLiveness;
+  emitClaimEvent: (event: TamanduaEvent) => void;
+}
+
+function claimOwnerLiveness(claim: SuiteClaim, runtime: SuiteClaimRuntime): SuiteOwnerLiveness {
+  if (claim.ownerPid === undefined) return "indeterminate";
+  try {
+    return runtime.probePid(claim.ownerPid, claim.ownerStartTime);
+  } catch {
+    return "indeterminate";
+  }
+}
+
+function emitDeadOwnerReclaim(
+  claim: SuiteClaim,
+  reclaimer: ValidSuiteClaimFields | undefined,
+  runtime: SuiteClaimRuntime,
+): void {
+  const event: TamanduaEvent = {
+    ts: new Date(runtime.now()).toISOString(),
+    event: "suite.claim_dead_owner_reclaimed",
+    runId: reclaimer?.runId ?? claim.runId ?? "",
+    stepId: reclaimer?.stepId,
+    originRepo: claim.originRepo,
+    treeHash: claim.treeHash,
+    cmdHash: claim.cmdHash,
+    ownerRunId: claim.runId,
+    ownerStepId: claim.stepId,
+    ownerPid: claim.ownerPid,
+    reclaimerRunId: reclaimer?.runId,
+    reclaimerStepId: reclaimer?.stepId,
+    reclaimerPid: reclaimer?.ownerPid,
+  };
+  try {
+    runtime.emitClaimEvent(event);
+  } catch (err) {
+    logger.warn("control-server: suite dead-owner reclaim event emission failed", {
+      error: String(err),
+      originRepo: claim.originRepo,
+      treeHash: claim.treeHash,
+      cmdHash: claim.cmdHash,
+    });
+  }
+}
+
+function emitClaimTimelineEvent(
+  name: "suite.claim_granted" | "suite.claim_wait" | "suite.claim_owner_released",
+  claim: SuiteClaim,
+  actor: ValidSuiteClaimFields | undefined,
+  runtime: SuiteClaimRuntime,
+  releaseReason?: string,
+): void {
+  runtime.emitClaimEvent({
+    ts: new Date(runtime.now()).toISOString(),
+    event: name,
+    runId: actor?.runId ?? claim.runId ?? "",
+    stepId: actor?.stepId ?? claim.stepId,
+    originRepo: claim.originRepo,
+    treeHash: claim.treeHash,
+    cmdHash: claim.cmdHash,
+    ownerRunId: claim.runId,
+    ownerStepId: claim.stepId,
+    ownerPid: claim.ownerPid,
+    reclaimerRunId: actor?.runId,
+    reclaimerStepId: actor?.stepId,
+    reclaimerPid: actor?.ownerPid,
+    releaseReason,
+  });
+}
+
+function cleanStaleClaims(
+  runtime: SuiteClaimRuntime,
+  collisionKey?: string,
+  reclaimer?: ValidSuiteClaimFields,
+): void {
+  const now = runtime.now();
+  for (const [key, claim] of sweptDeadSuiteClaims) {
+    if (now - claim.claimedAt > CLAIM_TIMEOUT_MS) sweptDeadSuiteClaims.delete(key);
+  }
+  for (const [key, claim] of suiteClaims) {
+    if (now - claim.claimedAt > CLAIM_TIMEOUT_MS) {
+      suiteClaims.delete(key);
+      sweptDeadSuiteClaims.delete(key);
+      continue;
+    }
+    if (claimOwnerLiveness(claim, runtime) !== "dead") continue;
+    suiteClaims.delete(key);
+    if (key === collisionKey) emitDeadOwnerReclaim(claim, reclaimer, runtime);
+    else sweptDeadSuiteClaims.set(key, claim);
+  }
+}
+
+/**
+ * Tolerance for the FLAKE_WINDOW_MS age comparisons (TIME-CLOCKS rule 2).
+ *
+ * The ledger is written by multiple worktrees/hosts whose wall clocks may
+ * differ by sub-second amounts and the window is a coarse 24h bucket, so 1s
+ * of slack keeps a row written just inside the window from being dropped by
+ * skew. The comparison stays strict at the widened boundary
+ * (`age > FLAKE_WINDOW_MS + tolerance`).
+ */
+const FLAKE_WINDOW_TOLERANCE_MS = 1_000;
+
+/**
+ * True when a stored `created_at` falls inside the FLAKE_WINDOW_MS window as
+ * of `nowMs`, computed numerically via `instantAgeMs`/`isOlderThan`
+ * (TIME-CLOCKS US-011) rather than a `created_at >= ?` SQL string bound.
+ *
+ * An unparseable/missing/`NaN` instant is NEVER inside the window:
+ * `isOlderThan` alone treats an unknown instant as fresh, so the explicit
+ * `instantAgeMs` parseability check is required. `nowMs` is injectable for
+ * tests; production uses `Date.now()`.
+ */
+export function isWithinFlakeWindow(
+  createdAt: string | null | undefined,
+  nowMs: number = Date.now(),
+): boolean {
+  if (instantAgeMs(createdAt, nowMs) === undefined) return false;
+  return !isOlderThan(createdAt, FLAKE_WINDOW_MS, nowMs, FLAKE_WINDOW_TOLERANCE_MS);
+}
+
+interface SuiteFlakyKey {
+  tree_hash: string;
+  cmd_hash: string;
+  cmd_display: string;
+  pass_count: number;
+  fail_count: number;
+}
+
+/**
+ * Aggregate flaky keys for `originRepo` inside the 24h flake window.
+ *
+ * Ages are computed per row via the shared instant helpers (US-011), so
+ * legacy naive-UTC instants compare correctly and an unparseable instant is
+ * never counted. Grouping and ordering (descending total runs) are unchanged,
+ * and exit-code semantics are preserved exactly: exit 87 (interrupted) rows
+ * are excluded from both counters; otherwise exit 0 is a pass and every other
+ * exit is a real failure.
+ */
+export function flakyKeysWithinWindow(
+  db: DatabaseSync,
+  originRepo: string,
+  nowMs: number = Date.now(),
+): SuiteFlakyKey[] {
+  const rows = db.prepare(
+    `SELECT tree_hash, cmd_hash, cmd_display, exit_code, created_at
+     FROM suite_results
+     WHERE origin_repo = ?`,
+  ).all(originRepo) as Array<{
+    tree_hash: string;
+    cmd_hash: string;
+    cmd_display: string;
+    exit_code: number;
+    created_at: string;
+  }>;
+
+  const byKey = new Map<string, SuiteFlakyKey>();
+  for (const row of rows) {
+    if (!isWithinFlakeWindow(row.created_at, nowMs)) continue;
+    const key = `${row.tree_hash}\u0000${row.cmd_hash}`;
+    let agg = byKey.get(key);
+    if (!agg) {
+      agg = {
+        tree_hash: row.tree_hash,
+        cmd_hash: row.cmd_hash,
+        cmd_display: row.cmd_display,
+        pass_count: 0,
+        fail_count: 0,
+      };
+      byKey.set(key, agg);
+    }
+    if (row.exit_code === 87) continue;
+    if (row.exit_code === 0) agg.pass_count++;
+    else agg.fail_count++;
+  }
+
+  return [...byKey.values()]
+    .filter((key) => key.pass_count > 0 && key.fail_count > 0)
+    .sort((a, b) => (b.pass_count + b.fail_count) - (a.pass_count + a.fail_count));
+}
+
+/**
+ * Pass/fail counts for one suite key inside the flake window, computed with
+ * the shared numeric helpers (US-011). Exit 87 rows are excluded; exit 0 is a
+ * pass and every other exit is a real failure. An unparseable `created_at` is
+ * never counted. `nowMs` is injectable for tests.
+ */
+export function suiteCountsWithinWindow(
+  db: DatabaseSync,
+  key: { originRepo: string; treeHash: string; cmdHash: string },
+  nowMs: number = Date.now(),
+): { passCount: number; failCount: number } {
+  const rows = db.prepare(
+    `SELECT exit_code, created_at FROM suite_results
+     WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?`,
+  ).all(key.originRepo, key.treeHash, key.cmdHash) as Array<{
+    exit_code: number;
+    created_at: string;
+  }>;
+
+  let passCount = 0;
+  let failCount = 0;
+  for (const row of rows) {
+    if (!isWithinFlakeWindow(row.created_at, nowMs)) continue;
+    if (row.exit_code === 87) continue;
+    if (row.exit_code === 0) passCount++;
+    else failCount++;
+  }
+  return { passCount, failCount };
+}
+
+async function handleSuiteLookup(url: string): Promise<JsonResponse> {
+  const parsed = new URL(url, "http://localhost");
+  const originRepo = parsed.searchParams.get("origin_repo");
+  const treeHash = parsed.searchParams.get("tree_hash");
+  const cmdHash = parsed.searchParams.get("cmd_hash");
+
+  if (!originRepo || !treeHash || !cmdHash) {
+    return { status: 400, body: { error: "Missing required query params: origin_repo, tree_hash, cmd_hash" } };
+  }
+
+  try {
+    const db = getDb();
+
+    const latest = db.prepare(
+      `SELECT id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, log_path, run_id, step_id, created_at
+       FROM suite_results
+       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+    ).get(originRepo, treeHash, cmdHash) as Record<string, unknown> | undefined;
+
+    // US-011: age the windowed rows numerically instead of a created_at >= ?
+    // SQL string bound.
+    const { passCount, failCount } = suiteCountsWithinWindow(db, { originRepo, treeHash, cmdHash });
+
+    return ok({
+      latest: latest ?? null,
+      passCount,
+      failCount,
+      flaky: passCount > 0 && failCount > 0,
+    });
+  } catch (err) {
+    logger.warn("control-server: suite lookup failed", { error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+/**
+ * Upper bound (characters) for any path/error value copied into a suite-log
+ * publish warning. The shim controls the temp path, but a failure must never
+ * let one line bloat the daemon log with an unbounded path or OS error string.
+ */
+const SUITE_LOG_WARN_FIELD_MAX = 300;
+
+/** Bound one warning field so a single failure logs exactly one short line. */
+function boundedWarnField(value: unknown): string {
+  const s = typeof value === "string" ? value : String(value ?? "");
+  return s.length > SUITE_LOG_WARN_FIELD_MAX ? `${s.slice(0, SUITE_LOG_WARN_FIELD_MAX)}\u2026` : s;
+}
+
+/**
+ * Resolve a shim-supplied temp log path to an absolute path strictly inside
+ * `<state dir>/suite-logs/`, or null when it is absent, not absolute, or
+ * escapes the directory (including via `..`). Exported as a pure rule so the
+ * control-plane tests can pin the path validation without a running server.
+ */
+export function resolveSuiteLogTempPath(tempLogPath: unknown, stateDir: string): string | null {
+  if (typeof tempLogPath !== "string" || tempLogPath.length === 0) return null;
+  if (!path.isAbsolute(tempLogPath)) return null;
+  const suiteLogsDir = path.join(stateDir, "suite-logs");
+  const resolved = path.resolve(tempLogPath);
+  if (!resolved.startsWith(suiteLogsDir + path.sep)) return null;
+  return resolved;
+}
+
+/**
+ * Publish a shim-written temp suite log as the ledger row's full log.
+ *
+ * The shim writes the COMPLETE combined stdout+stderr to a temp file it owns
+ * inside `<state dir>/suite-logs/`; the daemon assigns the row id, so only the
+ * daemon can name the final `<row id>.log`. The temp file is moved with a
+ * same-filesystem atomic rename and the row's `log_path` is updated to the
+ * final absolute path. On any failure (missing/invalid/out-of-directory temp
+ * path, rename error) exactly ONE bounded warning is logged, `log_path` stays
+ * NULL, and nothing is deleted — the temp file is left in place for forensics
+ * (evidence prune is bead 6sy.69).
+ */
+function publishSuiteLog(
+  db: DatabaseSync,
+  ledgerRowId: number,
+  tempLogPath: unknown,
+): string | null {
+  if (typeof tempLogPath !== "string" || tempLogPath.length === 0) return null;
+  const stateDir = resolveStateDir();
+  const resolvedTemp = resolveSuiteLogTempPath(tempLogPath, stateDir);
+  if (resolvedTemp === null) {
+    logger.warn("control-server: suite log publish skipped", {
+      rowId: ledgerRowId,
+      logPath: boundedWarnField(tempLogPath),
+      reason: "not an absolute path inside <state dir>/suite-logs/",
+    });
+    return null;
+  }
+  const suiteLogsDir = path.join(stateDir, "suite-logs");
+  const finalPath = path.join(suiteLogsDir, `${ledgerRowId}.log`);
+  try {
+    fs.mkdirSync(suiteLogsDir, { recursive: true });
+    fs.renameSync(resolvedTemp, finalPath);
+    db.prepare("UPDATE suite_results SET log_path = ? WHERE id = ?").run(finalPath, ledgerRowId);
+    return finalPath;
+  } catch (err) {
+    logger.warn("control-server: suite log publish failed", {
+      rowId: ledgerRowId,
+      logPath: boundedWarnField(resolvedTemp),
+      error: boundedWarnField(err instanceof Error ? err.message : err),
+    });
+    return null;
+  }
+}
+
+async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonResponse> {
+  const originRepo = typeof body.origin_repo === "string" ? body.origin_repo : "";
+  const treeHash = typeof body.tree_hash === "string" ? body.tree_hash : "";
+  const cmdHash = typeof body.cmd_hash === "string" ? body.cmd_hash : "";
+  const cmdDisplay = typeof body.cmd_display === "string" ? body.cmd_display : "";
+  const exitCode = typeof body.exit_code === "number" ? body.exit_code : null;
+  const durationMs = typeof body.duration_ms === "number" ? body.duration_ms : null;
+  const logTail = typeof body.log_tail === "string" ? body.log_tail : null;
+  // LEDGER-DIAG US-002: the shim's absolute temp-file path for the COMPLETE
+  // combined output. Published below as `<state dir>/suite-logs/<row id>.log`
+  // once the INSERT has assigned the row id.
+  const tempLogPath = typeof body.log_path === "string" ? body.log_path : null;
+  const runId = typeof body.run_id === "string" ? body.run_id : null;
+  const stepId = typeof body.step_id === "string" ? body.step_id : null;
+  const force = body.force === true;
+  // TIME-OUTPUT (US-007): the suite's started_at is normalized to canonical
+  // ISO-8601 UTC with Z before it is emitted on suite.executed. A legacy
+  // naive/offset value is converted; an unparseable one is omitted rather
+  // than serialized raw.
+  const startedAt = formatInstant(
+    typeof body.started_at === "string" ? body.started_at : undefined,
+    { style: "iso" },
+  );
+
+  if (!originRepo || !treeHash || !cmdHash || !cmdDisplay || exitCode === null || durationMs === null) {
+    return { status: 400, body: { error: "Missing required fields: origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms" } };
+  }
+
+  try {
+    const db = getDb();
+    const created_at = new Date().toISOString();
+    const result = db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(originRepo, treeHash, cmdHash, cmdDisplay, exitCode, durationMs, logTail, runId, stepId, created_at);
+
+    const ledgerRowId = Number(result.lastInsertRowid);
+    // Publish the full log BEFORE emitting the event so a reader of
+    // suite.executed (US-006) always sees the settled log_path.
+    const storedLogPath = publishSuiteLog(db, ledgerRowId, tempLogPath);
+    // LEDGER-DIAG US-006: a RED result gets exactly ONE daemon log line naming
+    // the persisted full-log path (when there is one) next to the execution
+    // identity; a green result logs nothing extra, so an all-green ledger
+    // stays quiet. The path is omitted, never null, when no log was persisted.
+    if (exitCode !== 0) {
+      logger.info("control-server: suite record red", {
+        originRepo,
+        treeHash,
+        cmdHash,
+        cmdDisplay,
+        exitCode,
+        ...(storedLogPath ? { logPath: storedLogPath } : {}),
+      });
+    }
+    // Emit exact-key execution/record evidence for immutable O9 harvesting.
+    const eventRunId = runId || "";
+    emitEvent({
+      ts: created_at,
+      event: "suite.executed",
+      runId: eventRunId,
+      stepId: stepId || undefined,
+      originRepo,
+      treeHash,
+      cmdHash,
+      cmdDisplay,
+      durationMs,
+      exitCode,
+      force,
+      startedAt,
+      ledgerRowId,
+      // LEDGER-DIAG US-006: the full-log path on the immutable evidence, ONLY
+      // when the publish settled. A reader that sees no logPath knows no log
+      // exists for this row.
+      ...(storedLogPath ? { logPath: storedLogPath } : {}),
+    });
+
+    // Clear any pending claim so waiters can pick up the result.
+    const claimKey = suiteClaimKey(originRepo, treeHash, cmdHash);
+    suiteClaims.delete(claimKey);
+    sweptDeadSuiteClaims.delete(claimKey);
+
+    return ok({ id: ledgerRowId, created_at, ...(storedLogPath ? { log_path: storedLogPath } : {}) });
+  } catch (err) {
+    logger.warn("control-server: suite record failed", { error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+async function handleSuiteClaim(
+  body: Record<string, unknown>,
+  runtime: SuiteClaimRuntime,
+): Promise<JsonResponse> {
+  const fields = validateSuiteClaimFields(body);
+  if (!fields) {
+    return { status: 400, body: { error: "Invalid or oversized suite claim fields" } };
+  }
+  const { originRepo, treeHash, cmdHash, ownerToken, ownerPid, ownerStartTime, runId, stepId } = fields;
+
+  const key = suiteClaimKey(originRepo, treeHash, cmdHash);
+  cleanStaleClaims(runtime, key, fields);
+  const existing = suiteClaims.get(key);
+
+  if (existing) {
+    emitClaimTimelineEvent("suite.claim_wait", existing, fields, runtime);
+    return ok({ action: "wait", claimedAt: new Date(existing.claimedAt).toISOString() });
+  }
+
+  const sweptDeadClaim = sweptDeadSuiteClaims.get(key);
+  if (sweptDeadClaim) {
+    sweptDeadSuiteClaims.delete(key);
+    emitDeadOwnerReclaim(sweptDeadClaim, fields, runtime);
+  }
+
+  const granted: SuiteClaim = {
+    claimedAt: runtime.now(), ownerToken, ownerPid, ownerStartTime, runId, stepId, originRepo, treeHash, cmdHash,
+  };
+  suiteClaims.set(key, granted);
+  emitClaimTimelineEvent("suite.claim_granted", granted, fields, runtime);
+  return ok({ action: "run" });
+}
+
+async function handleSuiteRelease(body: Record<string, unknown>, runtime: SuiteClaimRuntime): Promise<JsonResponse> {
+  const fields = validateSuiteClaimFields(body);
+  if (!fields) {
+    return { status: 400, body: { error: "Invalid or oversized suite release fields" } };
+  }
+  const { originRepo, treeHash, cmdHash, ownerToken } = fields;
+
+  const key = suiteClaimKey(originRepo, treeHash, cmdHash);
+  const existing = suiteClaims.get(key);
+  if (!existing) return ok({ released: false });
+  if (existing.ownerToken !== ownerToken) {
+    return { status: 409, body: { error: "Suite claim is owned by another caller" } };
+  }
+  suiteClaims.delete(key);
+  emitClaimTimelineEvent(
+    "suite.claim_owner_released",
+    existing,
+    fields,
+    runtime,
+    typeof body.reason === "string" ? body.reason : "exact_owner_release",
+  );
+  return ok({ released: true });
+}
+
+function releaseSuiteClaimsByOwner(
+  runId: string,
+  stepId?: string,
+  runtime?: SuiteClaimRuntime,
+  releaseReason = "owner_recovery",
+): number {
+  let released = 0;
+  for (const [key, claim] of suiteClaims) {
+    if (claim.runId !== runId || (stepId !== undefined && claim.stepId !== stepId)) continue;
+    suiteClaims.delete(key);
+    if (runtime) {
+      emitClaimTimelineEvent("suite.claim_owner_released", claim, undefined, runtime, releaseReason);
+    }
+    released += 1;
+  }
+  return released;
+}
+
+async function handleSuiteOwnerRelease(
+  body: Record<string, unknown>,
+  runtime: SuiteClaimRuntime,
+): Promise<JsonResponse> {
+  const runId = typeof body.run_id === "string" ? body.run_id.trim() : "";
+  const stepId = typeof body.step_id === "string" ? body.step_id.trim() : undefined;
+  if (!runId || runId.length > SUITE_OWNER_MAX_LENGTH
+    || (stepId !== undefined && (!stepId || stepId.length > SUITE_OWNER_MAX_LENGTH))) {
+    return { status: 400, body: { error: "Invalid suite claim owner attribution" } };
+  }
+  return ok({
+    released: releaseSuiteClaimsByOwner(
+      runId,
+      stepId,
+      runtime,
+      typeof body.reason === "string" ? body.reason : "owner_recovery",
+    ),
+  });
+}
+
+async function handleSuiteEvent(body: Record<string, unknown>): Promise<JsonResponse> {
+  const event = typeof body.event === "string" ? body.event : "";
+  if (!event) {
+    return { status: 400, body: { error: "Missing required field: event" } };
+  }
+
+  const runId = typeof body.run_id === "string" ? body.run_id : "";
+  const stepId = typeof body.step_id === "string" ? body.step_id : undefined;
+
+  // Build a TamanduaEvent with only the fields that are present.
+  const evt: Record<string, unknown> = {
+    ts: new Date().toISOString(),
+    event,
+    runId,
+  };
+  if (stepId) evt.stepId = stepId;
+  if (typeof body.tree_hash === "string") evt.treeHash = body.tree_hash;
+  if (typeof body.cmd_display === "string") evt.cmdDisplay = body.cmd_display;
+  if (typeof body.cmd_hash === "string") evt.cmdHash = body.cmd_hash;
+  if (typeof body.saved_duration_ms === "number") evt.savedDurationMs = body.saved_duration_ms;
+  if (typeof body.duration_ms === "number") evt.durationMs = body.duration_ms;
+  if (typeof body.exit_code === "number") evt.exitCode = body.exit_code;
+  if (typeof body.pass_count === "number") evt.passCount = body.pass_count;
+  if (typeof body.fail_count === "number") evt.failCount = body.fail_count;
+  if (typeof body.window === "string") evt.window = body.window;
+  if (typeof body.waited_ms === "number") evt.waitedMs = body.waited_ms;
+  if (typeof body.pre_tree_hash === "string") evt.preTreeHash = body.pre_tree_hash;
+  if (typeof body.post_tree_hash === "string") evt.postTreeHash = body.post_tree_hash;
+  if (typeof body.force === "boolean") evt.force = body.force;
+  if (typeof body.origin_repo === "string") evt.originRepo = body.origin_repo;
+  // TIME-OUTPUT (US-007): normalize the suite started_at before serialization;
+  // omit it when it is missing/unparseable rather than emitting a raw value.
+  const suiteStartedAt = formatInstant(
+    typeof body.started_at === "string" ? body.started_at : undefined,
+    { style: "iso" },
+  );
+  if (suiteStartedAt) evt.startedAt = suiteStartedAt;
+  if (typeof body.shim_exit_code === "number") evt.shimExitCode = body.shim_exit_code;
+  if (typeof body.command_exit_code === "number" || body.command_exit_code === null) evt.commandExitCode = body.command_exit_code;
+  if (typeof body.ledger_row_id === "number" || body.ledger_row_id === null) evt.ledgerRowId = body.ledger_row_id;
+  if (typeof body.interrupted === "boolean") evt.interrupted = body.interrupted;
+  if (typeof body.tracked_dirty === "boolean") evt.trackedDirty = body.tracked_dirty;
+  if (typeof body.junk_probe_path === "string") evt.junkProbePath = body.junk_probe_path;
+  if (typeof body.junk_probe_tracked === "boolean") evt.junkProbeTracked = body.junk_probe_tracked;
+
+  try {
+    emitEvent(evt as unknown as TamanduaEvent);
+    return ok({});
+  } catch (err) {
+    logger.warn("control-server: suite event emission failed", { event, error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+async function handleSuiteFlaky(url: string): Promise<JsonResponse> {
+  const parsed = new URL(url, "http://localhost");
+  const originRepo = parsed.searchParams.get("origin_repo");
+
+  if (!originRepo) {
+    return { status: 400, body: { error: "Missing required query param: origin_repo" } };
+  }
+
+  try {
+    const db = getDb();
+
+    // Find keys that have both pass (exit_code=0) and fail (exit_code!=0 and !=87) within the window.
+    // Exit code 87 (interrupted) rows are excluded from flaky detection — they are honest history,
+    // not real failures, and should not poison the flaky counter.
+    // US-011: ages are computed numerically per row via the shared instant helpers.
+    return ok({ flaky_keys: flakyKeysWithinWindow(db, originRepo) });
+  } catch (err) {
+    logger.warn("control-server: suite flaky query failed", { error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+async function handleSuiteDurationHistory(url: string): Promise<JsonResponse> {
+  const parsed = new URL(url, "http://localhost");
+  const originRepo = parsed.searchParams.get("origin_repo");
+  const cmdHash = parsed.searchParams.get("cmd_hash");
+
+  if (!originRepo || !cmdHash) {
+    return { status: 400, body: { error: "Missing required query params: origin_repo, cmd_hash" } };
+  }
+
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      `SELECT duration_ms FROM suite_results
+       WHERE origin_repo = ? AND cmd_hash = ? AND exit_code != 87
+       ORDER BY created_at DESC`,
+    ).all(originRepo, cmdHash) as Array<{ duration_ms: number }>;
+
+    const durations = rows.map((r) => r.duration_ms);
+    return ok({ durations, count: durations.length });
+  } catch (err) {
+    logger.warn("control-server: suite duration history failed", { error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+// ── Run scheduling handlers ──────────────────────────────────────────
+
+async function handleRegisterRun(runId: string): Promise<JsonResponse> {
+  const run = getRun(runId);
+  if (!run) return notFound(`Run not found: ${runId}`);
+  if (isTerminal(run.status)) return conflict(`Run is terminal: ${run.status}`);
+  // A resume landing inside an active teardown/drain window must get a
+  // precise, retriable answer — NOT admission (the in-flight teardown
+  // would immediately remove the freshly-created crons) and NOT a
+  // terminal 409 (the run is not genuinely terminal). The CLI renders
+  // this cleanly and the operator retries after teardown quiesces.
+  if (runsMidTeardown.has(runId)) {
+    return { status: 503, body: { error: "run teardown in progress, retry" } };
+  }
+  if (run.status === "paused" || run.scheduling_status === "paused") {
+    return ok({ state: "paused" });
+  }
+  // ── PAUSE-DRAIN re-admission guard ─────────────────────────────
+  // A pending drain must never be re-admitted. A step completion fires
+  // POST /control/nudge, whose admission loop iterates every running run;
+  // the old path reset a draining run's scheduling_status back to 'active'
+  // (and re-created timers), which bypassed the scheduler's drain guard and
+  // let the run keep dispatching new rounds. Preserve the drain state here;
+  // the scheduler's dispatch guard finalizes it to 'paused' once the last
+  // in-flight step ends. Only an explicit `workflow resume` (which clears
+  // the marker and flips scheduling_status before re-registering) cancels a
+  // pending drain.
+  if (
+    run.scheduling_status === "draining_pause" ||
+    parseRunContext(run.id, run.context ?? "").pause_drain === "true"
+  ) {
+    logger.debug("control-server: register-run skipped — drain pending", {
+      runId: run.id,
+      schedulingStatus: run.scheduling_status,
+    });
+    return ok({ state: "draining_pause" });
+  }
+  if (run.scheduling_status === "active") {
+    const { _scheduledJobCountForRun } = await import("../installer/agent-scheduler.js");
+    if (_scheduledJobCountForRun(run.id) >= requiredTimersForRun(run.id)) {
+      return ok({ state: "active" });
+    }
+  }
+
+  // pending_register / null / error → attempt admission
+  try {
+    return await admitOrQueueRun(run);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    try {
+      getDb()
+        .prepare(
+          `UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+        )
+        .run(message, runId);
+    } catch {
+      /* best-effort */
+    }
+    logger.error("control-server: register-run failed", { runId, error: message });
+    // US-003: return the RAW validation message. The caller (run.ts) adds the
+    // single "Failed to register run with daemon: " prefix, so wrapping it
+    // here too produced a doubled prefix.
+    return unprocessable(message);
+  }
+}
+
+async function handleTerminateRun(runId: string, suiteRuntime?: SuiteClaimRuntime, settle = false): Promise<JsonResponse> {
+  const run = getRun(runId);
+  if (!run) return notFound(`Run not found: ${runId}`);
+
+  // Mark the teardown window so a concurrent register-run (e.g. an
+  // immediate resume after force-fail) gets a retriable 503 instead of an
+  // admission whose fresh crons this teardown would wipe.
+  runsMidTeardown.add(runId);
+  try {
+    try {
+      const {
+        removeRunCrons,
+        getRunTeardownGraceMs,
+        settleRunInFlightRounds,
+        HARNESS_TEARDOWN_GRACE_MS,
+      } = await import("../installer/agent-scheduler.js");
+      // Terminate-run is called both for user-initiated termination of an
+      // ACTIVE run (kill in-flight work immediately) and as cleanup after a
+      // run naturally completed/failed (the harness that reported the final
+      // step is still flushing its output — give only those statuses the grace
+      // window so canceled and other user-directed states stay immediate).
+      //
+      // TATR US-005: a canceled run (or an explicit settle request) must NOT
+      // kill in-flight work immediately — the cancel path guarantees its
+      // terminal event is emitted only after in-flight token attribution
+      // settles (no trailing run.tokens.updated). Remove the scheduling timers
+      // so no new rounds dispatch, grant in-flight rounds the same grace
+      // window as naturally-completed runs, then settle them before returning.
+      // Completed/failed cleanup and pause/resume behavior are unchanged.
+      const shouldSettle = run.status === "canceled" || settle;
+      const graceMs = shouldSettle
+        ? HARNESS_TEARDOWN_GRACE_MS
+        : getRunTeardownGraceMs(run.status);
+      await removeRunCrons(runId, { graceMs });
+      if (shouldSettle) {
+        const settled = await settleRunInFlightRounds(runId, { graceMs });
+        if (settled.stillInFlight.length > 0) {
+          logger.warn("control-server: in-flight rounds still processing after settle grace", {
+            runId,
+            stillInFlight: settled.stillInFlight,
+            graceMs,
+          });
+        }
+      }
+    } catch (err) {
+      logger.warn("control-server: removeRunCrons threw", { runId, error: String(err) });
+    }
+    releaseSuiteClaimsByOwner(runId, undefined, suiteRuntime, "cancel");
+
+    try {
+      getDb()
+        .prepare(
+          `UPDATE runs SET scheduling_status = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+        )
+        .run(runId);
+    } catch {
+      /* best-effort */
+    }
+    await admitQueuedRuns().catch((err) => {
+      logger.warn("control-server: queued admission after terminate failed", {
+        runId,
+        error: String(err),
+      });
+    });
+  } finally {
+    runsMidTeardown.delete(runId);
+  }
+  return ok({ terminated: true });
+}
+
+async function handlePauseRun(
+  runId: string,
+  drain = false,
+  requestedBy = "unknown",
+  suiteRuntime?: SuiteClaimRuntime,
+): Promise<JsonResponse> {
+  const run = getRun(runId);
+  if (!run) return notFound(`Run not found: ${runId}`);
+  if (isTerminal(run.status)) return conflict(`Run is terminal: ${run.status}`);
+  if (run.status === "paused") return ok({ state: "paused" });
+
+  logger.info("control-server: pause requested", { runId, drain, requestedBy });
+
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "run.pause_requested",
+    runId: run.id,
+    workflowId: run.workflow_id,
+    detail: JSON.stringify({ requestedBy, drain }),
+  });
+
+  // Persist attribution context keys
+  const now = new Date().toISOString();
+  try {
+    setRunContextKey(runId, "paused_by", requestedBy);
+    setRunContextKey(runId, "paused_at", now);
+    setRunContextKey(runId, "pause_drain", String(drain));
+  } catch (err) {
+    logger.warn("control-server: pause context attribution failed", { runId, error: String(err) });
+  }
+
+  if (drain) {
+    try {
+      getDb()
+        .prepare(
+          `UPDATE runs SET scheduling_status = 'draining_pause', updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+        )
+        .run(runId);
+    } catch (err) {
+      logger.warn("control-server: drain pause db update failed", { runId, error: String(err) });
+      return notFound(`Run not found: ${runId}`);
+    }
+    try {
+      const { finalizeDrainingPause } = await import("../installer/step-ops.js");
+      finalizeDrainingPause(runId);
+    } catch (err) {
+      logger.warn("control-server: drain pause finalization check failed", { runId, error: String(err) });
+    }
+    logger.info("control-server: drain pause requested", { runId });
+    const updated = getRun(runId);
+    return ok({ state: updated?.scheduling_status ?? "draining_pause", drained: true });
+  }
+
+  try {
+    const { removeRunCrons } = await import("../installer/agent-scheduler.js");
+    // PKIL (US-005): a NON-DRAIN pause kills the in-flight worker, but it must
+    // not book a retry. Mark each in-flight round before the abort/SIGTERM so
+    // its post-round recovery classifies the exit as paused_by_operator
+    // (step.paused_kill, no retry charge). Drain pause returns above and never
+    // reaches this path; terminate/cancel call removeRunCrons with no flag.
+    await removeRunCrons(runId, { pausedByOperator: true });
+  } catch (err) {
+    logger.warn("control-server: pause removeRunCrons threw", { runId, error: String(err) });
+  }
+  releaseSuiteClaimsByOwner(runId, undefined, suiteRuntime, "stop");
+  try {
+    getDb()
+      .prepare(
+        `UPDATE runs SET status = 'paused', scheduling_status = 'paused', updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      )
+      .run(runId);
+  } catch (err) {
+    logger.warn("control-server: pause db update failed", { runId, error: String(err) });
+  }
+  await admitQueuedRuns().catch((err) => {
+    logger.warn("control-server: queued admission after pause failed", {
+      runId,
+      error: String(err),
+    });
+  });
+
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "run.paused",
+    runId: run.id,
+    workflowId: run.workflow_id,
+  });
+
+  return ok({ state: "paused" });
+}
+
+async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<JsonResponse> {
+  const run = getRun(runId);
+  if (!run) return notFound(`Run not found: ${runId}`);
+  if (isTerminal(run.status)) return conflict(`Run is terminal: ${run.status}`);
+  if (run.status === "running" && run.scheduling_status === "active") {
+    return ok({ state: "active" });
+  }
+  // PAUS US-003: a pending drain (pause --drain in progress) leaves the run
+  // status 'running' with scheduling_status 'draining_pause'. A plain resume
+  // must CANCEL that pending drain — clear the pause_drain marker atomically
+  // with the status flip, emit an audit event, and surface drainCancelled to
+  // callers — instead of silently dropping the marker so a later drain
+  // finalization could pause the run out from under the resume.
+  const cancelledDrain = run.scheduling_status === "draining_pause";
+  // PAUSE-DRAIN US-002: a drain that already FINALIZED leaves the historical
+  // `pause_drain` marker on the paused run (the marker also drives
+  // finalizeDrainingPause idempotency). That is not a pending drain, so it
+  // must not be audited as a cancel — but it MUST still be cleared on resume:
+  // handleRegisterRun refuses re-admission of any run whose marker is "true",
+  // so leaving it behind would silently wedge the resumed run at
+  // state:'draining_pause' with no timers (the reported resume-after-drain
+  // hang). Clear it without the cancel flag/event.
+  const staleDrainMarker =
+    !cancelledDrain &&
+    parseRunContext(run.id, run.context ?? "").pause_drain === "true";
+
+  logger.info("control-server: resume requested", { runId, requestedBy });
+
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "run.resume_requested",
+    runId: run.id,
+    workflowId: run.workflow_id,
+    detail: JSON.stringify({ requestedBy }),
+  });
+  try {
+    await validateRunHarnessForScheduling(run.id, run.context, {
+      matchlockPolicy: run.matchlock_policy ?? null,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    try {
+      getDb()
+        .prepare(
+          `UPDATE runs SET scheduling_status = 'error', scheduling_error = ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+        )
+        .run(message, runId);
+    } catch {
+      /* best-effort */
+    }
+    return unprocessable(`Cannot resume run: ${message}`);
+  }
+  try {
+    getDb()
+      .prepare(
+        `UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+      )
+      .run(new Date().toISOString(), runId);
+    if (cancelledDrain || staleDrainMarker) {
+      // Cancel the pending drain / clear the historical marker in the same
+      // synchronous DB section as the status flip (no awaits between the
+      // UPDATE and this context rewrite), so the marker can never half-exist
+      // with scheduling_status already flipped out of draining_pause.
+      removeRunContextKey(runId, "pause_drain");
+    }
+  } catch {
+    /* best-effort */
+  }
+
+  // Persist attribution context keys
+  const now = new Date().toISOString();
+  try {
+    setRunContextKey(runId, "resumed_by", requestedBy);
+    setRunContextKey(runId, "resumed_at", now);
+  } catch (err) {
+    logger.warn("control-server: resume context attribution failed", { runId, error: String(err) });
+  }
+
+  // Determine the workflow_id for the event. When the run was previously
+  // paused, status=paused and getRun already loaded workflow_id. When
+  // resume follows a failed/canceled path (future use), include whatever
+  // workflow_id we have.
+  const wfId = run.workflow_id ||
+    (getRun(runId)?.workflow_id ?? undefined);
+
+  // PAUS US-003: audit a cancelled pending drain before run.resumed.
+  if (cancelledDrain) {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.drain_cancelled_by_resume",
+      runId,
+      workflowId: wfId,
+      detail: JSON.stringify({ requestedBy }),
+    });
+  }
+
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "run.resumed",
+    runId,
+    workflowId: wfId,
+  });
+
+  // US-002: Recover orphaned running steps before re-creating scheduler timers.
+  // Pause-without-drain kills the pi process, leaving steps status='running'.
+  // On resume, reset those to 'pending' so peekStep finds them.
+  try {
+    const orphanedAgents = getDb()
+      .prepare("SELECT DISTINCT agent_id FROM steps WHERE run_id = ? AND status = 'running'")
+      .all(runId) as { agent_id: string }[];
+    if (orphanedAgents.length > 0) {
+      const { recoverOrphanedStepsForAgent } = await import("../installer/step-ops.js");
+      for (const { agent_id } of orphanedAgents) {
+        recoverOrphanedStepsForAgent(agent_id, runId);
+      }
+      logger.info("control-server: resume orphan recovery complete", {
+        runId,
+        agents: orphanedAgents.map((a) => a.agent_id),
+      });
+    }
+  } catch (err) {
+    logger.warn("control-server: resume orphan recovery failed", {
+      runId,
+      error: String(err),
+    });
+  }
+
+  // PAUS US-003: extend the register result so callers can tell a pending
+  // drain was cancelled. Only draining_pause resumes carry the flag, and only
+  // on success (2xx) — a failed admission keeps its error body untouched.
+  const registered = await handleRegisterRun(runId);
+  if (
+    cancelledDrain
+    && registered.status >= 200
+    && registered.status < 300
+    && typeof registered.body.error === "undefined"
+  ) {
+    return ok({ ...registered.body, drainCancelled: true }, registered.status);
+  }
+  return registered;
+}
+
+async function handleNudge(): Promise<JsonResponse> {
+  const db = getDb();
+
+  // Query SQLite for running runs only — excludes paused and terminal.
+  const runningRuns = db
+    .prepare(
+      `SELECT id, workflow_id, status, scheduling_status, context, created_at
+       FROM runs WHERE status = 'running'`,
+    )
+    .all() as unknown as RunRow[];
+
+  if (runningRuns.length === 0) {
+    return ok({
+      runningRuns: 0,
+      scheduledRuns: 0,
+      launched: 0,
+      skippedInFlight: 0,
+      skippedPaused: 0,
+      runs: [],
+      errors: [],
+    });
+  }
+
+  const { nudgeScheduledRuns } = await import("../installer/agent-scheduler.js");
+
+  const scheduledRunIds: string[] = [];
+  const admissionErrors: Array<{ runId: string; error: string }> = [];
+
+  // For each running run, attempt admission (idempotent via handleRegisterRun).
+  // Skipped runs (paused/queued) are not nudged.
+  for (const run of runningRuns) {
+    try {
+      const result = await handleRegisterRun(run.id);
+      const state = result.body.state as string | undefined;
+      if (state === "active") {
+        scheduledRunIds.push(run.id);
+      }
+    } catch (err) {
+      admissionErrors.push({
+        runId: run.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Call nudgeScheduledRuns with the admitted run IDs.
+  const nudgeResult = await nudgeScheduledRuns(scheduledRunIds);
+
+  // Build per-run detail and emit events.
+  const runsDetail: Array<Record<string, unknown>> = [];
+
+  for (const runId of scheduledRunIds) {
+    const runJobs = nudgeResult.jobs.filter((j) => j.runId === runId);
+    const runLaunched = runJobs.filter((j) => j.status === "launched").length;
+    const runSkipped = runJobs.filter((j) => j.status === "skipped_in_flight").length;
+    const runErrors = nudgeResult.errors.filter((e) => e.runId === runId);
+
+    const run = runningRuns.find((r) => r.id === runId);
+
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.nudged",
+      runId,
+      workflowId: run?.workflow_id,
+      detail: `Launched ${runLaunched}; skipped ${runSkipped} in-flight`,
+    });
+
+    for (const job of runJobs) {
+      if (job.status === "launched") {
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "agent.nudged",
+          runId: job.runId,
+          agentId: job.agentId,
+          workflowId: run?.workflow_id,
+        });
+      } else if (job.status === "skipped_in_flight") {
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "agent.nudge.skipped",
+          runId: job.runId,
+          agentId: job.agentId,
+          workflowId: run?.workflow_id,
+          detail: "Previous polling round still in flight",
+        });
+      }
+    }
+
+    runsDetail.push({
+      runId,
+      workflowId: run?.workflow_id,
+      launched: runLaunched,
+      skippedInFlight: runSkipped,
+      errors: runErrors.map((e) => e.error),
+    });
+  }
+
+  return ok({
+    runningRuns: runningRuns.length,
+    scheduledRuns: scheduledRunIds.length,
+    launched: nudgeResult.launched,
+    skippedInFlight: nudgeResult.skippedInFlight,
+    skippedPaused: 0,
+    runs: runsDetail,
+    errors: [
+      ...admissionErrors.map((e) => e.error),
+      ...nudgeResult.errors.map((e) => e.error),
+    ],
+  });
+}
+
+async function handleJobs(): Promise<JsonResponse> {
+  try {
+    const { listCronJobs } = await import("../installer/agent-scheduler.js");
+    const jobs = await listCronJobs();
+    return ok({ jobs: jobs.jobs ?? [] });
+  } catch (err) {
+    return ok({ jobs: [], error: String(err) });
+  }
+}
+
+function parseRequestBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => {
+      raw += c.toString();
+      if (raw.length > 65536) {
+        reject(new Error("Request body too large"));
+      }
+    });
+    req.on("end", () => {
+      if (!raw.trim()) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw) as Record<string, unknown>);
+      } catch {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+export interface ControlServerOptions {
+  port?: number;
+  secret?: string;
+  onError?: (err: NodeJS.ErrnoException) => void;
+  listen?: boolean;
+  /** Deterministic suite-claim test seam. */
+  now?: () => number;
+  /** Deterministic suite owner liveness test seam. */
+  probeSuiteOwnerPid?: (pid: number, expectedStartTime?: string) => SuiteOwnerLiveness;
+  /** Deterministic suite reclaim observability test seam. */
+  emitSuiteClaimEvent?: (event: TamanduaEvent) => void;
+}
+
+export function createControlServer(options: ControlServerOptions = {}): http.Server {
+  const expectedSecret = options.secret;
+  const suiteClaimRuntime: SuiteClaimRuntime = {
+    now: options.now ?? Date.now,
+    probePid: options.probeSuiteOwnerPid
+      ?? ((pid, expectedStartTime) => probeSuiteOwnerPid(
+        pid,
+        (targetPid, signal) => process.kill(targetPid, signal),
+        expectedStartTime,
+      )),
+    emitClaimEvent: options.emitSuiteClaimEvent ?? emitEvent,
+  };
+
+  const server = http.createServer(async (req, res) => {
+    const respond = (status: number, body: Record<string, unknown>): void => {
+      res.writeHead(status, {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      });
+      res.end(JSON.stringify(body));
+    };
+
+    const url = req.url ?? "/";
+    const method = req.method ?? "GET";
+    const pathname = url.split("?")[0];
+
+    // Health is exempt from auth so daemonctl liveness probes don't need
+    // the secret to succeed.
+    if (pathname === "/control/health" && method === "GET") {
+      respond(200, {
+        status: "ok",
+        pid: process.pid,
+        timestamp: new Date().toISOString(),
+        buildVersion,
+        // Effective state dir of the serving process (DPID scoping): lets a
+        // CLI prove a discovered control plane is OURS, not a foreign daemon.
+        stateDir: resolveStateDir(),
+      });
+      return;
+    }
+
+    if (expectedSecret) {
+      const provided = req.headers["x-tamandua-secret"];
+      const got = Array.isArray(provided) ? provided[0] : provided;
+      if (got !== expectedSecret) {
+        respond(401, { error: "Unauthorized" });
+        return;
+      }
+    }
+
+    try {
+      if (pathname === "/control/limits" && method === "GET") {
+        respond(200, { maxActiveTimers: getMaxActiveTimers() });
+        return;
+      }
+      if (pathname === "/control/jobs" && method === "GET") {
+        const r = await handleJobs();
+        respond(r.status, r.body);
+        return;
+      }
+      if (pathname === "/suite/lookup" && method === "GET") {
+        const r = await handleSuiteLookup(url);
+        respond(r.status, r.body);
+        return;
+      }
+      if (pathname === "/suite/flaky" && method === "GET") {
+        const r = await handleSuiteFlaky(url);
+        respond(r.status, r.body);
+        return;
+      }
+      if (pathname === "/suite/duration-history" && method === "GET") {
+        const r = await handleSuiteDurationHistory(url);
+        respond(r.status, r.body);
+        return;
+      }
+      if (method === "POST") {
+        const body = await parseRequestBody(req);
+        const runId = typeof body.runId === "string" ? body.runId.trim() : "";
+
+        if (pathname === "/suite/event") {
+          const r = await handleSuiteEvent(body);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/suite/record") {
+          const r = await handleSuiteRecord(body);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/suite/claim") {
+          const r = await handleSuiteClaim(body, suiteClaimRuntime);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/suite/release") {
+          const r = await handleSuiteRelease(body, suiteClaimRuntime);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/suite/release-owner") {
+          const r = await handleSuiteOwnerRelease(body, suiteClaimRuntime);
+          respond(r.status, r.body);
+          return;
+        }
+        if (
+          (pathname === "/control/register-run"
+            || pathname === "/control/terminate-run"
+            || pathname === "/control/pause-run"
+            || pathname === "/control/resume-run") && !runId
+        ) {
+          respond(400, { error: "Missing or empty 'runId' in request body" });
+          return;
+        }
+        if (pathname === "/control/register-run") {
+          const r = await handleRegisterRun(runId);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/control/terminate-run") {
+          const settle = body.settle === true;
+          const r = await handleTerminateRun(runId, suiteClaimRuntime, settle);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/control/pause-run") {
+          const drain = typeof body.drain === "boolean" ? body.drain : false;
+          const requestedBy = typeof body.requestedBy === "string" ? body.requestedBy : "unknown";
+          const r = await handlePauseRun(runId, drain, requestedBy, suiteClaimRuntime);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/control/resume-run") {
+          const requestedBy = typeof body.requestedBy === "string" ? body.requestedBy : "unknown";
+          const r = await handleResumeRun(runId, requestedBy);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/control/nudge") {
+          const r = await handleNudge();
+          respond(r.status, r.body);
+          return;
+        }
+      }
+      respond(404, { error: `Not found: ${method} ${pathname}` });
+    } catch (err) {
+      respond(500, { error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    logger.error("control-server: error", { code: err.code, message: err.message });
+    if (options.onError) options.onError(err);
+  });
+
+  if (options.listen !== false) {
+    const listenPort = options.port ?? getControlPort();
+    assertPortIsolation(listenPort, "control plane");
+    server.listen(listenPort, "127.0.0.1", () => {
+      logger.info("control-server: listening", { port: listenPort });
+    });
+  }
+
+  return server;
+}
+
+export async function startControlServer(options: ControlServerOptions = {}): Promise<http.Server> {
+  const server = createControlServer({ ...options, listen: false });
+  const port = options.port ?? getControlPort();
+  assertPortIsolation(port, "control plane");
+
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: NodeJS.ErrnoException) => {
+      server.off("listening", onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      logger.info("control-server: listening", { port });
+      resolve();
+    };
+
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, "127.0.0.1");
+  });
+
+  return server;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Reconciler
+// ────────────────────────────────────────────────────────────────────
+
+const RECONCILER_INTERVAL_MS = 30_000;
+
+/**
+ * Periodically inspects DB scheduling state and reconciles in-memory job
+ * maps. Runs at startup and every 30s thereafter. Survives missed control
+ * notifications and transient errors.
+ */
+/** @internal — exposed for tests to verify context flag → setupAgentCrons wiring. */
+export async function _admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
+  return admitOrQueueRun(run);
+}
+
+/**
+ * One full reconcile pass: stale-phantom recovery, dead-worker recovery,
+ * re-admission of pending/error/waiting runs, cleanup of jobs for runs that
+ * are no longer active, TSTX ledger pruning, then a queued-run drain.
+ *
+ * Keeping this as a standalone function (rather than inline in the timer
+ * callback) lets `_reconcileOnce()` drive exactly one pass in tests without
+ * waiting the 30s RECONCILER_INTERVAL_MS.
+ */
+async function reconcileOnce(): Promise<void> {
+  try {
+    const db = getDb();
+
+    // ── Stale launch-phantom sweep (LNCZ) ────────────────────────
+    // Recover legacy/crash-left runs only after a conservative 30-minute
+    // grace period and only while both launch artifacts remain absent.
+    try {
+      const { recoverStaleLaunchPhantoms } = await import("../installer/run-recovery.js");
+      const sweep = recoverStaleLaunchPhantoms();
+      if (sweep.recovered > 0) {
+        logger.info("control-server: recovered stale launch phantom runs", {
+          recovered: sweep.recovered,
+          runIds: sweep.runIds,
+        });
+      }
+    } catch (err) {
+      logger.warn("control-server: stale launch phantom sweep failed", { error: String(err) });
+    }
+
+    // ── Dead-worker sweep (MOTOR-CONTRACT.md C18) ────────────────
+    // A previous daemon may have died (crash, reboot, kill) with work
+    // rounds in flight, leaving steps 'running' under dead workers.
+    // Requeue them now instead of waiting out the age-based stale
+    // threshold (up to 45 minutes). First tick runs ~1s after startup.
+    let deadWorkerRunIds: string[] = [];
+    try {
+      const { recoverStepsWithDeadWorkers } = await import("../installer/step-ops.js");
+      const sweep = recoverStepsWithDeadWorkers();
+      if (sweep.recovered > 0 || sweep.failed > 0) {
+        deadWorkerRunIds = sweep.runIds;
+        logger.info("control-server: recovered steps claimed by dead workers", {
+          recovered: sweep.recovered,
+          failed: sweep.failed,
+          skipped: sweep.skipped,
+          runIds: sweep.runIds,
+        });
+      }
+    } catch (err) {
+      logger.warn("control-server: dead-worker sweep failed", { error: String(err) });
+    }
+
+    const desired = db
+      .prepare(
+        `SELECT id, workflow_id, status, scheduling_status, context, created_at
+         FROM runs
+         WHERE status IN ('running')
+           AND (scheduling_status IS NULL OR scheduling_status IN ('pending_register', 'active', 'error', 'waiting'))
+         ORDER BY scheduling_requested_at ASC, created_at ASC`,
+      )
+      .all() as unknown as RunRow[];
+
+    const { _hasRunScheduled, removeRunCrons, getRunTeardownGraceMs } = await import(
+      "../installer/agent-scheduler.js"
+    );
+
+    for (const run of desired) {
+      if (run.scheduling_status === "active" && _hasRunScheduled(run.id)) continue;
+      // Re-admit pending/error/waiting/missing runs. A run still blocked by a
+      // busy harness workdir simply records 'waiting' again and is retried on
+      // the next pass.
+      await handleRegisterRun(run.id).catch(() => {});
+    }
+
+    // Dispatch requeued steps immediately — their runs' jobs exist now
+    // that admission ran above.
+    if (deadWorkerRunIds.length > 0) {
+      const { nudgeScheduledRuns } = await import("../installer/agent-scheduler.js");
+      await nudgeScheduledRuns(deadWorkerRunIds).catch(() => {});
+    }
+
+    // Clean up jobs for runs that are no longer active.
+    const { _scheduledRunIds } = await import("../installer/agent-scheduler.js");
+    const scheduledIds = _scheduledRunIds();
+    for (const runId of scheduledIds) {
+      const row = db
+        .prepare("SELECT status FROM runs WHERE id = ?")
+        .get(runId) as { status: string } | undefined;
+      if (!row || row.status !== "running") {
+        await removeRunCrons(runId, {
+          graceMs: getRunTeardownGraceMs(row?.status),
+        });
+      }
+    }
+
+    // ── TSTX ledger retention pruning ──
+    // Remove suite_results rows older than LEDGER_RETENTION (14d).
+    try {
+      const { pruneOldSuiteResults } = await import("../db.js");
+      const pruned = pruneOldSuiteResults();
+      if (pruned > 0) {
+        logger.info("control-server: pruned old suite_results rows", { pruned });
+      }
+    } catch (err) {
+      logger.warn("control-server: suite_results pruning failed", { error: String(err) });
+    }
+
+    await admitQueuedRuns();
+  } catch (err) {
+    logger.warn("control-server: reconciler tick failed", { error: String(err) });
+  }
+}
+
+/** @internal — deterministic one-pass reconciler seam for tests. */
+export async function _reconcileOnce(): Promise<void> {
+  await reconcileOnce();
+}
+
+export function startReconciler(): { stop: () => void } {
+  let stopped = false;
+  let timer: NodeJS.Timeout | null = null;
+
+  async function tick(): Promise<void> {
+    if (stopped) return;
+    try {
+      await reconcileOnce();
+    } finally {
+      if (!stopped) {
+        timer = setTimeout(() => void tick(), RECONCILER_INTERVAL_MS);
+        timer.unref();
+      }
+    }
+  }
+
+  // Fire first tick on next event-loop turn so server bootstrap settles.
+  timer = setTimeout(() => void tick(), 1000);
+  timer.unref();
+
+  return {
+    stop: () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    },
+  };
+}

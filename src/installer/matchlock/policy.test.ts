@@ -5,6 +5,9 @@ import {
   buildMatchlockPolicy,
   serializeMatchlockPolicy,
   parseMatchlockPolicy,
+  withGrantedRootUsageConsent,
+  describeUnusableMatchlockPolicy,
+  sanitizeUnusableMatchlockPolicyReason,
   isExecutionIsolationPolicy,
   assertNoCredentialValues,
   resolvePiConfigRoot,
@@ -19,10 +22,30 @@ import {
   DEFAULT_PI_CONFIG_PROFILE,
   type ExecutionIsolation,
 } from "../../../dist/installer/matchlock/policy.js";
+import {
+  MATCHLOCK_DEFAULT_SWAP_MB,
+  MATCHLOCK_MAX_SWAP_MB,
+} from "../../../dist/installer/matchlock/resource-limits.js";
 import type { DshSubmissionContext } from "../../../dist/installer/matchlock/dsh-adapter-contract.js";
 
-/** Explicit limits threaded through the base fixture (post-MTLK-VM-SIZE). */
-const EXPLICIT_RESOURCE_LIMITS = { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 };
+/** Explicit limits threaded through the base fixture (post-MTLK-VM-SIZE/MTLK-SWAP). */
+const EXPLICIT_RESOURCE_LIMITS = { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 };
+
+/**
+ * Project a built v3 record back to the ORIGINAL version-2 stored shape: the
+ * three SHARED-V3 additions are stripped and the version is stamped 2. Used
+ * to prove the v2 reader path on real records (never a hand-rolled mutation
+ * of the current shape).
+ */
+function asV2Record(policy: ExecutionIsolation): Record<string, unknown> {
+  const record = JSON.parse(serializeMatchlockPolicy(policy)) as Record<string, unknown>;
+  record.version = 2;
+  delete record.requestedImageSource;
+  delete record.rootUsageConsent;
+  const limits = record.resourceLimits as Record<string, unknown>;
+  delete limits.swapMB;
+  return record;
+}
 
 const BASE = {
   requestedImage: "vic/matchlock-base:latest",
@@ -97,11 +120,15 @@ describe("matchlock policy", () => {
     }
   });
 
-  it("buildMatchlockPolicy produces a well-formed version-2 ExecutionIsolation record", () => {
+  it("buildMatchlockPolicy produces a well-formed version-3 ExecutionIsolation record", () => {
     const policy = buildMatchlockPolicy(BASE);
     assert.equal(policy.version, MATCHLOCK_POLICY_VERSION);
     assert.equal(policy.backend, "matchlock");
     assert.equal(policy.requestedImage, "vic/matchlock-base:latest");
+    // SHARED-V3: every fresh write carries the provenance + consent, defaulting
+    // to the pre-existing explicit/no-consent values.
+    assert.equal(policy.requestedImageSource, "explicit");
+    assert.equal(policy.rootUsageConsent, false);
     // The immutable content+config pin captured by admission is REQUIRED.
     assert.equal(policy.resolvedImageDigest, BASE.identity.digest);
     assert.equal(policy.resolvedImageConfigDigest, BASE.identity.config_digest);
@@ -125,44 +152,182 @@ describe("matchlock policy", () => {
       ...withoutLimits,
       resourceHostProbe: { onlineCpus: () => 4, totalMemoryMB: () => 16384 },
     });
-    assert.deepEqual(policy.resourceLimits, { cpus: 4, memoryMB: 8192, diskSizeMB: 20480 });
+    assert.deepEqual(policy.resourceLimits, {
+      cpus: 4,
+      memoryMB: 8192,
+      diskSizeMB: 20480,
+      swapMB: MATCHLOCK_DEFAULT_SWAP_MB,
+    });
   });
 
-  it("MATCHLOCK_POLICY_VERSION stays 2 and a persisted v2 record with legacy 2/2048/20480 limits still parses", () => {
-    assert.equal(MATCHLOCK_POLICY_VERSION, 2);
+  it("MATCHLOCK_POLICY_VERSION is 3 and a persisted v3 record with legacy 2/2048/20480 limits still parses", () => {
+    assert.equal(MATCHLOCK_POLICY_VERSION, 3);
     const policy = buildMatchlockPolicy(BASE);
-    assert.deepEqual(policy.resourceLimits, { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 });
+    assert.deepEqual(policy.resourceLimits, { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 });
     const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(policy));
-    assert.equal(parsed.version, 2);
-    assert.deepEqual(parsed.resourceLimits, { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 });
+    assert.equal(parsed.version, 3);
+    assert.deepEqual(parsed.resourceLimits, { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 });
   });
 
-  // UNION-FINAL US-007: the union folds resourceLimits into the SAME v2
-  // runs.matchlock_policy column the pre-MTLK-VM-SIZE build wrote. A row
-  // persisted by that older build (default 2/2048/20480, no imagePath) must
-  // keep parsing after the union — the policy version is deliberately NOT
-  // bumped, so parse must not reject or silently drop the legacy limits.
-  it("US-007: a legacy v2 runs.matchlock_policy row (old limits, no imagePath) parses and round-trips its resourceLimits", () => {
-    const persisted = JSON.parse(
-      serializeMatchlockPolicy(buildMatchlockPolicy(BASE)),
-    ) as Record<string, unknown>;
-    // The pre-VM-size shape: version-2, the then-default limits, no imagePath.
-    persisted.version = 2;
-    persisted.resourceLimits = { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 };
-    delete persisted.imagePath;
+  // UNION-FINAL US-007 / SHARED-V3: the union folds resourceLimits into the
+  // SAME runs.matchlock_policy column older builds wrote. A genuine v2 row
+  // (no v3-only fields) must keep reading and is projected to the v3 shape
+  // for consumers — swap OFF (0), never the new 8192 default.
+  it("SHARED-V3: a legacy v2 runs.matchlock_policy row parses, normalizes to the v3 shape (swapMB 0) and never rewrites the stored JSON", () => {
+    const persisted = asV2Record(buildMatchlockPolicy(BASE));
+    const persistedJson = JSON.stringify(persisted);
+    // The pre-v3 shape: version-2, no provenance/consent, no swapMB.
+    assert.equal(persisted.version, 2);
+    assert.equal("requestedImageSource" in persisted, false);
+    assert.equal("rootUsageConsent" in persisted, false);
+    assert.equal("swapMB" in (persisted.resourceLimits as Record<string, unknown>), false);
 
-    const parsed = parseMatchlockPolicy(JSON.stringify(persisted));
+    const parsed = parseMatchlockPolicy(persistedJson);
     assert.equal(parsed.version, MATCHLOCK_POLICY_VERSION);
+    assert.equal(parsed.requestedImageSource, "explicit");
+    assert.equal(parsed.rootUsageConsent, false);
     assert.deepEqual(
       parsed.resourceLimits,
-      { cpus: 2, memoryMB: 2048, diskSizeMB: 20480 },
-      "a legacy v2 row must keep its persisted resourceLimits",
+      { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 0 },
+      "a legacy v2 row keeps its persisted limits and projects swap OFF (0), not the new default",
     );
-    assert.equal(parsed.imagePath, undefined, "no imagePath on the legacy row");
-    // A second full round-trip is byte-stable (the DB column can be rewritten).
-    const rewritten = serializeMatchlockPolicy(parsed);
-    assert.deepEqual(parseMatchlockPolicy(rewritten), parsed);
-    assert.equal(rewritten, JSON.stringify(persisted), "serialize is stable for the legacy row");
+    assert.ok(isExecutionIsolationPolicy(parsed), "the normalized record is a valid v3 record");
+    // Read-time projection only: the ORIGINAL parsed object is untouched and
+    // the stored string is never rewritten by parse.
+    assert.equal(JSON.stringify(persisted), persistedJson, "parse must not mutate the stored value");
+  });
+
+  // ── SHARED-V3 (MTLK-ISO-SLICE1): the coordinated v3 schema ─────────────
+
+  it("SHARED-V3: v3 round-trip covers both provenance values, swapMB 0 and positive (<=65536) and both consent values", () => {
+    for (const requestedImageSource of ["explicit", "standard"] as const) {
+      for (const swapMB of [0, 1024, MATCHLOCK_MAX_SWAP_MB]) {
+        for (const rootUsageConsent of [true, false]) {
+          const built = buildMatchlockPolicy({
+            ...BASE,
+            requestedImageSource,
+            rootUsageConsent,
+            resourceLimits: { ...EXPLICIT_RESOURCE_LIMITS, swapMB },
+          });
+          assert.equal(built.version, 3);
+          assert.equal(built.requestedImageSource, requestedImageSource);
+          assert.equal(built.rootUsageConsent, rootUsageConsent);
+          assert.equal(built.resourceLimits.swapMB, swapMB);
+
+          const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(built));
+          assert.deepEqual(parsed, built);
+          assert.equal(parsed.requestedImageSource, requestedImageSource);
+          assert.equal(parsed.rootUsageConsent, rootUsageConsent);
+          assert.equal(parsed.resourceLimits.swapMB, swapMB);
+          assert.ok(isExecutionIsolationPolicy(parsed));
+        }
+      }
+    }
+  });
+
+  it("SHARED-V3: requestedImageSource is REQUIRED on v3 and must be one of the two values", () => {
+    const built = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+    delete built.requestedImageSource;
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(built)),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /requestedImageSource must be "explicit" or "standard"/.test(err.message),
+    );
+    const bogus = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+    bogus.requestedImageSource = "registry";
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(bogus)),
+      /requestedImageSource must be "explicit" or "standard"/,
+    );
+  });
+
+  it("SHARED-V3: rootUsageConsent is REQUIRED on v3 and rejects a non-boolean (strict boolean)", () => {
+    const built = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+    delete built.rootUsageConsent;
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(built)),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /rootUsageConsent must be a boolean/.test(err.message),
+    );
+    for (const bad of ["true", 1, 0, null, {}]) {
+      const record = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+      record.rootUsageConsent = bad;
+      assert.throws(
+        () => parseMatchlockPolicy(JSON.stringify(record)),
+        /rootUsageConsent must be a boolean/,
+        `rootUsageConsent ${JSON.stringify(bad)} must be refused`,
+      );
+    }
+  });
+
+  it("SHARED-V3: swapMB rejects 65537, negative, non-integer and non-number values", () => {
+    for (const bad of [65537, -1, 1.5, "8192", null]) {
+      const record = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+      (record.resourceLimits as Record<string, unknown>).swapMB = bad;
+      assert.throws(
+        () => parseMatchlockPolicy(JSON.stringify(record)),
+        (err: unknown) =>
+          err instanceof MatchlockPolicyError &&
+          err.code === "policy_invalid_record" &&
+          new RegExp(`swapMB must be an integer between 0 and ${MATCHLOCK_MAX_SWAP_MB}`).test(err.message),
+        `swapMB ${JSON.stringify(bad)} must be refused`,
+      );
+    }
+    // A v3 record missing swapMB entirely is refused (required on v3).
+    const missing = buildMatchlockPolicy(BASE) as unknown as Record<string, unknown>;
+    delete (missing.resourceLimits as Record<string, unknown>).swapMB;
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(missing)),
+      new RegExp(`swapMB must be an integer between 0 and ${MATCHLOCK_MAX_SWAP_MB}`),
+    );
+  });
+
+  it("SHARED-V3: version/field-set disagreement is refused (v2 carrying v3-only fields; v3 missing a required field)", () => {
+    // v2 record carrying each v3-only top-level field.
+    for (const field of ["requestedImageSource", "rootUsageConsent"] as const) {
+      const v2 = asV2Record(buildMatchlockPolicy(BASE));
+      v2[field] = field === "requestedImageSource" ? "explicit" : false;
+      assert.throws(
+        () => parseMatchlockPolicy(JSON.stringify(v2)),
+        (err: unknown) =>
+          err instanceof MatchlockPolicyError &&
+          err.code === "policy_invalid_record" &&
+          new RegExp(`${field} is a version-3 field`).test(err.message),
+        `v2 carrying ${field} must fail closed`,
+      );
+    }
+    // v2 record carrying the v3-only resourceLimits.swapMB.
+    const v2WithSwap = asV2Record(buildMatchlockPolicy(BASE));
+    (v2WithSwap.resourceLimits as Record<string, unknown>).swapMB = 0;
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(v2WithSwap)),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /resourceLimits\.swapMB is a version-3 field/.test(err.message),
+    );
+  });
+
+  it("SHARED-V3: the new allow-list keys parse cleanly and carry no forbidden credential fragment", () => {
+    // If requestedImageSource/rootUsageConsent were NOT in
+    // EXECUTION_ISOLATION_KEYS, parse would refuse the built record with
+    // 'unknown field'. A successful parse proves allow-list membership.
+    const policy = buildMatchlockPolicy({ ...BASE, requestedImageSource: "standard", rootUsageConsent: true });
+    const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(policy));
+    assert.equal(parsed.requestedImageSource, "standard");
+    assert.equal(parsed.rootUsageConsent, true);
+    // The credential scan (assertNoCredentialValues) must not see a forbidden
+    // fragment in either key.
+    for (const key of ["requestedImageSource", "rootUsageConsent"]) {
+      for (const fragment of ["token", "secret", "password", "passwd", "apikey", "api_key", "credential", "private_key", "bearer", "auth"]) {
+        assert.ok(!key.toLowerCase().includes(fragment), `${key} must not carry forbidden fragment "${fragment}"`);
+      }
+    }
+    assertNoCredentialValues({ requestedImageSource: "standard", rootUsageConsent: true });
   });
 
   it("configurationRoot honours PI_CODING_AGENT_DIR at capture time", () => {
@@ -912,5 +1077,97 @@ describe("matchlock policy", () => {
     // Guards against accidental use of the host os.homedir() in fixtures.
     assert.ok(path.isAbsolute("/home/operator/.dsh"));
     assert.equal(path.join("/home/operator", ".dsh"), "/home/operator/.dsh");
+  });
+
+  // MTLK-ISO-SLICE2 US-009 (R13): the ONE sanctioned in-place policy update —
+  // the consent-granting resume. It flips rootUsageConsent to true while
+  // preserving every other field VERBATIM, and never rescues an unusable
+  // record.
+  it("US-009 withGrantedRootUsageConsent flips consent to true and preserves every other field verbatim", () => {
+    const built = buildMatchlockPolicy({
+      ...BASE,
+      requestedImageSource: "standard",
+      rootUsageConsent: false,
+      resourceLimits: EXPLICIT_RESOURCE_LIMITS,
+    });
+    const stored = serializeMatchlockPolicy(built);
+    const granted = withGrantedRootUsageConsent(stored);
+    const parsed = parseMatchlockPolicy(granted);
+    assert.equal(parsed.rootUsageConsent, true);
+    assert.deepEqual(parsed, { ...parseMatchlockPolicy(stored), rootUsageConsent: true });
+    // Idempotent: an already-consented record is returned byte-for-byte.
+    assert.equal(withGrantedRootUsageConsent(granted), granted);
+  });
+
+  it("US-009 withGrantedRootUsageConsent normalizes a valid v2 record to v3 with consent true", () => {
+    const v2Stored = JSON.stringify(asV2Record(buildMatchlockPolicy(BASE)));
+    const granted = withGrantedRootUsageConsent(v2Stored);
+    const parsed = parseMatchlockPolicy(granted);
+    assert.equal(parsed.version, MATCHLOCK_POLICY_VERSION);
+    assert.equal(parsed.rootUsageConsent, true);
+    assert.equal(parsed.requestedImageSource, "explicit");
+    assert.equal(parsed.resourceLimits.swapMB, 0);
+    // Image identity + pin + mounts are preserved verbatim.
+    assert.deepEqual(parsed.identity, parseMatchlockPolicy(v2Stored).identity);
+    assert.deepEqual(parsed.workMounts, parseMatchlockPolicy(v2Stored).workMounts);
+  });
+
+  it("US-009 withGrantedRootUsageConsent refuses an unusable record (consent never rescues)", () => {
+    for (const bad of ["", "{}", "not json", JSON.stringify({ version: 2 })]) {
+      assert.throws(
+        () => withGrantedRootUsageConsent(bad),
+        (err: unknown) => err instanceof MatchlockPolicyError,
+        `unusable record ${JSON.stringify(bad)} must be refused`,
+      );
+    }
+  });
+
+  // MTLK-ISO-SLICE2 US-010: the failed-run consent grant preserves the FROZEN
+  // harness submission block verbatim (the R13 override is never permission to
+  // adopt a new image identity or re-derive submission inputs).
+  it("US-010 withGrantedRootUsageConsent preserves the FROZEN hermes submission block verbatim", () => {
+    const stored = serializeMatchlockPolicy(
+      buildMatchlockPolicy({
+        ...HERMES_BASE,
+        requestedImageSource: "standard",
+        rootUsageConsent: false,
+      }),
+    );
+    const granted = withGrantedRootUsageConsent(stored);
+    const parsed = parseMatchlockPolicy(granted);
+    assert.equal(parsed.version, MATCHLOCK_POLICY_VERSION);
+    assert.equal(parsed.rootUsageConsent, true);
+    assert.deepEqual(parsed.hermes, HERMES_SUBMISSION);
+    assert.deepEqual(parsed, { ...parseMatchlockPolicy(stored), rootUsageConsent: true });
+  });
+
+  // MTLK-ISO-SLICE2 US-014: the STATUS-UNUSABLE reason is allow-listed and
+  // sanitized. The raw parser message (which can embed stored-input fragments)
+  // and the raw stored JSON must never be returned to a display surface.
+  it("US-014 describeUnusableMatchlockPolicy returns typed codes with sanitized allow-listed reasons", () => {
+    const marker = "SUPER-SECRET-STORED-MARKER";
+    const cases: Array<[string | null, string]> = [
+      [null, "policy_missing"],
+      ["", "policy_json_invalid"],
+      [`{broken ${marker}`, "policy_json_invalid"],
+      [JSON.stringify({ version: 1, backend: "matchlock" }), "policy_legacy_unpinned"],
+      [JSON.stringify({ version: 99 }), "policy_unsupported_version"],
+      [JSON.stringify({ version: 3, apiToken: marker }), "policy_credential_field"],
+      [JSON.stringify({ version: 3, backend: "matchlock" }), "policy_invalid_record"],
+    ];
+    for (const [raw, code] of cases) {
+      const described = describeUnusableMatchlockPolicy(raw);
+      assert.equal(described.code, code, `code for ${JSON.stringify(raw)}`);
+      assert.equal(described.reason, sanitizeUnusableMatchlockPolicyReason(code));
+      assert.ok(
+        !described.reason.includes(marker),
+        "the sanitized reason must never embed stored input",
+      );
+    }
+    // An unknown code degrades to a bounded generic message, never the input.
+    assert.equal(
+      sanitizeUnusableMatchlockPolicyReason("policy_future_unknown"),
+      "the persisted matchlock policy could not be used",
+    );
   });
 });

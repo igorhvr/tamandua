@@ -46,7 +46,7 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // misread.
 // ONE schema chain (MATCHLOCK-UNION-4): main and the Matchlock lineage each
 // claimed a version for their own column, so the union folds both into a
-// single chain ending at SCHEMA_VERSION = 14.
+// single chain ending at SCHEMA_VERSION = 15.
 //   9  -> 10  TIME-STORAGE: migrateInstantsToIsoZ() rewrites every stored
 //              naive `YYYY-MM-DD HH:MM:SS` instant to ISO-8601 UTC `...Z`.
 //              Idempotent, so it also normalizes a Matchlock-lineage DB that
@@ -68,12 +68,19 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 //              and for any execution whose log could not be persisted). The
 //              20 KB `log_tail` column is unchanged, so every existing reader
 //              keeps working.
+//   14 -> 15  MTLK-ISO-SLICE2 US-005 (PREP-STATE): runs.isolation_intent (the
+//              host-owned isolation INTENT marker, `"true"` only for an
+//              opted-in Matchlock run, NULL = native). It is written
+//              ATOMICALLY with an opted-in run's first INSERT together with
+//              the initial non-schedulable hold (`scheduling_status =
+//              'preparing'`), so an interrupted admission stays identifiable
+//              and never schedulable natively (spec C §10 item 7).
 // Every bump is REQUIRED (WLST5.1 failure mode): adding a guarded ALTER
 // without bumping leaves existing DBs early-returning from migrate() and
 // skipping the ALTER, so any SQL touching the new column crashes with
 // "no such column". Every ALTER is guarded by PRAGMA table_info, so any
-// earlier lineage simply runs the chain and re-stamps v14.
-export const SCHEMA_VERSION = 14;
+// earlier lineage simply runs the chain and re-stamps v15.
+export const SCHEMA_VERSION = 15;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -216,12 +223,12 @@ export {
 //
 // detectSchemaLineage() reads the ACTUAL column shape through PRAGMA
 // table_info (never a cached constant) and returns a discriminant that
-// migrate()/applySchema() use to drive the guarded ALTERs and the final v14
+// migrate()/applySchema() use to drive the guarded ALTERs and the final v15
 // stamp. It is a pure read: it never writes and never throws on an absent
 // table (PRAGMA table_info on a missing table yields zero rows), so it is safe
 // to call on an empty database before applySchema() creates the tables.
 export type SchemaLineage =
-  // At v14 with every union column AND suite_results.log_path — the migrate()
+  // At v15+ with every union column AND suite_results.log_path — the migrate()
   // fast path never reaches applySchema() in this state.
   | "current"
   // Pre-union main v12: preclaim_death_count present, matchlock_policy absent.
@@ -258,9 +265,11 @@ export function detectSchemaLineage(db: DatabaseSync): SchemaLineage {
   if (version >= SCHEMA_VERSION && hasPreclaim && hasMatchlock && hasLogPath) return "current";
   if (hasPreclaim && !hasMatchlock) return "main-v12";
   if (hasMatchlock && !hasPreclaim) return "union-v12";
-  // A v13 DB (both union columns, no log_path) or any DB whose version stamp
-  // claims v14 but lacks the column is NOT current: run applySchema() so the
-  // guarded 13 -> 14 ALTER lands.
+  // A v13 DB (both union columns, no log_path) is NOT current: run
+  // applySchema() so the guarded 13 -> 14 ALTER lands. A DB stamped above the
+  // pre-PREP-STATE chain (v14, no isolation_intent) also lands here (it is not
+  // "current" because its version is below SCHEMA_VERSION) and runs the whole
+  // chain, including the v14 -> v15 ALTER.
   if (hasPreclaim && hasMatchlock && !hasLogPath) return "pre-v14";
   return "pre-v12";
 }
@@ -650,6 +659,22 @@ function applySchema(db: DatabaseSync, lineage: SchemaLineage): void {
     db.exec("ALTER TABLE runs ADD COLUMN matchlock_policy TEXT");
   }
 
+  // ── MTLK-ISO-SLICE2 PREP-STATE isolation intent for runs (14 -> 15) ──
+  // The host-owned isolation INTENT marker written ATOMICALLY with an opted-in
+  // run's first INSERT (alongside the `scheduling_status = 'preparing'` hold).
+  // Nullable with no backfill: existing rows and native runs keep NULL and are
+  // classified `native`. NOTE (WLST5.1): the SCHEMA_VERSION bump to v15 (above)
+  // is REQUIRED — adding the guarded ALTER without bumping leaves existing DBs
+  // early-returning and skipping the migration, so intent writes/reads crash
+  // with "no such column: isolation_intent". The PRAGMA table_info guard keeps
+  // it idempotent on re-run for every lineage.
+  const addIsolationIntent = db
+    .prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'isolation_intent'")
+    .all();
+  if (addIsolationIntent.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN isolation_intent TEXT");
+  }
+
   // Indexes for run-scoped scheduling and step claim queries.
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_steps_agent_run_status ON steps(agent_id, run_id, status)",
@@ -764,7 +789,7 @@ function applySchema(db: DatabaseSync, lineage: SchemaLineage): void {
   // 13) early-returning and skipping the migration, so log_path reads/writes
   // crash with "no such column: log_path". The PRAGMA table_info guard keeps
   // it idempotent on re-run. It runs for EVERY lineage: a
-  // pre-union/union-v12 or pre-v12 DB reaches v14 in one pass too.
+  // pre-union/union-v12, a v13, or a pre-v12 DB reaches v15 in one pass too.
   const addLogPath = db.prepare(
     "SELECT name FROM pragma_table_info('suite_results') WHERE name = 'log_path'",
   ).all();

@@ -61,6 +61,7 @@ src/installer/matchlock/admission.test.ts
 src/installer/matchlock/allow-private-support.test.ts
 src/installer/matchlock/controller.test.ts
 src/installer/matchlock/dsh-scheduler-seam.test.ts
+src/installer/matchlock/execution-boundary.test.ts
 src/installer/matchlock/finalizer-ledger-seam.test.ts
 src/installer/matchlock/guest-bridge.test.ts
 src/installer/matchlock/guest-suite.test.ts
@@ -78,10 +79,12 @@ src/installer/matchlock/native-step-progress.test.ts
 src/installer/matchlock/native-step-seam.test.ts
 src/installer/matchlock/native-step-services.test.ts
 src/installer/matchlock/pi-invocation-runner.test.ts
+src/installer/matchlock/prep-state.test.ts
 src/installer/matchlock/progress-resource.test.ts
 src/installer/matchlock/repository-scope.test.ts
 src/installer/matchlock/rpc-client.test.ts
 src/installer/matchlock/suite-wire-pack.test.ts
+src/installer/matchlock/swap-support.test.ts
 src/installer/matchlock/vm-evidence.test.ts
 src/installer/matchlock/vm-reaper.test.ts
 src/installer/merge-branch.test.ts
@@ -89,6 +92,7 @@ src/installer/native-build.test.ts
 src/installer/rugpull.test.ts
 src/installer/run-cleanup.test.ts
 src/installer/run-harness.test.ts
+src/installer/run-prep-state-capability.test.ts
 src/installer/run.test.ts
 src/installer/signal-boundary.test.ts
 src/installer/signal-isolation-compat.test.ts

@@ -190,7 +190,19 @@ function policyJsonFor(
   target: ReturnType<typeof resolveRunTarget> | null,
 ): string | null {
   const raw = target?.row?.matchlock_policy;
-  return typeof raw === "string" && raw.length > 0 ? raw : null;
+  // MTLK-ISO2-CORRECTIVE: explicit non-NULL handoff. Coercing '' to null
+  // loses a corrupt-but-present isolation record; only NULL is native.
+  if (raw === null || raw === undefined) return null;
+  return typeof raw === "string" ? raw : String(raw);
+}
+
+/** The raw `runs.isolation_intent` value for the target, when available. */
+function isolationIntentFor(
+  target: ReturnType<typeof resolveRunTarget> | null,
+): string | null {
+  const raw = (target?.row as { isolation_intent?: unknown } | undefined)?.isolation_intent;
+  if (raw === null || raw === undefined) return null;
+  return typeof raw === "string" ? raw : String(raw);
 }
 
 /**
@@ -261,6 +273,7 @@ export function createDiagnosticsBundle(
     runId,
     bareRunId: bare,
     policyJson: policyJsonFor(target),
+    isolationIntent: isolationIntentFor(target),
   });
 
   const workdir = deriveWorkdir(target, dbRows);

@@ -35,6 +35,7 @@
 import {
   MatchlockPolicyError,
   parseMatchlockPolicy,
+  sanitizeUnusableMatchlockPolicyReason,
   type ExecutionIsolation,
 } from "./policy.js";
 import {
@@ -88,12 +89,23 @@ export interface MatchlockDispatchRefusal {
    *  - matchlock_workflow_unsupported  — valid pinned policy whose workflow
    *    capability is not supported by the integrated backend;
    *  - matchlock_policy_invalid        — malformed / legacy-unpinned /
-   *    structurally invalid stored record.
+   *    structurally invalid stored record;
+   *  - matchlock_preparing_held        — the row carries the host-owned
+   *    isolation intent (PREP-STATE) but no policy has been persisted yet.
+   *    The run is HELD (non-schedulable), never native; this is not a
+   *    failure and must not force-fail an in-flight preparation.
    */
   code:
     | "backend_not_integrated"
     | "matchlock_workflow_unsupported"
-    | "matchlock_policy_invalid";
+    | "matchlock_policy_invalid"
+    | "matchlock_preparing_held";
+  /**
+   * True for the PREP-STATE held classification: the run is mid-preparation
+   * (isolation intent recorded, policy pending) and must stay non-schedulable
+   * rather than be force-failed. Absent/false for every genuine refusal.
+   */
+  held?: boolean;
   /** Actionable message recorded as the run's failure reason. */
   message: string;
   /** Parsed policy when the stored record itself is valid. */
@@ -102,7 +114,7 @@ export interface MatchlockDispatchRefusal {
 
 export interface MatchlockDispatchAllowed {
   refused: false;
-  /** Parsed valid pinned policy for a supported shape (absent for NULL/empty policies). */
+  /** Parsed valid pinned policy for a supported shape (absent for NULL policies). */
   policy?: ExecutionIsolation;
 }
 
@@ -131,21 +143,56 @@ export interface MatchlockDispatchContext {
    * reduced set to prove the preflight.
    */
   availableCapabilities?: readonly MatchlockCapability[];
+  /**
+   * MTLK-ISO-SLICE2 US-007 (PREP-STATE): the run row carries the host-owned
+   * isolation intent marker (`runs.isolation_intent = 'true'`). When the policy
+   * is NULL/absent this is a HELD, non-schedulable preparation state — never a
+   * native run. When a non-NULL policy is present the policy is classified
+   * FIRST and this flag is ignored (a persisted policy always wins).
+   */
+  isolationIntent?: boolean;
 }
 
 /**
  * Evaluate a persisted `runs.matchlock_policy` string for dispatch admission.
- * `null`/empty ⇒ native run ⇒ allowed (no Matchlock consulted). A non-null
- * value is parsed strictly; a valid pinned policy is allowed ONLY when the
- * requested workflow is admitted and its declared later-role capability
+ * Classification is by EXPLICIT non-NULL-ness (spec C §4.6 consumer audit):
+ * `null`/`undefined` ⇒ native run ⇒ allowed (no Matchlock consulted). Every
+ * other value — including an EMPTY STRING or whitespace — is a non-NULL
+ * policy and is parsed strictly; a valid pinned policy is allowed ONLY when
+ * the requested workflow is admitted and its declared later-role capability
  * closure is provided by the integrated backend, for every harness
- * (pi/hermes/dsh). Every other non-null outcome is a refusal.
+ * (pi/hermes/dsh). Every other non-NULL outcome is a refusal. Truthiness must
+ * never be used here: an empty-string policy must never look (or dispatch)
+ * native.
+ *
+ * PREP-STATE (US-007): a NULL policy on a row whose `ctx.isolationIntent` is
+ * true is NOT native — it is a HELD preparation state and is refused with the
+ * typed `matchlock_preparing_held` decision (`held: true`) so the caller can
+ * keep it non-schedulable without force-failing it.
  */
 export function matchlockDispatchDecision(
-  rawPolicy: string | null,
+  rawPolicy: string | null | undefined,
   ctx?: MatchlockDispatchContext,
 ): MatchlockDispatchDecision {
-  if (!rawPolicy || rawPolicy.trim() === "") {
+  if (rawPolicy === null || rawPolicy === undefined) {
+    if (ctx?.isolationIntent === true) {
+      // PREP-STATE (US-007): the host recorded the isolation intent with the
+      // first run row but admission has not persisted the pinned policy yet.
+      // The row is HELD — non-schedulable and NEVER native. This is a
+      // transient preparation state, not a failure; the caller must hold the
+      // run without force-failing it. No consent can make it runnable.
+      return {
+        refused: true,
+        held: true,
+        code: "matchlock_preparing_held",
+        message:
+          "Run is an isolation-preparation (PREP-STATE) run: the isolation intent is recorded but no pinned " +
+          "Matchlock policy has been persisted yet. The run is HELD and non-schedulable, and is refused native " +
+          "dispatch before any host harness probe/findBinary/spawn and before any VM create. Wait for admission " +
+          "to persist the policy, or recreate the run with an isolation policy; recorded consent does not and " +
+          "cannot make this row runnable.",
+      };
+    }
     return { refused: false };
   }
   let policy: ExecutionIsolation;
@@ -154,12 +201,16 @@ export function matchlockDispatchDecision(
   } catch (err) {
     const code =
       err instanceof MatchlockPolicyError ? err.code : "policy_invalid_record";
-    const detail = err instanceof Error ? err.message : String(err);
+    // MTLK-ISO2-TRANSITION-CAS (Family C-1): the parser message can embed
+    // fragments of the stored input (an unknown field name, a JSON snippet, a
+    // version sentinel). The refusal renders the typed code plus the
+    // allow-listed reason; the raw parser detail is never surfaced.
+    const reason = sanitizeUnusableMatchlockPolicyReason(code);
     return {
       refused: true,
       code: "matchlock_policy_invalid",
       message:
-        `Stored Matchlock policy is not a usable isolated-run record (${code}): ${detail} ` +
+        `Stored Matchlock policy is not a usable isolated-run record (${code}): ${reason} ` +
         "The run must never look like a working isolated run and never fall back to native execution. " +
         "Recreate the run with --matchlock so admission persists a pinned content+config identity.",
     };

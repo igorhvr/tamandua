@@ -62,6 +62,7 @@ import {
   type MatchlockSchedulerRound,
 } from "../../../dist/installer/matchlock/scheduler-matchlock.js";
 import { createMergeServiceForContext } from "../../../dist/installer/matchlock/merge-invocation-wiring.js";
+import { setMatchlockExecutionBoundarySeamsForTest } from "../../../dist/installer/matchlock/execution-boundary.js";
 
 const HARNESSES = ["pi", "hermes", "dsh"] as const;
 type Harness = (typeof HARNESSES)[number];
@@ -206,10 +207,16 @@ describe("harness x workflow admission matrix (MTLK-ALL-WORKFLOWS US-003/US-005)
     // would claim the host daemon's real alias. This admission matrix is not
     // about the alias, so install the deterministic fixed-alias seam.
     setMatchlockHomeAliasResolverForTest(() => "/home/alias-fixture/tamandua/4242/h");
+    // US-004: this matrix is not about the daemon execution boundary; install
+    // a supporting swap probe so the gate passes without a real matchlock.
+    setMatchlockExecutionBoundarySeamsForTest({
+      swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+    });
   });
 
   after(() => {
     setMatchlockHomeAliasResolverForTest(null);
+    setMatchlockExecutionBoundarySeamsForTest(null);
   });
 
   it("declares harness parity: every harness supports the full capability-closed set (no allow-list)", () => {

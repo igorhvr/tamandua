@@ -1129,7 +1129,7 @@ files is owned by the evidence-prune work (bead `6sy.69`), never by the shim.
   table's `CREATE TABLE` statement keeps its original explicit column list,
   and nullable additions never touch explicit-column INSERTs or the status.ts
   SELECT column lists.
-- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 14). This is
+- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 15). This is
   the WLST5.1 failure mode: adding a guarded ALTER without bumping leaves
   existing DBs (user_version === the old version) early-returning in
   `migrate()` and skipping the ALTER, so any SQL touching the new column
@@ -1137,11 +1137,14 @@ files is owned by the evidence-prune work (bead `6sy.69`), never by the shim.
   `applySchema()`, and `migrate()` now serializes cold-start migration across
   processes (`BEGIN IMMEDIATE` + bounded retry, re-reading `user_version`
   under the lock) so concurrent first-opens cannot race the guarded ALTERs.
-- ONE schema chain (UNION-PORT + LEDGER-DIAG v14): the main and Matchlock
+- ONE schema chain (UNION-PORT + LEDGER-DIAG v14 + MTLK-ISO-SLICE2 v15): the
+  main and Matchlock
   lineages each claimed a `v10`, and then each claimed a `v12` for a DIFFERENT
   column (`steps.preclaim_death_count` on main, `runs.matchlock_policy` on the
   Matchlock lineage), so the union port renumbers both into one idempotent
-  chain ending at `SCHEMA_VERSION = 14`.
+  chain whose pre-PREP-STATE top was `SCHEMA_VERSION = 14` (still the union +
+  LEDGER-DIAG top); MTLK-ISO-SLICE2 extends the same chain to the current
+  `SCHEMA_VERSION = 15`.
   `v9 -> v10` is `migrateInstantsToIsoZ()` (rewrites naive
   `YYYY-MM-DD HH:MM:SS` values to ISO-8601 UTC `...Z` in every timestamp
   column; idempotent, so it also normalizes a Matchlock-lineage DB that still
@@ -1154,18 +1157,23 @@ files is owned by the evidence-prune work (bead `6sy.69`), never by the shim.
   host-owned execution-isolation policy JSON; NULL means the native path).
   `v13 -> v14` is the guarded `suite_results.log_path TEXT` ALTER (LEDGER-DIAG:
   the absolute path of the full suite log; nullable with no backfill).
-  `migrate()` does NOT early-return for any `user_version < 14`; it classifies
+  `v14 -> v15` is the guarded `runs.isolation_intent TEXT` ALTER
+  (MTLK-ISO-SLICE2 US-005 PREP-STATE: the host-owned isolation INTENT marker,
+  `"true"` only for an opted-in Matchlock run, NULL = native; written
+  ATOMICALLY with the run's first INSERT alongside the initial non-schedulable
+  `scheduling_status = 'preparing'` hold).
+  `migrate()` does NOT early-return for any `user_version < 15`; it classifies
   the starting lineage with the exported pure `detectSchemaLineage(db)` helper
   by reading `PRAGMA table_info` — never the colliding `user_version` alone:
   `main-v12` (preclaim present, matchlock absent), `union-v12` (matchlock
   present, preclaim absent), `pre-v14` (both union columns present but
   `suite_results.log_path` absent — a v13 DB, which must NOT be mistaken for
-  `current`), `pre-v12` (earlier/empty) and `current` (v14 with all three).
+  `current`), `pre-v12` (earlier/empty) and `current` (v15 with all three).
   The matchlock-lineage old v10/v12 column is kept as-is (the
   `pragma_table_info` guard on every ALTER stays authoritative), and
-  `migrateInstantsToIsoZ()` still runs for every DB below 14 so a
+  `migrateInstantsToIsoZ()` still runs for every DB below 15 so a
   matchlock-lineage DB with naive instants is normalized; the final stamp is
-  `user_version = 14`.
+  `user_version = 15`.
 - Migration coverage belongs in `src/db.test.ts` MIGV tests: build a legacy DB
   with raw pre-bump DDL + `PRAGMA user_version = <starting version>` in a temp
   HOME, open it through `getDb()` in a subprocess (import from `dist/db.js`,
@@ -1420,7 +1428,7 @@ step) are the SLOW complement of an instant fail and join the SAME
 K = 6 / N = 20 escalating backoff and cap with a distinct vocabulary: each
 death emits `step.preclaim_round_died` (exit code, signal, harness wall ms,
 bounded stderr tail) and increments `steps.preclaim_death_count`
-(the `v11 -> v12` step; the overall `SCHEMA_VERSION` is 14), the dispatch gate
+(the `v11 -> v12` step; the overall `SCHEMA_VERSION` is 15), the dispatch gate
 is `preclaim_death_backoff`, and the
 N-th death emits `run.preclaim_death_loop` then force-fails the run
 (`formatPreclaimDeathReason`). Any successful claim resets the counter and

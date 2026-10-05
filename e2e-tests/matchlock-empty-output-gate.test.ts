@@ -329,7 +329,7 @@ describe(
               "workflow", "run", "do-now",
               "Empty-output gate: execute the harmless owned fixture action and report.",
               "--working-directory-for-harness", wdNow,
-              "--matchlock", FIXTURE_IMAGE_TAG,
+              "--matchlock-image", FIXTURE_IMAGE_TAG,
             ],
             env,
             60_000,

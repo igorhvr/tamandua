@@ -30,6 +30,7 @@ import {
   type MatchlockSchedulerRoundResult,
 } from "../../../dist/installer/matchlock/scheduler-matchlock.js";
 import { setDshSchedulerRoundRunnerForTest } from "../../../dist/installer/matchlock/scheduler-dsh.js";
+import { setMatchlockExecutionBoundarySeamsForTest } from "../../../dist/installer/matchlock/execution-boundary.js";
 import {
   MATCHLOCK_HOME_ALIAS_ENV,
   MATCHLOCK_HOME_ALIAS_OWNER_SCHEMA,
@@ -155,10 +156,15 @@ describe("Matchlock short-HOME alias wiring (US-002)", () => {
   beforeEach(() => {
     ambientHome = process.env.HOME;
     setMatchlockHomeAliasResolverForTest(() => ALIAS);
+    // US-004: this suite is about the alias, not the execution boundary.
+    setMatchlockExecutionBoundarySeamsForTest({
+      swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+    });
   });
 
   afterEach(() => {
     setMatchlockHomeAliasResolverForTest(null);
+    setMatchlockExecutionBoundarySeamsForTest(null);
     setMatchlockSchedulerRoundRunnerForTest(null);
     setDshSchedulerRoundRunnerForTest(null);
     setMatchlockProductionRouteRunnerForTest("pi", null);
@@ -338,11 +344,16 @@ describe("owner-aware Matchlock alias wiring (US-003)", () => {
   beforeEach(() => {
     // Use the REAL production (owner-aware) resolver, not the fixed test seam.
     setMatchlockHomeAliasResolverForTest(null);
+    // US-004: this suite is about the alias, not the execution boundary.
+    setMatchlockExecutionBoundarySeamsForTest({
+      swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+    });
     root = tamanduaTempDir("tamandua-mtlk-owner-wire-");
   });
 
   afterEach(() => {
     setMatchlockHomeAliasResolverForTest(null);
+    setMatchlockExecutionBoundarySeamsForTest(null);
     setMatchlockSchedulerRoundRunnerForTest(null);
     fs.rmSync(root, { recursive: true, force: true });
   });

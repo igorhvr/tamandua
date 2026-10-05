@@ -461,7 +461,7 @@ async function runWholePathScenario(scenario: WholePathScenario): Promise<void> 
       const runArgs = [
         "workflow", "run", scenario.workflowId,
         `Synthetic whole-path gate (${scenario.label}): implement the tiny owned fixture story and land it through the scoped guest merge path.`,
-        "--matchlock", FIXTURE_IMAGE_TAG,
+        "--matchlock-image", FIXTURE_IMAGE_TAG,
       ];
       if (scenario.workspaceMode === "worktree") {
         runArgs.push(

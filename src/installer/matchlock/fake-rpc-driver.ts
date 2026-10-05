@@ -88,11 +88,12 @@ import fs from "node:fs";
 
 // MTLK-ALLOW-PRIVATE: this same script doubles as a stand-in \`matchlock\` CLI
 // so capability probes (\`matchlock run --help\` / \`matchlock --version\`) can be
-// driven WITHOUT a real binary. Normal RPC invocations carry neither flag and
-// fall through to the JSON-RPC loop below.
+// driven WITHOUT a real binary. MTLK-ISO-SLICE2 adds the exact \`--swap\` token
+// so the swap-capability handshake can also be exercised. Normal RPC
+// invocations carry neither flag and fall through to the JSON-RPC loop below.
 const cliArgs = process.argv.slice(2);
 if (cliArgs.includes("--help") || cliArgs.includes("-h")) {
-  process.stdout.write("Usage: matchlock run [--allow-private <entry>] [--cpus N] [--memory MB]\\n");
+  process.stdout.write("Usage: matchlock run --swap <MB> [--allow-private <entry>] [--cpus N] [--memory MB]\\n");
   process.exit(0);
 }
 if (cliArgs.includes("--version") || cliArgs.includes("-v")) {

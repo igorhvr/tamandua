@@ -50,7 +50,7 @@ import {
   type ExecutionIsolationResourceLimits,
   type ExecutionIsolationWorkMount,
 } from "./policy.js";
-import { resolveMatchlockResourceLimits } from "./resource-limits.js";
+import { MATCHLOCK_DEFAULT_SWAP_MB, resolveMatchlockResourceLimits } from "./resource-limits.js";
 import {
   MATCHLOCK_ALLOW_PRIVATE_ENV,
   MATCHLOCK_ALLOW_PRIVATE_GRAMMAR,
@@ -62,7 +62,15 @@ import {
   probeMatchlockAllowPrivateSupport,
   type MatchlockAllowPrivateSupport,
 } from "./allow-private-support.js";
+import {
+  MATCHLOCK_SWAP_FLAG,
+  probeMatchlockSwapSupport,
+  resolveMatchlockSwapBinaryPath,
+  type MatchlockSwapSupport,
+  type MatchlockSwapSupportProbe,
+} from "./swap-support.js";
 import type { DshSubmissionContext } from "./dsh-adapter-contract.js";
+import type { MatchlockImageSource } from "./standard-image.js";
 import {
   canonicalRealPath,
   isWithinPath,
@@ -112,6 +120,101 @@ export class MatchlockAdmissionError extends Error {
 }
 
 /**
+ * R13: the deliberately long root-usage override flag. Kept in lockstep with
+ * the parser spelling (`src/cli/workflow-run-args.ts`) so the refusal text
+ * always names a flag that actually exists.
+ */
+export const MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG =
+  "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs";
+
+/**
+ * The spec C §2.6 root-usage refusal text. Matchlock is documented to run
+ * unprivileged; a root process is refused by default before ANY matchlock
+ * interaction (no probe, no image resolve, no VM), and the override is the one
+ * escape hatch. A refusal never falls back to the native host harness.
+ */
+export function matchlockRootUsageRefusalText(): string {
+  return [
+    "Cannot start run: refusing to execute a Matchlock run as root.",
+    "Matchlock is documented to run unprivileged — sudo is for its one-time host preparation only, never for running matchlock itself — and `tamandua matchlock setup` exists precisely so matchlock never needs root later.",
+    "If you insist, re-run with:",
+    `  ${MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG}`,
+    "The run was marked failed and nothing ran natively.",
+  ].join("\n");
+}
+
+/**
+ * Default effective-uid probe. `process.geteuid` is POSIX-only; when it is
+ * unavailable a non-root sentinel is returned so a platform without it never
+ * trips the root gate. The gate keys on the EFFECTIVE uid (broader than sudo:
+ * a root login is refused identically), never on the guest workload's uid.
+ */
+function defaultEffectiveUid(): number {
+  return typeof process.geteuid === "function" ? process.geteuid() : -1;
+}
+
+/**
+ * R13 root gate. Runs FIRST (before the capability probes, the image resolve
+ * and any policy construction) through the injectable `effectiveUid` seam.
+ *
+ * Consent is EITHER the override supplied to THIS action (`rootUsageConsent`)
+ * OR valid inherited consent on a replacement's persisted policy. `euid 0`
+ * with neither is a typed `matchlock_root_usage_refused` whose text is the
+ * spec C §2.6 refusal; it writes no policy, resolves no image and spawns no
+ * matchlock process. `euid 0` with consent proceeds (the persisted policy
+ * then records the consent per the §4.5 writer rule).
+ */
+function assertMatchlockRootUsagePermitted(
+  opts: MatchlockAdmissionOptions,
+  inherited: ExecutionIsolation | undefined,
+): void {
+  const effectiveUid = opts.effectiveUid ?? defaultEffectiveUid;
+  if (effectiveUid() !== 0) return;
+  const consented = inherited?.rootUsageConsent === true || opts.rootUsageConsent === true;
+  if (consented) return;
+  throw new MatchlockAdmissionError(
+    "matchlock_root_usage_refused",
+    matchlockRootUsageRefusalText(),
+  );
+}
+
+/**
+ * Provenance-aware `image_unusable` refusal text (spec C §2.3). A standard
+ * provenance store miss names the `tamandua matchlock setup` remedy; an
+ * explicit image keeps the import-and-retry guidance. Neither path ever
+ * fetches or builds an image.
+ */
+function imageUnusableRefusalMessage(
+  tag: string,
+  source: MatchlockImageSource,
+  detail: string,
+): string {
+  if (source === "standard") {
+    return (
+      `Cannot start run: the standard Matchlock image ${tag} is not in the local matchlock store. ` +
+      "Provision this host with: tamandua matchlock setup " +
+      "(or pass an explicit already-imported image with --matchlock-image <image>). " +
+      "The run was marked failed and nothing ran natively."
+    );
+  }
+  return (
+    `Cannot start run: Matchlock image ${tag} is not usable: image_unusable (${detail}). ` +
+    `Import it into the local matchlock store (matchlock pull ${tag}) and retry. ` +
+    "The run was marked failed and nothing ran natively."
+  );
+}
+
+/**
+ * The effective provenance of the image being admitted: an inherited policy's
+ * persisted value ALWAYS wins for a replacement (never recomputed from the
+ * current environment); a fresh admission uses the caller's real provenance
+ * (absent defaults to "explicit").
+ */
+function effectiveRequestedImageSource(opts: MatchlockAdmissionOptions): MatchlockImageSource {
+  return opts.inheritedPolicy?.requestedImageSource ?? opts.imageSource ?? "explicit";
+}
+
+/**
  * Environment override for the matchlock rpc CLI binary (tests inject a fake
  * driver; production uses `matchlock` from PATH). Only ever consulted when an
  * opt-in admission actually runs — no-flag runs never read it.
@@ -135,6 +238,31 @@ export interface MatchlockAdmissionOptions {
   /** Operator-supplied mandatory image (a replacement inherits its tag). */
   requestedImage: string;
   /**
+   * SHARED-V3 (MTLK-ISO-SLICE1): the REAL provenance of `requestedImage` for a
+   * FRESH admission — "explicit" (`--matchlock-image [=]<image>`) or "standard"
+   * (bare `--matchlock`, resolving to the built-in standard image or
+   * TAMANDUA_MATCHLOCK_IMAGE). Persisted as the policy's `requestedImageSource`
+   * so the v3 record is truthful instead of a placeholder. An inherited policy's
+   * value ALWAYS wins for a replacement (preserved VERBATIM, never recomputed
+   * from the current environment); absent on a fresh write defaults to
+   * "explicit".
+   */
+  imageSource?: MatchlockImageSource;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE1): true ONLY when the operator explicitly supplied
+   * `--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` to THIS
+   * action. Persisted as the policy's `rootUsageConsent` (R13 root usage
+   * consent). An inherited policy's value ALWAYS wins for a replacement
+   * (preserved VERBATIM); absent/false on a fresh write records `false`.
+   */
+  rootUsageConsent?: boolean;
+  /**
+   * R13: injectable effective-uid seam for the root gate. Production omits
+   * this (the real `process.geteuid()` is consulted); tests inject a
+   * deterministic value so the uid-0 branch is exercised without running as
+   * root. The gate concerns the HOST submitting process identity only.
+   */
+  effectiveUid?: () => number;
   /**
    * Selected Matchlock harness: "pi" (default), "hermes" or "dsh". A hermes
    * opt-in REQUIRES a Hermes `submission` (frozen inputs) unless an inherited
@@ -192,16 +320,51 @@ export interface MatchlockAdmissionOptions {
    * deterministic fake.
    */
   allowPrivateSupportProbe?: MatchlockAllowPrivateSupportProbe;
+  /**
+   * MTLK-ISO-SLICE2 US-003: injectable swap-capability support probe. Runs for
+   * EVERY Matchlock admission (fresh opt-in, a `--matchlock-no-swap` run and an
+   * inherited-policy replacement) BEFORE the image resolve / any policy
+   * construction and AFTER the R13 root gate, even when the run disables swap
+   * (0): the probe is the operator's proxy that the qualified runtime build is
+   * the one in use. Production omits this (the default US-001 probe runs against
+   * the binary resolved by {@link resolveRpcInvocation}); tests inject a
+   * deterministic supporting/refusing fake so they never spawn a real binary.
+   */
+  swapSupportProbe?: MatchlockSwapSupportProbe;
   /** Override the matchlock rpc binary (tests inject a fake driver). */
   rpcBinaryPath?: string;
   /** Override the matchlock rpc args (tests pass [driverPath]). */
   rpcArgs?: string[];
+  /**
+   * MTLK-ISO2-MEND (admission resolve-once-and-bind): the ONE rpc invocation
+   * this admission has already resolved. `admitMatchlockRun` resolves it once,
+   * before any awaited capability probe, and threads it through the swap
+   * handshake, the allow-private probe and the image resolve so the binary that
+   * is PROBED is exactly the binary that is LAUNCHED (no re-resolution drift).
+   * Callers normally omit it. Mirrors {@link MatchlockSwapHandshakeOptions}.
+   */
+  resolvedRpc?: ResolvedRpcInvocation;
   /** Finite request deadline for the owned resolve transport (ms). */
   rpcRequestTimeoutMs?: number;
   /** Admission context (tests pin home/live-state deterministically). */
   admission?: MountAdmissionContext;
   /** Git binary for repository-scope resolution (tests). */
   gitBinary?: string;
+}
+
+/**
+ * MTLK-ISO2-MEND (admission resolve-once-and-bind): the immutable rpc
+ * invocation resolved at the start of one admission/resume action. Admitting an
+ * executable ONCE and binding it across every awaited probe + the launch closes
+ * the drift window in which an environment change (PATH, TAMANDUA_MATCHLOCK_RPC_BIN
+ * or TAMANDUA_MATCHLOCK_RPC_ARGS) between two awaits could qualify one binary
+ * and launch a different one.
+ */
+export interface ResolvedRpcInvocation {
+  /** The absolute binary path the RPC transport will launch. */
+  binaryPath: string;
+  /** The argv tail handed to that binary (defaults to ["rpc"]). */
+  args: string[];
 }
 
 export interface MatchlockAdmissionResult {
@@ -465,10 +628,29 @@ function resolveAdmissionResourceLimits(
   inherited: ExecutionIsolation | undefined,
   supplied: ExecutionIsolationResourceLimits | undefined,
 ): ExecutionIsolationResourceLimits {
+  // INHERITANCE RULE (SHARED-V3): an inherited-policy write preserves the
+  // persisted limits VERBATIM — including swapMB (0 = off), which is NEVER
+  // recomputed from the current environment/defaults. A valid v2 record was
+  // already normalized to swapMB 0 at read time.
   if (inherited?.resourceLimits) return { ...inherited.resourceLimits };
-  if (supplied) return { ...supplied };
+  if (supplied) {
+    // A fresh write with caller-supplied (CLI-resolved) limits: an explicit
+    // 0 is preserved; only a caller that predates the swap field falls back
+    // to the built-in default so the persisted v3 record is complete.
+    return {
+      cpus: supplied.cpus,
+      memoryMB: supplied.memoryMB,
+      diskSizeMB: supplied.diskSizeMB,
+      swapMB: typeof supplied.swapMB === "number" ? supplied.swapMB : MATCHLOCK_DEFAULT_SWAP_MB,
+    };
+  }
   const resolved = resolveMatchlockResourceLimits();
-  return { cpus: resolved.cpus, memoryMB: resolved.memoryMB, diskSizeMB: resolved.diskSizeMB };
+  return {
+    cpus: resolved.cpus,
+    memoryMB: resolved.memoryMB,
+    diskSizeMB: resolved.diskSizeMB,
+    swapMB: resolved.swapMB,
+  };
 }
 
 /**
@@ -539,6 +721,16 @@ async function assertMatchlockAllowPrivateSupport(
   }
   if (support.supported) return;
 
+  // MTLK-ISO2-CORRECTIVE (F6): a missing binary keeps the uniform
+  // `matchlock_unavailable` taxonomy regardless of the allow-private list.
+  if (support.reasonCode === "missing_binary") {
+    throw new MatchlockAdmissionError(
+      "matchlock_unavailable",
+      `Matchlock rpc CLI is unavailable while admitting "${opts.requestedImage}": ${support.reason ?? `binary not found: ${binaryPath}`}. ` +
+        "Refusing to start the run without the qualified Matchlock runtime; no host fallback occurred.",
+    );
+  }
+
   const detail = support.reason ? ` Reason: ${support.reason}.` : "";
   throw new MatchlockAdmissionError(
     "matchlock_allow_private_unsupported",
@@ -549,8 +741,100 @@ async function assertMatchlockAllowPrivateSupport(
   );
 }
 
-function resolveRpcInvocation(opts: MatchlockAdmissionOptions): { binaryPath: string; args: string[] } {
-  const binaryPath = (opts.rpcBinaryPath ?? process.env[MATCHLOCK_RPC_BIN_ENV]?.trim()) || "matchlock";
+/**
+ * MTLK-ISO-SLICE2 US-010: the inputs {@link assertMatchlockSwapSupport} needs.
+ * It is a structural subset of {@link MatchlockAdmissionOptions} so the
+ * failed-run resume path (which does not run fresh admission) can re-run the
+ * exact same handshake against the persisted policy's image / the resolved
+ * binary.
+ */
+export interface MatchlockSwapHandshakeOptions {
+  /** Image named in a refusal; the persisted policy's reference on resume. */
+  requestedImage?: string;
+  /** Injectable probe (tests); production omits it. */
+  swapSupportProbe?: MatchlockSwapSupportProbe;
+  /** Override the matchlock rpc binary (tests inject a fake driver). */
+  rpcBinaryPath?: string;
+  /** Override the matchlock rpc args (tests pass [driverPath]). */
+  rpcArgs?: string[];
+  /**
+   * MTLK-ISO2-MEND (admission resolve-once-and-bind): an invocation the caller
+   * already resolved. When present it is bound verbatim for the probe and the
+   * returned path — the handshake never re-resolves the environment.
+   */
+  resolvedRpc?: ResolvedRpcInvocation;
+}
+
+/**
+ * MTLK-ISO-SLICE2 US-003: refuse a Matchlock admission when the resolved
+ * matchlock binary cannot honour the run's swap setting. The US-001 probe runs
+ * against the rpc binary resolved by {@link resolveRpcInvocation} BEFORE the
+ * image resolve / any policy construction and AFTER the R13 root gate — for
+ * EVERY Matchlock admission, including a swap-disabled (`swap_mb` 0) run and an
+ * inherited-policy replacement. A missing binary (ENOENT) keeps the existing
+ * `matchlock_unavailable` classification; every other failure — token not
+ * advertised, timeout, unparseable output — refuses with the typed
+ * `matchlock_swap_unsupported` error naming the resolved binary path and the
+ * `tamandua matchlock setup` remedy. No policy is written, no image resolved and
+ * no VM started. The probe is injectable so tests never need a real binary.
+ *
+ * MTLK-ISO-SLICE2 US-010: exported so `resumeWorkflow` re-runs the SAME
+ * handshake (and taxonomy) before re-registering a Matchlock run (resume does
+ * not pass through fresh admission).
+ */
+export async function assertMatchlockSwapSupport(
+  opts: MatchlockSwapHandshakeOptions,
+): Promise<string> {
+  const { binaryPath } = resolveRpcInvocation(opts);
+  const probe =
+    opts.swapSupportProbe ??
+    ((bin: string) => probeMatchlockSwapSupport({ binaryPath: bin }));
+
+  let support: MatchlockSwapSupport;
+  try {
+    support = await probe(binaryPath);
+  } catch (err) {
+    throw new MatchlockAdmissionError(
+      "matchlock_swap_unsupported",
+      `Refusing Matchlock run: could not verify that the matchlock binary at ${binaryPath} supports ${MATCHLOCK_SWAP_FLAG} (${errorMessage(err)}). ` +
+        `The qualified runtime is required even when swap is disabled; provision it with \`tamandua matchlock setup\` ` +
+        `or upgrade matchlock to a build that lists ${MATCHLOCK_SWAP_FLAG} (verify with \`matchlock run --help\`).`,
+    );
+  }
+  if (support.supported) return binaryPath;
+  if (support.reasonCode === "missing_binary") {
+    throw new MatchlockAdmissionError(
+      "matchlock_unavailable",
+      `Matchlock rpc CLI is unavailable while admitting "${opts.requestedImage}": ${support.reason ?? `binary not found: ${binaryPath}`}. ` +
+        "Refusing to start the run without the qualified Matchlock runtime; no host fallback occurred.",
+    );
+  }
+  const detail = support.reason ? ` Reason: ${support.reason}.` : "";
+  throw new MatchlockAdmissionError(
+    "matchlock_swap_unsupported",
+    `Refusing Matchlock run: the matchlock binary at ${binaryPath} does not support ${MATCHLOCK_SWAP_FLAG}.${detail} ` +
+      `The qualified runtime is required even when swap is disabled; provision it with \`tamandua matchlock setup\` ` +
+      `or upgrade matchlock to a build that lists ${MATCHLOCK_SWAP_FLAG} (verify with \`matchlock run --help\`).`,
+  );
+}
+
+function resolveRpcInvocation(opts: {
+  rpcBinaryPath?: string;
+  rpcArgs?: string[];
+  resolvedRpc?: ResolvedRpcInvocation;
+}): ResolvedRpcInvocation {
+  // MTLK-ISO2-MEND (admission resolve-once-and-bind): a caller that already
+  // resolved the invocation binds it verbatim — the environment is never
+  // re-read, so a PATH/RPC-env change between awaited probes cannot make the
+  // launched binary differ from the probed one.
+  if (opts.resolvedRpc) return opts.resolvedRpc;
+  // MTLK-ISO2-CORRECTIVE (F6): resolve the ONE absolute path the RPC transport
+  // will launch (empty PATH components included, exactly like spawn), so the
+  // probe and the child cannot diverge and refusals name an absolute path.
+  const explicit = opts.rpcBinaryPath?.trim();
+  const binaryPath = explicit
+    ? path.resolve(explicit)
+    : resolveMatchlockSwapBinaryPath(process.env);
   let args = opts.rpcArgs;
   if (!args) {
     const raw = process.env[MATCHLOCK_RPC_ARGS_ENV]?.trim();
@@ -587,7 +871,11 @@ export function pinFromPolicy(policy: ExecutionIsolation): PinnedImageIdentity {
   };
 }
 
-function classifyResolveError(err: unknown, tag: string): MatchlockAdmissionError {
+function classifyResolveError(
+  err: unknown,
+  tag: string,
+  imageSource: MatchlockImageSource,
+): MatchlockAdmissionError {
   if (err instanceof MatchlockImageError) {
     return new MatchlockAdmissionError(err.code, err.message);
   }
@@ -609,7 +897,7 @@ function classifyResolveError(err: unknown, tag: string): MatchlockAdmissionErro
   }
   return new MatchlockAdmissionError(
     "image_unusable",
-    `Matchlock could not resolve image "${tag}": ${message}`,
+    imageUnusableRefusalMessage(tag, imageSource, message),
   );
 }
 
@@ -661,7 +949,7 @@ async function resolveImageAdmissionIdentity(opts: MatchlockAdmissionOptions): P
     return { pin, imagePath };
   } catch (err) {
     if (err instanceof MatchlockAdmissionError) throw err;
-    throw classifyResolveError(err, opts.requestedImage);
+    throw classifyResolveError(err, opts.requestedImage, effectiveRequestedImageSource(opts));
   } finally {
     await client.dispose().catch(() => {});
   }
@@ -676,6 +964,11 @@ async function resolveImageAdmissionIdentity(opts: MatchlockAdmissionOptions): P
  */
 export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promise<MatchlockAdmissionResult> {
   const inherited = opts.inheritedPolicy;
+  // R13 root gate FIRST: an euid-0 process with no consent (neither the
+  // override supplied to THIS action nor valid inherited consent) refuses
+  // before any capability probe, the image resolve or any policy construction —
+  // no matchlock process is spawned and nothing runs natively.
+  assertMatchlockRootUsagePermitted(opts, inherited);
   const requestedImage = opts.requestedImage.trim();
   if (!requestedImage) {
     throw new MatchlockAdmissionError("image_unusable", "Matchlock admission requires a non-empty requestedImage.");
@@ -705,14 +998,35 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
   // the operator-supplied list. The value is persisted in the returned policy
   // and is never re-derived from the daemon environment at dispatch.
   const allowPrivate = resolveAdmissionAllowPrivate(inherited, opts.allowPrivate);
-  // US-008: fail closed BEFORE the harness split / image resolve / any create
-  // when the installed matchlock cannot honour a non-empty list. An empty list
-  // performs no probe and admission stays byte-identical.
-  if (allowPrivate && allowPrivate.length > 0) {
-    await assertMatchlockAllowPrivateSupport(opts, allowPrivate);
-  }
+
+  // MTLK-ISO2-MEND (admission resolve-once-and-bind): resolve the ONE rpc
+  // invocation HERE, after every structural refusal and before the first
+  // awaited capability probe, then bind it through the whole action. The swap
+  // handshake, the allow-private probe and the image resolve therefore all use
+  // the exact same binary/argv — a PATH or TAMANDUA_MATCHLOCK_RPC_* change
+  // between two awaits can no longer qualify one binary and launch another.
+  const boundOpts: MatchlockAdmissionOptions = {
+    ...opts,
+    resolvedRpc: resolveRpcInvocation(opts),
+  };
+
   if (harness === "hermes") {
-    return admitHermesMatchlockRun(opts, inherited, ctx, allowPrivate);
+    return admitHermesMatchlockRun(boundOpts, inherited, ctx, allowPrivate);
+  }
+
+  // MTLK-ISO-SLICE2 US-003: the pi/dsh path runs the swap-capability handshake
+  // BEFORE the image resolve / policy build and AFTER the R13 root gate, for
+  // every admission (including a swap-disabled run). The hermes branch runs the
+  // same handshake at the top of admitHermesMatchlockRun for parity, so each
+  // admission probes exactly once.
+  await assertMatchlockSwapSupport(boundOpts);
+
+  // MTLK-ISO2-CORRECTIVE (F6): the allow-private probe runs AFTER the swap
+  // handshake so a missing/unsupporting runtime ALWAYS reports the uniform
+  // matchlock_unavailable / matchlock_swap_unsupported taxonomy before the
+  // flag-specific allow-private refusal. No image resolve happens before it.
+  if (allowPrivate && allowPrivate.length > 0) {
+    await assertMatchlockAllowPrivateSupport(boundOpts, allowPrivate);
   }
 
   // Selected configuration source/profile/guest destination: inherited for
@@ -790,10 +1104,26 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
   // at dispatch — never re-resolved after submission. MTLK-PI-EXEC union
   // MTLK-DSH-EXEC: applies to pi and dsh alike (the pi admission path is
   // otherwise byte-identical; hermes resolves the same way in its own path).
-  const admitted = await resolveImageAdmissionIdentity(opts);
+  // MTLK-ISO2-MEND (resolve-once-and-bind): the image transport uses the SAME
+  // invocation the probes above used (`boundOpts`), never a fresh resolution.
+  const admitted = await resolveImageAdmissionIdentity(boundOpts);
+
+  // SHARED-V3 provenance + R13 consent. INHERITANCE RULE: an inherited-policy
+  // write (replacement/rugpull) preserves the persisted provenance VERBATIM and
+  // NEVER recomputes it from the current environment; a fresh write uses the
+  // caller's real provenance (defaults "explicit"). Consent follows the §4.5
+  // authoritative rule: existing true stays true; an override supplied to THIS
+  // action may set false->true; otherwise false — so a fresh false never
+  // clears inherited true, and the recorded value always matches the gate.
+  const requestedImageSource: MatchlockImageSource =
+    inherited?.requestedImageSource ?? opts.imageSource ?? "explicit";
+  const rootUsageConsent: boolean =
+    inherited?.rootUsageConsent === true || opts.rootUsageConsent === true;
 
   const policy = buildMatchlockPolicy({
     requestedImage,
+    requestedImageSource,
+    rootUsageConsent,
     identity: admitted.pin,
     imagePath: admitted.imagePath ?? undefined,
     harness,
@@ -839,6 +1169,20 @@ async function admitHermesMatchlockRun(
   ctx: MountAdmissionContext | undefined,
   allowPrivate: string[] | undefined,
 ): Promise<MatchlockAdmissionResult> {
+  // R13 parity: the hermes path runs the SAME root gate, with the same code
+  // and ordering, before its selection checks, probes or image resolve. The
+  // outer admitMatchlockRun gate already ran; this keeps the guarantee local
+  // to the branch as well.
+  assertMatchlockRootUsagePermitted(opts, inherited);
+  // MTLK-ISO-SLICE2 US-003 parity: the hermes path performs the SAME swap
+  // handshake with the same taxonomy, AFTER the root gate and BEFORE the
+  // Hermes selection checks and the image resolve.
+  await assertMatchlockSwapSupport(opts);
+  // MTLK-ISO2-CORRECTIVE (F6): same ordering/taxonomy as the pi/dsh path —
+  // the allow-private flag probe runs only after the swap handshake.
+  if (allowPrivate && allowPrivate.length > 0) {
+    await assertMatchlockAllowPrivateSupport(opts, allowPrivate);
+  }
   const requestedImage = opts.requestedImage.trim();
 
   // Frozen submission inputs: inherited for replacements (never re-read from
@@ -906,8 +1250,18 @@ async function admitHermesMatchlockRun(
   const admitted = await resolveImageAdmissionIdentity(opts);
   const identity = admitted.pin;
 
+  // SHARED-V3 provenance + R13 consent (identical to the pi/dsh path): an
+  // inherited-policy write preserves the persisted values VERBATIM; a fresh
+  // write uses the caller's real provenance/consent (defaults "explicit"/false).
+  const requestedImageSource: MatchlockImageSource =
+    inherited?.requestedImageSource ?? opts.imageSource ?? "explicit";
+  const rootUsageConsent: boolean =
+    inherited?.rootUsageConsent === true || opts.rootUsageConsent === true;
+
   const policy = buildMatchlockPolicy({
     requestedImage,
+    requestedImageSource,
+    rootUsageConsent,
     identity,
     imagePath: admitted.imagePath ?? undefined,
     harness: "hermes",

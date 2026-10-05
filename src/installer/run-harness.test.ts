@@ -12,6 +12,10 @@ import {
   removeRunWorktree,
 } from "../../dist/installer/worktree-manager.js";
 import { getDb } from "../../dist/db.js";
+import {
+  buildWorkflowStatusJson,
+  getWorkflowStatus,
+} from "../../dist/installer/status.js";
 
 describe("validateRunHarnessForScheduling", () => {
   let tempDir: string;
@@ -437,6 +441,37 @@ describe("validateRunHarnessForScheduling", () => {
       } else {
         delete process.env.TAMANDUA_HERMES_BINARY;
       }
+    }
+  });
+
+  it("US-006 consumer audit: an EMPTY-STRING persisted policy fails closed (never native) even when a host hermes binary IS available", async () => {
+    // A host hermes binary exists and would satisfy ordinary native
+    // validation. The empty-string policy is a non-NULL (unusable) policy,
+    // so the failed-run resume / registration validation input must refuse
+    // it rather than fall through to native host-binary resolution.
+    const workdir = path.join(tempDir, "direct-empty-policy");
+    fs.mkdirSync(workdir, { recursive: true });
+    const fakeHermes = path.join(tempDir, "hermes");
+    fs.writeFileSync(fakeHermes, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    process.env.TAMANDUA_HERMES_BINARY = fakeHermes;
+    try {
+      await assert.rejects(
+        validateRunHarnessForScheduling(
+          "run-empty-policy",
+          JSON.stringify({
+            workspace_mode: "direct",
+            working_directory_for_harness: workdir,
+            harness_type: "hermes",
+          }),
+          { matchlockPolicy: "" },
+        ),
+        /stored Matchlock policy is present but unusable/,
+      );
+    } finally {
+      if (savedHermesBinary === undefined) delete process.env.TAMANDUA_HERMES_BINARY;
+      else process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
     }
   });
 
@@ -1013,5 +1048,110 @@ describe("getRunHarnessType with corrupt context (US-005)", () => {
       typeof corruptEvents[0].detail === "string" && corruptEvents[0].detail!.length <= 200,
       "detail should be a bounded prefix of the raw context"
     );
+  });
+});
+
+describe("MTLK-ISO2-CORRECTIVE F5: policy parser input never leaks", () => {
+  it("does not embed a raw version sentinel in the validation error", async () => {
+    const tempDir = tamanduaTempDir("tamandua-f5-");
+    const prevHome = process.env.HOME;
+    const prevStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = path.join(tempDir, "home");
+    process.env.TAMANDUA_STATE_DIR = path.join(process.env.HOME, ".tamandua");
+    fs.mkdirSync(process.env.TAMANDUA_STATE_DIR, { recursive: true });
+    const wd = path.join(tempDir, "workdir");
+    fs.mkdirSync(wd, { recursive: true });
+    try {
+      const sentinel = "BOUNDARY_SENTINEL_INPUT";
+      const policy = JSON.stringify({
+        version: sentinel,
+        backend: "matchlock",
+        harness: "pi",
+      });
+      const err = await validateRunHarnessForScheduling(
+        "run-f5",
+        JSON.stringify({ working_directory_for_harness: wd, harness_type: "pi" }),
+        { matchlockPolicy: policy },
+      ).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(err instanceof Error, "the unusable policy must fail closed");
+      assert.doesNotMatch(err.message, /BOUNDARY_SENTINEL_INPUT/, "no raw parser input may leak");
+      assert.match(err.message, /policy_unsupported_version|policy_invalid_record|unusable/);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = prevStateDir;
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not leak a version sentinel through the full run-harness -> status JSON path", async () => {
+    const tempDir = tamanduaTempDir("tamandua-f5-status-");
+    const prevHome = process.env.HOME;
+    const prevStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = path.join(tempDir, "home");
+    process.env.TAMANDUA_STATE_DIR = path.join(process.env.HOME, ".tamandua");
+    fs.mkdirSync(process.env.TAMANDUA_STATE_DIR, { recursive: true });
+    const wd = path.join(tempDir, "workdir");
+    fs.mkdirSync(wd, { recursive: true });
+    try {
+      const sentinel = "BOUNDARY_SENTINEL_STATUS";
+      const rawPolicy = JSON.stringify({
+        version: sentinel,
+        backend: "matchlock",
+        harness: "pi",
+      });
+      const runId = "run-f5-status";
+      // 1. The producer (run-harness) fails closed with a typed, sanitized
+      //    message; the control server persists exactly this string into
+      //    runs.scheduling_error and returns it in the refusal body.
+      const err = await validateRunHarnessForScheduling(
+        runId,
+        JSON.stringify({ working_directory_for_harness: wd, harness_type: "pi" }),
+        { matchlockPolicy: rawPolicy },
+      ).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(err instanceof Error, "the unusable policy must fail closed");
+      assert.doesNotMatch(err.message, new RegExp(sentinel));
+
+      const now = new Date().toISOString();
+      getDb()
+        .prepare(
+          "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at, scheduling_status, scheduling_error, isolation_intent, matchlock_policy) VALUES (?, 'f5-wf', 'f5 task', 'failed', ?, ?, ?, 'error', ?, 'recorded', ?)",
+        )
+        .run(
+          runId,
+          JSON.stringify({ working_directory_for_harness: wd }),
+          now,
+          now,
+          err.message,
+          rawPolicy,
+        );
+
+      // 2. The status document (native CLI `workflow status --json`) must not
+      //    contain the sentinel in ANY field — scheduling_error, the unusable
+      //    policy surface, or anything else.
+      const status = buildWorkflowStatusJson(getWorkflowStatus(runId));
+      const serialized = JSON.stringify(status);
+      assert.equal(status.schedulingError, err.message);
+      assert.doesNotMatch(serialized, new RegExp(sentinel), "no sentinel anywhere in the status JSON");
+      assert.ok(status.matchlockPolicyError, "the unusable-policy surface is present");
+      assert.doesNotMatch(
+        JSON.stringify(status.matchlockPolicyError),
+        new RegExp(sentinel),
+        "the unusable-policy surface is sanitized too",
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = prevStateDir;
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

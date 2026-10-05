@@ -12,6 +12,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -110,7 +111,7 @@ async function startFakeControlPlane(): Promise<{
     req.on("end", () => {
       if (req.method === "GET" && req.url === "/control/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
         return;
       }
       if (req.method === "POST" && req.url === "/control/register-run") {
@@ -620,14 +621,40 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
     return {
       HOME: env.homeDir,
       TAMANDUA_CONTROL_PORT: String(fakePort),
-      TAMANDUA_MATCHLOCK_RPC_BIN: process.execPath,
-      TAMANDUA_MATCHLOCK_RPC_ARGS: JSON.stringify([fixture.driver]),
+      // MTLK-ISO-SLICE2 US-003: the fake rpc driver doubles as the matchlock
+      // CLI and advertises the exact --swap token, so the swap handshake (which
+      // probes `<bin> run --help`) passes without a real binary.
+      TAMANDUA_MATCHLOCK_RPC_BIN: fixture.driver,
+      TAMANDUA_MATCHLOCK_RPC_ARGS: JSON.stringify(["rpc"]),
       FAKE_TRANSCRIPT_FILE: fixture.transcript,
       FAKE_IMAGE_TAG: "vic/matchlock-base:latest",
       FAKE_IMAGE_DIGEST: `sha256:${"a".repeat(64)}`,
       FAKE_IMAGE_CONFIG_DIGEST: `sha256:${"b".repeat(64)}`,
       ...extra,
     };
+  }
+
+  /**
+   * MTLK-ISO-SLICE1 US-008: the CLI launch path resolves the swap size and
+   * hands it (with the other limits) to run creation, where admission persists
+   * it on the run's v3 policy. Read the newest run's persisted swapMB back.
+   */
+  function readPersistedSwapMB(tamanduaDir: string): number | undefined {
+    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    if (!fs.existsSync(dbPath)) return undefined;
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row = db
+        .prepare("SELECT matchlock_policy FROM runs ORDER BY rowid DESC LIMIT 1")
+        .get() as { matchlock_policy?: string } | undefined;
+      if (!row?.matchlock_policy) return undefined;
+      const parsed = JSON.parse(row.matchlock_policy) as {
+        resourceLimits?: { swapMB?: number };
+      };
+      return parsed.resourceLimits?.swapMB;
+    } finally {
+      db.close();
+    }
   }
 
   it("prints exactly one matchlock line inside the resolved block before the Run: line", async () => {
@@ -649,7 +676,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
           "Matchlock launch facts",
           "--working-directory-for-harness",
           fixture.workDir,
-          "--matchlock",
+          "--matchlock-image",
           "vic/matchlock-base:latest",
           "--matchlock-cpus",
           "4",
@@ -684,7 +711,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
       assert.ok(matchlockIdx < runIdx, "matchlock line must precede Run:");
       assert.equal(
         matchlockLines[0],
-        "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB",
+        "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB swap=8192MB",
       );
     } finally {
       try { await fake.close(); } catch {}
@@ -719,7 +746,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
           "Matchlock JSON facts",
           "--working-directory-for-harness",
           fixture.workDir,
-          "--matchlock",
+          "--matchlock-image",
           "vic/matchlock-base:latest",
           "--matchlock-cpus",
           "2",
@@ -743,14 +770,32 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
       assert.ok(parsed.resolution, `expected a resolution object:\n${stdout}`);
       assert.deepEqual(
         parsed.resolution.matchlockResources,
-        { image: "vic/matchlock-base:latest", cpus: 2, memoryMB: 2048, diskSizeMB: 10240 },
+        {
+          image: "vic/matchlock-base:latest",
+          imageSource: "explicit",
+          cpus: 2,
+          memoryMB: 2048,
+          diskSizeMB: 10240,
+          swapMB: 8192,
+          imageDigest: `sha256:${"a".repeat(64)}`,
+          imageConfigDigest: `sha256:${"b".repeat(64)}`,
+        },
         `--json must carry the matchlock facts in resolution.matchlockResources:\n${stdout}`,
       );
       // Mirrored at the top level exactly where `workflow status --json` puts
       // them, so the same shape is readable from either command.
       assert.deepEqual(
         parsed.matchlockResources,
-        { image: "vic/matchlock-base:latest", cpus: 2, memoryMB: 2048, diskSizeMB: 10240 },
+        {
+          image: "vic/matchlock-base:latest",
+          imageSource: "explicit",
+          cpus: 2,
+          memoryMB: 2048,
+          diskSizeMB: 10240,
+          swapMB: 8192,
+          imageDigest: `sha256:${"a".repeat(64)}`,
+          imageConfigDigest: `sha256:${"b".repeat(64)}`,
+        },
         `--json must mirror matchlockResources at the top level:\n${stdout}`,
       );
       // JSON mode stays a single document: no human-readable matchlock line.
@@ -758,6 +803,132 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
         !stdout.includes("matchlock: vic/"),
         `no text matchlock line on stdout in JSON mode:\n${stdout}`,
       );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("US-013: --json carries the shared root_usage_override warning only when consent is recorded", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+    const fixture = writeMatchlockFixture();
+
+    try {
+      const workflowId = "res-matchlock-warnings";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      const cleanWorkDir = path.join(fixture.fixtureRoot, "work-clean");
+      const consentWorkDir = path.join(fixture.fixtureRoot, "work-consent");
+      fs.mkdirSync(cleanWorkDir, { recursive: true });
+      fs.mkdirSync(consentWorkDir, { recursive: true });
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const baseArgs = (workDir: string) => [
+        "workflow",
+        "run",
+        workflowId,
+        "Matchlock warnings",
+        "--working-directory-for-harness",
+        workDir,
+        "--matchlock-image",
+        "vic/matchlock-base:latest",
+        "--matchlock-cpus",
+        "2",
+        "--matchlock-memory",
+        "2048",
+        "--matchlock-disk",
+        "10240",
+      ];
+
+      // A clean launch records no consent: the warnings key is ABSENT (never []).
+      const clean = await runCliToExit(
+        [...baseArgs(cleanWorkDir), "--json"],
+        matchlockEnv(env, fixture, fake.port),
+      );
+      assert.equal(clean.code, 0, `expected exit 0\nstdout:\n${clean.stdout}\nstderr:\n${clean.stderr}`);
+      const cleanParsed = JSON.parse(clean.stdout.trim());
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(cleanParsed, "warnings"),
+        false,
+        `a clean launch must not carry the warnings key (absent, never []):\n${clean.stdout}`,
+      );
+
+      // A consented launch re-derives root_usage_override from the ADMITTED
+      // policy; the warning states root execution is AUTHORIZED and never
+      // claims actual root execution.
+      const consent = await runCliToExit(
+        [
+          ...baseArgs(consentWorkDir),
+          "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs",
+          "--json",
+        ],
+        matchlockEnv(env, fixture, fake.port),
+      );
+      assert.equal(consent.code, 0, `expected exit 0\nstdout:\n${consent.stdout}\nstderr:\n${consent.stderr}`);
+      const consentParsed = JSON.parse(consent.stdout.trim());
+      assert.equal(consentParsed.warnings.length, 1, `expected one warning:\n${consent.stdout}`);
+      assert.equal(consentParsed.warnings[0].code, "root_usage_override");
+      assert.match(consentParsed.warnings[0].message, /AUTHORIZED/);
+      assert.doesNotMatch(consentParsed.warnings[0].message, /executed as root/);
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("US-013: text mode prints the shared warning to stderr and the exit code is unchanged", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+    const fixture = writeMatchlockFixture();
+
+    try {
+      const workflowId = "res-matchlock-warnings-text";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      const workDir = path.join(fixture.fixtureRoot, "work-text");
+      fs.mkdirSync(workDir, { recursive: true });
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const { stdout, stderr, code } = await runCliToExit(
+        [
+          "workflow",
+          "run",
+          workflowId,
+          "Matchlock warning text",
+          "--working-directory-for-harness",
+          workDir,
+          "--matchlock-image",
+          "vic/matchlock-base:latest",
+          "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs",
+        ],
+        matchlockEnv(env, fixture, fake.port),
+      );
+
+      // Advisory only: the warning never changes the exit code.
+      assert.equal(code, 0, `expected exit 0\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      assert.match(stderr, /warning\[root_usage_override\]: /);
+      assert.match(stderr, /AUTHORIZED/);
+      assert.doesNotMatch(stderr, /executed as root/);
+      // The warning is a bounded one-liner on stderr, never a second
+      // `matchlock:` stdout line.
+      assert.equal(stdoutLines(stdout).filter((l) => l.startsWith("matchlock:")).length, 1);
     } finally {
       try { await fake.close(); } catch {}
       try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
@@ -792,7 +963,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
         "run",
         workflowId,
         "Matchlock allow-private",
-        "--matchlock",
+        "--matchlock-image",
         "vic/matchlock-base:latest",
         "--matchlock-cpus",
         "2",
@@ -820,7 +991,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
       assert.deepEqual(
         matchlockLines,
         [
-          "matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB allow-private=192.168.107.74:8888,box.internal",
+          "matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB swap=8192MB allow-private=192.168.107.74:8888,box.internal",
         ],
         `launch line must carry the resolved allow-private entries:\n${text.stdout}`,
       );
@@ -833,9 +1004,13 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
       const parsed = JSON.parse(json.stdout.trim());
       const expected = {
         image: "vic/matchlock-base:latest",
+        imageSource: "explicit",
         cpus: 2,
         memoryMB: 2048,
         diskSizeMB: 10240,
+        swapMB: 8192,
+        imageDigest: `sha256:${"a".repeat(64)}`,
+        imageConfigDigest: `sha256:${"b".repeat(64)}`,
         allowPrivate: ["192.168.107.74:8888", "box.internal"],
       };
       assert.deepEqual(
@@ -889,6 +1064,10 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
         !text.stdout.includes("matchlock:"),
         `native run must print no matchlock line:\n${text.stdout}`,
       );
+      assert.ok(
+        !text.stdout.includes("matchlock pinned:"),
+        `native run must print no pinned line:\n${text.stdout}`,
+      );
 
       const json = await runCliToExit(
         [
@@ -921,6 +1100,184 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
         homeDir: env.homeDir,
       });
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  // MTLK-ISO-SLICE1 US-008: the CLI launch path resolves the swap size through
+  // the shared resolver (flag > env > default; --matchlock-no-swap wins) and
+  // hands it to run creation, where admission persists it on the run's v3
+  // policy. An invalid value exits non-zero BEFORE runWorkflow creates a row
+  // (pinned in tests/cli-workflow-run-working-directory.test.ts).
+  it("resolves the swap size (default/flag/no-swap/env) before run creation and persists it (US-008)", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+    const fixture = writeMatchlockFixture();
+
+    try {
+      const workflowId = "res-mtlk-swap";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const cases: Array<{
+        name: string;
+        flagArgs: string[];
+        extraEnv: Record<string, string>;
+        expectedSwapMB: number;
+      }> = [
+        { name: "default", flagArgs: [], extraEnv: {}, expectedSwapMB: 8192 },
+        { name: "flag-size", flagArgs: ["--matchlock-swap", "32g"], extraEnv: {}, expectedSwapMB: 32768 },
+        { name: "flag-equals", flagArgs: ["--matchlock-swap=4096"], extraEnv: {}, expectedSwapMB: 4096 },
+        { name: "no-swap", flagArgs: ["--matchlock-no-swap"], extraEnv: {}, expectedSwapMB: 0 },
+        { name: "env-size", flagArgs: [], extraEnv: { TAMANDUA_MATCHLOCK_SWAP_MB: "16384" }, expectedSwapMB: 16384 },
+        { name: "env-off", flagArgs: [], extraEnv: { TAMANDUA_MATCHLOCK_SWAP_MB: "off" }, expectedSwapMB: 0 },
+        {
+          name: "flag-beats-env",
+          flagArgs: ["--matchlock-swap", "2048"],
+          extraEnv: { TAMANDUA_MATCHLOCK_SWAP_MB: "16384" },
+          expectedSwapMB: 2048,
+        },
+        {
+          name: "no-swap-beats-env",
+          flagArgs: ["--matchlock-no-swap"],
+          extraEnv: { TAMANDUA_MATCHLOCK_SWAP_MB: "16384" },
+          expectedSwapMB: 0,
+        },
+      ];
+
+      for (const c of cases) {
+        const workDir = path.join(fixture.fixtureRoot, `work-${c.name}`);
+        fs.mkdirSync(workDir, { recursive: true });
+        const { stdout, stderr, code } = await runCliToExit(
+          [
+            "workflow",
+            "run",
+            workflowId,
+            `Swap ${c.name}`,
+            "--working-directory-for-harness",
+            workDir,
+            "--matchlock-image",
+            "vic/matchlock-base:latest",
+            ...c.flagArgs,
+          ],
+          matchlockEnv(env, fixture, fake.port, c.extraEnv),
+        );
+        assert.equal(
+          code,
+          0,
+          `case ${c.name}: expected exit 0, got ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+        );
+        assert.equal(
+          readPersistedSwapMB(env.tamanduaDir),
+          c.expectedSwapMB,
+          `case ${c.name}: the resolved swap size must reach the persisted policy`,
+        );
+      }
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  // MTLK-ISO-SLICE2 US-011: the shared output contract renders the resolved
+  // swap size on the single combined line and reports the admitted pin on its
+  // own `matchlock pinned:` line (distinct prefix) AFTER admission succeeds.
+  // --json folds provenance + swap into matchlockResources and stays a single
+  // document (no text pin line).
+  it("renders swap= and the pinned line for a swap-flag opt-in (US-011)", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+    const fixture = writeMatchlockFixture();
+
+    try {
+      const workflowId = "res-mtlk-output";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      const jsonWorkDir = path.join(fixture.fixtureRoot, "work-json-out");
+      fs.mkdirSync(jsonWorkDir, { recursive: true });
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const baseArgs = [
+        "workflow",
+        "run",
+        workflowId,
+        "Output contract",
+        "--matchlock-image",
+        "vic/matchlock-base:latest",
+        "--matchlock-cpus",
+        "2",
+        "--matchlock-memory",
+        "2048",
+        "--matchlock-disk",
+        "10240",
+        "--matchlock-swap",
+        "32g",
+      ];
+
+      const text = await runCliToExit(
+        [...baseArgs, "--working-directory-for-harness", fixture.workDir],
+        matchlockEnv(env, fixture, fake.port),
+      );
+      assert.equal(text.code, 0, `expected exit 0, got ${text.code}\nstdout:\n${text.stdout}\nstderr:\n${text.stderr}`);
+      assert.deepEqual(
+        stdoutLines(text.stdout).filter((l) => l.startsWith("matchlock:")),
+        [
+          "matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB swap=32768MB",
+        ],
+        `the launch text must carry the resolved swap size:\n${text.stdout}`,
+      );
+      const pinnedLines = stdoutLines(text.stdout).filter((l) =>
+        l.startsWith("matchlock pinned:"),
+      );
+      assert.deepEqual(
+        pinnedLines,
+        [
+          `matchlock pinned: digest=sha256:${"a".repeat(64)} config=sha256:${"b".repeat(64)}`,
+        ],
+        `the admitted pin must be reported once after admission:\n${text.stdout}`,
+      );
+
+      const json = await runCliToExit(
+        [...baseArgs, "--working-directory-for-harness", jsonWorkDir, "--json"],
+        matchlockEnv(env, fixture, fake.port),
+      );
+      assert.equal(json.code, 0, `expected exit 0, got ${json.code}\nstdout:\n${json.stdout}\nstderr:\n${json.stderr}`);
+      const parsed = JSON.parse(json.stdout.trim());
+      const expected = {
+        image: "vic/matchlock-base:latest",
+        imageSource: "explicit",
+        cpus: 2,
+        memoryMB: 2048,
+        diskSizeMB: 10240,
+        swapMB: 32768,
+        imageDigest: `sha256:${"a".repeat(64)}`,
+        imageConfigDigest: `sha256:${"b".repeat(64)}`,
+      };
+      assert.deepEqual(parsed.resolution.matchlockResources, expected);
+      assert.deepEqual(parsed.matchlockResources, expected);
+      assert.ok(
+        !json.stdout.includes("matchlock pinned:"),
+        `--json must stay a single document (no text pin line):\n${json.stdout}`,
+      );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true }); } catch {}
     }
   });
 });

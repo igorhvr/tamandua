@@ -19,6 +19,17 @@ import {
   MATCHLOCK_RPC_BIN_ENV,
 } from "../../dist/installer/matchlock/admission.js";
 import { tempTranscriptPath, writeFakeRpcDriver } from "../../dist/installer/matchlock/fake-rpc-driver.js";
+import type { MatchlockSwapSupportProbe } from "../../dist/installer/matchlock/swap-support.js";
+
+/**
+ * MTLK-ISO-SLICE2 US-003: a deterministic supporting swap-capability probe so a
+ * rugpull replacement's inherited-policy admission never spawns a real
+ * matchlock binary. It echoes back the resolved rpc binary path.
+ */
+const supportingRugpullSwapProbe: MatchlockSwapSupportProbe = (binaryPath) => ({
+  supported: true,
+  binaryPath,
+});
 
 /**
  * MTLK-ADMIT fixture base: work mounts must be at host paths whose exact-path
@@ -1108,7 +1119,7 @@ describe("relaunchRunAfterRugpull", () => {
     controlPort = await new Promise<number>((resolve) => {
       mockServer = http.createServer((_req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
       });
       mockServer.listen(0, "127.0.0.1", () => {
         const addr = mockServer.address();
@@ -1313,7 +1324,7 @@ describe("relaunchRunAfterRugpull", () => {
         res.end(JSON.stringify({ error: "registration rejected by test" }));
       } else {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
       }
     });
     const rejectingPort = await new Promise<number>((resolve) => {
@@ -1398,7 +1409,7 @@ describe("relaunchRunAfterRugpull", () => {
         }));
       } else {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
       }
     });
     const refusingPort = await new Promise<number>((resolve) => {
@@ -1938,7 +1949,9 @@ describe("relaunchRunAfterRugpull", () => {
       .run(serializeMatchlockPolicy(originalPolicy), failedRunId);
 
     try {
-      const result = await relaunchRunAfterRugpull(failedRunId);
+      const result = await relaunchRunAfterRugpull(failedRunId, {
+        matchlockSwapSupportProbe: supportingRugpullSwapProbe,
+      });
       assert.equal(result.relaunched, true, "matchlock replacement must relaunch");
       assert.ok(result.newRunId, "new run ID should be set");
       assert.notEqual(result.newRunId, failedRunId);
@@ -2038,7 +2051,9 @@ describe("relaunchRunAfterRugpull", () => {
     const savedWorktreeRoot = process.env.TAMANDUA_WORKTREE_ROOT;
     process.env.TAMANDUA_WORKTREE_ROOT = worktreeRoot;
     try {
-      const result = await relaunchRunAfterRugpull(failedRunId);
+      const result = await relaunchRunAfterRugpull(failedRunId, {
+        matchlockSwapSupportProbe: supportingRugpullSwapProbe,
+      });
       assert.equal(result.relaunched, true, "matchlock worktree replacement must relaunch");
       assert.ok(result.newRunId);
 
@@ -2131,7 +2146,9 @@ describe("relaunchRunAfterRugpull", () => {
       .run(serializeMatchlockPolicy(originalPolicy), failedRunId);
 
     try {
-      const result = await relaunchRunAfterRugpull(failedRunId);
+      const result = await relaunchRunAfterRugpull(failedRunId, {
+        matchlockSwapSupportProbe: supportingRugpullSwapProbe,
+      });
       assert.equal(result.relaunched, false,
         "a moved-tag replacement must be refused, never relaunched natively or re-pinned");
 
@@ -2203,6 +2220,118 @@ describe("relaunchRunAfterRugpull", () => {
     assert.equal(replacements.length, 0, "a refused replacement must create NO new run row");
   });
 
+  it("rugpull replacement of a MATCHLOCK run with an EMPTY-STRING stored policy is refused (US-006: never silently native)", async () => {
+    const workflowId = "test-relaunch-mtlk-empty-policy";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+
+    const { relaunchRunAfterRugpull } = await import("../../dist/installer/rugpull.js");
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      workspace_mode: "direct",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+    insertStep(db, "step-" + failedRunId.slice(0, 8), failedRunId, "finalize_merge", "failed", 0, "single");
+    // An EMPTY-STRING policy is non-NULL: it is NOT a native run. Truthiness
+    // would skip it and inherit no policy, launching a native replacement.
+    db.prepare("UPDATE runs SET matchlock_policy = ? WHERE id = ?").run("", failedRunId);
+
+    const result = await relaunchRunAfterRugpull(failedRunId);
+    assert.equal(result.relaunched, false,
+      "an empty-string stored Matchlock policy must refuse the rugpull relaunch, never go native");
+    assert.equal(result.newRunId, undefined, "no replacement run may be created");
+
+    const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
+    const failedEvents = events.filter((e) => e.event === "run.rugpull_relaunch_failed");
+    assert.equal(failedEvents.length, 1, "must emit run.rugpull_relaunch_failed");
+    assert.match(String(failedEvents[0].detail), /stored Matchlock policy is not reusable/);
+    assert.match(String(failedEvents[0].detail), /never become native/);
+
+    const replacements = db.prepare(
+      "SELECT id FROM runs WHERE workflow_id = ? AND id != ?",
+    ).all(workflowId, failedRunId) as Array<{ id: string }>;
+    assert.equal(replacements.length, 0, "a refused replacement must create NO new run row");
+  });
+
+  it("rugpull replacement of an INTENT-ONLY run (PREP-STATE) is refused, never native (US-008)", async () => {
+    const workflowId = "test-relaunch-intent-only";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+
+    const { relaunchRunAfterRugpull } = await import("../../dist/installer/rugpull.js");
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      workspace_mode: "direct",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+    insertStep(db, "step-" + failedRunId.slice(0, 8), failedRunId, "finalize_merge", "failed", 0, "single");
+    // PREP-STATE: the isolation intent is recorded but the pinned policy was
+    // never persisted (interrupted/failed admission). Truthiness would inherit
+    // no policy and launch a NATIVE replacement — the guard must refuse.
+    db.prepare("UPDATE runs SET isolation_intent = 'true', matchlock_policy = NULL WHERE id = ?")
+      .run(failedRunId);
+
+    const result = await relaunchRunAfterRugpull(failedRunId);
+    assert.equal(result.relaunched, false,
+      "an intent-only (PREP-STATE) run must not be replaced natively");
+    assert.equal(result.newRunId, undefined, "no replacement run may be created");
+
+    const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
+    const failedEvents = events.filter((e) => e.event === "run.rugpull_relaunch_failed");
+    assert.equal(failedEvents.length, 1, "must emit run.rugpull_relaunch_failed");
+    assert.match(String(failedEvents[0].detail), /isolation intent is recorded/i);
+    assert.match(String(failedEvents[0].detail), /held non-schedulable/i);
+    assert.match(String(failedEvents[0].detail), /retry preparation|recreate the run/i);
+
+    const replacements = db.prepare(
+      "SELECT id FROM runs WHERE workflow_id = ? AND id != ?",
+    ).all(workflowId, failedRunId) as Array<{ id: string }>;
+    assert.equal(replacements.length, 0, "a refused intent-only replacement must create NO new run row");
+  });
+
+  it("rugpull replacement of a run with BOTH the isolation intent and a persisted policy still inherits the policy (policy wins)", async () => {
+    const workflowId = "test-relaunch-intent-with-policy";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+
+    const { relaunchRunAfterRugpull } = await import("../../dist/installer/rugpull.js");
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      workspace_mode: "direct",
+      harness_type: "pi",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+    insertStep(db, "step-" + failedRunId.slice(0, 8), failedRunId, "finalize_merge", "failed", 0, "single");
+    // The isolation intent is still set (admission was interrupted AFTER the
+    // policy write in this contrived row) but a REAL policy exists: the
+    // ordered classification must let the policy win and refuse only on a
+    // parse failure, never on the stale intent.
+    db.prepare("UPDATE runs SET isolation_intent = 'true', matchlock_policy = ? WHERE id = ?")
+      .run("{not valid policy json", failedRunId);
+
+    const result = await relaunchRunAfterRugpull(failedRunId);
+    assert.equal(result.relaunched, false, "an unusable stored policy refuses the replacement");
+    const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
+    const failedEvents = events.filter((e) => e.event === "run.rugpull_relaunch_failed");
+    assert.equal(failedEvents.length, 1);
+    assert.match(String(failedEvents[0].detail), /stored Matchlock policy is not reusable/,
+      "a non-NULL policy must be classified FIRST, before the intent");
+  });
+
   it("rugpull replacement of a MATCHLOCK run with a LEGACY UNPINNED (version-1) stored policy is refused (no native replacement)", async () => {
     const workflowId = "test-relaunch-mtlk-legacy";
     writeWorkflowYml(tempHome, workflowId, "direct");
@@ -2233,7 +2362,7 @@ describe("relaunchRunAfterRugpull", () => {
     const failedEvents = events.filter((e) => e.event === "run.rugpull_relaunch_failed");
     assert.equal(failedEvents.length, 1, "must emit run.rugpull_relaunch_failed");
     assert.match(String(failedEvents[0].detail), /stored Matchlock policy is not reusable/);
-    assert.match(String(failedEvents[0].detail), /legacy UNPINNED record/);
+    assert.match(String(failedEvents[0].detail), /legacy unpinned record/);
 
     const replacements = db.prepare(
       "SELECT id FROM runs WHERE workflow_id = ? AND id != ?",
@@ -2278,7 +2407,7 @@ describe("failStep rugpull integration", () => {
     controlPort = await new Promise<number>((resolve) => {
       mockServer = http.createServer((_req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
       });
       mockServer.listen(0, "127.0.0.1", () => {
         const addr = mockServer.address();

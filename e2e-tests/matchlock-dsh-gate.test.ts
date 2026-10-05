@@ -1728,7 +1728,7 @@ async function runWholePath(
       "workflow", "run", workflowId,
       taskText,
       "--working-directory-for-harness", workdir,
-      "--matchlock", imageTag,
+      "--matchlock-image", imageTag,
       "--dsh-as-harness",
     ],
     env,

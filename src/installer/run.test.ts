@@ -7,12 +7,18 @@ import path from "node:path";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
 
-import { runWorkflow, resumeWorkflow, isGitRepositoryForHarness } from "../../dist/installer/run.js";
+import { runWorkflow, resumeWorkflow, isGitRepositoryForHarness, _setResumeInheritedImageVerifierForTest } from "../../dist/installer/run.js";
 import {
   readHarnessProbeStatus,
   reserveHarnessProbe,
 } from "../../dist/installer/harness-probe.js";
-import { parseMatchlockPolicy } from "../../dist/installer/matchlock/policy.js";
+import {
+  buildMatchlockPolicy,
+  parseMatchlockPolicy,
+  serializeMatchlockPolicy,
+  MATCHLOCK_POLICY_VERSION,
+} from "../../dist/installer/matchlock/policy.js";
+import { STANDARD_MATCHLOCK_IMAGE } from "../../dist/installer/matchlock/standard-image.js";
 import { buildMatchlockCreateConfig } from "../../dist/installer/matchlock/mount-plan.js";
 import {
   MatchlockAdmissionError,
@@ -20,6 +26,7 @@ import {
   MATCHLOCK_RPC_BIN_ENV,
 } from "../../dist/installer/matchlock/admission.js";
 import { tempTranscriptPath, writeFakeRpcDriver } from "../../dist/installer/matchlock/fake-rpc-driver.js";
+import type { MatchlockSwapSupportProbe } from "../../dist/installer/matchlock/swap-support.js";
 import { getPidFile, getPortFile, stopDaemon, stopDaemonFamily } from "../../dist/server/daemonctl.js";
 import {
   reservePortHandles,
@@ -110,6 +117,89 @@ function writeConditionalWorkflow(
     "utf-8");
 }
 
+/**
+ * MTLK-ISO-SLICE2 US-003: deterministic supporting swap-capability probe so the
+ * production admission path (runWorkflow) never spawns a real matchlock binary.
+ * It echoes back the resolved rpc binary path.
+ */
+const supportingMatchlockSwapProbe: MatchlockSwapSupportProbe = (binaryPath) => ({
+  supported: true,
+  binaryPath,
+});
+
+/**
+ * SHARED-V3 US-009 helper: run ONE Matchlock-opted-in `runWorkflow` over the
+ * fake rpc driver and read the persisted v3 policy back. The caller owns
+ * `repoDir` (so a replacement run can reuse the inherited working directory)
+ * and its fixture cleanup; env is restored here.
+ */
+async function runMatchlockRunAndReadPolicy(
+  tempHome: string,
+  workflowId: string,
+  opts: {
+    taskTitle: string;
+    image: string;
+    repoDir: string;
+    fakeImageTag?: string;
+    matchlockImageSource?: "explicit" | "standard";
+    matchlockRootUsageOverride?: boolean;
+    matchlockPolicy?: ReturnType<typeof parseMatchlockPolicy>;
+  },
+): Promise<{ policy: ReturnType<typeof parseMatchlockPolicy>; result?: Awaited<ReturnType<typeof runWorkflow>> }> {
+  const configRoot = path.join(tempHome, ".pi", "agent");
+  fs.mkdirSync(configRoot, { recursive: true });
+  const fakeDriver = writeFakeRpcDriver({
+    dir: path.join(MTLK_FIXTURE_BASE, `${workflowId}-driver-${crypto.randomUUID().slice(0, 8)}`),
+  });
+  const transcript = tempTranscriptPath();
+  const savedEnv: Array<[string, string | undefined]> = [];
+  const setEnv = (key: string, value: string | undefined): void => {
+    savedEnv.push([key, process.env[key]]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  };
+  setEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+  setEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+  setEnv("FAKE_TRANSCRIPT_FILE", transcript);
+  setEnv("FAKE_IMAGE_TAG", opts.fakeImageTag ?? opts.image);
+  setEnv("FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+  let result: Awaited<ReturnType<typeof runWorkflow>> | undefined;
+  try {
+    result = await runWorkflow({
+      workflowId,
+      taskTitle: opts.taskTitle,
+      workingDirectoryForHarness: opts.repoDir,
+      matchlockImage: opts.image,
+      ...(opts.matchlockImageSource ? { matchlockImageSource: opts.matchlockImageSource } : {}),
+      ...(opts.matchlockRootUsageOverride ? { matchlockRootUsageOverride: true } : {}),
+      ...(opts.matchlockPolicy ? { matchlockPolicy: opts.matchlockPolicy } : {}),
+      matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
+      matchlockResourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 },
+    });
+  } catch (err) {
+    assert.ok(
+      err instanceof Error && /Failed to register run with daemon|daemon/.test(err.message),
+      `unexpected runWorkflow failure: ${String(err)}`,
+    );
+  } finally {
+    for (const [key, value] of savedEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+  }
+
+  const { getDb } = await import("../../dist/db.js");
+  const db = getDb();
+  const row = db.prepare(
+    "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+  ).get(workflowId) as { matchlock_policy: string | null } | undefined;
+  assert.ok(row?.matchlock_policy, "matchlock_policy should be persisted");
+  return { policy: parseMatchlockPolicy(row!.matchlock_policy!), result };
+}
+
 // ── Test suite ──
 
 describe("runWorkflow", () => {
@@ -146,10 +236,16 @@ describe("runWorkflow", () => {
     // The handles protected the ports during setup.
     await Promise.all(portHandles.map((h) => h.close()));
     portHandles = [];
+
+    // MTLK-ISO2-CORRECTIVE: default the failed-run resume inherited-image
+    // verifier to a deterministic no-op so existing tests never spawn a real
+    // binary/RPC. Failure-injection tests override per-case via the option.
+    _setResumeInheritedImageVerifierForTest(async () => {});
   });
 
   after(async () => {
     await stopDaemonFamily({ homeDir: tempHome });
+    _setResumeInheritedImageVerifierForTest(null);
 
     if (origHome !== undefined) {
       process.env.HOME = origHome;
@@ -1202,6 +1298,7 @@ describe("runWorkflow", () => {
         await runWorkflow({
           workflowId,
           taskTitle: "Test matchlock policy capture",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/matchlock-base:latest",
         });
@@ -1254,6 +1351,112 @@ describe("runWorkflow", () => {
       if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
     });
 
+    // SHARED-V3 US-009: the parser's REAL image provenance and the per-action
+    // R13 root-usage consent are threaded through run creation into the
+    // persisted v3 policy — never placeholders. A bare standard opt-in records
+    // "standard" (and still persists the resolved immutable pin); an explicit
+    // image records "explicit"; the override records true and its absence false.
+    it("SHARED-V3 US-009: a bare standard opt-in persists requestedImageSource 'standard' with the resolved standard reference and pin", async () => {
+      const workflowId = "test-ctx-mtlk-provenance-standard";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const { policy } = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Test standard image provenance",
+          image: STANDARD_MATCHLOCK_IMAGE,
+          repoDir,
+          matchlockImageSource: "standard",
+          matchlockRootUsageOverride: true,
+        });
+        assert.equal(policy.version, MATCHLOCK_POLICY_VERSION);
+        assert.equal(policy.requestedImage, STANDARD_MATCHLOCK_IMAGE);
+        assert.equal(policy.requestedImageSource, "standard");
+        assert.equal(policy.rootUsageConsent, true, "the explicit root override is recorded truthfully");
+        assert.equal(
+          policy.resolvedImageDigest,
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "the standard opt-in still resolves and persists the immutable pin",
+        );
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    // SHARED-V3 US-009: an explicit image records "explicit"; a fresh action
+    // that did not exercise the root override records consent false.
+    it("SHARED-V3 US-009: an explicit opt-in persists requestedImageSource 'explicit' and no override records false", async () => {
+      const workflowId = "test-ctx-mtlk-provenance-explicit";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const { policy } = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Test explicit image provenance",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          matchlockImageSource: "explicit",
+        });
+        assert.equal(policy.requestedImage, "vic/matchlock-base:latest");
+        assert.equal(policy.requestedImageSource, "explicit");
+        assert.equal(policy.rootUsageConsent, false, "no override records consent false");
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    // SHARED-V3 US-009 INHERITANCE RULE: a replacement (inherited-policy) write
+    // preserves the persisted provenance and consent VERBATIM — a fresh write
+    // would have defaulted to "explicit"/false, so preserving "standard"/true
+    // proves the values are never recomputed from the current action/env.
+    it("SHARED-V3 US-009: an inherited-policy write (replacement) preserves the inherited provenance and consent verbatim", async () => {
+      const workflowId = "test-ctx-mtlk-provenance-inherited";
+      const replacementId = "test-ctx-mtlk-provenance-inherited-replacement";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      writeMinimalWorkflow(tempHome, replacementId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const first = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "First standard + consent run",
+          image: STANDARD_MATCHLOCK_IMAGE,
+          repoDir,
+          matchlockImageSource: "standard",
+          matchlockRootUsageOverride: true,
+        });
+        assert.equal(first.policy.requestedImageSource, "standard");
+        assert.equal(first.policy.rootUsageConsent, true);
+
+        const replacement = await runMatchlockRunAndReadPolicy(tempHome, replacementId, {
+          taskTitle: "Replacement inherits provenance + consent",
+          image: STANDARD_MATCHLOCK_IMAGE,
+          repoDir,
+          matchlockPolicy: first.policy,
+          // No fresh provenance/override: the inherited values must survive.
+        });
+        assert.equal(
+          replacement.policy.requestedImageSource,
+          "standard",
+          "an inherited-policy write preserves requestedImageSource VERBATIM",
+        );
+        assert.equal(
+          replacement.policy.rootUsageConsent,
+          true,
+          "an inherited-policy write preserves rootUsageConsent VERBATIM (a fresh write would be false)",
+        );
+        assert.equal(
+          replacement.policy.resolvedImageDigest,
+          first.policy.resolvedImageDigest,
+          "replacement re-resolves against and retains the inherited pin",
+        );
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
     // MTLK-VM-SIZE US-003: CLI-resolved limits are persisted in the run's
     // policy (serialize/parse round-trip) and surfaced on the result so the
     // CLI can echo the admitted VM size. An injected host probe proves the
@@ -1288,9 +1491,10 @@ describe("runWorkflow", () => {
         result = await runWorkflow({
           workflowId,
           taskTitle: "Test explicit matchlock resource limits",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/matchlock-base:latest",
-          matchlockResourceLimits: { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
+          matchlockResourceLimits: { cpus: 4, memoryMB: 4096, diskSizeMB: 20480, swapMB: 4096 },
           matchlockResourceHostProbe: { onlineCpus: () => 96, totalMemoryMB: () => 1048576 },
         });
       } catch (err) {
@@ -1312,8 +1516,25 @@ describe("runWorkflow", () => {
       assert.ok(result, "runWorkflow should return a result");
       assert.deepEqual(
         result.matchlockResourceLimits,
-        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
+        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480, swapMB: 4096 },
         "the persisted limits must be surfaced on RunWorkflowResult",
+      );
+      // MTLK-ISO-SLICE2 US-011: the admitted pin is read from the SAME
+      // persisted policy and surfaced for the `matchlock pinned:` line.
+      assert.deepEqual(
+        result.matchlockPin,
+        {
+          digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          configDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+        "the admitted image pin must be surfaced on RunWorkflowResult",
+      );
+      // MTLK-ISO-SLICE2 US-012: the admitted provenance is surfaced too, so the
+      // CLI can fold it into `workflow run --json`'s matchlockResources.
+      assert.equal(
+        result.matchlockImageSource,
+        "explicit",
+        "the admitted image provenance must be surfaced on RunWorkflowResult",
       );
 
       const { getDb } = await import("../../dist/db.js");
@@ -1325,7 +1546,7 @@ describe("runWorkflow", () => {
       assert.ok(rows[0].matchlock_policy, "matchlock_policy should be persisted");
       assert.deepEqual(
         parseMatchlockPolicy(rows[0].matchlock_policy!).resourceLimits,
-        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480 },
+        { cpus: 4, memoryMB: 4096, diskSizeMB: 20480, swapMB: 4096 },
       );
     });
 
@@ -1361,6 +1582,7 @@ describe("runWorkflow", () => {
         result = await runWorkflow({
           workflowId,
           taskTitle: "Test default matchlock resource limits",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/matchlock-base:latest",
           matchlockResourceHostProbe: { onlineCpus: () => 4, totalMemoryMB: () => 16384 },
@@ -1382,7 +1604,7 @@ describe("runWorkflow", () => {
       assert.ok(result, "runWorkflow should return a result");
       assert.deepEqual(
         result.matchlockResourceLimits,
-        { cpus: 4, memoryMB: 8192, diskSizeMB: 20480 },
+        { cpus: 4, memoryMB: 8192, diskSizeMB: 20480, swapMB: 8192 },
         "4 online CPUs / 16 GB host => cpus min(8,4)=4, memory min(16384,50%)=8192",
       );
 
@@ -1395,7 +1617,7 @@ describe("runWorkflow", () => {
       assert.ok(rows[0].matchlock_policy, "matchlock_policy should be persisted");
       assert.deepEqual(
         parseMatchlockPolicy(rows[0].matchlock_policy!).resourceLimits,
-        { cpus: 4, memoryMB: 8192, diskSizeMB: 20480 },
+        { cpus: 4, memoryMB: 8192, diskSizeMB: 20480, swapMB: 8192 },
       );
     });
 
@@ -1436,6 +1658,7 @@ describe("runWorkflow", () => {
         await runWorkflow({
           workflowId,
           taskTitle: "Test matchlock allow-private persistence",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/matchlock-base:latest",
           matchlockAllowPrivate: requested,
@@ -1515,6 +1738,7 @@ describe("runWorkflow", () => {
         await runWorkflow({
           workflowId,
           taskTitle: "Test matchlock allow-private refusal",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/matchlock-base:latest",
           matchlockAllowPrivate: ["192.168.107.74:8888"],
@@ -1560,14 +1784,22 @@ describe("runWorkflow", () => {
       const workflowId = "test-ctx-mtlk-off";
       writeMinimalWorkflow(tempHome, workflowId, "direct");
 
+      // US-003 AC#8: a native run must never spawn the swap-capability probe.
+      let swapProbeCalls = 0;
+      const neverSwapProbe: MatchlockSwapSupportProbe = () => {
+        swapProbeCalls += 1;
+        throw new Error("the swap probe must never run for a native run");
+      };
       try {
         await runWorkflow({
           workflowId,
           taskTitle: "Test no matchlock policy",
+          matchlockSwapSupportProbe: neverSwapProbe,
         });
       } catch {
         // Daemon registration may fail after persisting the run.
       }
+      assert.equal(swapProbeCalls, 0, "a native run (no --matchlock) never probes for swap support");
 
       const { getDb } = await import("../../dist/db.js");
       const db = getDb();
@@ -1616,6 +1848,7 @@ describe("runWorkflow", () => {
         await runWorkflow({
           workflowId,
           taskTitle: "Test hermes policy capture",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/hermes-base:latest",
           harnessType: "hermes",
@@ -1699,6 +1932,7 @@ describe("runWorkflow", () => {
         await runWorkflow({
           workflowId,
           taskTitle: "Test hermes env policy capture",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/hermes-env:latest",
           harnessType: "hermes",
@@ -1753,6 +1987,7 @@ describe("runWorkflow", () => {
         await runWorkflow({
           workflowId,
           taskTitle: "Test hermes refusal on absent config root",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/hermes-base:latest",
           harnessType: "hermes",
@@ -1811,6 +2046,7 @@ describe("runWorkflow", () => {
         await runWorkflow({
           workflowId,
           taskTitle: "Test matchlock refusal on unresolvable image",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/matchlock-base:latest",
         });
@@ -1836,7 +2072,7 @@ describe("runWorkflow", () => {
       assert.ok(run, "the run row must exist (honest refused run)");
       assert.equal(run.status, "failed", "refused run must be failed, never running");
       assert.equal(run.scheduling_status, null, "refused run must never be schedulable");
-      assert.match(JSON.parse(run.context).launch_error ?? "", /could not resolve image/);
+      assert.match(JSON.parse(run.context).launch_error ?? "", /is not usable: image_unusable/);
       const steps = db.prepare("SELECT COUNT(*) AS n FROM steps WHERE run_id = ?").get(run.id) as { n: number };
       assert.equal(steps.n, 0, "no step/work may be runnable for a refused run");
       const methods = fs.readFileSync(transcript, "utf-8").trim().split("\n")
@@ -1862,6 +2098,7 @@ describe("runWorkflow", () => {
         await runWorkflow({
           workflowId,
           taskTitle: "Test matchlock refusal on absent config root",
+          matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
           workingDirectoryForHarness: repoDir,
           matchlockImage: "vic/matchlock-base:latest",
         });
@@ -1931,13 +2168,14 @@ describe("runWorkflow", () => {
           runWorkflow({
             workflowId,
             taskTitle: "Test worktree-mode admission refusal fixture retention",
+            matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
             worktreeOriginRepository: originDir,
             matchlockImage: "vic/matchlock-base:latest",
           }),
           (err: unknown) =>
             err instanceof MatchlockAdmissionError &&
             err.code === "image_unusable" &&
-            /could not resolve image/.test(err.message),
+            /is not usable: image_unusable/.test(err.message),
           "runWorkflow must refuse an unresolvable image in worktree mode AFTER creating the managed worktree",
         );
 
@@ -1953,7 +2191,7 @@ describe("runWorkflow", () => {
         assert.equal(run.scheduling_status, null, "the refused run must never be schedulable");
         const runContext = JSON.parse(run.context) as Record<string, string>;
         assert.equal(runContext.workspace_mode, "worktree");
-        assert.match(runContext.launch_error ?? "", /could not resolve image/, "launch_error diagnostics retained");
+        assert.match(runContext.launch_error ?? "", /is not usable: image_unusable/, "launch_error diagnostics retained");
         const steps = db.prepare("SELECT COUNT(*) AS n FROM steps WHERE run_id = ?").get(run.id) as { n: number };
         assert.equal(steps.n, 0, "no step/work may be runnable for a refused run");
 
@@ -2090,7 +2328,7 @@ describe("runWorkflow", () => {
         req.on("end", () => {
           if (req.method === "GET" && req.url === "/control/health") {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true }));
+            res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
             return;
           }
           if (req.method === "POST" && req.url === "/control/register-run") {
@@ -2229,7 +2467,7 @@ describe("runWorkflow", () => {
         req.on("end", () => {
           if (req.method === "GET" && req.url === "/control/health") {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true }));
+            res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
             return;
           }
           if (req.method === "POST" && req.url === "/control/register-run") {
@@ -2426,7 +2664,7 @@ describe("runWorkflow", () => {
         req.on("end", () => {
           if (req.method === "GET" && req.url === "/control/health") {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true }));
+            res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
             return;
           }
           if (req.method === "POST" && req.url === "/control/register-run") {
@@ -2689,6 +2927,813 @@ describe("runWorkflow", () => {
     });
   });
 
+  // MTLK-ISO-SLICE2 US-008 (PREP-STATE): a failed run that records the
+  // isolation intent but no pinned Matchlock policy is mid-preparation. The
+  // failed-run resume must route it to preparation recovery (held), NEVER
+  // native, and must record no root consent.
+  describe("US-008: resume refuses native treatment of an intent-only run", () => {
+    it("routes an intent-only failed run to a held/preparing result without touching the control plane", async () => {
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      const harnessDir = path.join(tempHome, "us008-intent-only");
+      fs.mkdirSync(harnessDir, { recursive: true });
+      db.prepare(
+        `INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'failed', ?, ?, ?)`,
+      ).run(
+        runId,
+        808,
+        "test-us008-resume",
+        "US-008 intent-only resume",
+        JSON.stringify({ working_directory_for_harness: path.resolve(harnessDir) }),
+        now,
+        now,
+      );
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, type, created_at, updated_at)
+         VALUES (?, ?, 'implement', 'dev', 0, 'input', 'STATUS, CHANGES, TESTS', 'failed', 'single', ?, ?)`,
+      ).run(stepId, runId, now, now);
+      db.prepare(
+        "UPDATE runs SET isolation_intent = 'true', matchlock_policy = NULL WHERE id = ?",
+      ).run(runId);
+
+      // A recording fake control plane: a native resume would hit
+      // /control/health and /control/register-run. The held route must never
+      // reach the control plane at all (no native scheduling admission).
+      const requests: string[] = [];
+      const fake = http.createServer((req, res) => {
+        requests.push(`${req.method} ${req.url}`);
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        fake.once("error", reject);
+        fake.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = fake.address();
+      assert.ok(address && typeof address === "object");
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(address.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId);
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        fake.closeAllConnections?.();
+        await new Promise<void>((resolve) => fake.close(() => resolve()));
+      }
+
+      assert.equal(result.status, "preparing", "an intent-only resume must be HELD, never resumed");
+      assert.ok(result.preparingHeld, "the held/preparing remedy must be surfaced");
+      assert.match(result.preparingHeld!.message, /isolation intent is recorded/i);
+      assert.match(result.preparingHeld!.message, /held non-schedulable/i);
+      assert.match(result.preparingHeld!.message, /retry preparation|recreate the run/i);
+      assert.equal(result.schedulingState, "preparing");
+
+      const row = db
+        .prepare(
+          "SELECT status, scheduling_status, scheduling_error, matchlock_policy, isolation_intent FROM runs WHERE id = ?",
+        )
+        .get(runId) as {
+          status: string;
+          scheduling_status: string | null;
+          scheduling_error: string | null;
+          matchlock_policy: string | null;
+          isolation_intent: string | null;
+        };
+      assert.equal(row.status, "failed", "the run's prior (failed) state is preserved");
+      assert.equal(row.scheduling_status, "preparing", "the row is held non-schedulable");
+      assert.equal(row.scheduling_error, null);
+      assert.equal(row.matchlock_policy, null, "no policy is fabricated or fabricated consent written");
+      assert.equal(row.isolation_intent, "true", "the isolation-intent marker is preserved");
+      assert.equal(
+        requests.length,
+        0,
+        "the held route must not touch the control plane (never native registration)",
+      );
+    });
+  });
+
+  // MTLK-ISO-SLICE2 US-010 (R13): the failed-run resume form accepts the
+  // root-usage override and applies the spec C §4.4 executable order — validate
+  // the persisted policy, determine effective root permission, run the
+  // permitted checks (the SAME swap-capability handshake as admission), then
+  // commit the consent flip + scheduling transition in one short DB section.
+  // A refusal preserves the run's prior state; automatic/bulk callers never
+  // manufacture consent.
+  describe("US-010: failed-run Matchlock resume consent and re-run swap handshake", () => {
+    function buildResumePolicy(over: {
+      rootUsageConsent?: boolean;
+      requestedImageSource?: "explicit" | "standard";
+      swapMB?: number;
+      asV2?: boolean;
+    } = {}): string {
+      const built = buildMatchlockPolicy({
+        requestedImage: "igorhvr/tamandua:latest",
+        requestedImageSource: over.requestedImageSource ?? "standard",
+        identity: {
+          digest: `sha256:${"a".repeat(64)}`,
+          config_digest: `sha256:${"b".repeat(64)}`,
+          tag: "igorhvr/tamandua:latest",
+        },
+        harness: "pi",
+        workingDirectory: tempHome,
+        originalRepositoryRoot: tempHome,
+        workMounts: [{ hostPath: tempHome, hostRealPath: tempHome, guestPath: tempHome }],
+        gitMetadataRoots: [],
+        resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: over.swapMB ?? 8192 },
+        rootUsageConsent: over.rootUsageConsent === true,
+      });
+      if (!over.asV2) return serializeMatchlockPolicy(built);
+      const record = JSON.parse(serializeMatchlockPolicy(built)) as Record<string, unknown>;
+      record.version = 2;
+      delete record.requestedImageSource;
+      delete record.rootUsageConsent;
+      delete (record.resourceLimits as Record<string, unknown>).swapMB;
+      return JSON.stringify(record);
+    }
+
+    async function seedFailedResumeRun(opts: {
+      workflowId?: string;
+      matchlockPolicy?: string | null;
+      isolationIntent?: boolean;
+    }): Promise<{ runId: string; harnessDir: string }> {
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      const harnessDir = path.join(tempHome, `us010-${crypto.randomUUID().slice(0, 8)}`);
+      fs.mkdirSync(harnessDir, { recursive: true });
+      db.prepare(
+        `INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at, matchlock_policy, isolation_intent)
+         VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?)`,
+      ).run(
+        runId,
+        1010,
+        opts.workflowId ?? "test-us010-resume",
+        "US-010 failed-run resume",
+        JSON.stringify({ working_directory_for_harness: path.resolve(harnessDir) }),
+        now,
+        now,
+        opts.matchlockPolicy ?? null,
+        opts.isolationIntent ? "true" : null,
+      );
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, type, created_at, updated_at)
+         VALUES (?, ?, 'implement', 'dev', 0, 'input', 'STATUS, CHANGES, TESTS', 'failed', 'single', ?, ?)`,
+      ).run(stepId, runId, now, now);
+      return { runId, harnessDir };
+    }
+
+    async function resumeRunRow(runId: string): Promise<{
+      status: string;
+      scheduling_status: string | null;
+      scheduling_error: string | null;
+      matchlock_policy: string | null;
+      isolation_intent: string | null;
+    }> {
+      const { getDb } = await import("../../dist/db.js");
+      return getDb()
+        .prepare(
+          "SELECT status, scheduling_status, scheduling_error, matchlock_policy, isolation_intent FROM runs WHERE id = ?",
+        )
+        .get(runId) as {
+        status: string;
+        scheduling_status: string | null;
+        scheduling_error: string | null;
+        matchlock_policy: string | null;
+        isolation_intent: string | null;
+      };
+    }
+
+    /**
+     * MTLK-ISO2-CORRECTIVE (Family B3): a FULL durable-artifact snapshot so a
+     * refusal test can assert exact before/after equality over every artifact
+     * the resume request may touch (consent/policy, status, scheduling, drain
+     * marker, context, harness probe, steps and stories) — not just 3 fields.
+     */
+    async function snapshotResumeArtifacts(runId: string): Promise<{
+      row: Record<string, unknown>;
+      steps: Array<Record<string, unknown>>;
+      stories: Array<Record<string, unknown>>;
+    }> {
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const row = db
+        .prepare(
+          `SELECT status, scheduling_status, scheduling_requested_at, scheduling_error,
+                  matchlock_policy, isolation_intent, context, harness_probe_status, harness_probe_at
+           FROM runs WHERE id = ?`,
+        )
+        .get(runId) as Record<string, unknown>;
+      const steps = db
+        .prepare(
+          "SELECT id, status, retry_count, output FROM steps WHERE run_id = ? ORDER BY step_index, id",
+        )
+        .all(runId) as Array<Record<string, unknown>>;
+      const stories = db
+        .prepare(
+          "SELECT id, status, retry_count, output, resume_reset_count FROM stories WHERE run_id = ? ORDER BY id",
+        )
+        .all(runId) as Array<Record<string, unknown>>;
+      return { row, steps, stories };
+    }
+
+    /** Recording fake control plane: health + register-run, all other paths 200. */
+    async function startRecordingControlPlane(registerResponse?: {
+      status: number;
+      body: Record<string, unknown>;
+    }): Promise<{
+      port: number;
+      requests: string[];
+      close: () => Promise<void>;
+    }> {
+      const requests: string[] = [];
+      const server = http.createServer((req, res) => {
+        requests.push(`${req.method} ${req.url}`);
+        req.on("data", () => {});
+        req.on("end", () => {
+          if (req.method === "GET" && req.url === "/control/health") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
+            return;
+          }
+          if (
+            req.method === "POST" &&
+            req.url === "/control/register-run" &&
+            registerResponse
+          ) {
+            res.writeHead(registerResponse.status, { "content-type": "application/json" });
+            res.end(JSON.stringify(registerResponse.body));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      return {
+        port: address.port,
+        requests,
+        close: async () => {
+          server.closeAllConnections?.();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    function journalingProbe(result: (binaryPath: string) => {
+      supported: boolean;
+      binaryPath: string;
+      reasonCode?: "missing_binary" | "unsupported" | "probe_failed";
+      reason?: string;
+    }): { probe: MatchlockSwapSupportProbe; paths: string[] } {
+      const paths: string[] = [];
+      return {
+        paths,
+        probe: (binaryPath) => {
+          paths.push(binaryPath);
+          return result(binaryPath);
+        },
+      };
+    }
+
+    it("REFUSES the override for a truly native failed run and preserves its state", async () => {
+      const { runId } = await seedFailedResumeRun({});
+      const result = await resumeWorkflow(runId, { matchlockRootUsageOverride: true });
+
+      assert.equal(result.status, "refused");
+      assert.equal(result.matchlockRefused?.code, "matchlock_root_usage_override_not_applicable");
+      assert.match(result.matchlockRefused!.message, /truly native run/);
+      assert.match(result.matchlockRefused!.message, /isolation intent and no persisted Matchlock policy/);
+
+      const row = await resumeRunRow(runId);
+      assert.equal(row.status, "failed", "a refusal preserves the prior (failed) state");
+      assert.equal(row.matchlock_policy, null);
+      assert.equal(row.scheduling_status, null);
+    });
+
+    it("REFUSES a non-NULL unusable policy with STATUS-UNUSABLE before consent is consulted", async () => {
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: "not json" });
+      const result = await resumeWorkflow(runId, {
+        matchlockRootUsageOverride: true,
+        // euid 0 proves the STATUS-UNUSABLE refusal precedes the root gate.
+        effectiveUid: () => 0,
+      });
+
+      assert.equal(result.status, "refused");
+      assert.equal(result.matchlockRefused?.code, "policy_json_invalid");
+      assert.match(result.matchlockRefused!.message, /ISOLATION POLICY UNUSABLE/);
+
+      const row = await resumeRunRow(runId);
+      assert.equal(row.status, "failed");
+      assert.equal(row.matchlock_policy, "not json", "the unusable record is preserved verbatim");
+    });
+
+    it("routes an intent-only failed run PLUS the override to preparation recovery (no consent)", async () => {
+      const { runId } = await seedFailedResumeRun({ isolationIntent: true });
+      const result = await resumeWorkflow(runId, { matchlockRootUsageOverride: true });
+
+      assert.equal(result.status, "preparing");
+      assert.ok(result.preparingHeld);
+      const row = await resumeRunRow(runId);
+      assert.equal(row.status, "failed");
+      assert.equal(row.scheduling_status, "preparing");
+      assert.equal(row.matchlock_policy, null, "no consent/policy is fabricated for an intent-only row");
+      assert.equal(row.isolation_intent, "true");
+    });
+
+    it("grants consent on the override at euid 0 and commits the scheduling transition coherently", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: false, requestedImageSource: "standard" });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const swap = journalingProbe((binaryPath) => ({ supported: true, binaryPath }));
+      const fake = await startRecordingControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId, {
+          matchlockRootUsageOverride: true,
+          effectiveUid: () => 0,
+          matchlockSwapSupportProbe: swap.probe,
+        });
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+
+      assert.equal(result.status, "resumed", `expected resumed, got ${result.status}`);
+      assert.ok(swap.paths.length >= 1, "the re-run swap handshake must run before re-registration");
+
+      const row = await resumeRunRow(runId);
+      assert.equal(row.status, "running", "the scheduling transition rode the consent write");
+      assert.equal(row.scheduling_status, "pending_register");
+      const before = parseMatchlockPolicy(original);
+      const after = parseMatchlockPolicy(row.matchlock_policy as string);
+      assert.equal(after.rootUsageConsent, true, "the override flips consent to true");
+      // Everything except the consent bit is preserved VERBATIM.
+      assert.deepEqual(after, { ...before, rootUsageConsent: true });
+      assert.equal(after.resourceLimits.swapMB, 8192);
+      assert.equal(after.resolvedImageDigest, before.resolvedImageDigest);
+      assert.equal(after.requestedImageSource, "standard");
+    });
+
+    it("REFUSES a consent-less resume at euid 0 and preserves the prior state", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: false });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const result = await resumeWorkflow(runId, {
+        effectiveUid: () => 0,
+        matchlockSwapSupportProbe: () => {
+          throw new Error("the swap probe must not run before the root gate");
+        },
+      });
+
+      assert.equal(result.status, "refused");
+      assert.equal(result.matchlockRefused?.code, "matchlock_root_usage_refused");
+      assert.match(result.matchlockRefused!.message, /refusing to execute a Matchlock run as root/);
+
+      const row = await resumeRunRow(runId);
+      assert.equal(row.status, "failed", "failed stays failed");
+      assert.equal(row.matchlock_policy, original, "no consent was written");
+    });
+
+    it("lets a root resume proceed when consent is already recorded (no override)", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: true });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const swap = journalingProbe((binaryPath) => ({ supported: true, binaryPath }));
+      const fake = await startRecordingControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId, {
+          effectiveUid: () => 0,
+          matchlockSwapSupportProbe: swap.probe,
+        });
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+
+      assert.equal(result.status, "resumed");
+      const row = await resumeRunRow(runId);
+      assert.equal(parseMatchlockPolicy(row.matchlock_policy as string).rootUsageConsent, true);
+    });
+
+    it("refuses an unsupporting binary with the admission swap taxonomy and touches no control plane", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: true });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const swap = journalingProbe((binaryPath) => ({
+        supported: false,
+        binaryPath,
+        reasonCode: "unsupported",
+        reason: "no --swap",
+      }));
+      const fake = await startRecordingControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId, { matchlockSwapSupportProbe: swap.probe });
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+
+      assert.equal(result.status, "refused");
+      assert.equal(result.matchlockRefused?.code, "matchlock_swap_unsupported");
+      assert.match(result.matchlockRefused!.message, /tamandua matchlock setup/);
+      assert.equal(swap.paths.length, 1, "the handshake ran exactly once");
+
+      const row = await resumeRunRow(runId);
+      assert.equal(row.status, "failed");
+      assert.equal(row.scheduling_status, null, "no scheduling transition on a refusal");
+      assert.equal(row.matchlock_policy, original);
+      assert.equal(fake.requests.length, 0, "a refusal must not touch the control plane");
+    });
+
+    it("keeps the matchlock_unavailable classification for a missing binary", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: true });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const swap = journalingProbe((binaryPath) => ({
+        supported: false,
+        binaryPath,
+        reasonCode: "missing_binary",
+        reason: `matchlock binary not found: ${binaryPath}`,
+      }));
+      const result = await resumeWorkflow(runId, { matchlockSwapSupportProbe: swap.probe });
+
+      assert.equal(result.status, "refused");
+      assert.equal(result.matchlockRefused?.code, "matchlock_unavailable");
+      const row = await resumeRunRow(runId);
+      assert.equal(row.status, "failed");
+    });
+
+    it("never manufactures consent on the bulk/no-override path (inherit-only)", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: false });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const swap = journalingProbe((binaryPath) => ({ supported: true, binaryPath }));
+      const fake = await startRecordingControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        // No override — as reconciler / rugpull / resume-all callers do.
+        result = await resumeWorkflow(runId, { matchlockSwapSupportProbe: swap.probe });
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+
+      assert.equal(result.status, "resumed");
+      const row = await resumeRunRow(runId);
+      const after = parseMatchlockPolicy(row.matchlock_policy as string);
+      assert.equal(after.rootUsageConsent, false, "a bulk resume inherits recorded consent only");
+      assert.deepEqual(after, parseMatchlockPolicy(original), "the stored record is unchanged");
+    });
+
+    it("normalizes a v2 record to v3 on a consent grant while preserving identity/pin/mounts", async () => {
+      const originalV2 = buildResumePolicy({ asV2: true });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: originalV2 });
+      const swap = journalingProbe((binaryPath) => ({ supported: true, binaryPath }));
+      const fake = await startRecordingControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      let result: Awaited<ReturnType<typeof resumeWorkflow>>;
+      try {
+        result = await resumeWorkflow(runId, {
+          matchlockRootUsageOverride: true,
+          effectiveUid: () => 0,
+          matchlockSwapSupportProbe: swap.probe,
+        });
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+
+      assert.equal(result.status, "resumed");
+      const row = await resumeRunRow(runId);
+      const before = parseMatchlockPolicy(originalV2);
+      const after = parseMatchlockPolicy(row.matchlock_policy as string);
+      assert.equal(after.version, MATCHLOCK_POLICY_VERSION, "the write is a fresh v3 record");
+      assert.equal(after.rootUsageConsent, true);
+      assert.equal(after.requestedImageSource, "explicit", "v2 normalizes provenance to explicit");
+      assert.equal(after.resourceLimits.swapMB, 0, "v2 normalizes swap to off");
+      assert.deepEqual(after.identity, before.identity);
+      assert.deepEqual(after.workMounts, before.workMounts);
+      assert.deepEqual(after.resourceLimits, { ...before.resourceLimits, swapMB: 0 });
+    });
+
+    // MTLK-ISO-SLICE2 US-013: the shared advisory warnings channel on the
+    // failed-run resume result (present only when non-empty; advisory only).
+    async function resumeWithWarnings(
+      runId: string,
+      opts: { rootUsageOverride: boolean; euid: number },
+    ): Promise<{ result: Awaited<ReturnType<typeof resumeWorkflow>> }> {
+      const swap = journalingProbe((binaryPath) => ({ supported: true, binaryPath }));
+      const fake = await startRecordingControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        const result = await resumeWorkflow(runId, {
+          ...(opts.rootUsageOverride ? { matchlockRootUsageOverride: true } : {}),
+          effectiveUid: () => opts.euid,
+          matchlockSwapSupportProbe: swap.probe,
+        });
+        return { result };
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+    }
+
+    it("US-013: a consent-granting failed-run resume returns consent_granted_on_resume only", async () => {
+      const { runId } = await seedFailedResumeRun({
+        matchlockPolicy: buildResumePolicy({ rootUsageConsent: false }),
+      });
+      const { result } = await resumeWithWarnings(runId, { rootUsageOverride: true, euid: 0 });
+
+      assert.equal(result.status, "resumed");
+      assert.ok(result.warnings, "a consent-granting resume carries the warnings channel");
+      assert.deepEqual(result.warnings!.map((w) => w.code), ["consent_granted_on_resume"]);
+      assert.match(result.warnings![0].message, /consent was granted/);
+      assert.doesNotMatch(result.warnings![0].message, /executed as root/);
+    });
+
+    it("US-013: an inherited-consent failed-run resume returns root_usage_override", async () => {
+      const { runId } = await seedFailedResumeRun({
+        matchlockPolicy: buildResumePolicy({ rootUsageConsent: true }),
+      });
+      const { result } = await resumeWithWarnings(runId, { rootUsageOverride: false, euid: 1000 });
+
+      assert.equal(result.status, "resumed");
+      assert.deepEqual(result.warnings?.map((w) => w.code), ["root_usage_override"]);
+      assert.match(result.warnings![0].message, /AUTHORIZED/);
+    });
+
+    it("US-013: a clean failed-run resume omits the warnings channel", async () => {
+      const { runId } = await seedFailedResumeRun({
+        matchlockPolicy: buildResumePolicy({ rootUsageConsent: false }),
+      });
+      const { result } = await resumeWithWarnings(runId, { rootUsageOverride: false, euid: 1000 });
+
+      assert.equal(result.status, "resumed");
+      assert.equal(result.warnings, undefined, "absent — never [] — on a clean resume");
+    });
+
+    // MTLK-ISO2-CORRECTIVE (Family B2): a cancellation during the preflight
+    // (policy bytes unchanged) must survive; the stale resume may not
+    // resurrect the row to running.
+    it("B2: a concurrent cancellation during the preflight is never resurrected", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: true });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      let releaseGate!: (r: { supported: boolean; binaryPath: string }) => void;
+      const gate = new Promise<{ supported: boolean; binaryPath: string }>((resolve) => {
+        releaseGate = resolve;
+      });
+      let enteredResolve!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enteredResolve = resolve;
+      });
+      const fake = await startRecordingControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        const resumeP = resumeWorkflow(runId, {
+          matchlockSwapSupportProbe: async (binaryPath) => {
+            enteredResolve();
+            const r = await gate;
+            return { ...r, binaryPath };
+          },
+        });
+        await entered;
+        // Concurrent cancellation changes ONLY the state; policy bytes are
+        // unchanged, which the OLD guard would have missed.
+        const { getDb } = await import("../../dist/db.js");
+        getDb()
+          .prepare("UPDATE runs SET status = 'canceled', scheduling_status = 'canceled' WHERE id = ?")
+          .run(runId);
+        releaseGate({ supported: true, binaryPath: "matchlock" });
+        const result = await resumeP;
+        assert.equal(result.status, "refused", "the stale resume must refuse");
+        const row = await resumeRunRow(runId);
+        assert.equal(row.status, "canceled", "the cancellation wins");
+        assert.equal(row.scheduling_status, "canceled");
+        assert.equal(row.matchlock_policy, original, "no consent was written");
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+    });
+
+    // MTLK-ISO2-CORRECTIVE (Family B3): a registration 409 after a consent
+    // grant must be COMPENSATED to the exact prior state with no retained
+    // rootUsageConsent:true.
+    it("B3: a registration 409 restores EVERY durable artifact and withholds consent", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: false });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const before = await snapshotResumeArtifacts(runId);
+      const fake = await startRecordingControlPlane({
+        status: 409,
+        body: { state: "refused", error: "harness workdir held", message: "harness workdir held" },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        const result = await resumeWorkflow(runId, {
+          matchlockRootUsageOverride: true,
+          effectiveUid: () => 0,
+          matchlockSwapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+          matchlockInheritedImageVerifier: async () => {},
+        });
+        assert.equal(result.status, "refused");
+        // FULL before/after equality over every durable artifact: consent
+        // (policy bytes), status, scheduling status/requested-at/error, drain
+        // marker (context), isolation intent, harness probe, steps and stories.
+        const after = await snapshotResumeArtifacts(runId);
+        assert.deepEqual(after, before, "no residual request-created state may remain");
+        assert.equal(after.row.matchlock_policy, original, "no retained consent grant");
+        assert.equal(
+          parseMatchlockPolicy(after.row.matchlock_policy as string).rootUsageConsent,
+          false,
+        );
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+    });
+
+    it("B3: a registration 409 on a swap-OFF resume also restores every durable artifact", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: false, swapMB: 0 });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const before = await snapshotResumeArtifacts(runId);
+      const fake = await startRecordingControlPlane({
+        status: 409,
+        body: { state: "refused", error: "harness workdir held" },
+      });
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        const result = await resumeWorkflow(runId, {
+          matchlockRootUsageOverride: true,
+          effectiveUid: () => 0,
+          matchlockSwapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+          matchlockInheritedImageVerifier: async () => {},
+        });
+        assert.equal(result.status, "refused");
+        const after = await snapshotResumeArtifacts(runId);
+        assert.deepEqual(after, before, "swap-off: no residual request-created state may remain");
+        assert.equal(after.row.matchlock_policy, original);
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+    });
+
+    // MTLK-ISO2-CORRECTIVE (Family B1): an injected moved/absent inherited
+    // image refuses BOTH before any state write, for a swap-OFF run too.
+    it("B1: a moved/absent inherited image refuses a swap-off resume with zero transition", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: true, swapMB: 0 });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const fake = await startRecordingControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        const result = await resumeWorkflow(runId, {
+          matchlockSwapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+          matchlockInheritedImageVerifier: async () => {
+            throw new Error("image moved: digest mismatch");
+          },
+        });
+        assert.equal(result.status, "refused");
+        assert.match(result.matchlockRefused?.message ?? "", /image/i);
+        const row = await resumeRunRow(runId);
+        assert.equal(row.status, "failed");
+        assert.equal(row.scheduling_status, null);
+        assert.equal(row.matchlock_policy, original, "the policy is byte-identical");
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+    });
+
+    // MTLK-ISO2-CORRECTIVE (Finding D, D-enforce): the control client refuses
+    // to talk to a daemon that does not advertise the PREP-STATE capability,
+    // on BOTH entry paths the client owns. These exercise the REAL run.ts
+    // entry points (not the capability helper directly) so they are
+    // baseline-compatible: on the unmodified base no guard exists and the run
+    // is created/registered, so both assertions are red there.
+    async function startPrePrepStateControlPlane(): Promise<{
+      port: number;
+      close: () => Promise<void>;
+    }> {
+      const server = http.createServer((req, res) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          // Deliberately NO prepStateCapability: a pre-PREP-STATE daemon.
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, status: "ok" }));
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const addr = server.address();
+      assert.ok(addr && typeof addr === "object");
+      return {
+        port: addr.port,
+        close: async () => {
+          server.closeAllConnections?.();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    it("D: a failed-run resume against a pre-PREP-STATE daemon is refused before any state write", async () => {
+      const original = buildResumePolicy({ rootUsageConsent: true });
+      const { runId } = await seedFailedResumeRun({ matchlockPolicy: original });
+      const fake = await startPrePrepStateControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      try {
+        const result = await resumeWorkflow(runId, {
+          matchlockSwapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+          matchlockInheritedImageVerifier: async () => {},
+        });
+        assert.equal(result.status, "refused", "the resume must not proceed");
+        assert.equal(
+          result.matchlockRefused?.code,
+          "matchlock_daemon_prep_state_unsupported",
+          "typed capability refusal",
+        );
+        assert.match(result.matchlockRefused?.message ?? "", /PREP-STATE capability/);
+        const row = await resumeRunRow(runId);
+        assert.equal(row.status, "failed", "no running resurrection");
+        assert.equal(row.scheduling_status, null, "no scheduling transition");
+        assert.equal(row.matchlock_policy, original, "no consent/state write");
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+      }
+    });
+
+    it("D: a fresh opted-in launch against a pre-PREP-STATE daemon refuses BEFORE the intent INSERT", async () => {
+      const workflowId = `d-cap-${crypto.randomUUID().slice(0, 8)}`;
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = path.join(MTLK_FIXTURE_BASE, `${workflowId}-repo`);
+      initGitRepo(repoDir);
+      const fake = await startPrePrepStateControlPlane();
+      const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
+      process.env.TAMANDUA_CONTROL_PORT = String(fake.port);
+      const db = (await import("../../dist/db.js")).getDb();
+      try {
+        await assert.rejects(
+          () =>
+            runWorkflow({
+              workflowId,
+              taskTitle: "D capability refusal",
+              workingDirectoryForHarness: repoDir,
+              matchlockImage: "vic/matchlock-base:latest",
+              matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
+            }),
+          /PREP-STATE capability/,
+          "an older daemon must be refused",
+        );
+        const count = db
+          .prepare("SELECT COUNT(*) AS n FROM runs WHERE workflow_id = ?")
+          .get(workflowId) as { n: number };
+        assert.equal(count.n, 0, "the intent-only row must never be inserted");
+      } finally {
+        if (prevControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = prevControlPort;
+        else delete process.env.TAMANDUA_CONTROL_PORT;
+        await fake.close();
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   // RPRB (6sy.37): an EXPLICIT `workflow resume` of a run whose launch-time
   // harness probe recorded a definitive 'failed' outcome must clear that
   // outcome (and its timestamp) so a fresh once-per-run probe runs. 'ok' must
@@ -2706,7 +3751,7 @@ describe("runWorkflow", () => {
         req.on("end", () => {
           if (req.method === "GET" && req.url === "/control/health") {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true }));
+            res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
             return;
           }
           if (req.method === "POST" && req.url === "/control/register-run") {

@@ -294,7 +294,17 @@ describe("control-client test-isolation guard", { concurrency: 1 }, () => {
 
     const server = http.createServer((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ runningRuns: 0, scheduledRuns: 0, launched: 0 }));
+      // Advertise the current PREP-STATE capability: the nudge path performs
+      // the Finding D capability handshake before POSTing /control/nudge, and
+      // this fixture models a current (not pre-PREP-STATE) daemon.
+      res.end(
+        JSON.stringify({
+          runningRuns: 0,
+          scheduledRuns: 0,
+          launched: 0,
+          prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE",
+        }),
+      );
     });
 
     let serverPort = 0;
@@ -331,15 +341,13 @@ describe("control-client test-isolation guard", { concurrency: 1 }, () => {
 
     try {
       const { nudgeWithDaemon } = await import("../../dist/server/control-client.js");
+      // Guard is inactive, so the request proceeds past the isolation guard.
+      // The capability handshake is NOT applied to a global nudge (Family D
+      // scoping), so this call must never throw a PREP-STATE refusal: it either
+      // finds no daemon (null) or reaches whatever peer is listening.
       const response = await nudgeWithDaemon(500);
-
-      // Guard is inactive, so the request proceeds. It may fail to
-      // connect (returning null) or hit a real daemon if one is
-      // running — either outcome means the guard didn't block it.
-      // The important thing is the function doesn't short-circuit
-      // via the guard.
       assert.ok(
-        response === null || (typeof response.status === "number"),
+        response === null || typeof response.status === "number",
         "guard should not interfere when inactive",
       );
     } finally {
@@ -1042,6 +1050,292 @@ describe("US-004 monotonic waitForDaemonControl budget", { concurrency: 1 }, () 
     } finally {
       Date.now = realNow;
       restoreEnv(saved);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// MTLK-ISO-SLICE2 US-009 (R13): the resume root-usage override is threaded
+// to POST /control/resume-run ONLY when explicitly supplied; the
+// automatic/bulk callers never manufacture consent.
+// ══════════════════════════════════════════════════════════════════════
+describe("US-009 resume root-usage override threading", { concurrency: 1 }, () => {
+  interface CapturedBody {
+    [key: string]: unknown;
+  }
+
+  function captureServer(): {
+    server: http.Server;
+    bodies: CapturedBody[];
+    start: () => Promise<number>;
+  } {
+    const bodies: CapturedBody[] = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const raw = Buffer.concat(chunks).toString("utf-8");
+        bodies.push(raw ? (JSON.parse(raw) as CapturedBody) : {});
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ state: "pending_register" }));
+      });
+    });
+    const start = () =>
+      new Promise<number>((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+          const addr = server.address();
+          resolve(addr && typeof addr === "object" ? addr.port : 0);
+        });
+      });
+    return { server, bodies, start };
+  }
+
+  it("sends matchlockRootUsageOverride ONLY when the explicit override is supplied", async () => {
+    const { root, homeDir } = createTempHome("tamandua-cc-resume-");
+    const savedHome = process.env.HOME;
+    const savedStateDir = process.env.TAMANDUA_STATE_DIR;
+    const savedPort = process.env.TAMANDUA_CONTROL_PORT;
+    const { server, bodies, start } = captureServer();
+    const port = await start();
+    try {
+      const secretDir = path.join(homeDir, ".tamandua");
+      fs.mkdirSync(secretDir, { recursive: true });
+      fs.writeFileSync(path.join(secretDir, "daemon-secret"), "test-secret", "utf-8");
+      process.env.HOME = homeDir;
+      process.env.TAMANDUA_STATE_DIR = secretDir;
+      process.env.TAMANDUA_CONTROL_PORT = String(port);
+
+      const { resumeRunWithDaemon } = await import("../../dist/server/control-client.js");
+
+      // Bulk/automatic form (resume-all, MCP, dashboard): no override -> the
+      // body must NOT carry the field.
+      const bulk = await resumeRunWithDaemon("run-native", "resume-all");
+      assert.equal(bulk?.status, 200);
+
+      // Explicit per-action override -> the field is present and true.
+      const consented = await resumeRunWithDaemon("run-mtlk", "cli", true);
+      assert.equal(consented?.status, 200);
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = savedStateDir;
+      if (savedPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
+      else process.env.TAMANDUA_CONTROL_PORT = savedPort;
+      await new Promise<void>((r) => server.close(() => r()));
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+
+    assert.equal(bodies.length, 2);
+    assert.deepEqual(bodies[0], { runId: "run-native", requestedBy: "resume-all" });
+    assert.deepEqual(bodies[1], {
+      runId: "run-mtlk",
+      requestedBy: "cli",
+      matchlockRootUsageOverride: true,
+    });
+  });
+});
+
+describe("MTLK-ISO2-CORRECTIVE D: PREP-STATE daemon capability handshake", { concurrency: 1 }, () => {
+  let savedHome: string | undefined;
+  let savedStateDir: string | undefined;
+  let savedControlPort: string | undefined;
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    savedStateDir = process.env.TAMANDUA_STATE_DIR;
+    savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
+  });
+
+  afterEach(() => {
+    if (savedHome !== undefined) process.env.HOME = savedHome;
+    else delete process.env.HOME;
+    if (savedStateDir !== undefined) process.env.TAMANDUA_STATE_DIR = savedStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    if (savedControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = savedControlPort;
+    else delete process.env.TAMANDUA_CONTROL_PORT;
+  });
+
+  async function startHealthServer(body: Record<string, unknown>): Promise<{
+    port: number;
+    close: () => Promise<void>;
+  }> {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+    let serverPort = 0;
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (addr && typeof addr === "object") serverPort = addr.port;
+        resolve();
+      });
+    });
+    return {
+      port: serverPort,
+      close: async () => {
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    };
+  }
+
+  function isolateHome(): string {
+    const { root } = createTempHome("tamandua-d-cap-");
+    const secretDir = path.join(root, ".tamandua");
+    fs.mkdirSync(secretDir, { recursive: true });
+    fs.writeFileSync(path.join(secretDir, "daemon-secret"), "isolated-secret", "utf-8");
+    process.env.HOME = root;
+    process.env.TAMANDUA_STATE_DIR = secretDir;
+    return root;
+  }
+
+  it("refuses a peer that does not advertise the PREP-STATE capability", async () => {
+    const root = isolateHome();
+    const server = await startHealthServer({ status: "ok" });
+    process.env.TAMANDUA_CONTROL_PORT = String(server.port);
+    try {
+      const { assertDaemonPrepStateCapability } = await import("../../dist/server/control-client.js");
+      await assert.rejects(
+        assertDaemonPrepStateCapability(2000),
+        /PREP-STATE capability/,
+        "an old (pre-PREP-STATE) daemon must be refused",
+      );
+    } finally {
+      await server.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a peer that advertises the capability", async () => {
+    const root = isolateHome();
+    const server = await startHealthServer({
+      status: "ok",
+      prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE",
+    });
+    process.env.TAMANDUA_CONTROL_PORT = String(server.port);
+    try {
+      const { assertDaemonPrepStateCapability } = await import("../../dist/server/control-client.js");
+      await assertDaemonPrepStateCapability(2000);
+    } finally {
+      await server.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Start a controlled fake daemon that records every request path it
+   * receives. `onNudge` runs when (and only when) a POST /control/nudge
+   * arrives, so a test can detect whether the client actually reached the
+   * nudge endpoint.
+   */
+  async function startRecordingNudgeServer(body: Record<string, unknown>, onNudge?: () => void): Promise<{
+    port: number;
+    requests: string[];
+    close: () => Promise<void>;
+  }> {
+    const requests: string[] = [];
+    const server = http.createServer((req, res) => {
+      requests.push(`${req.method} ${req.url}`);
+      req.on("data", () => {});
+      req.on("end", () => {
+        if (req.method === "POST" && req.url === "/control/nudge") onNudge?.();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(body));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    const addr = server.address();
+    assert.ok(addr && typeof addr === "object");
+    return {
+      port: addr.port,
+      requests,
+      close: async () => {
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    };
+  }
+
+  it("nudgeWithDaemon is not globally capability-gated (native-only behavior unchanged)", async () => {
+    const root = isolateHome();
+    const server = await startRecordingNudgeServer({ ok: true, runningRuns: 0 });
+    process.env.TAMANDUA_CONTROL_PORT = String(server.port);
+    try {
+      const { nudgeWithDaemon } = await import("../../dist/server/control-client.js");
+      const response = await nudgeWithDaemon(2000);
+      assert.equal(response?.status, 200, "a nudge must still reach a capability-less peer");
+      assert.ok(
+        server.requests.some((r) => r === "POST /control/nudge"),
+        "a native nudge must not be short-circuited by a missing capability token",
+      );
+    } finally {
+      await server.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("an intent-only row carries the legacy-honored pause_drain hold (older daemons cannot dispatch it)", async () => {
+    // MTLK-ISO2-MEND (Family D): the mixed-version exclusion for an
+    // isolation-intent row is structural. The opted-in initial hold rides the
+    // EXACT state an older reader already treats as non-schedulable, so the
+    // client nudge needs no global capability gate.
+    const {
+      initialRunIsolationState,
+      PAUSE_DRAIN_CONTEXT_KEY,
+      DRAINING_PAUSE_SCHEDULING_STATUS,
+      readIsolationState,
+    } = await import("../../dist/installer/matchlock/prep-state.js");
+    const held = initialRunIsolationState(true, "2026-01-01T00:00:00.000Z");
+    assert.equal(held.schedulingStatus, DRAINING_PAUSE_SCHEDULING_STATUS);
+    assert.equal(
+      held.contextSeed[PAUSE_DRAIN_CONTEXT_KEY],
+      "true",
+      "the legacy-honored context hold is seeded",
+    );
+    const row = {
+      isolation_intent: "true",
+      matchlock_policy: null,
+      scheduling_status: held.schedulingStatus,
+      context: JSON.stringify(held.contextSeed),
+    };
+    assert.equal(readIsolationState(row), "preparing", "new binaries classify it as preparing");
+    // The EXACT pre-PREP-STATE pre-admission guard (provenance: 9f167705
+    // handleRegisterRun): a pause_drain/draining_pause hold returns the typed
+    // drain state without admission, and the legacy nudge loop routes through
+    // the same guard.
+    const legacyContext = JSON.parse(row.context) as Record<string, string>;
+    assert.equal(
+      row.scheduling_status === "draining_pause" ||
+        legacyContext[PAUSE_DRAIN_CONTEXT_KEY] === "true",
+      true,
+      "the legacy register/nudge guard holds the intent-only row",
+    );
+  });
+
+  it("nudgeWithDaemon still reaches a capability-advertising daemon", async () => {
+    const root = isolateHome();
+    let nudged = false;
+    const server = await startRecordingNudgeServer(
+      { ok: true, runningRuns: 0, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" },
+      () => {
+        nudged = true;
+      },
+    );
+    process.env.TAMANDUA_CONTROL_PORT = String(server.port);
+    try {
+      const { nudgeWithDaemon } = await import("../../dist/server/control-client.js");
+      const response = await nudgeWithDaemon(2000);
+      assert.ok(response !== null, "a current daemon must still be nudged");
+      assert.equal(response.status, 200);
+      assert.equal(nudged, true, "the nudge must reach a capability-advertising daemon");
+    } finally {
+      await server.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

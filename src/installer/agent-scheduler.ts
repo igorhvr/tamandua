@@ -13,6 +13,7 @@ import { gitIdentityEnv, readGitIdentityFromContext } from "./git-identity.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
 import { matchlockDispatchDecision } from "./matchlock/dispatch-guard.js";
+import { ISOLATION_INTENT_RECORDED } from "./matchlock/prep-state.js";
 import { matchlockWorkflowRequiresCapability } from "./matchlock/capabilities.js";
 import type { ExecutionIsolation } from "./matchlock/policy.js";
 import type { DshSessionInventory } from "./matchlock/dsh-adapter-contract.js";
@@ -2199,8 +2200,8 @@ export async function executeDispatchRound(
       const { getDb } = await import("../db.js");
       const db = getDb();
       const row = db
-        .prepare("SELECT status, scheduling_status, context, run_number, matchlock_policy FROM runs WHERE id = ?")
-        .get(job.runId) as { status: string; scheduling_status: string | null; context: string; run_number: number | null; matchlock_policy: string | null } | undefined;
+        .prepare("SELECT status, scheduling_status, context, run_number, matchlock_policy, isolation_intent FROM runs WHERE id = ?")
+        .get(job.runId) as { status: string; scheduling_status: string | null; context: string; run_number: number | null; matchlock_policy: string | null; isolation_intent: string | null } | undefined;
       if (row?.run_number !== null && row?.run_number !== undefined) {
         runNumber = row.run_number;
       }
@@ -2274,12 +2275,45 @@ export async function executeDispatchRound(
       // refused run, and no fake success is produced. NULL-policy (native)
       // runs are unaffected and never consult Matchlock beyond this pure parse
       // gate.
-      if (row.matchlock_policy) {
-        const decision = matchlockDispatchDecision(row.matchlock_policy, {
+      // MTLK-ISO-SLICE2 US-006 consumer audit: classify the persisted policy
+      // by EXPLICIT non-NULL-ness, never truthiness — an empty-string policy
+      // is a non-NULL (unusable) policy and must reach the dispatch gate (which
+      // refuses it) rather than silently skipping to the native harness path.
+      // MTLK-ISO-SLICE2 US-007 (PREP-STATE): a row whose isolation intent is
+      // recorded but whose policy has not been persisted yet is ALSO routed
+      // through the gate — it is HELD, never native. No consent can make it
+      // runnable.
+      const isolationIntent = row.isolation_intent === ISOLATION_INTENT_RECORDED;
+      if (
+        (row.matchlock_policy !== null && row.matchlock_policy !== undefined) ||
+        isolationIntent
+      ) {
+        const decision = matchlockDispatchDecision(row.matchlock_policy ?? null, {
           workflowId: job.workflowId,
           harnessType: job.harnessType ?? "pi",
+          isolationIntent,
         });
         if (decision.refused) {
+          if (decision.held) {
+            // PREP-STATE held: an in-flight/short-circuited preparation must
+            // NOT be force-failed and must never reach the native harness or a
+            // VM. Surface the typed held outcome and stay non-schedulable.
+            logger.info("Dispatch round held — Matchlock isolation intent recorded, policy pending", {
+              ...context,
+              code: decision.code,
+              reason: "matchlock_preparing_held",
+            });
+            emitEvent({
+              ts: new Date().toISOString(),
+              event: "run.matchlock_dispatch_held",
+              runId: job.runId,
+              workflowId: job.workflowId,
+              reason: decision.code,
+              detail: decision.message,
+            });
+            // Return WITHOUT spawning the native harness, the probe or any VM.
+            return;
+          }
           logger.warn("Dispatch round refused — Matchlock run not admitted for dispatch", {
             ...context,
             code: decision.code,
@@ -2372,10 +2406,26 @@ export async function executeDispatchRound(
         }
       }
     } catch (err) {
-      logger.warn("Run status check failed; continuing dispatch round", {
+      // MTLK-ISO2-MEND (Family C-2): this read is the ONLY thing that decides
+      // whether the round is Matchlock-isolated. Failing open would leave
+      // `matchlockPolicy` NULL and fall through to the native probe/harness
+      // path for an isolated or intent-only row. Fail CLOSED: refuse the round
+      // (the run stays non-schedulable and a later tick retries).
+      logger.error("Run status check failed; refusing dispatch round (fail closed)", {
         ...context,
         error: String(err),
       });
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "run.dispatch_refused",
+        runId: job.runId,
+        workflowId: job.workflowId,
+        reason: "run_status_read_failed",
+        detail:
+          "The run/policy read failed; the dispatch round was refused rather than " +
+          "falling through to the native harness path.",
+      });
+      return;
     }
 
     // ── PGID liveness watchdog (global sweep) ───────────────────

@@ -40,6 +40,10 @@ const RUN_TARGET_COLUMNS = [
   "ceiling_expiry_count",
   "instant_fail_count",
   "matchlock_policy",
+  // MTLK-ISO2-TRANSITION-CAS (Family C-2): the host-owned isolation intent must
+  // ride the projection so a held/preparing (intent, NULL-policy) row is
+  // classified as preparing/held downstream instead of native.
+  "isolation_intent",
 ].join(", ");
 
 /** Minimal read-only db surface this module needs (injectable for tests). */
@@ -69,6 +73,8 @@ export interface RunTargetRow {
   ceiling_expiry_count?: number | null;
   instant_fail_count?: number | null;
   matchlock_policy?: string | null;
+  /** Raw `runs.isolation_intent` marker (`"true"` when recorded). */
+  isolation_intent?: string | null;
   [key: string]: unknown;
 }
 
@@ -84,6 +90,12 @@ export interface ResolvedRunTarget {
   updatedAt: string | null;
   /** Harness the run was launched with (`context.harness_type`); null if unknown. */
   harnessType: string | null;
+  /**
+   * Raw `runs.isolation_intent` marker. `"true"` means the host recorded an
+   * isolation intent; combined with a NULL `row.matchlock_policy` the target is
+   * a held/preparing row, never native.
+   */
+  isolationIntent: string | null;
   /** Managed worktree path when the run has a `run_worktrees` row; else null. */
   worktreePath: string | null;
   /** The raw, projected run row. */
@@ -186,6 +198,7 @@ function toTarget(row: RunTargetRow, worktreePath: string | null): ResolvedRunTa
     createdAt: asString(row.created_at),
     updatedAt: asString(row.updated_at),
     harnessType: parseHarnessTypeFromContext(asString(row.context)),
+    isolationIntent: asString(row.isolation_intent),
     worktreePath,
     row,
   };

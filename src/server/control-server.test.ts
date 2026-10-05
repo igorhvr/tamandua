@@ -267,6 +267,47 @@ describe("daemon control plane", { concurrency: 1 }, () => {
     db2.close();
   });
 
+  it("POST /control/register-run HELDS an intent-only row (typed preparing, never native)", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    // MTLK-ISO-SLICE2 US-007: `active` + zero steps would otherwise hit the
+    // admission fast-path and report "active"; the intent-only hold must win.
+    // Warm the daemon so it has applied the schema before the direct insert.
+    await jsonRequest("POST", "/control/register-run", { runId: crypto.randomUUID() }, secret);
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, scheduling_requested_at, created_at, updated_at, matchlock_policy, isolation_intent) VALUES (?, ?, 'prep-held-http', 'running', '{}', 0, 'active', ?, ?, ?, NULL, 'true')",
+    ).run(runId, "wf-prep-held-http", now, now, now);
+    db.close();
+
+    const r = await jsonRequest("POST", "/control/register-run", { runId }, secret);
+    assert.equal(r.status, 202, JSON.stringify(r.body));
+    assert.equal(r.body.state, "preparing");
+    assert.equal(r.body.isolationIntent, true);
+    assert.match(String(r.body.message), /Held non-schedulable/);
+
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2
+      .prepare("SELECT status, scheduling_status, matchlock_policy FROM runs WHERE id = ?")
+      .get(runId) as {
+      status: string;
+      scheduling_status: string | null;
+      matchlock_policy: string | null;
+    };
+    assert.equal(row.status, "running", "an intent-only row must not silently succeed");
+    assert.equal(row.scheduling_status, "preparing", "the typed preparing-held state is recorded");
+    assert.equal(row.matchlock_policy, null, "no policy was invented");
+    db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db2.close();
+  });
+
   it("POST /control/terminate-run is a no-op for unknown run", async (t) => {
     if (!daemon) {
       t.skip("daemon not started");
@@ -2100,12 +2141,22 @@ describe("control-server unit exports", () => {
 
 import {
   _admitOrQueueRun,
+  _admitQueuedRunsOnce,
+  _handleResumeRunForTest,
+  _reconcileOnce,
+  _setResumeEffectiveUidForTest,
+  _setResumeMatchlockPreflightForTest,
   type RunRow,
 } from "../../dist/server/control-server.js";
 import {
   _scheduledJobCountForRun,
   shutdownAllCrons,
 } from "../../dist/installer/agent-scheduler.js";
+import {
+  buildMatchlockPolicy,
+  parseMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../dist/installer/matchlock/policy.js";
 
 describe("control-server save-tokens context wiring", () => {
   let tempHome: string;
@@ -2233,6 +2284,239 @@ describe("control-server save-tokens context wiring", () => {
       );
     });
   }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// MTLK-ISO-SLICE2 US-007 (PREP-STATE): registration/reconciler refuse
+// native treatment of intent-recorded rows with a NULL policy.
+// ══════════════════════════════════════════════════════════════════════
+
+describe("control-server PREP-STATE intent-only held registration", { concurrency: 1 }, () => {
+  let tempHome: string;
+  let stateDir: string;
+  let dbPath: string;
+  let origStateDir: string | undefined;
+  let origDbPath: string | undefined;
+  let origMaxTimers: string | undefined;
+  let origHome: string | undefined;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origStateDir = process.env.TAMANDUA_STATE_DIR;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    origMaxTimers = process.env.TAMANDUA_MAX_ACTIVE_TIMERS;
+
+    tempHome = tamanduaTempDir("tamandua-prep-register-");
+    stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    dbPath = path.join(stateDir, "tamandua.db");
+
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_MAX_ACTIVE_TIMERS = "10";
+  });
+
+  afterEach(() => {
+    shutdownAllCrons();
+    if (origHome) process.env.HOME = origHome;
+    else delete process.env.HOME;
+    if (origStateDir) process.env.TAMANDUA_STATE_DIR = origStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    if (origDbPath) process.env.TAMANDUA_DB_PATH = origDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (origMaxTimers) process.env.TAMANDUA_MAX_ACTIVE_TIMERS = origMaxTimers;
+    else delete process.env.TAMANDUA_MAX_ACTIVE_TIMERS;
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  function createMinimalWorkflow(workflowId: string): void {
+    const workflowDir = path.join(stateDir, "workflows", workflowId);
+    fs.mkdirSync(workflowDir, { recursive: true });
+    const yml = [
+      `id: ${workflowId}`,
+      `name: PREP-STATE Registration Test`,
+      `agents:`,
+      `  - id: developer`,
+      `    role: coding`,
+      `    workspace:`,
+      `      baseDir: agents/developer`,
+      `steps:`,
+      `  - id: impl`,
+      `    agent: developer`,
+      `    input: "implement feature"`,
+      `    expects: "implementation"`,
+    ].join("\n");
+    fs.writeFileSync(path.join(workflowDir, "workflow.yml"), yml, "utf-8");
+  }
+
+  interface InsertOpts {
+    schedulingStatus: string;
+    isolationIntent?: boolean;
+    matchlockPolicy?: string | null;
+    withStep?: boolean;
+  }
+
+  async function insertRun(
+    runId: string,
+    workflowId: string,
+    opts: InsertOpts,
+  ): Promise<void> {
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, scheduling_requested_at, created_at, updated_at, matchlock_policy, isolation_intent) VALUES (?, ?, 'prep-register-test', 'running', ?, 0, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      runId,
+      workflowId,
+      JSON.stringify({ working_directory_for_harness: tempHome }),
+      opts.schedulingStatus,
+      now,
+      now,
+      now,
+      opts.matchlockPolicy ?? null,
+      opts.isolationIntent ? "true" : null,
+    );
+    if (opts.withStep !== false) {
+      const stepId = crypto.randomUUID();
+      db.prepare(
+        "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'impl', ?, 0, 'implement', 'implementation', 'waiting', 0, 3, 'single', NULL, ?, ?)",
+      ).run(stepId, runId, `${workflowId}_developer`, now, now);
+    }
+  }
+
+  async function runRow(runId: string): Promise<{
+    status: string;
+    scheduling_status: string | null;
+    scheduling_error: string | null;
+    matchlock_policy: string | null;
+    isolation_intent: string | null;
+  }> {
+    const { getDb } = await import("../../dist/db.js");
+    return getDb()
+      .prepare(
+        "SELECT status, scheduling_status, scheduling_error, matchlock_policy, isolation_intent FROM runs WHERE id = ?",
+      )
+      .get(runId) as {
+      status: string;
+      scheduling_status: string | null;
+      scheduling_error: string | null;
+      matchlock_policy: string | null;
+      isolation_intent: string | null;
+    };
+  }
+
+  it("_admitOrQueueRun HELDS an intent-only row: typed preparing state, no native timers, no native admission", async () => {
+    const workflowId = `wf-prep-hold-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    await insertRun(runId, workflowId, { schedulingStatus: "error", isolationIntent: true });
+
+    const { getDb } = await import("../../dist/db.js");
+    const run = getDb()
+      .prepare(
+        "SELECT id, workflow_id, status, scheduling_status, context, matchlock_policy, isolation_intent FROM runs WHERE id = ?",
+      )
+      .get(runId) as RunRow | undefined;
+    assert.ok(run, "run should exist in DB");
+
+    const result = await _admitOrQueueRun(run!);
+    assert.equal(result.status, 202, `expected a retriable 202, got ${result.status}: ${JSON.stringify(result.body)}`);
+    assert.equal(result.body.state, "preparing");
+    assert.equal(result.body.isolationIntent, true);
+    assert.match(String(result.body.message), /Held non-schedulable/);
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "running", "the held run must not silently succeed");
+    assert.equal(row.scheduling_status, "preparing", "the typed preparing-held state is recorded");
+    assert.equal(row.scheduling_error, null, "a preparation is not an error");
+    assert.equal(row.matchlock_policy, null, "no policy was invented");
+    assert.equal(
+      _scheduledJobCountForRun(runId),
+      0,
+      "no native dispatch timers may be created for an intent-only row",
+    );
+  });
+
+  it("_reconcileOnce does not admit an intent-only row from a schedulable-drift state (no native work, no silent success)", async () => {
+    const workflowId = `wf-prep-reconcile-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    // 'error' IS selected by the reconciler's desired query; the guard, not the
+    // query, is what must hold the intent-only row.
+    await insertRun(runId, workflowId, { schedulingStatus: "error", isolationIntent: true });
+
+    await _reconcileOnce();
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "running", "the reconciler must not silently succeed a held run");
+    assert.equal(row.scheduling_status, "preparing", "the reconciler records the typed preparing-held state");
+    assert.equal(row.matchlock_policy, null, "no policy was invented by recovery");
+    assert.equal(
+      _scheduledJobCountForRun(runId),
+      0,
+      "recovery must produce no native dispatch timers for an intent-only row",
+    );
+  });
+
+  it("_admitQueuedRunsOnce HELDS an intent-only queued row (no native timers)", async () => {
+    const workflowId = `wf-prep-queued-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    await insertRun(runId, workflowId, { schedulingStatus: "queued", isolationIntent: true });
+
+    await _admitQueuedRunsOnce();
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "running");
+    assert.equal(row.scheduling_status, "preparing");
+    assert.equal(
+      _scheduledJobCountForRun(runId),
+      0,
+      "a queued intent-only row must never drain into native timers",
+    );
+  });
+
+  it("an intent-recorded row WITH a persisted policy is admitted normally (no false hold)", async () => {
+    const workflowId = `wf-prep-policy-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const policy = serializeMatchlockPolicy(
+      buildMatchlockPolicy({
+        requestedImage: "vic/ml:latest",
+        identity: {
+          digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          tag: "vic/ml:latest",
+        },
+        harness: "pi",
+        workingDirectory: tempHome,
+        originalRepositoryRoot: tempHome,
+        workMounts: [{ hostPath: tempHome, hostRealPath: tempHome, guestPath: tempHome }],
+        gitMetadataRoots: [],
+      }),
+    );
+    await insertRun(runId, workflowId, {
+      schedulingStatus: "error",
+      isolationIntent: true,
+      matchlockPolicy: policy,
+    });
+
+    const { getDb } = await import("../../dist/db.js");
+    const run = getDb()
+      .prepare(
+        "SELECT id, workflow_id, status, scheduling_status, context, matchlock_policy, isolation_intent FROM runs WHERE id = ?",
+      )
+      .get(runId) as RunRow | undefined;
+
+    const result = await _admitOrQueueRun(run!);
+    assert.notEqual(result.body.state, "preparing", "a persisted policy releases the hold");
+    assert.ok(result.status === 200 || result.status === 202);
+    assert.ok(_scheduledJobCountForRun(runId) > 0, "the policy-backed run is admitted normally");
+    const row = await runRow(runId);
+    assert.equal(row.scheduling_status, "active");
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════
@@ -3955,6 +4239,465 @@ describe("register-run during teardown (FFRC retriable gate)", { concurrency: 1 
         "run teardown in progress, retry",
         `expected the precise retriable message, got: ${JSON.stringify(r.body)}`,
       );
+    } finally {
+      _setRunMidTeardownForTest(runId, false);
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// MTLK-ISO-SLICE2 US-009 (R13): the paused/draining control-plane resume
+// root-usage override and consent path (spec C §4.4/§2.5/§2.6). Driven
+// in-process so the effective-uid seam can be toggled (the HTTP tests spawn
+// a separate daemon process).
+// ══════════════════════════════════════════════════════════════════════
+
+describe("control-server US-009 resume root-usage consent", { concurrency: 1 }, () => {
+  let tempHome: string;
+  let stateDir: string;
+  let dbPath: string;
+  let origStateDir: string | undefined;
+  let origDbPath: string | undefined;
+  let origHome: string | undefined;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origStateDir = process.env.TAMANDUA_STATE_DIR;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+
+    tempHome = tamanduaTempDir("tamandua-us009-resume-");
+    stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    dbPath = path.join(stateDir, "tamandua.db");
+
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    // Default to a non-root daemon; root-specific tests override per-case.
+    _setResumeEffectiveUidForTest(1000);
+    // MTLK-ISO2-CORRECTIVE: the shared resume preflight performs the swap
+    // handshake + inherited-image re-verify. Default the seams to a supporting
+    // fake so no real binary/RPC is used; failure-injection tests override.
+    _setResumeMatchlockPreflightForTest({
+      swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+      verifyInheritedImage: async () => {},
+    });
+  });
+
+  afterEach(() => {
+    shutdownAllCrons();
+    _setResumeEffectiveUidForTest(null);
+    _setResumeMatchlockPreflightForTest(null);
+    if (origHome) process.env.HOME = origHome;
+    else delete process.env.HOME;
+    if (origStateDir) process.env.TAMANDUA_STATE_DIR = origStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    if (origDbPath) process.env.TAMANDUA_DB_PATH = origDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  function createMinimalWorkflow(workflowId: string): void {
+    const workflowDir = path.join(stateDir, "workflows", workflowId);
+    fs.mkdirSync(workflowDir, { recursive: true });
+    const yml = [
+      `id: ${workflowId}`,
+      `name: US-009 Resume Consent Test`,
+      `agents:`,
+      `  - id: developer`,
+      `    role: coding`,
+      `    workspace:`,
+      `      baseDir: agents/developer`,
+      `steps:`,
+      `  - id: impl`,
+      `    agent: developer`,
+      `    input: "implement feature"`,
+      `    expects: "implementation"`,
+    ].join("\n");
+    fs.writeFileSync(path.join(workflowDir, "workflow.yml"), yml, "utf-8");
+  }
+
+  function matchlockPolicy(opts: { rootUsageConsent?: boolean; requestImageSource?: "explicit" | "standard" } = {}): string {
+    return serializeMatchlockPolicy(
+      buildMatchlockPolicy({
+        requestedImage: "igorhvr/tamandua:latest",
+        requestedImageSource: opts.requestImageSource ?? "standard",
+        identity: {
+          digest: `sha256:${"a".repeat(64)}`,
+          config_digest: `sha256:${"b".repeat(64)}`,
+          tag: "igorhvr/tamandua:latest",
+        },
+        harness: "pi",
+        workingDirectory: tempHome,
+        originalRepositoryRoot: tempHome,
+        workMounts: [{ hostPath: tempHome, hostRealPath: tempHome, guestPath: tempHome }],
+        gitMetadataRoots: [],
+        resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 },
+        rootUsageConsent: opts.rootUsageConsent === true,
+      }),
+    );
+  }
+
+  async function insertPausedRun(
+    runId: string,
+    workflowId: string,
+    opts: { matchlockPolicy?: string | null; isolationIntent?: boolean } = {},
+  ): Promise<void> {
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, scheduling_requested_at, created_at, updated_at, matchlock_policy, isolation_intent) VALUES (?, ?, 'us009-resume-test', 'paused', ?, 0, 'paused', ?, ?, ?, ?, ?)",
+    ).run(
+      runId,
+      workflowId,
+      JSON.stringify({ working_directory_for_harness: tempHome }),
+      now,
+      now,
+      now,
+      opts.matchlockPolicy ?? null,
+      opts.isolationIntent ? "true" : null,
+    );
+    const stepId = crypto.randomUUID();
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'impl', ?, 0, 'implement', 'implementation', 'waiting', 0, 3, 'single', NULL, ?, ?)",
+    ).run(stepId, runId, `${workflowId}_developer`, now, now);
+  }
+
+  async function runRow(runId: string): Promise<{
+    status: string;
+    scheduling_status: string | null;
+    scheduling_error: string | null;
+    matchlock_policy: string | null;
+    isolation_intent: string | null;
+  }> {
+    const { getDb } = await import("../../dist/db.js");
+    return getDb()
+      .prepare(
+        "SELECT status, scheduling_status, scheduling_error, matchlock_policy, isolation_intent FROM runs WHERE id = ?",
+      )
+      .get(runId) as {
+      status: string;
+      scheduling_status: string | null;
+      scheduling_error: string | null;
+      matchlock_policy: string | null;
+      isolation_intent: string | null;
+    };
+  }
+
+  it("REFUSES the override for a truly native run and leaves it paused", async () => {
+    const workflowId = `wf-us009-native-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    await insertPausedRun(runId, workflowId, {});
+
+    const result = await _handleResumeRunForTest(runId, "cli", true);
+    assert.equal(result.status, 422, `expected refusal, got ${result.status}: ${JSON.stringify(result.body)}`);
+    assert.match(String(result.body.error), /truly native run/);
+    assert.match(String(result.body.error), /--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs/);
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "paused", "a refusal preserves the prior state");
+    assert.equal(row.scheduling_status, "paused");
+    assert.equal(row.matchlock_policy, null, "no policy was invented");
+    assert.equal(_scheduledJobCountForRun(runId), 0, "nothing was scheduled natively");
+  });
+
+  it("routes an intent-only row to preparation recovery (never native, no consent)", async () => {
+    const workflowId = `wf-us009-prep-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    await insertPausedRun(runId, workflowId, { isolationIntent: true });
+
+    const result = await _handleResumeRunForTest(runId, "cli", true);
+    assert.equal(result.status, 202, `expected held 202, got ${result.status}: ${JSON.stringify(result.body)}`);
+    assert.equal(result.body.state, "preparing");
+    assert.equal(result.body.held, true);
+    assert.match(String(result.body.message), /held non-schedulable/);
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "paused", "the held run is never marked running");
+    assert.equal(row.scheduling_status, "preparing", "the typed preparing-held state is recorded");
+    assert.equal(row.matchlock_policy, null, "consent never invents a policy for an intent-only row");
+    assert.equal(_scheduledJobCountForRun(runId), 0, "no native timers for a held run");
+  });
+
+  it("REFUSES a non-NULL unusable policy on the STATUS-UNUSABLE path before consent", async () => {
+    const workflowId = `wf-us009-unusable-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: "" });
+
+    const result = await _handleResumeRunForTest(runId, "cli", true);
+    assert.equal(result.status, 422, `expected refusal, got ${result.status}: ${JSON.stringify(result.body)}`);
+    assert.match(String(result.body.error), /ISOLATION POLICY UNUSABLE/);
+    assert.match(String(result.body.error), /policy_json_invalid/);
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "paused", "a refusal preserves the prior state");
+    assert.equal(row.matchlock_policy, "", "the unusable policy is left untouched (no consent write)");
+    assert.equal(_scheduledJobCountForRun(runId), 0);
+  });
+
+  it("a consented root resume commits rootUsageConsent true with the scheduling transition, preserving the image identity", async () => {
+    const workflowId = `wf-us009-consent-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: false, requestImageSource: "standard" });
+    const before = parseMatchlockPolicy(stored);
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(0);
+
+    const result = await _handleResumeRunForTest(runId, "cli", true);
+    assert.ok(
+      result.status === 200 || result.status === 202,
+      `expected success, got ${result.status}: ${JSON.stringify(result.body)}`,
+    );
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "running", "the scheduling transition was committed");
+    assert.ok(row.matchlock_policy, "the consented policy was persisted");
+    const after = parseMatchlockPolicy(row.matchlock_policy as string);
+    assert.equal(after.rootUsageConsent, true, "consent was recorded");
+    // Everything except consent is preserved VERBATIM.
+    assert.deepEqual(after.identity, before.identity);
+    assert.deepEqual(after.resourceLimits, before.resourceLimits);
+    assert.deepEqual(after.workMounts, before.workMounts);
+    assert.equal(after.requestedImageSource, before.requestedImageSource);
+  });
+
+  it("a root resume without the override REFUSES a consent-less Matchlock run and preserves its state", async () => {
+    const workflowId = `wf-us009-root-refuse-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: false });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(0);
+
+    const result = await _handleResumeRunForTest(runId, "cli", false);
+    assert.equal(result.status, 422, `expected refusal, got ${result.status}: ${JSON.stringify(result.body)}`);
+    assert.match(String(result.body.error), /refusing to execute a Matchlock run as root/);
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "paused", "root refusal preserves paused state");
+    assert.equal(row.scheduling_status, "paused");
+    assert.equal(
+      parseMatchlockPolicy(row.matchlock_policy as string).rootUsageConsent,
+      false,
+      "no consent was invented",
+    );
+    assert.equal(_scheduledJobCountForRun(runId), 0);
+  });
+
+  it("a non-root bulk resume never manufactures consent", async () => {
+    const workflowId = `wf-us009-bulk-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: false });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(1000);
+
+    const result = await _handleResumeRunForTest(runId, "resume-all", false);
+    assert.ok(result.status === 200 || result.status === 202);
+
+    const row = await runRow(runId);
+    assert.equal(row.status, "running");
+    assert.equal(
+      parseMatchlockPolicy(row.matchlock_policy as string).rootUsageConsent,
+      false,
+      "the automatic/bulk path inherits only the recorded consent",
+    );
+  });
+
+  it("a non-root explicit override still records consent truthfully", async () => {
+    const workflowId = `wf-us009-nonroot-consent-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: false });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(1000);
+
+    const result = await _handleResumeRunForTest(runId, "cli", true);
+    assert.ok(result.status === 200 || result.status === 202);
+
+    const row = await runRow(runId);
+    assert.equal(parseMatchlockPolicy(row.matchlock_policy as string).rootUsageConsent, true);
+  });
+
+  // MTLK-ISO-SLICE2 US-013: the shared advisory warnings channel rides the
+  // resume JSON body ONLY when non-empty (absent — never `[]` — otherwise).
+  it("US-013: a consent-granting resume carries the consent_granted_on_resume warning", async () => {
+    const workflowId = `wf-us013-grant-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: false });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(1000);
+
+    const result = await _handleResumeRunForTest(runId, "cli", true);
+    assert.ok(result.status === 200 || result.status === 202, JSON.stringify(result.body));
+    const warnings = result.body.warnings as Array<{ code: string; message: string }>;
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].code, "consent_granted_on_resume");
+    assert.match(warnings[0].message, /consent was granted/);
+  });
+
+  it("US-013: an inherited-consent resume carries the root_usage_override warning", async () => {
+    const workflowId = `wf-us013-inherit-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: true });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(1000);
+
+    const result = await _handleResumeRunForTest(runId, "cli", false);
+    assert.ok(result.status === 200 || result.status === 202, JSON.stringify(result.body));
+    const warnings = result.body.warnings as Array<{ code: string; message: string }>;
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].code, "root_usage_override");
+    assert.match(warnings[0].message, /AUTHORIZED/);
+    assert.doesNotMatch(warnings[0].message, /executed as root/);
+  });
+
+  it("US-013: a clean resume omits the warnings key (absent, never [])", async () => {
+    const workflowId = `wf-us013-clean-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: false });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(1000);
+
+    const result = await _handleResumeRunForTest(runId, "cli", false);
+    assert.ok(result.status === 200 || result.status === 202, JSON.stringify(result.body));
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(result.body, "warnings"),
+      false,
+      "a clean resume body must not carry the warnings key",
+    );
+  });
+
+  // MTLK-ISO2-CORRECTIVE (F8): a repeated override on an already-consented run
+  // must not report a NEWLY granted consent.
+  it("does not report a newly granted consent when the override repeats on an already-consented run", async () => {
+    const workflowId = `wf-f8-repeat-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: true });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(1000);
+
+    const result = await _handleResumeRunForTest(runId, "cli", true);
+    assert.ok(result.status === 200 || result.status === 202, JSON.stringify(result.body));
+    const warnings = (result.body.warnings ?? []) as Array<{ code: string }>;
+    assert.equal(
+      warnings.some((w) => w.code === "consent_granted_on_resume"),
+      false,
+      "an unchanged consent must not be reported as newly granted",
+    );
+  });
+
+  // MTLK-ISO2-CORRECTIVE (Family B1): the shared preflight performs the swap
+  // handshake BEFORE any state write; a refusal preserves the paused row.
+  it("a preflight swap refusal preserves the paused state and never grants consent", async () => {
+    const workflowId = `wf-b1-refuse-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: false });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(1000);
+    _setResumeMatchlockPreflightForTest({
+      swapSupportProbe: (binaryPath) => ({
+        supported: false,
+        binaryPath,
+        reasonCode: "unsupported",
+        reason: "no --swap",
+      }),
+      verifyInheritedImage: async () => {},
+    });
+
+    const before = await runRow(runId);
+    const result = await _handleResumeRunForTest(runId, "cli", true);
+    assert.equal(result.status, 422, JSON.stringify(result.body));
+    const after = await runRow(runId);
+    assert.deepEqual(after, before, "a refused resume leaves the row byte-identical");
+    assert.equal(_scheduledJobCountForRun(runId), 0);
+  });
+
+  // MTLK-ISO2-CORRECTIVE (Family B3/c): a harness-validation refusal preserves
+  // the run's prior scheduling state (paused) for an isolated run.
+  it("a harness-validation refusal preserves the paused scheduling state", async () => {
+    const workflowId = `wf-b3-valid-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: true });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    _setResumeEffectiveUidForTest(1000);
+
+    // Point the run's harness workdir at a directory that does not exist so
+    // validateRunHarnessForScheduling refuses after the preflight.
+    const { getDb } = await import("../../dist/db.js");
+    getDb()
+      .prepare("UPDATE runs SET context = ? WHERE id = ?")
+      .run(JSON.stringify({ working_directory_for_harness: path.join(tempHome, "missing-workdir") }), runId);
+
+    const result = await _handleResumeRunForTest(runId, "cli", false);
+    assert.equal(result.status, 422, JSON.stringify(result.body));
+    const row = await runRow(runId);
+    assert.equal(row.status, "paused", "a validation refusal preserves paused");
+    assert.equal(row.scheduling_status, "paused", "never rewritten to error");
+  });
+
+  // MTLK-ISO2-CORRECTIVE (Family B3): a LATE registration refusal after a
+  // consent-granting commit must COMPENSATE every durable write the request
+  // made — restoring the exact prior state with NO retained
+  // rootUsageConsent:true and no residual step/context change. A mid-teardown
+  // register returns a non-2xx refusal, taking the same
+  // compensateControlMatchlockResume path as a 409 workdir refusal.
+  it("a late registration refusal compensates a granted consent to the exact prior state", async () => {
+    const workflowId = `wf-b3-comp-${crypto.randomUUID().slice(0, 8)}`;
+    const runId = crypto.randomUUID();
+    createMinimalWorkflow(workflowId);
+    const stored = matchlockPolicy({ rootUsageConsent: false });
+    await insertPausedRun(runId, workflowId, { matchlockPolicy: stored, isolationIntent: true });
+    // Root daemon + override: the preflight GRANTS consent, so the commit
+    // writes a consented policy before registration is attempted.
+    _setResumeEffectiveUidForTest(0);
+
+    const { getDb } = await import("../../dist/db.js");
+    const snapshot = (): Record<string, unknown> => {
+      const db = getDb();
+      const row = db
+        .prepare(
+          `SELECT status, scheduling_status, scheduling_requested_at, scheduling_error,
+                  matchlock_policy, isolation_intent, context
+           FROM runs WHERE id = ?`,
+        )
+        .get(runId) as Record<string, unknown>;
+      const steps = db
+        .prepare(
+          "SELECT id, status, retry_count, output FROM steps WHERE run_id = ? ORDER BY step_index, id",
+        )
+        .all(runId);
+      return { row, steps };
+    };
+    const before = snapshot();
+    const { _setRunMidTeardownForTest } = await import("../../dist/server/control-server.js");
+    _setRunMidTeardownForTest(runId, true);
+    try {
+      const result = await _handleResumeRunForTest(runId, "cli", true);
+      assert.equal(result.status, 503, JSON.stringify(result.body));
+      const after = snapshot();
+      assert.deepEqual(after, before, "every request-created durable write was compensated");
+      const row = await runRow(runId);
+      assert.equal(row.status, "paused", "back to the prior paused state");
+      assert.equal(row.scheduling_status, "paused", "prior scheduling state restored");
+      assert.equal(row.matchlock_policy, stored, "no retained consent grant");
+      assert.equal(
+        parseMatchlockPolicy(row.matchlock_policy as string).rootUsageConsent,
+        false,
+        "consent was withheld",
+      );
+      assert.equal(_scheduledJobCountForRun(runId), 0, "nothing was scheduled");
     } finally {
       _setRunMidTeardownForTest(runId, false);
     }

@@ -5,10 +5,15 @@
  * Pure filesystem reads (no child_process, no daemon, no VM, no network), so
  * this file stays in the parallel lane and needs no tests/serial-files.txt
  * entry. It pins the operator-facing artifacts US-005 required:
- *   - README Matchlock section: the three `--matchlock-*` size flags, the three
- *     `TAMANDUA_MATCHLOCK_*` env defaults, the host-derived built-in defaults
- *     and the standing caps, the launch line and `workflow status`;
+ *   - README Matchlock section: the `--matchlock-*` size flags plus the swap
+ *     flags, the `TAMANDUA_MATCHLOCK_*` env defaults, the host-derived built-in
+ *     defaults and the standing caps, the launch line and `workflow status`;
  *   - skills/tamandua-agents/SKILL.md: the brief Matchlock VM resources note.
+ *
+ * MTLK-ISO-SLICE1 (US-011) extends the guard to the standard-image opt-in
+ * grammar (`--matchlock` / `--matchlock-image <image>`), the swap default
+ * (8192 MB), the off switch (`--matchlock-no-swap` /
+ * `TAMANDUA_MATCHLOCK_SWAP_MB=off`) and matchlock's 65536 MB swap cap.
  *
  * The design doc (`/home/kaladin/tamandua-matchlock-design.md`) is outside the
  * repo and is not committed, so it is deliberately not asserted here.
@@ -44,22 +49,34 @@ const skillHeading = "#### Matchlock VM resources";
 const skillSection = sliceSection(skill, skillHeading, "### Worktree management");
 
 const REQUIRED_FLAGS = ["--matchlock-cpus", "--matchlock-memory", "--matchlock-disk"];
+const REQUIRED_SWAP_FLAGS = ["--matchlock-swap", "--matchlock-no-swap"];
 const REQUIRED_ENV = [
   "TAMANDUA_MATCHLOCK_CPUS",
   "TAMANDUA_MATCHLOCK_MEMORY_MB",
   "TAMANDUA_MATCHLOCK_DISK_MB",
+  "TAMANDUA_MATCHLOCK_SWAP_MB",
 ];
-const REQUIRED_DEFAULTS = ["min(8, host CPUs)", "min(16384 MB, 50% of host RAM)", "20480 MB"];
+const REQUIRED_DEFAULTS = [
+  "min(8, host CPUs)",
+  "min(16384 MB, 50% of host RAM)",
+  "20480 MB",
+  "8192 MB",
+];
 const REQUIRED_CAPS = [
   "cpus <= 16",
   "host online CPUs",
   "memory <= 75% of host MemTotal",
   "finite positive",
+  "65536 MB",
 ];
-const LAUNCH_LINE = "matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB";
+const LAUNCH_LINE =
+  "matchlock: <image> cpus=<n> memory=<MB>MB disk=<MB>MB swap=<n>MB|off";
 
 function assertDocumentsVmResources(section: string, label: string): void {
   for (const flag of REQUIRED_FLAGS) {
+    assert.ok(section.includes(flag), `${label} must document ${flag}`);
+  }
+  for (const flag of REQUIRED_SWAP_FLAGS) {
     assert.ok(section.includes(flag), `${label} must document ${flag}`);
   }
   for (const envName of REQUIRED_ENV) {
@@ -78,10 +95,11 @@ describe("README documents Matchlock VM resources (MTLK-VM-SIZE US-005)", () => 
     assert.ok(matchlockSection.length > 0, `README must contain '${matchlockHeading}'`);
   });
 
-  it("documents the three size flags and the MB/<n>g syntax", () => {
+  it("documents the three size flags, the swap flags and the MB/<n>g syntax", () => {
     assertDocumentsVmResources(matchlockSection, "README Matchlock section");
     assert.ok(matchlockSection.includes("--matchlock-memory <MB|16g>"));
     assert.ok(matchlockSection.includes("--matchlock-disk <MB|40g>"));
+    assert.ok(matchlockSection.includes("--matchlock-swap <MB|8g>"));
   });
 
   it("documents the env defaults, precedence and the launch/status surfaces", () => {
@@ -90,8 +108,16 @@ describe("README documents Matchlock VM resources (MTLK-VM-SIZE US-005)", () => 
     assert.match(matchlockSection, /workflow status/);
   });
 
-  it("requires the size flags to be paired with --matchlock", () => {
-    assert.match(matchlockSection, /Any of the three\s+requires `--matchlock <image>`/);
+  it("requires the size flags to be paired with either opt-in form", () => {
+    assert.match(
+      matchlockSection,
+      /Any of the four\s+requires an opt-in\s+\(`--matchlock` or `--matchlock-image <image>`\)/,
+    );
+  });
+
+  it("documents the swap default, the off switch and the matchlock cap", () => {
+    assert.match(matchlockSection, /TAMANDUA_MATCHLOCK_SWAP_MB=off/);
+    assert.match(matchlockSection, /--matchlock-no-swap/);
   });
 });
 

@@ -148,6 +148,12 @@ export interface DshSchedulerRound {
    * nothing here reaches the daemon/harness/guest env.
    */
   rpcEnv?: Record<string, string>;
+  /**
+   * MTLK-ISO2-CORRECTIVE: the ONE resolved absolute matchlock binary path the
+   * execution-boundary probe verified for this round; forwarded verbatim to
+   * the RPC transport so probe and child cannot diverge.
+   */
+  rpcBinaryPath?: string;
 }
 
 /** Result of one dsh scheduler round through the runner seam. */
@@ -294,6 +300,7 @@ async function runProductionDshRound(
     // Item 1a: the matchlock CONTROL child runs with the verified short-HOME
     // alias; DSH_HOME (guest) and the harness keep the real config env.
     ...(round.rpcEnv ? { rpcEnv: round.rpcEnv } : {}),
+    ...(round.rpcBinaryPath ? { rpcBinaryPath: round.rpcBinaryPath } : {}),
     // Bounded production stage budgets for cold real-VM invocation (same
     // bounds as the pi seam).
     createTimeoutMs: 240_000,

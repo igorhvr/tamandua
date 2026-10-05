@@ -1,7 +1,7 @@
 # Matchlock dsh Production Qualification Recipe
 
 This document is the operator recipe for the **real** DeepSeek Harness (`dsh`)
-under Matchlock (`--matchlock <image> --dsh-as-harness`) path delivered by the
+under Matchlock (`--matchlock-image <image> --dsh-as-harness`) path delivered by the
 MTLK-DSH-EXEC slice. It records the observed runtime identity (version and
 sha256 hashes, unpinned), the exact
 synthetic qualification already performed, the real-vs-synthetic coverage
@@ -18,7 +18,7 @@ boundary, and the work that remains before this path is production-qualified.
 
 | Axis | Supported |
 |------|-----------|
-| Opt-in | `--matchlock <image>` only (no env/YAML/agent-output/MCP/API activation) |
+| Opt-in | `--matchlock` (standard image `igorhvr/tamandua`, provisioned by `tamandua matchlock setup`) or `--matchlock-image <image>` (explicit, already-imported); no env/YAML/agent-output/MCP/API activation |
 | Harnesses | `--pi-as-harness` (default), `--hermes-as-harness` and `--dsh-as-harness` are all admitted with `--matchlock` (MTLK-INTEGRATE union); this recipe covers the `--dsh-as-harness` slice |
 | Workflows (this dsh slice) | `do-now`, `do-review-do-verify` |
 | Isolation | one **fresh** Matchlock VM per launch probe and per work round |
@@ -527,7 +527,7 @@ merge-worktree gate (no dsh overlay) is unaffected.
 ## 6. Real production recipe (operator)
 
 1. **Provide an image with real dsh.** The operator supplies
-   `--matchlock <image>`; Tamandua never installs dsh on the host for an
+   `--matchlock-image <image>`; Tamandua never installs dsh on the host for an
    opted-in run. The image must already contain the `dsh` executable plus its
    runtime (`node`, etc.) on its declared `PATH`, and must not require a
    provider call merely to boot.
@@ -547,8 +547,8 @@ merge-worktree gate (no dsh overlay) is unaffected.
 3. **Opt in explicitly:**
 
    ```bash
-   tamandua workflow run do-now "<task>" --dsh-as-harness --matchlock <image>
-   tamandua workflow run do-review-do-verify "<task>" --dsh-as-harness --matchlock <image>
+   tamandua workflow run do-now "<task>" --dsh-as-harness --matchlock-image <image>
+   tamandua workflow run do-review-do-verify "<task>" --dsh-as-harness --matchlock-image <image>
    ```
 
    Only `do-now` and `do-review-do-verify` are admitted; everything else

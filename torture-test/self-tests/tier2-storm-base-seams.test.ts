@@ -6,7 +6,7 @@
 //   * the resolved-launch block `workflow run` prints before the synchronous
 //     `run #N (short8) created; preparing workspace...` line
 //     (`working-directory:`/`origin:`, `harness:`, `daemon:`, `matchlock:`);
-//   * the Matchlock flags (`--matchlock`, `--matchlock-cpus`,
+//   * the Matchlock flags (`--matchlock-image`, `--matchlock-cpus`,
 //     `--matchlock-memory`, `--matchlock-disk`) forwarded verbatim on the
 //     launch argv the engine hands the product;
 //   * worker claim authority (`TAMANDUA_WORKER_PID` / `TAMANDUA_WORKER_PGID`)
@@ -109,7 +109,7 @@ describe("tt-storm base-seam conformance (schema-13 product, US-007)", () => {
       originRepository: "/var/repos/origin",
       originRef: "main",
       extra: [
-        "--matchlock", "vic/matchlock-base:latest",
+        "--matchlock-image", "vic/matchlock-base:latest",
         "--matchlock-cpus", "4",
         "--matchlock-memory", "4096",
         "--matchlock-disk", "20480",
@@ -122,7 +122,7 @@ describe("tt-storm base-seam conformance (schema-13 product, US-007)", () => {
       "--context", "branch=broken-tests",
       "--worktree-origin-repository", "/var/repos/origin",
       "--worktree-origin-ref", "main",
-      "--matchlock", "vic/matchlock-base:latest",
+      "--matchlock-image", "vic/matchlock-base:latest",
       "--matchlock-cpus", "4",
       "--matchlock-memory", "4096",
       "--matchlock-disk", "20480",

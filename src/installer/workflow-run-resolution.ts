@@ -20,6 +20,7 @@ import { resolveWorkflowDir } from "./paths.js";
 import { getControlPort } from "../server/control-server.js";
 import { isDaemonControlReachable } from "../server/control-client.js";
 import { formatMatchlockResourceSummary } from "./matchlock/resource-limits.js";
+import type { MatchlockImageSource } from "./matchlock/standard-image.js";
 import type { HarnessType } from "./types.js";
 
 /**
@@ -30,14 +31,34 @@ import type { HarnessType } from "./types.js";
  * same way from a launch as from a status query.
  */
 export interface WorkflowRunLaunchMatchlockResources {
-  /** Requested image reference (`--matchlock <image>`). */
+  /** Requested image reference (`--matchlock` / `--matchlock-image <image>`). */
   image: string;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-011): effective image provenance. `"standard"`
+   * adds the ` (standard image)` marker to the shared launch line; omitted or
+   * `"explicit"` renders no marker.
+   */
+  imageSource?: MatchlockImageSource;
   /** Resolved vCPU count. */
   cpus: number;
   /** Resolved guest memory in MB. */
   memoryMB: number;
   /** Resolved guest disk size in MB. */
   diskSizeMB: number;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-011): resolved guest swap size in MB, where
+   * `0` renders `swap=off`. The launch path always supplies it for an opted-in
+   * run; omitted only by a caller that predates the combined output contract.
+   */
+  swapMB?: number;
+  /**
+   * SHARED-V3 (MTLK-ISO-SLICE2 US-012): immutable OCI content/config digests
+   * from the ADMITTED policy. The pre-admission launch block cannot know them,
+   * so they are supplied only in the post-admission `workflow run --json`
+   * document (where they are folded in from `RunWorkflowResult.matchlockPin`).
+   */
+  imageDigest?: string;
+  imageConfigDigest?: string;
   /**
    * MTLK-ALLOW-PRIVATE (US-006): the launch-resolved (flag > env) per-run
    * exception list of private destinations the VM may reach. Omitted for a
@@ -71,8 +92,9 @@ export interface WorkflowRunLaunchInfo {
   daemonOk: boolean;
   /**
    * MTLK-VM-SIZE US-005: resolved Matchlock VM facts, present only for an
-   * opted-in `--matchlock <image>` launch. A native run leaves this unset so
-   * it prints no matchlock line and its JSON stays byte-identical.
+   * opted-in `--matchlock` / `--matchlock-image <image>` launch. A native run
+   * leaves this unset so it prints no matchlock line and its JSON stays
+   * byte-identical.
    */
   matchlockResources?: WorkflowRunLaunchMatchlockResources;
 }
@@ -260,7 +282,8 @@ export function formatWorkflowRunLaunchLines(
  * Field names stay close to the text prefixes so scripts can correlate them:
  *   working-directory / origin.path / origin.ref / origin.sha / clean /
  *   harness.type / harness.path / harness.version / daemon.endpoint /
- *   daemon.ok / matchlockResources.{image,cpus,memoryMB,diskSizeMB,allowPrivate}.
+ *   daemon.ok / matchlockResources.{image,imageSource,cpus,memoryMB,diskSizeMB,
+ *   swapMB,imageDigest,imageConfigDigest,allowPrivate}.
  *
  * US-003: this is emitted whenever `workflow run --json` is requested, so the
  * resolved values are machine-consumable; optional facts (a missing harness

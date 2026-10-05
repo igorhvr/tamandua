@@ -90,11 +90,42 @@ describe("README --matchlock union documentation (MTLK-ALL-WORKFLOWS)", () => {
     assert.match(matchlockSection, /`pi` \(default \/ `--pi-as-harness`\)/);
   });
 
-  it("states the mandatory image, fresh VM per invocation and no host fallback", () => {
+  it("states the two opt-in forms, fresh VM per invocation and no host fallback", () => {
     assert.match(matchlockSection, /inside a \*\*fresh Matchlock VM\*\*/);
     assert.match(matchlockSection, /never installs a harness or falls back/);
-    assert.match(matchlockSection, /Passing the flag is the \*\*only\*\* opt-in/);
-    assert.match(matchlockSection, /`--matchlock` is\s+refused with no image/);
+    assert.match(
+      matchlockSection,
+      /Passing one of the two opt-in flags is the \*\*only\*\*\s+opt-in/,
+    );
+    assert.match(
+      matchlockSection,
+      /A bare\s+`--matchlock` is refused when the standard image is not\s+provisioned/,
+    );
+  });
+
+  it("documents the standard image, its provisioning and the env override", () => {
+    assert.match(matchlockSection, /standard image\*\* `igorhvr\/tamandua`/);
+    assert.match(matchlockSection, /tamandua matchlock setup/);
+    assert.match(matchlockSection, /`TAMANDUA_MATCHLOCK_IMAGE`/);
+    assert.match(
+      matchlockSection,
+      /`--matchlock-image <image>` > `TAMANDUA_MATCHLOCK_IMAGE` > built-in/,
+    );
+  });
+
+  it("documents the root-usage refusal and its override flag", () => {
+    assert.match(matchlockSection, /Root usage is refused by default/);
+    assert.match(
+      matchlockSection,
+      /--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs/,
+    );
+  });
+
+  it("documents the swap default, cap and off switch", () => {
+    assert.match(matchlockSection, /--matchlock-swap/);
+    assert.match(matchlockSection, /--matchlock-no-swap/);
+    assert.match(matchlockSection, /8192 MB/);
+    assert.match(matchlockSection, /65536 MB/);
   });
 
   it("documents the per-harness configuration mount", () => {

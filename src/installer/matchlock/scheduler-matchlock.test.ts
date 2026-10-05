@@ -33,6 +33,7 @@ import {
   setDshSchedulerRoundRunnerForTest,
   type DshSchedulerRound,
 } from "../../../dist/installer/matchlock/scheduler-dsh.js";
+import { setMatchlockExecutionBoundarySeamsForTest } from "../../../dist/installer/matchlock/execution-boundary.js";
 import {
   buildMatchlockPolicy,
   MATCHLOCK_NETWORK_POLICY_VERSION,
@@ -156,6 +157,13 @@ describe("scheduler-matchlock production suite wiring", () => {
     // not about the alias, so install the deterministic fixed-alias seam (no
     // host HOME, no `/tmp` side effects).
     setMatchlockHomeAliasResolverForTest(() => "/home/alias-fixture/tamandua/4242/h");
+    // US-004: these routing/suite tests are not about the execution boundary,
+    // so install a supporting swap probe (the real default would probe the
+    // host's matchlock and refuse). The uid default (the real non-root test
+    // uid) passes the R13 gate unchanged.
+    setMatchlockExecutionBoundarySeamsForTest({
+      swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+    });
     tmp = tamanduaTempDir("tamandua-mtlk-sched-");
     packRoot = path.join(tmp, "pack");
     // Build a REAL versioned RO guest pack from the compiled checkout so the
@@ -172,6 +180,7 @@ describe("scheduler-matchlock production suite wiring", () => {
 
   after(() => {
     setMatchlockHomeAliasResolverForTest(null);
+    setMatchlockExecutionBoundarySeamsForTest(null);
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 

@@ -77,11 +77,75 @@ describe("matchlock dispatch admission barrier", () => {
   it("allows a NULL (native) policy without consulting Matchlock", () => {
     const decision = matchlockDispatchDecision(null);
     assert.deepEqual(decision, { refused: false });
+    // US-006 consumer audit: `undefined` is also explicitly native (absent).
+    assert.deepEqual(matchlockDispatchDecision(undefined), { refused: false });
   });
 
-  it("allows an empty-string policy (treated as native)", () => {
-    assert.deepEqual(matchlockDispatchDecision(""), { refused: false });
-    assert.deepEqual(matchlockDispatchDecision("   "), { refused: false });
+  it("REFUSES an empty-string / whitespace policy as matchlock_policy_invalid (never native)", () => {
+    // US-006 consumer audit: an empty string is a NON-NULL policy, not a
+    // native run. It must be parsed and refused, never allowed natively.
+    for (const raw of ["", "   ", "\t"]) {
+      const decision = matchlockDispatchDecision(raw);
+      assert.equal(decision.refused, true, `non-NULL policy ${JSON.stringify(raw)} must not be native`);
+      if (decision.refused) {
+        assert.equal(decision.code, "matchlock_policy_invalid");
+        assert.match(decision.message, /not a usable isolated-run record/);
+        assert.match(decision.message, /never fall back to native execution/);
+      }
+    }
+  });
+
+  // MTLK-ISO-SLICE2 US-007 (PREP-STATE): an intent-recorded row whose policy
+  // has not been persisted yet is HELD, never native. This is a transient
+  // preparation state (held:true) that must not be force-failed.
+  it("HELDS a PREP-STATE intent-recorded row with a NULL policy (never native) as matchlock_preparing_held", () => {
+    for (const policyRaw of [null, undefined] as const) {
+      const decision = matchlockDispatchDecision(policyRaw, {
+        workflowId: "do-now",
+        harnessType: "pi",
+        isolationIntent: true,
+      });
+      assert.equal(decision.refused, true, "an intent-recorded NULL-policy row is never native");
+      if (decision.refused) {
+        assert.equal(decision.code, "matchlock_preparing_held");
+        assert.equal(decision.held, true, "the held outcome is typed for the caller to keep the run non-schedulable");
+        assert.equal(decision.policy, undefined, "no policy exists yet");
+        assert.match(decision.message, /HELD and non-schedulable/);
+        assert.match(decision.message, /refused native dispatch/);
+        assert.match(decision.message, /cannot make this row runnable/);
+      }
+    }
+  });
+
+  it("a persisted policy wins over the isolation intent: intent flag is ignored when a policy is present", () => {
+    const valid = serializeMatchlockPolicy(buildMatchlockPolicy(BASE));
+    const allowed = matchlockDispatchDecision(valid, {
+      workflowId: "do-now",
+      harnessType: "pi",
+      isolationIntent: true,
+    });
+    assert.equal(allowed.refused, false, "a valid policy on an intent row is an isolated run, not held");
+    if (!allowed.refused) {
+      assert.ok(allowed.policy, "the parsed policy is returned");
+    }
+    // A present-but-unusable policy is classified by the policy FIRST, so it is
+    // a genuine invalid-policy refusal (not a held preparation).
+    const invalid = matchlockDispatchDecision("{not json", {
+      workflowId: "do-now",
+      harnessType: "pi",
+      isolationIntent: true,
+    });
+    assert.equal(invalid.refused, true);
+    if (invalid.refused) {
+      assert.equal(invalid.code, "matchlock_policy_invalid");
+      assert.notEqual(invalid.held, true, "an unusable present policy is a failure, not a hold");
+    }
+  });
+
+  it("a NULL policy without the isolation intent stays native (no false hold)", () => {
+    for (const ctx of [undefined, {}, { isolationIntent: false }]) {
+      assert.deepEqual(matchlockDispatchDecision(null, ctx), { refused: false });
+    }
   });
 
   // MTLK-HERMES-EXEC union MTLK-DSH-EXEC union MTLK-WORKFLOWS union
@@ -444,7 +508,7 @@ describe("matchlock dispatch admission barrier", () => {
     assert.equal(decision.refused, true);
     if (!decision.refused) return;
     assert.equal(decision.code, "matchlock_policy_invalid");
-    assert.match(decision.message, /legacy UNPINNED record/);
+    assert.match(decision.message, /legacy unpinned record/);
     assert.match(decision.message, /never look like a working isolated run/);
   });
 
@@ -456,7 +520,7 @@ describe("matchlock dispatch admission barrier", () => {
     assert.equal(decision.refused, true);
     if (!decision.refused) return;
     assert.equal(decision.code, "matchlock_policy_invalid");
-    assert.match(decision.message, /resolvedImageDigest is required/);
+    assert.match(decision.message, /structurally invalid/);
   });
 
   // ── MTLK-HERMES-EXEC US-003: hermes harness admission axis ────────────

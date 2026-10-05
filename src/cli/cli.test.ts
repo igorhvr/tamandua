@@ -42,9 +42,14 @@ describe("parseWorkflowRunArgs", () => {
       harnessAs: undefined,
       workdirCollisionPolicy: "refuse",
       matchlockImage: undefined,
+      matchlockImageSource: undefined,
+      matchlockRequested: undefined,
+      matchlockRootUsageOverride: undefined,
       matchlockCpus: undefined,
       matchlockMemory: undefined,
       matchlockDisk: undefined,
+      matchlockSwap: undefined,
+      matchlockNoSwap: undefined,
       matchlockAllowPrivate: undefined,
       context: {},
       wait: false,
@@ -402,7 +407,7 @@ describe("--help infrastructure", () => {
   });
 
   it("workflow run --matchlock <image> --hermes-as-harness --help is side-effect-free (help exits 0, no Matchlock discovery, no image resolution)", () => {
-    const result = cli(["workflow", "run", "--matchlock", "example.invalid/hermes:latest", "--hermes-as-harness", "--help"]);
+    const result = cli(["workflow", "run", "--matchlock-image", "example.invalid/hermes:latest", "--hermes-as-harness", "--help"]);
     assert.equal(result.status, 0);
     const out = result.stdout ?? "";
     assert.match(out, /--hermes-as-harness/);
@@ -438,7 +443,7 @@ describe("--help infrastructure", () => {
     assert.doesNotMatch(out, /Admitted merge shapes are refused for hermes\/dsh/);
     // Help dispatches BEFORE any command execution: no image parse error, no
     // admission/discovery side effects, no missing-task error.
-    assert.doesNotMatch(result.stderr ?? "", /Missing value for --matchlock|Missing workflow name/i);
+    assert.doesNotMatch(result.stderr ?? "", /Missing value for --matchlock-image|Missing workflow name/i);
   });
 
   it("command with --help prints usage and exits 0", () => {

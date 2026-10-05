@@ -32,7 +32,11 @@ import { runWorkflow } from "../installer/run.js";
 import { stopWorkflow, deleteWorkflow, getWorkflowStatus } from "../installer/status.js";
 import { parseRunContext } from "../installer/step-ops.js";
 import { monotonicNow, instantAgeMs, isOlderThan } from "../lib/instant.js";
-import { parseMatchlockPolicy } from "../installer/matchlock/policy.js";
+import { describeUnusableMatchlockPolicy, parseMatchlockPolicy } from "../installer/matchlock/policy.js";
+import {
+  isolationPreparingHeldText,
+  readIsolationState,
+} from "../installer/matchlock/prep-state.js";
 import { readVersionStatus } from "../lib/version-check.js";
 import { getBuildVersion } from "../lib/version.js";
 import {
@@ -829,9 +833,9 @@ async function handleRelaunchRun(
     const db = getDb();
 
     const run = db.prepare(
-      "SELECT id, workflow_id, task, status, context, notify_url, matchlock_policy FROM runs WHERE id = ?",
+      "SELECT id, workflow_id, task, status, context, notify_url, isolation_intent, matchlock_policy FROM runs WHERE id = ?",
     ).get(runId) as
-      | { id: string; workflow_id: string; task: string; status: string; context: string; notify_url: string | null; matchlock_policy: string | null }
+      | { id: string; workflow_id: string; task: string; status: string; context: string; notify_url: string | null; matchlock_policy: string | null; isolation_intent: string | null }
       | undefined;
 
     if (!run) {
@@ -860,14 +864,33 @@ async function handleRelaunchRun(
       let policyNote = "a persisted Matchlock isolation policy";
       try {
         parseMatchlockPolicy(run.matchlock_policy);
-      } catch (err) {
+      } catch {
+        // MTLK-ISO2-TRANSITION-CAS (Family C-1): the parser message can embed
+        // fragments of the stored input, so the refusal renders the typed code
+        // plus the allow-listed reason — never `(err as Error).message`.
+        const described = describeUnusableMatchlockPolicy(run.matchlock_policy);
         policyNote =
           `a persisted Matchlock isolation policy that cannot be used ` +
-          `(${(err as Error).message})`;
+          `(${described.code}): ${described.reason}`;
       }
       errorResponse(
         res,
         `Cannot relaunch run ${runId} through the dashboard: it carries ${policyNote}, and the dashboard has no Matchlock opt-in surface — relaunching here would create native (non-isolated) work. Recreate the run with --matchlock, or relaunch through the rugpull/CLI path which inherits the persisted policy.`,
+        409,
+      );
+      return;
+    }
+
+    // MTLK-ISO-SLICE2 US-008 (PREP-STATE) close: an intent-only row (isolation
+    // intent recorded, policy still NULL) is mid-preparation, NOT a native run.
+    // Relaunching it here would silently create NATIVE (non-isolated) work, so
+    // refuse with the shared held/preparing remedy. Every non-NULL-policy
+    // refusal above is preserved; a truly native (no intent, no policy) run is
+    // unchanged.
+    if (readIsolationState(run) === "preparing") {
+      errorResponse(
+        res,
+        `Cannot relaunch run ${runId} through the dashboard: ${isolationPreparingHeldText()}`,
         409,
       );
       return;

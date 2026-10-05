@@ -104,7 +104,7 @@ function startControlStub(): { port: number; close: () => Promise<void>; request
       requests.push(`${req.method} ${req.url ?? ""} ${body}`);
       if (req.url === "/control/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
       } else if (req.url === "/control/register-run") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, status: "registered" }));

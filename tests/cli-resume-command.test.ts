@@ -211,7 +211,7 @@ async function startFakeControlPlane(response: {
     req.on("end", () => {
       if (req.method === "GET" && req.url === "/control/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
         return;
       }
       if (req.method === "POST" && req.url === "/control/register-run") {
@@ -310,6 +310,84 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
       assert.ok(
         /Status:\s+running/i.test(statusOut),
         `Expected status to show "running", got: ${statusOut}`,
+      );
+    } finally {
+      if (daemon && daemon.exitCode === null && daemon.pid) {
+        try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
+        await sleep(200);
+      }
+    }
+  });
+
+  // MTLK-ISO-SLICE2 US-009 (R13): the standalone root-usage override is
+  // honored only for a Matchlock run; passing it for a truly native run (no
+  // isolation intent, no policy) is a runtime refusal naming that fact, and
+  // the run's prior paused state is preserved.
+  it("refuses the root-usage override for a truly native paused run and preserves it", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const controlPort = await getAvailablePort();
+    const th = createTempHome("tamandua-resume-native-override-");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+
+    const pausedRunId = crypto.randomUUID();
+    seedRunDb(dbPath, [
+      {
+        id: pausedRunId,
+        workflowId: "feature-dev-merge",
+        task: "Native paused run with the root override",
+        status: "paused",
+        context: { working_directory_for_harness: th.root },
+      },
+    ]);
+
+    const srcWorkflowDir = path.resolve(__dirname, "..", "workflows", "feature-dev-merge");
+    const dstWorkflowDir = path.join(th.tamanduaDir, "workflows", "feature-dev-merge");
+    fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
+    fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
+
+    let daemon: ChildProcess | undefined;
+
+    try {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
+        env: cleanChildEnv({ HOME: th.homeDir,
+          TAMANDUA_CONTROL_PORT: String(controlPort), }),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      daemon.stdout?.resume();
+      daemon.stderr?.resume();
+
+      await waitForControlUp(controlPort);
+
+      const { stdout, stderr, exitCode } = await runCli(
+        [
+          "workflow", "resume", pausedRunId,
+          "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs",
+        ],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      );
+
+      assert.notEqual(exitCode, 0, "a truly-native override must be refused");
+      assert.ok(
+        stderr.includes("truly native run"),
+        `Expected the truly-native refusal naming the fact, got: ${cleanStderr(stderr)}`,
+      );
+      assert.ok(
+        !stdout.includes("Resumed run"),
+        `Must not print a false "Resumed run": ${stdout}`,
+      );
+
+      // Refusal preserves the prior state: the run is still paused.
+      const { stdout: statusOut } = await runCli(
+        ["workflow", "status", pausedRunId.slice(0, 8)],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      );
+      assert.ok(
+        /Status:\s+paused/i.test(statusOut),
+        `Expected status to remain "paused", got: ${statusOut}`,
       );
     } finally {
       if (daemon && daemon.exitCode === null && daemon.pid) {
@@ -470,6 +548,54 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
         await sleep(200);
       }
     }
+  });
+
+  // MTLK-ISO-SLICE2 US-010 (R13): the failed-run form also accepts the
+  // root-usage override. Passing it for a truly native run is a runtime
+  // refusal that names that fact and preserves the run's prior state. The
+  // refusal precedes any control-plane interaction, so no daemon is needed.
+  it("refuses the root-usage override for a truly native failed run and preserves it", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const th = createTempHome("tamandua-resume-native-failed-");
+
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+
+    const failedRunId = crypto.randomUUID();
+    seedFailedResumeRun({
+      dbPath,
+      runId: failedRunId,
+      harnessDir: th.root,
+    });
+
+    const { stdout, stderr, exitCode } = await runCli(
+      [
+        "workflow",
+        "resume",
+        failedRunId.slice(0, 8),
+        "--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs",
+      ],
+      { HOME: th.homeDir },
+    );
+
+    assert.equal(exitCode, 1, `expected refusal exit 1, got ${exitCode}; stdout: ${stdout}`);
+    assert.match(
+      cleanStderr(stderr),
+      /truly native run/,
+      `expected a truly-native refusal, got: ${cleanStderr(stderr)}`,
+    );
+    assert.ok(!stdout.includes("Resumed run"), `must not print a false success: ${stdout}`);
+
+    // The run's prior (failed) state is preserved.
+    const db = new DatabaseSync(dbPath);
+    const row = db
+      .prepare("SELECT status, scheduling_status FROM runs WHERE id = ?")
+      .get(failedRunId) as { status: string; scheduling_status: string | null };
+    db.close();
+    assert.equal(row.status, "failed", "a refused resume leaves the run failed");
   });
 
   // FFRC (W3.21): force-fail a run, then immediately resume. The force-fail

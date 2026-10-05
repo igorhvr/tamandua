@@ -69,6 +69,7 @@ import {
   describeMatchlockError,
   MATCHLOCK_ERROR_TAIL_MAX_BYTES,
 } from "../../dist/installer/matchlock/runner-error.js";
+import { setMatchlockExecutionBoundarySeamsForTest } from "../../dist/installer/matchlock/execution-boundary.js";
 import { classifyInvocationError } from "../../dist/installer/matchlock/pi-invocation-runner.js";
 import { MatchlockControllerError } from "../../dist/installer/matchlock/controller.js";
 import { MATCHLOCK_SOCKET_PATH_TOO_LONG_CODE, MatchlockHomeAliasError } from "../../dist/installer/matchlock/home-alias.js";
@@ -130,6 +131,8 @@ function seedRun(
     pendingSteps?: number;
     runContext?: Record<string, string>;
     finalizeMergeStepId?: string;
+    /** MTLK-ISO-SLICE2 PREP-STATE: record the host-owned isolation intent. */
+    isolationIntent?: boolean;
   } = {},
 ): void {
   const workflowId = opts.workflowId ?? "test-wf";
@@ -141,9 +144,17 @@ function seedRun(
     ...(opts.runContext ?? {}),
   };
   db.prepare(
-    `INSERT INTO runs (id, workflow_id, task, status, context, scheduling_status, created_at, updated_at, matchlock_policy)
-     VALUES (?, ?, 'test task', 'running', ?, 'active', ?, ?, ?)`,
-  ).run(runId, workflowId, JSON.stringify(context), now, now, matchlockPolicyRaw);
+    `INSERT INTO runs (id, workflow_id, task, status, context, scheduling_status, created_at, updated_at, matchlock_policy, isolation_intent)
+     VALUES (?, ?, 'test task', 'running', ?, 'active', ?, ?, ?, ?)`,
+  ).run(
+    runId,
+    workflowId,
+    JSON.stringify(context),
+    now,
+    now,
+    matchlockPolicyRaw,
+    opts.isolationIntent ? "true" : null,
+  );
   for (let i = 0; i < stepCount; i++) {
     db.prepare(
       `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at)
@@ -371,7 +382,7 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     controlPort = await new Promise<number>((resolve) => {
       mockServer = http.createServer((_req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, prepStateCapability: "MTLK-ISO-SLICE2-PREP-STATE" }));
       });
       mockServer.listen(0, "127.0.0.1", () => {
         const addr = mockServer.address();
@@ -389,12 +400,20 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     seamJournal = [];
     seamJournalDsh = [];
     installSeamFake({ journal: seamJournal });
+    // US-004: these dispatch tests are not about the daemon execution
+    // boundary; install a supporting swap probe so the gate passes without a
+    // real matchlock binary. The uid default (the real non-root test uid)
+    // passes the R13 gate unchanged.
+    setMatchlockExecutionBoundarySeamsForTest({
+      swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
+    });
   });
 
   afterEach(() => {
     setMatchlockSchedulerRoundRunnerForTest(null);
     setDshSchedulerRoundRunnerForTest(null);
     setMatchlockHomeAliasResolverForTest(null);
+    setMatchlockExecutionBoundarySeamsForTest(null);
     if (savedPiBinary === undefined) delete process.env.TAMANDUA_PI_BINARY;
     else process.env.TAMANDUA_PI_BINARY = savedPiBinary;
     if (savedHarnessProbe === undefined) delete process.env.TAMANDUA_HARNESS_PROBE;
@@ -807,6 +826,85 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     assert.match(String(refused[0].detail), /Recreate the run with --matchlock/);
   });
 
+  it("US-006 consumer audit: an EMPTY-STRING stored policy reaches the dispatch gate and is refused (never native, zero harness spawns)", async () => {
+    const runId = "77777777-7777-4777-8777-777777777777";
+    const workdir = path.join(tempHome, "work-empty-policy");
+    fs.mkdirSync(workdir, { recursive: true });
+    // An empty string is a NON-NULL policy. Truthiness at the scheduler
+    // barrier would skip the dispatch gate and send the run to the native
+    // harness path; the explicit non-NULL check must refuse it instead.
+    seedRun(runId, workdir, "");
+
+    await dispatchJob(runId, workdir);
+
+    const row = runRow(runId);
+    assert.ok(row);
+    assert.equal(row.status, "failed", "an empty-string policy run must be force-failed, never run natively");
+    assert.equal(row.scheduling_status, null);
+    assert.ok(!fs.existsSync(piLog), "no host harness spawn for an empty-string stored policy");
+    assert.equal(seamJournal.length, 0, "the Matchlock runner seam must never be invoked");
+
+    const refused = eventsFor(runId).filter((e) => e.event === "run.matchlock_dispatch_refused");
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0].reason, "matchlock_policy_invalid");
+    assert.match(String(refused[0].detail), /never fall back to native execution/);
+  });
+
+  // ── US-007 (PREP-STATE) intent enforcement at dispatch ──────────────
+  it("US-007 PREP-STATE: an intent-recorded row with a NULL policy is HELD at dispatch (never native, held event, no force-fail)", async () => {
+    const runId = "88888888-8888-4888-8888-888888888888";
+    const workdir = path.join(tempHome, "work-intent-held");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, null, { isolationIntent: true });
+
+    await dispatchJob(runId, workdir);
+
+    const row = runRow(runId);
+    assert.ok(row);
+    assert.equal(row.status, "running", "a held preparation must NOT be force-failed");
+    assert.equal(row.scheduling_status, "active", "the held round must not mutate scheduling state");
+    assert.ok(!fs.existsSync(piLog), "the native harness must NEVER be spawned for an intent-only row");
+    assert.equal(seamJournal.length, 0, "no VM/runner round may start for an intent-only row");
+
+    const events = eventsFor(runId);
+    const held = events.filter((e) => e.event === "run.matchlock_dispatch_held");
+    assert.equal(held.length, 1, "one typed held event per dispatch attempt");
+    assert.equal(held[0].reason, "matchlock_preparing_held");
+    assert.match(String(held[0].detail), /HELD and non-schedulable/);
+    assert.match(String(held[0].detail), /cannot make this row runnable/);
+    assert.equal(
+      events.filter((e) => e.event === "run.matchlock_dispatch_refused").length,
+      0,
+      "a hold is not a refusal",
+    );
+    assert.equal(
+      events.filter((e) => e.event === "run.force_failed").length,
+      0,
+      "a hold must never force-fail an in-flight preparation",
+    );
+  });
+
+  it("US-007 PREP-STATE: an intent-recorded row WITH a persisted policy dispatches through the Matchlock seam (no false hold)", async () => {
+    const runId = "99999999-9999-4999-8999-999999999999";
+    const workflowId = "do-now";
+    const workdir = path.join(tempHome, "work-intent-policy");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, policyJson(), { workflowId, isolationIntent: true });
+
+    await dispatchJob(runId, workdir, { workflowId });
+
+    const row = runRow(runId);
+    assert.ok(row);
+    assert.equal(row.status, "completed", "a policy-backed intent row runs isolated to completion");
+    assert.ok(!fs.existsSync(piLog), "no host harness spawn for the isolated intent row");
+    assert.equal(seamJournal.length, 1, "exactly one work round through the runner seam");
+    assert.equal(
+      eventsFor(runId).filter((e) => e.event === "run.matchlock_dispatch_held").length,
+      0,
+      "the persisted policy wins: an isolated run is not held",
+    );
+  });
+
   it("no-flag differential: a NULL-policy (native) run dispatches normally to the host harness and never consults Matchlock", async () => {
     const runId = "55555555-5555-4555-8555-555555555555";
     const workdir = path.join(tempHome, "work4");
@@ -847,7 +945,7 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     assert.equal(seamJournal.length, 0);
     const refused = eventsFor(runId).filter((e) => e.event === "run.matchlock_dispatch_refused");
     assert.equal(refused.length, 1);
-    assert.match(String(refused[0].detail), /legacy UNPINNED record/);
+    assert.match(String(refused[0].detail), /legacy unpinned record/);
   });
 
   // ── in-VM launch probe through the runner seam (US-002) ─────────────
