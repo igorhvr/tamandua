@@ -94,6 +94,7 @@ describe("SPL2 thin CLI dispatcher", () => {
       "handleWorktree",
       "handleAutoresearch",
       "handleWorkflow",
+      "handleMatchlock",
     ]);
   });
 });

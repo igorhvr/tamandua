@@ -10,7 +10,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execSync, execFile } from "node:child_process";
+import { execSync, execFile, spawnSync } from "node:child_process";
 
 import { parseDocument } from "yaml";
 
@@ -80,12 +80,21 @@ import type {
 } from "./installer/matchlock/home-alias.js";
 import {
   MATCHLOCK_ALLOW_PRIVATE_FLAG,
+  MATCHLOCK_RPC_BIN_ENV,
   probeMatchlockAllowPrivateSupport,
+  resolveMatchlockRpcBinary,
 } from "./installer/matchlock/allow-private-support.js";
 import type {
   MatchlockAllowPrivateSupport,
   ProbeMatchlockAllowPrivateSupportOptions,
+  ResolvedMatchlockRpcBinary,
 } from "./installer/matchlock/allow-private-support.js";
+import {
+  MATCHLOCK_SUBMODULE_NAME,
+  parseGitlink,
+  resolveMatchlockPaths,
+} from "./installer/matchlock-setup.js";
+import type { MaybePromise } from "./installer/matchlock-setup.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -786,6 +795,20 @@ export async function checkMatchlockAllowPrivateSupport(
   }
 
   if (result.reasonCode === "missing_binary") {
+    if (result.envOverrideSet) {
+      // §0 Path 2: the user ENGAGED matchlock by setting the override, so a
+      // broken override is a real misconfiguration — warn (never fail) and
+      // name the canonical literal + remedy instead of hiding it as info.
+      return {
+        name: MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+        status: "warn",
+        message:
+          `${MATCHLOCK_RPC_BIN_ENV} is set to "${result.binaryPath}" but no usable ` +
+          `matchlock binary was found there; --matchlock runs are unavailable and ` +
+          `${MATCHLOCK_ALLOW_PRIVATE_FLAG} cannot be used`,
+        remedy: MATCHLOCK_SETUP_REMEDY,
+      };
+    }
     return {
       name: MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
       status: "info",
@@ -806,12 +829,464 @@ export async function checkMatchlockAllowPrivateSupport(
   };
 }
 
+// ── Matchlock binary-gated setup readiness (SETUP-S2 §0) ────────
+
+/**
+ * Check name reported in the ENVIRONMENT group for the binary-gated Matchlock
+ * setup-readiness gate (§0). Exported so tests assert against the exact name.
+ */
+export const MATCHLOCK_SETUP_READINESS_CHECK_NAME = "Matchlock setup readiness";
+
+/**
+ * The remedy named by every non-fatal Matchlock setup-readiness warning. Doctor
+ * never installs or pulls — it only points at the provisioning command.
+ */
+export const MATCHLOCK_SETUP_REMEDY = "Run: tamandua matchlock setup";
+
+/** Guest-kernel presence the host's selected backend will use (R6/R11). */
+export interface MatchlockKernelReadiness {
+  /** `present` (download path cached), `embedded` (vendored offline) or `missing`. */
+  status: "present" | "embedded" | "missing";
+  /** Kernel version recorded by the cache, when known. */
+  version?: string;
+  /** Absolute cache path backing a `present` verdict, when known. */
+  path?: string;
+}
+
+/** Installed binary commit vs the recorded gitlink (N3 drift comparison). */
+export interface MatchlockSubmoduleDrift {
+  /** Commit recorded in the superproject gitlink. */
+  recorded: string;
+  /** Commit the INSTALLED BINARY's version probe reports (not the checkout). */
+  installed: string;
+  /** True when the installed binary does not match the recorded gitlink. */
+  drifted: boolean;
+}
+
+/** Context handed to the kernel-presence and submodule-drift seams. */
+export interface MatchlockSetupReadinessContext {
+  binaryPath: string;
+  platform: string;
+  arch: string;
+  homeDir: string;
+  sourcePath: string;
+  /** Environment the selected backend / kernel override are read from. */
+  env?: NodeJS.ProcessEnv;
+  /**
+   * Commit parsed out of the installed binary's version probe, when the probe
+   * reported one. The drift probe compares THIS against the recorded gitlink —
+   * never the submodule checkout HEAD.
+   */
+  installedCommit?: string;
+}
+
+/**
+ * Injectable, read-only seams for {@link runMatchlockSetupReadinessChecks}.
+ *
+ * Everything is optional; the defaults are the real read-only probes. Tests
+ * inject fakes so no unit test spawns a real matchlock or touches the host
+ * kernel cache or a real submodule.
+ */
+export interface MatchlockSetupReadinessDeps {
+  /** Environment for binary resolution (default `process.env`). */
+  env?: NodeJS.ProcessEnv;
+  /** Platform seam (default `process.platform`). */
+  platform?: string;
+  /** Arch seam (default `process.arch`). */
+  arch?: string;
+  /** Home whose `~/.cache/matchlock/kernels` the download path reads. */
+  homeDir?: string;
+  /** Absolute source checkout that may hold the `matchlock` submodule. */
+  sourcePath?: string;
+  /** §0 binary resolution WITH provenance (default real resolver). */
+  resolveBinary?: (env?: NodeJS.ProcessEnv) => ResolvedMatchlockRpcBinary;
+  /** Bounded read-only version/commit probe (default real `--version` spawn). */
+  readVersion?: (binaryPath: string) => MaybePromise<string | undefined>;
+  /** US-007 `--allow-private` probe (default real bounded probe). */
+  probeAllowPrivate?: (
+    binaryPath: string,
+  ) => MaybePromise<MatchlockAllowPrivateSupport>;
+  /** Guest-kernel presence probe (default real kernel-cache/arch read). */
+  probeKernel?: (
+    ctx: MatchlockSetupReadinessContext,
+  ) => MaybePromise<MatchlockKernelReadiness>;
+  /** Submodule gitlink-drift probe; `undefined` when the submodule is absent. */
+  probeSubmoduleDrift?: (
+    ctx: MatchlockSetupReadinessContext,
+  ) => MaybePromise<MatchlockSubmoduleDrift | undefined>;
+  /**
+   * iso-s3-owned standard-image presence/staleness fields. Rendered verbatim
+   * under Path 3 and omitted entirely under Path 1; the doctor NEVER recomputes
+   * them (single-owner interface contract).
+   */
+  standardImageFields?: DoctorCheckResult[];
+}
+
+/** Extract a version (and best-effort commit) from a bounded `--version` read. */
+function parseMatchlockVersionLabel(text: string): string | undefined {
+  const version = /(\d+\.\d+(?:\.\d+)?[0-9A-Za-z.+-]*)/.exec(text);
+  if (!version) return undefined;
+  const commit = /commit:?\s*([0-9a-fA-F]{7,64})/.exec(text);
+  return commit ? `${version[1]} (commit ${commit[1]})` : version[1];
+}
+
+/**
+ * Extract the installed binary's commit from a version label produced by
+ * {@link parseMatchlockVersionLabel} (or a raw `--version` read). Mirrors the
+ * commit parse there so the drift probe compares the INSTALLED BINARY.
+ */
+function extractMatchlockCommit(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const commit = /commit:?\s*([0-9a-fA-F]{7,64})/.exec(text);
+  return commit ? commit[1].toLowerCase() : undefined;
+}
+
+/** Env var naming the selected sandbox backend (`firecracker` or `qemu`). */
+export const MATCHLOCK_BACKEND_ENV = "MATCHLOCK_BACKEND";
+
+/**
+ * Env vars that name an explicit guest-kernel override. The pinned runtime only
+ * uses the vendored/embedded kernel for the QEMU amd64 backend with NO explicit
+ * kernel override (`opts.KernelPath`/`config.Kernel.Ref`); an override always
+ * takes the download path, so doctor must not report `embedded` when one is set.
+ */
+const MATCHLOCK_KERNEL_OVERRIDE_ENVS = [
+  "MATCHLOCK_KERNEL",
+  "TAMANDUA_MATCHLOCK_KERNEL",
+];
+
+/** Selected backend, defaulting to `qemu` (the runtime's default). */
+function selectedMatchlockBackend(env: NodeJS.ProcessEnv | undefined): string {
+  const backend = (env?.[MATCHLOCK_BACKEND_ENV] ?? "").trim().toLowerCase();
+  return backend === "" ? "qemu" : backend;
+}
+
+/** True when the environment names an explicit guest-kernel override. */
+function hasMatchlockKernelOverride(env: NodeJS.ProcessEnv | undefined): boolean {
+  if (!env) return false;
+  return MATCHLOCK_KERNEL_OVERRIDE_ENVS.some(
+    (name) => (env[name] ?? "").trim() !== "",
+  );
+}
+
+/** Cache filename architecture token: the fixtures/runtime use `amd64` for x64. */
+function matchlockKernelArchToken(arch: string): string {
+  return arch === "x64" || arch === "amd64" ? "amd64" : arch;
+}
+
+/** True when two commit refs match, tolerating abbreviated (7–40 char) refs. */
+function commitRefsMatch(a: string, b: string): boolean {
+  const left = a.trim().toLowerCase();
+  const right = b.trim().toLowerCase();
+  if (left === "" || right === "") return false;
+  if (left === right) return true;
+  if (left.length === right.length) return false;
+  return left.startsWith(right) || right.startsWith(left);
+}
+
+/** Default bounded read-only `matchlock version` / `--version` probe. */
+function defaultReadMatchlockVersion(binaryPath: string): string | undefined {
+  for (const args of [["version"], ["--version"]]) {
+    try {
+      const result = spawnSync(binaryPath, args, {
+        encoding: "utf-8",
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (result.error || result.status !== 0) continue;
+      const label = parseMatchlockVersionLabel(
+        `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+      );
+      if (label) return label;
+    } catch {
+      /* try the next spelling */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Default guest-kernel presence probe.
+ *
+ * The vendored kernel is embedded ONLY for the linux/amd64 QEMU backend with no
+ * explicit kernel override (pinned runtime `resolveLinuxKernelForConfig`); every
+ * other backend, arch or override reads/downloads the
+ * `~/.cache/matchlock/kernels/<version>/` cache. A cache entry counts as present
+ * only when the version directory holds a real file for the REQUESTED
+ * architecture (`kernel-amd64`/`kernel-arm64`); an empty version directory or a
+ * plain `kernel` file is not a match. Never writes.
+ */
+function defaultProbeKernel(
+  ctx: MatchlockSetupReadinessContext,
+): MatchlockKernelReadiness {
+  const backend = selectedMatchlockBackend(ctx.env);
+  const archToken = matchlockKernelArchToken(ctx.arch);
+  const embedded =
+    ctx.platform === "linux" &&
+    (ctx.arch === "x64" || ctx.arch === "amd64") &&
+    backend === "qemu" &&
+    !hasMatchlockKernelOverride(ctx.env);
+  if (embedded) return { status: "embedded" };
+
+  const kernelCache = resolveMatchlockPaths({
+    platform: ctx.platform,
+    account: "doctor",
+    home: ctx.homeDir,
+  }).kernelCache;
+  try {
+    const versionDirs = fs
+      .readdirSync(kernelCache, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory());
+    for (const versionDir of versionDirs) {
+      const dirPath = path.join(kernelCache, versionDir.name);
+      let files: fs.Dirent[];
+      try {
+        files = fs.readdirSync(dirPath, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      const hit = files.find(
+        (file) =>
+          file.isFile() &&
+          file.name.startsWith("kernel") &&
+          file.name.includes(archToken),
+      );
+      if (hit) {
+        return {
+          status: "present",
+          path: path.join(dirPath, hit.name),
+          version: versionDir.name,
+        };
+      }
+    }
+  } catch {
+    /* cache absent */
+  }
+  return { status: "missing" };
+}
+
+/**
+ * Default installed-binary-vs-gitlink drift probe. Compares the commit recorded
+ * in the superproject gitlink against the commit the INSTALLED BINARY's version
+ * probe reported (`ctx.installedCommit`) — never the submodule checkout HEAD.
+ * Returns `undefined` (omit the line) when the submodule is not checked out or
+ * no installed commit is available, so doctor stays silent rather than guessing.
+ * All git reads are bounded and read-only.
+ */
+function defaultProbeSubmoduleDrift(
+  ctx: MatchlockSetupReadinessContext,
+): MatchlockSubmoduleDrift | undefined {
+  const installed = ctx.installedCommit?.trim().toLowerCase();
+  if (!installed) return undefined;
+  const submodulePath = path.join(ctx.sourcePath, MATCHLOCK_SUBMODULE_NAME);
+  try {
+    if (!fs.existsSync(path.join(submodulePath, ".git"))) return undefined;
+  } catch {
+    return undefined;
+  }
+  const gitlink = spawnSync(
+    "git",
+    ["-C", ctx.sourcePath, "ls-files", "--stage", "--", MATCHLOCK_SUBMODULE_NAME],
+    { encoding: "utf-8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  if (gitlink.error || gitlink.status !== 0) return undefined;
+  const recorded = parseGitlink(gitlink.stdout ?? "", MATCHLOCK_SUBMODULE_NAME);
+  if (!recorded) return undefined;
+  return { recorded, installed, drifted: !commitRefsMatch(recorded, installed) };
+}
+
+/**
+ * The §0 three-path binary gate and (Path 3 only) the read-only Matchlock setup
+ * readiness block.
+ *
+ *  - **Path 1 — passive/quiet:** nothing resolves and no override is set. The
+ *    readiness checks do NOT run: at most the single informational line, never
+ *    a problem/fault/remedy phrasing.
+ *  - **Path 2 — engaged-but-broken:** the override is set but the binary is
+ *    missing/unusable, or a `matchlock` sits on `PATH` unusable. A WARNING
+ *    (never a failure) names the canonical literal `TAMANDUA_MATCHLOCK_RPC_BIN`
+ *    and the `tamandua matchlock setup` remedy.
+ *  - **Path 3 — engaged:** a usable binary resolves. Render version/commit,
+ *    guest-kernel presence (`embedded` for the vendored amd64 backend), and
+ *    submodule drift when present, plus any iso-s3-injected standard-image
+ *    fields — all warn/info, never a hard failure.
+ *
+ * Read-only by construction: it never installs, pulls, chmods or writes.
+ */
+export async function runMatchlockSetupReadinessChecks(
+  deps: MatchlockSetupReadinessDeps = {},
+): Promise<DoctorCheckResult[]> {
+  const env = deps.env ?? process.env;
+  const platform = deps.platform ?? process.platform;
+  const arch = deps.arch ?? process.arch;
+  const homeDir = deps.homeDir ?? os.homedir();
+  const sourcePath = deps.sourcePath ?? process.cwd();
+  const resolveBinary = deps.resolveBinary ?? resolveMatchlockRpcBinary;
+  const readVersion = deps.readVersion ?? defaultReadMatchlockVersion;
+  const probeAllowPrivate =
+    deps.probeAllowPrivate ??
+    ((binaryPath: string) => probeMatchlockAllowPrivateSupport({ binaryPath }));
+  const probeKernel = deps.probeKernel ?? defaultProbeKernel;
+  const probeSubmoduleDrift = deps.probeSubmoduleDrift ?? defaultProbeSubmoduleDrift;
+
+  const resolved = resolveBinary(env);
+  const engaged = resolved.source === "path" || (resolved.source === "override" && resolved.executable);
+
+  // Path 1 — PASSIVE: no kernel/image/submodule/staleness output; exactly the
+  // one existing informational line (matchlock is optional for native runs).
+  if (!engaged && resolved.source === "unresolved") {
+    return [{
+      name: MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+      status: "info",
+      message:
+        "matchlock is not installed; it is optional and native (non-Matchlock) runs are unaffected",
+    }];
+  }
+
+  // Path 2 — ENGAGED-BUT-BROKEN: a set override or an unusable PATH entry is a
+  // real misconfiguration. Warn (never fail) naming the canonical literal.
+  if (!engaged) {
+    const detail =
+      resolved.source === "path_unusable"
+        ? `a matchlock entry exists on PATH at ${resolved.path} but cannot be launched`
+        : `${MATCHLOCK_RPC_BIN_ENV} is set to "${resolved.path}" but no usable matchlock binary was found there`;
+    return [{
+      name: MATCHLOCK_SETUP_READINESS_CHECK_NAME,
+      status: "warn",
+      message:
+        `Matchlock is engaged but not usable: ${detail}. ` +
+        `Fix or unset ${MATCHLOCK_RPC_BIN_ENV} (the canonical override), or provision matchlock with ` +
+        "`tamandua matchlock setup`.",
+      remedy: MATCHLOCK_SETUP_REMEDY,
+    }];
+  }
+
+  // Path 3 — ENGAGED: full read-only readiness block. Every line is warn/info
+  // only — the whole block must never hard-fail the doctor.
+  const checks: DoctorCheckResult[] = [];
+
+  // A fault in any single read-only probe is contained: it degrades that one
+  // line (or omits it) and still resolves the readiness promise.
+  let version: string | undefined;
+  try {
+    version = await readVersion(resolved.path);
+  } catch {
+    version = undefined;
+  }
+  const installedCommit = extractMatchlockCommit(version);
+  if (version) {
+    checks.push({
+      name: MATCHLOCK_SETUP_READINESS_CHECK_NAME,
+      status: "info",
+      message: `installed matchlock binary ${resolved.path} reports version ${version}`,
+    });
+  } else {
+    checks.push({
+      name: MATCHLOCK_SETUP_READINESS_CHECK_NAME,
+      status: "warn",
+      message:
+        `could not determine the version/commit of the installed matchlock binary ${resolved.path}; ` +
+        "the binary may be stale or not a matchlock build",
+      remedy: MATCHLOCK_SETUP_REMEDY,
+    });
+  }
+
+  const allowPrivate = await checkMatchlockAllowPrivateSupport(async () =>
+    probeAllowPrivate(resolved.path),
+  );
+  // US-007 keeps its standalone `pass` contract; under §0 the engaged block is
+  // warn/info only, so a supported probe is reported as info here.
+  checks.push(
+    allowPrivate.status === "pass" ? { ...allowPrivate, status: "info" } : allowPrivate,
+  );
+
+  const ctx: MatchlockSetupReadinessContext = {
+    binaryPath: resolved.path,
+    platform,
+    arch,
+    homeDir,
+    sourcePath,
+    env,
+    ...(installedCommit ? { installedCommit } : {}),
+  };
+
+  let kernel: MatchlockKernelReadiness;
+  try {
+    kernel = await probeKernel(ctx);
+  } catch {
+    kernel = { status: "missing" };
+  }
+  if (kernel.status === "embedded") {
+    checks.push({
+      name: "Matchlock guest kernel",
+      status: "info",
+      message:
+        "guest kernel: embedded (vendored QEMU/amd64 backend; offline by construction)",
+    });
+  } else if (kernel.status === "present") {
+    checks.push({
+      name: "Matchlock guest kernel",
+      status: "info",
+      message:
+        `guest kernel: present${kernel.path ? ` (${kernel.path})` : ""}` +
+        `${kernel.version ? `, version ${kernel.version}` : ""}`,
+    });
+  } else {
+    checks.push({
+      name: "Matchlock guest kernel",
+      status: "warn",
+      message:
+        "guest kernel: absent from the download cache and not embedded for this backend; " +
+        "an offline Matchlock run cannot boot until it is warmed",
+      remedy: MATCHLOCK_SETUP_REMEDY,
+    });
+  }
+
+  let drift: MatchlockSubmoduleDrift | undefined;
+  try {
+    drift = await probeSubmoduleDrift(ctx);
+  } catch {
+    drift = undefined;
+  }
+  if (drift) {
+    if (drift.drifted) {
+      checks.push({
+        name: "Matchlock submodule drift",
+        status: "warn",
+        message:
+          `installed matchlock binary commit ${drift.installed} does not match the recorded ` +
+          `gitlink ${drift.recorded}`,
+        remedy: `${MATCHLOCK_SETUP_REMEDY} (or: tamandua matchlock setup --latest)`,
+      });
+    } else {
+      checks.push({
+        name: "Matchlock submodule drift",
+        status: "info",
+        message: `installed matchlock binary commit matches the recorded gitlink ${drift.recorded}`,
+      });
+    }
+  }
+
+  // iso-s3-owned fields are consumed, never recomputed.
+  if (deps.standardImageFields && deps.standardImageFields.length > 0) {
+    checks.push(...deps.standardImageFields);
+  }
+
+  return checks;
+}
+
 // ── Doctor options ──────────────────────────────────────────────
 
 /** Options for runDoctorChecks. */
 export interface DoctorOpts {
   /** Override HOME directory for test isolation. */
   homeDir?: string;
+  /**
+   * Injectable, read-only seams for {@link runMatchlockSetupReadinessChecks}
+   * (tests). `homeDir` is also threaded into the default kernel-cache read.
+   */
+  matchlockSetupReadinessDeps?: MatchlockSetupReadinessDeps;
 }
 
 // ── Catalog Staleness check (US-002) ───────────────────────────
@@ -2114,6 +2589,21 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
   // message and the session-store / permission-mode probe gates.
   const dshAvailable: DshDiscoveryResult = await discoverDshBinary();
 
+  // SETUP-S2 §0: ONE binary-gated Matchlock block replaces the standalone
+  // always-on allow_private probe, so exactly one Matchlock gate line is
+  // emitted per state (passive info / engaged-but-broken warn / engaged full).
+  const matchlockReadinessDeps: MatchlockSetupReadinessDeps = {
+    ...(opts?.matchlockSetupReadinessDeps ?? {}),
+  };
+  if (
+    matchlockReadinessDeps.homeDir === undefined &&
+    opts?.homeDir !== undefined
+  ) {
+    matchlockReadinessDeps.homeDir = opts.homeDir;
+  }
+  const matchlockReadinessChecks =
+    await runMatchlockSetupReadinessChecks(matchlockReadinessDeps);
+
   const envPromises: Array<DoctorCheckResult | Promise<DoctorCheckResult>> = [
     checkNodeVersion(),
     checkPiOnPath(),
@@ -2121,9 +2611,8 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
     checkPiTokenSaver(),
     checkHermesTokenSaver(),
     checkDshTokenSaver(),
-    // MTLK-ALLOW-PRIVATE: always-on, non-fatal probe of the installed
-    // matchlock's --allow-private support (reports absent/unsupported).
-    checkMatchlockAllowPrivateSupport(),
+    // MTLK-ALLOW-PRIVATE + SETUP-S2 readiness: non-fatal, read-only.
+    ...matchlockReadinessChecks,
     buildHermesBinaryDiscoveryCheck(hermesAvailable),
     buildDshBinaryDiscoveryCheck(dshAvailable),
   ];

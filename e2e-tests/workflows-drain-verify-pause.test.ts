@@ -102,6 +102,12 @@ import {
   type ScriptedAgentConfig,
   type ScriptedBehavior,
 } from "./helpers/scripted-agent.ts";
+// The product's own JSONL classifier (src/installer/events.ts). Imported from
+// the built dist because this file runs under node's type-stripping loader,
+// which cannot follow events.ts's internal `./x.js` specifiers back to the
+// `.ts` sources. dist is a hard dependency of this tier anyway (the real CLI
+// and daemon are spawned from dist/).
+import { parseJsonlEventBuffer } from "../dist/installer/events.js";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
@@ -222,11 +228,17 @@ function dbStep(
 function readRunEvents(ctx: DrvpRunContext, runId: string): Array<Record<string, unknown>> {
   const eventsPath = path.join(ctx.env.tamanduaDir, "events", `${runId}.jsonl`);
   if (!fs.existsSync(eventsPath)) return [];
-  return fs
-    .readFileSync(eventsPath, "utf-8")
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  // Classify the raw JSONL through the product's own parser so this reader
+  // tolerates exactly what the product's readers tolerate (EVTA contract):
+  //   - complete newline-terminated line that parses to a JSON object → event
+  //   - complete newline-terminated line that fails to parse (or is not an
+  //     object) → corrupt (excluded from the event list; never thrown)
+  //   - the final unterminated segment (an in-progress/torn append) →
+  //     trailing partial (excluded; re-read on the next poll)
+  // This never swallows parse errors wholesale: valid events are returned
+  // unchanged, and the set of lines that count as events is unchanged.
+  const { events } = parseJsonlEventBuffer(fs.readFileSync(eventsPath), 0);
+  return events as unknown as Array<Record<string, unknown>>;
 }
 
 function eventIndexes(
@@ -241,6 +253,43 @@ function eventIndexes(
 
 function countEvent(events: Array<Record<string, unknown>>, event: string, stepId?: string): number {
   return eventIndexes(events, event, stepId).length;
+}
+
+/**
+ * Bounded wait for one or more occurrences of an event in the run's JSONL
+ * journal, returning the full ledger once the minimum count is observed.
+ *
+ * The product commits DB state first and appends the journal event as a
+ * separate operation (claimStep: UPDATE steps.status='running' then
+ * emitEvent("step.running"); finalizeDrainingPause: UPDATE runs SET
+ * status='paused' then emitEvent("run.paused"); the completion path
+ * additionally holds finalization events in memory until after COMMIT), so a
+ * cross-process reader can observe the DB transition before the corresponding
+ * event lands. This polls until the presence is observed (or dies naming the
+ * event and embedding diagnostics), and callers keep their exact-count and
+ * ordering assertions on the returned (now quiescent) ledger so genuine
+ * duplicates and misordering still fail.
+ */
+async function waitForEventCount(
+  ctx: DrvpRunContext,
+  runId: string,
+  event: string,
+  stepId: string | undefined,
+  minCount: number,
+  timeoutMs = 60_000,
+  intervalMs = 200,
+): Promise<Array<Record<string, unknown>>> {
+  const startedAt = Date.now();
+  let events: Array<Record<string, unknown>> = [];
+  while (Date.now() - startedAt < timeoutMs) {
+    events = readRunEvents(ctx, runId);
+    if (countEvent(events, event, stepId) >= minCount) return events;
+    await sleep(intervalMs);
+  }
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for ${minCount} ${event}${stepId ? ` (${stepId})` : ""}; ` +
+      `ledger: ${events.map((e) => e.event).join(",")}\n${diagnostics(ctx, runId)}`,
+  );
 }
 
 function contextJson(ctx: DrvpRunContext, runId: string): Record<string, string> {
@@ -589,7 +638,12 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
         assert.equal(runDraining.scheduling_status, "draining_pause");
         const drainCtx = contextJson(ctx, runId);
         assert.equal(drainCtx.pause_drain, "true", "pause_drain attribution should be set");
-        let events = readRunEvents(ctx, runId);
+        // Bounded observation: the pause-request event is appended after the
+        // control-plane DB update, so a cross-process reader can see the DB
+        // marker before the journal append lands.
+        let events = await waitForEventCount(ctx, runId, "run.pause_requested", undefined, 1);
+        // Absence control (semantics unchanged): no run.paused while the
+        // verify round is still in flight.
         assert.equal(
           countEvent(events, "run.paused"),
           0,
@@ -618,7 +672,13 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
           120_000,
         );
 
-        events = readRunEvents(ctx, runId);
+        // Bounded observation: the DB 'paused' state is committed before the
+        // buffered finalization events are flushed, so wait for every event
+        // involved in the exact-count and ordering assertions before reading
+        // the ledger at the now-quiescent pause point.
+        events = await waitForEventCount(ctx, runId, "run.paused", undefined, 1);
+        events = await waitForEventCount(ctx, runId, "story.verified", undefined, 1);
+        events = await waitForEventCount(ctx, runId, "step.pending", "test", 1);
         assert.equal(countEvent(events, "run.paused"), 1, `exactly one run.paused; ledger: ${events.map((e) => e.event).join(",")}`);
         const pauseReqIdx = eventIndexes(events, "run.pause_requested")[0]!;
         const pausedIdx = eventIndexes(events, "run.paused")[0]!;
@@ -645,6 +705,7 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
           `no step may be claimed between the drain request and the pause; claimed at indices ${runningBetween}\n${diagnostics(ctx, runId)}`,
         );
         assert.equal(countEvent(events, "step.running", "test"), 0, "downstream test step never claimed during the drain");
+        events = await waitForEventCount(ctx, runId, "step.running", "verify", 1);
         assert.equal(countEvent(events, "step.running", "verify"), 1, "the final verify round ran exactly once");
 
         // Final verification report retained on the verify step row, story
@@ -684,8 +745,15 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
         assertAllStepsDone(ctx, runId);
 
         // Event ledger after the full lifecycle: exactly one pause; the
-        // downstream step dispatches only after the resume.
-        events = readRunEvents(ctx, runId);
+        // downstream step dispatches only after the resume. Wait for the
+        // post-resume dispatch and terminal events (the run.completed append
+        // trails the DB terminal state just like the finalization events) so
+        // the ordering assertions see a complete ledger.
+        events = await waitForEventCount(ctx, runId, "run.resumed", undefined, 1);
+        events = await waitForEventCount(ctx, runId, "step.running", "verify", 1);
+        events = await waitForEventCount(ctx, runId, "step.running", "test", 1);
+        events = await waitForEventCount(ctx, runId, "run.completed", undefined, 1);
+        events = await waitForEventCount(ctx, runId, "story.started", undefined, 1);
         assert.equal(countEvent(events, "run.paused"), 1, `exactly one run.paused for the whole run; ledger: ${events.map((e) => e.event).join(",")}`);
         assert.equal(countEvent(events, "run.resume_requested"), 1);
         assert.equal(countEvent(events, "run.resumed"), 1);
@@ -811,7 +879,10 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
         // verify/test are still upstream-blocked: never claimed yet.
         assert.notEqual(dbStep(ctx, runId, "verify")?.status, "running");
         assert.notEqual(dbStep(ctx, runId, "test")?.status, "running");
-        let events = readRunEvents(ctx, runId);
+        // Bounded observation: claimStep commits steps.status='running' before
+        // it emits the step.running journal event, so a cross-process reader
+        // can see the DB claim state first.
+        let events = await waitForEventCount(ctx, runId, "step.running", "implement", 1);
         assert.equal(countEvent(events, "step.running", "implement"), 1, "implement claimed once");
         assert.equal(countEvent(events, "step.running", "verify"), 0, "verify not dispatched yet");
         assert.equal(countEvent(events, "step.running", "test"), 0, "test not dispatched yet");
@@ -837,7 +908,7 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
         );
         assert.equal(runDraining.scheduling_status, "draining_pause");
         assert.equal(contextJson(ctx, runId).pause_drain, "true", "pause_drain attribution should be set");
-        events = readRunEvents(ctx, runId);
+        events = await waitForEventCount(ctx, runId, "run.pause_requested", undefined, 1);
         assert.equal(countEvent(events, "run.paused"), 0, "no run.paused while implement is still in flight");
         assert.equal(countEvent(events, "run.pause_requested"), 1, "exactly one pause request");
 
@@ -853,7 +924,9 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
           180_000,
         );
 
-        events = readRunEvents(ctx, runId);
+        // Bounded observation: wait for the pause event before computing the
+        // no-new-dispatch window at the quiescent pause point.
+        events = await waitForEventCount(ctx, runId, "run.paused", undefined, 1);
         assert.equal(countEvent(events, "run.paused"), 1, `exactly one run.paused; ledger: ${events.map((e) => e.event).join(",")}`);
         const pauseReqIdx = eventIndexes(events, "run.pause_requested")[0]!;
         const pausedIdx = eventIndexes(events, "run.paused")[0]!;
@@ -869,6 +942,7 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
           0,
           `no step may be claimed between the drain request and the pause; claimed at indices ${runningBetween}\n${diagnostics(ctx, runId)}`,
         );
+        events = await waitForEventCount(ctx, runId, "step.running", "implement", 1);
         assert.equal(countEvent(events, "step.running", "implement"), 1, "implement ran exactly once");
         assert.equal(countEvent(events, "step.running", "verify"), 0, "verify must NOT dispatch during the drain");
         assert.equal(countEvent(events, "step.running", "test"), 0, "test must NOT dispatch during the drain");
@@ -921,8 +995,12 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
         assertAllStepsDone(ctx, runId);
 
         // Full lifecycle: one pause, one resume; verify then test dispatches
-        // only after the resume and the run completes after them.
-        events = readRunEvents(ctx, runId);
+        // only after the resume and the run completes after them. Wait for the
+        // post-resume dispatch and terminal events before the ordering asserts.
+        events = await waitForEventCount(ctx, runId, "run.resumed", undefined, 1);
+        events = await waitForEventCount(ctx, runId, "step.running", "verify", 1);
+        events = await waitForEventCount(ctx, runId, "step.running", "test", 1);
+        events = await waitForEventCount(ctx, runId, "run.completed", undefined, 1);
         assert.equal(countEvent(events, "run.paused"), 1, `exactly one run.paused for the whole run; ledger: ${events.map((e) => e.event).join(",")}`);
         assert.equal(countEvent(events, "run.resume_requested"), 1);
         assert.equal(countEvent(events, "run.resumed"), 1);
@@ -1048,7 +1126,13 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
 
         assertAllStepsDone(ctx, runId);
 
-        const events = readRunEvents(ctx, runId);
+        // Bounded observation: wait for the resume-cancel audit, the resumed
+        // dispatch and the terminal events before the counting/ordering
+        // assertions on the now-quiescent terminal ledger.
+        let events = await waitForEventCount(ctx, runId, "run.resumed", undefined, 1);
+        events = await waitForEventCount(ctx, runId, "run.drain_cancelled_by_resume", undefined, 1);
+        events = await waitForEventCount(ctx, runId, "step.running", "test", 1);
+        events = await waitForEventCount(ctx, runId, "story.verified", undefined, 1);
         assert.equal(
           countEvent(events, "run.paused"),
           0,
@@ -1129,7 +1213,10 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
         // The run was NEVER paused or drained: no pause events anywhere, and
         // at no point was scheduling_status draining_pause (the run went
         // straight through to completed). The verify row retains the report.
-        const events = readRunEvents(ctx, runId);
+        // Bounded-observation waits first (dispatch/verification journal
+        // appends trail the DB terminal state), then the same assertions.
+        let events = await waitForEventCount(ctx, runId, "step.running", "test", 1);
+        events = await waitForEventCount(ctx, runId, "story.verified", undefined, 1);
         assert.equal(countEvent(events, "run.pause_requested"), 0, "no pause requested on the non-draining path");
         assert.equal(countEvent(events, "run.paused"), 0, "no run.paused on the non-draining path");
         const verifyStep = dbStep(ctx, runId, "verify");
@@ -1211,7 +1298,7 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
           () => dbRun(failedCtx!, runId)?.status === "failed",
           90_000,
         );
-        const failedEvents = readRunEvents(failedCtx, runId);
+        const failedEvents = await waitForEventCount(failedCtx, runId, "run.failed", undefined, 1);
         assert.equal(countEvent(failedEvents, "run.failed"), 1, "run.failed must be emitted");
 
         const pauseFailed = await requestDrainPause(failedCtx, runId);
@@ -1284,7 +1371,7 @@ describe("DRVP US-004: scripted e2e - drain pause finalizes on final-verify comp
           () => dbRun(canceledCtx!, runId)?.status === "canceled",
           60_000,
         );
-        const canceledEvents = readRunEvents(canceledCtx, runId);
+        const canceledEvents = await waitForEventCount(canceledCtx, runId, "run.canceled", undefined, 1);
         assert.equal(countEvent(canceledEvents, "run.canceled"), 1, "run.canceled must be emitted");
 
         const pauseCanceled = await requestDrainPause(canceledCtx, runId);

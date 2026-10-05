@@ -16,9 +16,11 @@ import { runDoctorChecks, runLlmPromptAdherenceChecks, formatDoctorOutput,
   checkDshSessionStore, detectDshZstdSupport, evaluateDshPermissionDump,
   runLivenessChecks, repairLiveness, runMatchlockAliasChecks,
   checkMatchlockAllowPrivateSupport, MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+  runMatchlockSetupReadinessChecks, MATCHLOCK_SETUP_READINESS_CHECK_NAME,
+  MATCHLOCK_SETUP_REMEDY,
   MATCHLOCK_ALIAS_CHECK_NAME } from "../dist/doctor.js";
-import type { DoctorCheckResult, CheckGroup } from "../dist/doctor.js";
-import type { MatchlockAllowPrivateSupport } from "../dist/installer/matchlock/allow-private-support.js";
+import type { DoctorCheckResult, CheckGroup, MatchlockSetupReadinessDeps } from "../dist/doctor.js";
+import type { MatchlockAllowPrivateSupport, ResolvedMatchlockRpcBinary } from "../dist/installer/matchlock/allow-private-support.js";
 import {
   MATCHLOCK_HOME_ALIAS_ENV,
   MatchlockHomeAliasError,
@@ -677,6 +679,28 @@ describe("ENVIRONMENT matchlock allow_private support (US-007)", () => {
     assert.strictEqual(check.remedy, undefined);
   });
 
+  it("warns naming the canonical override when TAMANDUA_MATCHLOCK_RPC_BIN is set but broken (§0 Path 2)", async () => {
+    const check = await checkMatchlockAllowPrivateSupport(async () => ({
+      supported: false,
+      binaryPath: "/nonexistent/matchlock",
+      reasonCode: "missing_binary",
+      envOverrideSet: true,
+      reason: "matchlock binary not found: /nonexistent/matchlock",
+    }));
+    assert.strictEqual(check.status, "warn");
+    assert.notStrictEqual(check.status, "fail");
+    assert.ok(check.message.includes("TAMANDUA_MATCHLOCK_RPC_BIN"),
+      `Message must name the canonical override literally, got: ${check.message}`);
+    assert.ok(!check.message.includes("TAMANDUA_MATCHLOCK_RPC_BINARY"),
+      `Message must not name a typo spelling, got: ${check.message}`);
+    assert.ok(!check.message.includes("TAMANDUA_MATCHLOCK_RPC_BIN_"),
+      `Message must not name a longer typo spelling, got: ${check.message}`);
+    assert.ok(check.message.includes("/nonexistent/matchlock"),
+      `Message must name the broken path, got: ${check.message}`);
+    assert.ok(check.remedy && check.remedy.includes("tamandua matchlock setup"),
+      `warn must carry the setup remedy, got: ${check.remedy}`);
+  });
+
   it("warns without throwing when the probe itself throws", async () => {
     const check = await checkMatchlockAllowPrivateSupport(async () => {
       throw new Error("spawn blew up");
@@ -697,6 +721,445 @@ describe("ENVIRONMENT matchlock allow_private support (US-007)", () => {
     assert.ok(check, "Expected the matchlock allow_private support check");
     assert.notStrictEqual(check!.status, "fail",
       `allow_private support probe must never fail the doctor, got: ${check!.status}`);
+  });
+});
+
+// ── ENVIRONMENT matchlock setup readiness (SETUP-S2 §0) ───────────
+
+describe("ENVIRONMENT matchlock setup readiness (SETUP-S2 §0)", () => {
+  const engagedBinary: ResolvedMatchlockRpcBinary = {
+    path: "/opt/matchlock/bin/matchlock",
+    source: "path",
+    envOverrideSet: false,
+    executable: true,
+  };
+
+  /** Fully-injected Path-3 deps; override any single seam per test. */
+  function readinessDeps(
+    overrides: MatchlockSetupReadinessDeps = {},
+  ): MatchlockSetupReadinessDeps {
+    return {
+      env: {},
+      platform: "darwin",
+      arch: "arm64",
+      homeDir: path.resolve("doctor-readiness-home"),
+      sourcePath: path.resolve("doctor-readiness-src"),
+      resolveBinary: () => ({ ...engagedBinary }),
+      readVersion: () => "0.2.17 (commit abc1234)",
+      probeAllowPrivate: async () => ({
+        supported: true,
+        binaryPath: engagedBinary.path,
+        version: "0.2.17",
+        resolvedFrom: "path",
+        envOverrideSet: false,
+      }),
+      probeKernel: () => ({
+        status: "present",
+        path: "/home/.cache/matchlock/kernels/0.2.17",
+      }),
+      probeSubmoduleDrift: () => ({
+        recorded: "abc1234",
+        installed: "abc1234",
+        drifted: false,
+      }),
+      ...overrides,
+    };
+  }
+
+  /** A deps set whose non-passive seams throw if the quiet path ever probes. */
+  function passiveDeps(overrides: MatchlockSetupReadinessDeps = {}): MatchlockSetupReadinessDeps {
+    return readinessDeps({
+      resolveBinary: () => ({
+        path: "matchlock",
+        source: "unresolved",
+        envOverrideSet: false,
+        executable: false,
+      }),
+      readVersion: () => { throw new Error("version probe must not run on Path 1"); },
+      probeAllowPrivate: async () => { throw new Error("allow-private probe must not run on Path 1"); },
+      probeKernel: () => { throw new Error("kernel probe must not run on Path 1"); },
+      probeSubmoduleDrift: () => { throw new Error("submodule probe must not run on Path 1"); },
+      ...overrides,
+    });
+  }
+
+  /** A deps set whose non-gate seams throw if a broken path ever probes. */
+  function brokenDeps(overrides: MatchlockSetupReadinessDeps = {}): MatchlockSetupReadinessDeps {
+    return readinessDeps({
+      readVersion: () => { throw new Error("version probe must not run on Path 2"); },
+      probeAllowPrivate: async () => { throw new Error("allow-private probe must not run on Path 2"); },
+      probeKernel: () => { throw new Error("kernel probe must not run on Path 2"); },
+      probeSubmoduleDrift: () => { throw new Error("submodule probe must not run on Path 2"); },
+      ...overrides,
+    });
+  }
+
+  function assertNamesCanonicalOverride(message: string): void {
+    assert.ok(message.includes("TAMANDUA_MATCHLOCK_RPC_BIN"),
+      `must name the canonical override, got: ${message}`);
+    assert.ok(!message.includes("TAMANDUA_MATCHLOCK_RPC_BINARY"),
+      `must not name a typo spelling, got: ${message}`);
+    assert.doesNotMatch(message, /(?<!TAMANDUA_)MATCHLOCK_RPC_BIN\b/,
+      `must not name a non-canonical short spelling, got: ${message}`);
+  }
+
+  it("Path 1 (passive) is quiet: one info line, no kernel/image/submodule/staleness output, no remedy", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(passiveDeps({
+      standardImageFields: [
+        { name: "Standard image presence", status: "info", message: "digest sha256:deadbeef local" },
+        { name: "Standard image staleness", status: "info", message: "fresh" },
+      ],
+    }));
+    assert.equal(checks.length, 1, `Path 1 must emit at most one line, got ${checks.length}`);
+    const check = checks[0];
+    assert.equal(check.name, MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME);
+    assert.equal(check.status, "info");
+    assert.equal(check.remedy, undefined);
+    assert.doesNotMatch(check.message, /kernel|image|submodule|staleness|problem|fault|remedy/i,
+      `Path 1 must read as a non-event, got: ${check.message}`);
+  });
+
+  it("Path 2 (override set, binary missing) warns naming the canonical literal + remedy, never fails", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(brokenDeps({
+      resolveBinary: () => ({
+        path: "/nonexistent/matchlock",
+        source: "override",
+        envOverrideSet: true,
+        executable: false,
+      }),
+    }));
+    assert.equal(checks.length, 1);
+    const check = checks[0];
+    assert.equal(check.status, "warn");
+    assert.notEqual(check.status, "fail");
+    assertNamesCanonicalOverride(check.message);
+    assert.ok(check.message.includes("/nonexistent/matchlock"));
+    assert.equal(check.remedy, MATCHLOCK_SETUP_REMEDY);
+  });
+
+  it("Path 2 (PATH-resolved but unusable) warns naming the canonical literal + remedy", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(brokenDeps({
+      resolveBinary: () => ({
+        path: "/usr/local/bin/matchlock",
+        source: "path_unusable",
+        envOverrideSet: false,
+        executable: false,
+      }),
+    }));
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0].status, "warn");
+    assertNamesCanonicalOverride(checks[0].message);
+    assert.ok(checks[0].message.includes("/usr/local/bin/matchlock"));
+    assert.equal(checks[0].remedy, MATCHLOCK_SETUP_REMEDY);
+  });
+
+  it("Path 3 (engaged) reports version, allow-private support, kernel present and no drift", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps());
+    const names = checks.map((c) => c.name);
+    assert.ok(names.includes(MATCHLOCK_SETUP_READINESS_CHECK_NAME));
+    assert.ok(names.includes(MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME));
+    assert.ok(names.includes("Matchlock guest kernel"));
+    assert.ok(names.includes("Matchlock submodule drift"));
+    assert.ok(checks.every((c) => c.status !== "fail"),
+      `Path 3 must never hard-fail, got: ${JSON.stringify(checks)}`);
+    const version = checks.find((c) => c.name === MATCHLOCK_SETUP_READINESS_CHECK_NAME)!;
+    assert.equal(version.status, "info");
+    assert.ok(version.message.includes("0.2.17"), `version line, got: ${version.message}`);
+    assert.ok(version.message.includes("abc1234"), `commit line, got: ${version.message}`);
+  });
+
+  it("Path 3 (kernel absent) warns with the setup remedy — non-vacuity counterpart of embedded/present", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      probeKernel: () => ({ status: "missing" }),
+    }));
+    const kernel = checks.find((c) => c.name === "Matchlock guest kernel")!;
+    assert.equal(kernel.status, "warn");
+    assert.equal(kernel.remedy, MATCHLOCK_SETUP_REMEDY);
+    assert.ok(checks.every((c) => c.status !== "fail"));
+  });
+
+  it("Path 3 (vendored QEMU/amd64 kernel) reports embedded, the present counterpart", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      platform: "linux",
+      arch: "x64",
+      env: { MATCHLOCK_BACKEND: "qemu" },
+      probeKernel: () => ({ status: "embedded" }),
+    }));
+    const kernel = checks.find((c) => c.name === "Matchlock guest kernel")!;
+    assert.equal(kernel.status, "info");
+    assert.ok(kernel.message.includes("embedded"), `embedded kernel, got: ${kernel.message}`);
+    assert.equal(kernel.remedy, undefined);
+  });
+
+  it("Path 3 (submodule drift) warns with the setup/--latest remedy", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      probeSubmoduleDrift: () => ({
+        recorded: "aaaaaaa1",
+        installed: "bbbbbbb2",
+        drifted: true,
+      }),
+    }));
+    const drift = checks.find((c) => c.name === "Matchlock submodule drift")!;
+    assert.equal(drift.status, "warn");
+    assert.ok(drift.remedy?.includes("tamandua matchlock setup"));
+    assert.ok(drift.remedy?.includes("--latest"));
+    assert.ok(checks.every((c) => c.status !== "fail"));
+  });
+
+  it("Path 3 (no drift) passes — the non-vacuity counterpart of a drift warning", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps());
+    const drift = checks.find((c) => c.name === "Matchlock submodule drift")!;
+    assert.equal(drift.status, "info");
+    assert.equal(drift.remedy, undefined);
+  });
+
+  it("Path 3 omits the drift line entirely when the submodule does not exist", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      probeSubmoduleDrift: () => undefined,
+    }));
+    assert.ok(!checks.some((c) => c.name === "Matchlock submodule drift"));
+  });
+
+  it("Path 3 renders iso-s3-injected standard-image fields verbatim and never recomputes them", async () => {
+    const injected: DoctorCheckResult[] = [
+      { name: "Standard image presence", status: "info", message: "digest sha256:abc local-shadow" },
+      { name: "Standard image staleness", status: "info", message: "stale (remedy --refresh-image)" },
+    ];
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({ standardImageFields: injected }));
+    for (const field of injected) {
+      const found = checks.find((c) => c.name === field.name);
+      assert.ok(found, `expected the injected iso-s3 field ${field.name}`);
+      assert.strictEqual(found!.message, field.message);
+      assert.strictEqual(found!.status, field.status);
+      assert.strictEqual(found!.remedy, field.remedy);
+    }
+  });
+
+  it("runDoctorChecks never hard-fails the doctor on any of the three §0 paths", async () => {
+    const path2 = brokenDeps({
+      resolveBinary: () => ({
+        path: "/nonexistent/matchlock",
+        source: "override",
+        envOverrideSet: true,
+        executable: false,
+      }),
+    });
+    for (const deps of [readinessDeps(), passiveDeps(), path2]) {
+      const groups = await runDoctorChecks({ matchlockSetupReadinessDeps: deps });
+      const env = groups.find((g) => g.label === "ENVIRONMENT")!;
+      const matchlock = env.checks.filter((c) =>
+        [
+          MATCHLOCK_SETUP_READINESS_CHECK_NAME,
+          MATCHLOCK_ALLOW_PRIVATE_SUPPORT_CHECK_NAME,
+          "Matchlock guest kernel",
+          "Matchlock submodule drift",
+        ].includes(c.name),
+      );
+      assert.ok(matchlock.length > 0, "expected Matchlock readiness checks in ENVIRONMENT");
+      assert.ok(matchlock.every((c) => c.status !== "fail"),
+        `Matchlock readiness must never fail the doctor: ${JSON.stringify(matchlock)}`);
+    }
+  });
+
+  // ── SETUP-S2 corrective regressions ─────────────────────────────
+
+  it("Path 3 engaged block is warn/info only — never pass or fail (F01)", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps());
+    assert.ok(checks.length >= 4, JSON.stringify(checks));
+    assert.ok(
+      checks.every((c) => c.status === "warn" || c.status === "info"),
+      `engaged block must be warn/info only, got: ${JSON.stringify(checks)}`,
+    );
+  });
+
+  /** Build an isolated HOME whose kernel cache holds `contents` (dir names => null). */
+  function kernelFixtureHome(contents: Record<string, string | null>): string {
+    const home = tamanduaTempDir("tamandua-doctor-kernel-");
+    for (const [name, value] of Object.entries(contents)) {
+      const target = path.join(home, ".cache/matchlock/kernels", name);
+      if (value === null) {
+        fs.mkdirSync(target, { recursive: true });
+      } else {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, value);
+      }
+    }
+    return home;
+  }
+
+  async function kernelCheck(
+    contents: Record<string, string | null>,
+    platform: string,
+    arch: string,
+    env: NodeJS.ProcessEnv = {},
+  ): Promise<DoctorCheckResult> {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      homeDir: kernelFixtureHome(contents),
+      platform,
+      arch,
+      env,
+      probeKernel: undefined,
+    }));
+    return checks.find((c) => c.name === "Matchlock guest kernel")!;
+  }
+
+  it("kernel: an empty version directory is not a present kernel (F06)", async () => {
+    assert.equal((await kernelCheck({ "6.19.8": null }, "darwin", "arm64")).status, "warn");
+  });
+
+  it("kernel: a plain archless file is not present for arm64 (F07)", async () => {
+    assert.equal(
+      (await kernelCheck({ "6.19.8/kernel": "owned x86 fixture" }, "darwin", "arm64")).status,
+      "warn",
+    );
+  });
+
+  it("kernel: the requested architecture file is present (P18)", async () => {
+    const kernel = await kernelCheck({ "6.19.8/kernel-arm64": "owned arm fixture" }, "darwin", "arm64");
+    assert.equal(kernel.status, "info");
+    assert.match(kernel.message, /present/);
+    assert.match(kernel.message, /6\.19\.8/);
+  });
+
+  it("kernel: explicit Firecracker x64 requires the download cache (F08)", async () => {
+    assert.equal(
+      (await kernelCheck({}, "linux", "x64", { MATCHLOCK_BACKEND: "firecracker" })).status,
+      "warn",
+    );
+  });
+
+  it("kernel: explicit QEMU amd64 reports embedded (P19)", async () => {
+    const kernel = await kernelCheck({}, "linux", "x64", { MATCHLOCK_BACKEND: "qemu" });
+    assert.equal(kernel.status, "info");
+    assert.match(kernel.message, /embedded/);
+  });
+
+  it("kernel: QEMU amd64 with an explicit kernel override is not embedded", async () => {
+    assert.equal(
+      (await kernelCheck({}, "linux", "x64", {
+        MATCHLOCK_BACKEND: "qemu",
+        MATCHLOCK_KERNEL: "/owned/kernel-override",
+      })).status,
+      "warn",
+    );
+  });
+
+  function initGitFixtureRepo(dir: string): void {
+    for (const args of [
+      ["init", "--quiet"],
+      ["config", "user.name", "doctor fixture"],
+      ["config", "user.email", "doctor@example.invalid"],
+    ]) {
+      const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf-8" });
+      assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+    }
+  }
+
+  /** Synthetic superproject with a `matchlock` submodule gitlink pinned at A. */
+  function makeDriftSuperproject(): { superproject: string; commitA: string; commitB: string } {
+    const superproject = tamanduaTempDir("tamandua-doctor-drift-");
+    const sub = path.join(superproject, "matchlock");
+    fs.mkdirSync(sub, { recursive: true });
+    initGitFixtureRepo(superproject);
+    initGitFixtureRepo(sub);
+    fs.writeFileSync(path.join(sub, "marker"), "A");
+    spawnSync("git", ["-C", sub, "add", "marker"]);
+    spawnSync("git", ["-C", sub, "commit", "--quiet", "-m", "A"]);
+    const commitA = spawnSync("git", ["-C", sub, "rev-parse", "HEAD"], { encoding: "utf-8" }).stdout.trim();
+    fs.writeFileSync(path.join(sub, "marker"), "B");
+    spawnSync("git", ["-C", sub, "add", "marker"]);
+    spawnSync("git", ["-C", sub, "commit", "--quiet", "-m", "B"]);
+    const commitB = spawnSync("git", ["-C", sub, "rev-parse", "HEAD"], { encoding: "utf-8" }).stdout.trim();
+    spawnSync("git", ["-C", superproject, "update-index", "--add", "--cacheinfo", `160000,${commitA},matchlock`]);
+    return { superproject, commitA, commitB };
+  }
+
+  function writeFakeMatchlockVersion(dir: string, commit: string): string {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "matchlock");
+    fs.writeFileSync(
+      file,
+      `#!/bin/sh\necho "matchlock 0.2.17 (commit: ${commit}, built: fixture)"\n`,
+      { mode: 0o755 },
+    );
+    return file;
+  }
+
+  /** Default-probe drift status for an installed binary commit + checkout commit. */
+  async function driftStatusFor(
+    superproject: string,
+    binaryCommit: string,
+    checkoutCommit: string,
+  ): Promise<string> {
+    const sub = path.join(superproject, "matchlock");
+    const co = spawnSync("git", ["-C", sub, "checkout", "--quiet", "--detach", checkoutCommit], {
+      encoding: "utf-8",
+    });
+    assert.equal(co.status, 0, `git checkout failed: ${co.stderr}`);
+    const bin = writeFakeMatchlockVersion(
+      tamanduaTempDir("tamandua-doctor-drift-bin-"),
+      binaryCommit,
+    );
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      resolveBinary: () => ({
+        path: bin,
+        source: "override",
+        envOverrideSet: true,
+        executable: true,
+      }),
+      sourcePath: superproject,
+      readVersion: undefined,
+      probeSubmoduleDrift: undefined,
+    }));
+    const drift = checks.find((c) => c.name === "Matchlock submodule drift");
+    assert.ok(drift, `expected a drift line, got: ${JSON.stringify(checks)}`);
+    return drift.status;
+  }
+
+  it("drift: an installed-binary commit differing from the gitlink warns (F09)", async () => {
+    const { superproject, commitA, commitB } = makeDriftSuperproject();
+    // Checkout matches the gitlink (A) but the installed binary is B: old code
+    // compared the checkout and missed the drift.
+    assert.equal(await driftStatusFor(superproject, commitB, commitA), "warn");
+  });
+
+  it("drift: a matching installed binary is not misreported due to the checkout (F10)", async () => {
+    const { superproject, commitA, commitB } = makeDriftSuperproject();
+    // Checkout is B but the installed binary commit matches the gitlink A.
+    assert.notEqual(await driftStatusFor(superproject, commitA, commitB), "warn");
+  });
+
+  it("drift: matching installed binary and checkout is not drifted (P20)", async () => {
+    const { superproject, commitA } = makeDriftSuperproject();
+    assert.notEqual(await driftStatusFor(superproject, commitA, commitA), "warn");
+  });
+
+  it("contains a throwing readVersion as a non-fatal warning (R01)", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      readVersion: () => { throw new Error("injected version fault"); },
+    }));
+    const version = checks.find((c) => c.name === MATCHLOCK_SETUP_READINESS_CHECK_NAME)!;
+    assert.equal(version.status, "warn");
+    assert.equal(version.remedy, MATCHLOCK_SETUP_REMEDY);
+    assert.equal(formatDoctorOutput([{ label: "ENVIRONMENT", checks }]).hasFailures, false);
+  });
+
+  it("contains a throwing probeKernel as a non-fatal warning (R02)", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      probeKernel: () => { throw new Error("injected kernel fault"); },
+    }));
+    const kernel = checks.find((c) => c.name === "Matchlock guest kernel")!;
+    assert.equal(kernel.status, "warn");
+    assert.equal(kernel.remedy, MATCHLOCK_SETUP_REMEDY);
+    assert.equal(formatDoctorOutput([{ label: "ENVIRONMENT", checks }]).hasFailures, false);
+  });
+
+  it("contains a throwing probeSubmoduleDrift without rejecting (R03)", async () => {
+    const checks = await runMatchlockSetupReadinessChecks(readinessDeps({
+      probeSubmoduleDrift: () => { throw new Error("injected drift fault"); },
+    }));
+    assert.ok(!checks.some((c) => c.name === "Matchlock submodule drift"));
+    assert.equal(formatDoctorOutput([{ label: "ENVIRONMENT", checks }]).hasFailures, false);
   });
 });
 

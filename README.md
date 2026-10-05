@@ -1241,6 +1241,74 @@ therefore listed in `tests/serial-files.txt`; the real-VM gate above is
 on-demand and classified in no lane. The production qualification recipe for
 the REAL dsh Matchlock path is `docs/matchlock-dsh-qualification.md`.
 
+###### Provisioning the host with `tamandua matchlock setup`
+
+A host must be provisioned before any `--matchlock` run: the `matchlock` and
+`guest-init` binaries installed and bound by absolute path, matchlock's own
+Linux host setup completed, and the standard image plus the guest kernel present
+locally. `tamandua matchlock setup` performs that provisioning end to end
+(MTLK-SETUP). It never commits to the tamandua checkout, never installs OS
+packages, and never escalates silently: the one privileged step is phase 2's
+visible one-time `sudo` child, always displayed first and bound to the absolute
+installed binary (N7). Run it as your ordinary user:
+
+```bash
+tamandua matchlock setup                  # full setup
+tamandua matchlock setup --refresh-image  # documented standard-image update channel
+```
+
+The four phases, in order:
+
+1. **Binaries (fail-closed).** Synchronize the committed `matchlock` submodule
+   (`git submodule update --init matchlock`), verify the exact Go minimum read
+   from the synchronized `go.mod` with `GOTOOLCHAIN=local` (a missing or
+   too-old toolchain is a HARD failure before anything is built, installed or
+   host-mutated), build `matchlock` + `guest-init` with the repo's pinned
+   recipe, and install both side by side into the prefix atomically
+   (temp + rename). Idempotent: a re-run at the same commit reports
+   `already at <sha>` unless `--force`. Phase 1 aborts the run.
+2. **Host setup (Linux only).** Run `<absolute installed matchlock> diagnose`;
+   when the host is not ready, print the exact command and its plain-language
+   effects, then run it with inherited stdio (`sudo <absolute installed
+   matchlock> setup linux` for an ordinary user; the absolute binary directly
+   for a process already running as root with the R12 override). Skipped by
+   `--no-host-setup` and always skipped on macOS.
+3. **Boot assets.** Warn when a locally built/imported image shadows the
+   standard reference (the accepted override; a shadow is never deleted or
+   re-tagged), require `mkfs.erofs` on `PATH`, enforce a 16 GB free-space floor
+   on the image-store filesystem (`--allow-low-disk-space` overrides), pull the
+   effective standard image reference (`igorhvr/tamandua`, overridable with
+   `TAMANDUA_MATCHLOCK_IMAGE`) via `matchlock pull [--force] <reference>`, and
+   warm the guest kernel with `<absolute installed matchlock> kernel pull`
+   (R11). Phases 2 and 3 are independent: one failing does not block the other.
+4. **Verify + report.** Re-run `diagnose`, report the installed version and
+   commit, the effective image digest AND source (registry vs local shadow), the
+   warmed kernel version and path (or `embedded`), the expected daemon binary
+   and any PATH-shadow warning, stale `MATCHLOCK_*` overrides, and an explicit
+   offline-readiness verdict separating ASSETS from RUNNABILITY.
+
+**Re-login caveat.** When phase 2 enrolls the user in the `kvm`/`netdev`
+groups, that membership takes effect only in a NEW login session: VMs cannot
+run from the current session until you log out and back in. Log out, log in,
+then re-run `tamandua matchlock setup` (it skips what is already done). The
+verify phase never claims VM readiness while a re-login is pending, and it
+refuses `--smoke`.
+
+**Offline-readiness contract (R11).** A successful setup leaves the standard
+image in the local matchlock store and the guest kernel warmed for this host, so
+a later isolated run needs no public-internet access on the host.
+`assets: offline-ready` requires the binaries, the image and the kernel;
+`runnability` is reported separately and stays `relogin-required` until the new
+login session exists. `--refresh-image` is the standard image's update channel.
+A locally built or imported image intentionally shadows the registry copy (the
+`local` source in the report) and is the accepted override; the digest and
+source line record which one is effective.
+
+`tamandua matchlock setup --help` (implemented in
+`src/cli/commands/matchlock.ts`) is the single source for the full flag
+reference, the platform notes, the caveat and the admission-refusal
+relationship; this section deliberately does not duplicate that list.
+
 ##### Doctor Contract Check
 
 `tamandua doctor` includes a Hermes `state.db` contract check in its

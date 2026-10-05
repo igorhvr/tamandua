@@ -139,6 +139,61 @@ async function waitForJournalEntry(
   );
 }
 
+interface HeartbeatMarkerShape {
+  pid: number;
+  startedAt: string;
+  lastHeartbeatAt: string;
+}
+
+/**
+ * Bounded, tolerant read of daemon-heartbeat.json.
+ *
+ * The daemon rewrites the marker with a non-atomic truncate+write
+ * (daemon-lifecycle.ts writeHeartbeatMarker/touchHeartbeat use
+ * fs.writeFileSync), so a reader can land between the truncate and the write
+ * and observe an empty or torn body. The product's own readHeartbeatMarker
+ * treats such a read as null by design; the test must retry instead of letting
+ * JSON.parse throw. Retry missing/empty/torn/unparseable/wrong-shape reads
+ * until a complete marker parses or the deadline elapses, then throw a message
+ * naming the path and the deadline.
+ */
+async function readHeartbeatMarkerTolerant(
+  markerPath: string,
+  timeoutMs = 5_000,
+  intervalMs = 25,
+): Promise<HeartbeatMarkerShape> {
+  const startedAt = Date.now();
+  let lastError = "marker not present";
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const raw = fs.readFileSync(markerPath, "utf-8").trim();
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<HeartbeatMarkerShape>;
+        if (
+          typeof parsed.pid === "number" &&
+          typeof parsed.startedAt === "string" &&
+          typeof parsed.lastHeartbeatAt === "string"
+        ) {
+          return {
+            pid: parsed.pid,
+            startedAt: parsed.startedAt,
+            lastHeartbeatAt: parsed.lastHeartbeatAt,
+          };
+        }
+        lastError = `unexpected marker shape: ${raw.slice(0, 200)}`;
+      } else {
+        lastError = "marker read was empty (torn write)";
+      }
+    } catch (err) {
+      lastError = `marker read/parse failed: ${String(err)}`;
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for a valid heartbeat marker at ${markerPath}: ${lastError}`,
+  );
+}
+
 
 describe("version check integration", () => {
   it("daemon bootstrap triggers version check and writes version-status.json", async (t) => {
@@ -402,9 +457,10 @@ describe("daemon lifecycle journaling (DDTH)", { concurrency: 1 }, () => {
       );
       assert.equal(typeof startEntry.configFingerprint, "string");
 
-      // Heartbeat marker exists after startup with this instance's pid.
+      // Heartbeat marker exists after startup with this instance's pid. Read it
+      // tolerantly: the daemon may be mid-rewrite (truncate+write) right now.
       assert.ok(fs.existsSync(markerPath), "heartbeat marker should exist after startup");
-      const marker1 = JSON.parse(fs.readFileSync(markerPath, "utf-8"));
+      const marker1 = await readHeartbeatMarkerTolerant(markerPath);
       assert.equal(marker1.pid, child.pid);
       assert.ok(
         !Number.isNaN(Date.parse(marker1.startedAt)) &&
@@ -412,18 +468,36 @@ describe("daemon lifecycle journaling (DDTH)", { concurrency: 1 }, () => {
         "marker must carry ISO timestamps",
       );
 
-      // lastHeartbeatAt advances when TAMANDUA_HEARTBEAT_INTERVAL_MS=100.
+      // lastHeartbeatAt advances when TAMANDUA_HEARTBEAT_INTERVAL_MS=100. A
+      // torn read is retried rather than fatal; the advancement must still be
+      // OBSERVED within the 5s window.
       const advanceDeadline = Date.now() + 5000;
       let advanced = false;
+      let lastAdvanceReadError: unknown;
       while (Date.now() < advanceDeadline) {
-        const marker2 = JSON.parse(fs.readFileSync(markerPath, "utf-8"));
-        if (Date.parse(marker2.lastHeartbeatAt) > Date.parse(marker1.lastHeartbeatAt)) {
-          advanced = true;
-          break;
+        const remaining = advanceDeadline - Date.now();
+        try {
+          const marker2 = await readHeartbeatMarkerTolerant(
+            markerPath,
+            Math.max(remaining, 1),
+          );
+          if (Date.parse(marker2.lastHeartbeatAt) > Date.parse(marker1.lastHeartbeatAt)) {
+            advanced = true;
+            break;
+          }
+        } catch (err) {
+          // A marker that never becomes valid must not crash the loop; the
+          // deadline assertion below still fails with a clear message.
+          lastAdvanceReadError = err;
         }
         await sleep(100);
       }
-      assert.ok(advanced, "heartbeat lastHeartbeatAt should advance within 5s");
+      assert.ok(
+        advanced,
+        `heartbeat lastHeartbeatAt should advance within 5s${
+          lastAdvanceReadError ? ` (last read error: ${String(lastAdvanceReadError)})` : ""
+        }`,
+      );
 
       // SIGTERM → clean shutdown with a journaled daemon.shutdown.
       process.kill(child.pid!, "SIGTERM");

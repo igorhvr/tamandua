@@ -140,6 +140,11 @@ import {
   getRestartHelp,
   handleRestart,
 } from "./commands/restart.js";
+import {
+  getMatchlockHelp,
+  getMatchlockSetupHelp,
+  handleMatchlock,
+} from "./commands/matchlock.js";
 
 function getUsageText(): string {
   return [
@@ -222,6 +227,7 @@ function getUsageText(): string {
     "tamandua step release <run-id> [step-id] [--force]  Release stuck step back to pending. Ids: run-<uuid>, step-<uuid>.",
     "", "tamandua logs [<lines>|<run-id>|#<run-number>] [--tail <N>] [--follow|-f]  Show recent activity or follow",
     "tamandua logs-tail [<lines>|<run-id>|#<run-number>] Follow recent activity",
+    "", "tamandua matchlock setup          Provision matchlock: binaries, host setup, standard image",
     "", "tamandua version                      Show installed version",
     "tamandua skill-path                  Print path to the bundled tamandua-agents skill",
     "tamandua source-path                  Print source checkout path",
@@ -361,6 +367,10 @@ async function main() {
     if (group === "restart") {
       printHelp(getRestartHelp());
     }
+    if (group === "matchlock") {
+      if (action === "setup") { printHelp(getMatchlockSetupHelp()); }
+      printHelp(getMatchlockHelp());
+    }
     if (group === "nudge") {
       printHelp(getNudgeHelp());
     }
@@ -418,6 +428,8 @@ async function main() {
   if (await handleAutoresearch(group, args)) { return; }
 
   if (await handleWorkflow(group, args, printUsage)) { return; }
+
+  if (await handleMatchlock(group, args)) { return; }
 
   // Unknown command: detect whether it's a known top-level group with a missing
   // subcommand or a completely unknown group. Print a helpful error instead of

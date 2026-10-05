@@ -324,6 +324,16 @@ across rounds belongs in the whole-directory durable entries (`sessions/`,
 
 ## 3. Observed runtime identity (unpinned)
 
+**Provisioning assumption.** Every gate and recipe in this document assumes a
+host provisioned with `tamandua matchlock setup` (MTLK-SETUP), not a manual
+matchlock install. That command synchronizes the committed `matchlock`
+submodule, builds and installs the `matchlock`/`guest-init` pair, runs
+matchlock's own Linux host setup, pulls the standard image and warms the guest
+kernel (R11) so a later isolated run needs no public-internet access. Re-run it
+after any `tamandua update` that moves the submodule pin; use `--refresh-image`
+for the standard image's update channel. The "system `/usr/local/bin/matchlock`"
+below is that installed binary, resolved through `PATH` as the gates describe.
+
 The gates are **unpinned**: qualification uses whatever `matchlock` resolves on
 `PATH` (the system `/usr/local/bin/matchlock` on vaimetal) and lets matchlock
 resolve its own guest-init. `TAMANDUA_MATCHLOCK_RPC_BIN` /
@@ -525,6 +535,12 @@ overlay-lifecycle limitation, not a regression of the three landings; the pi
 merge-worktree gate (no dsh overlay) is unaffected.
 
 ## 6. Real production recipe (operator)
+
+**Prerequisite — provision the host.** Run `tamandua matchlock setup` (§3) as
+the ordinary user first: it installs the absolute-path `matchlock`/`guest-init`
+pair, completes matchlock's host setup, and leaves the standard image plus the
+warmed guest kernel locally, so the run below needs no host internet access.
+Do not hand-install `matchlock`.
 
 1. **Provide an image with real dsh.** The operator supplies
    `--matchlock-image <image>`; Tamandua never installs dsh on the host for an

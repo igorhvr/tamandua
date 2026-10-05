@@ -16,6 +16,7 @@ src/cli/commands/dashboard.test.ts
 src/cli/commands/evidence.test.ts
 src/cli/commands/get-ready.test.ts
 src/cli/commands/logs.test.ts
+src/cli/commands/matchlock.test.ts
 src/cli/commands/mcp.test.ts
 src/cli/commands/merge-branch.test.ts
 src/cli/commands/restart.test.ts
@@ -199,6 +200,7 @@ tests/matchlock-dsh-story-merge-roles.test.ts
 tests/matchlock-gate-rounds.test.ts
 tests/matchlock-hermes-story-merge-roles.test.ts
 tests/matchlock-integration-test-parity.test.ts
+tests/matchlock-setup-integration.test.ts
 tests/matchlock-union4-merge.test.ts
 tests/mcp-cli.test.ts
 tests/mcp-lifecycle.test.ts

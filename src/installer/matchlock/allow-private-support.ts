@@ -74,6 +74,19 @@ export interface MatchlockAllowPrivateSupport {
   reason?: string;
   /** Typed discriminator for the doctor/admission refusal paths. */
   reasonCode?: MatchlockAllowPrivateSupportReason;
+  /**
+   * How {@link binaryPath} was resolved, when the probe resolved it itself.
+   * Omitted when the caller supplied an explicit `binaryPath` and no resolution
+   * happened.
+   */
+  resolvedFrom?: MatchlockRpcBinarySource;
+  /**
+   * True when `TAMANDUA_MATCHLOCK_RPC_BIN` was set (non-empty) for the probe's
+   * environment, even when an explicit `binaryPath` was supplied. Doctor's §0
+   * Path-2 gate needs this to tell a passive user (unset) from an engaged user
+   * whose override is broken.
+   */
+  envOverrideSet?: boolean;
 }
 
 /** Options for {@link probeMatchlockAllowPrivateSupport}. */
@@ -105,22 +118,178 @@ function isExecutableFile(candidate: string): boolean {
   }
 }
 
+function pathEntryExists(candidate: string): boolean {
+  try {
+    return fs.existsSync(candidate);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Resolve the matchlock CLI binary to probe: `TAMANDUA_MATCHLOCK_RPC_BIN` when
- * set (trimmed), else the first executable `matchlock` on `PATH`, else the bare
- * name `matchlock` (so the probe reports a missing binary instead of guessing).
+ * Bounded launchability probe mirroring the runner's real subprocess launcher.
+ *
+ * `fs.accessSync(X_OK)` alone is NOT enough: an executable script whose shebang
+ * interpreter does not exist passes the permission check but `execve` fails with
+ * ENOENT, exactly as the runner's `spawn` would fail. This probe therefore
+ * attempts a bounded `version` run and treats only a spawn error as
+ * unlaunchable; a non-zero exit still proves the OS launched the file.
+ */
+export function isLaunchableMatchlockBinary(
+  candidate: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!isExecutableFile(candidate)) return false;
+  try {
+    const result = spawnSync(candidate, ["version"], {
+      env,
+      encoding: "utf-8",
+      timeout: MATCHLOCK_ALLOW_PRIVATE_PROBE_TIMEOUT_MS,
+      maxBuffer: MATCHLOCK_ALLOW_PRIVATE_PROBE_MAX_OUTPUT,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return !result.error;
+  } catch {
+    return false;
+  }
+}
+
+/** First launchable / first present-but-unusable hit for a bare PATH lookup. */
+interface MatchlockPathSearch {
+  /** Absolute path of the first entry the OS can actually launch. */
+  launchable?: string;
+  /** Absolute path of the first entry that exists but cannot be launched. */
+  present?: string;
+}
+
+/**
+ * Replicate the runner launcher's bare-name PATH resolution for `name`: search
+ * each `PATH` entry for `<entry>/<name>`, treating an empty entry as the current
+ * working directory (POSIX `execvp` semantics), and return the first entry that
+ * is launchable. When none is launchable but an entry exists, report it as
+ * present-but-unusable so doctor can warn (Path 2) rather than fall silent.
+ */
+function searchMatchlockOnPath(
+  name: string,
+  env: NodeJS.ProcessEnv,
+): MatchlockPathSearch {
+  const entries = (env.PATH ?? "").split(path.delimiter);
+  let present: string | undefined;
+  for (const entry of entries) {
+    // An empty PATH component means the current working directory, not "skip".
+    const candidate = path.resolve(entry === "" ? process.cwd() : entry, name);
+    if (isLaunchableMatchlockBinary(candidate, env)) {
+      return { launchable: candidate };
+    }
+    if (present === undefined && pathEntryExists(candidate)) {
+      present = candidate;
+    }
+  }
+  return present === undefined ? {} : { present };
+}
+
+/**
+ * How {@link resolveMatchlockRpcBinary} arrived at a candidate:
+ *  - `"override"`       — `TAMANDUA_MATCHLOCK_RPC_BIN` was set (non-empty);
+ *  - `"path"`           — an executable `matchlock` was found on `PATH`;
+ *  - `"path_unusable"`  — a `matchlock` entry exists on `PATH` but is not an
+ *                         executable file (present-but-unusable);
+ *  - `"unresolved"`     — nothing was found (the bare name is reported).
+ */
+export type MatchlockRpcBinarySource =
+  | "override"
+  | "path"
+  | "path_unusable"
+  | "unresolved";
+
+/**
+ * The runner's binary-resolution result WITH provenance. The §0 doctor gate must
+ * tell four states apart — override set, PATH executable found, PATH
+ * present-but-unusable, and nothing found — which a bare path string cannot
+ * express.
+ */
+export interface ResolvedMatchlockRpcBinary {
+  /** Path (or bare name) the runner would probe. */
+  path: string;
+  /** How {@link path} was resolved. */
+  source: MatchlockRpcBinarySource;
+  /** True when `TAMANDUA_MATCHLOCK_RPC_BIN` was set (non-empty after trim). */
+  envOverrideSet: boolean;
+  /** True when {@link path} is an existing executable file the OS can launch. */
+  executable: boolean;
+}
+
+/**
+ * Resolve the matchlock CLI binary the runners would use, preserving provenance
+ * and MIRRORING the runner launcher's OS-level `spawn` resolution:
+ *
+ *  - a `TAMANDUA_MATCHLOCK_RPC_BIN` containing a path separator is resolved by
+ *    the OS relative to the current working directory;
+ *  - a BARE override is searched on `PATH` (an empty entry means the cwd),
+ *    exactly as the runner hands the bare name to `spawn`;
+ *  - with no override, `matchlock` is searched on `PATH`;
+ *  - a candidate that exists but cannot actually be launched (e.g. a nonexistent
+ *    shebang interpreter, or a non-X_OK file) is never treated as usable.
+ *
+ * Returns the first launchable entry, else the present-but-unusable one as
+ * `path_unusable`, else the bare name `matchlock` (`unresolved`).
+ */
+export function resolveMatchlockRpcBinary(
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedMatchlockRpcBinary {
+  const override = env[MATCHLOCK_RPC_BIN_ENV]?.trim();
+  if (override) {
+    // A separator means the runner spawns it as a path (cwd-relative when
+    // relative); probe that exact path for launchability.
+    if (override.includes("/") || override.includes("\\")) {
+      return {
+        path: override,
+        source: "override",
+        envOverrideSet: true,
+        executable: isLaunchableMatchlockBinary(override, env),
+      };
+    }
+    // A bare override is resolved by the OS through PATH, never against cwd.
+    const found = searchMatchlockOnPath(override, env);
+    if (found.launchable !== undefined) {
+      return {
+        path: found.launchable,
+        source: "override",
+        envOverrideSet: true,
+        executable: true,
+      };
+    }
+    return {
+      path: override,
+      source: "override",
+      envOverrideSet: true,
+      executable: false,
+    };
+  }
+
+  const found = searchMatchlockOnPath("matchlock", env);
+  if (found.launchable !== undefined) {
+    return { path: found.launchable, source: "path", envOverrideSet: false, executable: true };
+  }
+  if (found.present !== undefined) {
+    return { path: found.present, source: "path_unusable", envOverrideSet: false, executable: false };
+  }
+  return { path: "matchlock", source: "unresolved", envOverrideSet: false, executable: false };
+}
+
+/**
+ * String-returning wrapper over {@link resolveMatchlockRpcBinary}. Keeps the
+ * historical contract (override or executable PATH hit, else the bare name) so
+ * admission and the probe defaults are unchanged; the structured resolver is
+ * where the §0 gate reads provenance.
  */
 export function resolveMatchlockRpcBinaryPath(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const override = env[MATCHLOCK_RPC_BIN_ENV]?.trim();
-  if (override) return override;
-  for (const dir of (env.PATH ?? "").split(path.delimiter)) {
-    if (!dir) continue;
-    const candidate = path.join(dir, "matchlock");
-    if (isExecutableFile(candidate)) return candidate;
-  }
-  return "matchlock";
+  const resolved = resolveMatchlockRpcBinary(env);
+  return resolved.source === "override" || resolved.source === "path"
+    ? resolved.path
+    : "matchlock";
 }
 
 /** Parse a version out of `<binary> --version` output (e.g. "matchlock version 0.2.17"). */
@@ -206,8 +375,26 @@ function defaultRunMatchlockHelp(
  * a spawn error, a killed/timeout child, or injected-runner failure all yield
  * `supported: false` with a typed {@link MatchlockAllowPrivateSupport.reasonCode}
  * and a human-readable `reason` — this function never throws for those cases.
+ *
+ * The result also carries binary-resolution provenance
+ * ({@link MatchlockAllowPrivateSupport.resolvedFrom} /
+ * {@link MatchlockAllowPrivateSupport.envOverrideSet}) so doctor's §0 gate can
+ * distinguish a passive user from a user whose override is set but broken.
  */
 export async function probeMatchlockAllowPrivateSupport(
+  opts: ProbeMatchlockAllowPrivateSupportOptions = {},
+): Promise<MatchlockAllowPrivateSupport> {
+  const env = opts.env ?? process.env;
+  const resolved = resolveMatchlockRpcBinary(env);
+  const result = await probeMatchlockAllowPrivateSupportInner(opts);
+  return {
+    envOverrideSet: resolved.envOverrideSet,
+    ...(opts.binaryPath?.trim() ? {} : { resolvedFrom: resolved.source }),
+    ...result,
+  };
+}
+
+async function probeMatchlockAllowPrivateSupportInner(
   opts: ProbeMatchlockAllowPrivateSupportOptions = {},
 ): Promise<MatchlockAllowPrivateSupport> {
   const env = opts.env ?? process.env;
