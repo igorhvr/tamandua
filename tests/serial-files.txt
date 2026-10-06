@@ -63,6 +63,7 @@ src/installer/matchlock/allow-private-support.test.ts
 src/installer/matchlock/controller.test.ts
 src/installer/matchlock/dsh-scheduler-seam.test.ts
 src/installer/matchlock/execution-boundary.test.ts
+src/installer/matchlock/fake-rpc-driver.test.ts
 src/installer/matchlock/finalizer-ledger-seam.test.ts
 src/installer/matchlock/guest-bridge.test.ts
 src/installer/matchlock/guest-suite.test.ts
@@ -72,6 +73,9 @@ src/installer/matchlock/home-alias-owner.test.ts
 src/installer/matchlock/host-merge-service.test.ts
 src/installer/matchlock/host-query-service.test.ts
 src/installer/matchlock/host-suite-service.test.ts
+src/installer/matchlock/interactive-session-plan.test.ts
+src/installer/matchlock/interactive-session-synthetic-e2e.test.ts
+src/installer/matchlock/interactive-session.test.ts
 src/installer/matchlock/merge-core.test.ts
 src/installer/matchlock/mount-plan.test.ts
 src/installer/matchlock/native-step-broker.test.ts

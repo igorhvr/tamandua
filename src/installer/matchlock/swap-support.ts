@@ -38,6 +38,12 @@ export const MATCHLOCK_RPC_BIN_ENV = "TAMANDUA_MATCHLOCK_RPC_BIN";
 /** Wall-clock bound (ms) for each probe subprocess. */
 export const MATCHLOCK_SWAP_PROBE_TIMEOUT_MS = 10_000;
 
+/**
+ * Typed refusal code carried by the interactive admission path when the
+ * resolved runtime does not advertise `--swap` (INTEGRATION-NOTES.md GAP-02).
+ */
+export const MATCHLOCK_SWAP_UNSUPPORTED_CODE = "matchlock_swap_unsupported" as const;
+
 /** Cap on captured help/version output (characters). */
 const MATCHLOCK_SWAP_PROBE_MAX_OUTPUT = 4 * 1024 * 1024;
 
@@ -59,6 +65,14 @@ export interface MatchlockSwapHelpResult {
 export type MatchlockSwapHelpRunner = (
   binaryPath: string,
 ) => MatchlockSwapHelpResult | Promise<MatchlockSwapHelpResult>;
+
+/**
+ * Back-compat aliases for the payload-era names. The interactive line imported
+ * `MatchlockSwapRunHelpResult`/`MatchlockSwapRunHelpRunner`; both names refer to
+ * the single reconciled leaf implementation above.
+ */
+export type MatchlockSwapRunHelpResult = MatchlockSwapHelpResult;
+export type MatchlockSwapRunHelpRunner = MatchlockSwapHelpRunner;
 
 /**
  * Injectable probe seam: receives the resolved matchlock binary path and
@@ -145,14 +159,15 @@ export function resolveMatchlockSwapBinaryPath(
 }
 
 /**
- * True only when `output` lists the EXACT `--swap` flag token. A bare
+ * True only when `helpText` lists the EXACT `--swap` flag token. A bare
  * substring match is deliberately NOT used: a build that only advertises a
  * longer near-miss such as `--swap-size` does not support `--swap` and must be
- * refused. The token must be delimited by whitespace (or the start/end of the
- * output), so `--swap-size`, `--swapfoo` and `x--swap` never count.
+ * refused. The token must be delimited by start-of-text/whitespace on the left
+ * and whitespace/`=`/end-of-text on the right, so `--swap-size`, `--swapfoo`,
+ * `--matchlock-swap` and `foo--swap` never count while `--swap=512` does.
  */
-function listsSwapFlagToken(output: string): boolean {
-  return /(?:^|\s)--swap(?=\s|$)/.test(output);
+export function helpListsMatchlockSwapFlag(helpText: string): boolean {
+  return /(^|\s)--swap(?:\s|=|$)/m.test(helpText);
 }
 
 /** Parse a version out of `<binary> --version` output (e.g. "matchlock version 0.2.17"). */
@@ -305,7 +320,7 @@ export async function probeMatchlockSwapSupport(
     };
   }
 
-  if (!listsSwapFlagToken(result.output)) {
+  if (!helpListsMatchlockSwapFlag(result.output)) {
     return {
       supported: false,
       binaryPath,

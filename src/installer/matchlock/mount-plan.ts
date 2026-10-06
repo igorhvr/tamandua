@@ -312,6 +312,15 @@ export interface BuildMatchlockCreateConfigOptions {
   /** Admission context (tests inject a deterministic home/state root). */
   admission?: MountAdmissionContext;
   /**
+   * INTERACTIVE-scoped identical-absolute-path override. When supplied, the
+   * selected configuration directory is mounted at this guest destination
+   * instead of `policy.guestConfigurationRoot`. The foreground interactive
+   * builder sets it to `policy.configurationRoot` so the guest sees the config
+   * at the SAME absolute path as the host (the identical-path contract).
+   * Workflow callers never set it, so their create params stay byte-identical.
+   */
+  configurationGuestPath?: string;
+  /**
    * HOST-ATTESTED scoped progress resource (MTLK-PROGRESS).
    *
    * When supplied, the plan mounts exactly the per-run progress-only host
@@ -575,17 +584,19 @@ function placeDshComposedConfigurationMounts(
 }
 
 /**
- * Build the `create` params (image identity pin + exact-destination mount
- * plan). Throws a {@link MatchlockMountPlanError} on any fail-closed rule.
+ * Shared work/repository/Git-metadata mount planning (workflow + interactive).
+ *
+ * Every planned root is mounted RW as an exact-destination `host_fs` mount at
+ * its identical absolute host/guest path, subject to the broad-host-source and
+ * protected-guest-root refusals. Callers own the surrounding `mounts` record
+ * and the later {@link normalizeExactDestinationSet} pass, so the workflow and
+ * interactive create builders cannot drift on scope rules.
  */
-export function buildMatchlockCreateConfig(
+function placeWorkScopeMounts(
+  mounts: Record<string, MatchlockMountConfig>,
   policy: ExecutionIsolation,
-  identity: { digest: string; config_digest: string; tag?: string },
-  opts?: BuildMatchlockCreateConfigOptions,
-): MatchlockCreateParams {
-  const ctx = opts?.admission;
-  const mounts: Record<string, MatchlockMountConfig> = {};
-
+  ctx: MountAdmissionContext | undefined,
+): void {
   // Work mounts (exact host/guest identical, persistent RW).
   for (const m of policy.workMounts) {
     assertBroadHostSource(m.hostPath, ctx);
@@ -608,13 +619,24 @@ export function buildMatchlockCreateConfig(
     assertGuestPathSafe(gitRoot, gitRoot);
     placeMount(mounts, gitRoot, { type: "host_fs", host_path: gitRoot, readonly: false });
   }
+}
 
-  // Selected configuration DIRECTORY, RW, at the guest override. A MISSING or
-  // NON-DIRECTORY host config source is a hard failure (never an image-default
-  // substitution). The HOST PI EXECUTABLE is NOT required (the image supplies
-  // it) — nothing here checks for it. pi/hermes mount the whole directory;
-  // dsh mounts the composed home (durable entries host-mapped, install-derived
-  // dirs from the private per-run overlay) — see placeDshComposedConfigurationMounts.
+/**
+ * Shared selected-configuration mount planning (workflow + interactive).
+ *
+ * The ENTIRE selected configuration DIRECTORY must exist and mount RW at the
+ * policy's guest override. A missing/non-directory host config source is a hard
+ * fail-closed refusal (never an image-default substitution) and broad host
+ * sources / protected guest roots are refused exactly as for work mounts.
+ * pi/hermes mount the whole directory; dsh mounts the composed private
+ * overlay home (see {@link placeDshComposedConfigurationMounts}).
+ */
+function placeConfigurationMount(
+  mounts: Record<string, MatchlockMountConfig>,
+  policy: ExecutionIsolation,
+  opts: BuildMatchlockCreateConfigOptions | undefined,
+  ctx: MountAdmissionContext | undefined,
+): void {
   let configStat: fs.Stats | undefined;
   try {
     configStat = fs.statSync(policy.configurationRoot);
@@ -629,19 +651,125 @@ export function buildMatchlockCreateConfig(
     );
   }
   assertBroadHostSource(policy.configurationRoot, ctx);
+  // The policy's approved guest override is always checked. When an
+  // interactive identical-path override is supplied, the effective destination
+  // is checked too (protecting against an override that names a protected
+  // guest OS root).
   assertGuestPathSafe(policy.configurationRoot, policy.guestConfigurationRoot);
+  const guestDestination = opts?.configurationGuestPath ?? policy.guestConfigurationRoot;
+  if (guestDestination !== policy.guestConfigurationRoot) {
+    assertGuestPathSafe(policy.configurationRoot, guestDestination);
+  }
   if (policy.harness === "dsh") {
     // dsh NEVER mounts the whole home: the whole profiles/ tree (including the
     // install-derived farm and the sibling boot lock) is sourced from the
     // private per-run overlay (DSH-PROFILE-OVERLAY US-002).
     placeDshComposedConfigurationMounts(mounts, policy, opts, ctx);
   } else {
-    placeMount(mounts, policy.guestConfigurationRoot, {
+    placeMount(mounts, guestDestination, {
       type: "host_fs",
       host_path: policy.configurationRoot,
       readonly: false,
     });
   }
+}
+
+/**
+ * MTLK-INTERACTIVE US-005: stamp the caller's numeric identity onto every
+ * `host_fs` mount. These are guest-visible ownership metadata only — the plan
+ * NEVER chowns/chmods a host path.
+ */
+function applyHostFsOwner(
+  mounts: Record<string, MatchlockMountConfig>,
+  ownerUid: number,
+  ownerGid: number,
+): void {
+  if (!Number.isInteger(ownerUid) || ownerUid < 0 || !Number.isInteger(ownerGid) || ownerGid < 0) {
+    throw new MatchlockMountPlanError(
+      "mount_policy_rejected",
+      `Refusing interactive mount plan: owner uid/gid must be non-negative integers (got uid=${String(ownerUid)} gid=${String(ownerGid)}).`,
+    );
+  }
+  for (const cfg of Object.values(mounts)) {
+    if (cfg.type !== "host_fs") continue;
+    cfg.owner_uid = ownerUid;
+    cfg.owner_gid = ownerGid;
+  }
+}
+
+/**
+ * Compose the shared `create` params envelope (image pin + resources + network
+ * boundary + guest env + exact-destination VFS). The workflow and interactive
+ * builders differ ONLY in which mounts/env they place; the wire shape around
+ * them is shared so swap/provenance/allow-private semantics cannot drift.
+ */
+function composeCreateParams(
+  policy: ExecutionIsolation,
+  identity: { digest: string; config_digest: string; tag?: string },
+  mounts: Record<string, MatchlockMountConfig>,
+  env: Record<string, string>,
+): MatchlockCreateParams {
+  return {
+    image: policy.requestedImage,
+    image_identity: {
+      digest: identity.digest,
+      config_digest: identity.config_digest,
+      ...(identity.tag ? { tag: identity.tag } : {}),
+    },
+    resources: {
+      cpus: policy.resourceLimits.cpus,
+      memory_mb: policy.resourceLimits.memoryMB,
+      disk_size_mb: policy.resourceLimits.diskSizeMB,
+      // MTLK-SWAP (spec B §4.5): forward the admitted swap size ONLY when swap
+      // is enabled. 0 means off and matchlock's `resources.swap_mb` is
+      // omitempty, so the key must be absent (never `swap_mb: 0`). tamandua
+      // NEVER emits kernel args (swap + custom kernel args is rejected by
+      // matchlock).
+      ...(policy.resourceLimits.swapMB > 0 ? { swap_mb: policy.resourceLimits.swapMB } : {}),
+    },
+    // Network boundary: public destinations are allowed; private, loopback,
+    // link-local, CGNAT and Yggdrasil destinations (including IPv6) stay
+    // blocked for everything not explicitly listed. The current matchlock
+    // fork intercepts IPv6 too, so the old IPv6 caveat is gone. The per-run
+    // allow-private exceptions (MTLK-ALLOW-PRIVATE) are emitted as
+    // `network.allow_private` ONLY when the admitted policy carries entries;
+    // with none admitted the key is omitted entirely and the block stays on.
+    network: {
+      block_private_ips: true,
+      intercept: true,
+      ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
+        ? { allow_private: [...policy.networkAllowPrivate] }
+        : {}),
+    },
+    env,
+    vfs: {
+      exact_destinations: true,
+      mounts,
+    },
+  };
+}
+
+/**
+ * Build the `create` params (image identity pin + exact-destination mount
+ * plan). Throws a {@link MatchlockMountPlanError} on any fail-closed rule.
+ */
+export function buildMatchlockCreateConfig(
+  policy: ExecutionIsolation,
+  identity: { digest: string; config_digest: string; tag?: string },
+  opts?: BuildMatchlockCreateConfigOptions,
+): MatchlockCreateParams {
+  const ctx = opts?.admission;
+  const mounts: Record<string, MatchlockMountConfig> = {};
+
+  // Work/repository/Git-metadata scope (shared with interactive sessions).
+  placeWorkScopeMounts(mounts, policy, ctx);
+
+  // Selected configuration directory at its guest override (shared with
+  // interactive sessions). A MISSING or NON-DIRECTORY host config source is a
+  // hard failure (never an image-default substitution). The HOST PI
+  // EXECUTABLE is NOT required (the image supplies it) — nothing here checks
+  // for it. pi/hermes mount the whole directory; dsh mounts the composed home.
+  placeConfigurationMount(mounts, policy, opts, ctx);
 
   // Versioned RO helper/skill pack (never RW, even when its host path
   // overlaps a work/config root). Absent a built guest pack the controller
@@ -715,50 +843,83 @@ export function buildMatchlockCreateConfig(
 
   const guestEnv = policy.harness === "dsh" ? dshGuestEnv(policy) : { PI_CODING_AGENT_DIR: policy.guestConfigurationRoot };
 
-  return {
-    image: policy.requestedImage,
-    image_identity: {
-      digest: identity.digest,
-      config_digest: identity.config_digest,
-      ...(identity.tag ? { tag: identity.tag } : {}),
-    },
-    resources: {
-      cpus: policy.resourceLimits.cpus,
-      memory_mb: policy.resourceLimits.memoryMB,
-      disk_size_mb: policy.resourceLimits.diskSizeMB,
-      // MTLK-SWAP (spec B §4.5): forward the admitted swap size ONLY when swap
-      // is enabled. 0 means off and matchlock's `resources.swap_mb` is
-      // omitempty, so the key must be absent (never `swap_mb: 0`). tamandua
-      // NEVER emits kernel args (swap + custom kernel args is rejected by
-      // matchlock).
-      ...(policy.resourceLimits.swapMB > 0 ? { swap_mb: policy.resourceLimits.swapMB } : {}),
-    },
-    // Network boundary: public destinations are allowed; private, loopback,
-    // link-local, CGNAT and Yggdrasil destinations (including IPv6) stay
-    // blocked for everything not explicitly listed. The current matchlock
-    // fork intercepts IPv6 too, so the old IPv6 caveat is gone. The per-run
-    // allow-private exceptions (MTLK-ALLOW-PRIVATE) are emitted as
-    // `network.allow_private` ONLY when the admitted policy carries entries;
-    // with none admitted the key is omitted entirely and the block stays on.
-    network: {
-      block_private_ips: true,
-      intercept: true,
-      ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
-        ? { allow_private: [...policy.networkAllowPrivate] }
-        : {}),
-    },
-    // Guest harness directory override: pin the image's harness into its real
-    // config mount rather than the image default HOME. pi pins
-    // PI_CODING_AGENT_DIR; dsh pins DSH_HOME (= the RW mount at
-    // /workspace/config/dsh) and, when the image declares a PATH, prepends
-    // ONLY the helper-pack bin to that image PATH (never a conservative
-    // default substitution while the image declares one).
-    env: guestEnv,
-    vfs: {
-      exact_destinations: true,
-      mounts,
-    },
-  };
+  return composeCreateParams(policy, identity, mounts, guestEnv);
+}
+
+/**
+ * MTLK-INTERACTIVE US-005 (PROVISIONAL GAP GAP-04) — interactive create-config.
+ *
+ * The foreground interactive commands (`tamandua matchlock pi|pi-shell|hermes|
+ * hermes-shell`) create a fresh VM whose create params differ from the
+ * workflow builder in exactly four ways:
+ *
+ *   1. the whole selected pi config dir / Hermes home is mounted RW at its
+ *      approved guest override, with `PI_CODING_AGENT_DIR` (pi) or
+ *      `HERMES_HOME` (hermes) in the create env;
+ *   2. every `host_fs` mount carries the caller's numeric `owner_uid`/
+ *      `owner_gid` (guest-visible ownership metadata; never a host chown);
+ *   3. the RO guest helper pack and the workflow progress resource are NEVER
+ *      mounted (the interactive session runs no scoped guest bridge);
+ *   4. dsh is refused — interactive sessions are pi/hermes only.
+ *
+ * The work/repository/Git-metadata scope, the selected-configuration mount and
+ * every fail-closed refusal are the SAME shared helpers the workflow builder
+ * uses, so the two builders can never diverge on scope rules. No second mount
+ * planner exists.
+ */
+export interface InteractiveCreateConfigOptions {
+  /** Caller's numeric uid stamped on every `host_fs` mount. */
+  ownerUid: number;
+  /** Caller's numeric gid stamped on every `host_fs` mount. */
+  ownerGid: number;
+  /** Admission context (tests inject a deterministic home/state root). */
+  admission?: MountAdmissionContext;
+}
+
+/** Typed refusal code: an interactive session requested an unsupported harness. */
+export const INTERACTIVE_HARNESS_UNSUPPORTED_CODE = "interactive_harness_unsupported" as const;
+
+/**
+ * Build the `create` params for ONE foreground interactive session from an
+ * admitted pi/hermes policy. Throws a {@link MatchlockMountPlanError} on any
+ * fail-closed rule (including a dsh policy).
+ */
+export function buildInteractiveSessionCreateConfig(
+  policy: ExecutionIsolation,
+  identity: { digest: string; config_digest: string; tag?: string },
+  options: InteractiveCreateConfigOptions,
+): MatchlockCreateParams {
+  if (policy.harness === "dsh") {
+    throw new MatchlockMountPlanError(
+      INTERACTIVE_HARNESS_UNSUPPORTED_CODE,
+      `Interactive Matchlock sessions support harness "pi" or "hermes" only (got "dsh"); refusing to build an interactive create config.`,
+    );
+  }
+  const ctx = options.admission;
+  const mounts: Record<string, MatchlockMountConfig> = {};
+
+  // Shared work/repository/Git scope + selected configuration mount. The
+  // interactive session mounts the configuration at its IDENTICAL absolute
+  // host path (never the workflow relocation at policy.guestConfigurationRoot).
+  placeWorkScopeMounts(mounts, policy, ctx);
+  placeConfigurationMount(mounts, policy, { configurationGuestPath: policy.configurationRoot }, ctx);
+
+  // Normalize the exact-destination set (drop redundant same-source nesting,
+  // fail closed on different-source nesting / symlinked sources), THEN stamp
+  // the caller identity onto every remaining host_fs mount. The helper pack
+  // and progress resource are deliberately absent.
+  normalizeExactDestinationSet(mounts);
+  applyHostFsOwner(mounts, options.ownerUid, options.ownerGid);
+
+  // Guest harness config override: pi pins its whole config directory at its
+  // identical host path; hermes pins the whole effective profile home at its
+  // identical host path.
+  const guestEnv: Record<string, string> =
+    policy.harness === "hermes"
+      ? { HERMES_HOME: policy.configurationRoot }
+      : { PI_CODING_AGENT_DIR: policy.configurationRoot };
+
+  return composeCreateParams(policy, identity, mounts, guestEnv);
 }
 
 /** Guest bin directory inside the RO helper pack (env PATH prepend). */

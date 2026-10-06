@@ -1,33 +1,96 @@
 /**
- * `tamandua matchlock` top-level group and its `setup` subcommand (MTLK-SETUP).
+ * `tamandua matchlock` top-level group and its subcommands.
  *
- * The group is a thin CLI surface over the pure installer core
- * (`src/installer/matchlock-setup.ts`): it parses the setup arguments and runs
- * `runMatchlockSetup` with the spawn-capable default seams from
- * `src/installer/matchlock-setup-runner.ts`.
+ * The group exposes `setup` (MTLK-SETUP: a thin CLI surface over the pure
+ * installer core in `src/installer/matchlock-setup.ts`) plus the four
+ * foreground interactive commands (MTLK-INTERACTIVE US-012):
  *
- * Spec: matchlock-setup-command-proposal.md §4.1 / §8.
+ *   tamandua matchlock setup        Provision matchlock: binaries, host setup, standard image
+ *   tamandua matchlock pi           [--working-directory-for-harness <dir>] [Matchlock options]
+ *   tamandua matchlock pi-shell     [--working-directory-for-harness <dir>] [Matchlock options]
+ *   tamandua matchlock hermes       [--working-directory-for-harness <dir>] [Matchlock options]
+ *   tamandua matchlock hermes-shell [--working-directory-for-harness <dir>] [Matchlock options]
+ *
+ * The interactive side owns ONLY the group routing, the five `get<Thing>Help`
+ * renderers and the hand-off to `parseInteractiveSessionArgs` (US-002). Image
+ * selection, resource resolution and allow-private validation stay in the
+ * shared installer modules the parser reuses, so the interactive path cannot
+ * drift from the workflow path.
+ *
+ * `handleMatchlock` routes a well-formed invocation through the injectable
+ * `runSession` seam. The production default is the US-013 orchestration
+ * (`runInteractiveSession`). Tests inject a fake `runSession` so no VM,
+ * terminal or real matchlock is touched. The `setup` path keeps the
+ * MTLK-SETUP behavior verbatim: it parses the setup arguments and runs
+ * `runMatchlockSetup` with the spawn-capable default seams.
  */
 
+import {
+  MatchlockResourceLimitError,
+  type MatchlockResourceHostProbe,
+} from "../../installer/matchlock/resource-limits.js";
+import {
+  runInteractiveSession,
+  type RunInteractiveSessionOptions,
+} from "../../installer/matchlock/interactive-session-orchestration.js";
+import {
+  INTERACTIVE_SESSION_SUBCOMMANDS,
+  InteractiveSessionArgError,
+  parseInteractiveSessionArgs,
+  type InteractiveSessionArgs,
+  type InteractiveSessionSubcommand,
+} from "../matchlock-interactive-args.js";
+import { reportUnknownCommand } from "../shared.js";
 import {
   parseMatchlockSetupArgs,
   runMatchlockSetup,
 } from "../../installer/matchlock-setup.js";
 import { createDefaultMatchlockSetupDeps } from "../../installer/matchlock-setup-runner.js";
 
-/** Group-level help for `tamandua matchlock`. */
-export function getMatchlockHelp(): string {
-  return `tamandua matchlock — Provision matchlock and prepare this host for Matchlock runs
+/** One-line usage synopsis shared by every matchlock error message. */
+export const MATCHLOCK_USAGE =
+  "tamandua matchlock <pi|pi-shell|hermes|hermes-shell> [--working-directory-for-harness <dir>] [Matchlock options]";
 
-Usage: tamandua matchlock <subcommand>
+/** Shared option/environment reference block printed by every matchlock help. */
+const MATCHLOCK_OPTIONS_HELP = `Options:
+  --working-directory-for-harness <dir>
+                          Directory mounted read-write at its identical
+                          absolute guest path and used as the session working
+                          directory (default: the invoking cwd; a relative
+                          argument resolves against it and must stay inside it)
+  --matchlock-image <ref>
+                          Explicit, already-imported image. Overrides
+                          TAMANDUA_MATCHLOCK_IMAGE and the built-in standard
+                          image; the reference is preserved exactly.
+  --matchlock-cpus <N>    VM vCPUs (positive integer)
+  --matchlock-memory <MB|Ng>
+                          VM memory
+  --matchlock-disk <MB|Ng>
+                          VM disk size
+  --matchlock-swap <MB|Ng>
+                          VM swap size (default 8192 MB, capped at 65536 MB)
+  --matchlock-no-swap     Disable swap (mutually exclusive with --matchlock-swap)
+  --matchlock-allow-private <entry>
+                          Allow one private address range; repeatable. CLI
+                          entries replace TAMANDUA_MATCHLOCK_ALLOW_PRIVATE.
+  --force-matchlock-usage-as-root-not-recommended-per-matchlock-docs
+                          Acknowledge and allow a root invocation for this
+                          session only (session-scoped consent; never inferred
+                          from SUDO_UID)
+  -h, --help              Show this help
 
-Subcommands:
-  setup        Provision matchlock: binaries, host setup, standard image
+Environment precedence:
+  image    --matchlock-image > TAMANDUA_MATCHLOCK_IMAGE > igorhvr/tamandua
+  cpus     --matchlock-cpus > TAMANDUA_MATCHLOCK_CPUS
+  memory   --matchlock-memory > TAMANDUA_MATCHLOCK_MEMORY_MB
+  disk     --matchlock-disk > TAMANDUA_MATCHLOCK_DISK_MB
+  swap     --matchlock-no-swap > --matchlock-swap > TAMANDUA_MATCHLOCK_SWAP_MB
+           > 8192 MB
 
-Run \`tamandua matchlock setup --help\` for the full phase, flag and platform
-documentation, the re-login caveat, the offline (R11) contract and the
-admission-refusal relationship.`;
-}
+A missing standard image is refused with the remedy \`tamandua matchlock setup\`.
+A root invocation is refused before any Matchlock interaction unless the exact
+override flag above is supplied. Sessions are foreground and interactive and
+have no workflow-round deadline.`;
 
 /** Detailed help for `tamandua matchlock setup`. */
 export function getMatchlockSetupHelp(): string {
@@ -144,24 +207,178 @@ Examples:
 }
 
 /**
- * Handles the `matchlock` group. Returns true when the command was handled;
- * false when the group belongs to another handler.
+ * Raised when a well-formed invocation reaches the orchestration seam before
+ * the foreground session controller is wired (US-013). It is a clean refusal:
+ * no VM is created and nothing is launched.
  */
-export async function handleMatchlock(group: string, args: string[]): Promise<boolean> {
+export class MatchlockSessionUnavailableError extends Error {
+  readonly code = "matchlock_session_unavailable";
+
+  constructor() {
+    super(
+      "Interactive Matchlock sessions are not available in this build " +
+        "(provisional gap GAP-09): no VM was created and nothing was launched.",
+    );
+    this.name = "MatchlockSessionUnavailableError";
+  }
+}
+
+/**
+ * Injectable command surface. Production callers (the CLI dispatcher) rely on
+ * the defaults; tests supply a resolved cwd/env/host probe, captured streams
+ * and a fake `runSession` so no VM, terminal or real matchlock is touched.
+ */
+export interface MatchlockCommandDeps {
+  /** Invoking directory used for the default/relative working directory. */
+  cwd?: string;
+  /** Environment snapshot for image/resource/allow-private defaults. */
+  env?: Record<string, string | undefined>;
+  /** Host capacity probe override (deterministic tests). */
+  hostProbe?: MatchlockResourceHostProbe;
+  stdout?: (text: string) => void;
+  stderr?: (text: string) => void;
+  exit?: (code: number) => void;
+  /**
+   * Foreground session orchestration seam (US-013). Receives the fully parsed
+   * invocation and resolves to the launched process's exit status.
+   */
+  runSession?: (args: InteractiveSessionArgs) => Promise<number>;
+  /**
+   * Injectable options for the production orchestration default (plan /
+   * runtime / controller seams). Tests pin admission and controller seams; the
+   * `stdout`/`stderr` sinks default to this handler's own sinks so captured
+   * output keeps flowing through {@link MatchlockCommandDeps}.
+   */
+  session?: RunInteractiveSessionOptions;
+}
+
+/** Group help listing the five subcommands and the shared option set. */
+export function getMatchlockHelp(): string {
+  return `tamandua matchlock — Run pi or Hermes in a disposable Matchlock VM
+
+Usage: ${MATCHLOCK_USAGE}
+
+Launch a foreground interactive session inside a fresh, disposable Matchlock
+VM. The VM belongs to this invocation only and is removed when the session
+ends. Each subcommand accepts the complete shared Matchlock option set.
+
+Subcommands:
+  setup         Provision matchlock: binaries, host setup, standard image
+  pi            Run the image-provided pi interactive coding harness
+  pi-shell      Prepare the same pi guest, then run an interactive zsh
+  hermes        Run the image-provided Hermes interactive coding harness
+  hermes-shell  Prepare the same Hermes guest, then run an interactive zsh
+
+Run \`tamandua matchlock setup --help\` for the full phase, flag and platform
+documentation, the re-login caveat, the offline (R11) contract and the
+admission-refusal relationship.
+
+${MATCHLOCK_OPTIONS_HELP}`;
+}
+
+/**
+ * Render one subcommand's help. The plain variants launch the harness; the
+ * `-shell` variants prepare the identical guest and then exec an interactive
+ * zsh so the harness can be started by hand inside.
+ */
+function renderSubcommandHelp(subcommand: InteractiveSessionSubcommand): string {
+  const harness = subcommand.startsWith("pi") ? "pi" : "Hermes";
+  const plain = subcommand.endsWith("-shell")
+    ? subcommand.slice(0, -"-shell".length)
+    : subcommand;
+  const shell = subcommand.endsWith("-shell");
+
+  const body = shell
+    ? `Prepares the guest exactly as \`tamandua matchlock ${plain}\` would (same image
+selection and pinning, resources, capability checks, mounts, configuration,
+environment, guest user and working directory), then execs an interactive zsh
+as the mapped guest user. Invoking ${harness} inside that shell starts the same
+session the direct command would have started. An image without a zsh runnable
+as the selected user is refused explicitly: no shell is substituted and
+nothing is installed.`
+    : `Launches the image-provided ${harness} interactive coding harness in normal
+interactive mode as the mapped guest user. The guest configuration and the
+working directory are mounted read-write at their identical absolute paths.`;
+
+  return `tamandua matchlock ${subcommand} — ${shell ? `Prepare a ${harness} guest and run zsh` : `Run ${harness} in a disposable Matchlock VM`}
+
+Usage: tamandua matchlock ${subcommand} [--working-directory-for-harness <dir>] [Matchlock options]
+
+${body}
+
+${MATCHLOCK_OPTIONS_HELP}`;
+}
+
+export function getMatchlockPiHelp(): string {
+  return renderSubcommandHelp("pi");
+}
+
+export function getMatchlockPiShellHelp(): string {
+  return renderSubcommandHelp("pi-shell");
+}
+
+export function getMatchlockHermesHelp(): string {
+  return renderSubcommandHelp("hermes");
+}
+
+export function getMatchlockHermesShellHelp(): string {
+  return renderSubcommandHelp("hermes-shell");
+}
+
+/** Default orchestration seam: the production foreground session runner. */
+async function defaultSessionRunner(
+  args: InteractiveSessionArgs,
+  deps: MatchlockCommandDeps,
+): Promise<number> {
+  return runInteractiveSession(args, {
+    ...deps.session,
+    ...(deps.stdout !== undefined ? { stdout: deps.stdout } : {}),
+    ...(deps.stderr !== undefined ? { stderr: deps.stderr } : {}),
+  });
+}
+
+function isInteractiveSessionSubcommand(
+  value: string,
+): value is InteractiveSessionSubcommand {
+  return (INTERACTIVE_SESSION_SUBCOMMANDS as readonly string[]).includes(value);
+}
+
+/**
+ * Handle `tamandua matchlock ...`. Returns false for unrelated groups.
+ *
+ * Unknown subcommands use the repository's shared unknown-command reporter
+ * (with a nearest-match suggestion); unknown/invalid options are refused by
+ * the shared interactive parser and reported as a non-zero usage error with
+ * the exact offending token.
+ */
+export async function handleMatchlock(
+  group: string,
+  args: string[],
+  deps: MatchlockCommandDeps = {},
+): Promise<boolean> {
   if (group !== "matchlock") return false;
+
+  const stderr = deps.stderr ?? ((text: string) => process.stderr.write(text));
+  const exit = deps.exit ?? ((code: number) => process.exit(code));
 
   const action = args[1];
 
+  if (action === undefined) {
+    stderr(`Missing matchlock subcommand.\nUsage: ${MATCHLOCK_USAGE}\n`);
+    exit(1);
+    return true;
+  }
+
   if (action === "setup") {
-    const deps = createDefaultMatchlockSetupDeps();
+    const setupDeps = createDefaultMatchlockSetupDeps();
     const parsed = parseMatchlockSetupArgs(args.slice(2));
     if (!parsed.ok) {
-      deps.output.warn(parsed.refusal.message);
+      setupDeps.output.warn(parsed.refusal.message);
       process.exitCode = 1;
       return true;
     }
 
-    const result = await runMatchlockSetup(parsed.options, deps);
+    const result = await runMatchlockSetup(parsed.options, setupDeps);
     if (result.status === "ok") {
       process.stdout.write(`${result.message}\n`);
       return true;
@@ -173,11 +390,44 @@ export async function handleMatchlock(group: string, args: string[]): Promise<bo
     return true;
   }
 
-  process.stderr.write(
-    action === undefined
-      ? "Missing matchlock subcommand.\nUsage: tamandua matchlock setup [flags]\n"
-      : `Unknown matchlock action: ${action}\nUsage: tamandua matchlock setup [flags]\n`,
-  );
-  process.exitCode = 1;
+  if (!isInteractiveSessionSubcommand(action)) {
+    reportUnknownCommand(action, [...INTERACTIVE_SESSION_SUBCOMMANDS], "matchlock");
+    return true;
+  }
+
+  let parsed: InteractiveSessionArgs;
+  try {
+    parsed = parseInteractiveSessionArgs(action, args.slice(2), {
+      ...(deps.cwd !== undefined ? { cwd: deps.cwd } : {}),
+      ...(deps.env !== undefined ? { env: deps.env } : {}),
+      ...(deps.hostProbe !== undefined ? { hostProbe: deps.hostProbe } : {}),
+    });
+  } catch (error) {
+    if (
+      error instanceof InteractiveSessionArgError ||
+      error instanceof MatchlockResourceLimitError
+    ) {
+      stderr(`Error: ${error.message}\nUsage: ${MATCHLOCK_USAGE}\n`);
+      exit(1);
+      return true;
+    }
+    throw error;
+  }
+
+  const runSession =
+    deps.runSession ?? ((parsed: InteractiveSessionArgs) => defaultSessionRunner(parsed, deps));
+  let exitCode: number;
+  try {
+    exitCode = await runSession(parsed);
+  } catch (error) {
+    if (error instanceof MatchlockSessionUnavailableError) {
+      stderr(`Error: ${error.message}\n`);
+      exit(1);
+      return true;
+    }
+    throw error;
+  }
+
+  if (exitCode !== 0) exit(exitCode);
   return true;
 }

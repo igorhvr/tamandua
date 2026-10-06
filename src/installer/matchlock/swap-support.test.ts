@@ -1,5 +1,6 @@
 /**
- * Unit tests for the matchlock swap support probe (MTLK-ISO-SLICE2, US-001).
+ * Unit tests for the matchlock swap support probe (MTLK-ISO-SLICE2, US-001 /
+ * MTLK-INTERACTIVE US-004 GAP-02).
  *
  * The probe is exercised with an injected runner for every decision branch and,
  * for the default bounded `spawnSync` runner, against throwaway shell scripts so
@@ -7,7 +8,7 @@
  *
  * The swap probe differs from the allow-private probe in one crucial way: it
  * requires the EXACT `--swap` token, never a substring, so a near-miss such as
- * `--swap-size` is reported unsupported.
+ * `--swap-size` is reported unsupported — while `--swap=512` still counts.
  */
 
 import { afterEach, describe, it } from "node:test";
@@ -21,9 +22,14 @@ import { tamanduaTempDir } from "../../../dist/lib/temp-dir.js";
 import {
   MATCHLOCK_RPC_BIN_ENV,
   MATCHLOCK_SWAP_FLAG,
+  MATCHLOCK_SWAP_PROBE_TIMEOUT_MS,
+  MATCHLOCK_SWAP_UNSUPPORTED_CODE,
+  helpListsMatchlockSwapFlag,
   probeMatchlockSwapSupport,
   resolveMatchlockSwapBinaryPath,
+  type MatchlockSwapRunHelpResult,
 } from "../../../dist/installer/matchlock/swap-support.js";
+
 
 const tempDirs: string[] = [];
 
@@ -361,5 +367,118 @@ describe("probeMatchlockSwapSupport: default bounded runner", () => {
     });
     assert.equal(result.supported, true);
     assert.equal(result.binaryPath, bin);
+  });
+});
+
+function result(overrides: Partial<MatchlockSwapRunHelpResult> = {}): MatchlockSwapRunHelpResult {
+  return { exitCode: 0, output: "", ...overrides };
+}
+
+const SWAP_HELP = `
+Usage:
+  matchlock run [flags]
+
+Flags:
+  --cpus int      vCPUs
+  --swap int      Swap device size in MB (0 = off)
+`;
+
+describe("helpListsMatchlockSwapFlag (full-token matcher)", () => {
+  it("accepts the exact --swap token in help output", () => {
+    assert.equal(helpListsMatchlockSwapFlag(SWAP_HELP), true);
+    assert.equal(helpListsMatchlockSwapFlag("  --swap int  Swap device size in MB (0 = off)"), true);
+    assert.equal(helpListsMatchlockSwapFlag("--swap=512"), true);
+  });
+
+  it("rejects a substring / unrelated token", () => {
+    assert.equal(helpListsMatchlockSwapFlag("--matchlock-swap int"), false);
+    assert.equal(helpListsMatchlockSwapFlag("--swap-limit int"), false);
+    assert.equal(helpListsMatchlockSwapFlag("--noswap"), false);
+    assert.equal(helpListsMatchlockSwapFlag(""), false);
+  });
+});
+
+describe("probeMatchlockSwapSupport", () => {
+  it("reports supported when run --help exits 0 and lists --swap", async () => {
+    const seen: string[] = [];
+    const support = await probeMatchlockSwapSupport({
+      binaryPath: "/opt/fake/matchlock",
+      runHelp: (bin) => {
+        seen.push(bin);
+        return result({ output: SWAP_HELP, version: "0.2.17" });
+      },
+    });
+    assert.deepEqual(seen, ["/opt/fake/matchlock"]);
+    assert.equal(support.supported, true);
+    assert.equal(support.binaryPath, "/opt/fake/matchlock");
+    assert.equal(support.version, "0.2.17");
+  });
+
+  it("reports unsupported (typed) when the flag is absent", async () => {
+    const support = await probeMatchlockSwapSupport({
+      binaryPath: "/opt/fake/matchlock",
+      runHelp: () => result({ output: "Flags:\n  --cpus int\n" }),
+    });
+    assert.equal(support.supported, false);
+    assert.equal(support.reasonCode, "unsupported");
+    assert.match(support.reason ?? "", /--swap/);
+  });
+
+  it("reports missing_binary on an ENOENT launch failure", async () => {
+    const support = await probeMatchlockSwapSupport({
+      binaryPath: "/opt/fake/matchlock",
+      runHelp: () =>
+        result({
+          exitCode: null,
+          error: "matchlock binary not found: /opt/fake/matchlock",
+          missingBinary: true,
+        }),
+    });
+    assert.equal(support.supported, false);
+    assert.equal(support.reasonCode, "missing_binary");
+  });
+
+  it("reports probe_failed on a non-zero exit, killed child and thrown runner", async () => {
+    const nonZero = await probeMatchlockSwapSupport({
+      binaryPath: "matchlock",
+      runHelp: () => result({ exitCode: 2, output: SWAP_HELP }),
+    });
+    assert.equal(nonZero.reasonCode, "probe_failed");
+
+    const killed = await probeMatchlockSwapSupport({
+      binaryPath: "matchlock",
+      runHelp: () => result({ exitCode: null }),
+    });
+    assert.equal(killed.reasonCode, "probe_failed");
+    assert.match(killed.reason ?? "", /did not exit/);
+
+    const threw = await probeMatchlockSwapSupport({
+      binaryPath: "matchlock",
+      runHelp: () => {
+        throw new Error("boom");
+      },
+    });
+    assert.equal(threw.reasonCode, "probe_failed");
+    assert.match(threw.reason ?? "", /boom/);
+  });
+
+  it("resolves the binary from TAMANDUA_MATCHLOCK_RPC_BIN when no path is supplied", async () => {
+    const seen: string[] = [];
+    const support = await probeMatchlockSwapSupport({
+      env: { [MATCHLOCK_RPC_BIN_ENV]: "  /custom/matchlock  " },
+      runHelp: (bin) => {
+        seen.push(bin);
+        return result({ output: SWAP_HELP });
+      },
+    });
+    assert.deepEqual(seen, ["/custom/matchlock"]);
+    assert.equal(support.binaryPath, "/custom/matchlock");
+  });
+
+  it("exposes the bounded probe timeout and typed refusal code", () => {
+    assert.equal(typeof MATCHLOCK_SWAP_PROBE_TIMEOUT_MS, "number");
+    assert.equal(MATCHLOCK_SWAP_PROBE_TIMEOUT_MS, 10_000);
+    assert.equal(MATCHLOCK_SWAP_FLAG, "--swap");
+    assert.equal(MATCHLOCK_SWAP_UNSUPPORTED_CODE, "matchlock_swap_unsupported");
   });
 });

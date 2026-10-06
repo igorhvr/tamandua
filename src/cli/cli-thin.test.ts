@@ -88,13 +88,13 @@ describe("SPL2 thin CLI dispatcher", () => {
       "handleRestart",
       "handleStatus",
       "handleRun",
+      "handleMatchlock",
       "handleEvidence",
       "handleStep",
       "handleLogs",
       "handleWorktree",
       "handleAutoresearch",
       "handleWorkflow",
-      "handleMatchlock",
     ]);
   });
 });

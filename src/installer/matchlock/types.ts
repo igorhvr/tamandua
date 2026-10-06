@@ -81,6 +81,16 @@ export interface MatchlockExecOptions {
   user?: string;
 }
 
+/**
+ * Interactive PTY exec options accepted by exec_tty. Adds the initial
+ * terminal dimensions to {@link MatchlockExecOptions}; the runtime defaults a
+ * missing/zero `rows`/`cols` to 24×80.
+ */
+export interface MatchlockTtyExecOptions extends MatchlockExecOptions {
+  rows?: number;
+  cols?: number;
+}
+
 // ── api.Config subset (create params) ───────────────────────────────
 
 export interface MatchlockResourcesConfig {

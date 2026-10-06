@@ -76,7 +76,7 @@
  * command for host execution.
  */
 
-import { MatchlockRpcClient, isAlreadyStoppedCloseError, type MatchlockRpcClientOptions, type StreamNotify, type MatchlockPipeHandle } from "./rpc-client.js";
+import { MatchlockRpcClient, isAlreadyStoppedCloseError, type MatchlockRpcClientOptions, type StreamNotify, type MatchlockPipeHandle, type MatchlockTtyHandle } from "./rpc-client.js";
 import { MATCHLOCK_SOCKET_PATH_TOO_LONG_CODE, matchlockSocketPathRefusal } from "./home-alias.js";
 import {
   buildMatchlockCreateConfig,
@@ -95,6 +95,7 @@ import type {
   MatchlockExecOptions,
   MatchlockExecResult,
   MatchlockRequestId,
+  MatchlockTtyExecOptions,
 } from "./types.js";
 
 export interface MatchlockControllerOptions {
@@ -157,6 +158,19 @@ export interface MatchlockControllerOptions {
    * Never overrides the immutable image_identity pin.
    */
   createEnv?: Record<string, string>;
+  /**
+   * MTLK-INTERACTIVE (US-010): optional create-config builder override. When
+   * omitted the workflow mount-plan builder (`buildMatchlockCreateConfig`) is
+   * used unchanged, so every existing caller is byte-identical. Foreground
+   * interactive sessions supply the shared interactive builder
+   * (`buildInteractiveSessionCreateConfig`) so the VM carries the caller's
+   * `owner_uid`/`owner_gid`, mounts the whole selected configuration directory
+   * and omits the helper pack/progress resource.
+   */
+  buildCreateConfig?: (
+    policy: ExecutionIsolation,
+    identity: PinnedImageIdentity,
+  ) => MatchlockCreateParams;
   /** Extra env keys merged over process.env for the RPC child (test seams). */
   rpcEnv?: Record<string, string>;
 }
@@ -231,6 +245,9 @@ export class MatchlockController {
   private readonly dshProfileOverlay: { runId: string; liveStateRoot: string } | undefined;
   private readonly mountAdmission: MountAdmissionContext | undefined;
   private readonly createEnv: Record<string, string> | undefined;
+  private readonly buildCreateConfig:
+    | ((policy: ExecutionIsolation, identity: PinnedImageIdentity) => MatchlockCreateParams)
+    | undefined;
   private readonly rpcEnv: Record<string, string> | undefined;
   private pinnedIdentity: PinnedImageIdentity | null = null;
   private invoked = false;
@@ -255,6 +272,7 @@ export class MatchlockController {
     this.dshProfileOverlay = opts.dshProfileOverlay;
     this.mountAdmission = opts.mountAdmission;
     this.createEnv = opts.createEnv;
+    this.buildCreateConfig = opts.buildCreateConfig;
     this.rpcEnv = opts.rpcEnv;
     if (opts.requireHelperPack !== false && !this.helperPackHostPath) {
       // The guest pack is the only scoped bridge + helper source. Refuse to
@@ -614,12 +632,17 @@ export class MatchlockController {
   /** Build the create params from the policy + pinned identity. */
   buildCreateParams(helperPackHostPath: string | null, identity: PinnedImageIdentity): MatchlockCreateParams {
     validateWorkMounts(this.policy.workMounts);
-    const cfg = buildMatchlockCreateConfig(this.policy, identity, {
-      helperPackHostPath: helperPackHostPath ?? undefined,
-      ...(this.progressResource ? { progressResource: this.progressResource } : {}),
-      ...(this.dshProfileOverlay ? { dshProfileOverlay: this.dshProfileOverlay } : {}),
-      ...(this.mountAdmission ? { admission: this.mountAdmission } : {}),
-    });
+    // Interactive foreground sessions supply the shared interactive builder as
+    // an override; every workflow caller keeps the mount-plan builder (and its
+    // helper-pack requirement) byte-for-byte.
+    const cfg = this.buildCreateConfig
+      ? this.buildCreateConfig(this.policy, identity)
+      : buildMatchlockCreateConfig(this.policy, identity, {
+          helperPackHostPath: helperPackHostPath ?? undefined,
+          ...(this.progressResource ? { progressResource: this.progressResource } : {}),
+          ...(this.dshProfileOverlay ? { dshProfileOverlay: this.dshProfileOverlay } : {}),
+          ...(this.mountAdmission ? { admission: this.mountAdmission } : {}),
+        });
     // Invocation-bound guest env (helper-pack PATH prepend, TAMANDUA_* identity
     // and attested suite env) is merged OVER the immutable planner defaults.
     // PI_CODING_AGENT_DIR (the harness directory override) stays pinned by the
@@ -644,6 +667,18 @@ export class MatchlockController {
     const client = this.client;
     if (!client) throw new MatchlockControllerError("vm_not_created", "VM not created; call prepareAndCreate first");
     return client.execPipe(cmd, notify, { timeoutMs });
+  }
+
+  /**
+   * Run a guest command in interactive PTY mode (`exec_tty`). Requires an
+   * admitted VM and delegates to the owned RPC client; the returned handle
+   * exposes readiness-gated `stdin`, `resize(rows, cols)` and `result`.
+   */
+  execTty(cmd: MatchlockTtyExecOptions, notify: StreamNotify, timeoutMs?: number): MatchlockTtyHandle {
+    this.requireAdmitted();
+    const client = this.client;
+    if (!client) throw new MatchlockControllerError("vm_not_created", "VM not created; call prepareAndCreate first");
+    return client.execTty(cmd, notify, { timeoutMs });
   }
 
   /** Cancels an in-flight guest exec request. */
@@ -735,8 +770,8 @@ export class MatchlockController {
       );
     }
     // Settle live exec requests before close (server close waits handlers).
-    // NOTE: today this registers ONLY the exec-family methods the client can
-    // put in flight (exec/exec_stream/exec_pipe). A later guest-bridge stage
+    // NOTE: today this registers the exec-family methods the client can put in
+    // flight (exec/exec_stream/exec_pipe/exec_tty). A later guest-bridge stage
     // that runs long-lived bridge requests through this controller MUST
     // register them here too, otherwise close would wait on their handlers.
     await client.cancelInFlightExecRequests();

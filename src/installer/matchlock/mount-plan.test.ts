@@ -6,11 +6,13 @@ import os from "node:os";
 import path from "node:path";
 import {
   buildMatchlockCreateConfig,
+  buildInteractiveSessionCreateConfig,
   validateWorkMounts,
   isBroadHostSource,
   shadowsProtectedGuestRoot,
   MatchlockMountPlanError,
   MATCHLOCK_GUEST_RUNTIME_ROOT,
+  INTERACTIVE_HARNESS_UNSUPPORTED_CODE,
   isHostAttestedProgressResource,
   hostProgressResourceDir,
 } from "../../../dist/installer/matchlock/mount-plan.js";
@@ -843,5 +845,215 @@ describe("matchlock mount plan", () => {
     // A narrow selected dsh home (the design's whole-effective-home case) is fine.
     assert.equal(isBroadHostSource("/home/operator/.dsh", ctx), false);
     assert.equal(isBroadHostSource("/home/operator/dsh-data", ctx), false);
+  });
+
+  // ── MTLK-INTERACTIVE US-005: interactive create config ───────────────
+  //
+  // The interactive builder shares the work/repository/Git/config planning
+  // helpers with the workflow builder but: stamps owner_uid/owner_gid on every
+  // host_fs mount, sets PI_CODING_AGENT_DIR (pi) or HERMES_HOME (hermes),
+  // omits the RO helper pack + progress resource, and refuses dsh.
+  describe("MTLK-INTERACTIVE US-005: interactive session create config", () => {
+    // The interactive builder mounts the selected configuration at its IDENTICAL
+    // absolute host path, so the source must live OUTSIDE the protected guest OS
+    // subtrees (/tmp, /etc, ...). Use an owned home-based fixture.
+    const interactiveConfig = fs.mkdtempSync(path.join(os.homedir(), ".mtlk-itest-config-"));
+    after(() => {
+      fs.rmSync(interactiveConfig, { recursive: true, force: true });
+    });
+
+    function interactivePolicy(over: Partial<ExecutionIsolation> = {}): ExecutionIsolation {
+      return policy({
+        harness: "pi",
+        configurationRoot: interactiveConfig,
+        guestConfigurationRoot: "/workspace/config/pi",
+        workMounts: [
+          { hostPath: "/srv/interactive-work", hostRealPath: "/srv/interactive-work", guestPath: "/srv/interactive-work" },
+        ],
+        originalRepositoryRoot: "/opt/original-repo",
+        gitMetadataRoots: ["/opt/git-common"],
+        ...over,
+      });
+    }
+
+    const OWNER = { ownerUid: 4242, ownerGid: 4343 };
+
+    it("mounts cwd, original repository and external Git metadata RW at identical host/guest paths; config RW at its identical host path", () => {
+      const cfg = buildInteractiveSessionCreateConfig(interactivePolicy(), IDENTITY, OWNER);
+      const mounts = cfg.vfs?.mounts ?? {};
+      assert.equal(cfg.image, "img:1");
+      assert.deepEqual(cfg.image_identity, IDENTITY);
+      assert.equal(cfg.vfs?.exact_destinations, true);
+      for (const p of ["/srv/interactive-work", "/opt/original-repo", "/opt/git-common"]) {
+        assert.equal(mounts[p]?.type, "host_fs", `${p} must be a host_fs mount`);
+        assert.equal(mounts[p]?.host_path, p, `${p} must mount at its identical host path`);
+        assert.equal(mounts[p]?.readonly, false, `${p} must be read-write`);
+      }
+      // D5: the config is mounted at the IDENTICAL absolute host path, not the
+      // workflow relocation at policy.guestConfigurationRoot.
+      assert.equal(mounts[interactiveConfig]?.type, "host_fs");
+      assert.equal(mounts[interactiveConfig]?.host_path, interactiveConfig);
+      assert.equal(mounts[interactiveConfig]?.readonly, false);
+      assert.equal(mounts["/workspace/config/pi"], undefined, "config must not be relocated");
+    });
+
+    it("sets PI_CODING_AGENT_DIR to the identical host config path (never HERMES_HOME)", () => {
+      const cfg = buildInteractiveSessionCreateConfig(interactivePolicy(), IDENTITY, OWNER);
+      assert.equal(cfg.env?.PI_CODING_AGENT_DIR, interactiveConfig);
+      assert.equal(cfg.env?.HERMES_HOME, undefined);
+    });
+
+    it("hermes mounts the whole effective profile home at its identical host path and sets HERMES_HOME there (never PI_CODING_AGENT_DIR)", () => {
+      const cfg = buildInteractiveSessionCreateConfig(
+        interactivePolicy({ harness: "hermes", guestConfigurationRoot: "/workspace/config/hermes/profiles/coder" }),
+        IDENTITY,
+        OWNER,
+      );
+      assert.equal(cfg.env?.HERMES_HOME, interactiveConfig);
+      assert.equal(cfg.env?.PI_CODING_AGENT_DIR, undefined);
+      assert.equal(cfg.vfs?.mounts?.[interactiveConfig]?.host_path, interactiveConfig);
+      assert.equal(cfg.vfs?.mounts?.[interactiveConfig]?.readonly, false);
+      assert.equal(cfg.vfs?.mounts?.["/workspace/config/hermes/profiles/coder"], undefined);
+    });
+
+    it("stamps the caller's numeric owner_uid/owner_gid on EVERY host_fs mount (guest-visible metadata, not a host chown)", () => {
+      const cfg = buildInteractiveSessionCreateConfig(interactivePolicy(), IDENTITY, OWNER);
+      const hostFs = Object.values(cfg.vfs?.mounts ?? {}).filter((m) => m.type === "host_fs");
+      assert.ok(hostFs.length >= 4, `expected the full mount set, got ${hostFs.length}`);
+      for (const m of hostFs) {
+        assert.equal(m.owner_uid, 4242, `${m.host_path} must carry the caller uid`);
+        assert.equal(m.owner_gid, 4343, `${m.host_path} must carry the caller gid`);
+      }
+    });
+
+    it("omits the RO guest helper pack, the progress resource and any host HOME/state mount", () => {
+      const cfg = buildInteractiveSessionCreateConfig(interactivePolicy(), IDENTITY, OWNER);
+      const mounts = cfg.vfs?.mounts ?? {};
+      assert.equal(mounts[MATCHLOCK_GUEST_RUNTIME_ROOT], undefined, "no helper pack in an interactive create config");
+      assert.equal(
+        Object.keys(mounts).some((guest) => guest === "/workspace/runs" || guest.startsWith("/workspace/runs/")),
+        false,
+        "no progress resource in an interactive create config",
+      );
+      const forbidden = new Set([
+        os.homedir(),
+        path.join(os.homedir(), ".tamandua"),
+        path.join(os.homedir(), ".pi"),
+      ]);
+      for (const m of Object.values(mounts)) {
+        assert.equal(forbidden.has(m.host_path ?? ""), false, `interactive session must never mount ${m.host_path}`);
+      }
+    });
+
+    it("drops a redundant same-source cwd mount inside the original repository, exposing it through the repo mount", () => {
+      // Direct-mode cwd inside its repo: the write-through repo mount already
+      // exposes the cwd, so the nested cwd destination is dropped exactly as
+      // the runtime's ValidateExactDestinationMounts requires.
+      const cfg = buildInteractiveSessionCreateConfig(
+        interactivePolicy({
+          workMounts: [
+            { hostPath: "/opt/original-repo/work", hostRealPath: "/opt/original-repo/work", guestPath: "/opt/original-repo/work" },
+          ],
+          originalRepositoryRoot: "/opt/original-repo",
+          gitMetadataRoots: ["/opt/original-repo/.git"],
+        }),
+        IDENTITY,
+        OWNER,
+      );
+      const mounts = cfg.vfs?.mounts ?? {};
+      assert.equal(mounts["/opt/original-repo"]?.host_path, "/opt/original-repo");
+      assert.equal(mounts["/opt/original-repo/work"], undefined, "nested same-source cwd must be dropped");
+      assert.equal(mounts["/opt/original-repo/.git"], undefined, "nested same-source .git must be dropped");
+    });
+
+    it("preserves the shared refusals: broad host HOME source, protected guest root, missing/non-directory config", () => {
+      // A whole host HOME as the configuration source is refused.
+      assert.throws(
+        () => buildInteractiveSessionCreateConfig(interactivePolicy({ configurationRoot: os.homedir() }), IDENTITY, OWNER),
+        (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "mount_policy_rejected" && /broad host source/.test(e.message),
+      );
+      // The whole ~/.pi store as a work mount is refused (narrow ~/.pi/agent is not).
+      assert.throws(
+        () => buildInteractiveSessionCreateConfig(
+          interactivePolicy({
+            workMounts: [{ hostPath: path.join(os.homedir(), ".pi"), hostRealPath: path.join(os.homedir(), ".pi"), guestPath: path.join(os.homedir(), ".pi") }],
+          }),
+          IDENTITY,
+          OWNER,
+        ),
+        (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "mount_policy_rejected" && /broad host source/.test(e.message),
+      );
+      // A protected guest destination is refused.
+      assert.throws(
+        () => buildInteractiveSessionCreateConfig(interactivePolicy({ guestConfigurationRoot: "/etc" }), IDENTITY, OWNER),
+        (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "mount_policy_rejected" && /protected guest OS root/.test(e.message),
+      );
+      // A missing configuration directory is a hard failure (never an image default).
+      assert.throws(
+        () => buildInteractiveSessionCreateConfig(interactivePolicy({ configurationRoot: path.join(tmp, "nope") }), IDENTITY, OWNER),
+        (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "guest_configuration_incompatible",
+      );
+    });
+
+    it("preserves the symlink-source and nested-different-source refusals", () => {
+      const real = path.join(interactiveConfig, "interactive-config-real");
+      fs.mkdirSync(real, { recursive: true });
+      const link = path.join(interactiveConfig, "interactive-config-link");
+      fs.symlinkSync(real, link, "dir");
+      assert.throws(
+        () => buildInteractiveSessionCreateConfig(interactivePolicy({ configurationRoot: link }), IDENTITY, OWNER),
+        (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "mount_policy_rejected" && /is a symlink/.test(e.message),
+      );
+      // A destination nested inside another destination from a DIFFERENT host
+      // source is a genuine collision (never silently dropped). The workflow
+      // builder still relocates the config to its guest override, so a Git root
+      // nested there is exactly that case.
+      assert.throws(
+        () =>
+          buildMatchlockCreateConfig(
+            policy({ configurationRoot: real, gitMetadataRoots: ["/workspace/config/pi/nested-git"] }),
+            IDENTITY,
+            { helperPackHostPath: helperPack },
+          ),
+        (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "mount_policy_rejected" && /nested inside/.test(e.message),
+      );
+    });
+
+    it("refuses a dsh policy (interactive sessions are pi/hermes only)", () => {
+      const dsh = policy({ harness: "dsh", configurationRoot: tmp });
+      assert.throws(
+        () => buildInteractiveSessionCreateConfig(dsh, IDENTITY, OWNER),
+        (e: unknown) => e instanceof MatchlockMountPlanError && e.code === INTERACTIVE_HARNESS_UNSUPPORTED_CODE,
+      );
+    });
+
+    it("refuses a non-integer or negative owner id instead of stamping garbage", () => {
+      for (const bad of [{ ownerUid: -1, ownerGid: 0 }, { ownerUid: 0, ownerGid: 1.5 }, { ownerUid: Number.NaN, ownerGid: 0 }]) {
+        assert.throws(
+          () => buildInteractiveSessionCreateConfig(interactivePolicy(), IDENTITY, bad),
+          (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "mount_policy_rejected" && /owner uid\/gid/.test(e.message),
+          `expected refusal for ${JSON.stringify(bad)}`,
+        );
+      }
+    });
+
+    it("does not require a helper pack (unlike the workflow builder) and stamps no owner fields on the workflow path", () => {
+      // The interactive builder never receives a helperPackHostPath and still
+      // succeeds; the workflow builder still REQUIRES one (fail closed).
+      const interactive = buildInteractiveSessionCreateConfig(interactivePolicy(), IDENTITY, OWNER);
+      assert.equal(interactive.vfs?.mounts?.[MATCHLOCK_GUEST_RUNTIME_ROOT], undefined);
+      assert.throws(
+        () => buildMatchlockCreateConfig(interactivePolicy(), IDENTITY),
+        (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "guest_bridge_unavailable",
+      );
+      // Workflow create params stay byte-compatible: helper RO at the reserved
+      // guest path and NO owner fields anywhere.
+      const workflow = buildMatchlockCreateConfig(interactivePolicy(), IDENTITY, { helperPackHostPath: helperPack });
+      assert.equal(workflow.vfs?.mounts?.[MATCHLOCK_GUEST_RUNTIME_ROOT]?.readonly, true);
+      for (const m of Object.values(workflow.vfs?.mounts ?? {})) {
+        assert.equal("owner_uid" in m, false, "workflow mounts must not gain owner fields");
+        assert.equal("owner_gid" in m, false, "workflow mounts must not gain owner fields");
+      }
+    });
   });
 });

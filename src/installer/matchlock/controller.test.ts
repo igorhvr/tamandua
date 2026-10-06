@@ -34,6 +34,15 @@ const FAKE_ENV_KEYS = [
   "FAKE_DELAY_READY_MS",
   "FAKE_NO_READY",
   "FAKE_PIPE_WAIT_MS",
+  "FAKE_TTY_STDOUT",
+  "FAKE_TTY_STDOUT_FRAMES",
+  "FAKE_TTY_SPLIT_UTF8",
+  "FAKE_TTY_ECHO_STDIN",
+  "FAKE_TTY_EXIT",
+  "FAKE_TTY_DURATION_MS",
+  "FAKE_TTY_DELAY_READY_MS",
+  "FAKE_TTY_NO_READY",
+  "FAKE_TTY_WAIT_MS",
   "FAKE_CANCEL_BLOCK_MS",
   "FAKE_EMIT_OVERSIZE_ON_START",
   "FAKE_STREAM_STDOUT_BYTES",
@@ -456,6 +465,74 @@ describe("matchlock controller (fake rpc driver)", () => {
     assert.equal(result.exit_code, 7);
     assert.equal(decodeFramesText(stdout), "hello\n");
     assert.equal(decodeFramesText(stderr), "boom");
+  });
+
+  // ── exec_tty (interactive PTY) ───────────────────────────────────────
+
+  it("US-009: execTty requires an admitted VM and refuses (vm_not_created) before any wire traffic", (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const c = s.makeController(policy({ configurationRoot: configDir }));
+    assert.throws(
+      () => c.execTty({ command: "pi" }, () => {}),
+      (e: unknown) => codeOf(e) === "vm_not_created",
+    );
+    assert.equal(s.readTranscript().length, 0, "a denied exec_tty must never touch the wire");
+  });
+
+  it("US-009: execTty delegates to the owned client with explicit user/working_dir/rows/cols and streams tty output", async (t) => {
+    const s = testScaffold(t);
+    s.setFake({ ...HAPPY_FAKE, FAKE_TTY_STDOUT: "guest-ready", FAKE_TTY_EXIT: "5" });
+    const c = s.makeController(policy({ configurationRoot: configDir }));
+    await c.prepareAndCreate(pin());
+    const stdout: MatchlockStreamFrame[] = [];
+    const tty = c.execTty(
+      { command: "pi", working_dir: "/opt/project", user: "1000:1000", rows: 30, cols: 100 },
+      (f: MatchlockStreamFrame) => {
+        if (f.kind === "stdout") stdout.push(f);
+      },
+    );
+    await tty.stdin.eof();
+    const result = await tty.result;
+    assert.equal(result.exit_code, 5);
+    assert.equal(decodeFramesText(stdout), "guest-ready");
+
+    const txn = s.readTranscript();
+    const ttyIdx = transcriptMethodIndexes(txn, "exec_tty");
+    assert.equal(ttyIdx.length, 1, "exactly one exec_tty must reach the wire");
+    const params = txn[ttyIdx[0]].params as Record<string, unknown>;
+    assert.equal(params.command, "pi");
+    assert.equal(params.working_dir, "/opt/project");
+    assert.equal(params.user, "1000:1000");
+    assert.equal(params.rows, 30);
+    assert.equal(params.cols, 100);
+    await c.close(30);
+    const outcome = await c.dispose();
+    assert.equal(outcome.code, 0);
+  });
+
+  it("US-009: an in-flight exec_tty is CANCELLED before a graceful close exactly like exec_stream/exec_pipe", async (t) => {
+    const s = testScaffold(t);
+    s.setFake({ ...HAPPY_FAKE, FAKE_TTY_WAIT_MS: "30000", FAKE_CLOSE_DELAY_MS: "700" });
+    const c = s.makeController(policy({ configurationRoot: configDir }));
+    await c.prepareAndCreate(pin());
+    const tty = c.execTty({ command: "pi" }, () => {});
+    const outcome = settle(tty.result);
+
+    await c.close(30);
+    assert.equal(c.isClosed, true);
+    const o = await outcome;
+    assert.equal(o.ok, false, "the live exec_tty must be cancelled/settled before close");
+    if (!o.ok) assert.equal(isRpcError(o.error, -32003), true, "live exec_tty must reject with ErrCodeCancelled");
+
+    const txn = s.readTranscript();
+    const cancelIdx = transcriptMethodIndexes(txn, "cancel");
+    const closeIdx = transcriptMethodIndexes(txn, "close");
+    assert.ok(cancelIdx.length >= 1, "expected cancel(s) before close");
+    assert.equal(closeIdx.length, 1, "expected exactly one close");
+    assert.ok(cancelIdx[0] < closeIdx[0], "cancel must precede close");
+    const result = await c.dispose();
+    assert.equal(result.code, 0);
   });
 
   it("cancel cancels an in-flight exec and the request rejects with ErrCodeCancelled", async (t) => {

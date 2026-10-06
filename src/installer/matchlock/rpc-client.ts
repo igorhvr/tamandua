@@ -22,6 +22,14 @@
  *     so the client MUST NOT write stdin before `ready` is observed (the
  *     server would silently drop the chunk); this client queues stdin until
  *     the `ready` notification arrives (bounded by `readyTimeoutMs`).
+ *   - `exec_tty` (interactive PTY) streams `exec_tty.ready` FIRST, then
+ *     `exec_tty.stdout` (base64 frames; a PTY merges stderr into stdout, so
+ *     there is deliberately NO `exec_tty.stderr`). stdin is delivered via
+ *     `exec_tty.stdin` (base64 `params.data`) then `exec_tty.stdin_eof`, and
+ *     terminal resizes via `exec_tty.resize` (`{rows, cols}`) — all one-way
+ *     NOTIFICATIONS. As with `exec_pipe`, the runtime registers the per-
+ *     request TTY session before it sends `ready`, so stdin AND resize are
+ *     queued until `ready` is observed (bounded by `readyTimeoutMs`).
  *   - `cancel` takes `{id}` of the in-flight request to cancel; the runtime
  *     answers synchronously and the cancelled exec later rejects with
  *     `-32003` (ErrCodeCancelled).
@@ -69,6 +77,7 @@ import type {
   MatchlockRpcErrorBody,
   MatchlockRequestId,
   MatchlockStreamFrame,
+  MatchlockTtyExecOptions,
 } from "./types.js";
 
 /** Client-originated error codes (kept away from the runtime's -32000 range). */
@@ -139,12 +148,14 @@ export function isAlreadyStoppedCloseError(err: unknown): boolean {
 
 /**
  * Exec-family methods the client can put in flight and therefore cancels
- * before a graceful close (the runtime's close waits for handlers). exec_tty
- * is deliberately NOT here yet: this slice exposes no execTty() API and does
- * not route exec_tty.* frames, so no exec_tty request can be in flight — the
- * future tty/bridge stage re-adds it together with the full wiring.
+ * before a graceful close (the runtime's close waits for handlers). This
+ * includes `exec_tty` (interactive PTY): an in-flight TTY session must be
+ * cancelled exactly like exec_stream / exec_pipe before a graceful close.
+ * Killing the RPC child alone is NEVER proof that the guest VM is gone, so
+ * cancellation is the only path that makes the runtime's close terminate a
+ * live handler rather than timing out.
  */
-const EXEC_METHODS = new Set(["exec", "exec_stream", "exec_pipe"]);
+const EXEC_METHODS = new Set(["exec", "exec_stream", "exec_pipe", "exec_tty"]);
 
 export interface MatchlockRpcClientOptions {
   /** Absolute path to the matchlock CLI (tests inject a fake driver). */
@@ -219,6 +230,27 @@ export interface MatchlockPipeHandle {
   result: Promise<MatchlockExecResult>;
 }
 
+export interface MatchlockTtyStdin {
+  /** Send one base64 stdin chunk for the PTY (after `exec_tty.ready`). Bounded. */
+  write(data: Buffer | string): Promise<void>;
+  /** Signal stdin EOF for the PTY (after `exec_tty.ready`). Bounded. */
+  eof(): Promise<void>;
+}
+
+/**
+ * Handle for an in-flight interactive PTY session (`exec_tty`). `stdin` and
+ * `resize` are valid only after `exec_tty.ready` is observed (queued until
+ * then, rejected on the ready deadline); `result` resolves with the guest
+ * process exit status once the PTY session ends.
+ */
+export interface MatchlockTtyHandle {
+  requestId: MatchlockRequestId;
+  stdin: MatchlockTtyStdin;
+  /** Forward a terminal resize as `exec_tty.resize` (queued until ready). */
+  resize(rows: number, cols: number): Promise<void>;
+  result: Promise<MatchlockExecResult>;
+}
+
 /** Decode ONE frame's base64 exactly once, returning its bytes. */
 export function decodeFrameBytes(frame: MatchlockStreamFrame): Buffer {
   return Buffer.from(frame.base64 ?? "", "base64");
@@ -240,8 +272,14 @@ export function decodeFramesText(frames: Array<MatchlockStreamFrame | { base64?:
 function toFrame(method: string, params: unknown): MatchlockStreamFrame | null {
   const p = (params ?? {}) as Record<string, unknown>;
   const requestId = typeof p.id === "number" ? p.id : undefined;
-  if (method === "exec_pipe.ready") return { kind: "ready", requestId };
-  if (method === "exec_stream.stdout" || method === "exec_stream.stderr" || method === "exec_pipe.stdout" || method === "exec_pipe.stderr") {
+  if (method === "exec_pipe.ready" || method === "exec_tty.ready") return { kind: "ready", requestId };
+  if (
+    method === "exec_stream.stdout" ||
+    method === "exec_stream.stderr" ||
+    method === "exec_pipe.stdout" ||
+    method === "exec_pipe.stderr" ||
+    method === "exec_tty.stdout"
+  ) {
     // Raw wire bytes preserved verbatim; consumers decode exactly once.
     return {
       kind: method.endsWith("stderr") ? "stderr" : "stdout",
@@ -465,7 +503,21 @@ export class MatchlockRpcClient {
       const refId = frame.requestId;
       if (frame.kind === "ready" && refId !== undefined) {
         const pending = this.pending.get(refId);
-        if (pending) pending.readySeen = true;
+        if (pending) {
+          // Open the client-side stdin/resize gate...
+          pending.readySeen = true;
+          // ...and DELIVER the ready frame to the consumer too: the foreground
+          // interactive controller opens its bounded host-stdin forwarder from
+          // this frame (`onFrame` -> `markReady`). Consumers that only read
+          // stdout (`exec_pipe`/`exec_tty` stream callbacks) ignore the kind.
+          if (pending.notify) {
+            try {
+              pending.notify(frame);
+            } catch (err) {
+              this.log("warn", "matchlock rpc stream callback threw", { error: String(err) });
+            }
+          }
+        }
         this.resolveReadyWaiters(refId);
         return;
       }
@@ -730,42 +782,85 @@ export class MatchlockRpcClient {
    */
   execPipe(cmd: MatchlockExecOptions, notify: StreamNotify, callOpts?: RequestCallOptions): MatchlockPipeHandle {
     const { id, promise } = this.sendRequest<MatchlockExecResult, MatchlockExecOptions>("exec_pipe", cmd, notify, callOpts);
-    const gate = (): Promise<void> => {
-      const entry = this.pending.get(id);
-      if (!entry) {
-        // Request already settled: stdin is inert.
-        return Promise.reject(clientError(MATCHLOCK_CLIENT_ERROR_CODES.REQUEST_INACTIVE, `exec_pipe ${id} already settled; stdin is inert`));
-      }
-      if (entry.readySeen) return Promise.resolve();
-      return new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          const idx = entry.readyWaiters.findIndex((w) => w.resolve === resolve);
-          if (idx >= 0) entry.readyWaiters.splice(idx, 1);
-          reject(clientError(MATCHLOCK_CLIENT_ERROR_CODES.TIMEOUT, `exec_pipe ${id} ready notification not observed within ${this.readyTimeoutMs}ms`));
-        }, this.readyTimeoutMs);
-        entry.readyWaiters.push({
-          resolve: () => {
-            clearTimeout(timer);
-            resolve();
-          },
-          reject: (err) => {
-            clearTimeout(timer);
-            reject(err);
-          },
-        });
-      });
-    };
     const stdin: MatchlockPipeStdin = {
       write: async (data: Buffer | string): Promise<void> => {
-        await gate();
+        await this.readyGate(id, "exec_pipe");
         await this.notify("exec_pipe.stdin", { id, data: Buffer.from(data).toString("base64") });
       },
       eof: async (): Promise<void> => {
-        await gate();
+        await this.readyGate(id, "exec_pipe");
         await this.notify("exec_pipe.stdin_eof", { id });
       },
     };
     return { requestId: id, stdin, result: promise };
+  }
+
+  /**
+   * Exec in interactive PTY mode (`exec_tty`). The runtime streams
+   * `exec_tty.ready` FIRST, then base64 `exec_tty.stdout` frames (a PTY merges
+   * stderr into stdout, so there is deliberately no `exec_tty.stderr`); stdin
+   * is delivered via `exec_tty.stdin` then `exec_tty.stdin_eof`, and terminal
+   * resizes via `exec_tty.resize` (all notifications).
+   *
+   * stdin AND resize are queued until `exec_tty.ready` is OBSERVED (the runtime
+   * registers the TTY session before sending ready; anything earlier can be
+   * dropped) and reject once the request settles or the transport dies —
+   * bounded by `readyTimeoutMs`, the stdin drain deadline and the request
+   * deadline. Byte-preserving stdout is handed to `notify` as raw base64
+   * frames, decoded exactly once by the consumer (`decodeFrameBytes` /
+   * `decodeFramesText`), so a multi-byte UTF-8 sequence split across frame
+   * boundaries survives.
+   */
+  execTty(cmd: MatchlockTtyExecOptions, notify: StreamNotify, callOpts?: RequestCallOptions): MatchlockTtyHandle {
+    const { id, promise } = this.sendRequest<MatchlockExecResult, MatchlockTtyExecOptions>("exec_tty", cmd, notify, callOpts);
+    const stdin: MatchlockTtyStdin = {
+      write: async (data: Buffer | string): Promise<void> => {
+        await this.readyGate(id, "exec_tty");
+        await this.notify("exec_tty.stdin", { id, data: Buffer.from(data).toString("base64") });
+      },
+      eof: async (): Promise<void> => {
+        await this.readyGate(id, "exec_tty");
+        await this.notify("exec_tty.stdin_eof", { id });
+      },
+    };
+    const resize = async (rows: number, cols: number): Promise<void> => {
+      await this.readyGate(id, "exec_tty");
+      await this.notify("exec_tty.resize", { id, rows, cols });
+    };
+    return { requestId: id, stdin, resize, result: promise };
+  }
+
+  /**
+   * Resolve once the `ready` notification for `requestId` has been OBSERVED;
+   * reject with a bounded TIMEOUT when it never arrives and with
+   * REQUEST_INACTIVE once the request has settled. Shared by exec_pipe and
+   * exec_tty: the runtime registers the per-request channel before sending
+   * `ready`, so stdin/resize written before then would be silently dropped.
+   */
+  private readyGate(requestId: number, label: string): Promise<void> {
+    const entry = this.pending.get(requestId);
+    if (!entry) {
+      // Request already settled: stdin/resize is inert.
+      return Promise.reject(clientError(MATCHLOCK_CLIENT_ERROR_CODES.REQUEST_INACTIVE, `${label} ${requestId} already settled; stdin is inert`));
+    }
+    if (entry.readySeen) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = entry.readyWaiters.findIndex((w) => w.resolve === resolve);
+        if (idx >= 0) entry.readyWaiters.splice(idx, 1);
+        reject(clientError(MATCHLOCK_CLIENT_ERROR_CODES.TIMEOUT, `${label} ${requestId} ready notification not observed within ${this.readyTimeoutMs}ms`));
+      }, this.readyTimeoutMs);
+      entry.readyWaiters.push({
+        resolve: () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
+    });
   }
 
   /** Cancel an in-flight request (returns whether it was cancellable). */

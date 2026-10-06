@@ -537,12 +537,31 @@ tamandua workflow delete <run-id> [--force]
 tamandua nudge
 tamandua run diagnose <run-id|run-number> [--out <dir>] [--json]  # read-only diagnostics bundle for a run
 tamandua evidence prune --older-than <days> [--yes] [--json]      # remove old evidence; dry-run by default, manual only
+tamandua matchlock pi|pi-shell|hermes|hermes-shell [--working-directory-for-harness <dir>] [Matchlock options]  # foreground interactive session in a fresh disposable VM
 ```
 
 **Flag rejection:** `tamandua workflow run` now rejects unknown `--flags` and
 `-x` short flags with a clear error message instead of silently absorbing them
 into the task title. Use `--` to pass a task that starts with `--` or `-`
 (e.g. `tamandua workflow run mywf -- --my-task-flag`).
+
+**Interactive Matchlock sessions.** `tamandua matchlock pi`,
+`tamandua matchlock pi-shell`, `tamandua matchlock hermes` and
+`tamandua matchlock hermes-shell` launch a foreground interactive harness (or an
+interactive `zsh` with the same guest prepared) inside one fresh, disposable
+Matchlock VM. All four accept the shared option set
+(`--working-directory-for-harness`, `--matchlock-image`, `--matchlock-cpus`,
+`--matchlock-memory`, `--matchlock-disk`, `--matchlock-swap`,
+`--matchlock-no-swap`, repeatable `--matchlock-allow-private`) plus `-h`/`--help`.
+The image must already be imported (a missing standard image names
+`tamandua matchlock setup`); a root invocation is refused before any Matchlock
+interaction unless
+`--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` is supplied.
+In this build the interactive path is qualified **synthetically only** against a
+test-owned fake backend; real-VM PTY qualification with actual pi and Hermes is
+deferred. See the README "Interactive sessions" subsection for the full contract
+(root gate, pinning, mounts, numeric uid/gid mapping, summary and confirmed
+cleanup).
 
 ### Installation, context, and workspace modes
 

@@ -66,6 +66,29 @@
  *   FAKE_TRANSCRIPT_FILE — every received request is appended as a JSON line
  *     plus {"event":...} markers, so tests can assert exact wire ordering.
  *
+ * exec_tty (interactive PTY) is a SEPARATE family mirroring the runtime
+ * pkg/rpc/handler.go handleExecTTY contract: the request carries
+ * command/working_dir/user/rows/cols, the driver emits `exec_tty.ready`
+ * (BEFORE any stdout frame) then base64 `exec_tty.stdout` frames, consumes
+ * `exec_tty.stdin` / `exec_tty.stdin_eof` / `exec_tty.resize` NOTIFICATIONS
+ * (no id, no response), and resolves with {exit_code, duration_ms}. There is
+ * deliberately NO `exec_tty.stderr` (a PTY merges stderr into stdout). Knobs:
+ *   FAKE_TTY_STDOUT — tty stdout text emitted as ONE base64 frame after ready.
+ *   FAKE_TTY_STDOUT_FRAMES — JSON array of strings; each entry is emitted as
+ *     its own `exec_tty.stdout` frame (overrides FAKE_TTY_STDOUT) so frame
+ *     boundaries/ordering can be scripted.
+ *   FAKE_TTY_SPLIT_UTF8=1 — emit "héllo → wörld" as TWO frames whose boundary
+ *     splits one multi-byte UTF-8 character (independent of the above).
+ *   FAKE_TTY_ECHO_STDIN=1 — append the collected stdin bytes as stdout frames.
+ *   FAKE_TTY_EXIT — exec_tty exit code (default FAKE_EXEC_EXIT, else 0).
+ *   FAKE_TTY_DURATION_MS — exec_tty `duration_ms` (default 1).
+ *   FAKE_TTY_DELAY_READY_MS — sleep this long before `exec_tty.ready` (stdin
+ *     must be queued until ready) and record {"event":"tty_ready_sent"}.
+ *   FAKE_TTY_NO_READY=1 — never emit `exec_tty.ready` (client ready-deadline
+ *     test) while still consuming stdin and resolving.
+ *   FAKE_TTY_WAIT_MS — how long exec_tty waits for stdin EOF before finishing
+ *     (default FAKE_PIPE_WAIT_MS, else 4000). Cancellation still interrupts.
+ *
  * The `close` handler mirrors pkg/rpc/handler.go handleClose: it does NOT
  * validate timeout_seconds (a non-positive value yields an immediately
  * expired close context, which fails an in-flight vm.Close with -32003 rather
@@ -134,6 +157,21 @@ const holdOpen = env.FAKE_HOLD_OPEN === "1";
 const exitAfterCreateMs = Number.parseInt(env.FAKE_EXIT_AFTER_CREATE_MS || "0", 10);
 const resolveDelayMs = Number.parseInt(env.FAKE_RESOLVE_DELAY_MS || "0", 10);
 const createDelayMs = Number.parseInt(env.FAKE_CREATE_DELAY_MS || "0", 10);
+// exec_tty (interactive PTY) knobs — see the module header.
+const ttyStdout = env.FAKE_TTY_STDOUT !== undefined ? env.FAKE_TTY_STDOUT : "";
+let ttyStdoutFrames = [];
+if (env.FAKE_TTY_STDOUT_FRAMES) {
+  try {
+    const parsed = JSON.parse(env.FAKE_TTY_STDOUT_FRAMES);
+    if (Array.isArray(parsed)) ttyStdoutFrames = parsed.map((v) => String(v));
+  } catch { ttyStdoutFrames = []; }
+}
+const ttyEchoStdin = env.FAKE_TTY_ECHO_STDIN === "1";
+const ttyExitCode = Number.parseInt(env.FAKE_TTY_EXIT !== undefined ? env.FAKE_TTY_EXIT : (env.FAKE_EXEC_EXIT || "0"), 10);
+const ttyDurationMs = Number.parseInt(env.FAKE_TTY_DURATION_MS || "1", 10);
+const ttyReadyDelayMs = Number.parseInt(env.FAKE_TTY_DELAY_READY_MS || "0", 10);
+const ttyNoReady = env.FAKE_TTY_NO_READY === "1";
+const ttyWaitMs = Number.parseInt(env.FAKE_TTY_WAIT_MS || env.FAKE_PIPE_WAIT_MS || "4000", 10);
 
 // Split the payload across two frames INSIDE a multi-byte UTF-8 sequence so a
 // naive per-frame utf8 decode corrupts it; bytes-first decode must survive.
@@ -158,12 +196,25 @@ if (env.FAKE_EMIT_OVERSIZE_ON_START === "1") {
 // exec_pipe per-id state
 const stdinBuf = new Map();       // id -> accumulated string
 const eofResolvers = new Map();   // id -> resolve()
+const eofSeen = new Set();        // ids whose EOF arrived before waitEofOrCancel
 const cancelled = new Set();      // request ids cancelled
+// exec_tty per-id state. stdin is byte-preserving (Array<Buffer>), separate
+// from exec_pipe's string accumulation, and shares eofResolvers/cancelled so
+// cancel() interrupts a pending tty session exactly like a pipe.
+const ttyStdinChunks = new Map(); // id -> Array<Buffer>
 let vmCreated = false;            // true after a successful create
 
-function resolveEof(id) { const r = eofResolvers.get(id); if (r) { eofResolvers.delete(id); r(); } }
+function resolveEof(id) {
+  const r = eofResolvers.get(id);
+  if (r) { eofResolvers.delete(id); r(); }
+  // EOF arrived BEFORE the request handler registered its waiter (e.g. a
+  // delayed exec_tty.ready): remember it so waitEofOrCancel resolves at once
+  // instead of waiting out the whole timeout.
+  else { eofSeen.add(id); }
+}
 
 function waitEofOrCancel(id, timeoutMs) {
+  if (eofSeen.has(id)) { eofSeen.delete(id); return Promise.resolve(); }
   return new Promise((resolve) => {
     const timer = setTimeout(() => { eofResolvers.delete(id); resolve(); }, timeoutMs);
     eofResolvers.set(id, () => { clearTimeout(timer); resolve(); });
@@ -222,7 +273,7 @@ async function handle(req) {
   if (method === "exec_pipe") {
     if (req.id == null) return sendError(req.id, -32600, "exec_pipe requires request id");
     const reqId = req.id;
-    stdinBuf.set(reqId, ""); eofResolvers.set(reqId, () => {});
+    stdinBuf.set(reqId, "");
     if (env.FAKE_STDOUT_BEFORE_READY === "1") {
       // Out-of-order wire frame: data emitted BEFORE exec_pipe.ready. A
       // conforming client must tolerate/route it and still gate stdin on ready.
@@ -248,6 +299,65 @@ async function handle(req) {
     }
     if (err !== "") send({ jsonrpc: "2.0", method: "exec_pipe.stderr", params: { id: reqId, data: Buffer.from(err).toString("base64") } });
     return sendResult(reqId, { exit_code: exitCode, duration_ms: 1 });
+  }
+  if (method === "exec_tty") {
+    // Runtime pkg/rpc/handler.go handleExecTTY: command/working_dir/user/rows/
+    // cols request -> exec_tty.ready BEFORE any stdout frame -> base64
+    // exec_tty.stdout frames -> {exit_code, duration_ms}. No exec_tty.stderr
+    // (a PTY merges stderr into stdout).
+    if (req.id == null) return sendError(req.id, -32600, "exec_tty requires request id");
+    const reqId = req.id;
+    const p = req.params || {};
+    ttyStdinChunks.set(reqId, []);
+    txn({ event: "tty_request", id: reqId, command: p.command, working_dir: p.working_dir, user: p.user, rows: p.rows, cols: p.cols });
+    if (ttyReadyDelayMs > 0) await new Promise((r) => setTimeout(r, ttyReadyDelayMs));
+    if (!ttyNoReady) {
+      txn({ event: "tty_ready_sent", id: reqId });
+      send({ jsonrpc: "2.0", method: "exec_tty.ready", params: { id: reqId } });
+    }
+    await waitEofOrCancel(reqId, ttyWaitMs);
+    if (cancelled.has(reqId)) return sendError(reqId, -32003, "request cancelled");
+    const chunks = [];
+    if (env.FAKE_TTY_SPLIT_UTF8 === "1") {
+      const [a, b] = splitFrames("héllo → wörld");
+      chunks.push(a, b);
+    } else if (ttyStdoutFrames.length > 0) {
+      for (const text of ttyStdoutFrames) chunks.push(Buffer.from(text, "utf8"));
+    } else if (ttyStdout !== "") {
+      chunks.push(Buffer.from(ttyStdout, "utf8"));
+    }
+    if (ttyEchoStdin) {
+      const echoed = Buffer.concat(ttyStdinChunks.get(reqId) || []);
+      if (echoed.length > 0) chunks.push(echoed);
+    }
+    let frameNo = 0;
+    for (const chunk of chunks) {
+      // Each chunk is ONE exec_tty.stdout frame; Buffer chunks (split UTF-8)
+      // are passed through untouched so the boundary stays inside the char.
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+      send({ jsonrpc: "2.0", method: "exec_tty.stdout", params: { id: reqId, data: bytes.toString("base64") } });
+      frameNo += 1;
+      txn({ event: "tty_stdout_sent", id: reqId, frame: frameNo });
+    }
+    txn({ event: "tty_result_sent", id: reqId, exit_code: ttyExitCode });
+    return sendResult(reqId, { exit_code: ttyExitCode, duration_ms: ttyDurationMs });
+  }
+  if (method === "exec_tty.stdin") {
+    // Dotted notification: no id, no response. Record the raw frame via txn()
+    // and accumulate the decoded bytes for optional echo.
+    const id = req.params && req.params.id;
+    const data = req.params && req.params.data ? Buffer.from(req.params.data, "base64") : Buffer.alloc(0);
+    const list = ttyStdinChunks.get(id);
+    if (list) list.push(data);
+    return;
+  }
+  if (method === "exec_tty.stdin_eof") {
+    resolveEof(req.params && req.params.id);
+    return;
+  }
+  if (method === "exec_tty.resize") {
+    // Dotted notification: recorded by txn() (received frame), no response.
+    return;
   }
   if (method === "exec_pipe.stdin") {
     const id = req.params && req.params.id;

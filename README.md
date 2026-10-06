@@ -1308,6 +1308,88 @@ source line record which one is effective.
 `src/cli/commands/matchlock.ts`) is the single source for the full flag
 reference, the platform notes, the caveat and the admission-refusal
 relationship; this section deliberately does not duplicate that list.
+###### Interactive sessions (`tamandua matchlock pi|pi-shell|hermes|hermes-shell`)
+
+The `tamandua matchlock` group launches a **foreground interactive session**
+inside one **fresh, disposable Matchlock VM** owned by that invocation alone.
+There are four subcommands:
+
+| Subcommand | What runs inside the VM |
+|---|---|
+| `tamandua matchlock pi` | the image-provided `pi` interactive coding harness |
+| `tamandua matchlock pi-shell` | an interactive `zsh` with the identical `pi` guest prepared |
+| `tamandua matchlock hermes` | the image-provided Hermes interactive coding harness |
+| `tamandua matchlock hermes-shell` | an interactive `zsh` with the identical Hermes guest prepared |
+
+Each subcommand accepts the complete **shared option set**, plus `-h`/`--help`;
+unknown options are refused with a non-zero usage error:
+
+- `--working-directory-for-harness <dir>` — mounted read-write at its identical
+  absolute guest path and used as the session working directory. It defaults to
+  the invoking cwd; a relative argument resolves against it and must stay inside
+  it.
+- `--matchlock-image <ref>` — an explicit, already-imported image. Precedence is
+  `--matchlock-image <ref>` > `TAMANDUA_MATCHLOCK_IMAGE` > the built-in standard
+  image `igorhvr/tamandua`; the reference (including a bare reference, never
+  `:latest`) is preserved exactly.
+- `--matchlock-cpus <N>`, `--matchlock-memory <MB|Ng>`,
+  `--matchlock-disk <MB|Ng>` and `--matchlock-swap <MB|Ng>` — the same resource
+  parsers, defaults, env fallbacks and standing caps as a `--matchlock` workflow
+  run. `--matchlock-no-swap` disables swap and is mutually exclusive with
+  `--matchlock-swap`.
+- Repeatable `--matchlock-allow-private <entry>` — CLI entries replace
+  `TAMANDUA_MATCHLOCK_ALLOW_PRIVATE`.
+- `--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` — the
+  exact root-usage override.
+
+**Root gate.** The shared root-usage gate runs BEFORE any Matchlock interaction
+(no probe, no image resolve, no admission, no VM create). A root invocation is
+refused unless the exact override flag above is supplied; consent is
+session-scoped, is never inferred from `SUDO_UID`, and is never silently
+escalated.
+
+**Image and identity pinning.** The image must already be imported: a missing
+standard image is refused naming `tamandua matchlock setup` as the remedy, and a
+missing explicit image requires operator provisioning. Nothing is pulled, built
+or installed at launch, and there is no host fallback. The resolved variant's
+content and config identity are pinned and verified immediately before the VM is
+created.
+
+**Configuration and working-directory mounts.** The working directory is mounted
+read-write at its identical absolute guest path, together with the original
+repository and its external Git/common metadata at their identical paths. The
+whole effective pi configuration directory is mounted read-write at its approved
+guest override with `PI_CODING_AGENT_DIR` set, and the selected Hermes
+home/profile is mounted read-write at the guest `HERMES_HOME` (the same
+selection and pinning as a `--hermes-as-harness --matchlock` workflow run). The
+host `HOME` is never mounted and no host mount is recursively chowned or
+chmodded.
+
+**Numeric uid/gid mapping.** Every `host_fs` mount carries the caller's numeric
+`owner_uid`/`owner_gid`, and the harness or shell is executed as
+`user="<uid>:<gid>"`. Guest passwd/group entries, a writable guest-local HOME
+and missing guest parent directories are prepared inside the disposable VM.
+Ownership fields are guest-visible metadata only — never a host `chown`/`chmod`.
+
+**Pre-launch summary and confirmed cleanup.** Before entering the TUI or shell,
+the session prints the resolved resources, image provenance with pinned digests,
+the guest uid/gid and the resolved mount scope (the shell variants also name the
+harness command to run inside). On exit, closure/removal of only this session's
+VM is positively confirmed on the wire before success, and the launched
+process's exit status is propagated as the CLI exit status. An infrastructure
+failure or an unconfirmed cleanup returns non-success naming the VM and its
+retained diagnostics; killing the RPC child alone is never proof of VM
+termination.
+
+**Qualification status.** The interactive commands in this build are qualified
+**synthetically only**: the whole path runs against a test-owned fake PTY/RPC
+backend and capability probes, with no real VM, no real model call and no real
+matchlock session. **Real-VM PTY qualification with actual pi and Hermes is
+deferred** to the post-integration gate, so the shell/direct launch paths are
+clean-refusal scaffolding rather than a real-VM-qualified feature. As with every
+Matchlock mount, the writable project and configuration mounts remain exposed
+and concurrent VMs do not isolate shared files — Matchlock provides execution
+isolation, not mounted-data protection.
 
 ##### Doctor Contract Check
 

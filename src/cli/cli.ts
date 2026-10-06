@@ -143,6 +143,10 @@ import {
 import {
   getMatchlockHelp,
   getMatchlockSetupHelp,
+  getMatchlockHermesHelp,
+  getMatchlockHermesShellHelp,
+  getMatchlockPiHelp,
+  getMatchlockPiShellHelp,
   handleMatchlock,
 } from "./commands/matchlock.js";
 
@@ -157,6 +161,8 @@ function getUsageText(): string {
     "                                      Atomically land a plumbing-based squash merge",
     "tamandua run diagnose <run-id|run-number> [--out <dir>] [--json]",
     "                                      Assemble a read-only diagnostics bundle for a run",
+    "tamandua matchlock <pi|pi-shell|hermes|hermes-shell> [options]",
+    "                                      Run pi/Hermes (or a shell) in a disposable Matchlock VM",
     "tamandua evidence prune --older-than <days> [--yes] [--json]",
     "                                      Remove old evidence artifacts (dry-run by default)",
     "", "tamandua workflow list                List available workflows",
@@ -369,6 +375,10 @@ async function main() {
     }
     if (group === "matchlock") {
       if (action === "setup") { printHelp(getMatchlockSetupHelp()); }
+      if (action === "pi") { printHelp(getMatchlockPiHelp()); }
+      if (action === "pi-shell") { printHelp(getMatchlockPiShellHelp()); }
+      if (action === "hermes") { printHelp(getMatchlockHermesHelp()); }
+      if (action === "hermes-shell") { printHelp(getMatchlockHermesShellHelp()); }
       printHelp(getMatchlockHelp());
     }
     if (group === "nudge") {
@@ -417,6 +427,8 @@ async function main() {
 
   if (handleRun(group, args)) { return; }
 
+  if (await handleMatchlock(group, args)) { return; }
+
   if (handleEvidence(group, args)) { return; }
 
   if (await handleStep(group, args)) { return; }
@@ -428,8 +440,6 @@ async function main() {
   if (await handleAutoresearch(group, args)) { return; }
 
   if (await handleWorkflow(group, args, printUsage)) { return; }
-
-  if (await handleMatchlock(group, args)) { return; }
 
   // Unknown command: detect whether it's a known top-level group with a missing
   // subcommand or a completely unknown group. Print a helpful error instead of

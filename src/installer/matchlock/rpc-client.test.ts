@@ -43,6 +43,15 @@ const FAKE_ENV_KEYS = [
   "FAKE_DELAY_READY_MS",
   "FAKE_NO_READY",
   "FAKE_PIPE_WAIT_MS",
+  "FAKE_TTY_STDOUT",
+  "FAKE_TTY_STDOUT_FRAMES",
+  "FAKE_TTY_SPLIT_UTF8",
+  "FAKE_TTY_ECHO_STDIN",
+  "FAKE_TTY_EXIT",
+  "FAKE_TTY_DURATION_MS",
+  "FAKE_TTY_DELAY_READY_MS",
+  "FAKE_TTY_NO_READY",
+  "FAKE_TTY_WAIT_MS",
   "FAKE_CANCEL_BLOCK_MS",
   "FAKE_EMIT_OVERSIZE_ON_START",
   "FAKE_STREAM_STDOUT_BYTES",
@@ -301,6 +310,112 @@ describe("matchlock rpc client (fake driver)", () => {
       return err.code === MATCHLOCK_CLIENT_ERROR_CODES.REQUEST_INACTIVE;
     });
     await assert.rejects(pipe.stdin.eof(), (e: unknown) => {
+      const err = e as { code?: number };
+      return err.code === MATCHLOCK_CLIENT_ERROR_CODES.REQUEST_INACTIVE;
+    });
+  });
+
+  // ── exec_tty (interactive PTY) ───────────────────────────────────────
+
+  it("exec_tty queues stdin AND resize until `exec_tty.ready`, then streams byte-preserving stdout", async (t) => {
+    const { client, readTranscript } = scaffold(t, {
+      FAKE_TTY_DELAY_READY_MS: "250",
+      FAKE_TTY_ECHO_STDIN: "1",
+    });
+    client.start();
+    const stdout: MatchlockStreamFrame[] = [];
+    const tty = client.execTty(
+      { command: "pi", working_dir: "/opt/project", user: "1000:1000", rows: 40, cols: 120 },
+      (f) => {
+        if (f.kind === "stdout") stdout.push(f);
+      },
+    );
+    // stdin + resize are issued BEFORE `ready` is observed: the client must
+    // queue them (the runtime registers the session before sending ready).
+    const writeP = tty.stdin.write("x\n");
+    const resizeP = tty.resize(50, 132);
+    const eofP = tty.stdin.eof();
+    const result = await tty.result;
+    await writeP;
+    await resizeP;
+    await eofP;
+    assert.equal(result.exit_code, 0);
+    assert.equal(decodeFramesText(stdout), "x\n");
+
+    const txn = readTranscript();
+    const ttyReq = txn.find((e) => e.method === "exec_tty");
+    assert.ok(ttyReq, "the exec_tty request must reach the wire");
+    const params = ttyReq.params as Record<string, unknown>;
+    assert.equal(params.command, "pi");
+    assert.equal(params.working_dir, "/opt/project");
+    assert.equal(params.user, "1000:1000");
+    assert.equal(params.rows, 40);
+    assert.equal(params.cols, 120);
+
+    const readyIdx = txn.findIndex((e) => e.event === "tty_ready_sent");
+    const stdinIdx = txn.findIndex((e) => e.method === "exec_tty.stdin");
+    const resizeIdx = txn.findIndex((e) => e.method === "exec_tty.resize");
+    const eofIdx = txn.findIndex((e) => e.method === "exec_tty.stdin_eof");
+    assert.ok(readyIdx >= 0, "driver must send exec_tty.ready");
+    assert.ok(stdinIdx >= 0, "client must send exec_tty.stdin");
+    assert.ok(resizeIdx >= 0, "client must send exec_tty.resize");
+    assert.ok(eofIdx >= 0, "client must send exec_tty.stdin_eof");
+    assert.ok(readyIdx < stdinIdx, "stdin must be sent AFTER ready");
+    assert.ok(readyIdx < resizeIdx, "resize must be sent AFTER ready");
+    const resizeParams = txn[resizeIdx].params as Record<string, unknown>;
+    assert.equal(resizeParams.rows, 50);
+    assert.equal(resizeParams.cols, 132);
+  });
+
+  it("exec_tty stdout frames decode byte-preservingly across a UTF-8 split", async (t) => {
+    const { client } = scaffold(t, { FAKE_TTY_SPLIT_UTF8: "1" });
+    client.start();
+    const stdout: MatchlockStreamFrame[] = [];
+    const tty = client.execTty({ command: "cat" }, (f) => {
+      if (f.kind === "stdout") stdout.push(f);
+    });
+    await tty.stdin.eof();
+    const result = await tty.result;
+    assert.equal(result.exit_code, 0);
+    assert.equal(stdout.length, 2, "driver must split tty stdout into two base64 frames");
+    // A naive per-frame utf8 decode CORRUPTS the split multibyte char…
+    const naive = Buffer.from(stdout[0].base64 ?? "", "base64").toString("utf8");
+    assert.ok(naive.includes("\uFFFD"), "per-frame decode of the split lead byte must show a replacement char");
+    // …while bytes-first concatenation + single decode is chunk-safe.
+    assert.equal(decodeFramesText(stdout), "héllo → wörld");
+  });
+
+  it("exec_tty stdin and resize reject on the ready deadline when `exec_tty.ready` never arrives (bounded, no hang)", async (t) => {
+    const { client } = scaffold(t, { FAKE_TTY_NO_READY: "1", FAKE_TTY_WAIT_MS: "2000" });
+    client.start();
+    const tty = client.execTty({ command: "cat" }, () => {});
+    // The exec result is deliberately never awaited in this scenario (stdin
+    // never became writable); mark it handled so the t.after dispose cannot
+    // surface it as an unhandled rejection.
+    void tty.result.catch(() => {});
+    const started = Date.now();
+    await assert.rejects(tty.stdin.write("hello"), (e: unknown) => {
+      const err = e as { code?: number };
+      return err.code === MATCHLOCK_CLIENT_ERROR_CODES.TIMEOUT;
+    });
+    await assert.rejects(tty.resize(24, 80), (e: unknown) => {
+      const err = e as { code?: number };
+      return err.code === MATCHLOCK_CLIENT_ERROR_CODES.TIMEOUT;
+    });
+    assert.ok(Date.now() - started < 5_000, "the tty ready deadline must fire promptly");
+  });
+
+  it("exec_tty stdin/resize are inert once the request has settled", async (t) => {
+    const { client } = scaffold(t, { FAKE_TTY_WAIT_MS: "150" });
+    client.start();
+    const tty = client.execTty({ command: "cat" }, () => {});
+    const result = await tty.result; // driver finishes on its wait deadline without stdin
+    assert.equal(result.exit_code, 0);
+    await assert.rejects(tty.stdin.write("late"), (e: unknown) => {
+      const err = e as { code?: number };
+      return err.code === MATCHLOCK_CLIENT_ERROR_CODES.REQUEST_INACTIVE;
+    });
+    await assert.rejects(tty.resize(24, 80), (e: unknown) => {
       const err = e as { code?: number };
       return err.code === MATCHLOCK_CLIENT_ERROR_CODES.REQUEST_INACTIVE;
     });
