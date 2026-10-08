@@ -1,51 +1,139 @@
-FROM igorhvr/bedlam-ubuntu
+FROM igorhvr/bedlam-ubuntu@sha256:1b21be58ec73d2347ecfe97cd725ec5ef6911097efd0cebb2878384c40936c28
 MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 
 # ============================================================================
-# ADDITIONS: hermes, pi, dsh (DeepSeek Harness), tamandua
+# [r4] standard matchlock image: tamandua + dsh + pi + hermes.
+#
+# pi and hermes are BUILT FROM SOURCE. Their main-tracked git clones live in
+# the image at /opt/src/{pi,hermes-agent} next to a ./build-and-install script:
+# edit the source, rerun the script, and the running version is yours. The
+# image itself is built by running those same scripts (one code path).
+#
+# Frozen source SHAs for r4 (also recorded in /etc/tamandua-image-manifest.json
+# and the OCI labels below; users can `git pull` ahead of them at will):
+#   hermes-agent: 2943ee6f19a2abd0cc93384db55643469e80dfcb
+#   pi:           f10993bc7f28145df1375f3ff39c7f5c4cfc05f0
+#   dsh:          5badb15009ae1756c3afe0ae0cef1faafc290ccc
+#   tamandua:     42cafe0d5ee158327ba522252fab5aeadbaece6b
+# Python runtime pin: 3.14.7 -- the NEWEST Python hermes main supports
+# (`requires-python >=3.11,<3.15`; upstream's own pm/lock.json names the exact
+# 3.14.7+20260901 artifact). Newest-supported is deliberate: older Pythons
+# previously caused sqlite corruption for the maintainer.
 # ============================================================================
-# The base above already provides git, curl, node v24, npm 11, python3, and a
-# functional nix profile (/root/.nix-profile). Tooling preference order: nix,
-# then apt-get, then other methods. hermes ships its own managed uv; pi is an
-# npm package; dsh builds from its repo with the repo-pinned pnpm; tamandua
-# builds from source via its documented installer. No nix package is strictly
-# required by any of the four tools, so precedence went to the package manager
-# already present (npm/corepack) and to hermes' own managed uv. All installers
-# run non-interactively (no TTY in the build VM).
 
-# Runtime shell (matchlock exec/run) must resolve every tool. Set HOME=/root so
-# $HOME-relative paths ($HOME/.local/bin via tamandua, $HOME/.hermes via hermes,
-# $HOME/.nix-profile via nix) land where the installers write. Put nix on PATH
-# too (the base's profile is real and executable).
-ENV PATH="/usr/local/bin:/root/.local/bin:/root/.hermes/bin:/root/.nix-profile/bin:$PATH"
+LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
+      org.opencontainers.image.source="https://github.com/igorhvr/tamandua" \
+      org.opencontainers.image.description="Matchlock standard image: tamandua, dsh, pi and hermes (pi/hermes built from in-image source with build-and-install scripts)" \
+      com.tamandua.hermes.commit="2943ee6f19a2abd0cc93384db55643469e80dfcb" \
+      com.tamandua.pi.commit="f10993bc7f28145df1375f3ff39c7f5c4cfc05f0" \
+      com.tamandua.dsh.commit="5badb15009ae1756c3afe0ae0cef1faafc290ccc" \
+      com.tamandua.tamandua.commit="42cafe0d5ee158327ba522252fab5aeadbaece6b" \
+      com.tamandua.python.pin="3.14.7"
+
+# User-agnostic PATH: everything the image runs for any caller uid lives under
+# /usr/local (never behind /root).
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV HOME="/root"
 
-# --- hermes (uv-managed venv; skip setup wizard, browser, computer-use) ---
-# --non-interactive never blocks on prompts; --skip-setup skips the API-key
-# wizard (no credentials baked into the image); --skip-browser and
-# --skip-computer-use skip the heavy Playwright/chromium + computer-use pulls.
-RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
-  | bash -s -- --non-interactive --skip-setup --skip-browser --skip-computer-use
+# --- native toolchain: pi's optional TUI native helpers need a C compiler +
+# --- libxcb; pkg-config/make cover source rebuilds of either tool by users. --
+RUN apt-get -o Acquire::Retries=3 update \
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+      build-essential pkg-config libxcb1-dev \
+ && rm -rf /var/lib/apt/lists/*
 
-# --- pi (npm package; auto-installs when no TTY) ---
-RUN curl -fsSL https://pi.dev/install.sh | sh
+# --- hermes-agent: main-tracked source clone + build-and-install -------------
+# The data root (store + venv generations) lives at /opt/src/hermes-root, and
+# /opt/src/manifest.json + /opt/src/hermes-venv make the built application
+# environment selectable for ANY caller uid and ANY HERMES_HOME (the guest
+# contract); install-stamp.json marks the install externally updated. See
+# build-and-install-hermes.sh.
+RUN set -eu; \
+    ok=""; \
+    for i in 1 2 3 4 5; do \
+      rm -rf /opt/src/hermes-agent; \
+      if git clone https://github.com/NousResearch/hermes-agent.git /opt/src/hermes-agent; then ok=1; break; fi; \
+      sleep 10; \
+    done; \
+    [ -n "$ok" ]; \
+    git -C /opt/src/hermes-agent checkout -B main 2943ee6f19a2abd0cc93384db55643469e80dfcb; \
+    git -C /opt/src/hermes-agent branch --set-upstream-to=origin/main main
 
-# --- dsh / DeepSeek Harness (build from the official repo, pinned pnpm) ---
-RUN npm install -g pnpm@11.7.0 \
- && git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git /opt/dsh \
- && cd /opt/dsh \
- && pnpm install --frozen-lockfile \
- && pnpm run build \
- && ln -sf /opt/dsh/apps/cli/lib/bin.js /usr/local/bin/dsh
+COPY build-and-install-hermes.sh /opt/src/hermes-agent/build-and-install
+RUN printf 'build-and-install\n' >> /opt/src/hermes-agent/.git/info/exclude \
+ && chmod 755 /opt/src/hermes-agent/build-and-install \
+ && EXPECT_HEAD=2943ee6f19a2abd0cc93384db55643469e80dfcb \
+    HERMES_SYSTEM_HOME=/opt/src/hermes-root \
+    TAMANDUA_IMAGE_BUILD=1 \
+    /opt/src/hermes-agent/build-and-install
 
-# --- tamandua (Node >=22; documented installer builds + symlinks) ---
-RUN git clone --depth 1 https://github.com/igorhvr/tamandua.git /opt/tamandua \
- && bash /opt/tamandua/scripts/install.sh --local /opt/tamandua
+# --- pi: main-tracked source clone + build-and-install -----------------------
+RUN set -eu; \
+    ok=""; \
+    for i in 1 2 3 4 5; do \
+      rm -rf /opt/src/pi; \
+      if git clone https://github.com/earendil-works/pi.git /opt/src/pi; then ok=1; break; fi; \
+      sleep 10; \
+    done; \
+    [ -n "$ok" ]; \
+    git -C /opt/src/pi checkout -B main f10993bc7f28145df1375f3ff39c7f5c4cfc05f0; \
+    git -C /opt/src/pi branch --set-upstream-to=origin/main main
 
-# --- verify all four entrypoints resolve on PATH (fail the build if any is missing) ---
-RUN set -eu; for t in hermes pi dsh tamandua; do command -v "$t"; done
+COPY build-and-install-pi.sh /opt/src/pi/build-and-install
+RUN printf 'build-and-install\n' >> /opt/src/pi/.git/info/exclude \
+ && chmod 755 /opt/src/pi/build-and-install \
+ && TAMANDUA_IMAGE_BUILD=1 EXPECT_HEAD=f10993bc7f28145df1375f3ff39c7f5c4cfc05f0 /opt/src/pi/build-and-install
 
-# --- ssh hygiene: do not inherit the base's baked host identity / root grant ---
+# --- dsh / DeepSeek Harness (same shape as the previous image; pinned) -------
+RUN set -eu; \
+    ok=""; \
+    for i in 1 2 3 4 5; do \
+      rm -rf /opt/dsh; \
+      if git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git /opt/dsh; then ok=1; break; fi; \
+      sleep 10; \
+    done; \
+    [ -n "$ok" ]; \
+    if [ "$(git -C /opt/dsh rev-parse HEAD)" != "5badb15009ae1756c3afe0ae0cef1faafc290ccc" ]; then \
+      git -C /opt/dsh fetch --depth 1 origin 5badb15009ae1756c3afe0ae0cef1faafc290ccc; \
+      git -C /opt/dsh checkout --detach 5badb15009ae1756c3afe0ae0cef1faafc290ccc; \
+    fi; \
+    npm install -g pnpm@11.7.0; \
+    cd /opt/dsh; \
+    pnpm install --frozen-lockfile; \
+    pnpm run build; \
+    ln -sf /opt/dsh/apps/cli/lib/bin.js /usr/local/bin/dsh; \
+    chmod -R a+rX /opt/dsh
+
+# --- tamandua (pinned source + launcher on the shared PATH) ------------------
+RUN set -eu; \
+    ok=""; \
+    for i in 1 2 3 4 5; do \
+      rm -rf /opt/tamandua; \
+      if git clone --depth 1 --branch main https://github.com/igorhvr/tamandua.git /opt/tamandua; then ok=1; break; fi; \
+      sleep 10; \
+    done; \
+    [ -n "$ok" ]; \
+    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "42cafe0d5ee158327ba522252fab5aeadbaece6b" ]; then \
+      git -C /opt/tamandua fetch --depth 1 origin 42cafe0d5ee158327ba522252fab5aeadbaece6b; \
+      git -C /opt/tamandua checkout --detach 42cafe0d5ee158327ba522252fab5aeadbaece6b; \
+    fi; \
+    git -C /opt/tamandua rev-parse HEAD; \
+    bash /opt/tamandua/scripts/install.sh --local /opt/tamandua; \
+    ln -sfn /opt/tamandua/bin/tamandua /usr/local/bin/tamandua; \
+    ln -sfn /opt/tamandua/bin/tamandua-test /usr/local/bin/tamandua-test; \
+    chmod -R a+rX /opt/tamandua
+
+# --- provenance: /etc/tamandua-image-manifest.json ---------------------------
+COPY provenance.sh /usr/local/sbin/tamandua-image-provenance
+RUN chmod 755 /usr/local/sbin/tamandua-image-provenance \
+ && /usr/local/sbin/tamandua-image-provenance
+
+# --- verify all entrypoints resolve on PATH and the manifest is valid JSON ---
+RUN set -eu; for t in hermes hermes-acp pi dsh tamandua; do command -v "$t"; done; \
+    python3 -c "import json;json.load(open('/etc/tamandua-image-manifest.json'))" \
+ && echo "image-manifest-ok"
+
+# --- ssh hygiene: do not inherit the base's baked host identity / root grant --
 # The base image deliberately bakes ssh host keys (/etc/ssh/ssh_host_*_key and
 # their .pub files) and a root /root/.ssh/authorized_keys for its own use. A
 # derived image otherwise inherits those bytes verbatim, so every consumer
