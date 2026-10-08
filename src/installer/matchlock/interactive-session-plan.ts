@@ -41,15 +41,19 @@
  */
 
 import os from "node:os";
+import path from "node:path";
 
 import {
   admitMatchlockRun,
+  MATCHLOCK_RPC_ARGS_ENV,
+  MATCHLOCK_RPC_BIN_ENV,
   MatchlockAdmissionError,
   type MatchlockAdmissionOptions,
   type MatchlockAdmissionResult,
   type MatchlockAllowPrivateSupportProbe,
+  type ResolvedRpcInvocation,
 } from "./admission.js";
-import { resolveMatchlockRpcBinaryPath } from "./allow-private-support.js";
+import { resolveMatchlockRpcBinary } from "./allow-private-support.js";
 import type { PinnedImageIdentity } from "./image.js";
 import type { MountAdmissionContext } from "./mount-plan.js";
 import {
@@ -91,6 +95,10 @@ export const MATCHLOCK_EXPLICIT_IMAGE_MISSING_CODE = "matchlock_explicit_image_m
 
 /** Typed refusal code: the numeric caller identity cannot be captured. */
 export const INTERACTIVE_IDENTITY_UNAVAILABLE_CODE = "interactive_session_identity_unavailable" as const;
+
+/** Typed refusal code (dwl): a controller rpc-binary override disagrees with the admitted invocation. */
+export const INTERACTIVE_SESSION_RPC_BINDING_MISMATCH_CODE =
+  "matchlock_interactive_rpc_binding_mismatch" as const;
 
 /** Typed, actionable refusal for an interactive admission planning failure. */
 export class InteractiveSessionPlanError extends Error {
@@ -202,6 +210,13 @@ export interface InteractiveSessionPlan {
   policy: ExecutionIsolation;
   /** The pinned immutable image identity (also embedded in the policy). */
   pinnedIdentity: PinnedImageIdentity;
+  /**
+   * MTLK-RPC-BIN-SPLIT (tamandua-dwl): the ONE frozen rpc invocation this
+   * session admitted and probed. The session controller MUST launch exactly
+   * this binary + argv — never a bare PATH re-resolution — so the executable
+   * that performed the capability checks is the executable that runs the VM.
+   */
+  resolvedRpc: ResolvedRpcInvocation;
 }
 
 /**
@@ -240,6 +255,64 @@ function missingImageError(
     `The explicitly requested Matchlock image "${image}" is not provisioned locally: ${detail}. ` +
       `Operator provisioning is required (provision/import the named image, or verify the reference with \`tamandua matchlock setup\`). ${suffix}`,
   );
+}
+
+/**
+ * MTLK-RPC-BIN-SPLIT (tamandua-dwl): freeze the executable SELECTION — not
+ * just the spelling — before any awaited work. Precedence: explicit option
+ * (resolved through the shared resolver against the effective planning env),
+ * then the env override / PATH. A launchable hit is made ABSOLUTE against the
+ * plan-time cwd so a later chdir cannot re-point a relative path; an
+ * unresolvable selection is carried verbatim so the swap handshake fails
+ * closed naming the caller's exact reference.
+ */
+function freezeMatchlockRpcBinarySelection(
+  explicit: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string {
+  const trimmed = explicit?.trim();
+  if (trimmed) {
+    const resolved = resolveMatchlockRpcBinary({ ...env, [MATCHLOCK_RPC_BIN_ENV]: trimmed });
+    return resolved.executable ? path.resolve(resolved.path) : trimmed;
+  }
+  const resolved = resolveMatchlockRpcBinary(env);
+  if (resolved.source === "override" || resolved.source === "path") {
+    return resolved.executable ? path.resolve(resolved.path) : resolved.path;
+  }
+  return "matchlock";
+}
+
+/**
+ * MTLK-RPC-BIN-SPLIT: freeze the `matchlock rpc` argv for the plan's resolved
+ * invocation with the SAME precedence and empty-array semantics admission
+ * applies — explicit option (an explicit empty array still yields the default
+ * and never consults the environment), then the `TAMANDUA_MATCHLOCK_RPC_ARGS`
+ * JSON override, then the transport default — so the probed binary, the
+ * admitted transport and the session transport cannot drift apart on argv.
+ */
+function freezeMatchlockRpcArgs(
+  explicit: string[] | undefined,
+  env: NodeJS.ProcessEnv,
+): string[] {
+  let args: string[] | undefined = explicit;
+  if (!args) {
+    const raw = env[MATCHLOCK_RPC_ARGS_ENV]?.trim();
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (!Array.isArray(parsed) || !parsed.every((x) => typeof x === "string")) {
+          throw new Error("not a string array");
+        }
+        args = parsed as string[];
+      } catch {
+        throw new MatchlockAdmissionError(
+          "matchlock_unavailable",
+          `${MATCHLOCK_RPC_ARGS_ENV} must be a JSON array of strings (override for the matchlock rpc CLI args).`,
+        );
+      }
+    }
+  }
+  return args && args.length > 0 ? [...args] : ["rpc"];
 }
 
 /** Re-classify an image-admission failure; every other error propagates. */
@@ -376,7 +449,27 @@ export async function planInteractiveSession(
 
   // 6. R8 swap-capability handshake against the binary admission will use —
   //    for EVERY interactive invocation, including swap-disabled ones.
-  const rpcBinaryPath = options.rpcBinaryPath?.trim() || resolveMatchlockRpcBinaryPath(env);
+  //
+  // MTLK-RPC-BIN-SPLIT (tamandua-dwl): resolve and FREEZE the ONE rpc
+  // invocation this session will use — before any awaited work — and carry it
+  // on the returned plan. The swap handshake probes that exact binary,
+  // admission binds the same (binary, argv) pair via `resolvedRpc`, and the
+  // session controller launches it; no later PATH / TAMANDUA_MATCHLOCK_RPC_*
+  // change (or working-directory change) can make the session spawn a
+  // different executable than the one admitted (the reported
+  // admission/session split).
+  //
+  // Resolution semantics are UNCHANGED from the previous plan behavior:
+  // explicit option, then the env override / PATH via the shared resolver.
+  // A resolved hit is made ABSOLUTE against the plan-time cwd so a relative
+  // spelling cannot be re-pointed by a later chdir; an unresolvable selection
+  // is carried VERBATIM so the swap handshake fails closed naming exactly
+  // what the caller supplied (never a silent PATH consult later).
+  const rpcBinaryPath = freezeMatchlockRpcBinarySelection(options.rpcBinaryPath, env);
+  const resolvedRpc: ResolvedRpcInvocation = {
+    binaryPath: rpcBinaryPath,
+    args: freezeMatchlockRpcArgs(options.rpcArgs, env),
+  };
   const swapProbe =
     options.swapSupportProbe ??
     ((bin: string) => probeMatchlockSwapSupport({ binaryPath: bin }));
@@ -438,8 +531,15 @@ export async function planInteractiveSession(
     ...(options.swapSupportProbe
       ? { swapSupportProbe: options.swapSupportProbe }
       : {}),
+    // MTLK-RPC-BIN-SPLIT (tamandua-dwl): the resolved INVOCATION is the ONE
+    // binary + argv admission will bind (`resolvedRpc`) and the session
+    // controller will launch; the legacy fields ride along for callers that
+    // still read them. Precedence and semantics are the established plan
+    // resolution: explicit option, then `TAMANDUA_MATCHLOCK_RPC_BIN`/PATH via
+    // `resolveMatchlockRpcBinaryPath`, then the bare name.
     rpcBinaryPath,
     ...(options.rpcArgs ? { rpcArgs: options.rpcArgs } : {}),
+    resolvedRpc,
     ...(options.rpcRequestTimeoutMs !== undefined
       ? { rpcRequestTimeoutMs: options.rpcRequestTimeoutMs }
       : {}),
@@ -470,5 +570,6 @@ export async function planInteractiveSession(
     ...(rootUsageWarning !== undefined ? { rootUsageWarning } : {}),
     policy: admitted.policy,
     pinnedIdentity: admitted.identity,
+    resolvedRpc,
   };
 }

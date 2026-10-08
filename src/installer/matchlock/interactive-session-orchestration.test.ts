@@ -486,4 +486,95 @@ describe("US-013: interactive session orchestration runner", () => {
     assert.equal(code, 0);
     assert.match(err, /Warning: root usage overridden/);
   });
+
+  // ══════════════════════════════════════════════════════════════════
+  // MTLK-RPC-BIN-SPLIT (tamandua-dwl): admitted rpc binding threading
+  // ══════════════════════════════════════════════════════════════════
+  // The plan freezes ONE rpc invocation; the session must launch exactly that
+  // (binary + argv) and refuse a controller override that names a DIFFERENT
+  // executable BEFORE any VM work. These are the differential tests the dwl
+  // bead asks for: admission binding vs override vs PATH.
+
+  const ADMITTED_RPC = { binaryPath: "/opt/admitted/matchlock", args: ["rpc", "--frozen"] };
+
+  it("threads the admitted invocation into the controller (no override)", async () => {
+    let seen: Record<string, unknown> | undefined;
+    const code = await runInteractiveSession(makeArgs("pi", "pi", false) as never, {
+      plan: async () => makePlan({ resolvedRpc: ADMITTED_RPC }) as never,
+      buildRuntime: (plan) => makeRuntime(plan as Record<string, unknown>) as never,
+      createController: (_plan, _prep, options) => {
+        seen = options as unknown as Record<string, unknown>;
+        return { run: async () => ({ ...OK_OUTCOME }) };
+      },
+      stdout: () => {},
+      stderr: () => {},
+    });
+    assert.equal(code, 0);
+    assert.equal(seen?.rpcBinaryPath, ADMITTED_RPC.binaryPath, "the admitted binary reaches the controller");
+    assert.deepEqual(seen?.rpcArgs, [...ADMITTED_RPC.args], "the admitted argv reaches the controller");
+  });
+
+  it("refuses a controller rpc binary override that disagrees with the admitted binding", async () => {
+    let launched = false;
+    let err = "";
+    const code = await runInteractiveSession(makeArgs("pi", "pi", false) as never, {
+      plan: async () => makePlan({ resolvedRpc: ADMITTED_RPC }) as never,
+      buildRuntime: (plan) => makeRuntime(plan as Record<string, unknown>) as never,
+      controllerOptions: { rpcBinaryPath: "/decoy/other-matchlock" },
+      createController: () => {
+        launched = true;
+        return { run: async () => ({ ...OK_OUTCOME }) };
+      },
+      stdout: () => {},
+      stderr: (text) => {
+        err += text;
+      },
+    });
+    assert.equal(code, 1, "a disagreeing binary override is a typed refusal");
+    assert.equal(launched, false, "no controller/VM work may start on a binding mismatch");
+    assert.match(err, /disagrees with the admitted matchlock invocation/);
+  });
+
+  it("refuses a controller rpc args override that disagrees with the admitted argv", async () => {
+    let launched = false;
+    let err = "";
+    const code = await runInteractiveSession(makeArgs("pi", "pi", false) as never, {
+      plan: async () => makePlan({ resolvedRpc: ADMITTED_RPC }) as never,
+      buildRuntime: (plan) => makeRuntime(plan as Record<string, unknown>) as never,
+      controllerOptions: { rpcArgs: ["rpc", "--other"] },
+      createController: () => {
+        launched = true;
+        return { run: async () => ({ ...OK_OUTCOME }) };
+      },
+      stdout: () => {},
+      stderr: (text) => {
+        err += text;
+      },
+    });
+    assert.equal(code, 1, "a disagreeing argv override is a typed refusal");
+    assert.equal(launched, false);
+    assert.match(err, /disagree with the admitted matchlock/);
+  });
+
+  it("accepts an agreeing override and normalizes an explicit empty args override", async () => {
+    let seen: Record<string, unknown> | undefined;
+    const code = await runInteractiveSession(makeArgs("pi", "pi", false) as never, {
+      plan: async () =>
+        makePlan({ resolvedRpc: { binaryPath: "/opt/admitted/matchlock", args: ["rpc"] } }) as never,
+      buildRuntime: (plan) => makeRuntime(plan as Record<string, unknown>) as never,
+      // Same executable (exact spelling) and an EXPLICIT EMPTY args array:
+      // the empty array mirrors the transport default ["rpc"], so it cannot
+      // disagree with an admitted default binding.
+      controllerOptions: { rpcBinaryPath: "/opt/admitted/matchlock", rpcArgs: [] },
+      createController: (_plan, _prep, options) => {
+        seen = options as unknown as Record<string, unknown>;
+        return { run: async () => ({ ...OK_OUTCOME }) };
+      },
+      stdout: () => {},
+      stderr: () => {},
+    });
+    assert.equal(code, 0, "an agreeing override must proceed");
+    assert.equal(seen?.rpcBinaryPath, "/opt/admitted/matchlock");
+    assert.deepEqual(seen?.rpcArgs, ["rpc"], "the admitted argv is transported");
+  });
 });

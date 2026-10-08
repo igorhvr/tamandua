@@ -40,7 +40,7 @@ import {
 } from "../../../dist/installer/matchlock/policy.js";
 import { runWorkflow } from "../../../dist/installer/run.js";
 import { _reconcileOnce } from "../../../dist/server/control-server.js";
-import { _scheduledJobCountForRun } from "../../../dist/installer/agent-scheduler.js";
+import { _scheduledJobCountForRun, _scheduledRunIds, removeRunCrons } from "../../../dist/installer/agent-scheduler.js";
 import {
   MATCHLOCK_RPC_ARGS_ENV,
   MATCHLOCK_RPC_BIN_ENV,
@@ -55,9 +55,12 @@ import type {
   MatchlockSwapSupportProbe,
 } from "../../../dist/installer/matchlock/swap-support.js";
 import { setRunContextKey } from "../../../dist/installer/step-ops.js";
+import { RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY } from "../../../dist/installer/run-harness.js";
 import { getDb } from "../../../dist/db.js";
+import { getRunEvents } from "../../../dist/installer/events.js";
 import { tamanduaTempDir } from "../../../dist/lib/temp-dir.js";
 import { cleanChildEnv, removeTestTempDirWithDiagnostics, reservePortHandle } from "../../../tests/helpers/test-env.ts";
+import { assertStatePathIsolation } from "../../../dist/lib/test-guard.js";
 
 /**
  * Matchlock work mounts must live at host paths whose exact-path GUEST mounts
@@ -92,12 +95,16 @@ function validV2PolicyJson(): string {
   });
 }
 
-function writeMinimalWorkflow(homeDir: string, workflowId: string): void {
+function writeMinimalWorkflow(
+  homeDir: string,
+  workflowId: string,
+  workspaceMode: "direct" | "worktree" = "direct",
+): void {
   const workflowDir = path.join(homeDir, ".tamandua", "workflows", workflowId);
   fs.mkdirSync(workflowDir, { recursive: true });
   fs.writeFileSync(
     path.join(workflowDir, "workflow.yml"),
-    `id: ${workflowId}\nrun:\n  workspace: direct\nagents:\n  - id: dev\n    model: fake\n    workspace:\n      baseDir: .\nsteps:\n  - id: implement\n    agent: dev\n    input: Implement the task\n    expects: STATUS, CHANGES, TESTS\n`,
+    `id: ${workflowId}\nrun:\n  workspace: ${workspaceMode}\nagents:\n  - id: dev\n    model: fake\n    workspace:\n      baseDir: .\nsteps:\n  - id: implement\n    agent: dev\n    input: Implement the task\n    expects: STATUS, CHANGES, TESTS\n`,
     "utf-8",
   );
 }
@@ -156,6 +163,8 @@ interface HeldProbe {
   entered: Promise<void>;
   /** Release the probe with an unsupporting result (aborts admission). */
   releaseUnsupported: () => void;
+  /** Release the probe with a SUPPORTING result (admission proceeds). */
+  releaseSupported: (binaryPath?: string) => void;
 }
 
 /** A gated swap probe: enters on first call and blocks until released. */
@@ -168,7 +177,9 @@ function makeHeldProbe(): HeldProbe {
   const entered = new Promise<void>((resolve) => {
     enteredResolve = resolve;
   });
+  let lastProbedBinary = "matchlock";
   const probe: MatchlockSwapSupportProbe = async (binaryPath) => {
+    lastProbedBinary = binaryPath;
     enteredResolve();
     return gate;
   };
@@ -177,7 +188,47 @@ function makeHeldProbe(): HeldProbe {
     entered,
     releaseUnsupported: () =>
       releaseGate({ supported: false, binaryPath: "matchlock", reasonCode: "unsupported" }),
+    releaseSupported: (binaryPath?: string) =>
+      releaseGate({ supported: true, binaryPath: binaryPath ?? lastProbedBinary }),
   };
+}
+
+/**
+ * Await the held probe's entry, failing fast when the run settles or stalls
+ * first: a regression that makes admission exit (or wedge) before ever
+ * probing swap support must fail the test promptly, not hang the suite
+ * waiting on a probe that never fires.
+ */
+async function awaitEntered(held: HeldProbe, runP: Promise<unknown>): Promise<void> {
+  // No-op handler so a late rejection from a stalled run is never an
+  // unhandled rejection; the real await in the test still sees it.
+  void runP.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), 30_000);
+  });
+  let outcome: "entered" | "settled" | "timeout";
+  try {
+    outcome = await Promise.race([
+      held.entered.then(() => "entered" as const),
+      runP.then(
+        () => "settled" as const,
+        () => "settled" as const,
+      ),
+      deadline,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (outcome !== "entered") {
+    // Never leave the admission wedged on a probe nobody will release.
+    held.releaseUnsupported();
+  }
+  assert.equal(
+    outcome,
+    "entered",
+    "runWorkflow settled or stalled before the swap probe was entered",
+  );
 }
 
 /** The `exit` promise for a child. ATTACH THIS BEFORE SIGNALLING THE CHILD. */
@@ -462,6 +513,12 @@ describe("PREP-STATE atomic persistence", () => {
     setEnv("TAMANDUA_STATE_DIR", tamanduaDir);
     setEnv("TAMANDUA_DB_PATH", path.join(tamanduaDir, "tamandua.db"));
     setEnv("TAMANDUA_WORKTREE_ROOT", path.join(tamanduaDir, "worktrees"));
+    // Prove the fixture state is isolated from the real ~/.tamandua BEFORE any
+    // code runs against it. This file imports events.js, so the static
+    // isolation guard requires the coverage; the assertions are also a real
+    // runtime check that the fixture HOME/state stayed under the temp dir.
+    assertStatePathIsolation(tamanduaDir, "prep-state test state dir");
+    assertStatePathIsolation(path.join(tamanduaDir, "tamandua.db"), "prep-state test database");
     // Held-admission tests deliberately run with NO reachable control plane:
     // reserve an OWNED ephemeral port and release it, so the D pre-INSERT
     // PREP-STATE capability gate is skipped and no fixed 59311/59312-class port
@@ -500,7 +557,7 @@ describe("PREP-STATE atomic persistence", () => {
       context: { [ISOLATION_INTENT_COLUMN]: "false" },
     });
 
-    await held.entered;
+    await awaitEntered(held, runP);
     // Exact post-INSERT/pre-policy state (no policy write has happened yet).
     const row = readRun(workflowId);
     assert.equal(row.isolation_intent, ISOLATION_INTENT_RECORDED, "intent recorded in the first INSERT");
@@ -735,7 +792,7 @@ describe("PREP-STATE atomic persistence", () => {
       matchlockSwapSupportProbe: held.probe,
     });
 
-    await held.entered;
+    await awaitEntered(held, runP);
     const before = readRun(workflowId);
     assert.equal(before.scheduling_status, DRAINING_PAUSE_SCHEDULING_STATUS);
 
@@ -779,7 +836,7 @@ describe("PREP-STATE atomic persistence", () => {
       matchlockSwapSupportProbe: held.probe,
     });
 
-    await held.entered;
+    await awaitEntered(held, runP);
     const row = readRun(workflowId);
     // The EXACT pre-PREP-STATE reconciler predicate, as an older daemon runs it.
     const legacySelected = getDb()
@@ -817,7 +874,7 @@ describe("PREP-STATE atomic persistence", () => {
       matchlockSwapSupportProbe: held.probe,
     });
 
-    await held.entered;
+    await awaitEntered(held, runP);
     const row = readRun(workflowId);
     // Drive the generic run-context writer (the shared UPDATE path used by
     // step completion, resume and replacement).
@@ -864,6 +921,9 @@ describe("PREP-STATE atomic persistence", () => {
     setProbeEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
     const supportingProbe: MatchlockSwapSupportProbe = (binaryPath) => ({ supported: true, binaryPath });
+    // Snapshot the scheduler jobs BEFORE reconciliation so teardown below
+    // removes only jobs created during THIS test.
+    const jobsBeforeAdmission = _scheduledRunIds();
 
     try {
       const result = await runWorkflow({
@@ -872,6 +932,9 @@ describe("PREP-STATE atomic persistence", () => {
         workingDirectoryForHarness: repoDir,
         matchlockImage: "vic/prep-admitted:latest",
         matchlockSwapSupportProbe: supportingProbe,
+        // An unrelated launch context key must survive the release (the
+        // single guarded UPDATE drops ONLY pause_drain).
+        context: { custom_launch_key: "kept" },
       });
       assert.equal(result.status, "running");
 
@@ -880,12 +943,183 @@ describe("PREP-STATE atomic persistence", () => {
       assert.equal(row.scheduling_status, NATIVE_SCHEDULING_STATUS, "the hold is released after the policy write");
       assert.ok(row.matchlock_policy, "the validated policy is persisted");
       assert.equal(readIsolationState(row), "isolated");
+      const admittedContext = JSON.parse(row.context) as Record<string, string>;
+      assert.equal(
+        PAUSE_DRAIN_CONTEXT_KEY in admittedContext,
+        false,
+        "the release drops the host-seeded pause_drain marker in the SAME write",
+      );
+      assert.equal(
+        admittedContext.custom_launch_key,
+        "kept",
+        "unrelated context keys survive the release",
+      );
+
+      // tamandua-crf regression: the durable marker is gone BEFORE the daemon
+      // registration path runs. Drive the REAL reconciliation pass (the same
+      // handleRegisterRun the daemon runs on register-run/nudge/reconcile) and
+      // require the run to reach 'active' WITH dispatch jobs — the original
+      // defect left it stranded at pending_register forever with zero jobs.
+      await _reconcileOnce();
+      const active = readRun(workflowId);
+      assert.equal(
+        active.scheduling_status,
+        "active",
+        "the REAL registration path admits the released run",
+      );
+      assert.ok(
+        _scheduledJobCountForRun(active.id) > 0,
+        "scheduling is established for the admitted run (crf: it used to be zero forever)",
+      );
+    } finally {
+      // Unconditional teardown: remove EVERY scheduler job created during this
+      // test (never leaving dangling timers behind when an assertion throws
+      // earlier than expected) — bounded to jobs NOT present at test start.
+      for (const scheduledId of _scheduledRunIds()) {
+        if (!jobsBeforeAdmission.has(scheduledId)) {
+          await removeRunCrons(scheduledId);
+        }
+      }
+      for (const [key, value] of savedProbeEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+      await fake.close();
+    }
+  });
+
+  it("operator drain mid-window survives the guarded release (fail-closed; no policy, no failure event, no scheduling)", async () => {
+    const workflowId = "test-prep-operator-midwindow";
+    writeMinimalWorkflow(tempHome, workflowId);
+    const fixtureRoot = newFixtureRoot(workflowId);
+    const repoDir = path.join(fixtureRoot, "repo");
+    initGitRepo(repoDir);
+    fs.mkdirSync(path.join(tempHome, ".pi", "agent"), { recursive: true });
+
+    // A full admission fixture (fake RPC driver + fake image responses): the
+    // operator's drain must be what refuses the release, not a broken
+    // transport. Mirrors the admitted-run fixture above.
+    const savedProbeEnv = new Map<string, string | undefined>();
+    const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+    const transcript = tempTranscriptPath();
+    const setProbeEnv = (key: string, value: string | undefined): void => {
+      savedProbeEnv.set(key, process.env[key]);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    setProbeEnv(MATCHLOCK_RPC_BIN_ENV, process.execPath);
+    setProbeEnv(MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver]));
+    setProbeEnv("FAKE_TRANSCRIPT_FILE", transcript);
+    setProbeEnv("FAKE_IMAGE_TAG", "vic/prep-operator:latest");
+    setProbeEnv("FAKE_IMAGE_DIGEST", "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    setProbeEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+
+    try {
+      const held = makeHeldProbe();
+      const runP = runWorkflow({
+        workflowId,
+        taskTitle: "PREP-STATE operator mid-window",
+        workingDirectoryForHarness: repoDir,
+        matchlockImage: "vic/prep-operator:latest",
+        matchlockSwapSupportProbe: held.probe,
+      });
+
+      await awaitEntered(held, runP);
+      const row = readRun(workflowId);
+      // The operator's drain lands WHILE admission is still awaited: record
+      // the durable attribution (`paused_by`) the guard must honor, keeping
+      // the drain-hold representation the control plane uses.
+      setRunContextKey(row.id, "paused_by", "operator");
+      getDb()
+        .prepare(`UPDATE runs SET scheduling_status = ?, updated_at = ? WHERE id = ?`)
+        .run(DRAINING_PAUSE_SCHEDULING_STATUS, new Date().toISOString(), row.id);
+
+      // Admission now completes with a SUPPORTING probe — but the guarded
+      // release must refuse to clobber the operator's state.
+      held.releaseSupported();
+      await assert.rejects(runP, (err: unknown) => {
+        assert.equal(
+          (err as Error).name,
+          "MatchlockAdmissionStateConflictError",
+          `expected the ownership-conflict class, got ${String(err)}`,
+        );
+        assert.match(String((err as Error).message), /changed concurrently/);
+        return true;
+      });
+
+      const after = readRun(workflowId);
+      assert.equal(after.status, "running", "the operator's run-state representation survives");
+      assert.equal(after.matchlock_policy, null, "no policy is persisted over operator state");
+      assert.equal(after.scheduling_status, DRAINING_PAUSE_SCHEDULING_STATUS, "the drain hold survives");
+      const ctx = JSON.parse(after.context) as Record<string, string>;
+      assert.equal(ctx[PAUSE_DRAIN_CONTEXT_KEY], "true", "the operator marker survives");
+      assert.equal(ctx.paused_by, "operator", "the operator attribution survives");
+      assert.equal(_scheduledJobCountForRun(after.id), 0, "no dispatch work is scheduled");
+      const events = getRunEvents(after.id);
+      assert.equal(
+        events.some((event) => event.event === "run.failed"),
+        false,
+        "no misleading run.failed event is emitted for an ownership conflict",
+      );
     } finally {
       for (const [key, value] of savedProbeEnv) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
       if (fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
+    }
+  });
+
+  it("worktree-mode context flush MERGES: a concurrent mid-window write survives", async () => {
+    const workflowId = "test-prep-wt-flush";
+    writeMinimalWorkflow(tempHome, workflowId, "worktree");
+    const originDir = path.join(tempHome, "flush-origin");
+    initGitRepo(originDir);
+
+    // A post-checkout hook fires DURING `git worktree add` — i.e. between the
+    // first INSERT and the launch's context flush — and writes a concurrent
+    // key into the run's durable context. The flush must MERGE (json_patch),
+    // never rewrite the whole context (which would erase this write).
+    const hookDir = path.join(tempHome, "flush-hooks");
+    fs.mkdirSync(hookDir, { recursive: true });
+    const writerPath = path.join(hookDir, "flush-writer.cjs");
+    fs.writeFileSync(
+      writerPath,
+      `const { DatabaseSync } = require("node:sqlite");\n` +
+        `const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);\n` +
+        `db.exec("PRAGMA busy_timeout = 5000");\n` +
+        `db.prepare("UPDATE runs SET context = json_set(context, '$.hook_key', 'hook-kept') WHERE workflow_id = ?").run(${JSON.stringify(workflowId)});\n` +
+        `db.close();\n`,
+      "utf-8",
+    );
+    const hookPath = path.join(hookDir, "post-checkout");
+    fs.writeFileSync(hookPath, `#!/bin/sh\nexec "${process.execPath}" "${writerPath}"\n`, "utf-8");
+    fs.chmodSync(hookPath, 0o755);
+    runGit(["config", "core.hooksPath", hookDir], originDir);
+
+    const fake = await startFakeControlPlane();
+    setEnv("TAMANDUA_CONTROL_PORT", String(fake.port));
+    try {
+      await runWorkflow({
+        workflowId,
+        taskTitle: "PREP-STATE worktree flush",
+        worktreeOriginRepository: originDir,
+      });
+      const row = readRun(workflowId);
+      const ctx = JSON.parse(row.context) as Record<string, string>;
+      assert.equal(ctx.hook_key, "hook-kept", "the concurrent mid-window write survives the flush");
+      assert.ok(ctx.worktree_path, "the worktree path is flushed");
+      assert.equal(ctx.repo, ctx.worktree_path, "repo points at the managed worktree");
+      assert.equal(
+        ctx[RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY],
+        ctx.worktree_path,
+        "the harness working directory is flushed",
+      );
+      assert.equal(ctx.original_branch, "main", "the origin branch is flushed");
+      assert.match(String(ctx.base_branch_sha), /^[0-9a-f]{40}$/, "the base branch SHA is flushed");
+      assert.match(String(ctx.worktree_origin_sha), /^[0-9a-f]{40}$/, "the origin SHA is flushed");
+    } finally {
       await fake.close();
     }
   });

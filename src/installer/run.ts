@@ -33,6 +33,9 @@ import {
 import {
   ISOLATION_INTENT_RECORDED,
   PREPARING_SCHEDULING_STATUS,
+  DRAINING_PAUSE_SCHEDULING_STATUS,
+  NATIVE_SCHEDULING_STATUS,
+  PAUSE_DRAIN_CONTEXT_KEY,
   initialRunIsolationState,
   isolationPreparingHeldText,
   readIsolationState,
@@ -292,30 +295,69 @@ function resolveDefaultMatchlockResourceLimits(
   };
 }
 
+/**
+ * MTLK-ADMIT-MARKER (tamandua-crf): thrown when the fresh-launch admission
+ * write cannot own the run row it just inserted (zero rows updated: the row
+ * was deleted or the policy/marker columns moved under a concurrent writer).
+ * The generic launch-failure handler is deliberately SKIPPED for this error —
+ * a lost ownership guard must preserve the newer state, never clobber it with
+ * the stale launch view.
+ */
+class MatchlockAdmissionStateConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MatchlockAdmissionStateConflictError";
+  }
+}
+
 function failPersistedRunLaunch(params: {
   runId: string;
   workflowId: string;
-  context: Record<string, string>;
   error: unknown;
 }): void {
   const db = getDb();
   const message = params.error instanceof Error
     ? params.error.message
     : String(params.error);
-  params.context.launch_error = message;
 
   // Do not let secondary bookkeeping errors mask the original launch error.
+  // MTLK-ADMIT-MARKER (tamandua-crf): the failure write is CONDITIONAL on the
+  // row still being OWNED by the launch. A concurrent operator pause/drain/
+  // cancel that landed while the launch was failing owns the row NOW — this
+  // handler must not reset its status or overwrite the new state with the
+  // stale launch view (the run.failed event below is still emitted for
+  // observability). `status = 'running'` alone does NOT discriminate an
+  // operator drain (it keeps the run running while it drains); the
+  // operator-attribution key `paused_by` (written by handlePauseRun) is the
+  // application's actual discriminator, exactly as the admission release uses
+  // it.
+  //
+  // The context edit is a `json_set` of `launch_error` on the CURRENT durable
+  // context, never a rewrite from the stale in-memory launch copy: serializing
+  // the launch view would resurrect a `pause_drain` marker the admission
+  // release already cleared, and would erase every context key written after
+  // the seed.
+  // The run.failed event is emitted ONLY when the guarded write above actually
+  // moved the row: when a concurrent writer (operator pause/drain/cancel) owns
+  // the run NOW, the run did not transition to failed and a run.failed event
+  // would misreport the durable state (tamandua-crf review).
+  let failureRecorded = false;
   try {
-    db.prepare(
+    const result = db.prepare(
       `UPDATE runs
-       SET status = 'failed', context = ?, scheduling_status = NULL,
+       SET status = 'failed', context = json_set(context, '$.launch_error', ?),
+           scheduling_status = NULL,
            scheduling_requested_at = NULL, scheduling_error = ?,
            updated_at = ${SQL_NOW_ISO}
-       WHERE id = ?`,
-    ).run(JSON.stringify(params.context), message, params.runId);
+       WHERE id = ? AND status = 'running'
+         AND json_extract(context, '$.paused_by') IS NULL`,
+    ).run(message, message, params.runId);
+    failureRecorded = Number(result.changes) === 1;
   } catch {
     // Best effort only; the caller rethrows the original setup failure.
   }
+
+  if (!failureRecorded) return;
 
   try {
     emitEvent({
@@ -381,23 +423,39 @@ function parseWorkdirCollisionHolder(raw: unknown): WorkdirCollisionHolder | und
 function failRefusedRunLaunch(params: {
   runId: string;
   workflowId: string;
-  context: Record<string, string>;
   message: string;
 }): void {
   const db = getDb();
-  params.context.launch_error = params.message;
 
+  // MTLK-ADMIT-MARKER (tamandua-crf): the context edit is a `json_set` of
+  // `launch_error` on the CURRENT durable context — the launch-time in-memory
+  // copy is never serialized back (it would resurrect a `pause_drain` marker
+  // the admission release already cleared and erase concurrent context
+  // updates written while the refusal resolved).
+  //
+  // Ownership-constrained like `failPersistedRunLaunch`: a concurrent operator
+  // pause/drain/cancel that landed while the refusal resolved owns the row NOW
+  // (a drain keeps `status='running'` but records `paused_by`, which this
+  // WHERE also discriminates), so the refusal bookkeeping must not overwrite
+  // the newer state. The run.failed event is emitted only when the guarded
+  // write actually moved the row.
+  let refusalRecorded = false;
   try {
-    db.prepare(
+    const result = db.prepare(
       `UPDATE runs
-       SET status = 'failed', context = ?, scheduling_status = 'error',
+       SET status = 'failed', context = json_set(context, '$.launch_error', ?),
+           scheduling_status = 'error',
            scheduling_requested_at = NULL, scheduling_error = ?,
            updated_at = ${SQL_NOW_ISO}
-       WHERE id = ?`,
-    ).run(JSON.stringify(params.context), params.message, params.runId);
+       WHERE id = ? AND status = 'running'
+         AND json_extract(context, '$.paused_by') IS NULL`,
+    ).run(params.message, params.message, params.runId);
+    refusalRecorded = Number(result.changes) === 1;
   } catch {
     // Best effort only; the caller still returns the typed refusal.
   }
+
+  if (!refusalRecorded) return;
 
   try {
     emitEvent({
@@ -854,8 +912,24 @@ export async function runWorkflow(
     Object.assign(seededContext, gitIdentityContextPatch(gitIdentity));
 
     // Update the run's context with the now-available worktree-specific fields.
-    const fullContextJson = JSON.stringify(seededContext);
-    db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(fullContextJson, runId);
+    // MTLK-ADMIT-MARKER (tamandua-crf): merge ONLY the fields this launch owns
+    // into the CURRENT durable context with `json_patch` — rewriting the whole
+    // context from the launch-time copy could erase a concurrent operator
+    // pause/drain attribution (`paused_by`), which the guarded admission
+    // release below examines before releasing the hold.
+    const worktreeContextPatch = JSON.stringify({
+      [RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY]: seededContext[RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY],
+      repo: seededContext.repo,
+      worktree_path: seededContext.worktree_path,
+      worktree_origin_repository: seededContext.worktree_origin_repository,
+      worktree_origin_ref: seededContext.worktree_origin_ref,
+      worktree_origin_sha: seededContext.worktree_origin_sha,
+      original_branch: seededContext.original_branch,
+      base_branch_sha: seededContext.base_branch_sha,
+      tested_tree: seededContext.tested_tree,
+      ...gitIdentityContextPatch(gitIdentity),
+    });
+    db.prepare("UPDATE runs SET context = json_patch(context, ?) WHERE id = ?").run(worktreeContextPatch, runId);
   } else {
     throw new Error(
       `Invalid run.workspace value: "${workspaceMode}". Expected "direct" or "worktree".`,
@@ -975,22 +1049,62 @@ export async function runWorkflow(
         configDigest: admission.policy.resolvedImageConfigDigest,
       };
     }
-    // MTLK-ISO-SLICE2 PREP-STATE: persist the validated policy AND release the
-    // initial non-schedulable hold in ONE short DB statement (a single SQLite
-    // UPDATE is atomic; no transaction spans the resolve RPC/subprocess work
-    // above). Only now may the reconciler/registration treat the run as
-    // schedulable (spec C §10 item 7).
-    db.prepare(
-      `UPDATE runs SET matchlock_policy = ?,
-             scheduling_status = 'pending_register',
-             scheduling_requested_at = ?,
-             scheduling_error = NULL
-       WHERE id = ?`,
-    ).run(
-      serializeMatchlockPolicy(admission.policy),
-      new Date().toISOString(),
-      runId,
-    );
+    // MTLK-ISO-SLICE2 PREP-STATE + MTLK-ADMIT-MARKER (tamandua-crf): publish
+    // the pinned policy AND release the host-seeded preparation hold in ONE
+    // guarded SQLite UPDATE — a single statement is atomic (no transaction
+    // spans the resolve RPC above), so there is no "policy persisted but still
+    // held" intermediate state for a crash or a concurrent reader to trip on;
+    // the release matches native-run parity (a fresh native run is registrable
+    // from its INSERT onward). The SET drops ONLY the host-seeded `pause_drain`
+    // context key via json_remove — every other key survives untouched — and
+    // the WHERE pins the exact fresh-launch ownership shape:
+    //   - the row this process inserted must still be running, intent-only
+    //     (policy NULL) and intent-recorded — a terminal/deleted/replaced row
+    //     cannot take the policy;
+    //   - the hold must still be a HOST-seeded representation (the legacy
+    //     `draining_pause` D-MARKER seed, or the typed `preparing` re-hold);
+    //     an operator pause/drain mid-window records `paused_by` (and a
+    //     non-drain pause moves `status` off 'running'), so the WHERE fails
+    //     and the whole write is refused — the operator's state and
+    //     attribution survive VERBATIM instead of being clobbered.
+    const admissionWrite = db
+      .prepare(
+        `UPDATE runs SET matchlock_policy = ?,
+               scheduling_status = ?,
+               scheduling_requested_at = ?,
+               scheduling_error = NULL,
+               context = json_remove(context, '$.${PAUSE_DRAIN_CONTEXT_KEY}'),
+               updated_at = ${SQL_NOW_ISO}
+         WHERE id = ? AND isolation_intent = ? AND matchlock_policy IS NULL AND status = 'running'
+           AND scheduling_status IN (?, ?)
+           AND json_extract(context, '$.${PAUSE_DRAIN_CONTEXT_KEY}') = 'true'
+           AND json_extract(context, '$.paused_by') IS NULL`,
+      )
+      .run(
+        serializeMatchlockPolicy(admission.policy),
+        NATIVE_SCHEDULING_STATUS,
+        new Date().toISOString(),
+        runId,
+        ISOLATION_INTENT_RECORDED,
+        DRAINING_PAUSE_SCHEDULING_STATUS,
+        PREPARING_SCHEDULING_STATUS,
+      );
+    // Fail closed on a lost ownership guard: zero rows means another writer
+    // (operator pause/drain/cancel, a competing admission, or a deleted row)
+    // owns the row NOW. Proceeding would hand the caller a "launched" run
+    // whose durable state does not match its admission. The typed conflict
+    // error is NOT routed through the generic launch-failure handler (see the
+    // catch below): the concurrent writer's state must survive verbatim.
+    if (Number(admissionWrite.changes) !== 1) {
+      throw new MatchlockAdmissionStateConflictError(
+        "Matchlock admission could not persist the pinned policy: the run row changed concurrently during admission " +
+          "(refusing to treat an unpersisted admission as a runnable launch).",
+      );
+    }
+    // tamandua-crf: the durable row no longer carries the host-seeded marker;
+    // drop it from the in-memory launch context too, so later bookkeeping that
+    // serializes this object cannot restore it.
+    delete seededContext[PAUSE_DRAIN_CONTEXT_KEY];
   }
 
   // WAVE-A TCMD (US-004): a launch-declared `--context test_cmd=` establishes
@@ -1093,11 +1207,16 @@ export async function runWorkflow(
   // the first step and the run would loop forever on peek=HAS_WORK / claim=NO_WORK.
   advancePipeline(runId);
   } catch (err) {
-    if (runPersisted) {
+    // MTLK-ADMIT-MARKER (tamandua-crf): a state-ownership conflict means a
+    // concurrent writer (operator pause/cancel, or another admission) owns the
+    // row NOW — the generic failure handler must not overwrite that state with
+    // the stale launch view (it would resurrect the seeded marker and reset
+    // status). Every OTHER launch failure keeps the historical failure
+    // bookkeeping (launch_error recorded, run failed).
+    if (runPersisted && !(err instanceof MatchlockAdmissionStateConflictError)) {
       failPersistedRunLaunch({
         runId,
         workflowId,
-        context: seededContext,
         error: err,
       });
     }
@@ -1155,7 +1274,6 @@ export async function runWorkflow(
         failRefusedRunLaunch({
           runId,
           workflowId,
-          context: seededContext,
           message: refusalMessage,
         });
 

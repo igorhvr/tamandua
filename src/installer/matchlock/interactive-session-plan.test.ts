@@ -826,3 +826,149 @@ describe("US-004 real admission seam through the fake RPC driver", () => {
   });
 });
 
+// ── MTLK-RPC-BIN-SPLIT (tamandua-dwl): plan-time freeze ──────────────
+
+describe("MTLK-RPC-BIN-SPLIT: the plan freezes the rpc invocation before any awaited work", () => {
+  /** A minimal launchable script so `isLaunchableMatchlockBinary` passes. */
+  function writeLaunchableShim(dir: string, name = "matchlock"): string {
+    const bin = path.join(dir, name);
+    fs.writeFileSync(bin, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(bin, 0o755);
+    return bin;
+  }
+
+  it("freezes a PATH hit to its absolute path BEFORE the awaited swap probe (later PATH mutation cannot repoint)", async () => {
+    const dirA = fs.mkdtempSync(path.join(os.homedir(), ".mtlk-freeze-a-"));
+    const dirB = fs.mkdtempSync(path.join(os.homedir(), ".mtlk-freeze-b-"));
+    try {
+      const binA = writeLaunchableShim(dirA);
+      const binB = writeLaunchableShim(dirB);
+
+      const env: NodeJS.ProcessEnv = { PATH: dirA };
+      const { admit, calls } = makeAdmitter();
+      let probed = "";
+      const plan = await planInteractiveSession(
+        baseArgs(),
+        baseOptions({
+          env,
+          admit,
+          swapSupportProbe: async (binaryPath: string) => {
+            probed = binaryPath;
+            // The environment changes DURING the awaited probe: the frozen
+            // selection must not follow it.
+            env.PATH = dirB;
+            return { supported: true, binaryPath };
+          },
+        }),
+      );
+
+      assert.equal(probed, binA, "the swap probe runs against the plan-time absolute path");
+      assert.equal(
+        plan.resolvedRpc.binaryPath,
+        binA,
+        "the plan carries the plan-time absolute path, not the mutated PATH hit",
+      );
+      assert.equal(
+        calls[0]?.resolvedRpc?.binaryPath,
+        binA,
+        "admission binds the same frozen absolute path",
+      );
+      assert.equal(calls[0]?.rpcBinaryPath, binA, "the legacy field carries the frozen path too");
+      assert.notEqual(plan.resolvedRpc.binaryPath, binB, "the post-mutation PATH hit must not win");
+    } finally {
+      fs.rmSync(dirA, { recursive: true, force: true });
+      fs.rmSync(dirB, { recursive: true, force: true });
+    }
+  });
+
+  it("copies argv at freeze time (caller mutation during the awaited probe cannot repoint it)", async () => {
+    const argv = ["rpc", "--first"];
+    const { admit, calls } = makeAdmitter();
+    const plan = await planInteractiveSession(
+      baseArgs(),
+      baseOptions({
+        admit,
+        rpcBinaryPath: process.execPath,
+        rpcArgs: argv,
+        swapSupportProbe: async (binaryPath: string) => {
+          argv.push("--mutated-during-probe");
+          return { supported: true, binaryPath };
+        },
+      }),
+    );
+
+    assert.deepEqual(plan.resolvedRpc.args, ["rpc", "--first"], "the frozen argv is a copy");
+    assert.deepEqual(calls[0]?.resolvedRpc?.args, ["rpc", "--first"], "admission binds the copy");
+  });
+
+  it("resolves an explicit bare-name selection through PATH at plan time (a later PATH mutation cannot repoint it)", async () => {
+    const dirA = fs.mkdtempSync(path.join(os.homedir(), ".mtlk-freeze-bare-a-"));
+    const dirB = fs.mkdtempSync(path.join(os.homedir(), ".mtlk-freeze-bare-b-"));
+    try {
+      const binA = writeLaunchableShim(dirA);
+      writeLaunchableShim(dirB);
+
+      const env: NodeJS.ProcessEnv = { PATH: dirA };
+      const { admit, calls } = makeAdmitter();
+      let probed = "";
+      const plan = await planInteractiveSession(
+        baseArgs(),
+        baseOptions({
+          env,
+          admit,
+          // Explicit BARE name: resolved through the planning env's PATH (the
+          // `override` branch of the shared resolver), frozen as an absolute
+          // path BEFORE the awaited swap probe.
+          rpcBinaryPath: "matchlock",
+          swapSupportProbe: async (binaryPath: string) => {
+            probed = binaryPath;
+            env.PATH = dirB;
+            return { supported: true, binaryPath };
+          },
+        }),
+      );
+
+      assert.equal(probed, binA, "the explicit bare name resolves to the plan-time PATH hit");
+      assert.equal(
+        plan.resolvedRpc.binaryPath,
+        binA,
+        "the frozen selection is the plan-time absolute path, not the post-mutation hit",
+      );
+      assert.equal(
+        calls[0]?.resolvedRpc?.binaryPath,
+        binA,
+        "admission binds the same frozen absolute path",
+      );
+      assert.notEqual(plan.resolvedRpc.binaryPath, path.join(dirB, "matchlock"), "the mutated PATH hit must not win");
+    } finally {
+      fs.rmSync(dirA, { recursive: true, force: true });
+      fs.rmSync(dirB, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an unresolvable explicit selection verbatim (preservation; the fail-closed refusal is exercised by the swap-support suites)", async () => {
+    const missing = "/nonexistent/mtlk-freeze-missing-binary";
+    const { admit, calls } = makeAdmitter();
+    let probed = "";
+    const plan = await planInteractiveSession(
+      baseArgs(),
+      baseOptions({
+        admit,
+        rpcBinaryPath: missing,
+        swapSupportProbe: async (binaryPath: string) => {
+          probed = binaryPath;
+          return { supported: true, binaryPath };
+        },
+      }),
+    );
+
+    assert.equal(probed, missing, "the probe receives the exact caller reference");
+    assert.equal(
+      plan.resolvedRpc.binaryPath,
+      missing,
+      "an unresolvable selection is carried verbatim so the handshake fails closed",
+    );
+    assert.equal(calls[0]?.rpcBinaryPath, missing);
+  });
+});
+

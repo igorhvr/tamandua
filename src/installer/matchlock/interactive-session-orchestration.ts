@@ -33,7 +33,8 @@
 
 import path from "node:path";
 
-import { MatchlockAdmissionError } from "./admission.js";
+import { MATCHLOCK_RPC_BIN_ENV, MatchlockAdmissionError } from "./admission.js";
+import { resolveMatchlockRpcBinary } from "./allow-private-support.js";
 import {
   buildInteractiveGuestLaunchEnv,
   defaultInteractiveGuestHome,
@@ -54,6 +55,7 @@ import {
   type InteractiveSessionVmBackend,
 } from "./interactive-session.js";
 import {
+  INTERACTIVE_SESSION_RPC_BINDING_MISMATCH_CODE,
   InteractiveSessionPlanError,
   planInteractiveSession,
   type InteractiveSessionPlan,
@@ -439,6 +441,25 @@ function reportRefusal(error: unknown, stderr: (text: string) => void): number {
 }
 
 /**
+ * MTLK-RPC-BIN-SPLIT (tamandua-dwl): normalize an rpc-binary reference for the
+ * admitted-binding comparison with the SAME semantics the launcher's `spawn`
+ * applies — a value containing a path separator is resolved relative to the
+ * process cwd, a bare name is resolved through PATH (empty entries meaning the
+ * cwd). Plain string/path normalization would treat a bare name as
+ * cwd-relative and could refuse a bare-name override that names the same
+ * executable as the admitted PATH hit (or accept a spelling that launches a
+ * different file).
+ */
+function resolveRpcBinaryForComparison(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.includes("/") || trimmed.includes("\\")) {
+    return path.resolve(trimmed);
+  }
+  const resolved = resolveMatchlockRpcBinary({ ...process.env, [MATCHLOCK_RPC_BIN_ENV]: trimmed });
+  return resolved.executable ? resolved.path : trimmed;
+}
+
+/**
  * Orchestrate ONE interactive `tamandua matchlock ...` invocation end to end:
  * admit, print the pre-launch summary, run the foreground session and return
  * the launched process exit status. Fail-closed refusals are reported on stderr
@@ -483,8 +504,52 @@ export async function runInteractiveSession(
     options.createController ??
     ((planToRun: InteractiveSessionPlan, prep: InteractiveGuestPrepPlan, opts: InteractiveSessionOptions) =>
       new InteractiveSessionController(planToRun, prep, opts));
+  // MTLK-RPC-BIN-SPLIT (tamandua-dwl): the session transport must launch the
+  // SAME invocation the plan probed and admission bound. The plan's frozen
+  // `resolvedRpc` is authoritative; a controller-level override that disagrees
+  // is a typed refusal BEFORE any VM side effect — never a silent substitution
+  // of an executable the admission never checked.
+  const admittedRpc = plan.resolvedRpc;
+  if (admittedRpc !== undefined) {
+    const overrideBinary = options.controllerOptions?.rpcBinaryPath;
+    if (
+      overrideBinary !== undefined &&
+      resolveRpcBinaryForComparison(overrideBinary) !==
+        resolveRpcBinaryForComparison(admittedRpc.binaryPath)
+    ) {
+      return reportRefusal(
+        new InteractiveSessionPlanError(
+          INTERACTIVE_SESSION_RPC_BINDING_MISMATCH_CODE,
+          `Controller rpc binary override (${overrideBinary}) disagrees with the admitted matchlock invocation ` +
+            `(${admittedRpc.binaryPath}); the session must launch the executable admission probed. ` +
+            "Remove the override or align it with the admitted binding.",
+        ),
+        stderr,
+      );
+    }
+    const overrideArgs = options.controllerOptions?.rpcArgs;
+    if (overrideArgs !== undefined) {
+      // An explicit EMPTY args override mirrors the admission/plan default
+      // `["rpc"]` (an explicit empty array never consults the environment);
+      // compare it after the same defaulting so it cannot disagree spuriously.
+      const normalizedOverrideArgs = overrideArgs.length > 0 ? overrideArgs : ["rpc"];
+      if (JSON.stringify(normalizedOverrideArgs) !== JSON.stringify(admittedRpc.args)) {
+        return reportRefusal(
+          new InteractiveSessionPlanError(
+            INTERACTIVE_SESSION_RPC_BINDING_MISMATCH_CODE,
+            `Controller rpc args override (${JSON.stringify(overrideArgs)}) disagree with the admitted matchlock ` +
+              `invocation args (${JSON.stringify(admittedRpc.args)}); the session must launch the argv admission bound.`,
+          ),
+          stderr,
+        );
+      }
+    }
+  }
   const controller = createController(plan, runtime.basePrep, {
     ...options.controllerOptions,
+    ...(admittedRpc !== undefined
+      ? { rpcBinaryPath: admittedRpc.binaryPath, rpcArgs: [...admittedRpc.args] }
+      : {}),
     resolveGuestPrep: runtime.resolveGuestPrep,
   });
 

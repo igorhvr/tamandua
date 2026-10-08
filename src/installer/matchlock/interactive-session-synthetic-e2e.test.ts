@@ -62,6 +62,7 @@ const MANAGED_ENV_KEYS = [
   "FAKE_CLOSE_FAIL",
   "FAKE_CLOSE_ERROR_MESSAGE",
   "FAKE_CLOSE_DELAY_MS",
+  "DECOY_LOG",
   MATCHLOCK_RPC_BIN_ENV,
 ] as const;
 
@@ -179,7 +180,7 @@ interface SessionRun {
 /** Start one real CLI dispatch with every transport pointed at the fake driver. */
 function startSession(
   argv: string[],
-  opts: { euid?: number; readyTimeoutMs?: number } = {},
+  opts: { euid?: number; readyTimeoutMs?: number; omitControllerRpc?: boolean } = {},
 ): SessionRun {
   const terminal = new FakeTerminal();
   const stdin = new PassThrough();
@@ -219,8 +220,12 @@ function startSession(
         admission: { home: os.homedir() },
       },
       controllerOptions: {
-        rpcBinaryPath: process.execPath,
-        rpcArgs: [driver],
+        // MTLK-RPC-BIN-SPLIT differential: when `omitControllerRpc` is set the
+        // session must launch the binding the PLAN froze and admission bound —
+        // no session-level binary/args are supplied at all.
+        ...(opts.omitControllerRpc
+          ? {}
+          : { rpcBinaryPath: process.execPath, rpcArgs: [driver] }),
         admission: { home: os.homedir() },
         terminal,
         stdin,
@@ -609,5 +614,124 @@ describe("US-014: synthetic end-to-end interactive session", () => {
     );
     assert.ok(run.guestBytes().toString("utf8").includes("AUDIT-BYTES"));
     assert.equal(run.terminal.restored, 1);
+  });
+
+  // MTLK-RPC-BIN-SPLIT (tamandua-dwl) DIFFERENTIAL. The original defect: the
+  // session transport re-resolved the matchlock executable from the ambient
+  // environment instead of launching the invocation the plan probed and
+  // admission bound. Here NO session-level rpc binary/args are supplied at all
+  // and the ambient override points at a decoy executable that records every
+  // launch: only a transport that uses the plan's frozen binding can complete
+  // the run through the admitted fake driver — a regression to environment
+  // fallback lands on the decoy (and fails).
+  it("launches ONLY the admitted binding when no session-level rpc options exist (environment fallback decoy must never run)", async () => {
+    const decoyDir = makeHomeTemp(".mtlk-decoy-");
+    const decoyPath = path.join(decoyDir, "matchlock");
+    const decoyLog = path.join(decoyDir, "decoy-launches.log");
+    fs.writeFileSync(
+      decoyPath,
+      `#!/bin/sh\necho "decoy launched: $*" >> "${decoyLog}"\nexit 1\n`,
+    );
+    fs.chmodSync(decoyPath, 0o755);
+
+    const transcript = resetTranscript();
+    primeEnv({
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_EXEC_STDOUT: "passwd=0\ngroup=0\nbin=/usr/bin/pi|755 1000 1000\n",
+      FAKE_TTY_EXIT: "0",
+      // The fallback trap: any code path that re-resolves the rpc binary from
+      // the environment (instead of the plan's frozen binding) can only find
+      // this decoy.
+      [MATCHLOCK_RPC_BIN_ENV]: decoyPath,
+      DECOY_LOG: decoyLog,
+    });
+
+    // Trap BOTH fallback routes: the environment override set above AND PATH
+    // (some fallback branches resolve the bare `matchlock` name through PATH).
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${decoyDir}:${savedPath ?? ""}`;
+    try {
+      const run = startSession(
+        [
+          "matchlock",
+          "pi",
+          "--working-directory-for-harness",
+          workDir,
+          "--matchlock-image",
+          "vic/ml:latest",
+        ],
+        { omitControllerRpc: true },
+      );
+      // Bounded readiness: if the session settles FIRST — the fallback decoy
+      // was taken and the transport died, or any other early outcome — this
+      // differential must surface that outcome instead of hanging forever;
+      // and a session that stays stuck (neither ready nor settled) fails at a
+      // wall-clock deadline instead of blocking the suite.
+      let readinessTimer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<{ kind: "deadline" }>((resolve) => {
+        readinessTimer = setTimeout(() => resolve({ kind: "deadline" }), 30_000);
+      });
+      // A no-op handler so a late rejection from a timed-out run is never an
+      // unhandled rejection; the real await below still sees the rejection.
+      void run.promise.catch(() => {});
+      let readiness:
+        | { kind: "ready" }
+        | { kind: "settled"; result: boolean }
+        | { kind: "rejected"; error: unknown }
+        | { kind: "deadline" };
+      try {
+        readiness = await Promise.race([
+          run.terminal.installed.then(() => ({ kind: "ready" as const })),
+          run.promise.then(
+            (result: boolean) => ({ kind: "settled" as const, result }),
+            (error: unknown) => ({ kind: "rejected" as const, error }),
+          ),
+          deadline,
+        ]);
+      } finally {
+        if (readinessTimer) clearTimeout(readinessTimer);
+      }
+      if (readiness.kind === "deadline") {
+        // Unblock the owned transport before failing so the regression leaves
+        // no wedged work behind.
+        run.stdin.end();
+        await Promise.race([run.promise, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+        throw new Error("differential: session never became ready within 30s");
+      }
+      if (readiness.kind === "settled") {
+        throw new Error(
+          `session settled before installing the terminal (result=${String(readiness.result)})`,
+        );
+      }
+      if (readiness.kind === "rejected") throw readiness.error;
+      await waitForTranscript(transcript, "tty_ready_sent");
+      run.stdin.end();
+
+      assert.equal(
+        await run.promise,
+        true,
+        "the session completes through the admitted fake transport",
+      );
+      assert.equal(
+        fs.existsSync(decoyLog),
+        false,
+        `the environment/PATH fallback decoy was never launched (${
+          fs.existsSync(decoyLog) ? fs.readFileSync(decoyLog, "utf8") : "no decoy log"
+        })`,
+      );
+
+      const frames = readTranscript(transcript);
+      const methods = frames
+        .map((frame) => frame.method)
+        .filter((method): method is string => typeof method === "string");
+      assert.ok(methods.includes("resolve_image"), "admission resolved the image");
+      assert.ok(methods.includes("create"), "the VM was created");
+      assert.ok(methods.includes("exec_tty"), "the harness launched over the admitted binding");
+      assert.ok(methods.includes("close"), "the VM was closed");
+      assert.deepEqual(run.exits, [], "no failure exit was requested");
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+    }
   });
 });

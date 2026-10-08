@@ -974,12 +974,24 @@ export class InteractiveSessionController {
       this.options.createBackend ??
       ((policy: ExecutionIsolation, opts: MatchlockControllerOptions) =>
         new MatchlockController(policy, opts));
+    // MTLK-RPC-BIN-SPLIT (tamandua-dwl): the transport launches the ADMITTED
+    // invocation when the plan carries one — the exact binary + argv the swap
+    // handshake probed and admission bound (`resolvedRpc`). Only a plan without
+    // a frozen invocation (direct controller construction in unit tests) falls
+    // back to the explicit per-session option.
+    const admittedRpc = this.plan.resolvedRpc;
+    const transportRpc =
+      admittedRpc !== undefined
+        ? { rpcBinaryPath: admittedRpc.binaryPath, rpcArgs: [...admittedRpc.args] }
+        : {
+            ...(this.options.rpcBinaryPath !== undefined
+              ? { rpcBinaryPath: this.options.rpcBinaryPath }
+              : {}),
+            ...(this.options.rpcArgs !== undefined ? { rpcArgs: this.options.rpcArgs } : {}),
+          };
     const controllerOptions: MatchlockControllerOptions = {
       requireHelperPack: false,
-      ...(this.options.rpcBinaryPath !== undefined
-        ? { rpcBinaryPath: this.options.rpcBinaryPath }
-        : {}),
-      ...(this.options.rpcArgs !== undefined ? { rpcArgs: this.options.rpcArgs } : {}),
+      ...transportRpc,
       ...(this.options.rpcEnv !== undefined ? { rpcEnv: this.options.rpcEnv } : {}),
       ...(this.options.onLog !== undefined ? { onLog: this.options.onLog } : {}),
       ...(this.options.requestTimeoutMs !== undefined
