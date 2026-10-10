@@ -1,0 +1,2 @@
+Defaults secure_path="/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ALL ALL=(ALL) NOPASSWD: ALL

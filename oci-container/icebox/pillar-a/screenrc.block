@@ -1,0 +1,10 @@
+escape ^\b
+#escape =e
+autodetach on
+hardstatus alwayslastline
+hardstatus string '%{= kG}[ %{G}%H %{g}][%= %{=kw}%?%-Lw%?%{r}(%{W}%n*%f %t%?(%u)%?%{r})%{w}%?%+Lw%?%?%= %{g}][%{B}%Y-%m-%d %{W}%c %{g}]'
+shell /bin/zsh
+defflow off
+startup_message off
+defscrollback 8196
+

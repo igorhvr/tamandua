@@ -1,0 +1,27 @@
+
+# tamandua icebox: system-wide oh-my-zsh for users without their own copy
+# (a user's own ~/.oh-my-zsh always wins; root is never touched by this loader).
+if [[ -n "${HOME-}" && "${EUID:-0}" -ne 0 && ! -d "$HOME/.oh-my-zsh" && -z "${TAMANDUA_OMZ_LOADED-}" && -f /usr/share/oh-my-zsh/oh-my-zsh.sh ]]; then
+  typeset -g TAMANDUA_OMZ_LOADED=1   # this-shell guard; NOT exported (each nested shell loads its own OMZ)
+  export ZSH=/usr/share/oh-my-zsh
+  export ZSH_THEME="${ZSH_THEME:-clean}"
+  export DISABLE_AUTO_UPDATE=true
+  export ZSH_CACHE_DIR="$HOME/.cache/oh-my-zsh"
+  mkdir -p "$ZSH_CACHE_DIR" 2>/dev/null || true
+  typeset -g ZSH_COMPDUMP="${ZDOTDIR:-$HOME}/.zcompdump"
+  # This bundled oh-my-zsh calls a bare `compinit -i`, which still runs the
+  # insecure-directory scan and ignores ZSH_COMPDUMP. Intercept that one call:
+  # it runs with -C (no compaudit scan at all; the shared tree is root-owned and
+  # not group/world-writable) and -d "$ZSH_COMPDUMP" (per-user dumpfile).
+  # Note on -C: an EXISTING dumpfile is then sourced as-is without the normal
+  # revalidation (no zsh-version/file-count check); it is regenerated only when
+  # the file is absent. Delete the effective dumpfile (${ZDOTDIR:-$HOME}/.zcompdump)
+  # to force a rebuild. The shim removes
+  # itself before loading the real compinit, whose tail restores the autoload
+  # stub afterwards -- so a later manual OMZ re-source behaves stock.
+  compinit() { unfunction compinit; autoload -Uz compinit; compinit -C -d "$ZSH_COMPDUMP"; }
+  source "$ZSH/oh-my-zsh.sh"
+fi
+
+# tamandua icebox: ~/.local/bin on PATH for every user (only when the dir exists)
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) [ -d "$HOME/.local/bin" ] && export PATH="$HOME/.local/bin:$PATH" ;; esac

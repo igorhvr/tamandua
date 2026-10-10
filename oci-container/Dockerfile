@@ -1,4 +1,4 @@
-FROM igorhvr/bedlam-ubuntu@sha256:1b21be58ec73d2347ecfe97cd725ec5ef6911097efd0cebb2878384c40936c28
+FROM igorhvr/bedlam-ubuntu@sha256:1b21be58ec73d2347ecfe97cd725ec5ef6911097efd0cebb2878384c40936c28 AS icebox-env
 MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 
 # ============================================================================
@@ -31,9 +31,24 @@ LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
       com.tamandua.python.pin="3.14.7"
 
 # User-agnostic PATH: everything the image runs for any caller uid lives under
-# /usr/local (never behind /root).
-ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# /usr/local (never behind /root) or /nix (a world-readable store). The nix
+# profile bin is FIRST so interactive sessions (which forward the image PATH
+# verbatim) and every child process (pi/hermes/...) see nix, uv and yggdrasil
+# without any shell rc.
+ENV PATH="/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV HOME="/root"
+
+# --- [icebox] Tier-A environment + passwordless-sudo drop-in (design v6 §2) --
+# One shared env stage. `docker build --target icebox-env` builds exactly this
+# layer (pinned base + Pillar A/B contents) for the disposable-container
+# acceptance run (oci-container/icebox/verify-icebox-env.sh); the production
+# stages below inherit it. The installer is idempotent and fail-closed:
+# oci-container/icebox/pillar-a/apply.sh.
+COPY icebox/pillar-a /opt/icebox/pillar-a
+RUN bash /opt/icebox/pillar-a/apply.sh
+
+# --- production stages: standard image (tamandua + dsh + pi + hermes) --------
+FROM icebox-env
 
 # --- native toolchain: pi's optional TUI native helpers need a C compiler +
 # --- libxcb; pkg-config/make cover source rebuilds of either tool by users. --

@@ -1,0 +1,27 @@
+
+# tamandua icebox: nix profile on PATH for every zsh (idempotent)
+case ":$PATH:" in *":/nix/var/nix/profiles/default/bin:"*) ;; *) PATH="/nix/var/nix/profiles/default/bin:$PATH"; export PATH ;; esac
+
+# tamandua icebox: suppress the zsh "new user" wizard via BOTH mechanisms:
+# (a) shadow the wizard helper with a no-op, defined here before zsh would
+#     autoload the real one (independent of any trigger condition);
+# (b) interactive shells only: create the empty rc file the wizard would offer
+#     to create, when it is absent and its directory is writable (ZDOTDIR
+#     respected; an existing file -- or symlink -- is never touched). The
+#     subshell's noclobber makes creation exclusive: if the file appears
+#     concurrently, the redirection fails instead of truncating it.
+# Escape hatch: `unfunction zsh-newuser-install` removes this shell's no-op;
+# the original is not restored automatically -- run
+# `autoload -Uz zsh-newuser-install; zsh-newuser-install` to invoke the stock
+# wizard in this shell.
+zsh-newuser-install() { : }
+if [[ -o interactive && -n "${HOME-}" ]]; then
+  _zd="${ZDOTDIR:-$HOME}"
+  if [[ -d "$_zd" && -w "$_zd" && ! -e "$_zd/.zshrc" && ! -L "$_zd/.zshrc" ]]; then
+    ( setopt noclobber; : > "$_zd/.zshrc" ) 2>/dev/null || true
+  fi
+  unset _zd
+fi
+
+# tamandua icebox: oh-my-zsh (loaded from /etc/zsh/zshrc) owns compinit
+skip_global_compinit=1
