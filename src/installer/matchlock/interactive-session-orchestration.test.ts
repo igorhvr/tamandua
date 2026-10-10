@@ -150,6 +150,10 @@ function makeRuntime(plan: Record<string, unknown>, prep = makePrep()): Record<s
     plan,
     createConfig: {
       image: "igorhvr/tamandua",
+      // ICEBOX Pillar B: the composer always emits the resolved boolean and
+      // the resolved dns_priority; the banner reads the emitted boolean.
+      privileged: true,
+      network: { block_private_ips: true, intercept: true, dns_priority: "ipv4" },
       vfs: {
         mounts: {
           "/srv/interactive-work": { type: "host_fs", readonly: false },
@@ -179,7 +183,12 @@ describe("US-013: interactive pre-launch summary", () => {
     const text = formatInteractiveSessionPrelaunch(makeRuntime(plan));
 
     assert.match(text, /matchlock: interactive pi session/);
-    assert.match(text, /matchlock: igorhvr\/tamandua cpus=2 memory=2048MB disk=20480MB/);
+    // ICEBOX 5ui: the summary line carries the provenance suffix (this plan
+    // records `standard` provenance).
+    assert.match(
+      text,
+      /matchlock: igorhvr\/tamandua \(standard image\) cpus=2 memory=2048MB disk=20480MB/,
+    );
     assert.match(text, /image provenance: standard/);
     assert.match(text, /digest=sha256:aaaa config=sha256:bbbb/);
     assert.match(text, /guest identity: uid=4242 gid=4343/);
@@ -209,6 +218,56 @@ describe("US-013: interactive pre-launch summary", () => {
     const plan = makePlan({ allowPrivate: ["10.0.0.1", "10.0.0.2"] });
     const text = formatInteractiveSessionPrelaunch(makeRuntime(plan));
     assert.match(text, /allow-private=10\.0\.0\.1,10\.0\.0\.2/);
+  });
+
+  // ── ICEBOX: 5ui suffix + Pillar B guest-sudo banner ──────────────────
+
+  it("ICEBOX 5ui: the ` (standard image)` suffix is driven by the RECORDED provenance, not the image name", () => {
+    const standard = formatInteractiveSessionPrelaunch(makeRuntime(makePlan()));
+    assert.match(
+      standard,
+      /matchlock: igorhvr\/tamandua \(standard image\) cpus=2 memory=2048MB disk=20480MB/,
+    );
+
+    // The SAME image reference with EXPLICIT provenance: no suffix.
+    const explicit = formatInteractiveSessionPrelaunch(
+      makeRuntime(makePlan({ imageSource: "explicit" })),
+    );
+    assert.match(explicit, /matchlock: igorhvr\/tamandua cpus=2 memory=2048MB disk=20480MB/);
+    assert.doesNotMatch(explicit, /\(standard image\)/);
+  });
+
+  it("ICEBOX Pillar B: prints exactly one additive guest-sudo line immediately after guest identity (both variants)", () => {
+    const privilegedText = formatInteractiveSessionPrelaunch(makeRuntime(makePlan()));
+    const privilegedLines = privilegedText.trimEnd().split("\n");
+    const identityIdx = privilegedLines.findIndex((line) => line.startsWith("guest identity: "));
+    assert.ok(identityIdx >= 0, "the guest identity line must be present");
+    assert.equal(
+      privilegedLines[identityIdx + 1],
+      "guest sudo: passwordless for all users (privileged VM)",
+      "the privileged banner line sits immediately AFTER the guest identity line",
+    );
+    assert.equal(
+      privilegedLines.filter((line) => line.startsWith("guest sudo: ")).length,
+      1,
+      "exactly one guest-sudo line",
+    );
+
+    // The opt-out variant: the fixture's create configuration says false, and
+    // the banner must report exactly that (the create config is the authority).
+    const base = makeRuntime(makePlan());
+    const optedOut = {
+      ...base,
+      createConfig: {
+        ...(base.createConfig as Record<string, unknown>),
+        privileged: false,
+      },
+    };
+    const optedOutText = formatInteractiveSessionPrelaunch(optedOut as never);
+    const optedOutLines = optedOutText.trimEnd().split("\n");
+    const optedOutIdx = optedOutLines.findIndex((line) => line.startsWith("guest identity: "));
+    assert.equal(optedOutLines[optedOutIdx + 1], "guest sudo: blocked (standard VM)");
+    assert.doesNotMatch(optedOutText, /passwordless/);
   });
 });
 

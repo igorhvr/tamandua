@@ -357,21 +357,41 @@ export function buildInteractiveSessionRuntime(
 
 /**
  * Render the pre-launch summary printed before entering the TUI or shell:
- * the shared resource summary, image provenance + pinned digests, guest
- * uid/gid and the resolved mount scope; shell variants also name the harness
- * command to run inside.
+ * the shared resource summary (with the ` (standard image)` provenance
+ * suffix, 5ui), image provenance + pinned digests, guest uid/gid, the
+ * guest-sudo line (ICEBOX Pillar B) and the resolved mount scope; shell
+ * variants also name the harness command to run inside.
  */
 export function formatInteractiveSessionPrelaunch(runtime: InteractiveSessionRuntime): string {
   const { plan, createConfig } = runtime;
   const lines: string[] = [];
   lines.push(`matchlock: interactive ${plan.harness}${plan.shell ? "-shell" : ""} session`);
-  lines.push(formatMatchlockResourceSummary(plan.image, plan.resourceLimits, plan.allowPrivate));
+  // ICEBOX 5ui (design v6 §6): the interactive summary line carries the SAME
+  // ` (standard image)` provenance suffix the workflow path prints — driven
+  // by the RECORDED provenance (plan.imageSource), never inferred from the
+  // image name itself.
+  lines.push(
+    formatMatchlockResourceSummary(
+      plan.image,
+      { ...plan.resourceLimits, imageSource: plan.imageSource },
+      plan.allowPrivate,
+    ),
+  );
   lines.push(`image provenance: ${plan.imageSource}`);
   lines.push(
     `image identity: tag=${plan.pinnedIdentity.tag ?? plan.image} ` +
       `digest=${plan.pinnedIdentity.digest} config=${plan.pinnedIdentity.config_digest}`,
   );
   lines.push(`guest identity: uid=${plan.identity.uid} gid=${plan.identity.gid}`);
+  // ICEBOX Pillar B: the ADDITIVE guest-sudo line, immediately after the
+  // guest identity line. The effective prepared CREATE CONFIGURATION is the
+  // authority (not raw flags): the shared composer always emits the resolved
+  // boolean, so the banner reports exactly what the VM will be.
+  lines.push(
+    createConfig.privileged === true
+      ? "guest sudo: passwordless for all users (privileged VM)"
+      : "guest sudo: blocked (standard VM)",
+  );
 
   const mounts = Object.entries(createConfig.vfs?.mounts ?? {})
     .map(([destination, config]) => ({ destination, readonly: config.readonly === true }))

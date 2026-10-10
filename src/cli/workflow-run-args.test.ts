@@ -1437,3 +1437,49 @@ describe("parseMatchlockRootUsageOverrideFlag (workflow resume)", () => {
     assert.equal(parseMatchlockRootUsageOverrideFlag(["--force-matchlock-usage-as-root"]), false);
   });
 });
+
+// ICEBOX (tamandua-5rr.3 E2): `--matchlock-no-privileged` — the pure-boolean
+// whole-VM privilege opt-out (privileged-by-default), resolved at launch as
+// flag > TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1 > default ON.
+describe("--matchlock-no-privileged (ICEBOX)", () => {
+  const parseWithImage = (args: string[]) =>
+    parseWorkflowRunArgs(["Build feature", "--matchlock-image", "vic/ml", ...args]);
+
+  it("is a pure boolean: true with an opt-in, and it never consumes the following token", () => {
+    assert.equal(parseWithImage(["--matchlock-no-privileged"]).matchlockNoPrivileged, true);
+    const result = parseWorkflowRunArgs([
+      "--matchlock",
+      "--matchlock-no-privileged",
+      "do",
+      "the",
+      "thing",
+    ]);
+    assert.equal(result.matchlockNoPrivileged, true);
+    assert.equal(result.taskTitle, "do the thing");
+  });
+
+  it("is absent unless supplied", () => {
+    assert.equal(parseWithImage([]).matchlockNoPrivileged, undefined);
+    assert.equal(parseWorkflowRunArgs(["task"]).matchlockNoPrivileged, undefined);
+  });
+
+  it("rejects the value-bearing equals form instead of silently absorbing it", () => {
+    assert.throws(
+      () => parseWithImage(["--matchlock-no-privileged=1"]),
+      /--matchlock-no-privileged takes no value/,
+    );
+  });
+
+  it("requires an opt-in with the dependent-flag message", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["task", "--matchlock-no-privileged"]),
+      /--matchlock-no-privileged requires --matchlock or --matchlock-image <image>/,
+    );
+  });
+
+  it("after the -- separator it is task text, not a flag", () => {
+    const result = parseWorkflowRunArgs(["task", "--", "--matchlock-no-privileged"]);
+    assert.equal(result.matchlockNoPrivileged, undefined);
+    assert.equal(result.taskTitle, "task --matchlock-no-privileged");
+  });
+});

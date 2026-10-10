@@ -112,6 +112,14 @@ export interface MatchlockNetworkConfig {
   no_network?: boolean;
   hostname?: string;
   /**
+   * ICEBOX (NIXV6-DNS-REWRITER): the guest resolver's address-family
+   * preference. tamandua ALWAYS sends the resolved value explicitly — even
+   * when it equals the fork default — so the request is self-describing and
+   * behavior is pinned to the tamandua version that composed it. Absent
+   * means the fork default (`"ipv4"`).
+   */
+  dns_priority?: "ipv4" | "ipv6";
+  /**
    * MTLK-ALLOW-PRIVATE: per-run exception list of private destinations
    * (host names, IP literals or CIDRs, optional `:port`). Mirrors the
    * matchlock fork's `network.allow_private`; omitted when no entries were
@@ -145,6 +153,14 @@ export interface MatchlockVfsConfig {
 export interface MatchlockCreateParams {
   image: string;
   image_identity?: { digest: string; config_digest: string; tag?: string };
+  /**
+   * ICEBOX Pillar B (privileged-by-default): whole-VM privilege. tamandua
+   * ALWAYS sends the resolved value explicitly — `true` by default, `false`
+   * under `--matchlock-no-privileged` / `TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1`
+   * — so a request never depends on matchlock's own default. Absent means
+   * matchlock's default (false); tamandua's composer never omits it.
+   */
+  privileged?: boolean;
   resources?: MatchlockResourcesConfig;
   network?: MatchlockNetworkConfig;
   env?: Record<string, string>;

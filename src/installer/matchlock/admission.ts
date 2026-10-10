@@ -52,6 +52,12 @@ import {
 } from "./policy.js";
 import { MATCHLOCK_DEFAULT_SWAP_MB, resolveMatchlockResourceLimits } from "./resource-limits.js";
 import {
+  resolveMatchlockDnsPriority,
+  resolveMatchlockPrivileged,
+  type ResolvedMatchlockDnsPriority,
+  type ResolvedMatchlockPrivileged,
+} from "./isolation-settings.js";
+import {
   MATCHLOCK_ALLOW_PRIVATE_ENV,
   MATCHLOCK_ALLOW_PRIVATE_GRAMMAR,
   normalizeAllowPrivateEntries,
@@ -310,6 +316,28 @@ export interface MatchlockAdmissionOptions {
    * or empty keeps the pre-change policy byte-identical.
    */
   allowPrivate?: readonly string[];
+  /**
+   * ICEBOX Pillar B (privileged-by-default): the SUBMISSION-resolved
+   * whole-VM privilege setting + source (opt-out flag >
+   * TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1 > default ON), resolved by the
+   * composing surface (the CLI parser / run creation) and threaded here for
+   * a FRESH admission. When absent, admission resolves the bare built-in
+   * default itself (`privileged: true`, source `"default"`) — admission
+   * NEVER reads the ambient environment for this setting. Ignored when
+   * `inheritedPolicy` is present: a replacement preserves the inherited
+   * value VERBATIM (the persisted policy, never current flags/env, is
+   * authoritative — same INHERITANCE RULE as resource limits and
+   * allow-private).
+   */
+  matchlockPrivileged?: ResolvedMatchlockPrivileged;
+  /**
+   * ICEBOX DNS (NIXV6-DNS-REWRITER): the SUBMISSION-resolved address-family
+   * preference + source (flag > env > default ipv4). Same contract as
+   * {@link matchlockPrivileged}: fresh admissions get the supplied value or
+   * the bare built-in default; replacements preserve the inherited value
+   * verbatim.
+   */
+  matchlockDnsPriority?: ResolvedMatchlockDnsPriority;
   /**
    * MTLK-ALLOW-PRIVATE US-008: injectable allow-private support probe. When an
    * effective (inherited or supplied) allow-private list is non-empty, admission
@@ -684,6 +712,62 @@ function resolveAdmissionAllowPrivate(
   return normalized;
 }
 
+/**
+ * ICEBOX: resolve the effective isolation settings (privileged-by-default +
+ * DNS preference) for one admission.
+ *
+ * INHERITANCE RULE (identical to resource limits / allow-private): an
+ * inherited policy's persisted settings win VERBATIM — a replacement/rugpull
+ * never re-derives privilege or the DNS preference from current flags or the
+ * daemon environment. A pre-ICEBOX inherited record carries NEITHER field:
+ * the replacement WRITE materializes the standing ICEBOX defaults this
+ * binary actually selects (`privileged: true`, source `"default"`; priority
+ * `"ipv4"`, source `"default"`) so the new record is self-describing and a
+ * future composer-default change can never silently alter the replacement's
+ * behavior. (Read paths never rewrite stored JSON — only this fresh WRITE
+ * gains the fields.)
+ *
+ * A FRESH admission uses the caller-supplied resolved value; a caller that
+ * threads nothing (a pre-ICEBOX caller shape) gets the bare built-in
+ * defaults resolved HERE — never from the ambient environment.
+ */
+function resolveAdmissionIsolationSettings(
+  inherited: ExecutionIsolation | undefined,
+  supplied: {
+    privileged?: ResolvedMatchlockPrivileged;
+    dnsPriority?: ResolvedMatchlockDnsPriority;
+  },
+): {
+  matchlockPrivileged: ResolvedMatchlockPrivileged;
+  matchlockDnsPriority: ResolvedMatchlockDnsPriority;
+} {
+  if (inherited) {
+    return {
+      // Persisted values are preserved VERBATIM (cloned so the new record
+      // never aliases the inherited object); a pre-ICEBOX record gains the
+      // standing defaults this binary actually selects.
+      matchlockPrivileged:
+        inherited.matchlockPrivileged !== undefined
+          ? { ...inherited.matchlockPrivileged }
+          : resolveMatchlockPrivileged({}),
+      matchlockDnsPriority:
+        inherited.matchlockDnsPriority !== undefined
+          ? { ...inherited.matchlockDnsPriority }
+          : resolveMatchlockDnsPriority({}),
+    };
+  }
+  return {
+    matchlockPrivileged:
+      supplied.privileged !== undefined
+        ? { ...supplied.privileged }
+        : resolveMatchlockPrivileged({}),
+    matchlockDnsPriority:
+      supplied.dnsPriority !== undefined
+        ? { ...supplied.dnsPriority }
+        : resolveMatchlockDnsPriority({}),
+  };
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -998,6 +1082,15 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
   // the operator-supplied list. The value is persisted in the returned policy
   // and is never re-derived from the daemon environment at dispatch.
   const allowPrivate = resolveAdmissionAllowPrivate(inherited, opts.allowPrivate);
+  // ICEBOX isolation settings (privileged-by-default + DNS priority):
+  // resolved ONCE here under the INHERITANCE RULE (an inherited policy's
+  // persisted values win VERBATIM; a fresh admission uses the
+  // caller-supplied resolved value, else the bare built-in defaults).
+  // Admission never reads the ambient environment for these.
+  const isolationSettings = resolveAdmissionIsolationSettings(inherited, {
+    privileged: opts.matchlockPrivileged,
+    dnsPriority: opts.matchlockDnsPriority,
+  });
 
   // MTLK-ISO2-MEND (admission resolve-once-and-bind): resolve the ONE rpc
   // invocation HERE, after every structural refusal and before the first
@@ -1011,7 +1104,7 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
   };
 
   if (harness === "hermes") {
-    return admitHermesMatchlockRun(boundOpts, inherited, ctx, allowPrivate);
+    return admitHermesMatchlockRun(boundOpts, inherited, ctx, allowPrivate, isolationSettings);
   }
 
   // MTLK-ISO-SLICE2 US-003: the pi/dsh path runs the swap-capability handshake
@@ -1144,6 +1237,11 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
       : {}),
     resourceLimits,
     networkAllowPrivate: allowPrivate,
+    // ICEBOX isolation settings: the resolved value + its source reach the
+    // persisted policy on every fresh admission write (see
+    // resolveAdmissionIsolationSettings for the INHERITANCE RULE).
+    matchlockPrivileged: isolationSettings.matchlockPrivileged,
+    matchlockDnsPriority: isolationSettings.matchlockDnsPriority,
   });
   return { policy, identity: admitted.pin };
 }
@@ -1168,6 +1266,10 @@ async function admitHermesMatchlockRun(
   inherited: ExecutionIsolation | undefined,
   ctx: MountAdmissionContext | undefined,
   allowPrivate: string[] | undefined,
+  isolationSettings: {
+    matchlockPrivileged: ResolvedMatchlockPrivileged;
+    matchlockDnsPriority: ResolvedMatchlockDnsPriority;
+  },
 ): Promise<MatchlockAdmissionResult> {
   // R13 parity: the hermes path runs the SAME root gate, with the same code
   // and ordering, before its selection checks, probes or image resolve. The
@@ -1279,6 +1381,12 @@ async function admitHermesMatchlockRun(
     },
     resourceLimits,
     networkAllowPrivate: allowPrivate,
+    // ICEBOX isolation settings: identical to the pi/dsh path — the
+    // resolved value + source (inherited verbatim, or the fresh
+    // submission-resolved pair, or the standing defaults) reach the
+    // persisted policy.
+    matchlockPrivileged: isolationSettings.matchlockPrivileged,
+    matchlockDnsPriority: isolationSettings.matchlockDnsPriority,
   });
   return { policy, identity };
 }

@@ -441,6 +441,31 @@ describe("matchlock controller (fake rpc driver)", () => {
     assert.equal(mounts["/workspace/runtime"].readonly, true);
     assert.equal(mounts["/workspace/runtime"].host_path, helperPack);
     assert.equal((createParams.env as Record<string, string>).PI_CODING_AGENT_DIR, "/workspace/config/pi");
+    // ICEBOX: the composer's isolation settings ride the SAME create frame.
+    assert.equal(createParams.privileged, true, "privileged travels explicitly (default ON)");
+    const network = createParams.network as Record<string, unknown>;
+    assert.equal(network.dns_priority, "ipv4", "dns_priority travels explicitly (default ipv4)");
+  });
+
+  it("ICEBOX: an explicit opt-out + ipv6 priority reach the create request verbatim", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const c = s.makeController(
+      policy({
+        configurationRoot: configDir,
+        matchlockPrivileged: { privileged: false, source: "flag" },
+        matchlockDnsPriority: { priority: "ipv6", source: "flag" },
+      }),
+    );
+    await c.prepareAndCreate(pin());
+    const txn = s.readTranscript();
+    const createParams = txn.find((frame) => frame.method === "create")!.params as Record<string, unknown>;
+    assert.equal(createParams.privileged, false, "the persisted opt-out is preserved on the wire");
+    assert.equal(
+      (createParams.network as Record<string, unknown>).dns_priority,
+      "ipv6",
+      "the persisted ipv6 priority is preserved on the wire",
+    );
   });
 
   it("exec_pipe: streams stdout and stderr separately, honors stdin + EOF, frames decode exactly once", async (t) => {

@@ -50,6 +50,7 @@ describe("parseWorkflowRunArgs", () => {
       matchlockDisk: undefined,
       matchlockSwap: undefined,
       matchlockNoSwap: undefined,
+      matchlockNoPrivileged: undefined,
       matchlockAllowPrivate: undefined,
       context: {},
       wait: false,

@@ -63,6 +63,12 @@ import {
   normalizeAllowPrivateEntries,
   validateAllowPrivateEntry,
 } from "./allow-private.js";
+import {
+  isMatchlockDnsPriorityValue,
+  isMatchlockIsolationSettingSource,
+  type ResolvedMatchlockDnsPriority,
+  type ResolvedMatchlockPrivileged,
+} from "./isolation-settings.js";
 
 /**
  * Current policy record version. Bump when the field set changes
@@ -314,6 +320,36 @@ export interface ExecutionIsolation {
    * it from the daemon environment.
    */
   networkAllowPrivate?: string[];
+  /**
+   * ICEBOX Pillar B (privileged-by-default): the resolved whole-VM privilege
+   * setting + its resolution source. OPTIONAL on the record — a policy
+   * persisted before ICEBOX (a normalized v2 record, or a pre-ICEBOX v3
+   * record) carries none, and composing it applies the STANDING ICEBOX
+   * default (privileged ON — every VM this binary creates is privileged by
+   * default; the resolution chain is opt-out flag > env > default ON). A
+   * CURRENT write ALWAYS carries it: admission resolves the setting on
+   * fresh admissions and MATERIALIZES the effective value on a replacement
+   * write (inherited verbatim when present; the standing default over a
+   * pre-ICEBOX record), so every round/retry/resume dispatches the SAME
+   * privilege and dispatch never re-derives it from the environment. An
+   * explicit persisted `false` (opt-out) always survives.
+   */
+  matchlockPrivileged?: ResolvedMatchlockPrivileged;
+  /**
+   * ICEBOX DNS (NIXV6-DNS-REWRITER): the resolved guest-resolver
+   * address-family preference + its resolution source. OPTIONAL for a LEGACY
+   * record (absent => the create params carry the fork default `"ipv4"`). A
+   * CURRENT fresh write ALWAYS carries it so the run policy records the
+   * effective value + provenance (flag/env/default) as evidence.
+   */
+  matchlockDnsPriority?: ResolvedMatchlockDnsPriority;
+  /**
+   * Versioning note (ICEBOX): both settings are OPTIONAL additions to the
+   * version-3 record — the same shape discipline as `networkAllowPrivate`
+   * (no version bump). A pre-ICEBOX reader lists them as unknown fields and
+   * fails closed rather than misreading them; that is deliberate fail-closed
+   * behavior, not a backward-compatibility guarantee.
+   */
   resourceLimits: ExecutionIsolationResourceLimits;
 }
 
@@ -398,6 +434,21 @@ export interface BuildMatchlockPolicyParams {
    * shape check that fails closed before an invalid policy is persisted.
    */
   networkAllowPrivate?: readonly string[];
+  /**
+   * ICEBOX Pillar B: the submission-resolved whole-VM privilege setting
+   * (opt-out flag > env > default ON, resolved by the composing surface).
+   * Admission supplies this on EVERY write it performs — a fresh
+   * resolution, an inherited value preserved verbatim, or the standing
+   * default materialized over a pre-ICEBOX record. Direct callers
+   * (fixtures) may omit it; the field then stays absent on the built record
+   * and the shared composer applies the standing default-ON.
+   */
+  matchlockPrivileged?: ResolvedMatchlockPrivileged;
+  /**
+   * ICEBOX DNS: the submission-resolved address-family preference (flag >
+   * env > default ipv4). Same emission rule as {@link matchlockPrivileged}.
+   */
+  matchlockDnsPriority?: ResolvedMatchlockDnsPriority;
   /**
    * Optional injected host probe used ONLY when `resourceLimits` is absent, so
    * the host-derived defaults are deterministic in tests. Production callers
@@ -692,6 +743,19 @@ export function buildMatchlockPolicy(params: BuildMatchlockPolicyParams): Execut
     // Clone so the persisted record never aliases caller state; omit entirely
     // when empty so an unset list stays absent.
     ...(networkAllowPrivate.length > 0 ? { networkAllowPrivate: [...networkAllowPrivate] } : {}),
+    // ICEBOX isolation settings (privileged-by-default + DNS priority):
+    // EMISSION RULE — the field is written only when the caller supplies it.
+    // Admission supplies both on every write it performs (a fresh
+    // resolution, an inherited value preserved verbatim, or the standing
+    // default materialized over a pre-ICEBOX record); a direct caller
+    // (fixture) that supplies neither builds a record without them, and the
+    // shared composer then applies the standing defaults at create time.
+    ...(params.matchlockPrivileged !== undefined
+      ? { matchlockPrivileged: { ...params.matchlockPrivileged } }
+      : {}),
+    ...(params.matchlockDnsPriority !== undefined
+      ? { matchlockDnsPriority: { ...params.matchlockDnsPriority } }
+      : {}),
     resourceLimits: params.resourceLimits
       ? completeResourceLimits(params.resourceLimits)
       : resolveDefaultResourceLimits(params.resourceHostProbe),
@@ -848,6 +912,10 @@ const EXECUTION_ISOLATION_KEYS = new Set([
   "mountPolicyVersion",
   "networkPolicyVersion",
   "networkAllowPrivate",
+  // ICEBOX isolation settings (v3, OPTIONAL for legacy records; a PRESENT
+  // value is shape-validated).
+  "matchlockPrivileged",
+  "matchlockDnsPriority",
   "resourceLimits",
 ]);
 
@@ -1039,6 +1107,14 @@ export function matchlockPolicyValidationErrors(
     if (v.rootUsageConsent !== undefined) {
       errors.push("rootUsageConsent is a version-3 field; a version-2 record must not carry it");
     }
+    // ICEBOX isolation settings are v3-only fields too (version/field-set
+    // agreement holds for them exactly like the two above).
+    if (v.matchlockPrivileged !== undefined) {
+      errors.push("matchlockPrivileged is a version-3 field; a version-2 record must not carry it");
+    }
+    if (v.matchlockDnsPriority !== undefined) {
+      errors.push("matchlockDnsPriority is a version-3 field; a version-2 record must not carry it");
+    }
   } else {
     // REQUIRED v3 image provenance.
     if (v.requestedImageSource !== "explicit" && v.requestedImageSource !== "standard") {
@@ -1147,6 +1223,54 @@ export function matchlockPolicyValidationErrors(
       );
     } else if (!(v.networkAllowPrivate as unknown[]).every(isAllowPrivateEntryShape)) {
       errors.push(`every networkAllowPrivate entry must be ${MATCHLOCK_ALLOW_PRIVATE_GRAMMAR}`);
+    }
+  }
+  // ICEBOX isolation settings: OPTIONAL (absent on any pre-ICEBOX record),
+  // but a PRESENT value is a strict `{ value, source }` pair with no unknown
+  // nested keys — a malformed or partial object must never survive a
+  // fail-closed read.
+  if (v.matchlockPrivileged !== undefined) {
+    const s = v.matchlockPrivileged;
+    if (!isRecord(s)) {
+      errors.push("matchlockPrivileged must be an object with privileged + source when present");
+    } else {
+      for (const key of Object.keys(s)) {
+        if (key !== "privileged" && key !== "source") {
+          errors.push(
+            /^[A-Za-z0-9_]{1,64}$/.test(key)
+              ? `matchlockPrivileged has unknown field "${key}"`
+              : "matchlockPrivileged has an unknown field (unsafe name withheld)",
+          );
+        }
+      }
+      if (typeof s.privileged !== "boolean") {
+        errors.push("matchlockPrivileged.privileged must be a boolean");
+      }
+      if (!isMatchlockIsolationSettingSource(s.source)) {
+        errors.push('matchlockPrivileged.source must be "flag", "env" or "default"');
+      }
+    }
+  }
+  if (v.matchlockDnsPriority !== undefined) {
+    const s = v.matchlockDnsPriority;
+    if (!isRecord(s)) {
+      errors.push("matchlockDnsPriority must be an object with priority + source when present");
+    } else {
+      for (const key of Object.keys(s)) {
+        if (key !== "priority" && key !== "source") {
+          errors.push(
+            /^[A-Za-z0-9_]{1,64}$/.test(key)
+              ? `matchlockDnsPriority has unknown field "${key}"`
+              : "matchlockDnsPriority has an unknown field (unsafe name withheld)",
+          );
+        }
+      }
+      if (!isMatchlockDnsPriorityValue(s.priority)) {
+        errors.push('matchlockDnsPriority.priority must be "ipv4" or "ipv6"');
+      }
+      if (!isMatchlockIsolationSettingSource(s.source)) {
+        errors.push('matchlockDnsPriority.source must be "flag", "env" or "default"');
+      }
     }
   }
   if (!isExecutionIsolationResourceLimits(v.resourceLimits, requireV3Fields)) {

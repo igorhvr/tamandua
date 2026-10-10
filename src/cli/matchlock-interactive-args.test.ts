@@ -18,6 +18,9 @@ import {
   MatchlockResourceLimitError,
 } from "../../dist/installer/matchlock/resource-limits.js";
 import { MATCHLOCK_ALLOW_PRIVATE_ENV } from "../../dist/installer/matchlock/allow-private.js";
+import {
+  MatchlockIsolationSettingError,
+} from "../../dist/installer/matchlock/isolation-settings.js";
 
 // Deterministic host probe: 8 online CPUs, 32 GiB MemTotal so the built-in
 // defaults are stable (cpus 8, memory 16384 MB, disk 20480 MB, swap 8192 MB).
@@ -346,5 +349,110 @@ describe("parseInteractiveSessionArgs — working directory", () => {
   it("accepts an absolute existing directory", () => {
     const result = parse(["--working-directory-for-harness", process.cwd()]);
     assert.equal(result.workingDirectory, process.cwd());
+  });
+});
+
+// ── ICEBOX isolation settings (privileged-by-default + DNS priority) ──
+
+describe("ICEBOX isolation settings on the interactive parser", () => {
+  it("defaults to privileged ON (source default) and ipv4 (source default)", () => {
+    const result = parse([], "pi", { env: {} });
+    assert.deepEqual(result.matchlockPrivileged, { privileged: true, source: "default" });
+    assert.deepEqual(result.matchlockDnsPriority, { priority: "ipv4", source: "default" });
+  });
+
+  it("opts the whole-VM privilege out via the flag and via the env (flag > env)", () => {
+    const byFlag = parse(["--matchlock-no-privileged"], "pi", { env: {} });
+    assert.deepEqual(byFlag.matchlockPrivileged, { privileged: false, source: "flag" });
+
+    const byEnv = parse([], "pi", { env: { TAMANDUA_MATCHLOCK_NO_PRIVILEGED: "1" } });
+    assert.deepEqual(byEnv.matchlockPrivileged, { privileged: false, source: "env" });
+
+    const both = parse(["--matchlock-no-privileged"], "pi", {
+      env: { TAMANDUA_MATCHLOCK_NO_PRIVILEGED: "1" },
+    });
+    assert.deepEqual(both.matchlockPrivileged, { privileged: false, source: "flag" });
+  });
+
+  it("accepts each DNS-priority flag and both flags (ipv6 wins, either order)", () => {
+    const ipv4 = parse(["--matchlock-prioritize-ipv4-dns-resolution"], "pi", { env: {} });
+    assert.deepEqual(ipv4.matchlockDnsPriority, { priority: "ipv4", source: "flag" });
+
+    const ipv6 = parse(["--matchlock-prioritize-ipv6-dns-resolution"], "pi", { env: {} });
+    assert.deepEqual(ipv6.matchlockDnsPriority, { priority: "ipv6", source: "flag" });
+
+    const bothV4First = parse(
+      ["--matchlock-prioritize-ipv4-dns-resolution", "--matchlock-prioritize-ipv6-dns-resolution"],
+      "pi",
+      { env: {} },
+    );
+    assert.deepEqual(bothV4First.matchlockDnsPriority, { priority: "ipv6", source: "flag" });
+
+    const bothV6First = parse(
+      ["--matchlock-prioritize-ipv6-dns-resolution", "--matchlock-prioritize-ipv4-dns-resolution"],
+      "pi",
+      { env: {} },
+    );
+    assert.deepEqual(bothV6First.matchlockDnsPriority, { priority: "ipv6", source: "flag" });
+  });
+
+  it("resolves the DNS env, lets either flag win over it, and ignores malformed env under a flag", () => {
+    const envV6 = parse([], "pi", { env: { TAMANDUA_MATCHLOCK_DNS_PRIORITY: "ipv6" } });
+    assert.deepEqual(envV6.matchlockDnsPriority, { priority: "ipv6", source: "env" });
+
+    const flagV4 = parse(["--matchlock-prioritize-ipv4-dns-resolution"], "pi", {
+      env: { TAMANDUA_MATCHLOCK_DNS_PRIORITY: "ipv6" },
+    });
+    assert.deepEqual(flagV4.matchlockDnsPriority, { priority: "ipv4", source: "flag" });
+
+    const flagV6 = parse(["--matchlock-prioritize-ipv6-dns-resolution"], "pi", {
+      env: { TAMANDUA_MATCHLOCK_DNS_PRIORITY: "garbage" },
+    });
+    assert.deepEqual(flagV6.matchlockDnsPriority, { priority: "ipv6", source: "flag" });
+  });
+
+  it("refuses a malformed CONSULTED TAMANDUA_MATCHLOCK_DNS_PRIORITY with a typed error", () => {
+    assert.throws(
+      () => parse([], "pi", { env: { TAMANDUA_MATCHLOCK_DNS_PRIORITY: "garbage" } }),
+      (err: unknown) =>
+        err instanceof MatchlockIsolationSettingError &&
+        err.message.includes("TAMANDUA_MATCHLOCK_DNS_PRIORITY"),
+    );
+  });
+
+  it("accepts both new flags on all four subcommands (both DNS flag orders resolve ipv6)", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      for (const dnsArgs of [
+        ["--matchlock-prioritize-ipv4-dns-resolution", "--matchlock-prioritize-ipv6-dns-resolution"],
+        ["--matchlock-prioritize-ipv6-dns-resolution", "--matchlock-prioritize-ipv4-dns-resolution"],
+      ]) {
+        const result = parse(["--matchlock-no-privileged", ...dnsArgs], subcommand, { env: {} });
+        assert.deepEqual(result.matchlockPrivileged, { privileged: false, source: "flag" });
+        assert.deepEqual(
+          result.matchlockDnsPriority,
+          { priority: "ipv6", source: "flag" },
+          `${subcommand} ${dnsArgs.join(" ")} => ipv6 wins`,
+        );
+      }
+    }
+  });
+
+  it("rejects the value-bearing equals form of --matchlock-no-privileged", () => {
+    assert.throws(
+      () => parse(["--matchlock-no-privileged=1"]),
+      (err: unknown) =>
+        err instanceof InteractiveSessionArgError &&
+        /Unknown option "--matchlock-no-privileged=1"/.test(err.message),
+    );
+  });
+
+  it("never consumes a following token as a value for the boolean flags", () => {
+    // `--matchlock-no-privileged pi` must treat `pi` as an unexpected
+    // positional argument, never as the flag's value.
+    assert.throws(() => parse(["--matchlock-no-privileged", "pi"]), /Unexpected argument/);
+    assert.throws(
+      () => parse(["--matchlock-prioritize-ipv6-dns-resolution", "something"]),
+      /Unexpected argument/,
+    );
   });
 });

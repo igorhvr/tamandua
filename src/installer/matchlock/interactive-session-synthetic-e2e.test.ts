@@ -441,8 +441,22 @@ describe("US-014: synthetic end-to-end interactive session", () => {
     assert.match(prelaunch, /image provenance: explicit/);
     assert.match(prelaunch, /digest=sha256:e2e-digest/);
     assert.match(prelaunch, /guest identity: uid=1000 gid=1000/);
+    // ICEBOX Pillar B: the additive guest-sudo line follows the identity line.
+    assert.match(prelaunch, /guest sudo: passwordless for all users \(privileged VM\)/);
     assert.match(prelaunch, new RegExp(`rw ${escapeRegExp(workDir)}`));
     assert.match(run.diagnostics(), /Warning: .*root/i);
+
+    // ICEBOX: the create frame itself carries the resolved isolation settings
+    // (privileged ON + the explicit dns_priority default) — the wire contract
+    // the shared composer owns, observed end to end.
+    const createRequest = frames.find((frame) => frame.method === "create");
+    assert.ok(createRequest, "a create frame must be present");
+    assert.equal(createRequest.params?.privileged, true, "privileged ON by default on the wire");
+    assert.equal(
+      (createRequest.params?.network as Record<string, unknown> | undefined)?.dns_priority,
+      "ipv4",
+      "the resolved dns_priority is ALWAYS sent explicitly",
+    );
 
     // Host terminal is restored exactly once.
     assert.equal(run.terminal.rawEnabled, 1);
@@ -471,6 +485,11 @@ describe("US-014: synthetic end-to-end interactive session", () => {
       workDir,
       "--matchlock-image",
       "vic/ml:latest",
+      "--matchlock-no-privileged",
+      // IPv6 BEFORE IPv4 on purpose: the last argument must not be the
+      // "winner" — the both-flags rule is ipv6-wins in EITHER order.
+      "--matchlock-prioritize-ipv6-dns-resolution",
+      "--matchlock-prioritize-ipv4-dns-resolution",
     ]);
 
     await run.terminal.installed;
@@ -483,6 +502,19 @@ describe("US-014: synthetic end-to-end interactive session", () => {
     assert.equal(tty?.params?.command, "zsh", "the shell variant execs an image zsh");
     assert.ok(eventIndex(frames, "vm_closed") >= 0, "the shell VM close is confirmed");
     assert.match(run.prelaunch(), /run `pi` inside the shell to start the same session/);
+    // ICEBOX: the opt-out + both-DNS-flags invocation reaches the create frame
+    // with ipv6 winning (either order), and the banner reports the standard-VM
+    // variant; explicit provenance means NO ` (standard image)` suffix.
+    const createRequest = frames.find((frame) => frame.method === "create");
+    assert.ok(createRequest, "a create frame must be present");
+    assert.equal(createRequest.params?.privileged, false, "the opt-out reaches the create frame");
+    assert.equal(
+      (createRequest.params?.network as Record<string, unknown> | undefined)?.dns_priority,
+      "ipv6",
+      "both DNS flags => ipv6 wins on the wire regardless of order",
+    );
+    assert.match(run.prelaunch(), /guest sudo: blocked \(standard VM\)/);
+    assert.doesNotMatch(run.prelaunch(), /\(standard image\)/);
     assert.deepEqual(run.exits, []);
     assert.equal(run.terminal.restored, 1);
   });

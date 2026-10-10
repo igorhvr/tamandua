@@ -521,6 +521,19 @@ export async function planInteractiveSession(
     workingDirectory: args.workingDirectory,
     resourceLimits,
     allowPrivate: args.allowPrivate,
+    // ICEBOX (tamandua-5rr.3 E2): the parser-resolved isolation settings
+    // (privileged: opt-out flag > env=1 > default ON; DNS preference: ipv6
+    // flag > ipv4 flag > env > default ipv4) reach admission, which persists
+    // the value + source on the v3 policy; the shared create composer emits
+    // them explicitly on the wire. Conditionally spread so a caller with a
+    // pre-ICEBOX args shape records a byte-identical admission-options call
+    // (admission then applies the same bare defaults internally).
+    ...(args.matchlockPrivileged !== undefined
+      ? { matchlockPrivileged: args.matchlockPrivileged }
+      : {}),
+    ...(args.matchlockDnsPriority !== undefined
+      ? { matchlockDnsPriority: args.matchlockDnsPriority }
+      : {}),
     ...(options.allowPrivateSupportProbe
       ? { allowPrivateSupportProbe: options.allowPrivateSupportProbe }
       : {}),

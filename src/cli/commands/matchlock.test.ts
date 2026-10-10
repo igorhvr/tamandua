@@ -352,8 +352,57 @@ describe("matchlock CLI handler (in-process)", () => {
     assert.equal(seen.workingDirectory, cwd);
     assert.equal(seen.image, "igorhvr/tamandua");
     assert.equal(seen.imageSource, "standard");
+    // ICEBOX (tamandua-5rr.3 E2): the parser always resolves both isolation
+    // settings; a bare invocation yields the defaults.
+    assert.deepEqual(seen.matchlockPrivileged, { privileged: true, source: "default" });
+    assert.deepEqual(seen.matchlockDnsPriority, { priority: "ipv4", source: "default" });
     // Exit 0 is the dispatcher's normal fall-through; it must not call exit().
     assert.deepEqual(captured.exits, []);
+  });
+
+  it("ICEBOX: parses --matchlock-no-privileged + BOTH DNS flags through the handler (ipv6 wins)", async () => {
+    let seen: InteractiveSessionArgs | undefined;
+    const captured = captureDeps({
+      runSession: async (args) => {
+        seen = args;
+        return 0;
+      },
+    });
+    await handleMatchlock(
+      "matchlock",
+      [
+        "matchlock",
+        "pi",
+        "--matchlock-no-privileged",
+        "--matchlock-prioritize-ipv4-dns-resolution",
+        "--matchlock-prioritize-ipv6-dns-resolution",
+      ],
+      captured.deps,
+    );
+    assert.ok(seen);
+    assert.deepEqual(seen.matchlockPrivileged, { privileged: false, source: "flag" });
+    assert.deepEqual(
+      seen.matchlockDnsPriority,
+      { priority: "ipv6", source: "flag" },
+      "both DNS flags supplied => ipv6 wins, never an error",
+    );
+    assert.deepEqual(captured.exits, [], "a valid invocation does not exit");
+  });
+
+  it("ICEBOX: a malformed TAMANDUA_MATCHLOCK_DNS_PRIORITY exits 1 naming the env var, with no launch", async () => {
+    let launched = false;
+    const captured = captureDeps({
+      env: { TAMANDUA_MATCHLOCK_DNS_PRIORITY: "garbage" },
+      runSession: async () => {
+        launched = true;
+        return 0;
+      },
+    });
+    await handleMatchlock("matchlock", ["matchlock", "pi"], captured.deps);
+    assert.deepEqual(captured.exits, [1]);
+    assert.equal(launched, false, "no session may launch on a typed usage refusal");
+    assert.match(captured.stderr(), /TAMANDUA_MATCHLOCK_DNS_PRIORITY/);
+    assert.match(captured.stderr(), /expected exactly "ipv4" or "ipv6"/);
   });
 
   it("parses hermes-shell and propagates the launched exit status", async () => {
@@ -396,6 +445,9 @@ describe("matchlock help renderers", () => {
     assert.match(help, /--matchlock-image <ref>/);
     assert.match(help, /--matchlock-no-swap/);
     assert.match(help, /--matchlock-allow-private <entry>/);
+    assert.match(help, /--matchlock-no-privileged/);
+    assert.match(help, /--matchlock-prioritize-ipv4-dns-resolution/);
+    assert.match(help, /--matchlock-prioritize-ipv6-dns-resolution/);
     assert.match(help, /--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs/);
     assert.match(help, /tamandua matchlock setup/);
     assert.match(help, /no workflow-round deadline/);
@@ -415,6 +467,16 @@ describe("matchlock help renderers", () => {
       assert.match(help, /--working-directory-for-harness <dir>/);
       assert.match(help, /--matchlock-image <ref>/);
       assert.match(help, /Environment precedence:/);
+      // ICEBOX: the new flags and the two precedence lines are documented on
+      // every interactive command's help.
+      assert.match(help, /--matchlock-no-privileged/);
+      assert.match(help, /--matchlock-prioritize-ipv4-dns-resolution/);
+      assert.match(help, /--matchlock-prioritize-ipv6-dns-resolution/);
+      assert.match(help, /privileged --matchlock-no-privileged > TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1/);
+      assert.match(
+        help,
+        /dns-priority --matchlock-prioritize-ipv6-dns-resolution >\s+--matchlock-prioritize-ipv4-dns-resolution >\s+TAMANDUA_MATCHLOCK_DNS_PRIORITY \(exactly "ipv4" or "ipv6"\) >\s+default ipv4/,
+      );
     });
   }
 

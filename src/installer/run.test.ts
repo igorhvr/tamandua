@@ -144,6 +144,13 @@ async function runMatchlockRunAndReadPolicy(
     matchlockImageSource?: "explicit" | "standard";
     matchlockRootUsageOverride?: boolean;
     matchlockPolicy?: ReturnType<typeof parseMatchlockPolicy>;
+    /** ICEBOX: the whole-VM privilege opt-out for THIS fresh launch. */
+    matchlockNoPrivileged?: boolean;
+    /**
+     * ICEBOX: extra env values set for the runWorkflow call (restored after).
+     * `undefined` DELETES the key for the duration of the call.
+     */
+    extraEnv?: Array<[string, string | undefined]>;
   },
 ): Promise<{ policy: ReturnType<typeof parseMatchlockPolicy>; result?: Awaited<ReturnType<typeof runWorkflow>> }> {
   const configRoot = path.join(tempHome, ".pi", "agent");
@@ -164,6 +171,8 @@ async function runMatchlockRunAndReadPolicy(
   setEnv("FAKE_IMAGE_TAG", opts.fakeImageTag ?? opts.image);
   setEnv("FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   setEnv("FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+  // ICEBOX: caller-supplied env for the isolation-setting resolution.
+  for (const [key, value] of opts.extraEnv ?? []) setEnv(key, value);
 
   let result: Awaited<ReturnType<typeof runWorkflow>> | undefined;
   try {
@@ -175,6 +184,7 @@ async function runMatchlockRunAndReadPolicy(
       ...(opts.matchlockImageSource ? { matchlockImageSource: opts.matchlockImageSource } : {}),
       ...(opts.matchlockRootUsageOverride ? { matchlockRootUsageOverride: true } : {}),
       ...(opts.matchlockPolicy ? { matchlockPolicy: opts.matchlockPolicy } : {}),
+      ...(opts.matchlockNoPrivileged ? { matchlockNoPrivileged: true } : {}),
       matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
       matchlockResourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 },
     });
@@ -1809,6 +1819,215 @@ describe("runWorkflow", () => {
       assert.ok(rows.length > 0, "run record should exist");
       assert.equal(rows[0].matchlock_policy, null,
         "absent --matchlock must leave the policy NULL (zero Matchlock actions)");
+    });
+
+    // ── ICEBOX (tamandua-5rr.3 E2): isolation-setting persistence ──────
+
+    it("ICEBOX: persists privileged ON + ipv4 with source default for a fresh opt-in", async () => {
+      const workflowId = "test-ctx-mtlk-icebox-defaults";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const { policy } = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Test ICEBOX privilege/DNS defaults",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          // Deterministic: both vars must be UNSET for the default-source case.
+          extraEnv: [
+            ["TAMANDUA_MATCHLOCK_NO_PRIVILEGED", undefined],
+            ["TAMANDUA_MATCHLOCK_DNS_PRIORITY", undefined],
+          ],
+        });
+        assert.deepEqual(policy.matchlockPrivileged, { privileged: true, source: "default" });
+        assert.deepEqual(policy.matchlockDnsPriority, { priority: "ipv4", source: "default" });
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("ICEBOX: resolves BOTH settings from the submission environment with source env", async () => {
+      const workflowId = "test-ctx-mtlk-icebox-env";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const { policy } = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Test ICEBOX env resolution",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          extraEnv: [
+            ["TAMANDUA_MATCHLOCK_NO_PRIVILEGED", "1"],
+            ["TAMANDUA_MATCHLOCK_DNS_PRIORITY", "ipv6"],
+          ],
+        });
+        assert.deepEqual(policy.matchlockPrivileged, { privileged: false, source: "env" });
+        assert.deepEqual(policy.matchlockDnsPriority, { priority: "ipv6", source: "env" });
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("ICEBOX: the --matchlock-no-privileged flag beats the opt-out env (source flag)", async () => {
+      const workflowId = "test-ctx-mtlk-icebox-flag";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const { policy } = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Test ICEBOX flag precedence",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          matchlockNoPrivileged: true,
+          extraEnv: [["TAMANDUA_MATCHLOCK_NO_PRIVILEGED", "1"]],
+        });
+        assert.deepEqual(policy.matchlockPrivileged, { privileged: false, source: "flag" });
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("ICEBOX: a replacement preserves the inherited settings verbatim and never consults the environment (even a malformed value)", async () => {
+      const workflowId = "test-ctx-mtlk-icebox-inherit";
+      const replacementId = "test-ctx-mtlk-icebox-inherit-repl";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      writeMinimalWorkflow(tempHome, replacementId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const first = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Test ICEBOX inherited settings",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          extraEnv: [
+            ["TAMANDUA_MATCHLOCK_NO_PRIVILEGED", "1"],
+            ["TAMANDUA_MATCHLOCK_DNS_PRIORITY", "ipv6"],
+          ],
+        });
+        assert.deepEqual(first.policy.matchlockPrivileged, { privileged: false, source: "env" });
+        assert.deepEqual(first.policy.matchlockDnsPriority, { priority: "ipv6", source: "env" });
+
+        const replacement = await runMatchlockRunAndReadPolicy(tempHome, replacementId, {
+          taskTitle: "Test ICEBOX inherited settings (replacement)",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          matchlockPolicy: first.policy,
+          // Contradictory AND malformed environment: a replacement must not
+          // re-derive anything — the malformed DNS value must not even be
+          // parsed (no throw), and neither setting may change.
+          extraEnv: [
+            ["TAMANDUA_MATCHLOCK_NO_PRIVILEGED", "0"],
+            ["TAMANDUA_MATCHLOCK_DNS_PRIORITY", "garbage"],
+          ],
+        });
+        assert.deepEqual(
+          replacement.policy.matchlockPrivileged,
+          first.policy.matchlockPrivileged,
+          "the inherited privilege setting + source survive the replacement VERBATIM",
+        );
+        assert.deepEqual(
+          replacement.policy.matchlockDnsPriority,
+          first.policy.matchlockDnsPriority,
+          "the inherited DNS setting + source survive the replacement VERBATIM",
+        );
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("ICEBOX: a native run never consults the isolation environment (a malformed DNS value is irrelevant)", async () => {
+      const workflowId = "test-ctx-mtlk-icebox-native";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv("TAMANDUA_MATCHLOCK_DNS_PRIORITY", "garbage");
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test ICEBOX native env isolation",
+        });
+      } catch (err) {
+        // The ONLY tolerated failure is the established isolated-daemon
+        // registration case; nothing may fail on the isolation env.
+        assert.ok(
+          err instanceof Error && /Failed to register run with daemon|daemon/.test(err.message),
+          `a native run must never fail on the isolation env: ${String(err)}`,
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { matchlock_policy: string | null }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.equal(
+        rows[0].matchlock_policy,
+        null,
+        "a native run persists no policy and never resolves the isolation env",
+      );
+    });
+
+    it("ICEBOX: a FRESH launch with a malformed CONSULTED DNS env refuses BEFORE any run record exists", async () => {
+      const workflowId = "test-ctx-mtlk-icebox-bad-env";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      const savedEnv: Array<[string, string | undefined]> = [];
+      const setEnv = (key: string, value: string | undefined): void => {
+        savedEnv.push([key, process.env[key]]);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      setEnv("TAMANDUA_MATCHLOCK_DNS_PRIORITY", "garbage");
+      try {
+        await assert.rejects(
+          () =>
+            runWorkflow({
+              workflowId,
+              taskTitle: "Test ICEBOX malformed DNS env",
+              workingDirectoryForHarness: repoDir,
+              matchlockImage: "vic/matchlock-base:latest",
+            }),
+          (err: unknown) => {
+            const message = err instanceof Error ? err.message : String(err);
+            assert.match(message, /TAMANDUA_MATCHLOCK_DNS_PRIORITY/);
+            assert.match(message, /expected exactly "ipv4" or "ipv6"/);
+            return true;
+          },
+          "the malformed env must refuse the launch, not be silently ignored",
+        );
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT id FROM runs WHERE workflow_id = ?"
+      ).all(workflowId) as Array<{ id: string }>;
+      assert.equal(
+        rows.length,
+        0,
+        "the resolution precedes run creation: no run row may exist after the refusal",
+      );
     });
 
     it("HERMES opt-in: admits and persists a PINNED harness-hermes policy carrying the FROZEN submission inputs + resolved Hermes config root/profile (resolve-only wire journal, no create)", async () => {

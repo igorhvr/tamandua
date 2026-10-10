@@ -298,6 +298,14 @@ Options:
       /workspace/config/dsh (preserving sessions/, profiles/, storages/, credentials/ and
       unknown entries as one mount) and the guest runs
       'dsh --profile headless <prompt>'.
+      Guest DNS: every opted-in VM's resolver is composed with
+      network.dns_priority resolved at submission from
+      TAMANDUA_MATCHLOCK_DNS_PRIORITY=ipv4|ipv6 (default ipv4) and recorded
+      in the run policy with its source. Workflow commands deliberately
+      expose no per-run DNS flag; the interactive commands
+      (tamandua matchlock pi|pi-shell|hermes|hermes-shell) own the
+      --matchlock-prioritize-ipv4-dns-resolution /
+      --matchlock-prioritize-ipv6-dns-resolution flags.
       A hermes/dsh work round returns plain text (not pi JSON); the session id
       comes from the stderr trailer and usage is projected from the mapped
       store inside the still-owned VM (input+output+cache_write; unknown/
@@ -399,6 +407,17 @@ Options:
       token. Mutually exclusive with --matchlock-swap. Requires --matchlock
       or --matchlock-image <image>. Env equivalent:
       ${MATCHLOCK_SWAP_ENV}=off.
+  --matchlock-no-privileged
+      Create every VM of the opted-in run WITHOUT the default whole-VM
+      privilege: in-guest sudo is blocked (standard VM). The persisted run
+      policy records the resolved value with its source (matchlockPrivileged
+      false, source "flag"). A pure boolean: it never consumes a following
+      token; a value-bearing (=...) form is an error. Requires --matchlock
+      or --matchlock-image <image>; without an opt-in the flag is a usage
+      error. Env equivalent: TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1 (the ONLY
+      enabling value). Precedence:
+      --matchlock-no-privileged > TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1 >
+      default on.
   --matchlock-allow-private <entry>
       Per-run exception list of private destinations the opted-in Matchlock
       VM may reach; mapped to the Matchlock network.allow_private policy.
@@ -1403,6 +1422,11 @@ export async function handleWorkflow(
       matchlockHarness: runArgs.matchlockImage !== undefined && harnessType === "dsh" ? "dsh" : "pi",
       dshSubmission,
       matchlockResourceLimits,
+      // ICEBOX Pillar B: the parsed pure-boolean privilege opt-out reaches
+      // run creation, which resolves the effective setting (opt-out flag >
+      // TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1 > default ON) at submission and
+      // threads the value + source into admission/persistence.
+      matchlockNoPrivileged: runArgs.matchlockNoPrivileged,
       // MTLK-ALLOW-PRIVATE: the launch-resolved (flag > env) entry list reaches
       // run creation/admission, which persists it on the run's Matchlock policy.
       matchlockAllowPrivate: runArgs.matchlockAllowPrivate,

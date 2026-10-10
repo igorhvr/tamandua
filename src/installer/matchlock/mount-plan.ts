@@ -716,6 +716,16 @@ function composeCreateParams(
       config_digest: identity.config_digest,
       ...(identity.tag ? { tag: identity.tag } : {}),
     },
+    // ICEBOX Pillar B (privileged-by-default): the resolved whole-VM
+    // privilege ALWAYS travels explicitly as the top-level `privileged`
+    // field. The resolved value (persisted with its source on the run
+    // policy — opt-out flag > env > default ON) wins when present; a record
+    // that predates the field (a hand-built fixture, or a legacy inherited
+    // record re-persisted verbatim) composes under the STANDING ICEBOX
+    // default-ON, exactly like a fresh run — and an explicitly persisted
+    // `false` (opt-out) always survives. The wire request is therefore
+    // self-describing and never depends on matchlock's own default.
+    privileged: policy.matchlockPrivileged?.privileged ?? true,
     resources: {
       cpus: policy.resourceLimits.cpus,
       memory_mb: policy.resourceLimits.memoryMB,
@@ -737,6 +747,13 @@ function composeCreateParams(
     network: {
       block_private_ips: true,
       intercept: true,
+      // ICEBOX DNS (NIXV6-DNS-REWRITER): the resolved address-family
+      // preference ALWAYS travels explicitly — even when it equals the fork
+      // default — so every create request is self-describing and behavior
+      // is pinned to the tamandua version that composed it (no ambiguity if
+      // the fork default ever changes). A policy record that predates the
+      // field falls back to the fork default "ipv4".
+      dns_priority: policy.matchlockDnsPriority?.priority ?? "ipv4",
       ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
         ? { allow_private: [...policy.networkAllowPrivate] }
         : {}),

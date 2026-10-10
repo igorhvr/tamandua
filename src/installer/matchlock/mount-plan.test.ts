@@ -167,7 +167,7 @@ describe("matchlock mount plan", () => {
       IDENTITY,
       { helperPackHostPath: helperPack },
     );
-    assert.deepEqual(Object.keys(empty.network ?? {}).sort(), ["block_private_ips", "intercept"]);
+    assert.deepEqual(Object.keys(empty.network ?? {}).sort(), ["block_private_ips", "dns_priority", "intercept"]);
   });
 
   it("MTLK-ALLOW-PRIVATE: the emitted allow_private list is a clone, never a live alias of the policy", () => {
@@ -1054,6 +1054,44 @@ describe("matchlock mount plan", () => {
         assert.equal("owner_uid" in m, false, "workflow mounts must not gain owner fields");
         assert.equal("owner_gid" in m, false, "workflow mounts must not gain owner fields");
       }
+    });
+
+    // ── ICEBOX (tamandua-5rr.3 E2): isolation settings on the wire ──
+
+    it("ICEBOX: defaults compose as privileged=true + the explicit dns_priority; an explicit opt-out and ipv6 survive", () => {
+      // Default: no settings on the policy record → the STANDING ICEBOX
+      // defaults (privileged ON, ipv4), ALWAYS explicit on the wire.
+      const dflt = buildInteractiveSessionCreateConfig(interactivePolicy(), IDENTITY, OWNER);
+      assert.equal(dflt.privileged, true, "the top-level privileged field is emitted explicitly");
+      assert.equal(
+        dflt.network?.dns_priority,
+        "ipv4",
+        "dns_priority is emitted explicitly even at the default",
+      );
+      assert.equal(dflt.network?.block_private_ips, true, "existing boundary fields are untouched");
+      assert.equal(dflt.network?.intercept, true);
+
+      // Explicit opt-out + ipv6: the persisted pair wins verbatim.
+      const opted = buildInteractiveSessionCreateConfig(
+        interactivePolicy({
+          matchlockPrivileged: { privileged: false, source: "flag" },
+          matchlockDnsPriority: { priority: "ipv6", source: "flag" },
+        }),
+        IDENTITY,
+        OWNER,
+      );
+      assert.equal(opted.privileged, false, "an explicit opt-out is preserved on the wire");
+      assert.equal(opted.network?.dns_priority, "ipv6");
+    });
+
+    it("ICEBOX: the WORKFLOW builder carries the same fields in its create params", () => {
+      const dflt = buildMatchlockCreateConfig(interactivePolicy(), IDENTITY, {
+        helperPackHostPath: helperPack,
+      });
+      assert.equal(dflt.privileged, true);
+      assert.equal(dflt.network?.dns_priority, "ipv4");
+      assert.equal(dflt.network?.block_private_ips, true);
+      assert.equal(dflt.network?.intercept, true);
     });
   });
 });

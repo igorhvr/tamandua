@@ -14,6 +14,7 @@ import {
   type MatchlockImageSource,
 } from "../installer/matchlock/standard-image.js";
 import { parseSwapMB } from "../installer/matchlock/resource-limits.js";
+import { MATCHLOCK_NO_PRIVILEGED_FLAG } from "../installer/matchlock/isolation-settings.js";
 
 export interface WorkflowRunArgs {
   taskTitle: string;
@@ -84,6 +85,16 @@ export interface WorkflowRunArgs {
    */
   matchlockNoSwap?: boolean;
   /**
+   * ICEBOX Pillar B (privileged-by-default): true when the pure-boolean
+   * `--matchlock-no-privileged` opt-out was supplied. Disables the default
+   * whole-VM privilege for every VM of this run (in-guest sudo blocked;
+   * the persisted policy records matchlockPrivileged false, source
+   * "flag"). Requires a Matchlock opt-in. Resolution at launch:
+   * `--matchlock-no-privileged` > `TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1` >
+   * default ON.
+   */
+  matchlockNoPrivileged?: boolean;
+  /**
    * MTLK-ALLOW-PRIVATE US-004: the launch-resolved per-run exception list of
    * private destinations the Matchlock VM may reach (repeatable
    * `--matchlock-allow-private <entry>`, falling back to the comma-separated
@@ -149,6 +160,7 @@ const KNOWN_FLAGS = new Set([
   "--matchlock-disk",
   "--matchlock-swap",
   "--matchlock-no-swap",
+  "--matchlock-no-privileged",
   "--matchlock-allow-private",
   MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
 ]);
@@ -253,6 +265,8 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   // MTLK-SWAP US-006: the pure boolean off switch; mutually exclusive with a
   // swap size (flag or equals form).
   let matchlockNoSwapSeen = false;
+  // ICEBOX Pillar B: the pure boolean privilege opt-out.
+  let matchlockNoPrivilegedSeen = false;
   // MTLK-ALLOW-PRIVATE US-004: raw repeatable allow-private entries (validated
   // and deduped after the loop) plus the first opt-in-dependent flag supplied,
   // so a missing opt-in names the flag the operator wrote first.
@@ -352,6 +366,25 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
         firstMatchlockDependentFlag = token;
       }
       continue;
+    }
+
+    if (token === MATCHLOCK_NO_PRIVILEGED_FLAG) {
+      // ICEBOX Pillar B: a PURE BOOLEAN opt-out (never consumes a token).
+      // It is a dependent flag (usage error without an opt-in).
+      matchlockNoPrivilegedSeen = true;
+      if (firstMatchlockDependentFlag === undefined) {
+        firstMatchlockDependentFlag = token;
+      }
+      continue;
+    }
+
+    // ICEBOX Pillar B: the boolean takes no value — a token in its equals
+    // form is a HARD ERROR (never silently absorbed into the task text),
+    // mirroring the `--matchlock=` precedent.
+    if (token.startsWith(`${MATCHLOCK_NO_PRIVILEGED_FLAG}=`)) {
+      throw new Error(
+        `${MATCHLOCK_NO_PRIVILEGED_FLAG} takes no value. It is a pure boolean opt-out; drop the "=..." part.`,
+      );
     }
 
     if (token === MATCHLOCK_NO_SWAP_FLAG) {
@@ -808,6 +841,7 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     matchlockDisk: matchlockSizeValues.matchlockDisk,
     matchlockSwap: matchlockSizeValues.matchlockSwap,
     matchlockNoSwap: matchlockNoSwapSeen || undefined,
+    matchlockNoPrivileged: matchlockNoPrivilegedSeen || undefined,
     matchlockAllowPrivate,
     context,
     wait,

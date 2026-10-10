@@ -109,6 +109,11 @@ function baseArgs(overrides: Partial<InteractiveSessionArgs> = {}): InteractiveS
     },
     rootUsageOverride: false,
     allowPrivate: [],
+    // ICEBOX (tamandua-5rr.3 E2): the parser always resolves both isolation
+    // settings; the default resolution is privileged ON + ipv4, both with
+    // source "default".
+    matchlockPrivileged: { privileged: true, source: "default" },
+    matchlockDnsPriority: { priority: "ipv4", source: "default" },
     ...overrides,
   };
 }
@@ -184,7 +189,25 @@ describe("US-004 planInteractiveSession admission", () => {
       swapMB: 8192,
     });
     assert.deepEqual(c.allowPrivate, []);
+    // ICEBOX (tamandua-5rr.3 E2): the parser-resolved isolation settings are
+    // forwarded to admission unchanged (base fixture = the defaults).
+    assert.deepEqual(c.matchlockPrivileged, { privileged: true, source: "default" });
+    assert.deepEqual(c.matchlockDnsPriority, { priority: "ipv4", source: "default" });
     assert.equal(typeof c.rpcBinaryPath, "string");
+  });
+
+  it("ICEBOX: forwards NON-DEFAULT isolation settings (values + sources) to admission unchanged", async () => {
+    const args = baseArgs({
+      matchlockPrivileged: { privileged: false, source: "flag" },
+      matchlockDnsPriority: { priority: "ipv6", source: "env" },
+    });
+    const { admit, calls } = makeAdmitter();
+    const plan = await planInteractiveSession(args, baseOptions({ admit }));
+
+    assert.deepEqual(plan.policy, FAKE_POLICY);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].matchlockPrivileged, { privileged: false, source: "flag" });
+    assert.deepEqual(calls[0].matchlockDnsPriority, { priority: "ipv6", source: "env" });
   });
 
   it("admits hermes with the frozen submission snapshot", async () => {

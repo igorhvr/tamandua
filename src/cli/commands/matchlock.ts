@@ -29,6 +29,7 @@ import {
   MatchlockResourceLimitError,
   type MatchlockResourceHostProbe,
 } from "../../installer/matchlock/resource-limits.js";
+import { MatchlockIsolationSettingError } from "../../installer/matchlock/isolation-settings.js";
 import {
   runInteractiveSession,
   type RunInteractiveSessionOptions,
@@ -73,6 +74,19 @@ const MATCHLOCK_OPTIONS_HELP = `Options:
   --matchlock-allow-private <entry>
                           Allow one private address range; repeatable. CLI
                           entries replace TAMANDUA_MATCHLOCK_ALLOW_PRIVATE.
+  --matchlock-no-privileged
+                          Create the VM WITHOUT the default whole-VM
+                          privilege: in-guest sudo is blocked (standard VM).
+                          Env form: TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1.
+  --matchlock-prioritize-ipv4-dns-resolution
+                          Prefer IPv4 answers from the guest DNS resolver
+                          (the default): AAAA records are omitted when the
+                          name has an A record.
+  --matchlock-prioritize-ipv6-dns-resolution
+                          Prefer IPv6 answers (verbatim relay). Wins when
+                          both DNS-priority flags are supplied.
+                          Env default (unless either flag is supplied):
+                          TAMANDUA_MATCHLOCK_DNS_PRIORITY=ipv4|ipv6.
   --force-matchlock-usage-as-root-not-recommended-per-matchlock-docs
                           Acknowledge and allow a root invocation for this
                           session only (session-scoped consent; never inferred
@@ -86,6 +100,12 @@ Environment precedence:
   disk     --matchlock-disk > TAMANDUA_MATCHLOCK_DISK_MB
   swap     --matchlock-no-swap > --matchlock-swap > TAMANDUA_MATCHLOCK_SWAP_MB
            > 8192 MB
+  privileged --matchlock-no-privileged > TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1
+           > default on
+  dns-priority --matchlock-prioritize-ipv6-dns-resolution >
+           --matchlock-prioritize-ipv4-dns-resolution >
+           TAMANDUA_MATCHLOCK_DNS_PRIORITY (exactly "ipv4" or "ipv6") >
+           default ipv4
 
 A missing standard image is refused with the remedy \`tamandua matchlock setup\`.
 A root invocation is refused before any Matchlock interaction unless the exact
@@ -405,7 +425,8 @@ export async function handleMatchlock(
   } catch (error) {
     if (
       error instanceof InteractiveSessionArgError ||
-      error instanceof MatchlockResourceLimitError
+      error instanceof MatchlockResourceLimitError ||
+      error instanceof MatchlockIsolationSettingError
     ) {
       stderr(`Error: ${error.message}\nUsage: ${MATCHLOCK_USAGE}\n`);
       exit(1);

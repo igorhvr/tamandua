@@ -221,6 +221,139 @@ describe("matchlock run-creation admission", () => {
     assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
   });
 
+  // ── ICEBOX (tamandua-5rr.3 E2): privileged + DNS persistence ───────
+
+  it("ICEBOX: a FRESH admission persists privileged ON + ipv4 with source default and they reach the create params", async () => {
+    transcript = tempTranscriptPath();
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
+      [MATCHLOCK_RPC_ARGS_ENV]: JSON.stringify([fakeDriver]),
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const result = await admitMatchlockRun(admissionOpts({}) as never);
+    assert.deepEqual(result.policy.matchlockPrivileged, { privileged: true, source: "default" });
+    assert.deepEqual(result.policy.matchlockDnsPriority, { priority: "ipv4", source: "default" });
+    // Round-trip through the serializer the caller persists with.
+    const reparsed = parseMatchlockPolicy(serializeMatchlockPolicy(result.policy));
+    assert.deepEqual(reparsed.matchlockPrivileged, result.policy.matchlockPrivileged);
+    assert.deepEqual(reparsed.matchlockDnsPriority, result.policy.matchlockDnsPriority);
+    // Dispatch side: the persisted values reach the create params explicitly.
+    const helperPack = path.join(tmpRoot, "icebox-defaults-pack");
+    fs.mkdirSync(helperPack, { recursive: true });
+    const cfg = buildMatchlockCreateConfig(reparsed, result.identity, { helperPackHostPath: helperPack });
+    assert.equal(cfg.privileged, true, "privileged travels explicitly (default ON)");
+    assert.equal(cfg.network?.dns_priority, "ipv4", "dns_priority travels explicitly even at the default");
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
+  it("ICEBOX: a FRESH admission persists SUPPLIED values with their sources verbatim", async () => {
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
+      [MATCHLOCK_RPC_ARGS_ENV]: JSON.stringify([fakeDriver]),
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_TRANSCRIPT_FILE: undefined,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        matchlockPrivileged: { privileged: false, source: "flag" },
+        matchlockDnsPriority: { priority: "ipv6", source: "flag" },
+      }) as never,
+    );
+    assert.deepEqual(result.policy.matchlockPrivileged, { privileged: false, source: "flag" });
+    assert.deepEqual(result.policy.matchlockDnsPriority, { priority: "ipv6", source: "flag" });
+  });
+
+  it("ICEBOX: a replacement preserves the inherited values + sources VERBATIM over contradictory supplied settings", async () => {
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
+      [MATCHLOCK_RPC_ARGS_ENV]: JSON.stringify([fakeDriver]),
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_TRANSCRIPT_FILE: undefined,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const first = await admitMatchlockRun(
+      admissionOpts({
+        matchlockPrivileged: { privileged: false, source: "flag" },
+        matchlockDnsPriority: { priority: "ipv6", source: "flag" },
+      }) as never,
+    );
+    const replacement = await admitMatchlockRun(
+      admissionOpts({
+        inheritedPolicy: first.policy,
+        // Contradictory fresh inputs: the INHERITANCE RULE must ignore them.
+        matchlockPrivileged: { privileged: true, source: "flag" },
+        matchlockDnsPriority: { priority: "ipv4", source: "flag" },
+      }) as never,
+    );
+    assert.deepEqual(replacement.policy.matchlockPrivileged, { privileged: false, source: "flag" });
+    assert.deepEqual(replacement.policy.matchlockDnsPriority, { priority: "ipv6", source: "flag" });
+  });
+
+  it("ICEBOX: a replacement over a PRE-ICEBOX record materializes the standing defaults", async () => {
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
+      [MATCHLOCK_RPC_ARGS_ENV]: JSON.stringify([fakeDriver]),
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_TRANSCRIPT_FILE: undefined,
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const first = await admitMatchlockRun(admissionOpts({}) as never);
+    // Simulate a pre-ICEBOX persisted record: both fields absent.
+    const legacy = { ...first.policy } as Record<string, unknown>;
+    delete legacy.matchlockPrivileged;
+    delete legacy.matchlockDnsPriority;
+    const replacement = await admitMatchlockRun(
+      admissionOpts({ inheritedPolicy: legacy as never }) as never,
+    );
+    assert.deepEqual(replacement.policy.matchlockPrivileged, { privileged: true, source: "default" });
+    assert.deepEqual(replacement.policy.matchlockDnsPriority, { priority: "ipv4", source: "default" });
+  });
+
+  it("ICEBOX: the hermes path persists the supplied isolation settings (parity with pi/dsh)", async () => {
+    const hermesRoot = path.join(tmpRoot, "icebox-hermes");
+    fs.mkdirSync(hermesRoot, { recursive: true });
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: undefined,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/hermes-icebox:latest",
+      FAKE_IMAGE_DIGEST: "sha256:iceboxhermesdigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:iceboxhermesconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        harness: "hermes",
+        submission: { homeDir: path.join(tmpRoot, "operator"), cwd: nonRepoDir, hermesHomeEnv: hermesRoot },
+        matchlockPrivileged: { privileged: false, source: "flag" },
+        matchlockDnsPriority: { priority: "ipv6", source: "env" },
+      }) as never,
+    );
+    assert.equal(result.policy.harness, "hermes");
+    assert.deepEqual(
+      result.policy.matchlockPrivileged,
+      { privileged: false, source: "flag" },
+      "an explicit false must survive the hermes path (no truthiness/defaulting regression)",
+    );
+    assert.deepEqual(result.policy.matchlockDnsPriority, { priority: "ipv6", source: "env" });
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
   it("an inherited policy's resourceLimits win over newly supplied limits (replacement, MTLK-VM-SIZE US-003)", async () => {
     setFake({
       [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
@@ -1663,6 +1796,10 @@ describe("matchlock run-creation admission", () => {
     );
     assert.equal(result.policy.harness, "dsh");
     assert.deepEqual(result.policy.networkAllowPrivate, ["[2001:db8::1]:443", "metadata.internal"]);
+    // ICEBOX: the dsh path persists the resolved isolation settings exactly
+    // like pi/hermes — the bare defaults here (no settings were supplied).
+    assert.deepEqual(result.policy.matchlockPrivileged, { privileged: true, source: "default" });
+    assert.deepEqual(result.policy.matchlockDnsPriority, { priority: "ipv4", source: "default" });
     assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
   });
 

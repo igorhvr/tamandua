@@ -27,6 +27,10 @@ import {
 } from "./matchlock/admission.js";
 import type { MatchlockSwapSupportProbe } from "./matchlock/swap-support.js";
 import {
+  resolveMatchlockDnsPriority,
+  resolveMatchlockPrivileged,
+} from "./matchlock/isolation-settings.js";
+import {
   runMatchlockResumePreflight,
   type InheritedImageVerifier,
 } from "./matchlock/resume-preflight.js";
@@ -192,6 +196,19 @@ export interface RunWorkflowParams {
    * including swap-disabled runs.
    */
   matchlockSwapSupportProbe?: MatchlockSwapSupportProbe;
+  /**
+   * ICEBOX Pillar B (privileged-by-default): true when the pure-boolean
+   * `--matchlock-no-privileged` opt-out was supplied to THIS fresh launch.
+   * Resolution happens ONCE here, at submission, from the run-composition
+   * side's environment (opt-out flag > TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1 >
+   * default ON); the resolved value + source are persisted on the run's
+   * Matchlock policy and threaded to admission. A native run reads neither
+   * the flag nor the environment, and a replacement (inherited
+   * `matchlockPolicy`) never re-derives them — the persisted policy is
+   * authoritative. The DNS preference (`TAMANDUA_MATCHLOCK_DNS_PRIORITY`)
+   * is resolved on the same fresh-only path.
+   */
+  matchlockNoPrivileged?: boolean;
   /** When true, suppresses automatic replacement-run launch after a rugpull is detected */
   noRelaunchUponRugpull?: boolean;
   /**
@@ -503,10 +520,34 @@ export async function runWorkflow(
     matchlockAllowPrivate,
     matchlockAllowPrivateSupportProbe,
     matchlockSwapSupportProbe,
+    matchlockNoPrivileged,
     noRelaunchUponRugpull,
     parentRunId,
     workdirCollisionPolicy,
   } = params;
+
+  // ICEBOX (tamandua-5rr.3 E2): resolve the isolation settings (whole-VM
+  // privilege + guest-resolver address-family preference) ONCE at submission,
+  // synchronously and BEFORE any await, from the COMPOSING side's
+  // environment — frozen for the whole run. Rules:
+  //   - a FRESH Matchlock opt-in resolves flag > env > default (privileged:
+  //     `--matchlock-no-privileged` > TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1 >
+  //     default ON; DNS: TAMANDUA_MATCHLOCK_DNS_PRIORITY > default ipv4 — a
+  //     workflow run has no DNS CLI flag by design);
+  //   - a NATIVE run reads neither the flag nor the environment;
+  //   - a REPLACEMENT (inherited `matchlockPolicy`) NEVER re-derives them —
+  //     the persisted policy is authoritative (INHERITANCE RULE), so even a
+  //     malformed DNS env value cannot fail an inherited launch.
+  const isFreshMatchlockOptIn = Boolean(matchlockImage) && !matchlockPolicy;
+  const isolationSettings = isFreshMatchlockOptIn
+    ? {
+        matchlockPrivileged: resolveMatchlockPrivileged({
+          noPrivilegedFlag: matchlockNoPrivileged === true,
+          env: process.env,
+        }),
+        matchlockDnsPriority: resolveMatchlockDnsPriority({ env: process.env }),
+      }
+    : undefined;
 
   // MTLK-HERMES-EXEC US-003: FROZEN Hermes submission inputs captured AT RUN
   // CREATION (the run creator's HOME / HERMES_HOME env snapshot / cwd). A
@@ -1005,6 +1046,16 @@ export async function runWorkflow(
         ? { imageSource: matchlockImageSource, rootUsageConsent: matchlockRootUsageOverride === true }
         : {}),
       harness: effectiveHarness,
+      // ICEBOX isolation settings: a FRESH opt-in threads the
+      // submission-resolved pair (value + source) so admission persists it;
+      // a replacement omits both and admission preserves the inherited
+      // values VERBATIM.
+      ...(isolationSettings
+        ? {
+            matchlockPrivileged: isolationSettings.matchlockPrivileged,
+            matchlockDnsPriority: isolationSettings.matchlockDnsPriority,
+          }
+        : {}),
       // FROZEN submission inputs for a FRESH hermes/dsh opt-in. A replacement
       // (inheritedPolicy) carries its own frozen inputs on the inherited
       // policy and never re-captures ambient state.

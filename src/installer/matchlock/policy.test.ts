@@ -42,6 +42,8 @@ function asV2Record(policy: ExecutionIsolation): Record<string, unknown> {
   record.version = 2;
   delete record.requestedImageSource;
   delete record.rootUsageConsent;
+  delete record.matchlockPrivileged;
+  delete record.matchlockDnsPriority;
   const limits = record.resourceLimits as Record<string, unknown>;
   delete limits.swapMB;
   return record;
@@ -1169,5 +1171,113 @@ describe("matchlock policy", () => {
       sanitizeUnusableMatchlockPolicyReason("policy_future_unknown"),
       "the persisted matchlock policy could not be used",
     );
+  });
+});
+
+// ── ICEBOX (tamandua-5rr.3 E2): isolation settings on the v3 record ──
+
+describe("ICEBOX isolation settings on the v3 policy record", () => {
+  it("round-trips every reachable value+source pair and omits the fields when not supplied", () => {
+    // REACHABLE resolution combinations: privileged can only be
+    // true/"default", false/"flag" or false/"env" (the opt-out channels can
+    // only turn privilege OFF); the DNS value pairs with any of the three
+    // sources.
+    const suppliedCases = [
+      { p: { privileged: true, source: "default" }, d: { priority: "ipv4", source: "default" } },
+      { p: { privileged: false, source: "flag" }, d: { priority: "ipv4", source: "flag" } },
+      { p: { privileged: false, source: "env" }, d: { priority: "ipv4", source: "env" } },
+      { p: { privileged: true, source: "default" }, d: { priority: "ipv6", source: "flag" } },
+      { p: { privileged: false, source: "flag" }, d: { priority: "ipv6", source: "env" } },
+    ] as const;
+    for (const { p, d } of suppliedCases) {
+      const built = buildMatchlockPolicy({
+        ...BASE,
+        matchlockPrivileged: p,
+        matchlockDnsPriority: d,
+      });
+      assert.deepEqual(built.matchlockPrivileged, p);
+      assert.deepEqual(built.matchlockDnsPriority, d);
+      const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(built));
+      assert.deepEqual(parsed, built, "serialize → parse must round-trip the settings byte-exactly");
+      assert.ok(isExecutionIsolationPolicy(parsed));
+    }
+    // A direct build without the inputs omits both keys entirely (legacy shape).
+    const bare = buildMatchlockPolicy(BASE);
+    assert.equal("matchlockPrivileged" in bare, false);
+    assert.equal("matchlockDnsPriority" in bare, false);
+    const raw = JSON.parse(serializeMatchlockPolicy(bare)) as Record<string, unknown>;
+    assert.equal("matchlockPrivileged" in raw, false);
+    assert.equal("matchlockDnsPriority" in raw, false);
+    assert.ok(isExecutionIsolationPolicy(parseMatchlockPolicy(JSON.stringify(raw))));
+  });
+
+  it("rejects malformed PRESENT values fail-closed (partial objects, wrong types, unknown keys, null/array/scalar)", () => {
+    const good = buildMatchlockPolicy(BASE);
+    const base = JSON.parse(serializeMatchlockPolicy(good)) as Record<string, unknown>;
+    const badPrivileged = [
+      { privileged: true },
+      { source: "flag" },
+      { privileged: "yes", source: "flag" },
+      { privileged: true, source: "legacy" },
+      { privileged: true, source: null },
+      { privileged: true, source: "flag", extra: 1 },
+      null,
+      [],
+      "flag",
+    ];
+    for (const bad of badPrivileged) {
+      assert.throws(
+        () => parseMatchlockPolicy(JSON.stringify({ ...base, matchlockPrivileged: bad })),
+        (err: unknown) =>
+          err instanceof MatchlockPolicyError &&
+          err.code === "policy_invalid_record" &&
+          /matchlockPrivileged/.test(err.message),
+        `matchlockPrivileged ${JSON.stringify(bad)} must be rejected`,
+      );
+    }
+    const badDns = [
+      { priority: "ipv6" },
+      { priority: "v6", source: "flag" },
+      { priority: "ipv4", source: "FLAG" },
+      { priority: "ipv4", source: "flag", extra: true },
+      null,
+      [],
+      7,
+    ];
+    for (const bad of badDns) {
+      assert.throws(
+        () => parseMatchlockPolicy(JSON.stringify({ ...base, matchlockDnsPriority: bad })),
+        (err: unknown) =>
+          err instanceof MatchlockPolicyError &&
+          err.code === "policy_invalid_record" &&
+          /matchlockDnsPriority/.test(err.message),
+        `matchlockDnsPriority ${JSON.stringify(bad)} must be rejected`,
+      );
+    }
+  });
+
+  it("rejects a version-2 record carrying an ICEBOX field (version/field-set agreement)", () => {
+    const good = buildMatchlockPolicy({
+      ...BASE,
+      matchlockPrivileged: { privileged: true, source: "default" },
+      matchlockDnsPriority: { priority: "ipv4", source: "default" },
+    });
+    const v2 = asV2Record(good);
+    const v2WithPrivileged = { ...v2, matchlockPrivileged: { privileged: true, source: "default" } };
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(v2WithPrivileged)),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /version-3 field/.test(err.message),
+    );
+  });
+
+  it("accepts a legacy v3 record with the fields ABSENT (pre-ICEBOX compatibility)", () => {
+    const bare = buildMatchlockPolicy(BASE);
+    const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(bare));
+    assert.equal(parsed.matchlockPrivileged, undefined);
+    assert.equal(parsed.matchlockDnsPriority, undefined);
+    assert.equal(parsed.version, MATCHLOCK_POLICY_VERSION);
   });
 });

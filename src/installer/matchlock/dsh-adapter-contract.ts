@@ -32,8 +32,30 @@ export const DSH_GUEST_PROFILE = "headless";
 
 /**
  * Sandbox mode injected into the guest launch environment. Full access is
- * scoped to the VM; it does not request privileged Matchlock mode and never
- * grants a host execution channel.
+ * scoped to the VM; it never grants a host execution channel.
+ *
+ * ICEBOX (tamandua-5rr.3 E2): this harness permission mode is a SEPARATE
+ * setting from the VM's whole-VM privilege. The create-params `privileged`
+ * field (emitted by the shared composer) defaults ON under ICEBOX — every
+ * Matchlock VM, dsh included, starts with passwordless in-guest sudo unless
+ * the run opts out (`--matchlock-no-privileged` /
+ * `TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1`, persisted on the run policy with its
+ * source) — while this constant only governs what the dsh harness itself
+ * may do inside the already-scoped VM.
+ *
+ * The guest resolver's address-family preference is likewise resolved by
+ * the composing surface and always emitted explicitly as
+ * `network.dns_priority` (`"ipv4"` default; `"ipv6"` opt-in). Interactive
+ * runs own the
+ * `--matchlock-prioritize-ipv4-dns-resolution` /
+ * `--matchlock-prioritize-ipv6-dns-resolution` flags and the
+ * `TAMANDUA_MATCHLOCK_DNS_PRIORITY` env (`=ipv4` default, `=ipv6`
+ * opt-in); scheduled/workflow runs (dsh included) resolve the DNS
+ * preference from the environment ONLY (no per-run workflow DNS flag) and
+ * the privilege opt-out from the workflow `--matchlock-no-privileged` flag
+ * or the `TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1` env. Both resolutions freeze
+ * on the run policy with their source at submission; dispatch never
+ * re-derives them.
  */
 export const DSH_GUEST_PERMISSION_MODE = "danger-full-access";
 

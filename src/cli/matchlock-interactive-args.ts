@@ -43,6 +43,15 @@ import {
   resolveMatchlockImageReference,
   type MatchlockImageSource,
 } from "../installer/matchlock/standard-image.js";
+import {
+  MATCHLOCK_NO_PRIVILEGED_FLAG,
+  MATCHLOCK_PRIORITIZE_IPV4_FLAG,
+  MATCHLOCK_PRIORITIZE_IPV6_FLAG,
+  resolveMatchlockDnsPriority,
+  resolveMatchlockPrivileged,
+  type ResolvedMatchlockDnsPriority,
+  type ResolvedMatchlockPrivileged,
+} from "../installer/matchlock/isolation-settings.js";
 import { MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG } from "../installer/matchlock/root-gate.js";
 
 // Re-export the canonical R13 flag from the gate that owns the refusal naming
@@ -98,6 +107,9 @@ const KNOWN_FLAGS = new Set<string>([
   "--matchlock-swap",
   MATCHLOCK_NO_SWAP_FLAG,
   MATCHLOCK_ALLOW_PRIVATE_FLAG,
+  MATCHLOCK_NO_PRIVILEGED_FLAG,
+  MATCHLOCK_PRIORITIZE_IPV4_FLAG,
+  MATCHLOCK_PRIORITIZE_IPV6_FLAG,
   MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
   WORKING_DIRECTORY_FLAG,
 ]);
@@ -136,6 +148,17 @@ export interface InteractiveSessionArgs {
   rootUsageOverride: boolean;
   /** Normalized, shape-validated allow-private list (empty when none). */
   allowPrivate: string[];
+  /**
+   * ICEBOX Pillar B: the resolved whole-VM privilege setting + source
+   * (opt-out flag > TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1 > default ON).
+   */
+  matchlockPrivileged: ResolvedMatchlockPrivileged;
+  /**
+   * ICEBOX DNS: the resolved guest-resolver address-family preference +
+   * source (ipv6 flag > ipv4 flag > TAMANDUA_MATCHLOCK_DNS_PRIORITY > default
+   * ipv4; both flags => ipv6, never an error).
+   */
+  matchlockDnsPriority: ResolvedMatchlockDnsPriority;
 }
 
 /** Injectable inputs for deterministic tests; production callers omit these. */
@@ -263,6 +286,12 @@ export function parseInteractiveSessionArgs(
   let allowPrivateSupplied = false;
   let noSwapSeen = false;
   let rootUsageOverride = false;
+  // ICEBOX isolation settings: three pure booleans (never consume a
+  // following token), resolved AFTER the loop so the two DNS flags are
+  // order-independent (ipv6 wins when both are supplied).
+  let noPrivilegedSeen = false;
+  let ipv4PrioritySeen = false;
+  let ipv6PrioritySeen = false;
 
   const assignValue = (field: InteractiveValueField, flag: string, rawValue: string): void => {
     if (rawValues[field] !== undefined) {
@@ -365,6 +394,24 @@ export function parseInteractiveSessionArgs(
       continue;
     }
 
+    // ICEBOX Pillar B: the pure-boolean whole-VM privilege opt-out.
+    if (token === MATCHLOCK_NO_PRIVILEGED_FLAG) {
+      noPrivilegedSeen = true;
+      continue;
+    }
+
+    // ICEBOX DNS: the two pure-boolean address-family preference flags.
+    // Either may appear; when BOTH appear ipv6 wins (resolved after the
+    // loop), so supplying both is never an error.
+    if (token === MATCHLOCK_PRIORITIZE_IPV4_FLAG) {
+      ipv4PrioritySeen = true;
+      continue;
+    }
+    if (token === MATCHLOCK_PRIORITIZE_IPV6_FLAG) {
+      ipv6PrioritySeen = true;
+      continue;
+    }
+
     if (token.startsWith("--")) {
       throw new InteractiveSessionArgError(
         `Unknown option ${JSON.stringify(token)} for tamandua matchlock ${subcommand}. ` +
@@ -411,6 +458,22 @@ export function parseInteractiveSessionArgs(
         MATCHLOCK_ALLOW_PRIVATE_ENV,
       );
 
+  // ICEBOX isolation settings, resolved ONCE here under the house
+  // precedence. Both resolutions are pure: privileged is
+  // flag > env(=1) > default ON; the DNS preference is ipv6 flag > ipv4 flag
+  // > env > default ipv4. A malformed TAMANDUA_MATCHLOCK_DNS_PRIORITY is a
+  // typed MatchlockIsolationSettingError — thrown ONLY when the env is
+  // actually consulted (a winning flag is never defeated by the env).
+  const matchlockPrivileged = resolveMatchlockPrivileged({
+    noPrivilegedFlag: noPrivilegedSeen,
+    env,
+  });
+  const matchlockDnsPriority = resolveMatchlockDnsPriority({
+    ipv4Flag: ipv4PrioritySeen,
+    ipv6Flag: ipv6PrioritySeen,
+    env,
+  });
+
   return {
     subcommand,
     harness: selection.harness,
@@ -421,5 +484,7 @@ export function parseInteractiveSessionArgs(
     resourceLimits,
     rootUsageOverride,
     allowPrivate,
+    matchlockPrivileged,
+    matchlockDnsPriority,
   };
 }

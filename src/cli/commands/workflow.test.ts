@@ -442,6 +442,14 @@ Examples:
       assert.match(matchlockSection, /comma-separated list/);
       assert.match(matchlockSection, /Requires --matchlock or --matchlock-image <image>/);
       assert.match(matchlockSection, /network\.allow_private/);
+
+      // ICEBOX (tamandua-5rr.3 E2): the whole-VM privilege opt-out and the
+      // DNS-preference env are documented on the workflow surface too.
+      assert.match(matchlockSection, /--matchlock-no-privileged/);
+      assert.match(matchlockSection, /TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1/);
+      assert.match(matchlockSection, /default on/);
+      assert.match(matchlockSection, /TAMANDUA_MATCHLOCK_DNS_PRIORITY=ipv4\|ipv6/);
+      assert.match(matchlockSection, /no per-run DNS flag/);
     });
 
     // MTLK-ISO-SLICE1 US-007: the quickstart names both opt-in forms and the
