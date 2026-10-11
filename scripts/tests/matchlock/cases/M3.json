@@ -1,0 +1,88 @@
+{
+  "name": "M3-noswap-exit7",
+  "argv": [
+    "{{MTLK_TAMANDUA_ARGV0}}",
+    "matchlock",
+    "pi-shell",
+    "--working-directory-for-harness",
+    "{{MTLK_WORKDIR}}",
+    "--matchlock-no-swap"
+  ],
+  "cwd": "{{MTLK_CWD}}",
+  "term": "xterm-256color",
+  "rows": 24,
+  "cols": 80,
+  "timeout_s": 600,
+  "grace_s": 90,
+  "forbid": [
+    "panicked",
+    "Unhandled [Ee]rror",
+    "no such file or directory: .*matchlock"
+  ],
+  "events": [
+    {
+      "wait_for": "matchlock: interactive pi-shell session",
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "matchlock: igorhvr/tamandua( \\(standard image\\))? cpus=\\d+ memory=\\d+MB disk=\\d+MB swap=off",
+      "regex": true,
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "image provenance: standard",
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "image identity: tag=igorhvr/tamandua digest={{MTLK_EXPECT_DIGEST}} config=sha256:[0-9a-f]{64}",
+      "regex": true,
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "guest identity: uid={{MTLK_UID}} gid={{MTLK_GID}}",
+      "regex": true,
+      "timeout_s": 90
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "send": "0\n"
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "send": "printf 'RDY-%s-%s-END\\n' \"$(uname -s)\" \"$$\"\n"
+    },
+    {
+      "wait_for": "RDY-(Darwin|Linux)-[0-9]+-END",
+      "regex": true,
+      "timeout_s": 180
+    },
+    {
+      "send": "printf 'SWAPCHK-%s-END\\n' \"$(awk 'NR>1{s+=$3} END{print s+0}' /proc/swaps)\"\n"
+    },
+    {
+      "wait_for": "SWAPCHK-0-END",
+      "timeout_s": 30
+    },
+    {
+      "send": "printf 'MNTCHK-M3-%s' \"$(date +%s)\" > {{MTLK_WORKDIR}}/.mntchk-M3.txt && printf 'MNT-%s-END\\n' \"$$\"\n"
+    },
+    {
+      "wait_for": "MNT-[0-9]+-END",
+      "regex": true,
+      "timeout_s": 30
+    },
+    {
+      "send": "exit 7\n"
+    }
+  ],
+  "expected_exit_code": 7,
+  "require": [
+    "SWAPCHK-0-END",
+    "MNT-[0-9]+-END"
+  ],
+  "mntchk": true
+}

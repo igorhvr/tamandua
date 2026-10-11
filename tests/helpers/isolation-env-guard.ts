@@ -49,6 +49,16 @@ export const ISOLATION_ENV_ALLOWLIST: readonly IsolationEnvAllowlistEntry[] = [
     reason:
       "Pure static policy scanner: 'bin/tamandua' appears only as fixture/map string data compared by content (never as a spawned executable); the file spawns no process, so there is no child env to isolate.",
   },
+  {
+    path: "tests/matchlock-interactive-common-config.test.ts",
+    reason:
+      "Only ever spawns `bash -c` with an inline script; 'cli.js' appears as the path of a TEMP-DIR STUB the generated script writes and runs to prove CANDIDATE-mode binding, never the real dist/cli/cli.js, and the subset of the ambient env it inherits is intentionally read-only (no daemon/CLI child env).",
+  },
+  {
+    path: "tests/matchlock-interactive-acceptance.test.ts",
+    reason:
+      "Pure filesystem contract test (no child_process import, spawns nothing): 'dist/cli/cli.js' appears only in a doc comment and in an assertion regex that documents the CANDIDATE argv0 binding, so there is no child env to isolate.",
+  },
 ];
 
 /** A call to a daemon-spawning lifecycle entrypoint. */

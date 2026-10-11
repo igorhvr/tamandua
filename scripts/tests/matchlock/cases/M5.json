@@ -1,0 +1,86 @@
+{
+  "name": "M5-pi-TUI-modelturn",
+  "argv": [
+    "{{MTLK_TAMANDUA_ARGV0}}",
+    "matchlock",
+    "pi",
+    "--working-directory-for-harness",
+    "{{MTLK_WORKDIR}}",
+    "--matchlock-allow-private",
+    "{{MTLK_ALLOW_PRIVATE}}"
+  ],
+  "cwd": "{{MTLK_CWD}}",
+  "term": "xterm-256color",
+  "rows": 24,
+  "cols": 80,
+  "timeout_s": 900,
+  "grace_s": 120,
+  "any_exit": true,
+  "forbid": [
+    "panicked",
+    "Unhandled [Ee]rror"
+  ],
+  "events": [
+    {
+      "wait_for": "matchlock: interactive pi session",
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "matchlock: igorhvr/tamandua( \\(standard image\\))? cpus=\\d+ memory=\\d+MB disk=\\d+MB swap=8192MB",
+      "regex": true,
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "image provenance: standard",
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "image identity: tag=igorhvr/tamandua digest={{MTLK_EXPECT_DIGEST}} config=sha256:[0-9a-f]{64}",
+      "regex": true,
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "guest identity: uid={{MTLK_UID}} gid={{MTLK_GID}}",
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "\\(auto\\)",
+      "regex": true,
+      "timeout_s": 300
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "send": "What is 111 + 222? Reply with exactly ZX- followed by your answer. Nothing else.\r"
+    },
+    {
+      "wait_for": "ZX\\s*-\\s*333",
+      "regex": true,
+      "timeout_s": 300
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "send_ctrl": "C"
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "send_ctrl": "C",
+      "optional": true
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "send_ctrl": "D",
+      "optional": true
+    },
+    {
+      "sleep": 3
+    }
+  ]
+}

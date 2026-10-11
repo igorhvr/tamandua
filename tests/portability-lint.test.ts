@@ -69,6 +69,13 @@ interface Violation {
 const PROC_ALLOWED = new Set([
   "src/lib/proc-info.ts",
   "src/lib/process-start-identity.ts",
+  // MTLK-INTERACTIVE-SUITE US-009: the T4 M7 spot-run verifies a private
+  // attempt daemon's identity from its OWN pidfile by reading the Linux procfs
+  // environ entry before it daemon-stops or removes anything, with a portable
+  // `ps -p <pid> -o command=` fallback in the same block for non-Linux hosts.
+  // This is host process introspection on a Linux gate host — exactly this
+  // allowlist's purpose. The reference instrument had the same guarded read.
+  "scripts/tests/matchlock/runner/m7-spot-run.sh",
 ]);
 
 /** Files with a known linux-guarded procfs environ read + lsof fallback. */
@@ -96,6 +103,11 @@ const GUEST_PROC_FILES = new Set([
   // procfs read.
   "e2e-tests/matchlock-vm-size-gate.test.ts",
   "tests/matchlock-vm-size-contract.test.ts",
+  // MTLK-INTERACTIVE-SUITE US-007: the T2 mechanics case contract asserts the
+  // accepted case JSON's guest-side swap-sum command, which reads the in-VM
+  // procfs mount table. It is the guest contract the case pins, never a host
+  // procfs read.
+  "tests/matchlock-interactive-case-contract.test.ts",
 ]);
 
 // ── Helpers ───────────────────────────────────────────────────────────

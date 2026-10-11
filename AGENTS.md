@@ -1108,6 +1108,47 @@ files is owned by the evidence-prune work (bead `6sy.69`), never by the shim.
   `/home/kaladin/matchlock-work/ledger-diag-contract.json` is identical; no
   test depends on the host copy.
 
+### Matchlock interactive acceptance suite (MTLK-INTERACTIVE-SUITE)
+
+The four-command interactive acceptance suite (the ported M0–M7 semantics for
+`tamandua matchlock pi|pi-shell|hermes|hermes-shell`, the swap surface and the
+scheduled spot-run) lives under `scripts/tests/matchlock/` with an explicit
+membership index at
+[`scripts/tests/matchlock/README.md`](scripts/tests/matchlock/README.md). It is
+a separate, on-demand real-VM gate family: it does **not** move or replace the
+existing root `run-matchlock-*-e2e-test` runners, and nothing in it is part of
+`npm test` or any fast lane.
+
+One-command entrypoint:
+
+```bash
+# fast, no-VM coverage (no gate lock, no digest needed):
+bash scripts/tests/matchlock/run-interactive-suite.sh --tier t1 --mode installed
+
+# real-VM tiers (t2/t3/t4) require --expect-digest and are operator-run outside
+# the agent sandbox; the entrypoint acquires the shared gate lock itself:
+bash scripts/tests/matchlock/run-interactive-suite.sh \
+  --tier t2 --mode installed --expect-digest <sha256:...>
+```
+
+Tiers are `t1` (fixtures + PTY driver self-test; no VM, no model), `t2`
+(real-VM mechanics M0–M4, model-free), `t3` (live-model TUI turns M5/M6,
+env-gated on credentials) and `t4` (scheduled spot-run M7, opt-in and bounded).
+Modes are `candidate` (default; builds this worktree and execs
+`dist/cli/cli.js`) and `installed` (execs the `tamandua` resolved from `PATH`,
+never rebuilds it). The image digest is a required runner input read from the
+local matchlock store — never a hardcoded constant.
+
+The suite follows the shared gate pattern: a "SLOW REAL-VM GATE — DO NOT RUN BY
+DEFAULT" header, a fresh `mktemp -d` evidence dir with private
+`HOME`/`TMPDIR`/`TAMANDUA_STATE_DIR` and a seeded private image store, the shared
+gate lock acquired at **one layer only** (`flock --exclusive
+/home/kaladin/matchlock-work/vaivm-gate.lock`, `MTLK_GATE_LOCK_HELD` handshake),
+component exit-code propagation, and `scripts/observed-rounds-guard.mjs` after a
+real-VM tier (zero-round PASS = exit 92). The developer-agent sandbox
+(`NoNewPrivs: 1`, `CapEff: 0`) cannot boot a VM; the operator runs `t2`–`t4`
+outside the sandbox.
+
 ## Environment Overrides
 
 - `TAMANDUA_WORKFLOWS_SRC`: Overrides the directory from which bundled workflows are loaded. When set, the installer resolves this directory (relative or absolute) instead of the default `<repo>/workflows/`. Tests that exercise `workflow install --all` or `get-ready` with custom workflow fixtures should point this at a temp directory containing the desired workflow set. Set in `src/installer/paths.ts` `resolveBundledWorkflowsDir()`.

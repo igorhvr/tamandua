@@ -558,10 +558,12 @@ The image must already be imported (a missing standard image names
 interaction unless
 `--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` is supplied.
 In this build the interactive path is qualified **synthetically only** against a
-test-owned fake backend; real-VM PTY qualification with actual pi and Hermes is
-deferred. See the README "Interactive sessions" subsection for the full contract
-(root gate, pinning, mounts, numeric uid/gid mapping, summary and confirmed
-cleanup).
+test-owned fake backend in the fast lanes, and on demand by the in-repo
+**Real-VM PTY qualification** acceptance suite at
+`scripts/tests/matchlock/run-interactive-suite.sh` (`--tier t1|t2|t3|t4`,
+`--mode candidate|installed`). See the README "Interactive sessions" subsection
+for the full contract (root gate, pinning, mounts, numeric uid/gid mapping,
+summary and confirmed cleanup).
 
 ### Installation, context, and workspace modes
 

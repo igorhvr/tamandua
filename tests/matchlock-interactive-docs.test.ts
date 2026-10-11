@@ -11,8 +11,8 @@
  *     H6 inside it;
  *   - README documents the root gate, image/identity pinning, configuration and
  *     working-directory mounts, numeric uid/gid mapping, the pre-launch summary
- *     and confirmed cleanup, and the synthetic-only qualification with the
- *     deferred real-VM PTY gate;
+ *     and confirmed cleanup, and the on-demand in-repo real-VM acceptance suite
+ *     (with the synthetic fast-lane coverage);
  *   - SKILL.md enumerates the interactive commands in its command overview;
  *   - INTEGRATION-NOTES.md carries every provisional gap with reconciliation
  *     instructions and the explicit unavailable-real-launch-path list.
@@ -130,11 +130,40 @@ describe("README interactive Matchlock documentation (MTLK-INTERACTIVE US-015)",
     assert.match(interactiveSection, /killing the RPC child alone is never proof/i);
   });
 
-  it("states the synthetic-only qualification and the deferred real-VM PTY gate", () => {
-    assert.match(interactiveSection, /synthetically only/i);
-    assert.match(interactiveSection, /Real-VM PTY qualification/i);
-    assert.match(interactiveSection, /deferred/i);
+  it("states the two-level qualification: synthetic fast coverage plus the on-demand real-VM suite", () => {
+    // Fast lanes stay synthetic and hermetic; no real VM under `npm test`.
+    assert.match(interactiveSection, /synthetically/i);
     assert.match(interactiveSection, /no real VM, no real model call/i);
+    assert.match(interactiveSection, /nothing in it runs in `npm test`/i);
+
+    // The in-repo acceptance suite and its flags are documented.
+    assert.ok(
+      interactiveSection.includes("scripts/tests/matchlock/run-interactive-suite.sh"),
+      "README must name the in-repo real-VM acceptance suite entrypoint",
+    );
+    assert.match(interactiveSection, /--tier t1\|t2\|t3\|t4/);
+    assert.match(interactiveSection, /--mode candidate\|installed/);
+
+    // Every tier's scope is described.
+    for (const token of [
+      "real-VM mechanics",
+      "live-model TUI turns",
+      "scheduled M7 spot-run",
+      "PTY driver self-test",
+    ]) {
+      assert.ok(interactiveSection.includes(token), `README must describe ${token}`);
+    }
+
+    // On demand, operator-run, under the shared gate lock, and NOT deferred.
+    assert.match(interactiveSection, /on demand only/i);
+    assert.match(interactiveSection, /operator runs/i);
+    assert.match(interactiveSection, /gate lock/);
+    assert.match(interactiveSection, /vaivm-gate\.lock/);
+    assert.doesNotMatch(
+      interactiveSection,
+      /deferred/i,
+      "README must no longer claim real-VM PTY qualification is deferred",
+    );
   });
 
   it("states the writable-mount security caveat", () => {
@@ -163,6 +192,20 @@ describe("SKILL.md interactive Matchlock documentation (MTLK-INTERACTIVE US-015)
     assert.match(skill, /tamandua matchlock setup/);
     assert.match(skill, /synthetically only/i);
     assert.match(skill, /Real-VM PTY qualification/i);
+
+    const start = skill.indexOf("**Interactive Matchlock sessions.**");
+    assert.ok(start >= 0, "SKILL.md must carry the interactive sessions paragraph");
+    const end = skill.indexOf("\n### ", start);
+    const interactive = skill.slice(start, end > start ? end : undefined);
+    assert.ok(
+      interactive.includes("scripts/tests/matchlock/run-interactive-suite.sh"),
+      "SKILL.md must point at the on-demand in-repo real-VM suite",
+    );
+    assert.doesNotMatch(
+      interactive,
+      /deferred/i,
+      "SKILL.md must no longer claim real-VM qualification is deferred",
+    );
   });
 });
 

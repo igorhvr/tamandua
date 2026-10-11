@@ -1,0 +1,97 @@
+{
+  "name": "M0-preflight-egress-tools",
+  "argv": [
+    "{{MTLK_TAMANDUA_ARGV0}}",
+    "matchlock",
+    "pi-shell",
+    "--working-directory-for-harness",
+    "{{MTLK_WORKDIR}}",
+    "--matchlock-allow-private",
+    "{{MTLK_ALLOW_PRIVATE}}"
+  ],
+  "cwd": "{{MTLK_CWD}}",
+  "term": "xterm-256color",
+  "rows": 24,
+  "cols": 80,
+  "timeout_s": 300,
+  "grace_s": 60,
+  "expected_exit_code": 0,
+  "forbid": [
+    "panicked",
+    "Unhandled [Ee]rror"
+  ],
+  "events": [
+    {
+      "wait_for": "matchlock: interactive pi-shell session",
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "image provenance: standard",
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "image identity: tag=igorhvr/tamandua digest={{MTLK_EXPECT_DIGEST}} config=sha256:[0-9a-f]{64}",
+      "regex": true,
+      "timeout_s": 90
+    },
+    {
+      "wait_for": "guest identity: uid={{MTLK_UID}} gid={{MTLK_GID}}",
+      "regex": true,
+      "timeout_s": 90
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "send": "0\n"
+    },
+    {
+      "sleep": 2
+    },
+    {
+      "send": "printf 'RDY-%s-%s-END\\n' \"$(uname -s)\" \"$$\"\n"
+    },
+    {
+      "wait_for": "RDY-(Darwin|Linux)-[0-9]+-END",
+      "regex": true,
+      "timeout_s": 180
+    },
+    {
+      "send": "echo PREFLIGHT-TOOLS-BEGIN; for t in pi hermes zsh curl node bash; do printf 'TOOL %s: %s\\n' \"$t\" \"$(command -v $t || echo MISSING)\"; done; echo PREFLIGHT-TOOLS-END\n"
+    },
+    {
+      "sleep": 3
+    },
+    {
+      "send": "echo PREFLIGHT-EGRESS-BEGIN; echo DNS-RESOLVE:; getent ahosts {{MTLK_MODEL_HOST}} 2>&1 | head -6; if command -v curl >/dev/null 2>&1; then curl -m 8 -sS -o /dev/null -w 'EGRESS http=%{http_code} time=%{time_total}s\\n' http://{{MTLK_ALLOW_PRIVATE}}/v1/models || echo EGRESS curl-rc=$?; else echo EGRESS no-curl; fi; echo PREFLIGHT-EGRESS-END\n"
+    },
+    {
+      "sleep": 12
+    },
+    {
+      "send": "printf 'MNTCHK-M0-%s' \"$(date +%s)\" > {{MTLK_WORKDIR}}/.mntchk-M0.txt && printf 'MNT-%s-END\\n' \"$$\"\n"
+    },
+    {
+      "wait_for": "MNT-[0-9]+-END",
+      "regex": true,
+      "timeout_s": 30
+    },
+    {
+      "send": "exit\n"
+    }
+  ],
+  "mntchk": true,
+  "require": [
+    "MNT-[0-9]+-END",
+    "EGRESS http=200",
+    "TOOL pi: /",
+    "TOOL hermes: /",
+    "TOOL zsh: /",
+    "TOOL curl: /",
+    "TOOL node: /",
+    "TOOL bash: /"
+  ]
+}

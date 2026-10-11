@@ -204,6 +204,12 @@ tests/matchlock-dsh-story-merge-roles.test.ts
 tests/matchlock-gate-rounds.test.ts
 tests/matchlock-hermes-story-merge-roles.test.ts
 tests/matchlock-integration-test-parity.test.ts
+tests/matchlock-interactive-common-config.test.ts
+tests/matchlock-interactive-entrypoint.test.ts
+tests/matchlock-interactive-image-store.test.ts
+tests/matchlock-interactive-run-case-controls.test.ts
+tests/matchlock-interactive-t1-driver.test.ts
+tests/matchlock-interactive-validator-controls.test.ts
 tests/matchlock-setup-integration.test.ts
 tests/matchlock-union4-merge.test.ts
 tests/mcp-cli.test.ts

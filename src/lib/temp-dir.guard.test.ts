@@ -165,6 +165,15 @@ const TMP_PATH_ALLOWLIST: Record<string, string> = {
   "scripts/prll-verify.sh":
     "uses TAMANDUA_TEST_TMPDIR with /tmp/tamandua-test default (correct pattern)",
 
+  // ── Frozen ported reference scripts ──
+  // MTLK-INTERACTIVE-SUITE US-002 ports the PTY driver self-test byte-for-byte
+  // from the frozen reference campaign; its content hash is pinned by
+  // tests/matchlock-interactive-driver-frozen.test.ts. Rewriting it to use
+  // TAMANDUA_TEST_TMPDIR would break the byte-identity guarantee. Its own
+  // /tmp/pty-selftest-* scratch dir is intentional and removed by its EXIT trap.
+  "scripts/tests/matchlock/runner/pty-selftest.sh":
+    "frozen reference self-test (sha-pinned) uses its own /tmp scratch dir",
+
   // ── Matchlock short-HOME alias literals ──
   // The alias feature's WHOLE point is a literal short `/tmp/tamandua/<uid>/h`
   // root (never the ambient TMPDIR, which can be deep), and the product tests

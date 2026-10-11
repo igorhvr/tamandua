@@ -11,6 +11,10 @@
 # Node.js
 node_modules/
 
+# Python bytecode caches (the frozen PTY driver is imported by its self-test)
+__pycache__/
+*.py[cod]
+
 # Build output
 dist/
 

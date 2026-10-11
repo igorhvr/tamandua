@@ -1381,14 +1381,38 @@ failure or an unconfirmed cleanup returns non-success naming the VM and its
 retained diagnostics; killing the RPC child alone is never proof of VM
 termination.
 
-**Qualification status.** The interactive commands in this build are qualified
-**synthetically only**: the whole path runs against a test-owned fake PTY/RPC
-backend and capability probes, with no real VM, no real model call and no real
-matchlock session. **Real-VM PTY qualification with actual pi and Hermes is
-deferred** to the post-integration gate, so the shell/direct launch paths are
-clean-refusal scaffolding rather than a real-VM-qualified feature. As with every
-Matchlock mount, the writable project and configuration mounts remain exposed
-and concurrent VMs do not isolate shared files — Matchlock provides execution
+**Qualification.** The interactive commands have two levels of coverage. On
+every `npm test` run they are exercised **synthetically** against a test-owned
+fake PTY/RPC backend and capability probes, with no real VM, no real model call
+and no real matchlock session, so the fast lanes stay hermetic and cheap. On
+demand, the in-repo real-VM acceptance suite at
+`scripts/tests/matchlock/run-interactive-suite.sh` qualifies the same path for
+real. It takes `--tier t1|t2|t3|t4` (repeatable) and
+`--mode candidate|installed`:
+
+- `--tier t1` — fixture controls plus the frozen PTY driver self-test, no VM and
+  no model.
+- `--tier t2` — real-VM mechanics M0–M4 (boot, banner, image
+  provenance/identity, guest identity, exact-destination mount write-through,
+  swap variants, PTY resize, exit-code propagation, disconnect), model-free.
+- `--tier t3` — live-model TUI turns M5/M6 (pi and hermes); env-gated on
+  credentials, token spend disclosed, absent credentials recorded `NOTRUN`.
+- `--tier t4` — the bounded scheduled M7 spot-run.
+
+`--mode candidate` (the default) builds this worktree and executes its
+`dist/cli/cli.js`; `--mode installed` executes the `tamandua` resolved from
+`PATH` and never rebuilds it.
+
+The suite is **on demand only** — nothing in it runs in `npm test` or any fast
+lane, and it never pulls an image (the digest is a required runner input read
+from the local matchlock store). The operator runs the real-VM tiers
+(`t2`/`t3`/`t4`) outside the developer-agent sandbox; the entrypoint acquires
+the shared gate lock (`/home/kaladin/matchlock-work/vaivm-gate.lock`) itself
+exactly once around the VM execution it launches directly, so do not wrap the
+call in another `flock`. Real-VM PTY qualification with actual pi and Hermes is
+therefore available in-repo and on demand. As with every Matchlock mount, the
+writable project and configuration mounts remain exposed and
+concurrent VMs do not isolate shared files — Matchlock provides execution
 isolation, not mounted-data protection.
 
 ##### Doctor Contract Check
@@ -1555,6 +1579,7 @@ The remote MCP endpoint exposes 14 tools:
 - [pi](https://github.com/earendil-works/pi) installed on the host
   - Tamandua uses pi for AI agent execution. Agents run via `pi --print` in non-interactive mode.
 - `gh` CLI for PR creation steps
+- `flock` (util-linux; macOS: `brew install flock`) — required by the serial test lane and the on-demand matchlock acceptance suite
 
 ---
 
