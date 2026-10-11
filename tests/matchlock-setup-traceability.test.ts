@@ -9,12 +9,12 @@
  *     while the injected-seam unit test and the pure docs/traceability tests
  *     stay in the PARALLEL lane;
  *   - the pure installer core never imports `node:child_process` (spec N5);
- *   - the standard-image constant / env override and the "kept byte-identical"
- *     comment are present (Environment note), and the sibling
- *     `src/installer/matchlock/standard-image.ts` delivered by the iso line
- *     exists on the merged tree (cross-module byte-equality is pinned by
- *     tests/matchlock-setup-standard-image-parity.test.ts; import-based
- *     consolidation is deferred to bead tamandua-48v);
+ *   - the standard-image constant / env override are present (Environment
+ *     note), and the sibling `src/installer/matchlock/standard-image.ts`
+ *     delivered by the iso line exists on the merged tree — the consolidation
+ *     LANDED (tamandua-48v): the setup module imports the sibling's canonical
+ *     constant and aliases it, pinned by
+ *     tests/matchlock-setup-standard-image-parity.test.ts;
  *   - the CLI surface (N6) exports both help functions and documents every
  *     setup flag;
  *   - the docs (spec §8) name the command.
@@ -125,29 +125,37 @@ describe("MTLK-SETUP US-017: materialization and seams (N5, N7, environment note
     );
   });
 
-  it("pins the standard-image reference and env override byte-identically", () => {
+  it("pins the consolidated standard-image constant and env override", () => {
+    // tamandua-48v: the literal lives ONLY in the sibling canonical module;
+    // the setup module imports and aliases it. This guard was deliberately
+    // bumped in the SAME change as the consolidation (it used to pin the
+    // duplicated literal + the "kept byte-identical" comment shape).
     assert.match(
       coreSource,
-      /export const STANDARD_IMAGE_REFERENCE = "igorhvr\/tamandua";/,
-      "STANDARD_IMAGE_REFERENCE must be exactly igorhvr/tamandua",
+      /import \{ STANDARD_MATCHLOCK_IMAGE \} from "\.\/matchlock\/standard-image\.js";/,
+      "matchlock-setup.ts must statically import the canonical sibling constant",
+    );
+    assert.match(
+      coreSource,
+      /export const STANDARD_IMAGE_REFERENCE = STANDARD_MATCHLOCK_IMAGE;/,
+      "STANDARD_IMAGE_REFERENCE must alias the canonical sibling constant",
+    );
+    assert.ok(
+      !coreSource.includes('"igorhvr/tamandua"'),
+      "matchlock-setup.ts must not re-declare the consolidated literal",
     );
     assert.match(
       coreSource,
       /export const MATCHLOCK_IMAGE_ENV_NAME = "TAMANDUA_MATCHLOCK_IMAGE";/,
       "the image env override must be exactly TAMANDUA_MATCHLOCK_IMAGE",
     );
-    assert.match(
-      coreSource,
-      /kept byte-identical to src\/installer\/matchlock\/standard-image\.ts/,
-      "the sibling-consolidation comment must be present",
-    );
   });
 
   it("carries the iso line's sibling standard-image module on the merged tree", () => {
-    // Combined-tree invariant: the setup line deferred the sibling on purpose
-    // (see the "kept byte-identical" comment in src/installer/matchlock-setup.ts),
-    // and current main delivers it. Both sides' artifacts must survive the merge;
-    // import-based consolidation stays deferred to bead tamandua-48v.
+    // Combined-tree invariant: the sibling module is the iso line's canonical
+    // deliverable; current main delivers it and the setup module CONSUMES it
+    // after the tamandua-48v consolidation. Both artifacts must survive the
+    // merge.
     assert.ok(
       exists("src/installer/matchlock/standard-image.ts"),
       "src/installer/matchlock/standard-image.ts is the iso line's sibling deliverable and must exist on the combined tree",

@@ -10,7 +10,7 @@ import { describe, it, afterEach, beforeEach } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
@@ -41,8 +41,10 @@ import {
   _scheduledJobGitIdentity,
   buildHarnessChildEnv,
   setMatchlockOrphanReapHookForTest,
+  _setRunWriterLivenessProbeForTest,
 } from "../../dist/installer/agent-scheduler.js";
 import { getDaemonInstanceToken } from "../../dist/installer/sweep-ownership.js";
+import { getEnvironText } from "../../dist/lib/proc-info.js";
 import { reapOrphanedMatchlockVms } from "../../dist/installer/matchlock/vm-reaper.js";
 import { readOrphanVms, writeOrphanVm } from "../../dist/installer/matchlock/vm-orphans.js";
 import {
@@ -52,6 +54,7 @@ import {
 import { setMatchlockSchedulerRoundRunnerForTest } from "../../dist/installer/matchlock/scheduler-matchlock.js";
 import { setMatchlockExecutionBoundarySeamsForTest } from "../../dist/installer/matchlock/execution-boundary.js";
 import { getDb } from "../../dist/db.js";
+import { createRunWorktree, removeRunWorktree } from "../../dist/installer/worktree-manager.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 import { emitRunTerminalEvent } from "../../dist/installer/step-ops.js";
 import { getHarnessAdapter } from "../../dist/installer/harness-adapter.js";
@@ -5207,5 +5210,299 @@ console.log("TESTS: native");
     assert.equal(admissionCount(log), 0, "a native round must never log the Matchlock admission line");
     assert.match(log, /Work round start/, "native rounds keep their work-round logging");
     assert.equal(seamJournal.length, 0, "the native path never touches the Matchlock runner seam");
+  });
+});
+
+// ── tamandua-dlt: runPostGraceSweep drives the teardown detach ──────
+//
+// Scheduler-level acceptance for the WORKTREE-OWN rider: the post-grace
+// sweep is the production teardown pass that now detaches a terminal run's
+// OWN managed worktree once its writers are provably stopped. Fixtures use
+// REAL git repositories and REAL managed worktrees; the injected liveness
+// probe is used ONLY for the deterministic negative branches, while the
+// primary end-to-end case exercises the PRODUCTION probe against a real
+// run-owned writer child (killed by the sweep, then observed gone before
+// the detach).
+
+describe("runPostGraceSweep — tamandua-dlt teardown detach gate", { concurrency: 1 }, () => {
+  interface Fixture {
+    runId: string;
+    repo: string;
+    wtPath: string;
+    token: string;
+  }
+  let fixtures: Fixture[];
+  let children: ChildProcess[];
+
+  beforeEach(() => {
+    fixtures = [];
+    children = [];
+  });
+
+  afterEach(async () => {
+    _setRunWriterLivenessProbeForTest(null);
+    for (const child of children) {
+      try {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      } catch {
+        // already dead
+      }
+      // Bounded await + assertion: fixtures must be provably reaped before
+      // the isolated DB/env is torn down around them (a leaked child would
+      // otherwise produce a false-green cleanup).
+      const reaped = await waitForExit(child, 2000);
+      assert.ok(reaped, `fixture child ${child.pid} must be reaped`);
+    }
+    children.length = 0;
+    for (const fx of fixtures) {
+      try {
+        removeRunWorktree({ runId: fx.runId, force: true });
+      } catch {
+        // best effort
+      }
+      try {
+        spawnSync("git", ["-C", fx.repo, "worktree", "prune"]);
+      } catch {
+        // best effort
+      }
+      try {
+        fs.rmSync(fx.repo, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+    fixtures.length = 0;
+  });
+
+  function runGitSync(args: string[], cwd: string) {
+    return spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  }
+
+  function gitOut(args: string[], cwd: string): string {
+    const result = runGitSync(args, cwd);
+    assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+    return (result.stdout ?? "").trim();
+  }
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function waitForExit(child: ChildProcess, timeoutMs = 4000): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve(true);
+      const timer = setTimeout(() => resolve(false), timeoutMs);
+      child.on("exit", () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+      child.on("error", () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  }
+
+  /** Poll until the child's environ is readable (procfs / KERN_PROCARGS2). */
+  async function waitForReadableEnviron(pid: number, timeoutMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let environ = getEnvironText(pid);
+    while ((environ === null || !environ.includes("TAMANDUA_RUN_ID=")) && Date.now() < deadline) {
+      await sleep(25);
+      environ = getEnvironText(pid);
+    }
+  }
+
+  /** Number of worktree records attached to refs/heads/<branch> in the repo. */
+  function branchOwnerCount(repo: string, branch: string): number {
+    return gitOut(["worktree", "list", "--porcelain"], repo)
+      .split("\n")
+      .filter((line) => line.trim() === `branch refs/heads/${branch}`).length;
+  }
+
+  /**
+   * Real fixture: an origin checkout ON the integration branch (#117 shape)
+   * plus this run's managed worktree ATTACHED to the same branch.
+   */
+  function buildAttachedFixture(runId: string, runNumber: number, runStatus: string): Fixture {
+    const repo = tamanduaTempDir("tamandua-sched-dlt-");
+    assert.equal(spawnSync("git", ["init", "-q"], { cwd: repo }).status, 0, "git init must succeed");
+    assert.equal(spawnSync("git", ["-C", repo, "config", "user.email", "test@tamandua.local"]).status, 0);
+    assert.equal(spawnSync("git", ["-C", repo, "config", "user.name", "Tamandua Test"]).status, 0);
+    fs.writeFileSync(path.join(repo, "README.md"), "# sched dlt\n", "utf-8");
+    assert.equal(spawnSync("git", ["-C", repo, "add", "README.md"]).status, 0);
+    assert.equal(spawnSync("git", ["-C", repo, "commit", "-q", "-m", "initial"]).status, 0);
+    assert.equal(spawnSync("git", ["-C", repo, "checkout", "-q", "-b", "integration/line"]).status, 0);
+    fs.writeFileSync(path.join(repo, "line.txt"), "line\n", "utf-8");
+    assert.equal(spawnSync("git", ["-C", repo, "add", "line.txt"]).status, 0);
+    assert.equal(spawnSync("git", ["-C", repo, "commit", "-q", "-m", "line"]).status, 0);
+
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'sched dlt task', ?, '{}', ?, ?)",
+    ).run(runId, runStatus, now, now);
+
+    const wt = createRunWorktree({
+      runId,
+      runNumber,
+      workflowId: "test-workflow",
+      worktreeOriginRepository: repo,
+    });
+    // Register the fixture BEFORE the attach assertion: a failed attach must
+    // still be cleaned up by afterEach.
+    const token = getDaemonInstanceToken();
+    assert.ok(token !== null, "the test process must resolve a daemon-instance token");
+    const fixture: Fixture = { runId, repo, wtPath: wt.worktreePath, token };
+    fixtures.push(fixture);
+    const attach = runGitSync(["checkout", "--ignore-other-worktrees", "integration/line"], wt.worktreePath);
+    assert.equal(attach.status, 0, `attach must succeed: ${attach.stderr}`);
+    return fixture;
+  }
+
+  /** The isolated state log for the current test (module-level isolationRoot). */
+  function readIsolationLog(): string {
+    if (!isolationRoot) return "";
+    const logPath = path.join(isolationRoot, ".tamandua", "tamandua.log");
+    return fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf-8") : "";
+  }
+
+  it("kills a real run-owned writer, observes it gone, detaches the terminal run's worktree, and stays idempotent on repeat", async () => {
+    const runId = "run-sched-dlt-e2e";
+    const fx = buildAttachedFixture(runId, 701, "completed");
+    assert.equal(branchOwnerCount(fx.repo, "integration/line"), 2, "fixture must reproduce the two-owner conflict");
+    const refBefore = gitOut(["rev-parse", "refs/heads/integration/line"], fx.repo);
+
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30);"], {
+      cwd: fx.wtPath,
+      env: {
+        PATH: process.env.PATH || "/usr/bin",
+        TAMANDUA_RUN_ID: runId,
+        TAMANDUA_DAEMON_INSTANCE: fx.token,
+      },
+      stdio: "ignore",
+      detached: true,
+    });
+    children.push(child);
+    const childPid = child.pid!;
+    await waitForReadableEnviron(childPid);
+    assert.ok(isAlive(childPid), "the run-owned writer must be alive before the sweep");
+
+    await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+
+    const exited = await waitForExit(child);
+    assert.ok(exited && !isAlive(childPid), "the sweep must have killed the run-owned writer");
+    const cleanup = getRunEvents(runId).filter((e) => e.event === "run.process_cleanup");
+    assert.equal(cleanup.length, 1, "exactly one sweep event for the run");
+    const detail = JSON.parse(cleanup[0].detail!);
+    assert.ok(
+      detail.killedPids.includes(childPid),
+      `sweep must record the killed writer: ${JSON.stringify(detail.killedPids)}`,
+    );
+
+    // Detached: HEAD detaches at the same commit; the branch ref is unmoved;
+    // only the ORIGIN keeps owning the branch.
+    assert.equal(runGitSync(["symbolic-ref", "-q", "HEAD"], fx.wtPath).status, 1, "HEAD must be detached");
+    assert.equal(gitOut(["rev-parse", "refs/heads/integration/line"], fx.repo), refBefore, "branch ref must be unmoved");
+    assert.equal(branchOwnerCount(fx.repo, "integration/line"), 1, "only the origin may keep the branch");
+    assert.equal(fs.existsSync(fx.wtPath), true, "directory must be kept");
+
+    // Repeat teardown: idempotent.
+    await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+    assert.equal(runGitSync(["symbolic-ref", "-q", "HEAD"], fx.wtPath).status, 1);
+    assert.equal(gitOut(["rev-parse", "refs/heads/integration/line"], fx.repo), refBefore);
+    assert.equal(branchOwnerCount(fx.repo, "integration/line"), 1);
+  });
+
+  it("leaves the worktree attached while a writer stays observable (injected alive probe)", async () => {
+    const runId = "run-sched-dlt-alive";
+    const fx = buildAttachedFixture(runId, 702, "completed");
+    _setRunWriterLivenessProbeForTest(() => ({
+      status: "alive",
+      processes: [{ pid: 424242, evidence: "test-injected alive" }],
+    }));
+    try {
+      await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+    } finally {
+      _setRunWriterLivenessProbeForTest(null);
+    }
+    assert.equal(gitOut(["branch", "--show-current"], fx.wtPath), "integration/line");
+    assert.equal(branchOwnerCount(fx.repo, "integration/line"), 2);
+  });
+
+  it("leaves the worktree attached when quiescence cannot be proven (injected unknown probe)", async () => {
+    const runId = "run-sched-dlt-unknown";
+    const fx = buildAttachedFixture(runId, 703, "completed");
+    _setRunWriterLivenessProbeForTest(() => ({ status: "unknown", reason: "test: cannot observe" }));
+    try {
+      await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+    } finally {
+      _setRunWriterLivenessProbeForTest(null);
+    }
+    assert.equal(gitOut(["branch", "--show-current"], fx.wtPath), "integration/line");
+    assert.equal(branchOwnerCount(fx.repo, "integration/line"), 2);
+  });
+
+  it("reports a real git failure without masking the teardown; a later sweep recovers and detaches", async () => {
+    const runId = "run-sched-dlt-lock";
+    const fx = buildAttachedFixture(runId, 704, "completed");
+    _setRunWriterLivenessProbeForTest(() => ({ status: "quiescent" }));
+    const gitDir = gitOut(["rev-parse", "--absolute-git-dir"], fx.wtPath);
+    const lockPath = path.join(gitDir, "index.lock");
+    fs.writeFileSync(lockPath, "", "utf-8");
+    try {
+      // Must resolve (best-effort contract), leaving the attachment intact.
+      await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+      assert.equal(gitOut(["branch", "--show-current"], fx.wtPath), "integration/line");
+      assert.equal(branchOwnerCount(fx.repo, "integration/line"), 2);
+      const runRow = getDb().prepare("SELECT status FROM runs WHERE id = ?").get(runId) as {
+        status: string;
+      };
+      assert.equal(runRow.status, "completed", "the detach failure must not alter the run's own outcome");
+      // The failure must be REPORTED (not swallowed): the run's log names the
+      // run and the failed detach.
+      const log = readIsolationLog();
+      assert.match(log, /Run worktree detach at teardown failed/, "the detach failure must be logged");
+      assert.ok(log.includes(runId), "the failure log must name the run");
+    } finally {
+      fs.rmSync(lockPath, { force: true });
+    }
+    // Recovery: the next sweep detaches.
+    await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+    assert.equal(runGitSync(["symbolic-ref", "-q", "HEAD"], fx.wtPath).status, 1);
+    assert.equal(branchOwnerCount(fx.repo, "integration/line"), 1);
+    _setRunWriterLivenessProbeForTest(null);
+  });
+
+  it("does not detach for a non-terminal run, and a stale teardown callback after a resume/re-attach leaves the worktree attached", async () => {
+    const runId = "run-sched-dlt-resume";
+    const fx = buildAttachedFixture(runId, 705, "running");
+
+    // Non-terminal: nothing happens.
+    await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+    assert.equal(gitOut(["branch", "--show-current"], fx.wtPath), "integration/line");
+
+    // Terminal: detaches.
+    getDb().prepare("UPDATE runs SET status = 'completed' WHERE id = ?").run(runId);
+    await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+    assert.equal(runGitSync(["symbolic-ref", "-q", "HEAD"], fx.wtPath).status, 1, "terminal run must detach");
+
+    // Simulated resume: the run is active again and the worktree re-attached;
+    // a late/stale teardown callback must leave it intact.
+    getDb().prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+    const reattach = runGitSync(["checkout", "--ignore-other-worktrees", "integration/line"], fx.wtPath);
+    assert.equal(reattach.status, 0, `re-attach must succeed: ${reattach.stderr}`);
+    await runPostGraceSweep(runId, { workingDirectory: fx.wtPath });
+    assert.equal(gitOut(["branch", "--show-current"], fx.wtPath), "integration/line");
+    assert.equal(branchOwnerCount(fx.repo, "integration/line"), 2);
   });
 });

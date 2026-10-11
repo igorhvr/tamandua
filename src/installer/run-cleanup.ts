@@ -193,6 +193,154 @@ export function matchRunEvidence(
   return `daemon-scoped run marker: run=${runId}`;
 }
 
+/** One live process found by the observation scan. */
+export interface LiveRunOwnedProcess {
+  pid: number;
+  /** The evidence string that matched (same evidence model as the sweep). */
+  evidence: string;
+}
+
+/**
+ * Direct, environ-independent liveness probe for a recorded run-owned process
+ * GROUP: `kill(-pgid, 0)` asks the kernel whether any process in the group
+ * still exists, with no dependence on environ readability. Because the pgid
+ * was recorded by this daemon for a child it spawned, the group is in scope
+ * even when the member's environ cannot be read. Conservative mapping: only
+ * ESRCH proves the group is gone; EPERM/other errors return "unknown" (which
+ * gating callers must treat exactly like "still alive").
+ */
+export function probeProcessGroupAlive(pgid: number): "alive" | "gone" | "unknown" {
+  if (!Number.isInteger(pgid) || pgid <= 1) return "unknown";
+  if (process.platform === "win32") return "unknown";
+  try {
+    process.kill(-pgid, 0);
+    return "alive";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "gone";
+    return "unknown";
+  }
+}
+
+/**
+ * Tri-state result of the observation scan. "unknown" is DISTINCT from
+ * "quiescent": it means the scan could not answer (its process enumeration
+ * could not even observe the current process), and callers must treat it as
+ * "cannot prove absence" — never as permission.
+ */
+export type RunOwnedProcessObservation =
+  | { status: "alive"; processes: LiveRunOwnedProcess[] }
+  | { status: "quiescent" }
+  | { status: "unknown"; reason: string };
+
+/**
+ * OBSERVATION-ONLY scan for live processes that the run-teardown sweep would
+ * have matched: recorded owned pgids plus the daemon-scoped marker channel —
+ * the same exclusive evidence model as {@link sweepRunProcesses}, minus the
+ * kill. Never signals, never throws.
+ *
+ * Tri-state, conservative: "quiescent" is reported only when the enumeration
+ * demonstrably worked (the snapshot must contain this very process, an
+ * always-visible same-user canary); otherwise the result is "unknown". A
+ * per-candidate unreadable environ simply does not match (same semantics as
+ * the sweep's kill gate). This is a bounded host-process observation — it is
+ * evidence of absence for host-visible writers, not proof that some
+ * non-host-visible writer has stopped; gating callers must treat only
+ * "quiescent" as permission and skip on "unknown".
+ */
+export function observeLiveRunOwnedProcesses(
+  runId: string,
+  options?: {
+    /** Recorded owned process groups (captured at teardown + steps.claim_pgid). */
+    pgids?: number[];
+    /** This daemon instance's token; null disables the marker channel. */
+    daemonInstance?: string | null;
+    /** PID that must never be reported (typically the current process). */
+    daemonPid?: number;
+    /**
+     * The run's working directory. Used ONLY as a RELEVANCE breadcrumb for
+     * fail-closed resolution of unreadable candidates — never as kill or
+     * match evidence.
+     */
+    worktreePath?: string | null;
+  },
+): RunOwnedProcessObservation {
+  const snapshot = collectProcessSnapshot();
+  if (!snapshot.some((entry) => entry.pid === process.pid)) {
+    return {
+      status: "unknown",
+      reason: "process enumeration did not include the current process; absence cannot be proven",
+    };
+  }
+
+  const skipPids = new Set<number>([1, process.pid]);
+  if (options?.daemonPid !== undefined) skipPids.add(options.daemonPid);
+  const ownedPgids = new Set<number>(options?.pgids ?? []);
+  const daemonInstance = options?.daemonInstance ?? null;
+
+  // No evidence channel at all (no daemon token AND no recorded pgids) can
+  // only produce non-matches; absence of a match would be vacuous, so report
+  // "unknown" instead of a false "quiescent".
+  if (daemonInstance === null && ownedPgids.size === 0) {
+    return {
+      status: "unknown",
+      reason: "no ownership evidence channel available (no daemon token, no recorded pgids)",
+    };
+  }
+
+  const alive: LiveRunOwnedProcess[] = [];
+  for (const entry of snapshot) {
+    const pid = entry.pid;
+    if (skipPids.has(pid)) continue;
+    try {
+      let pgid: number | null = null;
+      if (ownedPgids.size > 0) pgid = getPgid(pid);
+      if (pgid !== null && ownedPgids.has(pgid)) {
+        alive.push({ pid, evidence: `pgid owned by run: ${pgid}` });
+        continue;
+      }
+      if (daemonInstance !== null) {
+        const environ = entry.environ ?? readProcEnviron(pid);
+        const match = matchRunEvidence({ environ }, runId, daemonInstance);
+        if (match) {
+          alive.push({ pid, evidence: match });
+          continue;
+        }
+        // Fail-closed resolution: a process whose environ cannot be READ but
+        // which carries run-relevance breadcrumbs (cwd under the run's
+        // working directory, or a command line naming the run id / worktree)
+        // is UNRESOLVED, not a proven non-owner. A gate must never treat it
+        // as absence; per-candidate unreadability elsewhere stays a plain
+        // non-match (same as the sweep's kill gate) and never turns every
+        // unrelated process on the host into "unknown".
+        if (environ === null && options?.worktreePath) {
+          const resolvedWorktree = safeRealpath(options.worktreePath);
+          const resolvedCwd = entry.cwd ? safeRealpath(entry.cwd) : null;
+          const cwdRelevant =
+            resolvedCwd !== null &&
+            (resolvedCwd === resolvedWorktree || resolvedCwd.startsWith(resolvedWorktree + path.sep));
+          const cmdlineRelevant =
+            entry.cmdline !== "" &&
+            (entry.cmdline.includes(runId) || entry.cmdline.includes(options.worktreePath));
+          if (cwdRelevant || cmdlineRelevant) {
+            return {
+              status: "unknown",
+              reason:
+                `run-relevant process ${pid} is unresolved (unreadable environ with ` +
+                "cwd/cmdline breadcrumbs); absence cannot be proven",
+            };
+          }
+        }
+      }
+    } catch {
+      // A process that vanished mid-scan is not alive; anything else makes
+      // this candidate unresolvable, and an unresolvable candidate is simply
+      // not reported as alive (never a false match).
+    }
+  }
+  return alive.length > 0 ? { status: "alive", processes: alive } : { status: "quiescent" };
+}
+
 /**
  * Check if a process belongs to the run by inspecting its cwd, environ,
  * and command line. Returns the evidence string, or null if no match.

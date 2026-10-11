@@ -2,16 +2,19 @@
  * Unit tests for the daemon heartbeat marker module
  * (src/server/daemon-lifecycle.ts).
  *
- * Pure-logic tests: no child_process imports, no daemon spawns, no
- * process-spawning source dependencies — parallel lane.
+ * Serial lane (the module transitively reaches daemonctl's spawners). The
+ * atomic-publication suite at the bottom additionally spawns one child
+ * process to race a concurrent reader against the publisher
+ * (tamandua-2xx concurrency/atomicity proof).
  */
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { createTempHome } from "../../tests/helpers/test-env.ts";
+import { spawn } from "node:child_process";
+import { cleanChildEnv, createTempHome } from "../../tests/helpers/test-env.ts";
 import {
   DAEMON_LIFECYCLE_INSTANT_TOLERANCE_MS,
   HEARTBEAT_INTERVAL_DEFAULT_MS,
@@ -809,5 +812,333 @@ describe("daemon heartbeat marker test-guard", { concurrency: 1 }, () => {
     assert.ok(fs.existsSync(getHeartbeatPath(opts)), "touch must update the isolated marker");
     finalizeHeartbeatMarker(opts);
     assert.ok(!fs.existsSync(getHeartbeatPath(opts)), "finalize must remove the isolated marker");
+  });
+});
+
+// ── Atomic publication + concurrent readers (tamandua-2xx) ───────────
+//
+// The heartbeat publisher used to be a bare truncate+write; a concurrent
+// reader could observe an empty/torn marker ("Unexpected end of JSON
+// input"). Publication is now tmp+rename (same idiom as the sibling
+// acknowledgeDaemonDeath). These tests prove it two ways:
+//   (a) deterministic interception of fs calls — every publish stages a
+//       `.tmp` file and installs it by rename, and the DESTINATION always
+//       holds a complete marker both during staging and at rename time
+//       (observations are recorded inside the interceptor and asserted
+//       OUTSIDE the mocked window, where the publisher's best-effort catch
+//       can no longer swallow an assertion);
+//   (b) a separate-process RAW reader (plain readFileSync + JSON.parse, not
+//       the tolerant product reader) racing live publishes — it must never
+//       observe a torn/empty marker, and an adversarial calibration target
+//       demonstrates the reader instrument DOES detect truncate+write tears.
+
+describe("heartbeat atomic publication (tamandua-2xx)", { concurrency: 1 }, () => {
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  it("publishes via tmp+rename: the destination never receives a direct write and always holds a complete marker", () => {
+    const th = createTempHome("tamandua-hb-atomic-");
+    const opts = { homeDir: th.homeDir };
+    const target = getHeartbeatPath(opts);
+
+    // An initialized destination first (the realistic steady state).
+    writeHeartbeatMarker(opts);
+
+    const realWrite = fs.writeFileSync.bind(fs);
+    const realRename = fs.renameSync.bind(fs);
+    const realRead = fs.readFileSync.bind(fs);
+    const writes: Array<{ file: string; destinationAtStaging: string | null }> = [];
+    const renames: Array<{ from: string; to: string; before: string | null; after: string | null }> = [];
+
+    mock.method(fs, "writeFileSync", (file: Parameters<typeof realWrite>[0], data: Parameters<typeof realWrite>[1], o?: Parameters<typeof realWrite>[2]) => {
+      let destinationAtStaging: string | null = null;
+      try {
+        destinationAtStaging = String(realRead(target, "utf-8"));
+      } catch {
+        destinationAtStaging = null;
+      }
+      writes.push({ file: String(file), destinationAtStaging });
+      return realWrite(file, data, o);
+    });
+    mock.method(fs, "renameSync", (from: Parameters<typeof realRename>[0], to: Parameters<typeof realRename>[1]) => {
+      let before: string | null = null;
+      let after: string | null = null;
+      try {
+        before = String(realRead(target, "utf-8"));
+      } catch {
+        before = null;
+      }
+      const result = realRename(from, to);
+      try {
+        after = String(realRead(target, "utf-8"));
+      } catch {
+        after = null;
+      }
+      renames.push({ from: String(from), to: String(to), before, after });
+      return result;
+    });
+
+    let threw = false;
+    try {
+      touchHeartbeat(opts); // refresh path
+      writeHeartbeatMarker(opts); // fresh publish path
+    } catch {
+      threw = true;
+    } finally {
+      mock.restoreAll();
+    }
+
+    // Assertions OUTSIDE the mocked window.
+    assert.equal(threw, false, "publishers are best-effort and must never throw");
+    assert.equal(writes.length, 2, "each publish stages exactly one file");
+    for (const w of writes) {
+      assert.ok(w.file.endsWith(".tmp"), `staged file must be a .tmp: ${w.file}`);
+      assert.notEqual(w.file, target, "the destination is never write()n directly");
+      assert.ok(
+        w.destinationAtStaging !== null,
+        "destination must exist during staging",
+      );
+      assert.doesNotThrow(
+        () => JSON.parse(w.destinationAtStaging!),
+        "destination must hold COMPLETE JSON while a publish is staged",
+      );
+    }
+    assert.equal(renames.length, 2, "each publish installs via exactly one rename");
+    for (const r of renames) {
+      assert.ok(r.from.endsWith(".tmp"), "rename must move the staging file");
+      assert.equal(r.to, target, "rename must install onto the destination");
+      assert.equal(typeof r.before, "string", "destination bytes must be captured before install");
+      assert.ok((r.before ?? "").length > 0, "destination must be non-empty (a complete marker) before install");
+      assert.doesNotThrow(() => JSON.parse(r.before!), "destination before install must be complete JSON");
+      assert.equal(typeof r.after, "string", "destination bytes must be captured after install");
+      assert.ok((r.after ?? "").length > 0, "destination must be non-empty after install");
+      const after = JSON.parse(r.after!) as { pid: unknown; startedAt: unknown; lastHeartbeatAt: unknown };
+      assert.equal(typeof after.pid, "number");
+      assert.equal(typeof after.startedAt, "string");
+      assert.equal(typeof after.lastHeartbeatAt, "string");
+    }
+    assert.ok(readHeartbeatMarker(opts), "final marker must still be readable");
+  });
+
+  it("a failed replacement preserves the previous complete marker (best-effort, never throws)", () => {
+    const th = createTempHome("tamandua-hb-renamefail-");
+    const opts = { homeDir: th.homeDir };
+    const target = getHeartbeatPath(opts);
+
+    writeHeartbeatMarker(opts);
+    const previous = fs.readFileSync(target, "utf-8");
+    assert.doesNotThrow(() => JSON.parse(previous), "precondition: previous marker is complete");
+
+    mock.method(fs, "renameSync", () => {
+      throw new Error("simulated rename failure");
+    });
+    let threw = false;
+    try {
+      writeHeartbeatMarker(opts);
+      touchHeartbeat(opts);
+    } catch {
+      threw = true;
+    } finally {
+      mock.restoreAll();
+    }
+
+    assert.equal(threw, false, "best-effort contract: publication failures never throw");
+    const after = fs.readFileSync(target, "utf-8");
+    assert.equal(after, previous, "a failed replacement must leave the previous complete marker byte-identical");
+
+    // Recovery: once rename works again, publication resumes normally.
+    touchHeartbeat(opts);
+    const recovered = readHeartbeatMarker(opts);
+    assert.ok(recovered, "publication must recover after the transient failure");
+  });
+
+  it("a separate-process RAW reader never observes a torn marker during live publishing", async () => {
+    const th = createTempHome("tamandua-hb-race-");
+    const opts = { homeDir: th.homeDir };
+    const target = getHeartbeatPath(opts);
+    writeHeartbeatMarker(opts);
+
+    // RAW reader (NOT readHeartbeatMarker): plain readFileSync + JSON.parse,
+    // so a torn/empty file is a hard observation rather than a tolerated
+    // null. Measured-phase handshake: the reader records the FIRST version it
+    // parses (published BEFORE it started), then writes the seen path the
+    // moment it observes a DIFFERENT version — which can only be a marker
+    // published during the parent's racing phase. Prints READY after its
+    // first successful parse, then a summary.
+    const readerScript = [
+      "const fs = require('fs');",
+      "const target = process.argv[1];",
+      "const seenPath = process.argv[2];",
+      "const deadline = Date.now() + 4000;",
+      "let reads = 0, bad = 0, readErrors = 0, distinct = 0, seen = false;",
+      "let firstRaw = null, firstBad = null, ready = false;",
+      "while (Date.now() < deadline) {",
+      "  let raw = null;",
+      "  try { raw = fs.readFileSync(target, 'utf8'); } catch { readErrors++; continue; }",
+      "  let parsed = null;",
+      "  try { parsed = JSON.parse(raw); } catch { bad++; firstBad = 'json:' + raw.slice(0, 96); break; }",
+      "  if (typeof parsed.pid !== 'number' || typeof parsed.startedAt !== 'string' || typeof parsed.lastHeartbeatAt !== 'string') { bad++; firstBad = 'shape:' + raw.slice(0, 96); break; }",
+      "  reads++;",
+      "  if (firstRaw === null) {",
+      "    firstRaw = raw;",
+      "    if (!ready) { ready = true; process.stdout.write('READY\\n'); }",
+      "  } else if (raw !== firstRaw) {",
+      "    distinct++;",
+      "    if (!seen) { seen = true; try { fs.writeFileSync(seenPath, 'seen'); } catch {} }",
+      "  }",
+      "}",
+      "process.stdout.write(JSON.stringify({ reads, bad, readErrors, distinct, seen, firstBad }) + '\\n');",
+    ].join("\n");
+
+    function spawnReader(readerTarget: string, seenPath: string) {
+      const child = spawn(process.execPath, ["-e", readerScript, readerTarget, seenPath], {
+        env: cleanChildEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let errOut = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        out += chunk.toString("utf-8");
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        errOut += chunk.toString("utf-8");
+      });
+      // Registered at spawn time; 'close' (not 'exit') so stdio is fully
+      // flushed before any captured output is parsed.
+      const closed = new Promise<number | null>((resolve) => {
+        child.on("close", (code) => resolve(code));
+        child.on("error", () => resolve(null));
+      });
+      return { child, readOut: () => out, readErr: () => errOut, closed };
+    }
+
+    async function boundedWait<T>(p: Promise<T>, ms: number): Promise<T | "timeout"> {
+      return Promise.race([
+        p,
+        new Promise<"timeout">((resolve) => {
+          const timer = setTimeout(() => resolve("timeout"), ms);
+          timer.unref();
+        }),
+      ]);
+    }
+
+    async function waitForReady(reader: { readOut: () => string }, ms: number): Promise<void> {
+      const deadline = Date.now() + ms;
+      while (!reader.readOut().includes("READY") && Date.now() < deadline) {
+        await sleep(10);
+      }
+    }
+
+    async function reap(child: ReturnType<typeof spawn>, closed: Promise<number | null>): Promise<void> {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      const closedCode = await boundedWait(closed, 3000);
+      assert.notEqual(closedCode, "timeout", "reader child must be reaped (closed) within the bound");
+    }
+
+    function parseSummary(reader: {
+      readOut: () => string;
+      readErr: () => string;
+    }): { reads: number; bad: number; readErrors: number; distinct: number; seen: boolean; firstBad: string | null } {
+      const line = reader
+        .readOut()
+        .split("\n")
+        .find((candidate) => candidate.startsWith("{"));
+      assert.ok(
+        line,
+        `reader must print a summary; stdout=${JSON.stringify(reader.readOut())} stderr=${JSON.stringify(reader.readErr())}`,
+      );
+      return JSON.parse(line!) as { reads: number; bad: number; readErrors: number; distinct: number; seen: boolean; firstBad: string | null };
+    }
+
+    // ── Production target: measured-phase race. The reader's first observed
+    //    version is the pre-race marker; the parent publishes in a tight
+    //    loop (2 ms apart, so every publish changes the bytes) until the
+    //    reader's seen file appears — proving the reader observed at least
+    //    one marker version PRODUCED DURING the racing phase, and observed
+    //    it without ever seeing a torn file. ──
+    const seenPath = path.join(path.dirname(target), "reader-seen.txt");
+    fs.rmSync(seenPath, { force: true });
+    const prod = spawnReader(target, seenPath);
+    try {
+      await waitForReady(prod, 4000);
+      assert.ok(
+        prod.readOut().includes("READY"),
+        `reader must reach its first successful parse; stderr=${JSON.stringify(prod.readErr())}`,
+      );
+      let publishes = 0;
+      const publishDeadline = Date.now() + 3000;
+      while (!fs.existsSync(seenPath) && Date.now() < publishDeadline) {
+        touchHeartbeat(opts);
+        writeHeartbeatMarker(opts);
+        publishes++;
+        await sleep(2);
+      }
+      assert.ok(publishes > 0, "the publisher must have published during the race");
+      assert.ok(
+        fs.existsSync(seenPath),
+        `reader must observe a marker version published during the racing phase (publishes=${publishes})`,
+      );
+      // Continue publishing a bounded batch after the acknowledgement so the
+      // reader keeps observing REPLACEMENTS (not just the one version that
+      // tripped the handshake) for as long as it stays alive.
+      const continueDeadline = Date.now() + 800;
+      while (Date.now() < continueDeadline && prod.child.exitCode === null) {
+        touchHeartbeat(opts);
+        writeHeartbeatMarker(opts);
+        publishes++;
+        await sleep(2);
+      }
+      const code = await boundedWait(prod.closed, 9000);
+      assert.notEqual(code, "timeout", "reader must exit within the bound after its deadline");
+      const summary = parseSummary(prod);
+      assert.equal(code, 0, "reader process must exit cleanly");
+      assert.ok(summary.reads > 0, "reader must actually read the marker during publishing");
+      assert.ok(summary.distinct > 0, "reader must have observed distinct published versions");
+      assert.equal(summary.seen, true, "reader must have signaled the measured-phase observation");
+      assert.equal(summary.bad, 0, `raw reader observed a torn/empty marker: ${summary.firstBad}`);
+      assert.equal(
+        summary.readErrors,
+        0,
+        "the complete marker must always be readable; a read error means the destination was missing",
+      );
+    } finally {
+      await reap(prod.child, prod.closed);
+    }
+
+    // ── Adversarial calibration (deterministic): the SAME reader against a
+    //    target that is torn mid-run MUST detect the tear — proving the
+    //    instrument can see the defect class rather than passing vacuously.
+    //    The tear is held until the reader observes it, so no timing luck is
+    //    involved. ──
+    const controlTarget = path.join(path.dirname(target), "control-marker.json");
+    fs.writeFileSync(
+      controlTarget,
+      JSON.stringify({ pid: 12345, startedAt: new Date().toISOString(), lastHeartbeatAt: new Date().toISOString() }),
+      "utf-8",
+    );
+    const control = spawnReader(controlTarget, path.join(path.dirname(target), "control-seen.txt"));
+    try {
+      await waitForReady(control, 5000);
+      assert.ok(
+        control.readOut().includes("READY"),
+        `calibration reader must reach its first successful parse; stderr=${JSON.stringify(control.readErr())}`,
+      );
+      // Deterministic tear: truncate the payload mid-JSON and leave it torn.
+      fs.writeFileSync(controlTarget, '{"pid":12345,"startedAt":"2026', "utf-8");
+      const controlCode = await boundedWait(control.closed, 6000);
+      assert.notEqual(controlCode, "timeout", "calibration reader must observe the torn marker and exit");
+      const controlSummary = parseSummary(control);
+      assert.equal(controlCode, 0);
+      assert.ok(
+        controlSummary.bad > 0,
+        "calibration must demonstrate the raw reader detects torn content " +
+          `(reads=${controlSummary.reads}, bad=${controlSummary.bad}); ` +
+          "otherwise the production proof above would be vacuous",
+      );
+      assert.match(controlSummary.firstBad ?? "", /^(json|shape):/);
+    } finally {
+      await reap(control.child, control.closed);
+    }
   });
 });

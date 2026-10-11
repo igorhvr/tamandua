@@ -15,10 +15,12 @@ import {
   validateRunWorktree,
   removeRunWorktree,
   listRunWorktrees,
+  detachRunWorktreeBranch,
   type ManagedRunWorktree,
 } from "../../dist/installer/worktree-manager.js";
 import { getDaemonInstanceToken } from "../../dist/installer/sweep-ownership.js";
 import { getEnvironText } from "../../dist/lib/proc-info.js";
+import { getDb } from "../../dist/db.js";
 
 // ── Helpers ──
 
@@ -941,6 +943,272 @@ describe("worktree-manager", () => {
       // Clean up
       removeRunWorktree({ runId: "run-list-001", force: true });
       removeRunWorktree({ runId: "run-list-002", force: true });
+    });
+  });
+
+  // ── detachRunWorktreeBranch (tamandua-dlt) ──
+
+  describe("detachRunWorktreeBranch (tamandua-dlt teardown detach)", () => {
+    let dltRepo: string;
+    let dltCommonDir: string;
+
+    before(() => {
+      dltRepo = tamanduaTempDir("tamandua-dlt-origin-");
+      initGitRepo(dltRepo);
+      // #117 shape: the origin checkout STAYS on the integration branch; the
+      // run's worktree attaches to the SAME branch via
+      // `checkout --ignore-other-worktrees` (the setup output recorded in the
+      // bead). Two worktrees therefore own refs/heads/integration/line until
+      // run teardown detaches the run-owned one.
+      assert.equal(runGit(["checkout", "-b", "integration/line"], dltRepo).status, 0, "branch creation must succeed");
+      writeFileSync(path.join(dltRepo, "line.txt"), "line\n", "utf-8");
+      assert.equal(runGit(["add", "line.txt"], dltRepo).status, 0, "add must succeed");
+      assert.equal(runGit(["commit", "-m", "integration line"], dltRepo).status, 0, "commit must succeed");
+      const raw = getGitCommonDir(dltRepo);
+      dltCommonDir = path.isAbsolute(raw) ? raw : path.resolve(dltRepo, raw);
+    });
+
+    after(() => {
+      rmSync(dltRepo, { recursive: true, force: true });
+    });
+
+    /** Worktree records attached to refs/heads/<branch> (the #117 owner count). */
+    function branchOwnerCount(branch: string): number {
+      return runGit(["worktree", "list", "--porcelain"], dltRepo)
+        .stdout.split("\n")
+        .filter((line) => line.trim() === `branch refs/heads/${branch}`).length;
+    }
+
+    /** Seed a runs row for the detach helper's fresh-read fence. */
+    function seedRun(runId: string, status: string): void {
+      const now = new Date().toISOString();
+      getDb()
+        .prepare(
+          "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'wf-dlt', 'dlt task', ?, '{}', ?, ?)",
+        )
+        .run(runId, status, now, now);
+    }
+
+    function setRunStatus(runId: string, status: string): void {
+      getDb().prepare("UPDATE runs SET status = ? WHERE id = ?").run(status, runId);
+    }
+
+    /** Seed a run_worktrees row directly (for negative-path fixtures). */
+    function seedWorktreeRow(runId: string, wtPath: string): void {
+      getDb()
+        .prepare(
+          `INSERT INTO run_worktrees (run_id, worktree_origin_repository, worktree_origin_git_common_dir,
+            worktree_path, worktree_origin_ref, worktree_origin_sha, original_branch, status,
+            cleanup_policy, created_at)
+           VALUES (?, ?, ?, ?, 'integration/line', ?, 'integration/line', 'ready', 'keep', ?)`,
+        )
+        .run(runId, dltRepo, dltCommonDir, wtPath, getHeadSha(dltRepo), new Date().toISOString());
+    }
+
+    /** Create a managed worktree and ATTACH it to the integration branch
+     *  (#117 shape: setup ran `git checkout --ignore-other-worktrees`). */
+    function createAttachedWorktree(runId: string, runNumber: number): string {
+      const wt = createRunWorktree({
+        runId,
+        runNumber,
+        workflowId: "test-workflow",
+        worktreeOriginRepository: dltRepo,
+      });
+      const attach = runGit(["checkout", "--ignore-other-worktrees", "integration/line"], wt.worktreePath);
+      assert.equal(attach.status, 0, `attach must succeed: ${attach.stdout}`);
+      return wt.worktreePath;
+    }
+
+    it("detaches a terminal run's attached worktree keeping directory, refs, HEAD and content; origin untouched; neighbor intact; repeat cleanup safe", () => {
+      const runId = "run-dlt-001";
+      const wtPath = createAttachedWorktree(runId, 201);
+
+      // The #117 precondition: origin + run worktree BOTH own the branch.
+      assert.equal(branchOwnerCount("integration/line"), 2, "fixture must reproduce the two-owner conflict");
+
+      // A separate, REAL worktree belonging to ANOTHER run (its own branch):
+      // must remain attached and unchanged across this run's teardown.
+      const neighborId = "run-dlt-neighbor";
+      assert.equal(runGit(["branch", "integration/neighbor"], dltRepo).status, 0);
+      const neighborWt = createRunWorktree({
+        runId: neighborId,
+        runNumber: 250,
+        workflowId: "test-workflow",
+        worktreeOriginRepository: dltRepo,
+      });
+      assert.equal(
+        runGit(["checkout", "--ignore-other-worktrees", "integration/neighbor"], neighborWt.worktreePath).status,
+        0,
+      );
+      const neighborHeadBefore = getHeadSha(neighborWt.worktreePath);
+      writeFileSync(path.join(neighborWt.worktreePath, "neighbor.txt"), "neighbor content\n", "utf-8");
+
+      // Content in every state the detach must preserve.
+      writeFileSync(path.join(wtPath, "README.md"), "# Modified in run\n", "utf-8"); // unstaged
+      writeFileSync(path.join(wtPath, "staged.txt"), "staged\n", "utf-8");
+      runGit(["add", "staged.txt"], wtPath);
+      writeFileSync(path.join(wtPath, "untracked.txt"), "untracked\n", "utf-8");
+
+      const headBefore = getHeadSha(wtPath);
+      const branchBefore = runGit(["rev-parse", "refs/heads/integration/line"], wtPath).stdout;
+      const statusBefore = runGit(["status", "--porcelain"], wtPath).stdout;
+      const diffBefore = runGit(["diff"], wtPath).stdout;
+      const diffCachedBefore = runGit(["diff", "--cached"], wtPath).stdout;
+      const readmeBytes = readFileSync(path.join(wtPath, "README.md"));
+      const stagedBytes = readFileSync(path.join(wtPath, "staged.txt"));
+      const untrackedBytes = readFileSync(path.join(wtPath, "untracked.txt"));
+      const originHeadBefore = getHeadSha(dltRepo);
+      const originBranchBefore = runGit(["branch", "--show-current"], dltRepo).stdout;
+
+      seedRun(runId, "completed");
+      const first = detachRunWorktreeBranch(runId);
+      assert.equal(first.outcome, "detached", `outcome: ${first.outcome} (${first.reason ?? ""})`);
+      assert.equal(first.branch, "integration/line");
+      assert.equal(first.head, headBefore);
+
+      // Git detach semantics: HEAD detached at the same commit; branch ref
+      // never moved; directory and content kept — BYTES, not just status.
+      assert.equal(runGit(["symbolic-ref", "-q", "HEAD"], wtPath).status, 1, "HEAD must be detached");
+      assert.equal(getHeadSha(wtPath), headBefore, "HEAD commit must be unchanged");
+      assert.equal(
+        runGit(["rev-parse", "refs/heads/integration/line"], wtPath).stdout,
+        branchBefore,
+        "branch ref must be unchanged",
+      );
+      assert.equal(existsSync(wtPath), true, "directory must be kept");
+      assert.equal(runGit(["status", "--porcelain"], wtPath).stdout, statusBefore, "status must be untouched");
+      assert.equal(runGit(["diff"], wtPath).stdout, diffBefore, "unstaged diff must be byte-identical");
+      assert.equal(runGit(["diff", "--cached"], wtPath).stdout, diffCachedBefore, "staged diff must be byte-identical");
+      assert.deepEqual(readFileSync(path.join(wtPath, "README.md")), readmeBytes, "working file bytes preserved");
+      assert.deepEqual(readFileSync(path.join(wtPath, "staged.txt")), stagedBytes, "staged file bytes preserved");
+      assert.deepEqual(readFileSync(path.join(wtPath, "untracked.txt")), untrackedBytes, "untracked file bytes preserved");
+
+      // The conflict is resolved: exactly ONE owner (the origin checkout).
+      assert.equal(branchOwnerCount("integration/line"), 1, "only the origin may keep owning the branch");
+
+      // Origin untouched.
+      assert.equal(runGit(["branch", "--show-current"], dltRepo).stdout, originBranchBefore);
+      assert.equal(originBranchBefore, "integration/line");
+      assert.equal(getHeadSha(dltRepo), originHeadBefore);
+
+      // The NEIGHBOR run's worktree remains attached and unchanged.
+      assert.equal(runGit(["branch", "--show-current"], neighborWt.worktreePath).stdout, "integration/neighbor");
+      assert.equal(getHeadSha(neighborWt.worktreePath), neighborHeadBefore);
+      assert.equal(readFileSync(path.join(neighborWt.worktreePath, "neighbor.txt"), "utf-8"), "neighbor content\n");
+
+      // Repeat cleanup: idempotent no-op with everything still intact.
+      const second = detachRunWorktreeBranch(runId);
+      assert.equal(second.outcome, "already-detached");
+      assert.equal(getHeadSha(wtPath), headBefore);
+      assert.equal(runGit(["rev-parse", "refs/heads/integration/line"], wtPath).stdout, branchBefore);
+
+      removeRunWorktree({ runId, force: true });
+      removeRunWorktree({ runId: neighborId, force: true });
+      // Removed allocation: the helper refuses to act at all.
+      const third = detachRunWorktreeBranch(runId);
+      assert.equal(third.outcome, "skipped");
+    });
+
+    it("leaves a not-yet-terminal run attached; a reactivated/re-attached run (simulated resume via status flip + re-attach) stays intact", () => {
+      const runId = "run-dlt-002";
+      const wtPath = createAttachedWorktree(runId, 202);
+
+      seedRun(runId, "running");
+      let res = detachRunWorktreeBranch(runId);
+      assert.equal(res.outcome, "skipped", `not-terminal must skip: ${res.reason ?? ""}`);
+      assert.match(res.reason ?? "", /not terminal/);
+      assert.equal(runGit(["branch", "--show-current"], wtPath).stdout, "integration/line");
+
+      setRunStatus(runId, "completed");
+      res = detachRunWorktreeBranch(runId);
+      assert.equal(res.outcome, "detached");
+
+      // Resume: the run is active again and the fresh setup re-attaches the
+      // worktree; a late teardown callback must leave it intact.
+      setRunStatus(runId, "running");
+      const reattach = runGit(["checkout", "--ignore-other-worktrees", "integration/line"], wtPath);
+      assert.equal(reattach.status, 0);
+      res = detachRunWorktreeBranch(runId);
+      assert.equal(res.outcome, "skipped", `resumed run must stay attached: ${res.reason ?? ""}`);
+      assert.equal(runGit(["branch", "--show-current"], wtPath).stdout, "integration/line");
+
+      removeRunWorktree({ runId, force: true });
+    });
+
+    it("refuses the origin checkout and another run's allocation without touching either", () => {
+      const runId = "run-dlt-003";
+      const wtPath = createAttachedWorktree(runId, 203);
+      seedRun(runId, "completed");
+
+      // A bogus row pointing at the origin checkout: refused before any git
+      // operation, whatever the row says.
+      getDb()
+        .prepare("UPDATE run_worktrees SET worktree_path = ? WHERE run_id = ?")
+        .run(dltRepo, runId);
+      let res = detachRunWorktreeBranch(runId);
+      assert.equal(res.outcome, "skipped", `origin must be refused: ${res.reason ?? ""}`);
+      assert.match(res.reason ?? "", /origin checkout/);
+      assert.equal(runGit(["branch", "--show-current"], dltRepo).stdout, "integration/line");
+
+      // Another run's allocation: canonical-spelling conflict refused.
+      getDb()
+        .prepare("UPDATE run_worktrees SET worktree_path = ? WHERE run_id = ?")
+        .run(wtPath, runId);
+      const otherId = "run-dlt-003-other";
+      seedRun(otherId, "completed");
+      seedWorktreeRow(otherId, wtPath);
+      res = detachRunWorktreeBranch(runId);
+      assert.equal(res.outcome, "skipped", `conflict must skip: ${res.reason ?? ""}`);
+      assert.match(res.reason ?? "", /another run/);
+      assert.equal(runGit(["branch", "--show-current"], wtPath).stdout, "integration/line");
+
+      // Clean up the extra row so the real worktree can be removed.
+      getDb().prepare("DELETE FROM run_worktrees WHERE run_id = ?").run(otherId);
+      removeRunWorktree({ runId, force: true });
+    });
+
+    it("reports a git failure as failed without masking it, and recovers on retry", () => {
+      const runId = "run-dlt-004";
+      const wtPath = createAttachedWorktree(runId, 204);
+      seedRun(runId, "completed");
+
+      const gitDir = runGit(["rev-parse", "--absolute-git-dir"], wtPath).stdout;
+      const lockPath = path.join(gitDir, "index.lock");
+      writeFileSync(lockPath, "", "utf-8");
+      try {
+        const res = detachRunWorktreeBranch(runId);
+        assert.equal(res.outcome, "failed", `injected git failure must be reported: ${JSON.stringify(res)}`);
+        assert.match(res.reason ?? "", /checkout --detach failed|exit \d+/);
+        assert.equal(
+          runGit(["branch", "--show-current"], wtPath).stdout,
+          "integration/line",
+          "a failed detach must leave the attachment untouched",
+        );
+      } finally {
+        rmSync(lockPath, { force: true });
+      }
+
+      const retry = detachRunWorktreeBranch(runId);
+      assert.equal(retry.outcome, "detached", "retry after the transient failure must succeed");
+      removeRunWorktree({ runId, force: true });
+    });
+
+    it("refuses a recorded path outside the canonical worktree root", () => {
+      const outside = tamanduaTempDir("tamandua-dlt-outside-");
+      mkdirSync(outside, { recursive: true });
+      const add = runGit(["worktree", "add", "--detach", outside, "integration/line"], dltRepo);
+      assert.equal(add.status, 0, `outside worktree must exist for the fixture: ${add.stdout}`);
+      try {
+        const runId = "run-dlt-005";
+        seedRun(runId, "completed");
+        seedWorktreeRow(runId, outside);
+        const res = detachRunWorktreeBranch(runId);
+        assert.equal(res.outcome, "skipped", `outside root must skip: ${res.reason ?? ""}`);
+        assert.match(res.reason ?? "", /canonical worktree root/);
+      } finally {
+        runGit(["worktree", "remove", "--force", outside], dltRepo);
+        rmSync(outside, { recursive: true, force: true });
+      }
     });
   });
 });

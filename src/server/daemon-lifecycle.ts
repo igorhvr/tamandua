@@ -90,9 +90,30 @@ export function getHeartbeatPath(opts?: DaemonctlPathOptions): string {
 }
 
 /**
+ * Publish a small JSON payload at `file` atomically: the bytes are written
+ * to a same-directory temp file and renamed into place, so a concurrent
+ * reader can never observe a truncated/torn file — it sees either the prior
+ * complete payload or the new one. This is the same tmp+rename idiom the
+ * sibling acknowledgeDaemonDeath uses (tamandua-2xx: the heartbeat publisher
+ * used to be a bare truncate+write, whose window a concurrent reader could
+ * see as an empty/torn file — reproduced as "Unexpected end of JSON input"
+ * in daemon tests). A crash mid-write leaves at most a stray
+ * `<file>.<pid>.tmp` beside the real file; readers never look at it.
+ * The caller owns error handling (this helper throws).
+ */
+function publishJsonAtomic(file: string, payload: unknown): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(payload), "utf-8");
+  fs.renameSync(tmp, file);
+}
+
+/**
  * Write a fresh marker for the current process. Tiny, best-effort, never
- * throws; mkdir recursive before write. A guarded process resolving the
- * production path drops the write instead.
+ * throws; mkdir recursive before write. Publication is atomic (tmp+rename,
+ * see {@link publishJsonAtomic}) so the marker file is never observed
+ * truncated — tamandua-2xx. A guarded process resolving the production path
+ * drops the write instead.
  */
 export function writeHeartbeatMarker(opts?: DaemonctlPathOptions): void {
   try {
@@ -103,8 +124,7 @@ export function writeHeartbeatMarker(opts?: DaemonctlPathOptions): void {
       startedAt: now,
       lastHeartbeatAt: now,
     };
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(marker), "utf-8");
+    publishJsonAtomic(file, marker);
   } catch {
     // Best-effort by contract: never throws, never writes production state.
   }
@@ -140,6 +160,8 @@ export function readHeartbeatMarker(opts?: DaemonctlPathOptions): HeartbeatMarke
 /**
  * Update the marker's lastHeartbeatAt, preserving pid and startedAt. No-op
  * when no marker exists (nothing to preserve). Best-effort, never throws.
+ * Publication is atomic (tmp+rename, see {@link publishJsonAtomic}): the
+ * refresh can never be observed as a truncated file either (tamandua-2xx).
  */
 export function touchHeartbeat(opts?: DaemonctlPathOptions): void {
   try {
@@ -147,8 +169,7 @@ export function touchHeartbeat(opts?: DaemonctlPathOptions): void {
     if (!existing) return;
     existing.lastHeartbeatAt = nowIso();
     const file = getHeartbeatPath(opts);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(existing), "utf-8");
+    publishJsonAtomic(file, existing);
   } catch {
     // Best-effort.
   }

@@ -474,3 +474,423 @@ export function listRunWorktrees(): ManagedRunWorktree[] {
 
   return rows.map(rowToManagedRunWorktree);
 }
+
+// ── tamandua-dlt: teardown detach (WORKTREE-OWN) ─────────────────────
+
+/**
+ * Run statuses in which a run's writers have stopped (its teardown passes
+ * have run). Only these may have their OWN managed worktree detached from an
+ * attached branch — a run that is (or was just) reactivated keeps its
+ * attachment.
+ */
+const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "canceled",
+]);
+
+/** What {@link detachRunWorktreeBranch} did (or deliberately did not do). */
+export type DetachRunWorktreeOutcome = "detached" | "already-detached" | "skipped" | "failed";
+
+export interface DetachRunWorktreeResult {
+  runId: string;
+  /** Recorded worktree path, when the run has a managed-worktree row. */
+  worktreePath: string | null;
+  outcome: DetachRunWorktreeOutcome;
+  /** Branch the worktree was attached to (outcome "detached" only). */
+  branch?: string;
+  /** Commit HEAD pointed at before the detach (outcome "detached" only). */
+  head?: string;
+  /** Human-readable cause for a "skipped"/"failed" outcome. */
+  reason?: string;
+}
+
+/**
+ * Bounded timeout for ONE detach git invocation. A local plumbing command on
+ * a healthy repository completes in milliseconds; the bound exists so a
+ * pathological repository can never wedge the daemon's event loop (these git
+ * calls are synchronous) or hold the serializing transaction below open
+ * indefinitely.
+ */
+const DETACH_GIT_TIMEOUT_MS = 5_000;
+
+/**
+ * Canonicalize a path, or null when the filesystem cannot resolve it.
+ * Fail-closed by design: callers treat null as "cannot corroborate", never
+ * as a lexical fallback — a claimed-canonical compare must not degrade into
+ * a string compare.
+ */
+function realpathOrNull(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run one git command for the detach with a REPLACEMENT environment (not a
+ * merge on top of process.env): every repository-selection / config-injection
+ * variable is removed at the subprocess boundary, so no caller environment
+ * can redirect the operation away from the exact verified worktree path.
+ * Checkout hooks are suppressed (core.hooksPath points at the null device,
+ * where no hook files exist) and submodule recursion is disabled. Bounded by
+ * {@link DETACH_GIT_TIMEOUT_MS}.
+ */
+function runGitDetach(
+  args: string[],
+  cwd: string,
+): { stdout: string; stderr: string; status: number } {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+  ]) {
+    delete env[key];
+  }
+  const result = spawnSync(
+    "git",
+    [
+      "-C",
+      cwd,
+      "-c",
+      `core.hooksPath=${os.devNull}`,
+      "-c",
+      "submodule.recurse=false",
+      ...args,
+    ],
+    {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: DETACH_GIT_TIMEOUT_MS,
+      env,
+    },
+  );
+  return {
+    stdout: (result.stdout ?? "").trim(),
+    stderr: (result.stderr ?? "").trim(),
+    status: result.status ?? -1,
+  };
+}
+
+/**
+ * tamandua-dlt (WORKTREE-OWN, TEARDOWN-DETACH): when a run has reached a
+ * terminal state, detach the run's OWN managed worktree from a branch it is
+ * still attached to (`git checkout --detach` semantics at the current HEAD:
+ * the directory, every ref and all working-tree content are kept). This is
+ * the #117 failure-class fix: a completed run's worktree left attached to
+ * the integration branch conflates branch ownership with the origin
+ * checkout, so the NEXT run's `finalize_merge` refuses ("multiple worktrees
+ * own refs/heads/X") (bead tamandua-dlt).
+ *
+ * STRICT SAFETY — the target is only ever the exactly-identified run-owned
+ * allocation:
+ *   - the EXACT run's own managed-worktree row is resolved (never a generic
+ *     working-directory fallback); the target is never "whichever worktree
+ *     holds a branch";
+ *   - refusal set, compared on canonical (realpath-resolved) paths: the
+ *     origin checkout; any path claimed by a DIFFERENT run's row (canonical
+ *     aliases cannot defeat this); any path outside the canonical worktree
+ *     root (a drifted root yields a safe skip, never a wrong-target detach);
+ *     and any path whose git administrative metadata fails the corroboration
+ *     (toplevel must resolve to the path itself, git-common-dir must match
+ *     the recorded origin repository, and the linked worktree's registration
+ *     backlink must point back at the path);
+ *   - writer fence: the run must be TERMINAL (completed/failed/canceled) at a
+ *     fresh read taken INSIDE a short `BEGIN IMMEDIATE` transaction that also
+ *     serializes the detach against competing resume/state-write
+ *     transactions, so a resume that commits first is guaranteed to be seen
+ *     (skip). A resume that begins only after the transaction commits then
+ *     operates on an already-detached worktree — the state the #117 recovery
+ *     prescribes (directory + refs intact, re-attachable with one
+ *     `git checkout`); no ref is ever moved. This helper does not itself
+ *     re-prove process exit: callers (the post-grace teardown) establish
+ *     writer quiescence with a bounded probe before invoking it;
+ *   - idempotent: an intentionally detached HEAD is a success no-op; an
+ *     UNREADABLE HEAD inspection is a failure (never conflated with
+ *     idempotent success);
+ *   - bounded: every git invocation is bounded ({@link DETACH_GIT_TIMEOUT_MS})
+ *     and never touches anything but HEAD's attachment; on failure it reports
+ *     `failed` with the cause (post-verify failures are reported, never
+ *     "rolled back" via a destructive retry) and never throws, so the caller
+ *     can surface it WITHOUT masking the run's own outcome.
+ */
+export function detachRunWorktreeBranch(runId: string): DetachRunWorktreeResult {
+  const base: DetachRunWorktreeResult = { runId, worktreePath: null, outcome: "skipped" };
+  try {
+    const wt = getRunWorktree(runId);
+    if (!wt) return { ...base, reason: "run has no managed worktree row" };
+    base.worktreePath = wt.worktreePath;
+
+    if (wt.status === "removed" || wt.status === "removing") {
+      return { ...base, reason: `worktree row status is "${wt.status}"` };
+    }
+
+    const db = getDb();
+    const wtReal = realpathOrNull(wt.worktreePath);
+    if (wtReal === null) {
+      return { ...base, outcome: "failed", reason: "cannot canonicalize the recorded worktree path" };
+    }
+    const originReal = realpathOrNull(wt.worktreeOriginRepository);
+    // Every git invocation below targets the CANONICAL, verified path: the
+    // validation and the mutation must address the same directory even when
+    // the recorded spelling differs from the on-disk reality.
+    const detachTarget = wtReal;
+
+    // (1) Never the origin checkout, whatever the row says. If the origin
+    // cannot be canonicalized the comparison cannot be PROVEN, so refuse
+    // rather than guess.
+    if (originReal === null) {
+      return {
+        ...base,
+        outcome: "failed",
+        reason: "cannot canonicalize the recorded origin repository; refusing to guess",
+      };
+    }
+    if (wtReal === originReal) {
+      return { ...base, reason: "refusing to operate on the origin checkout itself" };
+    }
+
+    // (2) Never another run's worktree — canonical compare over ALL other
+    // rows (incl. removing/removed history: an allocation mid-removal must
+    // not become available to this teardown), so aliased spellings of the
+    // same directory cannot defeat the check.
+    const otherRows = db
+      .prepare("SELECT run_id, worktree_path FROM run_worktrees WHERE run_id != ?")
+      .all(runId) as Array<{ run_id: string; worktree_path: string }>;
+    for (const row of otherRows) {
+      const rowReal = realpathOrNull(row.worktree_path);
+      if (rowReal !== null && rowReal === wtReal) {
+        return { ...base, reason: `worktree path is claimed by another run (${row.run_id})` };
+      }
+    }
+
+    // (3) Corroborate the persisted allocation against the canonical root —
+    // a drifted/unknown root can only cause a safe skip, never a
+    // wrong-target detach.
+    const rootReal = realpathOrNull(resolveWorktreeRoot());
+    if (rootReal === null || !wtReal.startsWith(rootReal + path.sep)) {
+      return {
+        ...base,
+        reason: `worktree path is outside the canonical worktree root (${rootReal ?? "<unresolvable>"})`,
+      };
+    }
+
+    // (4) Git administrative metadata + registration corroboration.
+    const toplevelRes = runGitDetach(["rev-parse", "--show-toplevel"], detachTarget);
+    if (toplevelRes.status !== 0) {
+      return {
+        ...base,
+        reason: `not a git working tree: ${toplevelRes.stderr || toplevelRes.stdout || `exit ${toplevelRes.status}`}`,
+      };
+    }
+    if (realpathOrNull(toplevelRes.stdout) !== wtReal) {
+      return { ...base, reason: "git toplevel does not resolve to the recorded worktree path" };
+    }
+    const commonRes = runGitDetach(["rev-parse", "--git-common-dir"], detachTarget);
+    if (commonRes.status !== 0) {
+      return {
+        ...base,
+        reason: `cannot resolve git-common-dir: ${commonRes.stderr || commonRes.stdout || `exit ${commonRes.status}`}`,
+      };
+    }
+    const commonDir = path.isAbsolute(commonRes.stdout)
+      ? commonRes.stdout
+      : path.resolve(detachTarget, commonRes.stdout);
+    const commonDirReal = realpathOrNull(commonDir);
+    const recordedCommonDirReal = realpathOrNull(wt.worktreeOriginGitCommonDir);
+    if (
+      commonDirReal === null ||
+      recordedCommonDirReal === null ||
+      commonDirReal !== recordedCommonDirReal
+    ) {
+      return {
+        ...base,
+        reason: "git-common-dir could not be corroborated against the recorded origin repository",
+      };
+    }
+    const absGitDirRes = runGitDetach(["rev-parse", "--absolute-git-dir"], detachTarget);
+    if (absGitDirRes.status !== 0 || absGitDirRes.stdout === "") {
+      return { ...base, reason: "cannot resolve the worktree's absolute git dir" };
+    }
+    const absGitDirReal = realpathOrNull(absGitDirRes.stdout);
+    const worktreesRootReal = realpathOrNull(path.join(commonDir, "worktrees"));
+    if (
+      absGitDirReal === null ||
+      worktreesRootReal === null ||
+      !absGitDirReal.startsWith(worktreesRootReal + path.sep)
+    ) {
+      return { ...base, reason: "git dir is not a linked worktree registration under the origin" };
+    }
+    let backlink: string;
+    try {
+      backlink = fs.readFileSync(path.join(absGitDirRes.stdout, "gitdir"), "utf-8").trim();
+    } catch (err) {
+      return {
+        ...base,
+        reason: `cannot read the worktree registration backlink: ${(err as Error).message}`,
+      };
+    }
+    const backlinkReal = realpathOrNull(backlink);
+    const dotGitReal = realpathOrNull(path.join(detachTarget, ".git"));
+    if (backlinkReal === null || dotGitReal === null || backlinkReal !== dotGitReal) {
+      return { ...base, reason: "registration backlink does not point back at the recorded path" };
+    }
+
+    // (5) Attachment probe — strictly tri-state: exit 1 = deliberately
+    // detached (valid idempotent no-op), exit 0 with a full refs/heads/*
+    // symbolic ref = attached, anything else (including exit 0 with empty
+    // or non-branch output) = failed inspection, never conflated with
+    // success.
+    const symRes = runGitDetach(["symbolic-ref", "--quiet", "HEAD"], detachTarget);
+    if (symRes.status === 1) {
+      return { ...base, outcome: "already-detached" };
+    }
+    if (symRes.status !== 0 || symRes.stdout === "" || !symRes.stdout.startsWith("refs/heads/")) {
+      return {
+        ...base,
+        outcome: "failed",
+        reason: `cannot inspect HEAD attachment (exit ${symRes.status}): ${symRes.stderr || symRes.stdout}`,
+      };
+    }
+    const branchRef = symRes.stdout;
+    const branch = branchRef.slice("refs/heads/".length);
+    const branchBeforeRes = runGitDetach(["rev-parse", "--verify", `${branchRef}^{commit}`], detachTarget);
+    const headBeforeRes = runGitDetach(["rev-parse", "HEAD"], detachTarget);
+    if (
+      branchBeforeRes.status !== 0 ||
+      branchBeforeRes.stdout === "" ||
+      headBeforeRes.status !== 0 ||
+      headBeforeRes.stdout === ""
+    ) {
+      return { ...base, outcome: "failed", reason: "cannot read HEAD/branch state before detach" };
+    }
+    const branchBefore = branchBeforeRes.stdout;
+    const headBefore = headBeforeRes.stdout;
+
+    // (6) Serialized writer fence + detach. The IMMEDIATE transaction
+    // RE-VALIDATES, at the freshest possible read: the run's terminal
+    // status (a resume/state change that committed earlier is seen and
+    // skipped), the worktree-allocation row (still this exact path, still
+    // eligible), and the absence of a conflicting owner — the pre-checks
+    // above ran outside the lock and can be stale. It then holds the DB
+    // write lock across EXACTLY ONE bounded git mutation (the detach
+    // itself), so a competing writer either commits BEFORE the
+    // re-validation or waits until after the detach.
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const runRow = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as
+        | { status: string }
+        | undefined;
+      if (!runRow) {
+        db.exec("ROLLBACK");
+        return { ...base, reason: "run row is gone" };
+      }
+      if (!TERMINAL_RUN_STATUSES.has(String(runRow.status))) {
+        db.exec("ROLLBACK");
+        return { ...base, reason: `run status "${runRow.status}" is not terminal` };
+      }
+      const alloc = db
+        .prepare(
+          "SELECT worktree_path, worktree_origin_repository, worktree_origin_git_common_dir, status FROM run_worktrees WHERE run_id = ?",
+        )
+        .get(runId) as
+        | {
+            worktree_path: string;
+            worktree_origin_repository: string;
+            worktree_origin_git_common_dir: string;
+            status: string;
+          }
+        | undefined;
+      const allocReal = alloc ? realpathOrNull(alloc.worktree_path) : null;
+      const allocOriginReal = alloc ? realpathOrNull(alloc.worktree_origin_repository) : null;
+      const allocCommonReal = alloc ? realpathOrNull(alloc.worktree_origin_git_common_dir) : null;
+      if (
+        !alloc ||
+        allocReal === null ||
+        allocReal !== wtReal ||
+        allocOriginReal !== originReal ||
+        allocCommonReal === null ||
+        allocCommonReal !== recordedCommonDirReal ||
+        alloc.status === "removed" ||
+        alloc.status === "removing"
+      ) {
+        db.exec("ROLLBACK");
+        return { ...base, reason: "worktree allocation changed before the detach" };
+      }
+      const conflictingRows = db
+        .prepare("SELECT run_id, worktree_path FROM run_worktrees WHERE run_id != ?")
+        .all(runId) as Array<{ run_id: string; worktree_path: string }>;
+      for (const row of conflictingRows) {
+        const rowReal = realpathOrNull(row.worktree_path);
+        if (rowReal !== null && rowReal === wtReal) {
+          db.exec("ROLLBACK");
+          return { ...base, reason: `worktree path is claimed by another run (${row.run_id})` };
+        }
+      }
+
+      // Git detach semantics: `checkout --detach` (deliberately NOT --force)
+      // detaches at the current HEAD; the directory, every ref and all
+      // working-tree content (staged, unstaged, untracked) are kept.
+      const detachRes = runGitDetach(["checkout", "--detach"], detachTarget);
+      if (detachRes.status !== 0) {
+        db.exec("ROLLBACK");
+        return {
+          ...base,
+          outcome: "failed",
+          reason: `git checkout --detach failed (exit ${detachRes.status}): ${detachRes.stderr || detachRes.stdout}`,
+        };
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Best-effort: the outer catch reports the outcome either way.
+      }
+      return { ...base, outcome: "failed", reason: `detach aborted: ${(err as Error).message}` };
+    }
+
+    // (7) Post-verify, outside the lock (the mutation already committed; a
+    // post-mutation uncertainty can no longer be "rolled back", so it is
+    // REPORTED). Strict reads: every verification must SUCCEED and match —
+    // an unreadable or empty result is a reported failure, never a false
+    // success.
+    const afterRes = runGitDetach(["symbolic-ref", "--quiet", "HEAD"], detachTarget);
+    if (afterRes.status !== 1) {
+      return {
+        ...base,
+        outcome: "failed",
+        reason:
+          afterRes.status === 0
+            ? `HEAD still attached to "${afterRes.stdout}" after detach`
+            : `cannot verify detachment (inspection exit ${afterRes.status})`,
+      };
+    }
+    const headAfterRes = runGitDetach(["rev-parse", "HEAD"], detachTarget);
+    if (headAfterRes.status !== 0 || headAfterRes.stdout === "") {
+      return { ...base, outcome: "failed", reason: "cannot verify HEAD after detach" };
+    }
+    if (headAfterRes.stdout !== headBefore) {
+      return { ...base, outcome: "failed", reason: "HEAD moved during detach" };
+    }
+    const branchAfterRes = runGitDetach(["rev-parse", "--verify", `${branchRef}^{commit}`], detachTarget);
+    if (branchAfterRes.status !== 0 || branchAfterRes.stdout === "") {
+      return { ...base, outcome: "failed", reason: `cannot verify branch ref ${branchRef} after detach` };
+    }
+    if (branchAfterRes.stdout !== branchBefore) {
+      return { ...base, outcome: "failed", reason: `branch ref ${branchRef} moved during detach` };
+    }
+
+    return { ...base, outcome: "detached", branch, head: headBefore };
+  } catch (err) {
+    return { ...base, outcome: "failed", reason: `detach threw: ${(err as Error).message}` };
+  }
+}

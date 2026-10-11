@@ -40,12 +40,17 @@
  */
 
 import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { STANDARD_MATCHLOCK_IMAGE } from "./matchlock/standard-image.js";
 
 /**
- * Standard Matchlock image reference pulled in phase 3.
+ * Standard Matchlock image reference pulled in phase 3 — tamandua-48v
+ * consolidation: the literal is declared exactly ONCE, in the sibling
+ * src/installer/matchlock/standard-image.ts (the iso line's canonical module),
+ * and both lines resolve it through this alias. Previously each line declared
+ * its own byte-equal copy; a crossline parity guard pinned them together until
+ * this consolidation landed.
  */
-// kept byte-identical to src/installer/matchlock/standard-image.ts (sibling line; consolidated at integration)
-export const STANDARD_IMAGE_REFERENCE = "igorhvr/tamandua";
+export const STANDARD_IMAGE_REFERENCE = STANDARD_MATCHLOCK_IMAGE;
 
 /**
  * Environment variable that overrides the effective standard image reference.

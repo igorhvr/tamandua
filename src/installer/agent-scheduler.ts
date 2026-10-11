@@ -4869,7 +4869,7 @@ export async function runPostGraceSweep(
       );
     }
 
-    const { sweepRunProcesses } = await import("./run-cleanup.js");
+    const { sweepRunProcesses, observeLiveRunOwnedProcesses, probeProcessGroupAlive } = await import("./run-cleanup.js");
     const result = sweepRunProcesses(runId, dir, {
       daemonPid: process.pid,
       // After grace, the leak guard already killed harness groups;
@@ -4886,6 +4886,151 @@ export async function runPostGraceSweep(
       });
     } else {
       logger.debug("Post-grace sweep found no leaked processes", { runId });
+    }
+
+    // tamandua-dlt (WORKTREE-OWN, TEARDOWN-DETACH): only once no run-owned
+    // writer remains OBSERVABLE (the sweep above killed survivors; this
+    // bounded probe wait establishes actual exit — a kill is not an exit —
+    // over the same exclusive evidence model as the sweep: recorded owned
+    // process groups probed directly, plus the daemon-scoped marker channel)
+    // does the teardown detach the run's OWN managed worktree from a branch
+    // it still holds (the #117 class: a leftover attached worktree makes the
+    // NEXT run's finalize_merge refuse with "multiple worktrees own
+    // refs/heads/X"). If any run-owned writer is still observable when the
+    // bound expires, the attachment is LEFT INTACT and the skip is reported
+    // — uncertainty never turns into permission. The detach then flips
+    // HEAD's attachment via `checkout --detach` at the current HEAD: the
+    // directory, every ref and all working-tree content stay in place; no
+    // ref is ever moved, and the resulting state is the documented
+    // reversible #117 recovery state. The helper re-validates terminality
+    // inside a serialized SQLite transaction (a reactivated run is seen and
+    // skipped, even when an older cleanup callback fires late), refuses
+    // anything that is not exactly this run's registered worktree, is
+    // idempotent, and never throws: a detach failure is reported (warn)
+    // WITHOUT masking the run's own outcome. Runs that skip (non-terminal,
+    // no worktree row, already detached) log at debug.
+    try {
+      // Runs without a managed worktree (direct-mode) have nothing to detach:
+      // skip immediately — no settle wait, no liveness probe.
+      const { getRunWorktree, detachRunWorktreeBranch } = await import("./worktree-manager.js");
+      const managedWorktree = getRunWorktree(runId);
+      if (
+        !managedWorktree ||
+        managedWorktree.status === "removed" ||
+        managedWorktree.status === "removing"
+      ) {
+        logger.debug("Run worktree detach at teardown skipped: no active managed worktree", {
+          runId,
+        });
+      } else {
+        // Lifecycle + freshness evidence. A reactivated run (resume/restart)
+        // or a stale cleanup callback must not even run the probe, and a
+        // round still registered for this run is writer activity the process
+        // scan cannot see (post-round token attribution writes). The
+        // serialized transaction inside detachRunWorktreeBranch re-validates
+        // the terminal status at mutation time.
+        let currentStatus: string | undefined;
+        try {
+          const { getDb: getDbForFence } = await import("../db.js");
+          currentStatus = (
+            getDbForFence().prepare("SELECT status FROM runs WHERE id = ?").get(runId) as
+              | { status: string }
+              | undefined
+          )?.status;
+        } catch {
+          currentStatus = undefined;
+        }
+        if (
+          currentStatus !== "completed" &&
+          currentStatus !== "failed" &&
+          currentStatus !== "canceled"
+        ) {
+          logger.debug("Run worktree detach at teardown skipped: run no longer terminal", {
+            runId,
+            status: currentStatus ?? null,
+          });
+        } else {
+          const settled = await settleRunInFlightRounds(runId, {
+            graceMs: RUN_WRITER_QUIESCENCE_TIMEOUT_MS,
+          });
+          if (settled.stillInFlight.length > 0) {
+            logger.warn(
+              "Run worktree detach skipped: dispatch rounds still settling after the sweep",
+              { runId, stillInFlight: settled.stillInFlight },
+            );
+          } else {
+            // Bounded wait for writer quiescence. Two independent legs, both
+            // fail-closed (only a PROVEN absence authorizes detachment):
+            //   - recorded run-owned process groups (children the daemon
+            //     spawned + steps.claim_pgid) probed directly by pgid, so an
+            //     unreadable environ can never hide an owned writer;
+            //   - the observation scan (daemon-scoped marker channel), which
+            //     reports "unknown" — never "quiescent" — when it cannot
+            //     prove its enumeration worked.
+            const probe: RunWriterLivenessProbe =
+              runWriterLivenessProbeHook ??
+              ((rid: string) =>
+                observeLiveRunOwnedProcesses(rid, {
+                  pgids: [...ownedPgids],
+                  daemonInstance,
+                  daemonPid: process.pid,
+                  worktreePath: dir,
+                }));
+            const observation = await waitForRunWritersQuiescent(
+              runId,
+              [...ownedPgids],
+              probe,
+              probeProcessGroupAlive,
+            );
+            if (observation.status !== "quiescent") {
+              // alive and unknown are BOTH conservative skips: a still-alive
+              // owned writer, or an observation that could not prove absence,
+              // leaves the attachment intact. Nothing is scheduled to retry
+              // here: the attachment stays until a future teardown pass for
+              // this run evaluates the gate again (e.g. after a resume the
+              // run reaches terminal state once more). `tamandua worktree
+              // remove` is NOT such a pass — it removes the directory
+              // outright and is never substituted for this gate.
+              logger.warn(
+                "Run worktree detach skipped: run-owned writers not proven quiescent after the sweep",
+                {
+                  runId,
+                  status: observation.status,
+                  ...(observation.status === "alive"
+                    ? { stillAlive: observation.processes }
+                    : { reason: observation.reason }),
+                },
+              );
+            } else {
+              const detach = detachRunWorktreeBranch(runId);
+              if (detach.outcome === "detached") {
+                logger.info("Detached run worktree from its branch at run teardown", {
+                  runId,
+                  worktreePath: detach.worktreePath,
+                  branch: detach.branch,
+                });
+              } else if (detach.outcome === "failed") {
+                logger.warn("Run worktree detach at teardown failed", {
+                  runId,
+                  worktreePath: detach.worktreePath,
+                  reason: detach.reason,
+                });
+              } else {
+                logger.debug("Run worktree detach at teardown skipped", {
+                  runId,
+                  outcome: detach.outcome,
+                  reason: detach.reason ?? null,
+                });
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn("Run worktree detach at teardown threw", {
+        runId,
+        error: (err as Error).message,
+      });
     }
   } catch (err) {
     logger.warn("Post-grace sweep failed", {
@@ -4945,6 +5090,104 @@ export function setMatchlockOrphanReapHookForTest(
   hook: MatchlockOrphanReapHook | null,
 ): void {
   matchlockOrphanReapHook = hook;
+}
+
+/**
+ * Writer-quiescence bound for the tamandua-dlt teardown detach gate: after
+ * the post-grace sweep has killed run-owned survivors, the detach waits up
+ * to this long (polling the observation-only liveness probe) for those
+ * writers to actually EXIT. A sweep kill is not proof of exit; only the
+ * probe reporting no live run-owned process (or this bound expiring) ends
+ * the wait.
+ */
+export const RUN_WRITER_QUIESCENCE_TIMEOUT_MS = 2_000;
+
+/** Tri-state writer-liveness result for the detach gate (fail-closed: only
+ * `"quiescent"` authorizes detachment; `"unknown"` means absence could not be
+ * proven). */
+export type RunWriterLivenessResult =
+  | { status: "alive"; processes: Array<{ pid: number; evidence: string }> }
+  | { status: "quiescent" }
+  | { status: "unknown"; reason: string };
+
+/** Observation-only liveness probe for the detach gate (test seam). */
+export type RunWriterLivenessProbe = (
+  runId: string,
+) => RunWriterLivenessResult | Promise<RunWriterLivenessResult>;
+
+let runWriterLivenessProbeHook: RunWriterLivenessProbe | null = null;
+
+/**
+ * Test-only seam: replace the teardown detach gate's writer-liveness probe
+ * (default: `observeLiveRunOwnedProcesses` with the run's owned pgids + this
+ * daemon's instance token). Pass `null` to restore the production probe.
+ * Observation only — the seam can never cause a kill.
+ */
+export function _setRunWriterLivenessProbeForTest(hook: RunWriterLivenessProbe | null): void {
+  runWriterLivenessProbeHook = hook;
+}
+
+/**
+ * Bounded wait for run-writer quiescence. Each poll evaluates BOTH evidence
+ * legs: every recorded owned pgid probed directly by process group (pgid
+ * channel — works without environ readability), and the caller-supplied
+ * observation probe (marker channel). Returns the first non-"alive" result
+ * ("quiescent" authorizes detachment; "unknown" never does), or the last
+ * "alive" result once the deadline (monotonic) expires.
+ */
+async function waitForRunWritersQuiescent(
+  runId: string,
+  ownedPgids: number[],
+  probe: RunWriterLivenessProbe,
+  probeGroupAlive: (pgid: number) => "alive" | "gone" | "unknown",
+): Promise<RunWriterLivenessResult> {
+  const deadline = monotonicNow() + RUN_WRITER_QUIESCENCE_TIMEOUT_MS;
+  for (;;) {
+    const result = await observeRunWriterLiveness(runId, ownedPgids, probe, probeGroupAlive);
+    if (result.status !== "alive") return result;
+    if (monotonicNow() >= deadline) return result;
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/**
+ * One combined writer-liveness observation. Fail-closed: "unknown" from
+ * either leg propagates; a live owned process group is reported as "alive"
+ * even when the scan's marker channel found nothing (an unreadable or
+ * unscannable owned writer must never read as absence).
+ */
+async function observeRunWriterLiveness(
+  runId: string,
+  ownedPgids: number[],
+  probe: RunWriterLivenessProbe,
+  probeGroupAlive: (pgid: number) => "alive" | "gone" | "unknown",
+): Promise<RunWriterLivenessResult> {
+  const liveGroups: number[] = [];
+  for (const pgid of ownedPgids) {
+    const state = probeGroupAlive(pgid);
+    if (state === "unknown") {
+      return {
+        status: "unknown",
+        reason: `owned process group ${pgid} liveness is unresolvable`,
+      };
+    }
+    if (state === "alive") liveGroups.push(pgid);
+  }
+  const scan = await probe(runId);
+  if (scan.status === "unknown") return scan;
+  if (liveGroups.length > 0) {
+    return {
+      status: "alive",
+      processes: [
+        ...liveGroups.map((pgid) => ({
+          pid: pgid,
+          evidence: `owned process group still alive: pgid ${pgid}`,
+        })),
+        ...(scan.status === "alive" ? scan.processes : []),
+      ],
+    };
+  }
+  return scan;
 }
 
 /**
