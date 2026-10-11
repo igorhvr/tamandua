@@ -263,12 +263,13 @@ async function handle(req) {
     // response delay: a close processed while create is in flight therefore
     // closes a real (vmCreated) VM — the late-create/cancel settlement case.
     vmCreated = true;
-    txn({ event: "vm_created" });
+    const createdId = "vm-" + Math.random().toString(16).slice(2, 10);
+    txn({ event: "vm_created", id: createdId });
     if (createDelayMs > 0) await new Promise((r) => setTimeout(r, createDelayMs));
     if (exitAfterCreateMs > 0) {
       setTimeout(() => process.exit(9), exitAfterCreateMs);
     }
-    return sendResult(req.id, { id: "vm-" + Math.random().toString(16).slice(2, 10) });
+    return sendResult(req.id, { id: createdId });
   }
   if (method === "exec_pipe") {
     if (req.id == null) return sendError(req.id, -32600, "exec_pipe requires request id");

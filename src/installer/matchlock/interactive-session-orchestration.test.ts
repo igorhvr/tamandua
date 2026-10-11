@@ -546,6 +546,47 @@ describe("US-013: interactive session orchestration runner", () => {
     assert.match(err, /Warning: root usage overridden/);
   });
 
+  // CLEANUP-1 (tamandua-me1): the removal outcome is stderr metadata only —
+  // it never changes the exit status, and it is silent on success.
+  it("warns on stderr when a confirmed close's VM record removal failed, without changing the exit status", async () => {
+    let err = "";
+    const code = await runInteractiveSession(makeArgs("pi", "pi", false) as never, {
+      plan: async () => makePlan() as never,
+      buildRuntime: (plan) => makeRuntime(plan as Record<string, unknown>) as never,
+      createController: () => ({
+        run: async () => ({
+          ...OK_OUTCOME,
+          vmRemoved: false,
+          vmRemovalError: "matchlock rm exited 1: AUDIT_RM",
+        }),
+      }),
+      stdout: () => {},
+      stderr: (text) => {
+        err += text;
+      },
+    });
+    assert.equal(code, 0, "the removal warning never changes the exit status");
+    assert.match(err, /record\/state dir was not removed/);
+    assert.match(err, /AUDIT_RM/);
+  });
+
+  it("stays silent on stderr when the record removal succeeded", async () => {
+    let err = "";
+    const code = await runInteractiveSession(makeArgs("pi", "pi", false) as never, {
+      plan: async () => makePlan() as never,
+      buildRuntime: (plan) => makeRuntime(plan as Record<string, unknown>) as never,
+      createController: () => ({
+        run: async () => ({ ...OK_OUTCOME, vmRemoved: true, vmLogsCopiedTo: null }),
+      }),
+      stdout: () => {},
+      stderr: (text) => {
+        err += text;
+      },
+    });
+    assert.equal(code, 0);
+    assert.equal(err, "", "no removal warning when the record was removed");
+  });
+
   // ══════════════════════════════════════════════════════════════════
   // MTLK-RPC-BIN-SPLIT (tamandua-dwl): admitted rpc binding threading
   // ══════════════════════════════════════════════════════════════════

@@ -175,6 +175,7 @@ interface SessionRun {
   prelaunch: () => string;
   diagnostics: () => string;
   exits: number[];
+  removedVmIds: string[];
 }
 
 /** Start one real CLI dispatch with every transport pointed at the fake driver. */
@@ -190,6 +191,8 @@ function startSession(
   const prelaunch: string[] = [];
   const diagnostics: string[] = [];
   const exits: number[] = [];
+  /** CLEANUP-1: VM ids the confirmed close handed to the removal seam. */
+  const removedVmIds: string[] = [];
 
   const promise = handleMatchlock("matchlock", argv, {
     cwd: workDir,
@@ -226,6 +229,16 @@ function startSession(
         ...(opts.omitControllerRpc
           ? {}
           : { rpcBinaryPath: process.execPath, rpcArgs: [driver] }),
+        // CLEANUP-1 (tamandua-me1): the removal seam is test-owned so no fake
+        // session can ever reach an ambient matchlock binary or the operator
+        // HOME through the removal step; it records the exact VM id the
+        // confirmed close handed to removal. The production default seam
+        // (captureAndRemoveVm) is exercised in interactive-session.test.ts
+        // against an owned fake CLI + owned HOME + owned evidence root.
+        removeVm: (options: Record<string, unknown>) => {
+          removedVmIds.push(String(options.vmId));
+          return { vmId: options.vmId, removed: true, logsCopiedTo: null, removalExitCode: 0 };
+        },
         admission: { home: os.homedir() },
         terminal,
         stdin,
@@ -250,6 +263,7 @@ function startSession(
     prelaunch: () => prelaunch.join(""),
     diagnostics: () => diagnostics.join(""),
     exits,
+    removedVmIds,
   };
 }
 
@@ -385,6 +399,15 @@ describe("US-014: synthetic end-to-end interactive session", () => {
       eventIndex(frames, "vm_closed") > eventIndex(frames, "tty_result_sent"),
       "cleanup is confirmed AFTER the guest exits",
     );
+    // CLEANUP-1 (tamandua-me1): the confirmed close hands the session's OWN VM
+    // to the removal step — exactly the id the create returned, exactly once.
+    const createdEvent = frames.find((frame) => frame.event === "vm_created");
+    assert.ok(
+      typeof createdEvent?.id === "string",
+      "the fake runtime names the created VM id on the vm_created event",
+    );
+    assert.equal(run.removedVmIds.length, 1, "the confirmed close triggers exactly one removal");
+    assert.equal(run.removedVmIds[0], createdEvent?.id, "removal targets the VM the create returned");
     assert.ok(
       !frames.some((frame) => JSON.stringify(frame).includes("Method not found")),
       "no unsupported method reached the transport",

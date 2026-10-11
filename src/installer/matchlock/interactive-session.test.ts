@@ -18,8 +18,12 @@
  * class, so this file is registered in tests/serial-files.txt.
  */
 
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert";
+import fs from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { tamanduaTempDir } from "../../../dist/lib/temp-dir.js";
 import {
   InteractiveSessionController,
   InteractiveSessionError,
@@ -38,6 +42,93 @@ async function until(cond: () => boolean, label = "condition"): Promise<void> {
     await new Promise((resolve) => setImmediate(resolve));
   }
   throw new Error(`timed out waiting for ${label}`);
+}
+
+// ── CLEANUP-1 fixture helpers ────────────────────────────────────────
+
+const ownedTempDirs: string[] = [];
+
+function tmpDir(prefix: string): string {
+  const dir = tamanduaTempDir(prefix);
+  ownedTempDirs.push(dir);
+  return dir;
+}
+
+after(() => {
+  for (const dir of ownedTempDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup
+    }
+  }
+});
+
+/**
+ * Owned fake `matchlock` CLI for the CLEANUP-1 DEFAULT removal seam: records
+ * every invocation's exact argv + forced HOME, deletes the exact state.db row
+ * and removes the exact `<HOME>/.matchlock/vms/<vmId>/` state dir (or fails on
+ * request). A non-`rm` invocation exits 2 so an accidental transport-args
+ * reuse is loudly wrong.
+ */
+function writeFakeMatchlockRemovalCli(opts: {
+  journalPath: string;
+  rmExit?: number;
+  rmStderr?: string;
+}): string {
+  const dir = tmpDir("tamandua-interactive-rmcli-");
+  const file = path.join(dir, "matchlock");
+  const L: string[] = [];
+  L.push("#!/usr/bin/env node");
+  L.push("const fs = require('node:fs');");
+  L.push("const argv = process.argv.slice(2);");
+  L.push(`const JOURNAL = ${JSON.stringify(opts.journalPath)};`);
+  L.push(`const RM_EXIT = ${opts.rmExit ?? 0};`);
+  L.push(`const RM_STDERR = ${JSON.stringify(opts.rmStderr ?? "")};`);
+  L.push("const home = process.env.HOME || '';");
+  L.push("const vmId = argv[1] || '';");
+  L.push("const stateDir = home + '/.matchlock/vms/' + vmId;");
+  L.push(
+    "fs.appendFileSync(JOURNAL, JSON.stringify({ event: 'invoke', argv: argv, home: home, vmId: vmId, stateDirExisted: fs.existsSync(stateDir) }) + '\\n');",
+  );
+  L.push("if (argv[0] === 'rm') {");
+  L.push("  if (RM_EXIT !== 0) { process.stderr.write(RM_STDERR); process.exit(RM_EXIT); }");
+  L.push("  try {");
+  L.push("    const dbPath = home + '/.matchlock/state.db';");
+  L.push("    if (!fs.existsSync(dbPath)) throw new Error('state.db missing at ' + dbPath);");
+  L.push("    const { DatabaseSync } = require('node:sqlite');");
+  L.push("    const db = new DatabaseSync(dbPath);");
+  L.push("    const res = db.prepare('DELETE FROM vms WHERE id = ?').run(vmId);");
+  L.push("    db.close();");
+  L.push("    if (Number(res.changes) === 0) throw new Error('no vms row for ' + vmId);");
+  L.push("    fs.rmSync(stateDir, { recursive: true, force: true });");
+  L.push("  } catch (e) {");
+  L.push("    // A fixture deletion failure must FAIL the fixture, not fake success.");
+  L.push("    fs.appendFileSync(JOURNAL, JSON.stringify({ event: 'delete_error', vmId: vmId, message: String(e && e.message || e) }) + '\\n');");
+  L.push("    process.exit(3);");
+  L.push("  }");
+  L.push("  process.exit(0);");
+  L.push("}");
+  L.push("process.exit(2);");
+  fs.writeFileSync(file, L.join("\n") + "\n", { mode: 0o755 });
+  return file;
+}
+
+interface RemovalJournalLine {
+  event: string;
+  argv: string[];
+  home: string;
+  vmId: string;
+  stateDirExisted: boolean;
+}
+
+function readRemovalJournal(p: string): RemovalJournalLine[] {
+  if (!fs.existsSync(p)) return [];
+  return fs
+    .readFileSync(p, "utf-8")
+    .split("\n")
+    .filter((l: string) => l.trim() !== "")
+    .map((l: string) => JSON.parse(l) as RemovalJournalLine);
 }
 
 function makePlan(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -302,6 +393,8 @@ class FakeBackend {
   readonly events: string[] = [];
   disposeCalls = 0;
   vmId = "vm-1";
+  /** When set, `prepareAndCreate` throws it (create never returned a VM). */
+  createError: unknown = null;
   failPrepAtCommandIndex = -1;
   closeError: unknown = null;
   closeResolvesWithoutIsClosed = false;
@@ -310,6 +403,7 @@ class FakeBackend {
 
   async prepareAndCreate(expected: unknown): Promise<{ vmId: string; identity: unknown }> {
     this.createCalls.push(expected);
+    if (this.createError !== null) throw this.createError;
     return { vmId: this.vmId, identity: expected };
   }
 
@@ -365,6 +459,11 @@ interface Harness {
   readonly stdout: BufferSink;
   readonly terminal: FakeTerminal;
   readonly factoryCalls: Array<{ policy: unknown; options: Record<string, unknown> }>;
+  /**
+   * CLEANUP-1: every removal call made through the harness's DEFAULT owned
+   * recorder (injected seams record into their own closures).
+   */
+  readonly removals: Array<Record<string, unknown>>;
 }
 
 function makeHarness(
@@ -377,6 +476,12 @@ function makeHarness(
   const stdout = new BufferSink();
   const terminal = new FakeTerminal();
   const factoryCalls: Harness["factoryCalls"] = [];
+  const removals: Harness["removals"] = [];
+  const {
+    removeVm: injectedRemoveVm,
+    removalEvidenceRoot: injectedRemovalEvidenceRoot,
+    ...rest
+  } = overrides;
   const controller = new InteractiveSessionController(plan, prep, {
     createBackend: (policy: unknown, options: Record<string, unknown>) => {
       factoryCalls.push({ policy, options });
@@ -386,16 +491,30 @@ function makeHarness(
     stdout,
     terminal,
     terminalSize: () => ({ rows: 30, cols: 100 }),
-    ...overrides,
+    // CLEANUP-1 test isolation: a fake-backend session defaults to an OWNED
+    // recorder + evidence root, so no unit test can ever reach an ambient
+    // matchlock binary or the real HOME through the removal seam. Tests that
+    // exercise the REAL default seam (captureAndRemoveVm) construct the
+    // controller directly with owned fixtures; failure cases inject their own
+    // seam explicitly.
+    removeVm:
+      injectedRemoveVm ??
+      ((options: Record<string, unknown>): Record<string, unknown> => {
+        removals.push(options);
+        return { vmId: options.vmId, removed: true, logsCopiedTo: null, removalExitCode: 0 };
+      }),
+    removalEvidenceRoot:
+      injectedRemovalEvidenceRoot ?? tmpDir("tamandua-interactive-removal-"),
+    ...rest,
   });
-  return { controller, backend, stdin, stdout, terminal, factoryCalls };
+  return { controller, backend, stdin, stdout, terminal, factoryCalls, removals };
 }
 
 // ── tests ────────────────────────────────────────────────────────────
 
 describe("interactive session controller core (US-010)", () => {
   it("creates exactly one VM and launches one exec_tty with explicit user/working_dir/rows/cols and no workflow deadline", async () => {
-    const { controller, backend, factoryCalls } = makeHarness();
+    const { controller, backend, factoryCalls, removals } = makeHarness();
     const plan = makePlan();
     const prep = makePrep();
 
@@ -431,6 +550,9 @@ describe("interactive session controller core (US-010)", () => {
     assert.equal(outcome.cancelled, false);
     assert.deepEqual(backend.closeCalls, [30], "bounded positive close timeout");
     assert.equal(interactiveSessionSucceeded(outcome), true);
+    assert.equal(outcome.vmRemoved, true, "the confirmed close removed this session's VM record");
+    assert.equal(removals.length, 1, "a confirmed close triggers exactly one VM record removal");
+    assert.equal(removals[0].vmId, "vm-1", "removal targets this session's own VM");
   });
 
   it("forwards host stdin only after exec_tty.ready and honors bounded backpressure", async () => {
@@ -615,6 +737,11 @@ describe("interactive session controller core (US-010)", () => {
       stdout: new BufferSink(),
       terminal: new FakeTerminal(),
       terminalSize: () => ({ rows: 30, cols: 100 }),
+      // CLEANUP-1 test isolation: this direct construction bypasses
+      // makeHarness, so it injects its own owned no-op removal seam + owned
+      // evidence root — no test may reach an ambient matchlock/HOME.
+      removeVm: () => ({ vmId: "vm-1", removed: true, logsCopiedTo: null, removalExitCode: 0 }),
+      removalEvidenceRoot: tmpDir("tamandua-interactive-removal-"),
       resolveGuestPrep: async () => {
         resolverCalls += 1;
         sawCreateBeforeResolve = backend.createCalls.length === 1;
@@ -866,6 +993,8 @@ describe("interactive session failure propagation (D1/D2/D3) and cleanup diagnos
         stdout,
         terminal,
         terminalSize: () => ({ rows: 30, cols: 100 }),
+        // CLEANUP-1 test isolation: an owned recorder (no ambient binary/HOME).
+        removeVm: () => ({ vmId: "vm-1", removed: true, logsCopiedTo: null, removalExitCode: 0 }),
       },
       stdout: () => {},
       stderr: () => {},
@@ -1016,6 +1145,203 @@ describe("interactive session failure propagation (D1/D2/D3) and cleanup diagnos
       assert.ok(err instanceof InteractiveSessionError);
       assert.match(err.message, /AUDIT_GUEST/);
       assert.match(err.message, /cleanup for VM vm-audit-owned was confirmed/);
+      return true;
+    });
+  });
+});
+
+// ── CLEANUP-1 (tamandua-me1): post-confirmed-close VM record removal ──
+
+describe("CLEANUP-1: the interactive close path removes the session's own VM record", () => {
+  function makeOwnedStore(): {
+    root: string;
+    home: string;
+    evidenceRoot: string;
+    ownedVm: string;
+    sentinelVm: string;
+    journal: string;
+  } {
+    const root = tmpDir("tamandua-interactive-clean1-");
+    const home = path.join(root, "home");
+    const evidenceRoot = path.join(root, "evidence");
+    const ownedVm = "vm-cleanup-owned";
+    const sentinelVm = "vm-cleanup-sentinel";
+    fs.mkdirSync(path.join(home, ".matchlock", "vms", ownedVm, "logs"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".matchlock", "vms", ownedVm, "config.json"), JSON.stringify({ id: ownedVm }));
+    fs.writeFileSync(path.join(home, ".matchlock", "vms", ownedVm, "logs", "guest.log"), "guest log\n");
+    fs.mkdirSync(path.join(home, ".matchlock", "vms", sentinelVm), { recursive: true });
+    const db = new DatabaseSync(path.join(home, ".matchlock", "state.db"));
+    db.exec(
+      "CREATE TABLE vms (id TEXT PRIMARY KEY, pid INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, " +
+        "image TEXT NOT NULL DEFAULT '', config_json BLOB, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    );
+    const now = new Date().toISOString();
+    // Faithful post-close state: matchlock's close marks the row stopped
+    // (it is the removal step under test that deletes row + dir).
+    const insert = db.prepare("INSERT INTO vms (id, pid, status, image, created_at, updated_at) VALUES (?, 0, 'stopped', 'img', ?, ?)");
+    insert.run(ownedVm, now, now);
+    insert.run(sentinelVm, now, now);
+    db.close();
+    return {
+      root,
+      home,
+      evidenceRoot,
+      ownedVm,
+      sentinelVm,
+      journal: path.join(root, "rm-journal.jsonl"),
+    };
+  }
+
+  function buildDirectController(
+    store: ReturnType<typeof makeOwnedStore>,
+    fakeCli: string,
+    backend: FakeBackend,
+    extra: Record<string, unknown> = {},
+  ): InstanceType<typeof InteractiveSessionController> {
+    return new InteractiveSessionController(makePlan(), makePrep(), {
+      createBackend: () => backend,
+      stdin: new FakeStdin(),
+      stdout: new BufferSink(),
+      terminal: new FakeTerminal(),
+      terminalSize: () => ({ rows: 30, cols: 100 }),
+      rpcBinaryPath: fakeCli,
+      rpcEnv: { HOME: store.home },
+      removalEvidenceRoot: store.evidenceRoot,
+      ...extra,
+    });
+  }
+
+  it("a confirmed close removes the VM row + state dir via the DEFAULT seam, keeping evidence and unrelated records", async () => {
+    const store = makeOwnedStore();
+    const fakeCli = writeFakeMatchlockRemovalCli({ journalPath: store.journal });
+    const backend = new FakeBackend();
+    backend.vmId = store.ownedVm;
+    const controller = buildDirectController(store, fakeCli, backend);
+
+    const runPromise = controller.run();
+    await until(() => backend.ttyCalls.length === 1, "exec_tty launch");
+    backend.tty.resolve(0);
+    const outcome = await runPromise;
+
+    assert.equal(outcome.cleanupConfirmed, true, "the close is still the authority");
+    assert.equal(outcome.vmRemoved, true, "the confirmed close removed this session's VM record");
+
+    // Evidence retained before removal, in the session's evidence root.
+    const evidenceDir = path.join(store.evidenceRoot, store.ownedVm);
+    assert.equal(outcome.vmLogsCopiedTo, evidenceDir, "evidence destination reported");
+    assert.ok(fs.existsSync(path.join(evidenceDir, "config.json")), "config.json captured");
+    assert.ok(fs.existsSync(path.join(evidenceDir, "logs", "guest.log")), "logs captured");
+
+    // Record + state dir gone; the unrelated sentinel row/dir untouched.
+    assert.equal(fs.existsSync(path.join(store.home, ".matchlock", "vms", store.ownedVm)), false, "owned state dir removed");
+    const checkDb = new DatabaseSync(path.join(store.home, ".matchlock", "state.db"));
+    const ownedCount = checkDb.prepare("SELECT COUNT(*) AS n FROM vms WHERE id = ?").get(store.ownedVm) as { n: number };
+    const sentinelCount = checkDb.prepare("SELECT COUNT(*) AS n FROM vms WHERE id = ?").get(store.sentinelVm) as { n: number };
+    checkDb.close();
+    assert.equal(Number(ownedCount.n), 0, "owned VM row deleted");
+    assert.equal(Number(sentinelCount.n), 1, "unrelated VM row untouched");
+    assert.equal(fs.existsSync(path.join(store.home, ".matchlock", "vms", store.sentinelVm)), true, "unrelated state dir untouched");
+
+    // Exact one removal invocation: `rm <vmId>` with the forced HOME.
+    const entries = readRemovalJournal(store.journal);
+    assert.equal(entries.length, 1, "exactly one removal invocation");
+    assert.deepEqual(entries[0].argv, ["rm", store.ownedVm], "exact removal argv (no rpc args reuse)");
+    assert.equal(entries[0].home, store.home, "HOME forced to the session's effective matchlock HOME");
+    assert.equal(entries[0].stateDirExisted, true, "state dir existed at removal time");
+  });
+
+  it("an UNCONFIRMED close never attempts record removal", async () => {
+    const { controller, backend, removals } = makeHarness();
+    backend.closeError = new Error("close transport died");
+    const runPromise = controller.run();
+    await until(() => backend.ttyCalls.length === 1, "exec_tty launch");
+    backend.tty.resolve(0);
+    const outcome = await runPromise;
+
+    assert.equal(outcome.cleanupConfirmed, false);
+    assert.equal(outcome.vmRemoved, undefined, "no removal outcome on an unconfirmed close");
+    assert.equal(removals.length, 0, "no removal was attempted");
+  });
+
+  it("a session whose create never returned removes nothing", async () => {
+    const { controller, backend, removals } = makeHarness();
+    backend.createError = new Error("create failed (fixture)");
+    await assert.rejects(controller.run(), (err: unknown) => {
+      assert.ok(err instanceof InteractiveSessionError);
+      assert.match(err.message, /no VM was created/);
+      return true;
+    });
+    assert.equal(removals.length, 0, "nothing to remove without an owned VM id");
+    assert.equal(backend.disposeCalls, 1, "the never-created session disposes the transport");
+    assert.deepEqual(backend.closeCalls, [], "no close without a VM");
+  });
+
+  it("a FAILED removal is reported and never changes the confirmed-close verdict", async () => {
+    const store = makeOwnedStore();
+    const fakeCli = writeFakeMatchlockRemovalCli({
+      journalPath: store.journal,
+      rmExit: 7,
+      rmStderr: "rm refused by test wrapper",
+    });
+    const backend = new FakeBackend();
+    backend.vmId = store.ownedVm;
+    const controller = buildDirectController(store, fakeCli, backend);
+
+    const runPromise = controller.run();
+    await until(() => backend.ttyCalls.length === 1, "exec_tty launch");
+    backend.tty.resolve(0);
+    const outcome = await runPromise;
+
+    assert.equal(outcome.cleanupConfirmed, true, "the close verdict is unchanged by a removal failure");
+    assert.equal(outcome.vmRemoved, false, "removal failure reported on the outcome");
+    assert.match(outcome.vmRemovalError ?? "", /rm refused by test wrapper/, "bounded removal error surfaced");
+    assert.equal(
+      fs.existsSync(path.join(store.home, ".matchlock", "vms", store.ownedVm)),
+      true,
+      "the refused removal leaves the state dir in place",
+    );
+  });
+
+  it("a THROWING removal seam is contained as reportable metadata", async () => {
+    const { controller, backend } = makeHarness(makePlan(), makePrep(), {
+      removeVm: () => {
+        throw new Error("removal seam exploded AUDIT_REMOVAL_THROW");
+      },
+    });
+    const runPromise = controller.run();
+    await until(() => backend.ttyCalls.length === 1, "exec_tty launch");
+    backend.tty.resolve(0);
+    const outcome = await runPromise;
+
+    assert.equal(outcome.cleanupConfirmed, true, "the close verdict survives a throwing remover");
+    assert.equal(outcome.vmRemoved, false);
+    assert.match(outcome.vmRemovalError ?? "", /AUDIT_REMOVAL_THROW/);
+  });
+
+  it("a guest failure PLUS a failed removal reports BOTH (the primary error is never hidden)", async () => {
+    const { controller, backend } = makeHarness(makePlan(), makePrep(), {
+      removeVm: () => ({
+        vmId: "vm-audit-owned",
+        removed: false,
+        logsCopiedTo: null,
+        removalExitCode: 9,
+        removalError: "removal fault AUDIT_REMOVE",
+      }),
+    });
+    backend.vmId = "vm-audit-owned";
+    const runPromise = controller.run();
+    await until(() => backend.ttyCalls.length === 1, "exec_tty launch");
+    backend.tty.reject(new Error("guest transport fault AUDIT_GUEST"));
+
+    await assert.rejects(runPromise, (err: unknown) => {
+      assert.ok(err instanceof InteractiveSessionError);
+      assert.match(err.message, /AUDIT_GUEST/, "the original failure is preserved");
+      assert.match(err.message, /cleanup for VM vm-audit-owned was confirmed/, "the close verdict is reported");
+      assert.match(
+        err.message,
+        /vm-record removal for VM vm-audit-owned was NOT confirmed: removal fault AUDIT_REMOVE/,
+        "the removal failure is reported alongside, not instead of",
+      );
       return true;
     });
   });

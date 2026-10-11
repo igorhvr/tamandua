@@ -29,7 +29,15 @@
  *      stay bounded), and
  *   7. it resolves with the launched process exit status, while teardown is
  *      bounded and NEVER claims success on an unconfirmed VM closure: an
- *      unconfirmed close yields a non-success outcome naming the VM.
+ *      unconfirmed close yields a non-success outcome naming the VM. Rider
+ *      CLEANUP-1 (bead tamandua-me1): a POSITIVELY confirmed close is followed
+ *      by the workflow path's post-close step — the VM's retained evidence is
+ *      copied, then its record + `~/.matchlock/vms/<id>/` state dir are
+ *      removed through `vm-evidence.captureAndRemoveVm` (otherwise a stopped
+ *      row + dir accumulate one per session). The removal outcome rides the
+ *      result as `vmRemoved`/`vmLogsCopiedTo`/`vmRemovalError`; it never
+ *      changes the close verdicts, and a failed removal never masks the
+ *      original session failure — both are reported.
  *
  * US-011 layers host-terminal integration onto the same controller through
  * injectable seams:
@@ -50,6 +58,8 @@
  * happens in tests.
  */
 
+import path from "node:path";
+
 import {
   MatchlockController,
   type MatchlockControllerOptions,
@@ -57,8 +67,22 @@ import {
 import type { PinnedImageIdentity } from "./image.js";
 import type { InteractiveGuestPrepPlan } from "./interactive-guest-prep.js";
 import type { InteractiveSessionPlan } from "./interactive-session-plan.js";
-import { buildInteractiveSessionCreateConfig, type MountAdmissionContext } from "./mount-plan.js";
+import {
+  buildInteractiveSessionCreateConfig,
+  resolveLiveStateRoot,
+  type MountAdmissionContext,
+} from "./mount-plan.js";
 import { decodeFrameBytes, type MatchlockTtyHandle, type StreamNotify } from "./rpc-client.js";
+import {
+  MATCHLOCK_ERROR_TAIL_MAX_BYTES,
+  boundMatchlockErrorText,
+} from "./runner-error.js";
+import {
+  captureAndRemoveVm,
+  type CaptureAndRemoveVmOptions,
+  type CaptureAndRemoveVmResult,
+  type VmEvidenceLogLevel,
+} from "./vm-evidence.js";
 import type { ExecutionIsolation } from "./policy.js";
 import type {
   MatchlockExecOptions,
@@ -115,6 +139,11 @@ export function renderUnknownError(value: unknown): string {
     if (typeof message === "string" && message !== "") return message;
   }
   return String(value);
+}
+
+/** Byte-bound a removal failure description the same way vm-evidence does. */
+function boundRemovalError(text: string): string {
+  return boundMatchlockErrorText(text, MATCHLOCK_ERROR_TAIL_MAX_BYTES);
 }
 
 /** Signals the interactive controller handles on the host terminal. */
@@ -219,8 +248,35 @@ export interface InteractiveSessionOutcome {
   cleanupConfirmed: boolean;
   /** Present when cleanup was not confirmed: names the VM + the failure. */
   cleanupError?: string;
+  /**
+   * Rider CLEANUP-1 (bead tamandua-me1): outcome of the post-confirmed-close
+   * VM-record removal, with the SAME semantics the workflow path's
+   * `captureAndRemoveVm` establishes: `true` when the helper reports success
+   * (the state dir was removed, was already absent, or the CLI reported the
+   * VM already gone); `false` when removal was attempted and failed; ABSENT
+   * when removal was never attempted (no VM was created, or the close was not
+   * confirmed). A removal failure never changes the close verdicts — it is
+   * reportable metadata, exactly like the workflow runners' `vmReapOutcome`.
+   */
+  vmRemoved?: boolean;
+  /** Evidence destination the VM's retained files were copied into (null when nothing was captured). */
+  vmLogsCopiedTo?: string | null;
+  /** Bounded removal failure description; present only when removal failed. */
+  vmRemovalError?: string;
   /** True when the session was cancelled before the guest exited. */
   cancelled: boolean;
+}
+
+/**
+ * Rider CLEANUP-1 (bead tamandua-me1): bounded outcome of the
+ * post-confirmed-close removal of the session's OWN VM record + state dir.
+ * Internal to the controller; its fields are surfaced through the outcome
+ * (`vmRemoved`/`vmLogsCopiedTo`/`vmRemovalError`) and the failure message.
+ */
+interface InteractiveVmRemovalOutcome {
+  removed: boolean;
+  logsCopiedTo: string | null;
+  removalError?: string;
 }
 
 /** Injectable host integration for deterministic unit tests. */
@@ -286,6 +342,24 @@ export interface InteractiveSessionOptions {
    * raw mode or real terminal state is ever touched.
    */
   terminal?: InteractiveSessionTerminalHooks;
+  /**
+   * Rider CLEANUP-1 (bead tamandua-me1): injectable removal seam for the
+   * post-confirmed-close step. Defaults to `vm-evidence.captureAndRemoveVm` —
+   * the SAME bounded, symlink-safe, never-throws implementation the workflow
+   * invocation runners use — so the interactive close path mirrors the
+   * workflow path exactly. Tests inject an owned fake (or point the admitted
+   * CLI binding at a fake matchlock script) so no real matchlock binary is
+   * ever spawned.
+   */
+  removeVm?: (options: CaptureAndRemoveVmOptions) => CaptureAndRemoveVmResult;
+  /**
+   * Rider CLEANUP-1: root directory for the per-VM retained evidence copied
+   * by the removal step (parity with the workflow path's
+   * `<runRoot>/<bareRunId>/matchlock/<vmId>`). Defaults to
+   * `<live-state-root>/matchlock/interactive-sessions`; tests inject an owned
+   * temp root so no real state is touched.
+   */
+  removalEvidenceRoot?: string;
 }
 
 /** Default bounded host-input high-water mark (bytes). */
@@ -493,6 +567,29 @@ export class InteractiveSessionController {
   private readonly cols: number;
   private readonly sizeProbe: () => { rows?: number; cols?: number } | null | undefined;
   private readonly terminalHooks: Required<InteractiveSessionTerminalHooks>;
+  /**
+   * Rider CLEANUP-1 (bead tamandua-me1): the removal context captured at
+   * construction — the CLI binding from the SAME selection helper the rpc
+   * transport uses (`resolveTransportBinding`; a bare-name binding is
+   * resolved through PATH by the spawn, exactly as the transport's launcher
+   * resolves it), the effective matchlock HOME (the per-session
+   * `rpcEnv.HOME` when present, else the host HOME) and the evidence root,
+   * plus a copy of the `rpcEnv` overlay. There is no ADDITIONAL teardown-time
+   * environment re-decision beyond what the transport itself applies.
+   */
+  private readonly removalCliBinaryPath: string;
+  private readonly removalHome: string;
+  private readonly removalEvidenceRoot: string;
+  /** Frozen copy of the session's rpcEnv overlay, used for BOTH the rpc transport and the removal child. */
+  private readonly transportRpcEnv: Record<string, string> | undefined;
+  /**
+   * The ONE frozen rpc transport binding (the admitted plan invocation when
+   * present, else the explicit session options), captured at construction and
+   * reused by BOTH the rpc transport (`resolveBackend`) and the removal
+   * context above — one evaluation point, so creation and removal can never
+   * diverge on the executable/argv decision.
+   */
+  private readonly transportBinding: { rpcBinaryPath?: string; rpcArgs?: string[] };
 
   private backend: InteractiveSessionVmBackend | null = null;
   private handle: MatchlockTtyHandle | null = null;
@@ -566,6 +663,32 @@ export class InteractiveSessionController {
     this.cols = dimensions.cols;
     this.currentRows = dimensions.rows;
     this.currentCols = dimensions.cols;
+
+    // Rider CLEANUP-1: capture the transport binding and the removal context
+    // NOW (see the field docs). The CLI binding is the SAME single frozen
+    // binding the rpc transport uses, so the removal targets the same CLI
+    // selection as the session's own RPC child (a bare-name binding still
+    // PATH-resolves at spawn, exactly as the transport launcher does).
+    // `rpcArgs` are never reused for removal — removal is a CLI subcommand
+    // invocation, not the rpc transport argv.
+    const transportRpc = this.resolveTransportBinding();
+    this.transportBinding = transportRpc;
+    this.removalCliBinaryPath =
+      typeof transportRpc.rpcBinaryPath === "string" && transportRpc.rpcBinaryPath.length > 0
+        ? transportRpc.rpcBinaryPath
+        : "matchlock";
+    const rpcHome = options.rpcEnv?.HOME;
+    this.removalHome =
+      typeof rpcHome === "string" && rpcHome.length > 0 ? rpcHome : (process.env.HOME ?? "");
+    this.removalEvidenceRoot =
+      typeof options.removalEvidenceRoot === "string" && options.removalEvidenceRoot.trim() !== ""
+        ? options.removalEvidenceRoot
+        : path.join(resolveLiveStateRoot(), "matchlock", "interactive-sessions");
+    // Copy the overlay so a later caller-side mutation cannot retarget the
+    // post-close removal environment; the SAME frozen snapshot feeds the rpc
+    // transport (resolveBackend), so creation and removal share one
+    // launch-context environment.
+    this.transportRpcEnv = options.rpcEnv !== undefined ? { ...options.rpcEnv } : undefined;
   }
 
   /** The VM id once `create` has returned (null before). */
@@ -746,6 +869,20 @@ export class InteractiveSessionController {
 
     const teardown = await this.teardown(backend);
 
+    // Rider CLEANUP-1 (bead tamandua-me1): a POSITIVELY confirmed close of
+    // THIS session's own VM is followed by the workflow path's post-close
+    // step — bounded evidence capture, then removal of the VM's record +
+    // state dir. An unconfirmed close NEVER attempts removal (the record may
+    // still back a live VM), and removal never runs for an id this session
+    // did not create. The result is reportable metadata only: it cannot
+    // change the close verdict, and a removal failure is surfaced ALONGSIDE
+    // (never instead of) any original session failure.
+    const ownedVmId = this.vmId;
+    let removal: InteractiveVmRemovalOutcome | null = null;
+    if (teardown.confirmed && ownedVmId !== null) {
+      removal = this.removeConfirmedVmRecord(ownedVmId);
+    }
+
     if (failed) {
       // Bounded cleanup has already been attempted; surface the original
       // failure TOGETHER with the cleanup status, VM identity and close error
@@ -754,12 +891,18 @@ export class InteractiveSessionController {
       const cleanup = teardown.confirmed
         ? `cleanup for ${vmLabel} was confirmed`
         : `cleanup for ${vmLabel} was NOT confirmed: ${teardown.error ?? "reason unknown"}`;
+      // The ORIGINAL failure above is never hidden: a failed record removal is
+      // appended as its own diagnostic (both are reported).
+      const removalNote =
+        removal !== null && !removal.removed
+          ? `; vm-record removal for VM ${this.vmId} was NOT confirmed: ${removal.removalError ?? "reason unknown"}`
+          : "";
       if (failure instanceof InteractiveSessionError) {
-        throw new InteractiveSessionError(failure.code, `${failure.message}; ${cleanup}.`);
+        throw new InteractiveSessionError(failure.code, `${failure.message}; ${cleanup}${removalNote}.`);
       }
       throw new InteractiveSessionError(
         INTERACTIVE_SESSION_FAILED_CODE,
-        `Interactive session failed: ${renderUnknownError(failure)}; ${cleanup}.`,
+        `Interactive session failed: ${renderUnknownError(failure)}; ${cleanup}${removalNote}.`,
       );
     }
 
@@ -768,6 +911,15 @@ export class InteractiveSessionController {
       vmId: this.vmId ?? "",
       cleanupConfirmed: teardown.confirmed,
       ...(teardown.error !== undefined ? { cleanupError: teardown.error } : {}),
+      ...(removal !== null
+        ? {
+            vmRemoved: removal.removed,
+            vmLogsCopiedTo: removal.logsCopiedTo,
+            ...(removal.removalError !== undefined
+              ? { vmRemovalError: removal.removalError }
+              : {}),
+          }
+        : {}),
       cancelled: cancelled || this.cancelled,
     };
   }
@@ -840,6 +992,66 @@ export class InteractiveSessionController {
       `Interactive stdin delivery to Matchlock VM ${this.vmId ?? "(unknown)"} failed: ` +
         `${renderUnknownError(error)}; refusing to report success because host input was lost.`,
     );
+  }
+
+  // Rider CLEANUP-1: the removal context (CLI binding, matchlock HOME,
+  // evidence root, rpcEnv overlay) is fixed at construction — nothing here
+  // re-resolves the executable decision through the ambient environment at
+  // teardown time (see `removalCliBinaryPath` / `removalHome` /
+  // `removalEvidenceRoot`).
+
+  /**
+   * Rider CLEANUP-1 (bead tamandua-me1): after a POSITIVELY confirmed close,
+   * remove THIS session's VM record + `~/.matchlock/vms/<id>/` state dir via
+   * the workflow path's `captureAndRemoveVm` (bounded evidence copy first,
+   * then `matchlock rm <vmId>` with HOME forced to the session's effective
+   * matchlock HOME). NEVER throws and NEVER changes a close verdict: a failure
+   * is reported as `{removed: false, removalError}` (bounded), a throwing
+   * removal seam is contained, and a genuine removal failure is logged — the
+   * remaining row is cleanup metadata, exactly like the workflow runners'
+   * `vmReapOutcome`. Called ONLY for the exact VM id `create` returned to
+   * this session and ONLY when the wire close is confirmed.
+   */
+  private removeConfirmedVmRecord(vmId: string): InteractiveVmRemovalOutcome {
+    const remove = this.options.removeVm ?? captureAndRemoveVm;
+    const onLog = this.options.onLog
+      ? (level: VmEvidenceLogLevel, message: string, fields?: Record<string, unknown>): void => {
+          try {
+            this.options.onLog?.(level, message, fields);
+          } catch {
+            /* logging must never affect the session outcome */
+          }
+        }
+      : undefined;
+    try {
+      const result = remove({
+        vmId,
+        matchlockHome: this.removalHome,
+        destinationDir: path.join(this.removalEvidenceRoot, vmId),
+        cliBinaryPath: this.removalCliBinaryPath,
+        // The removal child receives the ONE frozen rpcEnv snapshot (HOME is
+        // force-set to the frozen removalHome inside captureAndRemoveVm), so
+        // post-close cleanup runs with the same environment overlay as the
+        // session's own RPC child.
+        ...(this.transportRpcEnv !== undefined ? { env: this.transportRpcEnv } : {}),
+        ...(onLog !== undefined ? { onLog } : {}),
+      });
+      return {
+        removed: result.removed === true,
+        logsCopiedTo: result.logsCopiedTo ?? null,
+        ...(result.removalError !== undefined ? { removalError: result.removalError } : {}),
+      };
+    } catch (err) {
+      // Defense-in-depth: a throwing removal implementation is CONTAINED so it
+      // can never mask the session outcome (that containment is asserted).
+      const removalError = boundRemovalError(`vm record removal failed: ${renderUnknownError(err)}`);
+      try {
+        this.options.onLog?.("warn", "matchlock vm record removal failed", { vmId, removalError });
+      } catch {
+        /* logging must never affect the session outcome */
+      }
+      return { removed: false, logsCopiedTo: null, removalError };
+    }
   }
 
   /** Register the injectable signal/stream hooks for the whole session. */
@@ -968,6 +1180,29 @@ export class InteractiveSessionController {
     );
   };
 
+  /**
+   * The ONE rpc transport binding for this session: the admitted plan
+   * invocation when the plan carries one (MTLK-RPC-BIN-SPLIT: the exact
+   * binary + argv the swap handshake probed and admission bound), else the
+   * explicit session-level options (direct construction in unit tests).
+   * Shared by `resolveBackend` (the rpc transport) and the constructor's
+   * removal-context freeze, so both derive their executable from the SAME
+   * inputs through one code path. Pure: reads only frozen plan/options state,
+   * never the ambient environment.
+   */
+  private resolveTransportBinding(): { rpcBinaryPath?: string; rpcArgs?: string[] } {
+    const admittedRpc = this.plan.resolvedRpc;
+    if (admittedRpc !== undefined) {
+      return { rpcBinaryPath: admittedRpc.binaryPath, rpcArgs: [...admittedRpc.args] };
+    }
+    return {
+      ...(this.options.rpcBinaryPath !== undefined
+        ? { rpcBinaryPath: this.options.rpcBinaryPath }
+        : {}),
+      ...(this.options.rpcArgs !== undefined ? { rpcArgs: [...this.options.rpcArgs] } : {}),
+    };
+  }
+
   /** Build the ONE owned backend (real controller by default). */
   private resolveBackend(): InteractiveSessionVmBackend {
     const create =
@@ -979,20 +1214,11 @@ export class InteractiveSessionController {
     // handshake probed and admission bound (`resolvedRpc`). Only a plan without
     // a frozen invocation (direct controller construction in unit tests) falls
     // back to the explicit per-session option.
-    const admittedRpc = this.plan.resolvedRpc;
-    const transportRpc =
-      admittedRpc !== undefined
-        ? { rpcBinaryPath: admittedRpc.binaryPath, rpcArgs: [...admittedRpc.args] }
-        : {
-            ...(this.options.rpcBinaryPath !== undefined
-              ? { rpcBinaryPath: this.options.rpcBinaryPath }
-              : {}),
-            ...(this.options.rpcArgs !== undefined ? { rpcArgs: this.options.rpcArgs } : {}),
-          };
+    const transportRpc = this.transportBinding;
     const controllerOptions: MatchlockControllerOptions = {
       requireHelperPack: false,
       ...transportRpc,
-      ...(this.options.rpcEnv !== undefined ? { rpcEnv: this.options.rpcEnv } : {}),
+      ...(this.transportRpcEnv !== undefined ? { rpcEnv: this.transportRpcEnv } : {}),
       ...(this.options.onLog !== undefined ? { onLog: this.options.onLog } : {}),
       ...(this.options.requestTimeoutMs !== undefined
         ? { requestTimeoutMs: this.options.requestTimeoutMs }

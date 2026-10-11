@@ -590,6 +590,16 @@ export async function runInteractiveSession(
     );
     return outcome.exitCode !== null && outcome.exitCode !== 0 ? outcome.exitCode : 1;
   }
+  if (outcome.vmRemoved === false) {
+    // Rider CLEANUP-1 (bead tamandua-me1): the VM close was confirmed but the
+    // record/state-dir removal was not. The stopped VM row may remain, so say
+    // so on stderr; the session's exit semantics are unchanged.
+    stderr(
+      `Warning: the Matchlock VM ${outcome.vmId || "(unknown)"} record/state dir was not removed` +
+        `${outcome.vmRemovalError ? `: ${outcome.vmRemovalError}` : ""}; ` +
+        "the stopped VM row may remain.\n",
+    );
+  }
   if (!interactiveSessionSucceeded(outcome)) {
     // D1: external termination/disconnect (SIGTERM/SIGHUP/host stream error)
     // yields a CONFIRMED-cleanup but CANCELLED outcome with no guest exit code.
