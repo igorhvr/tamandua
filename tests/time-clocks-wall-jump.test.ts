@@ -12,9 +12,10 @@
  *       crash-recovery reservations) keep wall-epoch semantics and are aged
  *       numerically through `instantAgeMs()`/`isOlderThan()` with an explicit
  *       documented tolerance.
- *   (3) File-mtime provenance (daemon pidfile / start lock, dsh session
- *       "created since spawn") keeps OS-epoch semantics but routes its
- *       age/since-spawn decision through the same helpers and tolerance.
+ *   (3) File-mtime provenance (daemon pidfile / start lock) keeps OS-epoch
+ *       semantics but routes its age decision through the same helpers and
+ *       tolerance; dsh session attribution is ownership-based (DSH-OWNER) and
+ *       reads no timestamps at all.
  *
  * Coverage map:
  *   - backward + forward wall jumps on `Stopwatch`/`Deadline` (injected and
@@ -27,8 +28,10 @@
  *     an injected now;
  *   - daemonctl pidfile / start-lock mtime tolerance exactly at, just inside
  *     and just outside the boundary (real `fs.statSync` mtimes);
- *   - dsh session attribution mtime tolerance exactly at, just inside and just
- *     outside `DSH_SESSION_MTIME_TOLERANCE_MS` (real `fs.utimesSync` mtimes).
+ *   - dsh session attribution is ownership-based (DSH-OWNER): an owned-store
+ *     session resolves under hostile directory mtimes and header instants,
+ *     and a missing owned store reads UNOBSERVED (real `fs.utimesSync`
+ *     mtimes).
  *
  * Determinism: every simulation uses an injected clock or an injected
  * `nowMs`; the only real waits are two tiny bounded (< 100ms) timers. No live
@@ -79,9 +82,8 @@ import {
   _startLockIsStaleForTest,
 } from "../dist/server/daemonctl.js";
 import {
-  DSH_SESSION_MTIME_TOLERANCE_MS,
   DSH_V3_LOG_PLAIN,
-  dshSessionProjectDir,
+  dshOwnedSessionProjectDir,
   lookupDshSessionTokens,
 } from "../dist/installer/dsh-usage.js";
 
@@ -557,16 +559,23 @@ describe("US-013 daemonctl file-mtime provenance tolerance boundaries", () => {
   });
 });
 
-// ── Rule 3: dsh session attribution mtime tolerance ────────────────
+// ── Rule 3 → DSH-OWNER: dsh session attribution is ownership-based ─
 
-describe("US-013 dsh session attribution mtime tolerance boundaries", () => {
-  function headerLine(id: string): string {
+describe("DSH-OWNER dsh session attribution reads no timestamps", () => {
+  function ownedHeaderLine(id: string, createdAt: number): string {
     return (
-      JSON.stringify({ type: "session", version: 3, id, createdAt: 1, delegationDepth: 0 }) + "\n"
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id,
+        createdAt,
+        isSeeded: false,
+        delegationDepth: 0,
+      }) + "\n"
     );
   }
 
-  function usageLine(input: number, output: number): string {
+  function ownedUsageLine(input: number, output: number): string {
     return (
       JSON.stringify({
         type: "assistant/message",
@@ -583,32 +592,29 @@ describe("US-013 dsh session attribution mtime tolerance boundaries", () => {
   }
 
   /**
-   * Stage one plain-v3 session directory whose mtime is `ageMs` before the
-   * passed spawn instant, then resolve tokens for that spawn instant. The
-   * spawn timestamp is derived from the REAL `fs.statSync` mtime, so the
-   * "exactly at the tolerance" case is exact regardless of fs rounding.
+   * Stage one plain-v3 session inside an invocation-OWNED store while
+   * moving every time-shaped input (directory mtime, header `createdAt`)
+   * to a HOSTILE value, then resolve tokens. Ownership, not time, must
+   * decide: the owned session is read whatever the timestamps say.
    */
-  async function lookupAtAge(ageMs: number) {
-    const root = tamanduaTempDir("tamandua-us013-dsh-");
+  async function lookupWithTimes(opts: { mtimeMs: number; createdAtMs: number }) {
+    const root = tamanduaTempDir("tamandua-us013-dsh-owner-");
     try {
-      const dshHome = path.join(root, "dsh-home");
+      const ownedRoot = path.join(root, "owned");
       const workdir = path.join(root, "worktree", "repo");
       const sessionName = "session-us013";
-      const sessionDir = path.join(dshSessionProjectDir(dshHome, workdir), sessionName);
+      const sessionDir = path.join(dshOwnedSessionProjectDir(ownedRoot, workdir), sessionName);
       fs.mkdirSync(sessionDir, { recursive: true });
       fs.writeFileSync(
         path.join(sessionDir, DSH_V3_LOG_PLAIN),
-        headerLine(sessionName) + usageLine(40, 2),
+        ownedHeaderLine(sessionName, opts.createdAtMs) + ownedUsageLine(40, 2),
       );
-
-      const fixed = new Date(1_700_000_000_000);
-      fs.utimesSync(sessionDir, fixed, fixed);
-      const mtimeMs = fs.statSync(sessionDir).mtimeMs;
+      fs.utimesSync(sessionDir, new Date(opts.mtimeMs), new Date(opts.mtimeMs));
 
       return await lookupDshSessionTokens({
-        spawnedAtMs: mtimeMs + ageMs,
+        ownedRoot,
         workdir,
-        env: { DSH_HOME: dshHome, PATH: process.env.PATH },
+        env: { PATH: process.env.PATH },
         zstdStrategy: "none",
       });
     } finally {
@@ -616,19 +622,39 @@ describe("US-013 dsh session attribution mtime tolerance boundaries", () => {
     }
   }
 
-  it("includes a session at the tolerance boundary and just inside it", async () => {
-    const atBoundary = await lookupAtAge(DSH_SESSION_MTIME_TOLERANCE_MS);
-    assert.ok(atBoundary, "an mtime exactly at the tolerance is eligible (age <= tolerance)");
-    assert.equal(atBoundary.totalTokens, 42);
-    assert.equal(atBoundary.sessionRef, "session-us013");
-
-    const justInside = await lookupAtAge(DSH_SESSION_MTIME_TOLERANCE_MS - 1_000);
-    assert.ok(justInside, "an mtime just inside the tolerance is eligible");
-    assert.equal(justInside.totalTokens, 42);
+  it("resolves the owned session under hostile mtimes and header instants", async () => {
+    // Epoch zero, the fixture epoch, and a far-future instant for BOTH the
+    // directory mtime and the header createdAt: no time-shaped input may
+    // gate, rank, or exclude the invocation's own session.
+    for (const mtimeMs of [0, 1_700_000_000_000, 4_100_000_000_000]) {
+      for (const createdAtMs of [0, 1_700_000_000_000, 4_100_000_000_000]) {
+        const resolved = await lookupWithTimes({ mtimeMs, createdAtMs });
+        assert.ok(
+          resolved,
+          `owned session must resolve regardless of mtime ${mtimeMs} / createdAt ${createdAtMs}`,
+        );
+        assert.equal(resolved.totalTokens, 42);
+        assert.equal(resolved.sessionRef, "session-us013");
+      }
+    }
   });
 
-  it("excludes a session just outside the tolerance (never a fabricated total)", async () => {
-    const justOutside = await lookupAtAge(DSH_SESSION_MTIME_TOLERANCE_MS + 1_000);
-    assert.equal(justOutside, null, "a session beyond the mtime tolerance must not be attributed");
+  it("returns null (UNOBSERVED, never a fallback) when the owned store is absent", async () => {
+    const root = tamanduaTempDir("tamandua-us013-dsh-nostore-");
+    try {
+      const missing = await lookupDshSessionTokens({
+        ownedRoot: path.join(root, "never-created"),
+        workdir: path.join(root, "worktree", "repo"),
+        env: { PATH: process.env.PATH },
+        zstdStrategy: "none",
+      });
+      assert.equal(
+        missing,
+        null,
+        "with no owned evidence the lookup reads UNOBSERVED — it never substitutes another store",
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

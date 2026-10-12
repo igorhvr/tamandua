@@ -11,11 +11,13 @@
  * TAMANDUA_DSH_BINARY is pointed at a scripted dsh (see
  * helpers/scripted-dsh.ts) that executes the real work protocol
  * deterministically, emitting plain-text output with NO session trailer
- * and writing a fake session.v3.jsonl.zstd under the temp $DSH_HOME for
- * token attribution (dsh prints no usage — the scheduler reads usage
- * from the session files via the escaped-cwd scan; the v3 format is a
- * `session` header plus `assistant/message` records carrying a top-level
- * `data.usage`).
+ * and writing a fake session.v3.jsonl.zstd into its per-invocation OWNED
+ * store for token attribution: the dispatcher hands each dsh invocation a
+ * `--patch` session-persistence overlay (DSH-OWNER), and the runtime
+ * writes the log under that overlay's root — collected below by walking
+ * the tamandua state dir's `dsh-sessions` tree (dsh prints no usage; the
+ * v3 format is a `session` header plus `assistant/message` records
+ * carrying a top-level `data.usage`).
  *
  * Runs advance at nudge speed via the daemon control plane.
  *
@@ -59,10 +61,6 @@ import type {
 import {
   sumUsageChunks,
 } from "../dist/installer/dsh-usage.js";
-import {
-  ROOT_DAC_SKIP_REASON,
-  shouldSkipDacFixtureTest,
-} from "../src/lib/dac-guard.ts";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
@@ -93,20 +91,36 @@ function decompressZstd(buffer: Buffer): string {
   return r.stdout.toString("utf-8");
 }
 
-/** Collect every session.v3.jsonl.zstd under a dsh home's sessions tree. */
-function collectSessionLogs(dshHome: string): string[] {
-  const sessionsRoot = path.join(dshHome, "sessions");
-  if (!fs.existsSync(sessionsRoot)) return [];
+/**
+ * Collect every session.v3.jsonl.zstd under the tamandua state dir's
+ * DSH-OWNER owned-store tree (`<tamanduaDir>/dsh-sessions/<runId>/…`).
+ * Owned roots also hold non-session artifacts (the generated overlay and
+ * the ownership receipt), so the walk filters on the exact session-log
+ * filename. A legacy shared-store `sessions/` tree is also collected when
+ * present, so the helper stays usable if any pre-owned-store leftovers
+ * exist.
+ */
+function collectSessionLogs(tamanduaDir: string): string[] {
   const logs: string[] = [];
-  for (const projectEntry of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
-    if (!projectEntry.isDirectory()) continue;
-    const projectDir = path.join(sessionsRoot, projectEntry.name);
-    for (const sessionEntry of fs.readdirSync(projectDir, { withFileTypes: true })) {
-      if (!sessionEntry.isDirectory()) continue;
-      const logPath = path.join(projectDir, sessionEntry.name, "session.v3.jsonl.zstd");
-      if (fs.existsSync(logPath)) logs.push(logPath);
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 8) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
     }
-  }
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(p, depth + 1);
+      } else if (entry.isFile() && entry.name === "session.v3.jsonl.zstd") {
+        logs.push(p);
+      }
+    }
+  };
+  walk(path.join(tamanduaDir, "dsh-sessions"), 0);
+  walk(path.join(tamanduaDir, "sessions"), 0);
   return logs.sort();
 }
 
@@ -611,13 +625,12 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
             `got ${ctx.scripted.workInvocations("auditor").length} invocations\n${diagnostics(ctx)}`,
         );
 
-        // ── Token accounting: session-file usage attributed to the run ──
-        // Each work round writes a fake session.v3.jsonl.zstd under the
-        // temp DSH_HOME; the scheduler attributes the newest session per
-        // round via the escaped-cwd scan (top-level data.usage, cache
-        // reads excluded).
-        const dshHome = ctx.scripted.env.DSH_HOME;
-        const sessionLogs = collectSessionLogs(dshHome);
+        // ── Token accounting: owned-store usage attributed to the run ──
+        // Each work round writes a fake session.v3.jsonl.zstd into its own
+        // `--patch`-redirected owned store (under the state dir's
+        // dsh-sessions tree); the scheduler settles each round from its OWN
+        // store only (top-level data.usage, cache reads excluded).
+        const sessionLogs = collectSessionLogs(ctx.env.tamanduaDir);
         assert.equal(
           sessionLogs.length,
           BUG_FIX_HAPPY_ROUNDS,
@@ -805,59 +818,30 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
     },
   );
 
-  // ── Scenario d: token degradation — read-only DSH_HOME with no sessions ──
+  // ── Scenario d: token degradation — a round whose own session never materialized ──
   it(
-    "do-now: token degradation (read-only DSH_HOME) — run completes, tokens_spent = 0, no crash",
+    "do-now: token degradation (round completes with no own session) — run completes, tokens_spent = 0, no crash",
     { timeout: 120_000 },
-    async (t) => {
-      if (shouldSkipDacFixtureTest()) {
-        t.skip(ROOT_DAC_SKIP_REASON);
-        return;
-      }
+    async () => {
       let ctx: ScriptedDshRunContext | undefined;
       try {
-        // Create the scripted dsh normally (this creates the DSH_HOME dir
-        // as part of createScriptedDsh) but we override DSH_HOME when
-        // passing env to the DAEMON.
-        const env = await createTempHome();
-        const behaviors: ScriptedAgentConfig = {
+        // The scripted dsh completes the round normally but never writes a
+        // session log (skipSessionLog) — exactly the #124 shape: a round
+        // whose own session never materialized. Under DSH-OWNER the settle
+        // reads only the invocation's OWN store, finds nothing, and must
+        // read UNOBSERVED (0 tokens, no crash, no foreign substitution).
+        // NOTE: no DAC-guard skip is needed — this scenario relies on no
+        // permissions fixture at all, so it runs under every euid (root
+        // included).
+        ctx = await startDshScriptedEnvironment("do-now", {
+          skipSessionLog: true,
           agents: {
             doer: { output: "STATUS: done\nREPORT: completed with degraded token lookup" },
           },
-        };
-        const scripted = createScriptedDsh(env.root, behaviors);
-
-        // Create a separate DSH_HOME with no sessions tree that CANNOT grow
-        // one, so the session-file lookup fails and the worker cannot write
-        // its fake session log either (the runtime degrades gracefully).
-        //
-        // The home path is a REGULAR FILE, not a chmod-0555 directory: the
-        // integration gate runs as root, and root bypasses DAC mode bits, so
-        // an 0555 dir is still writable and the degraded precondition never
-        // holds. `$DSH_HOME/sessions/...` under a file fails with ENOTDIR for
-        // every euid, enforcing the intended degraded lookup with the
-        // assertion (`tokens_spent === 0`) unchanged.
-        const brokenDshHome = path.join(env.root, "broken-dsh-home");
-        fs.writeFileSync(brokenDshHome, "");
-
-        // Build daemon env with the broken DSH_HOME
-        const daemonEnv = {
-          ...scripted.env,
-          DSH_HOME: brokenDshHome,
-        };
-
-        cliMustSucceed(
-          ["workflow", "install", "do-now"],
-          baseEnv(env.homeDir, env.controlPort),
-          "install do-now",
-        );
-        await releasePortReservations(env);
-        const daemon = await startIsolatedDaemon(
-          env.homeDir,
-          env.controlPort,
-          daemonEnv,
-        );
-        ctx = { env, scripted, daemon };
+        });
+        const env = ctx.env;
+        const scripted = ctx.scripted;
+        const daemon = ctx.daemon;
 
         const workdir = path.join(env.root, "do-now-workdir");
         fs.mkdirSync(workdir, { recursive: true });
@@ -888,7 +872,7 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
         assert.equal(
           tokens,
           0,
-          `tokens_spent should stay 0 when DSH_HOME has no sessions tree (degraded), got ${tokens}\n${diagnostics(ctx)}`,
+          `tokens_spent should stay 0 when the round's own session never materialized (degraded owned-store lookup), got ${tokens}\n${diagnostics(ctx)}`,
         );
 
         // ── Run still completes normally ──────────────────────────
@@ -901,7 +885,7 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
         assert.equal(steps[0].status, "done", "step should complete normally");
 
         console.log(
-          `[scripted-dsh-e2e degradation] do-now with unusable DSH_HOME: ` +
+          `[scripted-dsh-e2e degradation] do-now with no own session materialized: ` +
             `run completed, tokens_spent=${tokens} (degraded gracefully)`,
         );
       } finally {
@@ -990,8 +974,8 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
             `got ${workRounds.length}\n${diagnostics(ctx)}`,
         );
 
-        // ── Session file present with the expected usage ─────────
-        const sessionLogs = collectSessionLogs(ctx.scripted.env.DSH_HOME);
+        // ── Session file present in the owned store with the expected usage ──
+        const sessionLogs = collectSessionLogs(ctx.env.tamanduaDir);
         assert.equal(
           sessionLogs.length,
           1,

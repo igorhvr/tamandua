@@ -7,10 +7,12 @@
  *   1. stdout is EXACTLY the final assistant text plus a newline — plain
  *      text, no JSON, no session trailer
  *   2. stderr is EMPTY on success; exit code 0
- *   3. a valid session.v3.jsonl.zstd is written under
- *      $DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/ with a v3
+ *   3. a valid session.v3.jsonl.zstd is written under the resolved session
+ *      root — the `--patch` overlay's `root:` when the dispatcher passed
+ *      one (DSH-OWNER), otherwise $DSH_HOME/sessions/<escaped-cwd>/ — as
+ *      session-<uuid>/ with a v3
  *      assistant/message data.usage object (input + output tokens,
- *      cacheReadTokens excluded) so the scheduler's session-file token
+ *      cacheReadTokens excluded) so the scheduler's owned-store token
  *      lookup (dsh-usage.ts) can attribute tokens
  *   4. All chaos modes (work, hang, die-before-claim, die-after-claim,
  *      no-status, garbage)
@@ -31,6 +33,9 @@ import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 import {
   lookupDshSessionTokens,
   dshSessionProjectDir,
+  dshOwnedSessionProjectDir,
+  buildDshSessionRootOverlay,
+  DSH_OWNED_OVERLAY_FILENAME,
 } from "../../dist/installer/dsh-usage.js";
 
 const runtimePath = path.resolve(
@@ -159,7 +164,7 @@ function createMockCli(dir: string, opts?: { noWork?: boolean }): string {
 function spawnDsh(
   dirs: TestDirs,
   env: Record<string, string>,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; overlayPath?: string },
 ): SpawnSyncReturns<string> {
   const prompt = [
     'workflow "test-wf", agent "test-wf_doer", run "' + PREF_RUN_ID + '"',
@@ -167,9 +172,15 @@ function spawnDsh(
     '"' + dirs.mockCliPath + '" step claim "test-wf_doer" --run-id "' + PREF_RUN_ID + '"',
   ].join("\n");
 
+  const args = [runtimePath, "--profile", "headless"];
+  if (opts?.overlayPath !== undefined) {
+    args.push("--patch", opts.overlayPath);
+  }
+  args.push(prompt);
+
   return spawnSync(
     process.execPath,
-    [runtimePath, "--profile", "headless", prompt],
+    args,
     {
       encoding: "utf-8",
       cwd: dirs.workdir,
@@ -348,7 +359,11 @@ describe("scripted-dsh-runtime", () => {
         const header = JSON.parse(lines[0]);
         assert.equal(header.type, "session");
         assert.equal(header.version, 3, "session header must declare format v3");
-        assert.equal(header.id, sessionDirs[0].replace(/^session-/, ""));
+        // dsh names BOTH the session directory and the header id
+        // `session-<uuid>` (the owned-store reader binds them); the header
+        // must also carry isSeeded:false so its root classification holds.
+        assert.equal(header.id, sessionDirs[0]);
+        assert.equal(header.isSeeded, false, "the root header must declare isSeeded:false");
 
         // One v3 assistant/message record with TOP-LEVEL data.usage
         // (input + output, plus a non-zero cacheReadTokens that must be
@@ -381,7 +396,7 @@ describe("scripted-dsh-runtime", () => {
       }
     });
 
-    it("is readable by the real lookupDshSessionTokens end to end", async () => {
+    it("is readable by the real lookupDshSessionTokens end to end (owned store via --patch)", async () => {
       const dirs = makeTempDirs();
       try {
         createMockCli(dirs.tmp);
@@ -389,16 +404,35 @@ describe("scripted-dsh-runtime", () => {
           agents: { doer: { output: "STATUS: done", tokens: 237 } },
         });
 
-        spawnDsh(dirs, {
-          DSH_HOME: dirs.dshHome,
-          TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
-          TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
-        });
+        // DSH-OWNER: the dispatcher hands dsh a per-invocation --patch
+        // overlay redirecting its session-persistence root. Generate one
+        // with the production builder and spawn the runtime with it, then
+        // look up ONLY that owned root.
+        const ownedRoot = path.join(dirs.tmp, "owned");
+        fs.mkdirSync(ownedRoot, { recursive: true });
+        const overlayPath = path.join(ownedRoot, DSH_OWNED_OVERLAY_FILENAME);
+        fs.writeFileSync(overlayPath, buildDshSessionRootOverlay(ownedRoot));
+
+        spawnDsh(
+          dirs,
+          {
+            DSH_HOME: dirs.dshHome,
+            TAMANDUA_SCRIPTED_BEHAVIORS: dirs.behaviorsPath,
+            TAMANDUA_SCRIPTED_STATE: dirs.stateDir,
+          },
+          { overlayPath },
+        );
+
+        // The session landed in the OVERLAY root, not the shared store.
+        const ownedProjectDir = dshOwnedSessionProjectDir(ownedRoot, dirs.workdir);
+        assert.ok(
+          fs.existsSync(ownedProjectDir),
+          `the session must land under the overlay root (${ownedProjectDir})`,
+        );
 
         const usage = await lookupDshSessionTokens({
-          spawnedAtMs: 0,
+          ownedRoot,
           workdir: dirs.workdir,
-          env: { DSH_HOME: dirs.dshHome },
         });
 
         assert.ok(usage !== null, "lookup should find the fake session");
@@ -408,6 +442,11 @@ describe("scripted-dsh-runtime", () => {
           `total should be 237 (cache reads excluded), got ${usage?.totalTokens}`,
         );
         assert.match(usage.sessionRef, /^session-[0-9a-f-]{36}$/);
+        assert.equal(
+          usage.sessionDir,
+          path.join(ownedProjectDir, usage.sessionRef),
+          "the settled session identity must be the owned-store path",
+        );
       } finally {
         cleanup(dirs.tmp);
       }

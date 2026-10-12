@@ -99,13 +99,13 @@ describe("TIME-CLOCKS docs contract (US-015)", () => {
     );
     assert.match(
       agents,
-      /pidfile \/ start\s+lock provenance and dsh session "created since spawn"/,
-      "AGENTS.md must name the pidfile/start-lock and dsh session mtime sites"
+      /Daemon pidfile \/ start\s+lock provenance has no monotonic\s+analogue/,
+      "AGENTS.md must keep the pidfile/start-lock OS-epoch provenance note"
     );
     assert.match(
       agents,
-      /age\/since-spawn decision still\s+routes through the same `instantAgeMs\(\)` \/ `isOlderThan\(\)` helpers/,
-      "AGENTS.md must route mtime decisions through the same instant helpers"
+      /dsh attribution is ownership-based[\s\S]{0,80}not session timestamps or\s+"created\s+since spawn"/,
+      "AGENTS.md must state dispatched-native-dsh attribution is ownership-based, not timestamp-elected"
     );
   });
 

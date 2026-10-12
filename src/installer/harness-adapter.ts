@@ -127,6 +127,16 @@ export interface RunHarnessOptions {
    */
   binaryPath?: string;
   /**
+   * DSH-OWNER: absolute path of the per-invocation dsh session-persistence
+   * `--patch` overlay. When set on a dsh round, the adapter passes it to
+   * the dsh launcher (`--patch <path>`, before the prompt) so dsh writes
+   * this invocation's session log into the invocation-owned store the
+   * dispatcher prepared. Omitted for every non-dsh round and for any dsh
+   * caller that deliberately uses the default store (the adapter then
+   * behaves exactly as before).
+   */
+  dshSessionPersistenceOverlay?: string;
+  /**
    * KHYG US-002: run/execution identity for the per-launch isolation-mode
    * records (run.harness_isolation events + logs). Set by the scheduler
    * for work rounds and the launch-time probe round; optional — records
@@ -1084,11 +1094,18 @@ class DshHarnessAdapter implements HarnessAdapter {
     // durationMs are all derived from it, never from Date.now() differences.
     const roundWatch = new Stopwatch();
 
-    // dsh headless invocation: `dsh --profile headless <prompt>`.
+    // dsh headless invocation: `dsh --profile headless [--patch <overlay>] <prompt>`.
     // The headless app accepts ONLY the task positional (plus --help) —
     // no --json/--model/--resume/--cwd/--timeout/--yolo. All behavior
-    // comes from env vars and profile patch layers.
+    // comes from env vars and profile patch layers. `--patch` is a
+    // LAUNCHER flag consumed before the app's args: on tamandua-dispatched
+    // native rounds it carries the per-invocation session-persistence
+    // overlay (DSH-OWNER) so dsh writes its session log into the
+    // invocation-owned store.
     const args = ["--profile", "headless"];
+    if (options?.dshSessionPersistenceOverlay) {
+      args.push("--patch", options.dshSessionPersistenceOverlay);
+    }
 
     // Prompt-starting-with-`-` guard. Observed dsh behavior: a task token
     // whose first character is `-` is rejected by the headless app's

@@ -978,12 +978,19 @@ dsh-related operation is resolving and running an existing binary.
 
 #### Token Accounting
 
-dsh never prints token usage. Tamandua records each round's spawn time and,
-after the round, reads the session log under
-`$DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd`
-(`$DSH_HOME` defaults to `~/.dsh`) and sums the recorded usage once per
+dsh never prints token usage. Each tamandua-dispatched native dsh invocation
+gets its **own** session store: the dispatcher creates a fresh directory
+under `<state dir>/dsh-sessions/` and passes dsh a `--patch` overlay
+redirecting the `session-persistence-jsonl` root there, so the log lands
+under the owned root (`<owned root>/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd`)
+rather than the shared `$DSH_HOME/sessions` store. After the round Tamandua
+reads only that owned store and sums the recorded usage once per
 request from the top-level `data.usage` of the v3 records (input + output
-tokens, cache reads excluded). This requires **dsh >= 0.1.5** (session format
+tokens, cache reads excluded). Exactly one root session must be present — a
+missing, unreadable or ambiguous owned store reads unobserved (0 tokens with
+a warning) and never borrows another invocation's session, and a
+per-session high-water ledger makes repeated settlement of one physical
+session add only the unaccounted increment. This requires **dsh >= 0.1.5** (session format
 v3); older layouts (`session.jsonl.zstd` from dsh 0.1.0 and
 `session.v2.jsonl.zstd` from dsh 0.1.3) are unsupported — Tamandua logs one
 warning naming the found file and records 0 tokens, and the remedy is to

@@ -18,10 +18,12 @@
  * │    / `isOlderThan()` — never as string comparisons. Each call site     │
  * │    documents the explicit tolerance it passes.                         │
  * │                                                                        │
- * │ 3. File-mtime provenance (daemon pidfile / start lock, dsh session     │
- * │    "created since spawn") keeps OS-epoch semantics, but the age /      │
- * │    since-threshold decisions still route through `instantAgeMs()` /    │
- * │    `isOlderThan()` with the same documented-tolerance discipline.      │
+ * │ 3. File-mtime provenance (daemon pidfile / start lock) keeps          │
+ * │    OS-epoch semantics, but the age decision still routes through       │
+ * │    `instantAgeMs()` / `isOlderThan()` with the same                    │
+ * │    documented-tolerance discipline. dsh session attribution is NOT     │
+ * │    time-based (DSH-OWNER): each invocation reads only its own          │
+ * │    `--patch`-redirected owned store, whose absence reads UNOBSERVED.   │
  * └────────────────────────────────────────────────────────────────────────┘
  *
  * Instant storage format: ISO-8601 UTC with milliseconds and a `Z` suffix,

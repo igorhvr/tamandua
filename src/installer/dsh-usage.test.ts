@@ -1,8 +1,10 @@
 /**
- * Unit tests for dsh-usage.ts — lookupDshSessionTokens.
+ * Unit tests for dsh-usage.ts — the OWNED-store reader (DSH-OWNER).
  *
  * Most fixtures are synthetic session logs (no real dsh, no model calls,
- * zero tokens). zstd fixture compression is feature-gated on node:zlib
+ * zero tokens) staged under an invocation-owned root, the same layout the
+ * dispatcher hands to dsh through the `--patch` persistence overlay.
+ * zstd fixture compression is feature-gated on node:zlib
  * `zstdCompressSync` (Node >= 23.8); the binary-strategy tests exercise
  * the same parsing through a fake `zstd` shell script so the reader's
  * core logic is covered on every supported Node.
@@ -11,6 +13,14 @@
  * coordinator-verified dsh 0.1.5 container (copied byte-for-byte into
  * tests/fixtures/dsh-v3/) and — on this host — exercises the genuine
  * `zstd -dc` binary.
+ *
+ * OWNERSHIP regressions pinned here (from the adversarial review):
+ *   - a delayed-start own session (createdAt far outside any old window)
+ *     is still selected from its own store — never a foreign session;
+ *   - missing own evidence + a foreign session present elsewhere →
+ *     UNOBSERVED, never the foreign session;
+ *   - two roots, equal instants, unreadable artifacts, legacy layouts and
+ *     symlinked entries all refuse (never "whichever entry parses").
  *
  * This file spawns `zstd` (fake shell shim and, for the real-fixture
  * binary-tier test, the real binary), so it is classified in the serial
@@ -27,11 +37,17 @@ import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
   lookupDshSessionTokens,
   projectKey,
+  encodeDshSessionSegment,
   resolveDshHome,
   dshSessionProjectDir,
+  dshOwnedSessionProjectDir,
+  prepareDshOwnedStore,
+  buildDshSessionRootOverlay,
+  readDshOwnedReceipt,
+  DSH_OWNED_OVERLAY_FILENAME,
+  DSH_OWNED_RECEIPT_FILENAME,
   sumUsageChunks,
   decompressDshSessionLog,
-  DSH_SESSION_MTIME_TOLERANCE_MS,
 } from "../../dist/installer/dsh-usage.js";
 
 // ── Real dsh 0.1.5 (v3) ground-truth fixture ───────────────────────
@@ -76,18 +92,18 @@ function detectZstdBinary(): boolean {
 const haveZstdBinary = detectZstdBinary();
 
 /**
- * Stage the real fixture as a v3 session directory under a temp
- * `$DSH_HOME` (`sessions/<escaped-workdir>/session-<uuid>`), preserving
- * the file bytes. `mutate` may rewrite the log bytes (e.g. truncation).
+ * Stage the real fixture as a v3 session directory under an owned root
+ * (`<ownedRoot>/<escaped-workdir>/session-<uuid>`), preserving the file
+ * bytes. `mutate` may rewrite the log bytes (e.g. truncation).
  */
 function stageFixtureSession(opts: {
-  dshHome: string;
+  ownedRoot: string;
   workdir: string;
   sessionName?: string;
   mutate?: (bytes: Buffer) => Buffer;
 }): { sessionDir: string; logPath: string } {
   const sessionName = opts.sessionName ?? FIXTURE_SESSION_NAME;
-  const sessionsDir = dshSessionProjectDir(opts.dshHome, opts.workdir);
+  const sessionsDir = dshOwnedSessionProjectDir(opts.ownedRoot, opts.workdir);
   const sessionDir = path.join(sessionsDir, sessionName);
   fs.mkdirSync(sessionDir, { recursive: true });
   const bytes = fs.readFileSync(FIXTURE_ZSTD);
@@ -107,6 +123,7 @@ const haveNodeZstd = zstdCompress !== null;
 
 // ── Fixture helpers ────────────────────────────────────────────────
 
+/** A valid ROOT v3 session header (the shape the reader classifies as root). */
 function headerLine(id: string, createdAt: number): string {
   return (
     JSON.stringify({
@@ -114,6 +131,7 @@ function headerLine(id: string, createdAt: number): string {
       version: 3,
       id,
       createdAt,
+      isSeeded: false,
       delegationDepth: 0,
     }) + "\n"
   );
@@ -151,16 +169,16 @@ function usageLine(opts: {
   );
 }
 
-/** Create a session dir under `$DSH_HOME/sessions/<escaped-workdir>` and write its log. */
-function writeSessionDir(opts: {
-  dshHome: string;
+/** Create a session dir under `<ownedRoot>/<escaped-workdir>` and write its log. */
+function writeOwnedSession(opts: {
+  ownedRoot: string;
   workdir: string;
   sessionName: string;
   content: Buffer | string;
   /** Session-log filename; defaults to the supported v3 compressed form. */
   fileName?: string;
 }): string {
-  const sessionsDir = dshSessionProjectDir(opts.dshHome, opts.workdir);
+  const sessionsDir = dshOwnedSessionProjectDir(opts.ownedRoot, opts.workdir);
   const sessionDir = path.join(sessionsDir, opts.sessionName);
   fs.mkdirSync(sessionDir, { recursive: true });
   const logPath = path.join(sessionDir, opts.fileName ?? "session.v3.jsonl.zstd");
@@ -178,14 +196,10 @@ function makeFakeZstdBin(tmp: string): string {
   return binDir;
 }
 
-function envWith(dshHome: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  return { DSH_HOME: dshHome, ...extra };
-}
-
-function envWithFakeZstd(dshHome: string, binDir: string): NodeJS.ProcessEnv {
-  return envWith(dshHome, {
-    PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
-  });
+function envWith(binDir?: string): NodeJS.ProcessEnv {
+  return binDir === undefined
+    ? {}
+    : { PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` };
 }
 
 // ── Warning capture (module warns through lib/logger) ─────────────
@@ -193,11 +207,13 @@ function envWithFakeZstd(dshHome: string, binDir: string): NodeJS.ProcessEnv {
 let tmpRoot: string | null = null;
 let stateDir: string | null = null;
 let savedStateDir: string | undefined;
+let savedDshHome: string | undefined;
 
 beforeEach(() => {
   tmpRoot = tamanduaTempDir("tamandua-test-dsh-usage-");
   stateDir = path.join(tmpRoot, "state");
   savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  savedDshHome = process.env.DSH_HOME;
   process.env.TAMANDUA_STATE_DIR = stateDir;
 });
 
@@ -212,6 +228,11 @@ afterEach(() => {
   } else {
     process.env.TAMANDUA_STATE_DIR = savedStateDir;
   }
+  if (savedDshHome === undefined) {
+    delete process.env.DSH_HOME;
+  } else {
+    process.env.DSH_HOME = savedDshHome;
+  }
 });
 
 function readTamanduaLog(): string {
@@ -220,6 +241,13 @@ function readTamanduaLog(): string {
   } catch {
     return "";
   }
+}
+
+/** A fresh owned root for one synthetic invocation. */
+function mkOwnedRoot(tag: string): string {
+  const root = path.join(tmpRoot!, `owned-${tag}`);
+  fs.mkdirSync(root, { recursive: true });
+  return root;
 }
 
 // ── projectKey: dsh cwd-escaping replication ───────────────────────
@@ -260,6 +288,31 @@ describe("projectKey (dsh cwd-escaping replication)", () => {
 
   it("throws on empty input (dsh parity)", () => {
     assert.throws(() => projectKey(""), /empty project path/);
+  });
+});
+
+// ── encodeDshSessionSegment: dsh session-dir escaping replication ──
+
+describe("encodeDshSessionSegment (dsh sessionDir parity)", () => {
+  it("keeps safe [A-Za-z0-9._-] units literal", () => {
+    assert.equal(
+      encodeDshSessionSegment("session-4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"),
+      "session-4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+    );
+  });
+
+  it("fully escapes . and ..", () => {
+    assert.equal(encodeDshSessionSegment("."), "~002E");
+    assert.equal(encodeDshSessionSegment(".."), "~002E~002E");
+  });
+
+  it("escapes unsafe code units as ~XXXX", () => {
+    assert.equal(encodeDshSessionSegment("a/b"), "a~002Fb");
+    assert.equal(encodeDshSessionSegment("a b"), "a~0020b");
+  });
+
+  it("throws on empty input (dsh parity)", () => {
+    assert.throws(() => encodeDshSessionSegment(""), /empty path segment/);
   });
 });
 
@@ -383,61 +436,165 @@ describe("sumUsageChunks", () => {
   });
 });
 
-// ── lookupDshSessionTokens ─────────────────────────────────────────
+// ── prepareDshOwnedStore: the invocation-ownership primitive ───────
 
-describe("lookupDshSessionTokens", () => {
+describe("prepareDshOwnedStore", () => {
+  it("creates a fresh root with the overlay and receipt, and distinct roots per invocation", () => {
+    const state = path.join(tmpRoot!, "state");
+    const a = prepareDshOwnedStore({
+      stateDir: state,
+      runId: "run-11111111-1111-4111-8111-111111111111",
+      jobId: "job-developer",
+      phase: "work",
+    });
+    const b = prepareDshOwnedStore({
+      stateDir: state,
+      runId: "run-11111111-1111-4111-8111-111111111111",
+      jobId: "job-developer",
+      phase: "work",
+    });
+    const probe = prepareDshOwnedStore({
+      stateDir: state,
+      runId: "run-11111111-1111-4111-8111-111111111111",
+      jobId: "job-developer",
+      phase: "probe",
+    });
+    assert.ok(a && b && probe, "preparation must succeed");
+
+    // Same deterministic job id, three invocations → three DISTINCT roots.
+    assert.notEqual(a!.ownedRoot, b!.ownedRoot);
+    assert.notEqual(a!.ownedRoot, probe!.ownedRoot);
+    assert.notEqual(b!.ownedRoot, probe!.ownedRoot);
+    assert.ok(a!.ownedRoot.startsWith(path.join(state, "dsh-sessions")));
+
+    // Overlay content: id-targeted session-persistence-jsonl root redirect.
+    const overlay = fs.readFileSync(a!.overlayPath, "utf8");
+    assert.match(overlay, /- id: session-persistence-jsonl/);
+    assert.ok(
+      overlay.includes(`root: ${JSON.stringify(a!.ownedRoot)}`),
+      "overlay must name the owned root",
+    );
+    assert.match(overlay, /compression: zstd/);
+
+    // Receipt: binds the root to this exact invocation.
+    const receipt = readDshOwnedReceipt(a!.ownedRoot);
+    assert.ok(receipt, "receipt must be readable");
+    assert.equal(receipt!.runId, "run-11111111-1111-4111-8111-111111111111");
+    assert.equal(receipt!.jobId, "job-developer");
+    assert.equal(receipt!.phase, "work");
+    assert.equal(receipt!.ownedRoot, a!.ownedRoot);
+    assert.ok(fs.existsSync(path.join(a!.ownedRoot, DSH_OWNED_OVERLAY_FILENAME)));
+    assert.ok(fs.existsSync(path.join(a!.ownedRoot, DSH_OWNED_RECEIPT_FILENAME)));
+  });
+
+  it("refuses (null) for missing identity, never fabricating a root", () => {
+    const state = path.join(tmpRoot!, "state");
+    assert.equal(
+      prepareDshOwnedStore({ stateDir: "", runId: "r", jobId: "j", phase: "work" }),
+      null,
+    );
+    assert.equal(
+      prepareDshOwnedStore({ stateDir: state, runId: "", jobId: "j", phase: "work" }),
+      null,
+    );
+    assert.equal(
+      prepareDshOwnedStore({ stateDir: state, runId: "r", jobId: "", phase: "work" }),
+      null,
+    );
+    assert.match(readTamanduaLog(), /dsh owned session store preparation failed/);
+  });
+
+  it("builds the overlay deterministically for a plain path", () => {
+    const text = buildDshSessionRootOverlay("/var/lib/tamandua/owned");
+    assert.match(text, /- id: session-persistence-jsonl/);
+    assert.match(text, /root: "\/var\/lib\/tamandua\/owned"/);
+    assert.match(text, /compression: zstd/);
+  });
+});
+
+// ── lookupDshSessionTokens: owned-store reader ─────────────────────
+
+describe("lookupDshSessionTokens (owned store)", () => {
   it("sums input+output across multiple v3 usage records via the binary zstd tier", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const ownedRoot = mkOwnedRoot("basic");
     const workdir = path.join(tmpRoot!, "worktree", "repo");
     const sessionName = "session-11111111-2222-4333-8444-555555555555";
     const text =
       headerLine(sessionName, 1_700_000_000_000) +
       usageLine({ input: 100, output: 50, cacheRead: 9_000, seq: 1 }) +
       usageLine({ input: 25, output: 75, cacheRead: 1_000, seq: 2 });
-    writeSessionDir({ dshHome, workdir, sessionName, content: text });
+    writeOwnedSession({ ownedRoot, workdir, sessionName, content: text });
 
     const binDir = makeFakeZstdBin(tmpRoot!);
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
+      ownedRoot,
       workdir,
-      env: envWithFakeZstd(dshHome, binDir),
+      env: envWith(binDir),
       zstdStrategy: "binary",
     });
 
     assert.ok(result !== null);
     assert.equal(result.totalTokens, 250); // cache reads (10_000) excluded
     assert.equal(result.sessionRef, sessionName);
+    assert.equal(result.sessionDir, path.join(dshOwnedSessionProjectDir(ownedRoot, workdir), sessionName));
   });
 
-  it("returns null when the sessions dir is missing (with a warning)", async () => {
-    const dshHome = path.join(tmpRoot!, "empty-home");
-    fs.mkdirSync(dshHome, { recursive: true });
+  it("returns null (UNOBSERVED) when the owned store is missing (with a warning)", async () => {
     const workdir = path.join(tmpRoot!, "worktree", "repo");
-
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
+      ownedRoot: path.join(tmpRoot!, "never-created"),
       workdir,
-      env: envWith(dshHome),
+      env: envWith(),
     });
-
     assert.equal(result, null);
-    assert.match(readTamanduaLog(), /dsh session token lookup failed: no sessions dir/);
+    assert.match(readTamanduaLog(), /owned session store missing/);
+  });
+
+  it("returns null (UNOBSERVED) when the owned store holds no project dir for the workdir", async () => {
+    const ownedRoot = mkOwnedRoot("empty");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+    });
+    assert.equal(result, null);
+    assert.match(readTamanduaLog(), /no session directory in the owned store/);
+  });
+
+  it("returns null and warns for a missing ownedRoot argument", async () => {
+    const result = await lookupDshSessionTokens({
+      ownedRoot: "",
+      workdir: path.join(tmpRoot!, "worktree"),
+    });
+    assert.equal(result, null);
+    assert.match(readTamanduaLog(), /no owned session store for this invocation/);
+  });
+
+  it("returns null and warns for an empty workdir", async () => {
+    const result = await lookupDshSessionTokens({
+      ownedRoot: mkOwnedRoot("empty-workdir"),
+      workdir: "",
+    });
+    assert.equal(result, null);
+    assert.match(readTamanduaLog(), /missing worker working directory/);
   });
 
   it("returns null and warns when no zstd support is available", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const ownedRoot = mkOwnedRoot("no-zstd");
     const workdir = path.join(tmpRoot!, "worktree", "repo");
-    writeSessionDir({
-      dshHome,
+    writeOwnedSession({
+      ownedRoot,
       workdir,
       sessionName: "session-aaa",
-      content: headerLine("s", 1) + usageLine({ input: 1, output: 2, seq: 1 }),
+      content:
+        headerLine("session-aaa", 1) + usageLine({ input: 1, output: 2, seq: 1 }),
     });
 
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
+      ownedRoot,
       workdir,
-      env: envWith(dshHome),
+      env: envWith(),
       zstdStrategy: "none",
     });
 
@@ -446,377 +603,77 @@ describe("lookupDshSessionTokens", () => {
   });
 
   it("returns null and warns on a corrupt session log", { skip: !haveNodeZstd }, async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const ownedRoot = mkOwnedRoot("corrupt");
     const workdir = path.join(tmpRoot!, "worktree", "repo");
-    writeSessionDir({
-      dshHome,
+    writeOwnedSession({
+      ownedRoot,
       workdir,
       sessionName: "session-bbb",
       content: Buffer.from("this is not a zstd stream"),
     });
 
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
+      ownedRoot,
       workdir,
-      env: envWith(dshHome),
+      env: envWith(),
       zstdStrategy: "node",
     });
 
-    assert.equal(result, null);
-    assert.match(readTamanduaLog(), /failed to decompress session log/);
-  });
-
-  it("returns null and warns when the zstd binary is unavailable (auto on no-node-zstd)", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: "session-ccc",
-      content: headerLine("s", 1) + usageLine({ input: 1, output: 2, seq: 1 }),
-    });
-
-    // PATH without any zstd binary and strategy pinned to the binary tier.
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
-      workdir,
-      env: envWith(dshHome, { PATH: path.join(tmpRoot!, "empty-bin") }),
-      zstdStrategy: "binary",
-    });
-
-    assert.equal(result, null);
-    assert.match(readTamanduaLog(), /zstd binary unavailable or failed/);
-  });
-
-  it("picks the newest session since spawn time", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    const spawnMs = 1_700_000_000_000;
-
-    const older = "session-older";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: older,
-      content: headerLine(older, 1) + usageLine({ input: 111, output: 1, seq: 1 }),
-    });
-    const newer = "session-newer";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: newer,
-      content: headerLine(newer, 1) + usageLine({ input: 222, output: 2, seq: 1 }),
-    });
-
-    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
-    fs.utimesSync(path.join(sessionsDir, older), new Date(spawnMs + 1_000), new Date(spawnMs + 1_000));
-    fs.utimesSync(path.join(sessionsDir, newer), new Date(spawnMs + 5_000), new Date(spawnMs + 5_000));
-
-    const binDir = makeFakeZstdBin(tmpRoot!);
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: spawnMs,
-      workdir,
-      env: envWithFakeZstd(dshHome, binDir),
-      zstdStrategy: "binary",
-    });
-
-    assert.ok(result !== null);
-    assert.equal(result.totalTokens, 224); // the newer session wins
-    assert.equal(result.sessionRef, newer);
-  });
-
-  it("excludes sessions created before spawn time", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    const spawnMs = 1_700_000_000_000;
-
-    const old = "session-old";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: old,
-      content: headerLine(old, 1) + usageLine({ input: 999, output: 9, seq: 1 }),
-    });
-    const fresh = "session-fresh";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: fresh,
-      content: headerLine(fresh, 1) + usageLine({ input: 42, output: 4, seq: 1 }),
-    });
-
-    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
-    fs.utimesSync(path.join(sessionsDir, old), new Date(spawnMs - 5_000), new Date(spawnMs - 5_000));
-    fs.utimesSync(path.join(sessionsDir, fresh), new Date(spawnMs + 1_000), new Date(spawnMs + 1_000));
-
-    const binDir = makeFakeZstdBin(tmpRoot!);
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: spawnMs,
-      workdir,
-      env: envWithFakeZstd(dshHome, binDir),
-      zstdStrategy: "binary",
-    });
-
-    assert.ok(result !== null);
-    assert.equal(result.totalTokens, 46);
-    assert.equal(result.sessionRef, fresh);
-  });
-
-  // ── Rule-3 mtime tolerance for "created since spawn" (US-010) ───
-  //
-  // The session-dir mtime is an OS-epoch file instant; the filter ages it
-  // against spawnedAtMs through instantAgeMs with the documented
-  // DSH_SESSION_MTIME_TOLERANCE_MS slack. These pin the boundary with real
-  // os.utimes values (no clock injection needed) and the never-0 contract.
-
-  it("includes a session whose mtime is just older than spawn within the mtime tolerance", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    const spawnMs = 1_700_000_000_000;
-    const sessionName = "session-within-tolerance";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName,
-      content: headerLine(sessionName, 1) + usageLine({ input: 40, output: 2, seq: 1 }),
-    });
-
-    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
-    const justBeforeSpawn = new Date(
-      spawnMs - (DSH_SESSION_MTIME_TOLERANCE_MS - 500),
-    );
-    fs.utimesSync(
-      path.join(sessionsDir, sessionName),
-      justBeforeSpawn,
-      justBeforeSpawn,
-    );
-
-    const binDir = makeFakeZstdBin(tmpRoot!);
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: spawnMs,
-      workdir,
-      env: envWithFakeZstd(dshHome, binDir),
-      zstdStrategy: "binary",
-    });
-
-    assert.ok(result !== null, "a just-before-spawn mtime is within tolerance");
-    assert.equal(result.totalTokens, 42);
-    assert.equal(result.sessionRef, sessionName);
-    assert.doesNotMatch(readTamanduaLog(), /no session created since spawn/);
-  });
-
-  it("excludes a session whose mtime is older than spawn beyond the mtime tolerance", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    const spawnMs = 1_700_000_000_000;
-    const sessionName = "session-too-old";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName,
-      content: headerLine(sessionName, 1) + usageLine({ input: 999, output: 9, seq: 1 }),
-    });
-
-    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
-    const tooOld = new Date(spawnMs - (DSH_SESSION_MTIME_TOLERANCE_MS + 5_000));
-    fs.utimesSync(path.join(sessionsDir, sessionName), tooOld, tooOld);
-
-    const binDir = makeFakeZstdBin(tmpRoot!);
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: spawnMs,
-      workdir,
-      env: envWithFakeZstd(dshHome, binDir),
-      zstdStrategy: "binary",
-    });
-
-    assert.equal(result, null, "beyond tolerance must never fabricate a total");
-    assert.match(readTamanduaLog(), /no session created since spawn/);
-  });
-
-  it("picks the newest eligible session when one is within tolerance and one is after spawn", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    const spawnMs = 1_700_000_000_000;
-
-    const tolerated = "session-tolerated";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: tolerated,
-      content: headerLine(tolerated, 1) + usageLine({ input: 111, output: 1, seq: 1 }),
-    });
-    const newer = "session-newer-after-spawn";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: newer,
-      content: headerLine(newer, 1) + usageLine({ input: 222, output: 2, seq: 1 }),
-    });
-
-    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
-    const toleratedMtime = new Date(
-      spawnMs - (DSH_SESSION_MTIME_TOLERANCE_MS - 500),
-    );
-    fs.utimesSync(
-      path.join(sessionsDir, tolerated),
-      toleratedMtime,
-      toleratedMtime,
-    );
-    const newerMtime = new Date(spawnMs + 1_000);
-    fs.utimesSync(path.join(sessionsDir, newer), newerMtime, newerMtime);
-
-    const binDir = makeFakeZstdBin(tmpRoot!);
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: spawnMs,
-      workdir,
-      env: envWithFakeZstd(dshHome, binDir),
-      zstdStrategy: "binary",
-    });
-
-    assert.ok(result !== null);
-    assert.equal(result.totalTokens, 224, "the post-spawn session is newest");
-    assert.equal(result.sessionRef, newer);
-  });
-
-  it("applies the same mtime tolerance to the unsupported-layout probe", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    const spawnMs = 1_700_000_000_000;
-    const sessionName = "session-legacy-within-tolerance";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName,
-      fileName: "session.v2.jsonl.zstd",
-      content: headerLine(sessionName, 1) + usageLine({ input: 5, output: 5, seq: 1 }),
-    });
-
-    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
-    const justBeforeSpawn = new Date(
-      spawnMs - (DSH_SESSION_MTIME_TOLERANCE_MS - 500),
-    );
-    fs.utimesSync(
-      path.join(sessionsDir, sessionName),
-      justBeforeSpawn,
-      justBeforeSpawn,
-    );
-
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: spawnMs,
-      workdir,
-      env: envWith(dshHome),
-    });
-
+    // Corruption may be caught at header classification (unreadable
+    // artifact) or at the usage decode; either way the lookup must refuse
+    // with an UNOBSERVED warning and never a fabricated total.
     assert.equal(result, null);
     assert.match(
       readTamanduaLog(),
-      /unsupported session layout .*session\.v2\.jsonl\.zstd/,
-      "a tolerated legacy session must reach the upgrade-dsh warning, not the empty-spawn warning",
+      /unreadable session artifact in the owned store|failed to decompress session log/,
     );
   });
 
-  // ── v3-only layout probing (dsh >= 0.1.5) ──────────────────────
-
-  it("returns null and warns once for a v1-only session.jsonl.zstd layout", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
+  it("returns null and warns when the zstd binary is unavailable", async () => {
+    const ownedRoot = mkOwnedRoot("no-binary");
     const workdir = path.join(tmpRoot!, "worktree", "repo");
-    writeSessionDir({
-      dshHome,
+    writeOwnedSession({
+      ownedRoot,
       workdir,
-      sessionName: "session-v1",
-      fileName: "session.jsonl.zstd",
-      // Deliberately not a valid zstd stream: the unsupported layout must
-      // be rejected before any read, so its bytes never matter.
-      content: headerLine("s", 1) + usageLine({ input: 999, output: 9, seq: 1 }),
+      sessionName: "session-ccc",
+      content:
+        headerLine("session-ccc", 1) + usageLine({ input: 1, output: 2, seq: 1 }),
     });
 
+    // PATH containing ONLY an empty directory (the real zstd binary is NOT
+    // reachable) and strategy pinned to the binary tier.
+    const emptyBinDir = path.join(tmpRoot!, "empty-bin");
+    fs.mkdirSync(emptyBinDir, { recursive: true });
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
+      ownedRoot,
       workdir,
-      env: envWith(dshHome),
-    });
-
-    assert.equal(result, null, "an unsupported v1 layout must never yield a total");
-    const log = readTamanduaLog();
-    assert.match(log, /found session\.jsonl\.zstd/, "warning must name the found file");
-    assert.match(log, /dsh >= 0\.1\.5/, "warning must state the required dsh version");
-    assert.match(log, /upgrade dsh/, "warning must give the upgrade-dsh remedy");
-    assert.equal(
-      log.split("\n").filter((l) => l.includes("unsupported session layout")).length,
-      1,
-      "the unsupported-layout warning must be emitted exactly once",
-    );
-  });
-
-  it("returns null and warns once for a v2-only session.v2.jsonl.zstd layout", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: "session-v2",
-      fileName: "session.v2.jsonl.zstd",
-      content: "not a zstd stream and never read",
-    });
-
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
-      workdir,
-      env: envWith(dshHome),
+      env: { PATH: emptyBinDir },
+      zstdStrategy: "binary",
     });
 
     assert.equal(result, null);
-    const log = readTamanduaLog();
-    assert.match(log, /found session\.v2\.jsonl\.zstd/);
-    assert.match(log, /upgrade dsh/);
-    assert.match(log, /dsh >= 0\.1\.5/);
-    assert.equal(
-      log.split("\n").filter((l) => l.includes("unsupported session layout")).length,
-      1,
-    );
-  });
-
-  it("returns null and warns for a plain (uncompressed) v1 session.jsonl layout", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: "session-v1-plain",
-      fileName: "session.jsonl",
-      content: "legacy plain log — never read",
-    });
-
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
-      workdir,
-      env: envWith(dshHome),
-    });
-
-    assert.equal(result, null);
-    const log = readTamanduaLog();
-    assert.match(log, /found session\.jsonl(?!\.zstd)/);
-    assert.match(log, /upgrade dsh/);
+    assert.match(readTamanduaLog(), /unreadable session artifact in the owned store/);
   });
 
   it("reads a plain session.v3.jsonl directly without invoking zstd", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const ownedRoot = mkOwnedRoot("plain");
     const workdir = path.join(tmpRoot!, "worktree", "repo");
     const sessionName = "session-plain-v3";
-    writeSessionDir({
-      dshHome,
+    writeOwnedSession({
+      ownedRoot,
       workdir,
       sessionName,
       fileName: "session.v3.jsonl",
-      content: headerLine(sessionName, 1) + usageLine({ input: 7, output: 3, seq: 1 }),
+      content:
+        headerLine(sessionName, 1) + usageLine({ input: 7, output: 3, seq: 1 }),
     });
 
     // The "none" tier would warn and return null if the reader touched
     // zstd; a parsed total proves the plain log skipped zstd entirely.
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
+      ownedRoot,
       workdir,
-      env: envWith(dshHome),
+      env: envWith(),
       zstdStrategy: "none",
     });
 
@@ -827,10 +684,10 @@ describe("lookupDshSessionTokens", () => {
   });
 
   it("prefers the .zstd v3 log over the plain v3 log when both exist", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const ownedRoot = mkOwnedRoot("both");
     const workdir = path.join(tmpRoot!, "worktree", "repo");
     const sessionName = "session-both-v3";
-    const sessionDir = path.join(dshSessionProjectDir(dshHome, workdir), sessionName);
+    const sessionDir = path.join(dshOwnedSessionProjectDir(ownedRoot, workdir), sessionName);
     fs.mkdirSync(sessionDir, { recursive: true });
     // Plain form would total 2; the fake `zstd -dc` (cat) exposes the
     // compressed form's bytes, which total 150 — so the observed value
@@ -846,9 +703,9 @@ describe("lookupDshSessionTokens", () => {
 
     const binDir = makeFakeZstdBin(tmpRoot!);
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
+      ownedRoot,
       workdir,
-      env: envWithFakeZstd(dshHome, binDir),
+      env: envWith(binDir),
       zstdStrategy: "binary",
     });
 
@@ -857,70 +714,21 @@ describe("lookupDshSessionTokens", () => {
     assert.equal(result.sessionRef, sessionName);
   });
 
-  it("prefers a v3 session over a newer older-layout sibling", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
-    const workdir = path.join(tmpRoot!, "worktree", "repo");
-    const spawnMs = 1_700_000_000_000;
-
-    // The older-layout sibling is NEWER on disk but unsupported: it must
-    // be ignored (and not warned about) because a v3 session exists.
-    const legacy = "session-older-layout";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: legacy,
-      fileName: "session.jsonl.zstd",
-      content: "legacy bytes — never read",
-    });
-    const v3 = "session-v3-wins";
-    writeSessionDir({
-      dshHome,
-      workdir,
-      sessionName: v3,
-      fileName: "session.v3.jsonl",
-      content: headerLine(v3, 1) + usageLine({ input: 42, output: 8, seq: 1 }),
-    });
-
-    const sessionsDir = dshSessionProjectDir(dshHome, workdir);
-    fs.utimesSync(
-      path.join(sessionsDir, legacy),
-      new Date(spawnMs + 9_000),
-      new Date(spawnMs + 9_000),
-    );
-    fs.utimesSync(
-      path.join(sessionsDir, v3),
-      new Date(spawnMs + 1_000),
-      new Date(spawnMs + 1_000),
-    );
-
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: spawnMs,
-      workdir,
-      env: envWith(dshHome),
-      zstdStrategy: "none",
-    });
-
-    assert.ok(result !== null);
-    assert.equal(result.sessionRef, v3);
-    assert.equal(result.totalTokens, 50);
-    assert.doesNotMatch(readTamanduaLog(), /unsupported session layout/);
-  });
-
   it("returns null when the log has no usage chunks", async () => {
-    const dshHome = path.join(tmpRoot!, "dsh-home");
+    const ownedRoot = mkOwnedRoot("no-usage");
     const workdir = path.join(tmpRoot!, "worktree", "repo");
-    writeSessionDir({
-      dshHome,
+    writeOwnedSession({
+      ownedRoot,
       workdir,
       sessionName: "session-empty",
-      content: headerLine("s", 1),
+      content: headerLine("session-empty", 1),
     });
 
     const binDir = makeFakeZstdBin(tmpRoot!);
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
+      ownedRoot,
       workdir,
-      env: envWithFakeZstd(dshHome, binDir),
+      env: envWith(binDir),
       zstdStrategy: "binary",
     });
 
@@ -928,24 +736,396 @@ describe("lookupDshSessionTokens", () => {
     assert.match(readTamanduaLog(), /found no usage chunks/);
   });
 
-  it("returns null and warns for an invalid spawn timestamp", async () => {
-    const result = await lookupDshSessionTokens({
-      spawnedAtMs: Number.NaN,
-      workdir: path.join(tmpRoot!, "worktree"),
-      env: envWith(path.join(tmpRoot!, "dsh-home")),
+  // ── Ownership regressions (adversarial review counterexamples) ──
+
+  it("OWNERSHIP (S4): a delayed-start own session is selected despite a foreign session in the shared store", async () => {
+    const ownedRoot = mkOwnedRoot("s4-own");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const dshHome = path.join(tmpRoot!, "default-dsh-home");
+    process.env.DSH_HOME = dshHome;
+
+    // The round's OWN session — its header createdAt is FAR outside every
+    // legacy cutoff the previous design used (31s and beyond).
+    const ownName = "session-own-delayed";
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: ownName,
+      fileName: "session.v3.jsonl",
+      content:
+        headerLine(ownName, 1_700_000_031_000) +
+        usageLine({ input: 100, output: 10, seq: 1 }),
     });
-    assert.equal(result, null);
-    assert.match(readTamanduaLog(), /invalid spawn timestamp/);
+
+    // The formerly attractive FOREIGN session, in the shared default store
+    // (an in-window-looking createdAt and higher usage). Ownership means it
+    // is never read: the lookup does not scan $DSH_HOME at all. DSH_HOME is
+    // explicitly pointed at it so a regression to shared-store scanning
+    // WOULD find it (and fail the assertion below).
+    const foreignName = "session-foreign-tempting";
+    const foreignDir = path.join(dshSessionProjectDir(dshHome, workdir), foreignName);
+    fs.mkdirSync(foreignDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(foreignDir, "session.v3.jsonl"),
+      headerLine(foreignName, 1_700_000_005_000) +
+        usageLine({ input: 200, output: 20, seq: 1 }),
+    );
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.ok(result !== null, "own store session must be readable");
+    assert.equal(result.sessionRef, ownName, "must select the OWN session");
+    assert.equal(result.totalTokens, 110, "must charge the OWN usage (110), never 220");
   });
 
-  it("returns null and warns for an empty workdir", async () => {
+  it("OWNERSHIP (S4z): compressed own session beyond the old cutoff is selected over a foreign one", { skip: !haveNodeZstd }, async () => {
+    const ownedRoot = mkOwnedRoot("s4z-own");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const dshHome = path.join(tmpRoot!, "default-dsh-home");
+    process.env.DSH_HOME = dshHome;
+
+    const ownName = "session-own-delayed-zstd";
+    // Multi-frame container (header frame + usage frame), like dsh writes.
+    const ownBytes = Buffer.concat([
+      zstdCompress!(Buffer.from(headerLine(ownName, 1_700_000_031_000))),
+      zstdCompress!(Buffer.from(usageLine({ input: 100, output: 10, seq: 1 }))),
+    ]);
+    writeOwnedSession({ ownedRoot, workdir, sessionName: ownName, content: ownBytes });
+
+    const foreignName = "session-foreign-tempting-zstd";
+    const foreignDir = path.join(dshSessionProjectDir(dshHome, workdir), foreignName);
+    fs.mkdirSync(foreignDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(foreignDir, "session.v3.jsonl"),
+      headerLine(foreignName, 1_700_000_005_000) +
+        usageLine({ input: 200, output: 20, seq: 1 }),
+    );
+
     const result = await lookupDshSessionTokens({
-      spawnedAtMs: 0,
-      workdir: "",
-      env: envWith(path.join(tmpRoot!, "dsh-home")),
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "auto",
     });
+
+    assert.ok(result !== null);
+    assert.equal(result.sessionRef, ownName);
+    assert.equal(result.totalTokens, 110);
+  });
+
+  it("OWNERSHIP (S1): missing own evidence + a foreign session present elsewhere → UNOBSERVED, never the foreign", async () => {
+    const ownedRoot = mkOwnedRoot("s1-no-own");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const dshHome = path.join(tmpRoot!, "default-dsh-home");
+    process.env.DSH_HOME = dshHome;
+
+    // The own store exists (prepared, like a real round) but dsh never
+    // materialized a session in it.
+    const foreignName = "session-foreign-sole";
+    const foreignDir = path.join(dshSessionProjectDir(dshHome, workdir), foreignName);
+    fs.mkdirSync(foreignDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(foreignDir, "session.v3.jsonl"),
+      headerLine(foreignName, 1_700_000_005_000) +
+        usageLine({ input: 200, output: 20, seq: 1 }),
+    );
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.equal(result, null, "no own evidence must read UNOBSERVED, never a foreign session");
+    const log = readTamanduaLog();
+    assert.match(log, /no session directory in the owned store/);
+    assert.doesNotMatch(log, /session-foreign-sole/, "the foreign session must never be named as read");
+  });
+
+  it("refuses when TWO roots exist in the owned store (never ranked)", async () => {
+    const ownedRoot = mkOwnedRoot("two-roots");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-root-a",
+      fileName: "session.v3.jsonl",
+      content: headerLine("session-root-a", 1) + usageLine({ input: 100, output: 10, seq: 1 }),
+    });
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-root-b",
+      fileName: "session.v3.jsonl",
+      content: headerLine("session-root-b", 2) + usageLine({ input: 200, output: 20, seq: 1 }),
+    });
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.equal(result, null, "ambiguous roots must refuse");
+    assert.match(readTamanduaLog(), /multiple root sessions in the owned store/);
+  });
+
+  it("refuses EQUAL-INSTANT roots exactly like any two roots (timestamps grant no privilege)", async () => {
+    const ownedRoot = mkOwnedRoot("equal-instant");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    for (const name of ["session-eq-a", "session-eq-b"]) {
+      writeOwnedSession({
+        ownedRoot,
+        workdir,
+        sessionName: name,
+        fileName: "session.v3.jsonl",
+        content: headerLine(name, 1_700_000_000_000) + usageLine({ input: 100, output: 10, seq: 1 }),
+      });
+    }
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
     assert.equal(result, null);
-    assert.match(readTamanduaLog(), /missing worker working directory/);
+    assert.match(readTamanduaLog(), /multiple root sessions in the owned store/);
+  });
+
+  it("PRESERVED: a non-root sibling (child/subagent/seeded) is excluded; the root is selected", async () => {
+    const ownedRoot = mkOwnedRoot("non-root-sibling");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const ownName = "session-own-root";
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: ownName,
+      fileName: "session.v3.jsonl",
+      content: headerLine(ownName, 1) + usageLine({ input: 100, output: 10, seq: 1 }),
+    });
+    // A delegated child session (parentSession set) — not the round's own
+    // root accounting.
+    const childName = "session-child";
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: childName,
+      fileName: "session.v3.jsonl",
+      content:
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: childName,
+          createdAt: 2,
+          isSeeded: false,
+          delegationDepth: 1,
+          parentSession: "session-own-root",
+        }) + "\n",
+    });
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.ok(result !== null);
+    assert.equal(result.sessionRef, ownName);
+    assert.equal(result.totalTokens, 110);
+  });
+
+  it("refuses when the owned store holds ONLY a non-root session (no root accounting)", async () => {
+    const ownedRoot = mkOwnedRoot("only-non-root");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-seeded-only",
+      fileName: "session.v3.jsonl",
+      content:
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "session-seeded-only",
+          createdAt: 1,
+          isSeeded: true,
+          delegationDepth: 0,
+        }) + "\n",
+    });
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.equal(result, null);
+    assert.match(readTamanduaLog(), /no root session in the owned store/);
+  });
+
+  it("refuses when an unreadable artifact sits in the owned store (never 'whichever entry parses')", async () => {
+    const ownedRoot = mkOwnedRoot("unreadable");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-readable",
+      fileName: "session.v3.jsonl",
+      content: headerLine("session-readable", 1) + usageLine({ input: 100, output: 10, seq: 1 }),
+    });
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-garbage",
+      fileName: "session.v3.jsonl.zstd",
+      content: Buffer.from("not a zstd stream at all"),
+    });
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "node",
+    });
+
+    assert.equal(result, null, "an unreadable artifact must refuse the lookup");
+    assert.match(readTamanduaLog(), /unreadable session artifact in the owned store/);
+  });
+
+  it("refuses a session directory holding no recognized log", async () => {
+    const ownedRoot = mkOwnedRoot("no-artifact");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const sessionDir = path.join(dshOwnedSessionProjectDir(ownedRoot, workdir), "session-empty-dir");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionDir, "notes.txt"), "not a session log");
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.equal(result, null);
+    assert.match(readTamanduaLog(), /unclassifiable artifact in the owned store/);
+  });
+
+  it("refuses a symlinked session directory (never follows it)", async () => {
+    const ownedRoot = mkOwnedRoot("symlink");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    const sessionsDir = dshOwnedSessionProjectDir(ownedRoot, workdir);
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const outside = path.join(tmpRoot!, "outside-session");
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(
+      path.join(outside, "session.v3.jsonl"),
+      headerLine("session-outside", 1) + usageLine({ input: 999, output: 9, seq: 1 }),
+    );
+    fs.symlinkSync(outside, path.join(sessionsDir, "session-linked"));
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.equal(result, null);
+    assert.match(readTamanduaLog(), /unclassifiable artifact in the owned store/);
+  });
+
+  it("refuses when the winning log's directory name does not match its header id", async () => {
+    const ownedRoot = mkOwnedRoot("name-mismatch");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-dir-name",
+      fileName: "session.v3.jsonl",
+      content: headerLine("session-different-id", 1) + usageLine({ input: 100, output: 10, seq: 1 }),
+    });
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.equal(result, null);
+    assert.match(readTamanduaLog(), /session directory name does not match its header id/);
+  });
+
+  it("refuses an unsupported (pre-v3) layout in the owned store with the upgrade-dsh remedy", async () => {
+    const ownedRoot = mkOwnedRoot("legacy");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-v1",
+      fileName: "session.jsonl.zstd",
+      // Deliberately not a valid zstd stream: the unsupported layout must
+      // be rejected before any read, so its bytes never matter.
+      content: headerLine("session-v1", 1) + usageLine({ input: 999, output: 9, seq: 1 }),
+    });
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.equal(result, null, "an unsupported v1 layout must never yield a total");
+    const log = readTamanduaLog();
+    assert.match(log, /found session\.jsonl\.zstd/, "warning must name the found file");
+    assert.match(log, /dsh >= 0\.1\.5/, "warning must state the required dsh version");
+    assert.match(log, /upgrade dsh/, "warning must give the upgrade-dsh remedy");
+    assert.equal(
+      log.split("\n").filter((l) => l.includes("unsupported session layout")).length,
+      1,
+      "the unsupported-layout warning must be emitted exactly once",
+    );
+  });
+
+  it("still refuses when a readable root coexists with a legacy layout (fully-classifiable store required)", async () => {
+    const ownedRoot = mkOwnedRoot("root-plus-legacy");
+    const workdir = path.join(tmpRoot!, "worktree", "repo");
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-root-ok",
+      fileName: "session.v3.jsonl",
+      content: headerLine("session-root-ok", 1) + usageLine({ input: 100, output: 10, seq: 1 }),
+    });
+    writeOwnedSession({
+      ownedRoot,
+      workdir,
+      sessionName: "session-v2-layout",
+      fileName: "session.v2.jsonl.zstd",
+      content: "not a zstd stream and never read",
+    });
+
+    const result = await lookupDshSessionTokens({
+      ownedRoot,
+      workdir,
+      env: envWith(),
+      zstdStrategy: "none",
+    });
+
+    assert.equal(result, null);
+    assert.match(readTamanduaLog(), /unsupported session layout .*session\.v2\.jsonl\.zstd/);
   });
 
   // ── node:zlib zstd tier (feature-gated on Node >= 23.8) ────────
@@ -954,7 +1134,7 @@ describe("lookupDshSessionTokens", () => {
     "decompresses a multi-frame concatenated zstd log and sums usage chunks",
     { skip: !haveNodeZstd },
     async () => {
-      const dshHome = path.join(tmpRoot!, "dsh-home");
+      const ownedRoot = mkOwnedRoot("multiframe");
       const workdir = path.join(tmpRoot!, "worktree", "repo");
       const sessionName = "session-22222222-3333-4444-8555-666666666666";
 
@@ -969,17 +1149,17 @@ describe("lookupDshSessionTokens", () => {
       const frame2 = zstdCompress!(
         Buffer.from(usageLine({ input: 30, output: 40, cacheRead: 600, seq: 2 })),
       );
-      writeSessionDir({
-        dshHome,
+      writeOwnedSession({
+        ownedRoot,
         workdir,
         sessionName,
         content: Buffer.concat([frame1, frame2]),
       });
 
       const result = await lookupDshSessionTokens({
-        spawnedAtMs: 0,
+        ownedRoot,
         workdir,
-        env: envWith(dshHome),
+        env: envWith(),
         zstdStrategy: "node",
       });
 
@@ -993,7 +1173,7 @@ describe("lookupDshSessionTokens", () => {
     "reads a single-frame zstd-compressed log (zstdCompressSync fixture)",
     { skip: !haveNodeZstd },
     async () => {
-      const dshHome = path.join(tmpRoot!, "dsh-home");
+      const ownedRoot = mkOwnedRoot("singleframe");
       const workdir = path.join(tmpRoot!, "worktree", "repo");
       const sessionName = "session-33333333-4444-4555-8666-777777777777";
       const compressed = zstdCompress!(
@@ -1002,12 +1182,12 @@ describe("lookupDshSessionTokens", () => {
             usageLine({ input: 5, output: 6, cacheRead: 700, seq: 1 }),
         ),
       );
-      writeSessionDir({ dshHome, workdir, sessionName, content: compressed });
+      writeOwnedSession({ ownedRoot, workdir, sessionName, content: compressed });
 
       const result = await lookupDshSessionTokens({
-        spawnedAtMs: 0,
+        ownedRoot,
         workdir,
-        env: envWith(dshHome),
+        env: envWith(),
       });
 
       assert.ok(result !== null);
@@ -1063,14 +1243,14 @@ describe("dsh v3 real multi-frame fixture", () => {
     "looks up exactly 7235 tokens from the real fixture via the node tier",
     { skip: !haveNodeZstd },
     async () => {
-      const dshHome = path.join(tmpRoot!, "dsh-home");
+      const ownedRoot = mkOwnedRoot("fixture");
       const workdir = path.join(tmpRoot!, "worktree", "repo");
-      stageFixtureSession({ dshHome, workdir });
+      stageFixtureSession({ ownedRoot, workdir });
 
       const result = await lookupDshSessionTokens({
-        spawnedAtMs: 0,
+        ownedRoot,
         workdir,
-        env: envWith(dshHome),
+        env: envWith(),
         zstdStrategy: "node",
       });
 
@@ -1085,9 +1265,9 @@ describe("dsh v3 real multi-frame fixture", () => {
       // zlib zstd (it selects the frame-scanning node path) — not just
       // the first frame.
       const autoResult = await lookupDshSessionTokens({
-        spawnedAtMs: 0,
+        ownedRoot,
         workdir,
-        env: envWith(dshHome),
+        env: envWith(),
       });
       assert.ok(autoResult !== null, "the auto tier must decode the real fixture");
       assert.equal(autoResult.totalTokens, FIXTURE_TOTAL_TOKENS);
@@ -1098,15 +1278,15 @@ describe("dsh v3 real multi-frame fixture", () => {
     "looks up exactly 7235 tokens from the real fixture via the binary zstd tier",
     { skip: !haveZstdBinary },
     async () => {
-      const dshHome = path.join(tmpRoot!, "dsh-home");
+      const ownedRoot = mkOwnedRoot("fixture-binary");
       const workdir = path.join(tmpRoot!, "worktree", "repo");
-      stageFixtureSession({ dshHome, workdir });
+      stageFixtureSession({ ownedRoot, workdir });
 
       const result = await lookupDshSessionTokens({
-        spawnedAtMs: 0,
+        ownedRoot,
         workdir,
         // Real PATH so the genuine `zstd -dc` (v1.4.8) is spawned.
-        env: envWith(dshHome),
+        env: envWith(),
         zstdStrategy: "binary",
       });
 
@@ -1120,19 +1300,19 @@ describe("dsh v3 real multi-frame fixture", () => {
     "returns null (never a partial total) for a truncated fixture, without throwing",
     { skip: !haveNodeZstd },
     async () => {
-      const dshHome = path.join(tmpRoot!, "dsh-home");
+      const ownedRoot = mkOwnedRoot("fixture-truncated");
       const workdir = path.join(tmpRoot!, "worktree", "repo");
       // Cut bytes off the tail so the final zstd frame is incomplete.
       stageFixtureSession({
-        dshHome,
+        ownedRoot,
         workdir,
         mutate: (bytes) => bytes.subarray(0, bytes.length - 5),
       });
 
       const result = await lookupDshSessionTokens({
-        spawnedAtMs: 0,
+        ownedRoot,
         workdir,
-        env: envWith(dshHome),
+        env: envWith(),
         zstdStrategy: "node",
       });
 
@@ -1141,7 +1321,7 @@ describe("dsh v3 real multi-frame fixture", () => {
 
       // Direct entry point must also degrade to null instead of throwing.
       const truncatedPath = stageFixtureSession({
-        dshHome: path.join(tmpRoot!, "dsh-home-2"),
+        ownedRoot: mkOwnedRoot("fixture-truncated-2"),
         workdir,
         mutate: (bytes) => bytes.subarray(0, bytes.length - 5),
       }).logPath;

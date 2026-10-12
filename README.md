@@ -1507,19 +1507,29 @@ session file and the remedy `upgrade dsh` (see Token Accounting below).
 
 ##### Token Accounting
 
-dsh never prints token usage. Tamandua records each round's spawn time and,
-after the round, reads the session log under
-`$DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd`
-(`$DSH_HOME` defaults to `~/.dsh`) and sums the recorded usage once per
-request from the top-level `data.usage` of the v3 records (input + output
-tokens, cache reads excluded). This requires **dsh >= 0.1.5** (session format
-v3). Older layouts are unsupported: `session.jsonl.zstd` (dsh 0.1.0) and
-`session.v2.jsonl.zstd` (dsh 0.1.3) are never read — Tamandua logs one
-warning naming the found file and records 0 tokens. **Remedy: upgrade dsh to
->= 0.1.5.** The v3 `session.v3.jsonl.zstd` is a concatenated zstd frame
-container and every frame is decoded, so usage recorded in later frames is
-not missed. This is best-effort — any failure (no zstd support, a missing or
-unreadable session store) falls back to 0 tokens with a warning. `tamandua
+dsh never prints token usage. Each tamandua-dispatched native dsh invocation
+receives its **own** session store: the dispatcher creates a fresh directory
+under `<state dir>/dsh-sessions/<runId>/…` and passes dsh a `--patch` overlay
+that redirects the `session-persistence-jsonl` root there, so this
+invocation's session files land under the owned root
+(`<owned root>/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd`) instead
+of the shared `$DSH_HOME/sessions` store. After the round Tamandua reads
+**only** that owned store and sums the recorded usage once per request from
+the top-level `data.usage` of the v3 records (input + output tokens, cache
+reads excluded). Exactly one root session must be present: a missing,
+unreadable or ambiguous owned store reads 0 tokens with a warning
+(unobserved) and never borrows another invocation's session, and a
+per-session high-water ledger makes repeated settlement of one physical
+session add only the unaccounted increment. This requires **dsh >= 0.1.5**
+(session format v3). Older layouts are unsupported: `session.jsonl.zstd`
+(dsh 0.1.0) and `session.v2.jsonl.zstd` (dsh 0.1.3) are never read —
+Tamandua logs one warning naming the found file and records 0 tokens.
+**Remedy: upgrade dsh to >= 0.1.5.** The v3 `session.v3.jsonl.zstd` is a
+concatenated zstd frame container and every frame is decoded, so usage
+recorded in later frames is not missed. This is best-effort — any failure
+(no zstd support, a missing or unreadable session store, an unclassifiable
+artifact) falls back to 0 tokens with a warning, and the round itself still
+completes normally. `tamandua
 doctor` includes a dsh session-store probe that warns when the sessions
 directory is unreadable or zstd decompression is unavailable, and a
 permission-mode probe that warns when a profile layer pins sandbox/approval

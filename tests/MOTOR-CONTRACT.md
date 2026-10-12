@@ -115,16 +115,18 @@ widen, and `workflow wait` has no window (a display duration). An
 unparseable/missing instant is never stale, never pruned, and never replayed —
 the shim maps the helper's `undefined` to `NaN`, which every caller already
 treats as "not fresh" (fail-closed).
-File-mtime provenance (daemon pidfile age, start-lock staleness, dsh session
-"created since spawn") keeps OS-epoch semantics — a file mtime has no
-monotonic analogue — but the age/since-spawn decision still routes through
+File-mtime provenance (daemon pidfile age, start-lock staleness) keeps
+OS-epoch semantics — a file mtime has no
+monotonic analogue — but the age decision still routes through
 `instantAgeMs()`/`isOlderThan()` with a documented tolerance, never a
 `Date.now()` difference: `daemonctl`'s `pidfileProvenanceMatches` uses the
 `PIDFILE_AGE_SLACK_SECONDS` tolerance and `startLockIsStale` uses
-`START_LOCK_STALE_MS` as its tolerance, and `dsh-usage`'s
-`createdSinceSpawn` filter/recency sort uses
-`DSH_SESSION_MTIME_TOLERANCE_MS`. An unparseable/unreadable mtime is never
-stale, never eligible, and never fabricates provenance.
+`START_LOCK_STALE_MS` as its tolerance. dsh session attribution is NOT
+time-based at all (DSH-OWNER): each native dsh invocation writes into its
+own `--patch`-redirected session store and the settle reads only that
+store, so no mtime or header instant ever selects, ranks, or excludes a
+session; a missing/unreadable owned store reads UNOBSERVED (never a
+fallback).
 
 The cross-cutting regression suite
 `tests/time-clocks-wall-jump.test.ts` (US-013) pins all three rules together

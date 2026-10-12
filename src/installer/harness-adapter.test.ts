@@ -1728,6 +1728,53 @@ process.stdout.write('done output\\n');
       }
     });
 
+    it("adapter argv inserts --patch <overlay> before the prompt when an owned-store overlay is set", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-overlay-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      const argsFile = path.join(tmpDir, "args-overlay.txt");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync('${argsFile}', JSON.stringify(process.argv.slice(2)));
+process.stdout.write('done output\\n');
+`,
+        { mode: 0o755 },
+      );
+      const overlay = path.join(tmpDir, "owned", "session-root.patch.yml");
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("test prompt", {
+          timeout: 5,
+          workdir: tmpDir,
+          dshSessionPersistenceOverlay: overlay,
+        });
+
+        assert.ok(fs.existsSync(argsFile), "args file should exist");
+        const recorded = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+        assert.deepEqual(
+          recorded,
+          ["--profile", "headless", "--patch", overlay, "test prompt"],
+          "the owned-store overlay must be passed as a launcher --patch flag before the prompt",
+        );
+        assert.equal(
+          recorded[recorded.length - 1],
+          "test prompt",
+          "the prompt must stay the final argv element",
+        );
+        assert.equal(result.exitCode, 0);
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
     it("stdout passes through verbatim including STATUS lines and trailing newline", async () => {
       const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
       const fakeDsh = path.join(tmpDir, "dsh");

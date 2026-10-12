@@ -64,7 +64,14 @@ import {
   type HarnessProbeFailureFields,
 } from "./harness-probe.js";
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
-import { lookupDshSessionTokens } from "./dsh-usage.js";
+import {
+  lookupDshSessionTokens,
+  prepareDshOwnedStore,
+  readDshOwnedReceipt,
+  canonicalContainedSessionDir,
+  type DshOwnedStore,
+} from "./dsh-usage.js";
+import { resolveStateDir } from "../lib/tamandua-config.js";
 import { extractPerCallTokenTotal } from "./token-usage-policy.js";
 import {
   getDaemonInstanceToken,
@@ -1511,6 +1518,223 @@ async function attributeWorkRoundTokenUsage(
   }
 }
 
+// ── DSH-OWNER settlement (the ONLY native dsh charging path) ────────
+
+/**
+ * Settle ONE native dsh invocation's usage from its OWNED store.
+ *
+ * This is the single native-dsh charging path, called from the success,
+ * error and probe paths (a settlement is idempotent, so re-entering it —
+ * e.g. a post-resolution throw after the success path already settled, or
+ * a retry of the same physical session — adds only the unaccounted
+ * increment and can never double-count). Sequence:
+ *
+ *   1. OWNERSHIP BINDING: the store's receipt must declare THIS exact
+ *      invocation (same runId, jobId, phase and canonical owned root).
+ *      A receipt that is missing, malformed or foreign refuses the
+ *      settlement — ownership comes from the pre-launch binding, never
+ *      from "whoever settles first".
+ *   2. Read the invocation's own store exclusively (UNOBSERVED → no
+ *      charge, no substitution).
+ *   3. Canonical containment: the returned session dir's PHYSICAL path
+ *      must be a strict descendant of the canonical owned root.
+ *   4. `applyDshSessionCharge` (db.ts) commits the high-water increment
+ *      atomically with `runs.tokens_spent`. Only a POSITIVE committed
+ *      increment emits `run.tokens.updated` (post-terminal identity
+ *      preserved); a no-op emits nothing.
+ *
+ * Returns the COMMITTED increment — callers must use it (never the
+ * observed session total, and never re-attribute it through
+ * attributeWorkRoundTokenUsage, which would add it again).
+ *
+ * Exported for the DSH-OWNER regressions: the receipt/containment/charge
+ * validation IS the behavior under test, and there is no test-only path
+ * around it.
+ */
+export async function settleDshOwnedRoundUsage(params: {
+  context: Record<string, unknown>;
+  job: CronJobInfo;
+  ownedStore: DshOwnedStore;
+  phase: "work" | "probe";
+  workdir: string;
+  source: "work_success" | "work_error" | "probe";
+}): Promise<{ chargedTokens: number; tokensSpent: number | null; unobserved: boolean }> {
+  const { context, job, ownedStore, phase, workdir, source } = params;
+  const refuse = (reason: string, extra: Record<string, unknown> = {}) => {
+    logger.warn("dsh owned settlement refused", {
+      ...context,
+      source,
+      reason,
+      ...extra,
+    });
+  };
+
+  try {
+    // 1. Ownership receipt: the store must declare THIS invocation.
+    // The allocated root's leaf is inspected BEFORE it is followed:
+    // realpath alone would accept a leaf that another attempt (same
+    // deterministic run/job/phase — all legitimate identity fields)
+    // replaced with a link to ITS root, silently redirecting this
+    // settlement. The originally allocated root is the invocation
+    // discriminator, so a symlinked/replaced leaf is refused outright.
+    let rootStat: fs.Stats;
+    try {
+      rootStat = fs.lstatSync(ownedStore.ownedRoot);
+    } catch (err) {
+      refuse("owned_root_unreadable", {
+        ownedRoot: ownedStore.ownedRoot,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      refuse("owned_root_not_plain", { ownedRoot: ownedStore.ownedRoot });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+    const receipt = readDshOwnedReceipt(ownedStore.ownedRoot);
+    if (receipt === null) {
+      refuse("receipt_missing_or_malformed", { ownedRoot: ownedStore.ownedRoot });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = fs.realpathSync(ownedStore.ownedRoot);
+    } catch (err) {
+      refuse("owned_root_unreadable", {
+        ownedRoot: ownedStore.ownedRoot,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+    // The originally allocated root was already canonical at prepare time
+    // (realpathSync before the overlay landed). A fresh resolve that
+    // disagrees means an ancestor changed under us — refuse rather than
+    // settle against a root the invocation does not demonstrably own.
+    if (canonicalRoot !== ownedStore.ownedRoot) {
+      refuse("owned_root_canonical_drift", {
+        ownedRoot: ownedStore.ownedRoot,
+        canonicalRoot,
+      });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+    if (
+      receipt.runId !== job.runId ||
+      receipt.jobId !== job.id ||
+      receipt.phase !== phase ||
+      path.resolve(receipt.ownedRoot) !== canonicalRoot
+    ) {
+      refuse("ownership_receipt_mismatch", {
+        ownedRoot: canonicalRoot,
+        receiptRunId: receipt.runId,
+        receiptJobId: receipt.jobId,
+        receiptPhase: receipt.phase,
+      });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+
+    // 2. Read the invocation's OWN store, exclusively.
+    const usage = await lookupDshSessionTokens({ ownedRoot: canonicalRoot, workdir });
+    if (usage === null) {
+      logger.warn("dsh session token lookup unobserved — no charge for this round", {
+        ...context,
+        source,
+        reason: "owned_store_unobserved",
+        ownedRoot: canonicalRoot,
+      });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+
+    // 3. Canonical containment of the settled session directory.
+    const canonicalSessionDir = canonicalContainedSessionDir(canonicalRoot, usage.sessionDir);
+    if (canonicalSessionDir === null) {
+      refuse("session_dir_not_contained", {
+        ownedRoot: canonicalRoot,
+        sessionDir: usage.sessionDir,
+      });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+
+    // 4. Atomic high-water charge.
+    const { applyDshSessionCharge } = await import("../db.js");
+    const charge = applyDshSessionCharge({
+      sessionDir: canonicalSessionDir,
+      runId: job.runId,
+      jobId: job.id,
+      observedTotalTokens: usage.totalTokens,
+    });
+    if (charge.status === "refused") {
+      refuse(`charge_${charge.reason ?? "refused"}`, {
+        ownedRoot: canonicalRoot,
+        sessionRef: usage.sessionRef,
+      });
+      return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+    }
+    if (charge.status === "noop") {
+      logger.debug("dsh owned settlement no-op — already charged at or above this total", {
+        ...context,
+        source,
+        sessionRef: usage.sessionRef,
+        observedTotal: usage.totalTokens,
+        ownedRoot: canonicalRoot,
+      });
+      return { chargedTokens: 0, tokensSpent: charge.tokensSpent, unobserved: false };
+    }
+
+    const committed = charge.chargedTokens;
+    // Post-commit observability is BEST-EFFORT and isolated: the charge is
+    // already durable, so a throwing event write or log must never turn a
+    // successful charge into "unobserved" (and replay still cannot charge
+    // again — the ledger high-water mark is committed).
+    try {
+      // F3: remember the last settled delta so the closing run.tokens.final
+      // can carry it (same contract as attributeWorkRoundTokenUsage).
+      lastRoundTokenDeltas.set(job.runId, committed);
+      const evt: TamanduaEvent = {
+        ts: new Date().toISOString(),
+        event: "run.tokens.updated",
+        runId: job.runId,
+        workflowId: charge.workflowId,
+        tokenDelta: committed,
+        tokensSpent: charge.tokensSpent ?? 0,
+      };
+      evt.roundId = job.id;
+      if (isTerminalRunStatus(charge.runStatus)) {
+        evt.postTerminal = true;
+        evt.terminalStatus = charge.runStatus;
+      }
+      emitEvent(evt);
+      logger.info("dsh token attribution from owned session store", {
+        ...context,
+        source,
+        sessionRef: usage.sessionRef,
+        tokenDelta: committed,
+        observedTotal: usage.totalTokens,
+        ownedRoot: canonicalRoot,
+      });
+    } catch (postCommitErr) {
+      try {
+        logger.warn("dsh owned settlement post-commit reporting failed (charge already committed)", {
+          ...context,
+          source,
+          sessionRef: usage.sessionRef,
+          tokenDelta: committed,
+          error: postCommitErr instanceof Error ? postCommitErr.message : String(postCommitErr),
+        });
+      } catch {
+        // Even the warning must never escape: the charge is durable.
+      }
+    }
+    return { chargedTokens: committed, tokensSpent: charge.tokensSpent, unobserved: false };
+  } catch (err) {
+    logger.warn("dsh owned settlement failed", {
+      ...context,
+      source,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { chargedTokens: 0, tokensSpent: null, unobserved: true };
+  }
+}
+
 // ── Instant-fail round tracking (RSPN) ───────────────────────────────
 
 /**
@@ -2152,12 +2376,14 @@ export async function executeDispatchRound(
   // Resolved once with the snapshot so the watchdog's synchronous poll can call
   // the same DB accessor without re-importing per tick.
   let getDbForStepWatchdog: (typeof import("../db.js"))["getDb"] | null = null;
-  // Round-start timestamp captured for dsh token accounting. dsh never
-  // prints usage; tokens are read from $DSH_HOME session files keyed on
-  // the workdir + a "created since this time" scan. Captured BEFORE
-  // binary resolution so the error path (e.g. a dispatch-time resolution
-  // failure) can still attempt the best-effort session lookup.
-  let dshRoundStartedAtMs: number | undefined;
+  // DSH-OWNER: the per-invocation OWNED dsh session store for this native
+  // work round. Prepared AFTER binary resolution, immediately before the
+  // adapter invocation, and handed to the adapter as the `--patch`
+  // session-persistence overlay; the post-round lookup reads ONLY this
+  // store. `null` until prepared; a failed preparation refuses the launch
+  // (an unowned launch would fall back to the shared store and lose
+  // attribution ownership).
+  let dshOwnedStore: DshOwnedStore | null = null;
   // Captured from the run-status DB query so the traceability header can
   // include run_number without a second DB trip.
   let runNumber: number | undefined;
@@ -2914,15 +3140,6 @@ export async function executeDispatchRound(
       };
 
       const adapter = getHarnessAdapter(harnessType);
-      if (harnessType === "dsh") {
-        // TIME-CLOCKS allow-list (rule 3): dsh session attribution compares
-        // this round-start stamp against OS file mtimes ($DSH_HOME session
-        // files), so it stays an epoch-ms instant and MUST NOT be switched to
-        // monotonic time. US-010 routes that comparison through the shared
-        // instant helpers/tolerance (dsh-usage's `createdSinceSpawn` /
-        // `instantAgeMs` with `DSH_SESSION_MTIME_TOLERANCE_MS`).
-        dshRoundStartedAtMs = Date.now();
-      }
       // Round-start timestamp for instant-fail classification (RSPN). The
       // adapters now report their own durationMs on resolved rounds; this
       // capture covers the adapter-throw path (deleted/broken harness binary
@@ -2937,6 +3154,26 @@ export async function executeDispatchRound(
       // options.binaryPath so runRound skips its own redundant findBinary()
       // call.
       const binaryPath = await adapter.findBinary({ preferTokenSaver });
+      // DSH-OWNER: AFTER binary resolution, immediately before the
+      // invocation, allocate this round's OWNED session store and hand its
+      // `--patch` overlay to the adapter. From here on this invocation's
+      // dsh writes its session log into this store and nowhere else; the
+      // post-round lookup reads ONLY this store. A preparation failure
+      // REFUSES the launch — running unowned would silently fall back to
+      // the shared store and forfeit attribution ownership.
+      if (harnessType === "dsh") {
+        dshOwnedStore = prepareDshOwnedStore({
+          stateDir: resolveStateDir(),
+          runId: job.runId,
+          jobId: job.id,
+          phase: "work",
+        });
+        if (dshOwnedStore === null) {
+          throw new Error(
+            "DSH-OWNER: the owned session store could not be prepared — refusing an unowned dsh launch",
+          );
+        }
+      }
       const harnessEnv = buildHarnessChildEnv(job, binaryPath);
       result = await adapter.runRound(workPrompt, {
         timeout,
@@ -2945,6 +3182,9 @@ export async function executeDispatchRound(
         onSpawn,
         preferTokenSaver,
         binaryPath,
+        ...(dshOwnedStore !== null
+          ? { dshSessionPersistenceOverlay: dshOwnedStore.overlayPath }
+          : {}),
         // KHYG US-002: run/execution identity for the per-launch
         // isolation-mode records (run.harness_isolation), and this round's
         // explicit cancellation signal (aborted on teardown/cancel).
@@ -3068,44 +3308,28 @@ export async function executeDispatchRound(
       }
     }
 
-    // ── dsh token lookup ─────────────────────────────────────────
+    // ── dsh token lookup (owned store) ───────────────────────────
     // dsh prints no session id and no usage — usage lives in the session
-    // file under $DSH_HOME/sessions/<escaped-workdir>/session-<uuid>/.
-    // The lookup scans session dirs created since the round-start
-    // timestamp and reads the newest (this includes timed-out rounds,
-    // which resolve through the normal post-round path). Best-effort:
-    // an unavailable lookup falls back to 0 tokens with a warning —
-    // never an error, never blocks the round. NATIVE dsh only: an
-    // opted-in dsh Matchlock round attributes from the MOUNTED store
+    // file inside THIS invocation's OWNED store (the dispatcher handed dsh
+    // its `--patch` session-persistence overlay before the spawn). The
+    // settle helper validates the ownership receipt, reads only that
+    // store, and charges the high-water increment atomically
+    // (idempotent: a repeated settlement adds nothing). Best-effort: an
+    // UNOBSERVED store warns and charges nothing — never an error, never
+    // a scan of any other store. NATIVE dsh only: an opted-in dsh
+    // Matchlock round attributes from the MOUNTED store
     // (policy.configurationRoot) via the confined US-001 read below and
     // must never read the native host store.
-    if (harnessType === "dsh" && !matchlockPolicy && dshRoundStartedAtMs !== undefined && workingDirectoryForHarness) {
-      const dshUsage = await lookupDshSessionTokens({
-        spawnedAtMs: dshRoundStartedAtMs,
+    if (harnessType === "dsh" && !matchlockPolicy && dshOwnedStore !== null && workingDirectoryForHarness) {
+      const settled = await settleDshOwnedRoundUsage({
+        context,
+        job,
+        ownedStore: dshOwnedStore,
+        phase: "work",
         workdir: workingDirectoryForHarness,
+        source: "work_success",
       });
-      if (dshUsage !== null && dshUsage.totalTokens > 0) {
-        const dshMetadata: WorkRoundMetadata = {
-          assistantOutput: output,
-          tokenUsage: dshUsage.totalTokens,
-          runId: null,
-          stepId: null,
-          jsonMetadataDetected: false,
-        };
-        roundTokenDelta = await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
-        logger.info("dsh token attribution from session file", {
-          ...context,
-          sessionRef: dshUsage.sessionRef,
-          tokenDelta: dshUsage.totalTokens,
-        });
-      } else {
-        // Zero-token fallback: warn (with round context) so operators can
-        // see WHY the run reads 0 tokens — never an error, never a retry.
-        logger.warn("dsh session token lookup unavailable — tokens will read 0", {
-          ...context,
-          reason: "no_session_since_round_start_or_unreadable",
-        });
-      }
+      roundTokenDelta = settled.unobserved ? null : settled.chargedTokens;
     }
 
     // ── dsh Matchlock token lookup (mounted v2 store, confined bounded read) ─
@@ -3349,44 +3573,31 @@ export async function executeDispatchRound(
         }
       }
 
-      // ── dsh token lookup on round failure ──────────────────────
-      // When a dsh round fails before it ever resolved (dispatch-time
-      // binary-resolution failure, spawn rejection), a session may still
-      // exist for the workdir. Scan by the captured round-start timestamp
-      // and attribute when a session is found — the same best-effort
-      // lookup as the success path (null → 0 tokens with a warning, never
-      // an error, never blocks the failure handling). `result ===
-      // undefined` keeps this complementary to the success path: a round
-      // that DID resolve already ran its lookup there, so re-running it
-      // here on a later post-round throw would double count. NATIVE dsh
-      // only — opted-in dsh Matchlock rounds use the mounted store below.
+      // ── dsh owned settlement on round failure ──────────────────
+      // A native dsh round that threw may have flushed a session into THIS
+      // invocation's owned store — settle it through the same idempotent
+      // helper (a repeated settlement adds only the unaccounted increment,
+      // so a post-resolution throw after the success path already settled
+      // is a safe no-op rather than a double count; that is why this no
+      // longer depends on `result === undefined`). Unobserved → no charge
+      // with a warning, never an error, never blocks failure handling,
+      // never a scan of any other store. A binary-RESOLUTION failure never
+      // reaches here with a store (none was prepared — no launch, no
+      // evidence).
       if (
         harnessType === "dsh" &&
         !matchlockPolicy &&
-        result === undefined &&
-        dshRoundStartedAtMs !== undefined &&
+        dshOwnedStore !== null &&
         workingDirectoryForHarness
       ) {
-        const dshUsage = await lookupDshSessionTokens({
-          spawnedAtMs: dshRoundStartedAtMs,
+        await settleDshOwnedRoundUsage({
+          context,
+          job,
+          ownedStore: dshOwnedStore,
+          phase: "work",
           workdir: workingDirectoryForHarness,
+          source: "work_error",
         });
-        if (dshUsage !== null && dshUsage.totalTokens > 0) {
-          const dshMetadata: WorkRoundMetadata = {
-            assistantOutput: "",
-            tokenUsage: dshUsage.totalTokens,
-            runId: null,
-            stepId: null,
-            jsonMetadataDetected: false,
-          };
-          const outputSummary = summarizeWorkRoundOutput("");
-          await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
-          logger.info("dsh token attribution from error-path session lookup", {
-            ...context,
-            sessionRef: dshUsage.sessionRef,
-            tokenDelta: dshUsage.totalTokens,
-          });
-        }
       }
 
       // ── dsh Matchlock token lookup on round failure ─────────────
@@ -3817,9 +4028,12 @@ async function runLaunchTimeHarnessProbe(params: {
   // interval, measured by a monotonic Stopwatch so a wall-clock jump cannot
   // produce a negative or inflated probe duration.
   const probeWatch = new Stopwatch();
-  // dsh probe rounds need a round-start timestamp for the session-file
-  // token scan (dsh prints no session id; usage lives in $DSH_HOME files).
-  let dshProbeStartedAtMs: number | undefined;
+  // DSH-OWNER: the probe invocation's OWN owned session store. The probe
+  // is a real harness invocation with its own session, so it gets its own
+  // store (phase "probe"), prepared after binary resolution and handed to
+  // the adapter as the `--patch` overlay; the probe's token settlement
+  // reads ONLY this store, on both pass and fail outcomes.
+  let dshProbeOwnedStore: DshOwnedStore | null = null;
 
   const fail = (fields: HarnessProbeFailureFields): LaunchTimeProbeOutcome => ({
     passed: false,
@@ -3856,12 +4070,30 @@ async function runLaunchTimeHarnessProbe(params: {
   }
 
   if (harnessType === "dsh") {
-    // TIME-CLOCKS allow-list (rule 3): the dsh probe's session scan
-    // compares this stamp against OS file mtimes, so it stays epoch ms and
-    // MUST NOT be switched to monotonic time. US-010 routes that comparison
-    // through the shared instant helpers (dsh-usage's `createdSinceSpawn` /
-    // `instantAgeMs` with `DSH_SESSION_MTIME_TOLERANCE_MS`).
-    dshProbeStartedAtMs = Date.now();
+    // DSH-OWNER: allocate the probe invocation's OWN session store (phase
+    // "probe"), AFTER binary resolution and immediately before the launch,
+    // and hand its `--patch` overlay to the adapter. A preparation failure
+    // refuses the probe launch (never an unowned launch — it would write
+    // into the shared store and forfeit attribution ownership).
+    dshProbeOwnedStore = prepareDshOwnedStore({
+      stateDir: resolveStateDir(),
+      runId: job.runId,
+      jobId: job.id,
+      phase: "probe",
+    });
+    if (dshProbeOwnedStore === null) {
+      return fail({
+        harness: harnessType,
+        probeCmd,
+        expected: "",
+        observed: "",
+        exitCode: null,
+        signal: null,
+        durationMs: undefined,
+        stderrTail:
+          "DSH-OWNER: the probe's owned session store could not be prepared — refusing an unowned dsh probe launch",
+      });
+    }
   }
   const harnessEnv = buildHarnessChildEnv(job, binaryPath);
   // The adapter merges options.env over process.env for real rounds; give
@@ -3902,6 +4134,9 @@ async function runLaunchTimeHarnessProbe(params: {
       onSpawn,
       preferTokenSaver,
       binaryPath,
+      ...(dshProbeOwnedStore !== null
+        ? { dshSessionPersistenceOverlay: dshProbeOwnedStore.overlayPath }
+        : {}),
       // KHYG US-002: the launch-time probe round is a harness execution
       // too — give it run/execution identity for the per-launch
       // isolation-mode records (run.harness_isolation) plus this round's
@@ -3915,7 +4150,27 @@ async function runLaunchTimeHarnessProbe(params: {
       signal,
     });
   } catch (err) {
-    return fail({
+    // The probe's spawn/round threw AFTER the store was prepared — a
+    // session may already have been written, so settle it before reporting
+    // the failure. The COMMITTED increment is carried on the failure
+    // outcome too (probe metadata must never contradict the DB).
+    let settledTokens = 0;
+    if (harnessType === "dsh" && dshProbeOwnedStore !== null) {
+      try {
+        const settled = await settleDshOwnedRoundUsage({
+          context,
+          job,
+          ownedStore: dshProbeOwnedStore,
+          phase: "probe",
+          workdir,
+          source: "probe",
+        });
+        settledTokens = settled.chargedTokens;
+      } catch {
+        // settleDshOwnedRoundUsage never throws; defensive only.
+      }
+    }
+    const failure = fail({
       harness: harnessType,
       probeCmd,
       expected: expectedPath,
@@ -3925,6 +4180,8 @@ async function runLaunchTimeHarnessProbe(params: {
       durationMs: undefined,
       stderrTail: `harness probe spawn failed: ${err instanceof Error ? err.message : String(err)}`,
     });
+    failure.tokens = settledTokens;
+    return failure;
   }
 
   const durationMs = result.durationMs ?? Math.max(0, probeWatch.elapsedMs());
@@ -3961,22 +4218,19 @@ async function runLaunchTimeHarnessProbe(params: {
         await attributeWorkRoundTokenUsage(context, job, outputSummary, hermesMetadata);
         tokens = hermesTokens;
       }
-    } else if (harnessType === "dsh" && dshProbeStartedAtMs !== undefined) {
-      const dshUsage = await lookupDshSessionTokens({
-        spawnedAtMs: dshProbeStartedAtMs,
+    } else if (harnessType === "dsh" && dshProbeOwnedStore !== null) {
+      // Same ownership binding + high-water settlement as work rounds: the
+      // probe's session is charged through the receipt-validated owned
+      // store, exactly once even on replay.
+      const settled = await settleDshOwnedRoundUsage({
+        context,
+        job,
+        ownedStore: dshProbeOwnedStore,
+        phase: "probe",
         workdir,
+        source: "probe",
       });
-      if (dshUsage !== null && dshUsage.totalTokens > 0) {
-        const dshMetadata: WorkRoundMetadata = {
-          assistantOutput: result.output,
-          tokenUsage: dshUsage.totalTokens,
-          runId: null,
-          stepId: null,
-          jsonMetadataDetected: false,
-        };
-        await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
-        tokens = dshUsage.totalTokens;
-      }
+      tokens = settled.chargedTokens;
     }
   } catch (err) {
     logger.warn("Launch-time harness probe token attribution failed", {
@@ -4016,7 +4270,15 @@ async function runLaunchTimeHarnessProbe(params: {
       stderrTail: "",
     };
   }
-  return fail({ ...(outcome.failure as HarnessProbeFailureFields), durationMs });
+  // A resolved-but-failed DSL probe still carries the COMMITTED increment
+  // (its session was real usage, so the reported outcome must agree with
+  // the DB). Scoped to dsh's owned-store path: pi/hermes probe failure
+  // metadata semantics are unchanged.
+  const failedOutcome = fail({ ...(outcome.failure as HarnessProbeFailureFields), durationMs });
+  if (harnessType === "dsh" && dshProbeOwnedStore !== null) {
+    failedOutcome.tokens = tokens;
+  }
+  return failedOutcome;
 }
 
 /**

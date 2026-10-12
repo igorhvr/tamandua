@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { assertStatePathIsolation } from "./lib/test-guard.js";
-import { nowIso, Deadline, monotonicNow, instantAgeMs, isOlderThan, type ClockFn } from "./lib/instant.js";
+import { nowIso, Deadline, monotonicNow, instantAgeMs, isOlderThan, SQL_NOW_ISO, type ClockFn } from "./lib/instant.js";
 import { LEDGER_RETENTION_MS } from "./suite/config.js";
 
 // Any change to migrate() MUST bump SCHEMA_VERSION. Missing a bump causes broken DBs.
@@ -46,7 +46,7 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // misread.
 // ONE schema chain (MATCHLOCK-UNION-4): main and the Matchlock lineage each
 // claimed a version for their own column, so the union folds both into a
-// single chain ending at SCHEMA_VERSION = 15.
+// single chain ending at SCHEMA_VERSION = 16.
 //   9  -> 10  TIME-STORAGE: migrateInstantsToIsoZ() rewrites every stored
 //              naive `YYYY-MM-DD HH:MM:SS` instant to ISO-8601 UTC `...Z`.
 //              Idempotent, so it also normalizes a Matchlock-lineage DB that
@@ -75,12 +75,24 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 //              the initial non-schedulable hold (`scheduling_status =
 //              'preparing'`), so an interrupted admission stays identifiable
 //              and never schedulable natively (spec C §10 item 7).
+//   15 -> 16  DSH-OWNER (tamandua-sal corrective): the `dsh_session_charges`
+//              ledger — one row per physical dsh session directory charged
+//              by a native dsh round, holding the run/job that owns it and
+//              the charge HIGH-WATER mark (`charged_total_tokens`). Repeated
+//              settlement of the same session adds only the positive
+//              difference above that mark, applied atomically with the
+//              `runs.tokens_spent` update (applyDshSessionCharge). The bump
+//              is REQUIRED (WLST5.1 failure mode): the CREATE TABLE is
+//              guarded by IF NOT EXISTS inside applySchema(), which only
+//              runs when user_version !== SCHEMA_VERSION — without the bump
+//              an existing v15 DB early-returns and every settle query
+//              crashes with "no such table: dsh_session_charges".
 // Every bump is REQUIRED (WLST5.1 failure mode): adding a guarded ALTER
 // without bumping leaves existing DBs early-returning from migrate() and
 // skipping the ALTER, so any SQL touching the new column crashes with
 // "no such column". Every ALTER is guarded by PRAGMA table_info, so any
-// earlier lineage simply runs the chain and re-stamps v15.
-export const SCHEMA_VERSION = 15;
+// earlier lineage simply runs the chain and re-stamps v16.
+export const SCHEMA_VERSION = 16;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -700,6 +712,33 @@ function applySchema(db: DatabaseSync, lineage: SchemaLineage): void {
     db.exec("INSERT OR IGNORE INTO tamandua_stats (id, system_tokens_spent) VALUES (1, 0)");
   }
 
+  // ── DSH-OWNER per-session charge ledger (15 -> 16) ──
+  // One row per physical dsh session directory a native dsh round settled.
+  // `session_dir` is the canonical absolute path inside the invocation's
+  // owned store and is the PRIMARY KEY WITHOUT run scoping: the same
+  // physical session can never be charged into a second run (a settle that
+  // finds a foreign owner is REFUSED, never re-owned — first-caller does
+  // not win). `charged_total_tokens` is the charge HIGH-WATER mark: a later
+  // settlement of the same session charges only the positive difference
+  // above it, and an equal/smaller observation charges nothing. `run_id` /
+  // `job_id` record the authorization handle so conflicting ownership is
+  // detectable. Deliberately NO foreign key to runs: run deletion must not
+  // break (the status.ts delete path runs unconditionally), and the ledger
+  // rows must not vanish while their sessions remain replayable.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dsh_session_charges (
+      session_dir TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      charged_total_tokens INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_dsh_session_charges_run ON dsh_session_charges(run_id)",
+  );
+
   // ── Worktree tracking ──
   // Tracks managed git worktrees created for run workspace isolation.
   db.exec(`
@@ -864,6 +903,242 @@ export function migrateInstantsToIsoZ(db: DatabaseSync): void {
       );
     }
   }
+}
+
+// ── DSH-OWNER per-session charge ledger ────────────────────────────
+//
+// One row per physical dsh session directory a native dsh round settled.
+// The transaction below is the ONLY writer of `runs.tokens_spent` for
+// native dsh rounds and is the idempotent single-charge mechanism:
+// repeated settlement of the same session directory adds only the
+// positive difference above the stored high-water mark, atomically with
+// the run counter update. Equal/lower observations are a no-op; a
+// conflicting foreign owner is refused; an absent run is refused without
+// consuming the charge identity.
+
+export interface DshSessionChargeResult {
+  /** "charged": a positive increment committed. "noop": nothing new to add. "refused": no charge (reason set). */
+  status: "charged" | "noop" | "refused";
+  /** Machine-readable refusal/noop reason (absent only for "charged"). */
+  reason?: string;
+  /** The increment actually committed to runs.tokens_spent (0 for noop/refused). */
+  chargedTokens: number;
+  /** The run's total after the charge (null when refused). */
+  tokensSpent: number | null;
+  /** The fixed workflow id of the charged run. */
+  workflowId?: string;
+  /** The run's DB status AFTER the charge (for post-terminal flush identity). */
+  runStatus?: string;
+}
+
+/**
+ * Apply one native-dsh settlement for one physical session directory.
+ *
+ * SYNCHRONOUS and self-contained: the caller must have already validated
+ * ownership (the session dir belongs to the invocation's owned root, and
+ * the invocation's receipt matches the dispatch identity). This function
+ * is the durable, atomic single-charge primitive:
+ *
+ *   1. BEGIN IMMEDIATE (serializes concurrent settlers via SQLite's write
+ *      lock). A caller already inside a transaction is REFUSED: releasing a
+ *      savepoint would not commit the outer transaction, so reporting the
+ *      increment as committed could let the caller emit an event for a
+ *      write a later ROLLBACK discards.
+ *   2. the target run MUST exist — otherwise refuse WITHOUT inserting a
+ *      ledger row (an absent run must not consume the charge identity);
+ *   3. read the ledger row:
+ *        - a row owned by a DIFFERENT run refuses (never re-own, never
+ *          first-caller-wins for the second caller);
+ *        - delta = observed − charged_total_tokens; delta <= 0 is a noop
+ *          (high-water marks never move down, nothing is written);
+ *   4. when delta > 0, update the ledger high-water mark AND
+ *      `runs.tokens_spent = tokens_spent + delta` (verifying exactly one
+ *      row changed) in the same transaction, then COMMIT — any failure
+ *      rolls back BOTH.
+ *
+ * Observed totals must be non-negative SAFE integers; they are never
+ * silently floored or truncated, and the accumulated counter is guarded
+ * against unsafe arithmetic.
+ */
+export function applyDshSessionCharge(params: {
+  sessionDir: string;
+  runId: string;
+  jobId: string;
+  observedTotalTokens: number;
+}): DshSessionChargeResult {
+  const { sessionDir, runId, jobId, observedTotalTokens } = params;
+
+  if (
+    typeof sessionDir !== "string" ||
+    sessionDir.length === 0 ||
+    typeof runId !== "string" ||
+    runId.length === 0 ||
+    typeof jobId !== "string" ||
+    jobId.length === 0 ||
+    !Number.isSafeInteger(observedTotalTokens) ||
+    observedTotalTokens < 0
+  ) {
+    return { status: "refused", reason: "invalid_charge_arguments", chargedTokens: 0, tokensSpent: null };
+  }
+  const observed = observedTotalTokens;
+
+  let db: DatabaseSync;
+  try {
+    db = getDb();
+  } catch (err) {
+    return {
+      status: "refused",
+      reason: `charge_database_error: ${err instanceof Error ? err.message : String(err)}`,
+      chargedTokens: 0,
+      tokensSpent: null,
+    };
+  }
+  try {
+    db.exec("BEGIN IMMEDIATE");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      status: "refused",
+      reason: /within a transaction/i.test(message)
+        ? "transaction_already_open"
+        : `charge_database_error: ${message}`,
+      chargedTokens: 0,
+      tokensSpent: null,
+    };
+  }
+  try {
+
+    const runRow = db
+      .prepare("SELECT workflow_id, tokens_spent, status FROM runs WHERE id = ?")
+      .get(runId) as { workflow_id: string; tokens_spent: number; status: string } | undefined;
+    if (!runRow) {
+      db.exec("COMMIT");
+      return { status: "refused", reason: "run_missing", chargedTokens: 0, tokensSpent: null };
+    }
+
+    const ledgerRow = db
+      .prepare(
+        "SELECT run_id, job_id, charged_total_tokens FROM dsh_session_charges WHERE session_dir = ?",
+      )
+      .get(sessionDir) as
+      | { run_id: string; job_id: string; charged_total_tokens: number }
+      | undefined;
+
+    if (ledgerRow !== undefined && ledgerRow.run_id !== runId) {
+      db.exec("COMMIT");
+      return {
+        status: "refused",
+        reason: "foreign_session_owner",
+        chargedTokens: 0,
+        tokensSpent: null,
+      };
+    }
+    // Same-run, DIFFERENT-job settlements of one session are also refused:
+    // the charge identity belongs to the exact invocation that first
+    // charged it, and a sibling job re-observing the same store would
+    // otherwise advance the shared high-water mark.
+    if (ledgerRow !== undefined && ledgerRow.job_id !== jobId) {
+      db.exec("COMMIT");
+      return {
+        status: "refused",
+        reason: "foreign_session_job",
+        chargedTokens: 0,
+        tokensSpent: null,
+      };
+    }
+
+    const highWater = ledgerRow?.charged_total_tokens ?? 0;
+    const delta = observed - highWater;
+    if (delta <= 0) {
+      db.exec("COMMIT");
+      return {
+        status: "noop",
+        reason: "no_new_usage_above_high_water",
+        chargedTokens: 0,
+        tokensSpent: runRow.tokens_spent,
+        workflowId: runRow.workflow_id,
+        runStatus: runRow.status,
+      };
+    }
+
+    if (!Number.isSafeInteger(runRow.tokens_spent + delta)) {
+      throw new Error(
+        `counter_overflow: ${runRow.tokens_spent} + ${delta} exceeds the safe-integer range`,
+      );
+    }
+
+    db.prepare(
+      `INSERT INTO dsh_session_charges
+         (session_dir, run_id, job_id, charged_total_tokens, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ${SQL_NOW_ISO}, ${SQL_NOW_ISO})
+       ON CONFLICT(session_dir) DO UPDATE SET
+         charged_total_tokens = excluded.charged_total_tokens,
+         updated_at = ${SQL_NOW_ISO}`,
+    ).run(sessionDir, runId, jobId, observed);
+    // Test-only failpoint: runs between the two writes so a regression can
+    // prove they roll back together.
+    _dshChargeFailpointForTest?.();
+    const update = db.prepare(
+      `UPDATE runs SET tokens_spent = tokens_spent + ?, updated_at = ${SQL_NOW_ISO} WHERE id = ?`,
+    ).run(delta, runId);
+    if ((update.changes ?? 0) !== 1) {
+      // The counter update must have landed exactly once; anything else
+      // rolls back BOTH statements rather than leaking the charge.
+      throw new Error(`run_counter_update_missed (changes=${String(update.changes)})`);
+    }
+
+    const after = db
+      .prepare("SELECT workflow_id, tokens_spent, status FROM runs WHERE id = ?")
+      .get(runId) as { workflow_id: string; tokens_spent: number; status: string };
+
+    db.exec("COMMIT");
+    return {
+      status: "charged",
+      chargedTokens: delta,
+      tokensSpent: after.tokens_spent,
+      workflowId: after.workflow_id,
+      runStatus: after.status,
+    };
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // SQLite may already have rolled back on a fatal error.
+    }
+    return {
+      status: "refused",
+      reason: `charge_database_error: ${err instanceof Error ? err.message : String(err)}`,
+      chargedTokens: 0,
+      tokensSpent: null,
+    };
+  }
+}
+
+/** Test-only failpoint executed between the ledger write and the run-counter write. */
+let _dshChargeFailpointForTest: (() => void) | null = null;
+
+/** @internal — test seam for the charge-rollback regression (DSH-OWNER). */
+export function _setDshChargeFailpointForTest(fn: (() => void) | null): void {
+  _dshChargeFailpointForTest = fn;
+}
+
+/**
+ * Read the charge-ledger row for one session directory (tests/diagnostics).
+ */
+export function getDshSessionCharge(sessionDir: string): {
+  session_dir: string;
+  run_id: string;
+  job_id: string;
+  charged_total_tokens: number;
+} | undefined {
+  const db = getDb();
+  return db
+    .prepare(
+      "SELECT session_dir, run_id, job_id, charged_total_tokens FROM dsh_session_charges WHERE session_dir = ?",
+    )
+    .get(sessionDir) as
+    | { session_dir: string; run_id: string; job_id: string; charged_total_tokens: number }
+    | undefined;
 }
 
 export function closeDb(): void {

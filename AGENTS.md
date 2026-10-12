@@ -1170,7 +1170,7 @@ outside the sandbox.
   table's `CREATE TABLE` statement keeps its original explicit column list,
   and nullable additions never touch explicit-column INSERTs or the status.ts
   SELECT column lists.
-- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 15). This is
+- ANY change to `migrate()` MUST bump `SCHEMA_VERSION` (currently 16). This is
   the WLST5.1 failure mode: adding a guarded ALTER without bumping leaves
   existing DBs (user_version === the old version) early-returning in
   `migrate()` and skipping the ALTER, so any SQL touching the new column
@@ -1178,14 +1178,16 @@ outside the sandbox.
   `applySchema()`, and `migrate()` now serializes cold-start migration across
   processes (`BEGIN IMMEDIATE` + bounded retry, re-reading `user_version`
   under the lock) so concurrent first-opens cannot race the guarded ALTERs.
-- ONE schema chain (UNION-PORT + LEDGER-DIAG v14 + MTLK-ISO-SLICE2 v15): the
+- ONE schema chain (UNION-PORT + LEDGER-DIAG v14 + MTLK-ISO-SLICE2 v15 +
+  DSH-OWNER v16): the
   main and Matchlock
   lineages each claimed a `v10`, and then each claimed a `v12` for a DIFFERENT
   column (`steps.preclaim_death_count` on main, `runs.matchlock_policy` on the
   Matchlock lineage), so the union port renumbers both into one idempotent
   chain whose pre-PREP-STATE top was `SCHEMA_VERSION = 14` (still the union +
-  LEDGER-DIAG top); MTLK-ISO-SLICE2 extends the same chain to the current
-  `SCHEMA_VERSION = 15`.
+  LEDGER-DIAG top); MTLK-ISO-SLICE2 extends the same chain to
+  `SCHEMA_VERSION = 15`, and the DSH-OWNER corrective extends it to the
+  current `SCHEMA_VERSION = 16`.
   `v9 -> v10` is `migrateInstantsToIsoZ()` (rewrites naive
   `YYYY-MM-DD HH:MM:SS` values to ISO-8601 UTC `...Z` in every timestamp
   column; idempotent, so it also normalizes a Matchlock-lineage DB that still
@@ -1203,18 +1205,24 @@ outside the sandbox.
   `"true"` only for an opted-in Matchlock run, NULL = native; written
   ATOMICALLY with the run's first INSERT alongside the initial non-schedulable
   `scheduling_status = 'preparing'` hold).
-  `migrate()` does NOT early-return for any `user_version < 15`; it classifies
+  `v15 -> v16` is the `dsh_session_charges` charge ledger (DSH-OWNER: ONE row
+  per physical dsh session directory a native dsh round settled; `session_dir`
+  is the charge identity — the same session is never charged into a second
+  run — and `charged_total_tokens` is the charge high-water mark, so a later
+  settlement charges only the positive difference). It is purely additive:
+  no existing column changes and run deletion never touches the ledger.
+  `migrate()` does NOT early-return for any `user_version < 16`; it classifies
   the starting lineage with the exported pure `detectSchemaLineage(db)` helper
   by reading `PRAGMA table_info` — never the colliding `user_version` alone:
   `main-v12` (preclaim present, matchlock absent), `union-v12` (matchlock
   present, preclaim absent), `pre-v14` (both union columns present but
   `suite_results.log_path` absent — a v13 DB, which must NOT be mistaken for
-  `current`), `pre-v12` (earlier/empty) and `current` (v15 with all three).
+  `current`), `pre-v12` (earlier/empty) and `current` (v16 with all three).
   The matchlock-lineage old v10/v12 column is kept as-is (the
   `pragma_table_info` guard on every ALTER stays authoritative), and
-  `migrateInstantsToIsoZ()` still runs for every DB below 15 so a
+  `migrateInstantsToIsoZ()` still runs for every DB below 16 so a
   matchlock-lineage DB with naive instants is normalized; the final stamp is
-  `user_version = 15`.
+  `user_version = 16`.
 - Migration coverage belongs in `src/db.test.ts` MIGV tests: build a legacy DB
   with raw pre-bump DDL + `PRAGMA user_version = <starting version>` in a temp
   HOME, open it through `getDb()` in a subprocess (import from `dist/db.js`,
@@ -1254,10 +1262,11 @@ cross-cutting wall-jump regression suite
   or missing instant is never stale (`isOlderThan()` returns `false`), so an
   unknown age cannot fabricate a recovery, expiration, or replay.
 - **Rule 3 — file mtimes keep OS-epoch semantics.** Daemon pidfile / start
-  lock provenance and dsh session "created since spawn" have no monotonic
-  analogue, so they stay epoch-based, but the age/since-spawn decision still
-  routes through the same `instantAgeMs()` / `isOlderThan()` helpers with
-  the same documented-tolerance discipline.
+  lock provenance has no monotonic analogue, so it stays epoch-based, but
+  the age decision still routes through the same `instantAgeMs()` /
+  `isOlderThan()` helpers with the same documented-tolerance discipline.
+  Tamandua-dispatched native dsh attribution is ownership-based (the round's
+  owned DSH-OWNER store), not session timestamps or "created since spawn".
 
 `tests/time-clocks-guard.test.ts` comment-blind scans `src/**/*.ts`
 (excluding `*.test.ts`) for raw `Date.now()` interval/deadline idioms and
@@ -1469,7 +1478,7 @@ step) are the SLOW complement of an instant fail and join the SAME
 K = 6 / N = 20 escalating backoff and cap with a distinct vocabulary: each
 death emits `step.preclaim_round_died` (exit code, signal, harness wall ms,
 bounded stderr tail) and increments `steps.preclaim_death_count`
-(the `v11 -> v12` step; the overall `SCHEMA_VERSION` is 15), the dispatch gate
+(the `v11 -> v12` step; the overall `SCHEMA_VERSION` is 16), the dispatch gate
 is `preclaim_death_backoff`, and the
 N-th death emits `run.preclaim_death_loop` then force-fails the run
 (`formatPreclaimDeathReason`). Any successful claim resets the counter and

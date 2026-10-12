@@ -110,6 +110,12 @@ export interface ScriptedAgentConfig {
   heartbeatTokens?: number;
   /** Default usage.totalTokens for work rounds (default 111). */
   defaultTokens?: number;
+  /**
+   * When true, work rounds complete normally but write NO fake session
+   * log at all — models a round whose own session never materialized, so
+   * the owned-store lookup settles UNOBSERVED (token degradation).
+   */
+  skipSessionLog?: boolean;
 }
 
 export interface InvocationLogEntry {

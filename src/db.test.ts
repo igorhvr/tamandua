@@ -10,7 +10,7 @@ import { createTempHome } from "../tests/helpers/test-env.ts";
 // We test the migration by directly importing getDb, which calls migrate().
 // But since getDb() uses a cached connection and resolves DB path from
 // env/home, we test the migration logic directly with an isolated DB.
-import { getDb, getDbPath, SCHEMA_VERSION, detectSchemaLineage, migrateInstantsToIsoZ, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults, _enableWalModeForTest, _acquireMigrationLockForTest } from "../dist/db.js";
+import { getDb, getDbPath, SCHEMA_VERSION, detectSchemaLineage, migrateInstantsToIsoZ, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults, _enableWalModeForTest, _acquireMigrationLockForTest, applyDshSessionCharge, getDshSessionCharge, _setDshChargeFailpointForTest } from "../dist/db.js";
 
 describe("PRAGMA synchronous", () => {
   let tempHome: string;
@@ -1391,11 +1391,11 @@ console.log(JSON.stringify({ version, rows }));
     }
   });
 
-  it("SCHEMA_VERSION is 15 (9->10 instants -> 10->11 target-moved reroute budget -> 11->12 preclaim death counter -> 12->13 matchlock policy -> 13->14 suite_results.log_path -> 14->15 PREP-STATE isolation_intent)", () => {
+  it("SCHEMA_VERSION is 16 (9->10 instants -> 10->11 target-moved reroute budget -> 11->12 preclaim death counter -> 12->13 matchlock policy -> 13->14 suite_results.log_path -> 14->15 PREP-STATE isolation_intent -> 15->16 DSH-OWNER dsh_session_charges)", () => {
     assert.equal(
       SCHEMA_VERSION,
-      15,
-      "SCHEMA_VERSION must be 15 after the union folds runs.matchlock_policy in as the v12->v13 step and LEDGER-DIAG adds suite_results.log_path as the v13->v14 step and MTLK-ISO-SLICE2 PREP-STATE adds runs.isolation_intent as the v14->v15 step; the full chain is 9->10 instants, 10->11 target_moved_reroute_count, 11->12 preclaim_death_count, 12->13 matchlock_policy, 13->14 suite_results.log_path, 14->15 isolation_intent",
+      16,
+      "SCHEMA_VERSION must be 16 after the union folds runs.matchlock_policy in as the v12->v13 step, LEDGER-DIAG adds suite_results.log_path as the v13->v14 step, MTLK-ISO-SLICE2 PREP-STATE adds runs.isolation_intent as the v14->v15 step, and DSH-OWNER adds the dsh_session_charges charge ledger as the v15->v16 step; the full chain is 9->10 instants, 10->11 target_moved_reroute_count, 11->12 preclaim_death_count, 12->13 matchlock_policy, 13->14 suite_results.log_path, 14->15 isolation_intent, 15->16 dsh_session_charges",
     );
   });
 
@@ -5755,5 +5755,402 @@ describe("MIGV union4 v14 + PREP-STATE v15 schema chain (every starting state)",
     assert.deepEqual(second.runCols, first.runCols, "no DDL: runs columns unchanged");
     assert.deepEqual(second.stepCols, first.stepCols, "no DDL: steps columns unchanged");
     assert.deepEqual(second.suiteCols, first.suiteCols, "no DDL: suite columns unchanged");
+  });
+});
+
+// ── DSH-OWNER: dsh_session_charges ledger (15 -> 16) ───────────────
+
+describe("DSH-OWNER dsh_session_charges ledger (v16)", () => {
+  let chargeHome: ReturnType<typeof createTempHome>;
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+  let origStateDir: string | undefined;
+
+  before(() => {
+    chargeHome = createTempHome("tamandua-dsh-charge-");
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    origStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = chargeHome.homeDir;
+    process.env.TAMANDUA_STATE_DIR = chargeHome.tamanduaDir;
+    delete process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    _setDshChargeFailpointForTest(null);
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    if (origDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = origDbPath;
+    if (origStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = origStateDir;
+  });
+
+  function insertChargeRun(id: string): void {
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'wf-dsh-charge', 'charge suite', 'running', '{}', ?, ?)",
+    ).run(id, now, now);
+  }
+
+  function chargeSpent(id: string): number {
+    const row = getDb().prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(id) as
+      | { tokens_spent: number }
+      | undefined;
+    return row?.tokens_spent ?? -1;
+  }
+
+  function ledgerRowCount(): number {
+    const row = getDb().prepare("SELECT COUNT(*) AS n FROM dsh_session_charges").get() as { n: number };
+    return row.n;
+  }
+
+  it("stamps a fresh DB at the current SCHEMA_VERSION with the ledger table present", () => {
+    const db = getDb();
+    const ver = db.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(ver.user_version, SCHEMA_VERSION);
+    const cols = (db.prepare("PRAGMA table_info(dsh_session_charges)").all() as Array<{ name: string }>)
+      .map((c) => c.name)
+      .sort();
+    assert.deepEqual(cols, [
+      "charged_total_tokens",
+      "created_at",
+      "job_id",
+      "run_id",
+      "session_dir",
+      "updated_at",
+    ]);
+  });
+
+  it("commits the first charge, records the high-water mark, and repeats as a strict no-op", () => {
+    const runId = "charge-run-1";
+    insertChargeRun(runId);
+
+    const first = applyDshSessionCharge({
+      sessionDir: "/sessions/s1",
+      runId,
+      jobId: "job-a",
+      observedTotalTokens: 250,
+    });
+    assert.equal(first.status, "charged");
+    assert.equal(first.chargedTokens, 250);
+    assert.equal(first.tokensSpent, 250);
+    assert.equal(chargeSpent(runId), 250);
+
+    const row = getDshSessionCharge("/sessions/s1");
+    assert.ok(row, "the charge identity must be readable back");
+    assert.equal(row!.charged_total_tokens, 250);
+    assert.equal(row!.run_id, runId);
+    assert.equal(row!.job_id, "job-a");
+
+    const second = applyDshSessionCharge({
+      sessionDir: "/sessions/s1",
+      runId,
+      jobId: "job-a",
+      observedTotalTokens: 250,
+    });
+    assert.equal(second.status, "noop");
+    assert.equal(second.chargedTokens, 0);
+    assert.equal(chargeSpent(runId), 250, "an equal re-settle must not move the counter");
+    assert.equal(ledgerRowCount(), 1);
+  });
+
+  it("charges only the delta above the high-water mark and never moves the mark down", () => {
+    const runId = "charge-run-2";
+    insertChargeRun(runId);
+
+    applyDshSessionCharge({ sessionDir: "/sessions/s2", runId, jobId: "job-b", observedTotalTokens: 250 });
+    const grown = applyDshSessionCharge({
+      sessionDir: "/sessions/s2",
+      runId,
+      jobId: "job-b",
+      observedTotalTokens: 370,
+    });
+    assert.equal(grown.status, "charged");
+    assert.equal(grown.chargedTokens, 120, "only the unaccounted increment");
+    assert.equal(chargeSpent(runId), 370);
+
+    const lower = applyDshSessionCharge({
+      sessionDir: "/sessions/s2",
+      runId,
+      jobId: "job-b",
+      observedTotalTokens: 300,
+    });
+    assert.equal(lower.status, "noop");
+    assert.equal(chargeSpent(runId), 370, "a lower observation must not move the mark down");
+    assert.equal(getDshSessionCharge("/sessions/s2")!.charged_total_tokens, 370);
+  });
+
+  it("refuses a foreign run and a foreign job; the first owner keeps the charge", () => {
+    insertChargeRun("charge-run-3a");
+    insertChargeRun("charge-run-3b");
+    applyDshSessionCharge({
+      sessionDir: "/sessions/s3",
+      runId: "charge-run-3a",
+      jobId: "job-c",
+      observedTotalTokens: 100,
+    });
+
+    const foreignRun = applyDshSessionCharge({
+      sessionDir: "/sessions/s3",
+      runId: "charge-run-3b",
+      jobId: "job-c",
+      observedTotalTokens: 999,
+    });
+    assert.equal(foreignRun.status, "refused");
+    assert.equal(foreignRun.reason, "foreign_session_owner");
+
+    const foreignJob = applyDshSessionCharge({
+      sessionDir: "/sessions/s3",
+      runId: "charge-run-3a",
+      jobId: "job-other",
+      observedTotalTokens: 999,
+    });
+    assert.equal(foreignJob.status, "refused");
+    assert.equal(foreignJob.reason, "foreign_session_job");
+
+    assert.equal(chargeSpent("charge-run-3a"), 100);
+    assert.equal(chargeSpent("charge-run-3b"), 0, "the loser's counter never moves");
+    assert.equal(getDshSessionCharge("/sessions/s3")!.charged_total_tokens, 100);
+  });
+
+  it("refuses a missing run WITHOUT consuming the charge identity", () => {
+    const missing = applyDshSessionCharge({
+      sessionDir: "/sessions/s4",
+      runId: "no-such-run",
+      jobId: "job-d",
+      observedTotalTokens: 500,
+    });
+    assert.equal(missing.status, "refused");
+    assert.equal(missing.reason, "run_missing");
+    assert.equal(getDshSessionCharge("/sessions/s4"), undefined, "a refused charge writes no ledger row");
+
+    insertChargeRun("charge-run-4");
+    const retry = applyDshSessionCharge({
+      sessionDir: "/sessions/s4",
+      runId: "charge-run-4",
+      jobId: "job-d",
+      observedTotalTokens: 500,
+    });
+    assert.equal(retry.status, "charged");
+    assert.equal(retry.chargedTokens, 500);
+    assert.equal(chargeSpent("charge-run-4"), 500);
+  });
+
+  it("refuses invalid arguments outright", () => {
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const res = applyDshSessionCharge({
+        sessionDir: "/sessions/s5",
+        runId: "r",
+        jobId: "j",
+        observedTotalTokens: bad,
+      });
+      assert.equal(res.status, "refused");
+      assert.equal(res.reason, "invalid_charge_arguments");
+    }
+    const emptyDir = applyDshSessionCharge({
+      sessionDir: "",
+      runId: "r",
+      jobId: "j",
+      observedTotalTokens: 1,
+    });
+    assert.equal(emptyDir.reason, "invalid_charge_arguments");
+    assert.equal(getDshSessionCharge("/sessions/s5"), undefined);
+  });
+
+  it("rolls back BOTH writes when the counter update fails (failpoint regression)", () => {
+    const runId = "charge-run-6";
+    insertChargeRun(runId);
+    try {
+      _setDshChargeFailpointForTest(() => {
+        throw new Error("failpoint: before the counter write");
+      });
+      const res = applyDshSessionCharge({
+        sessionDir: "/sessions/s6",
+        runId,
+        jobId: "job-f",
+        observedTotalTokens: 777,
+      });
+      assert.equal(res.status, "refused");
+      assert.match(String(res.reason), /charge_database_error/);
+    } finally {
+      _setDshChargeFailpointForTest(null);
+    }
+    assert.equal(chargeSpent(runId), 0, "the counter update rolled back");
+    assert.equal(getDshSessionCharge("/sessions/s6"), undefined, "the ledger insert rolled back with it");
+
+    // The rollback consumed nothing: a clean retry commits in full.
+    const retry = applyDshSessionCharge({
+      sessionDir: "/sessions/s6",
+      runId,
+      jobId: "job-f",
+      observedTotalTokens: 777,
+    });
+    assert.equal(retry.status, "charged");
+    assert.equal(retry.chargedTokens, 777);
+    assert.equal(chargeSpent(runId), 777);
+  });
+});
+
+// ── DSH-OWNER migration: a genuine v15 DB reaches v16 ──────────────
+
+describe("DSH-OWNER migration: a genuine v15 DB reaches v16 with a working ledger", () => {
+  function migvDistDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  function runMigvSubprocess(th: { homeDir: string }, dbPath: string, script: string): string {
+    return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: migvDistDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    }).trim();
+  }
+
+  /**
+   * A faithful V15 shape: every column the chain had produced by v15,
+   * INCLUDING runs.isolation_intent (the 14->15 step) and
+   * suite_results.log_path (13->14), plus steps.preclaim_death_count. A
+   * v15-stamped seed missing those columns would only exercise the
+   * pragma-guarded ALTERs, not the real upgrade path.
+   */
+  const V15_DDL = `
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      run_number INTEGER,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      notify_url TEXT,
+      scheduling_status TEXT,
+      scheduling_requested_at TEXT,
+      scheduling_error TEXT,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      parent_run_id TEXT,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      test_cmd_established TEXT,
+      test_cmd_source TEXT,
+      harness_probe_status TEXT,
+      harness_probe_at TEXT,
+      matchlock_policy TEXT,
+      isolation_intent TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      input_template TEXT NOT NULL,
+      expects TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      preclaim_death_count INTEGER NOT NULL DEFAULT 0,
+      target_moved_reroute_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE suite_results (
+      id INTEGER PRIMARY KEY,
+      origin_repo TEXT NOT NULL,
+      tree_hash TEXT NOT NULL,
+      cmd_hash TEXT NOT NULL,
+      cmd_display TEXT NOT NULL,
+      exit_code INTEGER NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      log_tail TEXT,
+      log_path TEXT,
+      run_id TEXT,
+      step_id TEXT,
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+    VALUES ('legacy-run', 'wf-legacy', 'legacy task', 'running', '{}', 42, '2026-01-02T03:04:05.000Z', '2026-01-02T03:04:06.000Z');
+    PRAGMA user_version = 15;
+  `;
+
+  const MIGV_V15_CHARGE_SCRIPT = [
+    `import { getDb, SCHEMA_VERSION, _migrateFullRuns, applyDshSessionCharge, getDshSessionCharge } from ${JSON.stringify(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "db.js"))};`,
+    "const db = getDb();",
+    'const cols = db.prepare("PRAGMA table_info(dsh_session_charges)").all().map((c) => c.name).sort();',
+    'const ver = db.prepare("PRAGMA user_version").get().user_version;',
+    'const charge = applyDshSessionCharge({ sessionDir: "/migrated/s1", runId: "legacy-run", jobId: "legacy-job", observedTotalTokens: 250 });',
+    'const run = db.prepare("SELECT status, tokens_spent FROM runs WHERE id = ?").get("legacy-run");',
+    'const ledger = getDshSessionCharge("/migrated/s1") ?? null;',
+    "console.log(JSON.stringify({ cols, ver, schemaVersion: SCHEMA_VERSION, charge, run, ledger, fullRuns: _migrateFullRuns }));",
+  ].join("\n");
+
+  const MIGV_V15_REOPEN_SCRIPT = [
+    `import { getDb, _migrateFullRuns } from ${JSON.stringify(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "db.js"))};`,
+    "const db = getDb();",
+    'const ver = db.prepare("PRAGMA user_version").get().user_version;',
+    'const ledgerCount = db.prepare("SELECT COUNT(*) AS n FROM dsh_session_charges").get().n;',
+    'const tokens = db.prepare("SELECT tokens_spent FROM runs WHERE id = ?").get("legacy-run").tokens_spent;',
+    "console.log(JSON.stringify({ ver, ledgerCount, tokens, fullRuns: _migrateFullRuns }));",
+  ].join("\n");
+
+  it("creates the ledger and stamps v16 on the first open, then re-opens idempotently", () => {
+    const th = createTempHome("tamandua-dsh-migv15-");
+    const dbPath = path.join(th.root, "v15.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(V15_DDL);
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, 15, "precondition: the seed is a genuine v15 DB");
+    legacyDb.close();
+
+    const first = JSON.parse(runMigvSubprocess(th, dbPath, MIGV_V15_CHARGE_SCRIPT)) as {
+      cols: string[];
+      ver: number;
+      schemaVersion: number;
+      charge: { status: string; chargedTokens: number };
+      run: { status: string; tokens_spent: number };
+      ledger: { charged_total_tokens: number } | null;
+      fullRuns: number;
+    };
+    assert.equal(first.ver, SCHEMA_VERSION);
+    assert.equal(first.ver, 16, "a v15 DB must be re-stamped to v16");
+    assert.deepEqual(first.cols, [
+      "charged_total_tokens",
+      "created_at",
+      "job_id",
+      "run_id",
+      "session_dir",
+      "updated_at",
+    ]);
+    assert.equal(first.fullRuns, 1, "the first open must take the full migration path");
+    assert.equal(first.charge.status, "charged");
+    assert.equal(first.charge.chargedTokens, 250);
+    assert.equal(first.run.status, "running", "pre-existing run data survives the upgrade");
+    assert.equal(first.run.tokens_spent, 42 + 250, "the charge composes with existing spend");
+    assert.ok(first.ledger);
+    assert.equal(first.ledger!.charged_total_tokens, 250);
+
+    const second = JSON.parse(runMigvSubprocess(th, dbPath, MIGV_V15_REOPEN_SCRIPT)) as {
+      ver: number;
+      ledgerCount: number;
+      tokens: number;
+      fullRuns: number;
+    };
+    assert.equal(second.ver, 16);
+    assert.equal(second.fullRuns, 0, "the second open early-returns (no DDL)");
+    assert.equal(second.ledgerCount, 1, "the charge row survives the re-open");
+    assert.equal(second.tokens, 42 + 250);
   });
 });

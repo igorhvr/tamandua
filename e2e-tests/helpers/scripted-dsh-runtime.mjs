@@ -9,12 +9,17 @@
  *     the end (plain text, no JSON, no streaming, no session trailer)
  *   - stderr: EMPTY on success (`dsh: <code>: <message>` only on failure)
  *   - exit code: 0 on completion, non-zero on failure
- *   - usage: never printed — recorded in the session log at
- *     $DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd
+ *   - usage: never printed — recorded in the session log under the
+ *     session-persistence root. Tamandua dispatches each native dsh
+ *     invocation with a per-invocation `--patch` overlay redirecting that
+ *     root (DSH-OWNER); this runtime honors it when present
+ *     (`<overlay root>/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd`)
+ *     and otherwise falls back to the shared
+ *     `$DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd`.
  *
  * Token attribution: after each work round this runtime writes a fake
  * session.v3.jsonl.zstd (a real zstd-compressed dsh >= 0.1.5 session log)
- * under the temp $DSH_HOME so the scheduler's session-file lookup
+ * into that root so the scheduler's owned-store lookup
  * (dsh-usage.ts → lookupDshSessionTokens) can attribute per-round tokens
  * end to end.
  *
@@ -26,8 +31,9 @@
  *   3. Run `step claim`, look up this agent's scripted behavior, apply file
  *      edits / shell commands in the harness workdir, then report via
  *      `step complete` / `step fail`
- *   4. Write the fake session log to $DSH_HOME/sessions/<escaped-cwd>/
- *      session-<uuid>/session.v3.jsonl.zstd with configurable token counts
+ *   4. Write the fake session log to the overlay- (or $DSH_HOME-) resolved
+ *      session root: <root>/<escaped-cwd>/session-<uuid>/session.v3.jsonl.zstd
+ *      with configurable token counts
  *
  * Behaviors come from a JSON file (TAMANDUA_SCRIPTED_BEHAVIORS), keyed by the
  * short agent id. Same format as the pi/hermes runtimes.
@@ -67,8 +73,33 @@ import {
 // We don't validate the exact sequence — dsh adheres to this contract.
 const prompt = process.argv[process.argv.length - 1] ?? "";
 
+// ── DSH-OWNER session-root resolution ───────────────────────────────
+// The dispatcher passes a per-invocation session-persistence overlay as
+// `--patch <path>` (a launcher flag before the prompt). When the overlay
+// is readable and names a `root:`, the session log must land under that
+// root — exactly like real dsh; otherwise (standalone spawns) fall back
+// to the shared `$DSH_HOME/sessions` layout. Never fatal.
+const argv = process.argv.slice(2);
+let sessionRootOverride = null;
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === "--patch" && i + 1 < argv.length) {
+    try {
+      const overlayText = fs.readFileSync(argv[i + 1], "utf-8");
+      const m = /^\s*root:\s*"(.+)"\s*$/m.exec(overlayText);
+      if (m) sessionRootOverride = m[1];
+    } catch {
+      // Unreadable overlay — fall back to $DSH_HOME.
+    }
+  }
+}
+
 const behaviorsPath = process.env.TAMANDUA_SCRIPTED_BEHAVIORS ?? "";
 const stateDir = process.env.TAMANDUA_SCRIPTED_STATE ?? "";
+
+// Set after the behaviors config loads; suppresses the fake session-log
+// write for the token-degradation scenario (see ScriptedAgentConfig
+// skipSessionLog).
+let skipSessionLogWrites = false;
 
 // ── State-dir logging (test diagnostics) ────────────────────────────
 
@@ -99,12 +130,14 @@ function emitOutput(text) {
 
 // ── Fake session.v3.jsonl.zstd for token accounting ─────────────────
 //
-// The scheduler calls lookupDshSessionTokens(spawnedAtMs, workdir) after
-// each round. That function scans $DSH_HOME/sessions/<escaped-cwd>/ for
-// session dirs created since the round started and decompresses the
-// newest session.v3.jsonl.zstd. We must write the file BEFORE exiting so
-// it is available (the dsh adapter waits for the child to exit before the
-// lookup runs).
+// The scheduler calls the owned-store lookup
+// (`lookupDshSessionTokens({ ownedRoot, workdir })`) after each round;
+// this runtime must write its session log BEFORE exiting so the file is
+// available (the dsh adapter waits for the child to exit before the
+// lookup runs). When the dispatcher passed a `--patch` persistence
+// overlay, the log goes under the overlay's `root:` (DSH-OWNER); a
+// standalone spawn without one falls back to
+// `$DSH_HOME/sessions/<escaped-cwd>/`.
 
 /**
  * Encode a cwd as dsh's per-project session directory key. Replicates
@@ -159,8 +192,10 @@ function compressZstd(buffer) {
 }
 
 /**
- * Write the fake session log under
- * $DSH_HOME/sessions/<escaped-cwd>/session-<sessionId>/session.v3.jsonl.zstd
+ * Write the fake session log under the resolved session root — the
+ * `--patch` overlay's `root:` when one was passed (DSH-OWNER), otherwise
+ * `$DSH_HOME/sessions` — as
+ * <root>/<escaped-cwd>/session-<sessionId>/session.v3.jsonl.zstd
  * with usage totaling the given token count.
  *
  * The log is a real zstd-compressed dsh >= 0.1.5 (format v3) session.jsonl:
@@ -175,11 +210,26 @@ function compressZstd(buffer) {
  */
 function writeSessionLog(sessionId, tokens) {
   try {
-    const dshHome = process.env.DSH_HOME;
-    if (!dshHome) {
-      // No DSH_HOME set — token attribution degrades (null).
-      logInvocation({ phase: "session-file", note: "DSH_HOME not set, skipping session log write" });
+    if (skipSessionLogWrites) {
+      // Behavior flag (config.skipSessionLog): the round completed but its
+      // own session never materialized — the degradation case.
+      logInvocation({
+        phase: "session-file",
+        note: "skipSessionLog behavior: session log write suppressed",
+      });
       return;
+    }
+    let root;
+    if (sessionRootOverride) {
+      root = sessionRootOverride;
+    } else {
+      const dshHome = process.env.DSH_HOME;
+      if (!dshHome) {
+        // No overlay and no DSH_HOME — token attribution degrades (null).
+        logInvocation({ phase: "session-file", note: "no session root available, skipping session log write" });
+        return;
+      }
+      root = path.join(dshHome, "sessions");
     }
 
     // Distribute totalTokens across input/output, matching the scripted
@@ -193,8 +243,13 @@ function writeSessionLog(sessionId, tokens) {
     const header = JSON.stringify({
       type: "session",
       version: 3,
-      id: sessionId,
+      // Real dsh names both the directory and the header id
+      // `session-<uuid>` (encodeSegment(id) === dirName), and always
+      // writes `isSeeded` — mirror that exactly so the owned-store
+      // reader's header classification and name binding accept it.
+      id: `session-${sessionId}`,
       createdAt: Date.now(),
+      isSeeded: false,
       delegationDepth: 0,
     });
     const now = Date.now();
@@ -221,8 +276,7 @@ function writeSessionLog(sessionId, tokens) {
     const lines = [header, message].join("\n") + "\n";
 
     const sessionDir = path.join(
-      dshHome,
-      "sessions",
+      root,
       projectKeyOf(process.cwd()),
       `session-${sessionId}`,
     );
@@ -280,6 +334,7 @@ const cli = createCli(cliPath);
 // ── Behaviors config ────────────────────────────────────────────────
 
 const config = loadBehaviors(behaviorsPath);
+skipSessionLogWrites = config.skipSessionLog === true;
 
 function behaviorForInvocation(index) {
   return sharedBehaviorForInvocation(config, agentId, shortAgent, index);
