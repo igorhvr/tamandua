@@ -64,6 +64,17 @@ v5.2 refinements:
   * TARGET SIGNAL DEFAULTING: the target resets INT/TERM/HUP/QUIT to SIG_DFL (the supervisor's
     ignores must not swallow Ctrl-C/external TERM intended for the command under test).
 
+v5.8 (icebox W3 v1: OSC-title interference; sanctioned fix under the v5.6 freeze):
+  * OSC-STRIP FOR MATCHING: wait_for and require patterns are matched against an OSC-free
+    projection of the stream (buf keeps the raw bytes; log/forbid/vm-id scan/tail
+    unchanged). The guest shells load system-wide oh-my-zsh (icebox Pillar A); its preexec
+    hook emits an OSC-2 title containing the command text with prompt expansion applied
+    ("$?" substituted with the STALE prior status, "$(...)" executed), so a title could
+    satisfy a literal receipt wait BEFORE the command ran (W3 v1 w3-a: E2-SUDO-RC-0-END
+    matched at t+0.01 s; the next send then desynced into the still-running command).
+    Titles are terminal metadata, never program output. Non-OSC escapes (CSI etc.) are
+    preserved; split-read sequences are handled; res.osc_stripped counts dropped sequences.
+
 Driver exit: 0 = PASS, 1 = FAIL. Result: OUTDIR/<name>.json (+ raw log; case copy).
 """
 import fcntl, json, os, pty, re, select, shutil, signal, struct, subprocess, sys, time, termios, traceback
@@ -105,6 +116,63 @@ def same_terminal(a, b):
     if (a.get("lflag") & ~_VOLATILE_LFLAG) != (b.get("lflag") & ~_VOLATILE_LFLAG):
         return False
     return True
+
+
+def strip_osc(data, state):
+    """Drop OSC sequences (ESC ] ... BEL | ESC-backslash) from a byte chunk (v5.8).
+
+    Builds the OSC-free projection used for wait_for/require matching (see the v5.8 note):
+    terminal titles carry prompt-expanded command text and must never satisfy a receipt.
+    Stateful across chunks (`state` dict: mode/osc_len/count), so a sequence split across
+    reads stays dropped. Everything except OSC passes through byte-for-byte.
+    """
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        mode = state["mode"]
+        if mode == b"esc":  # the previous byte was ESC (outside OSC)
+            b = data[i:i+1]
+            if b == b"]":
+                state["mode"] = b"osc"
+                state["count"] += 1
+                state["osc_len"] = 0
+            else:
+                out += b"\x1b"
+                if b == b"\x1b":
+                    pass  # this ESC becomes the pending one
+                else:
+                    out += b
+                    state["mode"] = b""
+            i += 1
+            continue
+        if mode == b"osc-esc":  # an ESC inside OSC: ST is ESC-backslash
+            b = data[i:i+1]
+            if b == b"\\":
+                state["mode"] = b""
+            elif b == b"\x1b":
+                state["mode"] = b"osc-esc"
+            else:
+                state["mode"] = b"osc"
+            i += 1
+            continue
+        if mode == b"osc":  # dropping until BEL or ESC
+            b = data[i:i+1]
+            state["osc_len"] += 1
+            if b == b"\x07":
+                state["mode"] = b""
+            elif b == b"\x1b":
+                state["mode"] = b"osc-esc"
+            elif state["osc_len"] > 65536:
+                state["mode"] = b""  # fail-safe: an unterminated sequence stops swallowing
+            i += 1
+            continue
+        b = data[i:i+1]
+        if b == b"\x1b":
+            state["mode"] = b"esc"
+        else:
+            out += b
+        i += 1
+    return bytes(out)
 
 
 def group_alive(pgid):
@@ -389,8 +457,10 @@ def main():
 
     res["child_pid"] = None
     buf = bytearray()
+    cbuf = bytearray()  # OSC-free projection; wait/require matching runs on THIS (v5.8)
+    osc_state = {"mode": b"", "osc_len": 0, "count": 0}
     log = open(logp, "wb")
-    search_from = 0
+    search_from = 0  # cursor into cbuf
     master_open = True
     disconnected = False
     status_holder = {"val": None, "known": False}
@@ -431,6 +501,7 @@ def main():
             return
         if data:
             buf.extend(data)
+            cbuf.extend(strip_osc(data, osc_state))
             log.write(data)
             log.flush()
 
@@ -446,7 +517,7 @@ def main():
 
     def match_from_buffer(pat, rx):
         nonlocal search_from
-        hay = bytes(buf[search_from:])
+        hay = bytes(cbuf[search_from:])
         if rx:
             m = rx.search(hay)
             if m:
@@ -528,7 +599,7 @@ def main():
                 early = False
                 while time.monotonic() < wdl:
                     pump(0.4)
-                    hay = bytes(buf[search_from:])
+                    hay = bytes(cbuf[search_from:])
                     if rx:
                         m = rx.search(hay)
                         if m:
@@ -773,6 +844,7 @@ def main():
         # ---- forbid + require + VM ids + verdict -----------------------------------
         try:
             text = bytes(buf).decode("utf-8", "replace")
+            ctext = bytes(cbuf).decode("utf-8", "replace")
             for pat in case.get("forbid", []) or []:
                 try:
                     if re.search(pat, text):
@@ -781,11 +853,12 @@ def main():
                     fail(f"invalid forbid pattern {pat!r}: {e}")
             for pat in case.get("require", []) or []:
                 try:
-                    if not re.search(pat, text):
+                    if not re.search(pat, ctext):
                         fail(f"required end-state pattern {pat!r} absent from output")
                 except re.error as e:
                     fail(f"invalid require pattern {pat!r}: {e}")
             res["vm_ids_seen"] = sorted(set(re.findall(r"vm-[0-9a-f]{8}", text)))
+            res["osc_stripped"] = osc_state["count"]
             res["tail"] = text[-1200:]
         except Exception:
             pass

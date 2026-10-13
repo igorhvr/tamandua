@@ -358,7 +358,10 @@ screen_block(){ local uid=$1 h="$X/h${1}scr" S="mx$1"
   eq "$C2" "$C1" "uid $uid: Ctrl-A c added no window (escape rebound)"
   att '' "$X/att3-$uid.out"; eq "$?" "0" "uid $uid: attach round 3 rc"
   python3 "$X/strip.py" "$X/att3-$uid.out" "$X/att3-$uid.clean"
-  local D; D=$(grep -cE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' "$X/att3-$uid.clean" || true)
+  # v1.1 TIME-OF-DAY FIX (2026-10-13): screen's %c renders a SPACE-padded hour before
+  # 10:00 ("2026-10-13  0:30"), so the strict two-digit hour never matches at hours 0-9
+  # and the assert false-reds every nightly run. Accept 1-2 digits after one or more spaces.
+  local D; D=$(grep -cE '[0-9]{4}-[0-9]{2}-[0-9]{2} +[0-9]{1,2}:[0-9]{2}' "$X/att3-$uid.clean" || true)
   [ "$D" -ge 1 ] && ok "uid $uid: operator hardstatus rendered (date in bar)" || bad "uid $uid: hardstatus bar not rendered"
   sj screen -S "$S" -X quit >/dev/null 2>&1 || true
 }

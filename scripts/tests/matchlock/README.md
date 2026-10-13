@@ -221,7 +221,7 @@ compose around it).
 | `lib/manifest.sh` | The REQUESTED manifest recorded before execution; tier/case status is `UNEXECUTED`/`PASS`/`FAIL` | bash (sourced) | no | none | `<evidence-dir>/manifest/` |
 | `lib/image-store.sh` | Private, fully usable per-run matchlock image store seeded from the operator store (hardlinked blobs, independent mutable metadata) | bash (sourced) | no | none | `<evidence-dir>/image-store/` |
 | `lib/lock.sh` | The shared gate lock acquired at one layer only (`MTLK_GATE_LOCK_HELD` handshake, no nesting) | bash (sourced) | no | none | `<evidence-dir>/lock.txt` |
-| `runner/pty-drive.py` | The frozen PTY driver v5.7 (sha256 `75667065ab885728365e985141345055fae2360d9978163479c4c1ad3f3a382d`); no node port | python3 | yes (t2/t3/t4) | none | `<evidence-dir>/<case>/driver.log` |
+| `runner/pty-drive.py` | The frozen PTY driver v5.8 (sha256 `156ddeb2d8ee5cf84057ae6d5535e87c12d999e43395986a6b60f13f00ff3c57`; v5.7 reference + the sanctioned OSC-free match projection); no node port | python3 | yes (t2/t3/t4) | none | `<evidence-dir>/<case>/driver.log` |
 | `runner/pty-selftest.sh` | The driver behavioral self-test (fixture processes only) | bash + python3 | no | none | `<evidence-dir>/T1/pty-selftest.log` |
 | `runner/run-case.sh` | Per-case wrapper: fail-closed BEFORE/AFTER inventory, case-scoped ownership, exact-destination mount write-through, `case-summary.json` | bash | yes (t2/t3/t4) | none | `<evidence-dir>/<case>/` |
 | `runner/run-cases.sh` | Sequential manifest-aware orchestration: pty-selftest first, per-case hygiene, `HALTED` on first failure, `MATRIX-PHASE-DONE` only on full requested success | bash | yes (t2/t3/t4) | none | `<evidence-dir>/matrix/` |

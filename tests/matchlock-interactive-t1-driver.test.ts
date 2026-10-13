@@ -26,8 +26,8 @@ const selftestPath = path.join(
   "pty-selftest.sh",
 );
 
-/** The frozen driver content hash the self-test must self-report. */
-const FROZEN_DRIVER_SHA256 = "75667065ab885728365e985141345055fae2360d9978163479c4c1ad3f3a382d";
+/** The frozen driver content hash the self-test must self-report (v5.8). */
+const FROZEN_DRIVER_SHA256 = "156ddeb2d8ee5cf84057ae6d5535e87c12d999e43395986a6b60f13f00ff3c57";
 
 /** The self-test needs a generous ceiling: it intentionally exercises multi-second sleeps. */
 const SELFTEST_TIMEOUT_MS = 300_000;

@@ -67,7 +67,7 @@ describe("dead-worker-recovery", () => {
 /** A pid that is guaranteed dead: spawn a no-op process and let it exit. */
 function deadPid(): number {
   const r = spawnSync("true");
-  return r.pid ?? 999999;
+  return r.pid ?? 2000009999;
 }
 
 function seedRunWithRunningStep(opts: {
@@ -203,7 +203,7 @@ describe("recoverStepsWithDeadWorkers (C18)", () => {
     const { spawnSync } = await import("node:child_process");
     // A pgid guaranteed dead: a short-lived detached leader that already exited.
     const r = spawnSync("true");
-    const deadGroup = r.pid ?? 999998;
+    const deadGroup = r.pid ?? 2000009998;
 
     const { stepId } = seedRunWithRunningStep({
       claimPid: deadPid(),
@@ -624,7 +624,7 @@ function seedWatchdogStep(opts: {
   db.prepare(
     `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
        retry_count, max_retries, claim_pid, claim_pgid, claim_job_id, claim_updated_at, created_at, updated_at)
-     VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 99999, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 2000009001, ?, ?, ?, ?, ?)`,
   ).run(stepId, runId, opts.claimPgid, opts.claimJobId, ago, ago, ago);
 
   return { runId, stepId };
@@ -632,7 +632,7 @@ function seedWatchdogStep(opts: {
 
 describe("checkRunningWorkersLiveness — WDGM defense-in-depth", () => {
   // Unique dead pgid per test to avoid collisions across tests sharing a DB.
-  let deadPgidSeq = 90000;
+  let deadPgidSeq = 2000000000;
   function nextDeadPgid(): number { return deadPgidSeq++; }
 
   it("skips recovery when claim_pgid is dead but a live inFlightChild exists for claim_job_id (WDGM)", async () => {
@@ -2282,7 +2282,7 @@ describe("ABN2 sweep-level resilience — per-step try/catch", () => {
     const db = getDb();
 
     // Use unique dead pgids to avoid collisions
-    let pgidSeq = 95000;
+    let pgidSeq = 2000001000;
     const nextPgid = () => pgidSeq++;
 
     seedWatchdogStep({ claimPgid: nextPgid(), claimJobId: "job-sweep-a", backdateSeconds: 60 });
@@ -2305,7 +2305,7 @@ describe("ABN2 sweep-level resilience — per-step try/catch", () => {
     const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
     const db = getDb();
 
-    let pgidSeq = 95100;
+    let pgidSeq = 2000001100;
     const nextPgid = () => pgidSeq++;
 
     seedWatchdogStep({ claimPgid: nextPgid(), claimJobId: "job-sweep-c", backdateSeconds: 60 });
@@ -2338,6 +2338,15 @@ describe("ABN2 sweep-level resilience — per-step try/catch", () => {
  * type='loop', a dead claim_pgid, and claim_updated_at backdated past
  * the 30s LIVENESS_GRACE_PERIOD_MS.
  */
+function assertPgidDead(pgid: number, where: string): void {
+  try {
+    process.kill(-pgid, 0);
+    throw new Error(`seed pgid ${pgid} must be unallocatable but a live group exists (${where})`);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+  }
+}
+
 function seedWatchdogStoryRun(opts: {
   claimPgid: number;
   claimJobId?: string | null;
@@ -2369,19 +2378,20 @@ function seedWatchdogStoryRun(opts: {
        status, retry_count, max_retries, type, current_story_id, loop_config,
        claim_pid, claim_pgid, claim_job_id, claim_updated_at, created_at, updated_at)
      VALUES (?, ?, 'implement', ?, 0, 'Implement', '', 'running', 0, 4, 'loop', ?, ?,
-             99999, ?, ?, ?, ?, ?)`,
+             2000009000, ?, ?, ?, ?, ?)`,
   ).run(
     stepRowId, runId, opts.agentId ?? "wf-dead_dev",
     storyRowId, JSON.stringify({ over: "stories" }),
     opts.claimPgid, opts.claimJobId ?? "job-wdgm-story", ago, ago, ago,
   );
 
+  assertPgidDead(opts.claimPgid, "seedWatchdogStoryRun");
   return { runId, storyRowId, stepRowId };
 }
 
 describe("ABN2 US-006 — Incident shape: dead PGID, story recovers via liveness watchdog", () => {
   // Unique dead pgid per test to avoid collisions across tests sharing a DB.
-  let deadPgidSeq2 = 98000;
+  let deadPgidSeq2 = 2000002000;
   function nextDeadPgid2(): number { return deadPgidSeq2++; }
 
   // Ensure story_abandonments table exists (a previous ABN2 resilience
@@ -2510,7 +2520,7 @@ describe("ABN2 US-006 — Incident shape: dead PGID, story recovers via liveness
 // ══════════════════════════════════════════════════════════════════════
 
 describe("ABN2 US-007 — Telemetry-write failure does not prevent recovery", () => {
-  let deadPgidSeq3 = 99000;
+  let deadPgidSeq3 = 2000003000;
   function nextDeadPgid3(): number { return deadPgidSeq3++; }
 
   // Ensure story_abandonments table is recreated for subsequent tests

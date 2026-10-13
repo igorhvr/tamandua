@@ -2,9 +2,11 @@
  * MTLK-INTERACTIVE-SUITE US-002 — the PTY driver is FROZEN.
  *
  * The proven Python PTY driver (`scripts/tests/matchlock/runner/pty-drive.py`,
- * v5.7) is ported into the repo byte-for-byte from the preserved reference
- * campaign sources. It is deliberately NOT ported to node and MUST NOT be
- * edited in-repo: this test pins its content hash so any drift is caught, and
+ * v5.7; sanctioned revision v5.8 — OSC-free match projection) is ported into
+ * the repo byte-for-byte from the preserved reference campaign sources. It is
+ * deliberately NOT ported to node and MUST NOT be edited in-repo without a
+ * sanctioned revision that updates these pins: this test pins its content
+ * hash so any drift is caught, and
  * asserts the file carries no machine-specific absolute paths (the reference
  * sources contain environment-specific paths that must never leak into the
  * suite).
@@ -32,11 +34,11 @@ const selftestPath = path.join(
   "pty-selftest.sh",
 );
 
-/** The frozen driver v5.7 content hash from the reference manifest. */
-const FROZEN_DRIVER_SHA256 = "75667065ab885728365e985141345055fae2360d9978163479c4c1ad3f3a382d";
+/** The frozen driver v5.8 content hash (v5.7 reference + the sanctioned revision). */
+const FROZEN_DRIVER_SHA256 = "156ddeb2d8ee5cf84057ae6d5535e87c12d999e43395986a6b60f13f00ff3c57";
 
-/** The frozen self-test content hash from the reference manifest. */
-const FROZEN_SELFTEST_SHA256 = "2315ed7a50cd94260c427c0c86e3b15e779242f3585493c0bd0a0ea7decd80f8";
+/** The frozen self-test content hash (v5.8). */
+const FROZEN_SELFTEST_SHA256 = "a54775bc992f1c89af3caa7cde6f40dbe2bd9149a03ba1b9e9a5db5d6c6e17f0";
 
 /**
  * Absolute-path prefixes that identify a specific machine/operator checkout.
@@ -59,7 +61,7 @@ describe("Matchlock interactive driver is frozen (MTLK-INTERACTIVE-SUITE US-002)
     assert.equal(
       sha256(driverPath),
       FROZEN_DRIVER_SHA256,
-      "pty-drive.py must be byte-for-byte the frozen v5.7 reference driver",
+      "pty-drive.py must be byte-for-byte the frozen driver revision (v5.8)",
     );
   });
 
@@ -69,7 +71,7 @@ describe("Matchlock interactive driver is frozen (MTLK-INTERACTIVE-SUITE US-002)
     assert.equal(
       sha256(selftestPath),
       FROZEN_SELFTEST_SHA256,
-      "pty-selftest.sh must be byte-for-byte the frozen reference self-test",
+      "pty-selftest.sh must be byte-for-byte the frozen self-test revision (v5.8)",
     );
   });
 

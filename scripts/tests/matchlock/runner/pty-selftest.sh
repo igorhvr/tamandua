@@ -219,6 +219,68 @@ ck "$(run_case "$T/c22.json" "$T/o22")" 1 "deadline-ceiling-rc1"
 ck "$(jq_ "$T/o22/late-after-deadline.json" "d['verdict']")" "FAIL" "deadline-ceiling-verdict"
 ck "$(jq_ "$T/o22/late-after-deadline.json" "any('hard deadline' in r for r in d['fail_reasons'])")" "True" "deadline-ceiling-reason"
 
+# 23. v5.8 OSC-STRIP (wait side): a receipt-shaped string that exists ONLY inside an OSC
+#     window-title sequence must NOT satisfy a wait_for. Pre-v5.8 the title matched at
+#     ~t+0.1 s and this case PASSED; the strip makes it a deterministic FAIL (and the raw
+#     log must still keep the title bytes).
+cat > "$T/c23.json" <<J
+{"name":"osc-title-wait","argv":["/bin/sh","-c","printf '\u001b]2;GHOST-$NONCE-END\u0007'; sleep 3; exit 0"],"timeout_s":15,"grace_s":5,
+ "events":[{"wait_for":"GHOST-$NONCE-END","timeout_s":2}],"expected_exit_code":0}
+J
+ck "$(run_case "$T/c23.json" "$T/o23")" 1 "osc-title-wait-rc1"
+ck "$(jq_ "$T/o23/osc-title-wait.json" "any('not found within' in r for r in d['fail_reasons'])")" "True" "osc-title-wait-reason"
+ck "$(grep -c "$(printf '\033]2;GHOST-')" "$T/o23/osc-title-wait.log" | awk '{print ($1>=1)?"yes":"no"}')" "yes" "osc-title-raw-log-kept"
+
+# 24. v5.8 OSC-STRIP (no over-strip): the SAME receipt printed for real must still match,
+#     and NOT be matched from the title: at_s >= 0.9 s discriminates early-title matching.
+cat > "$T/c24.json" <<J
+{"name":"osc-title-real","argv":["/bin/sh","-c","printf '\u001b]2;REAL-$NONCE-END\u0007'; sleep 1; printf 'REAL-$NONCE-END\n'; exit 0"],"timeout_s":15,"grace_s":5,
+ "events":[{"wait_for":"REAL-$NONCE-END","timeout_s":5}],"expected_exit_code":0}
+J
+ck "$(run_case "$T/c24.json" "$T/o24")" 0 "osc-title-real-rc0"
+ck "$(jq_ "$T/o24/osc-title-real.json" "d['verdict']=='PASS' and d['osc_stripped']>=1 and d['events'][0]['at_s']>=0.9")" "True" "osc-title-real-neither-early-nor-lost"
+
+# 25. v5.8 OSC-STRIP (require side): a string that exists ONLY in a title must NOT satisfy
+#     a case["require"] pattern (pre-v5.8 the require scan read raw text and PASSED).
+cat > "$T/c25.json" <<J
+{"name":"osc-title-req","argv":["/bin/sh","-c","printf '\u001b]2;REQONLY-$NONCE-END\u0007'; printf 'OK-REQ\n'; exit 0"],"timeout_s":15,"grace_s":5,
+ "events":[{"wait_for":"OK-REQ","timeout_s":5}],"require":["REQONLY-$NONCE-END"],"expected_exit_code":0}
+J
+ck "$(run_case "$T/c25.json" "$T/o25")" 1 "osc-title-req-rc1"
+ck "$(jq_ "$T/o25/osc-title-req.json" "any('required end-state pattern' in r for r in d['fail_reasons'])")" "True" "osc-title-req-reason"
+
+# 26. v5.8 FORBID CONTROL: forbid patterns keep reading the RAW text (a forbidden token in
+#     a title still FAILS the case) — the strip must not neuter forbid teeth.
+cat > "$T/c26.json" <<J
+{"name":"osc-forbid","argv":["/bin/sh","-c","printf '\u001b]2;Unhandled error\u0007'; printf 'OK-FORBID\n'; exit 0"],"timeout_s":15,"grace_s":5,
+ "events":[{"wait_for":"OK-FORBID","timeout_s":5}],"forbid":["Unhandled error"],"expected_exit_code":0}
+J
+ck "$(run_case "$T/c26.json" "$T/o26")" 1 "osc-forbid-rc1"
+ck "$(jq_ "$T/o26/osc-forbid.json" "any('forbidden pattern' in r for r in d['fail_reasons'])")" "True" "osc-forbid-reason"
+
+# 27. v5.8 strip_osc unit controls: split-read sequences (BEL and ST forms), CSI
+#     preservation, split ESC into a CSI, and the dropped-sequence counter.
+python3 - "$DRIVE" <<'PY' > "$T/osc-unit.out" 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("pd", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+st = {"mode": b"", "osc_len": 0, "count": 0}
+a = m.strip_osc(b"pre\x1b]2;g", st) + m.strip_osc(b"host\x07post", st)
+b2 = m.strip_osc(b"A\x1b]0;x", st) + m.strip_osc(b"\x1b\\B", st)
+c = m.strip_osc(b"E\x1b[31mF", st)
+d = m.strip_osc(b"G\x1b", st) + m.strip_osc(b"[1mH", st)
+print("osc-split-bel", a)
+print("osc-split-st", b2)
+print("csi-keep", c)
+print("esc-split-csi", d)
+print("count", st["count"])
+PY
+ck "$(awk '/^osc-split-bel/{print $2}' "$T/osc-unit.out")" "b'prepost'" "osc-unit-split-bel"
+ck "$(awk '/^osc-split-st/{print $2}' "$T/osc-unit.out")" "b'AB'" "osc-unit-split-st"
+ck "$(awk '/^csi-keep/{print $2}' "$T/osc-unit.out")" "b'E\\x1b[31mF'" "osc-unit-csi-kept"
+ck "$(awk '/^esc-split-csi/{print $2}' "$T/osc-unit.out")" "b'G\\x1b[1mH'" "osc-unit-esc-split-csi"
+ck "$(awk '/^count/{print $2}' "$T/osc-unit.out")" "2" "osc-unit-count"
+
 echo "PTY-SELFTEST-SUMMARY pass=$pass fail=$fail"
 echo "PTY-SELFTEST-SHA $(sha256sum "$DRIVE" | cut -d' ' -f1)"
 [ "$fail" = 0 ] || exit 1

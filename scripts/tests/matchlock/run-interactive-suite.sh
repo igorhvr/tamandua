@@ -290,6 +290,20 @@ mtlk_pi_agent_seed() {
   return 0
 }
 
+# The interactive Hermes commands mount the ENTIRE effective Hermes
+# configuration directory (`HERMES_HOME`, else `<private home>/.hermes`) at the
+# approved guest HERMES_HOME and refuse an image-default substitution when it is
+# missing (by design). A genuinely ABSENT config.yaml under a VALID directory is
+# the SDK-tested built-in local-backend default, so an EMPTY private `.hermes`
+# is exactly what these cases need -- never copy operator state or credentials
+# into the private evidence HOME.
+mtlk_hermes_home_seed() {
+  local private_home="$1"
+  [ -n "$private_home" ] || return 0
+  mkdir -p "$private_home/.hermes" || return 1
+  return 0
+}
+
 if [ -n "$VM_TIERS" ]; then
   mkdir -p "$EV/home" "$EV/tmp" "$EV/state" "$EV/work" || {
     printf 'MTLK-ABORT cannot-create-private-state %s\n' "$EV" >&2
@@ -306,6 +320,10 @@ if [ -n "$VM_TIERS" ]; then
     mtlk_image_store_seed "$HOME" || exit $?
     mtlk_pi_agent_seed "$HOME" "$MTLK_OPERATOR_HOME" || {
       printf 'MTLK-ABORT pi-config-seed-failed %s\n' "$MTLK_OPERATOR_HOME/.pi/agent" >&2
+      exit 2
+    }
+    mtlk_hermes_home_seed "$HOME" || {
+      printf 'MTLK-ABORT hermes-config-seed-failed %s\n' "$HOME/.hermes" >&2
       exit 2
     }
   fi

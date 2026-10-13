@@ -401,7 +401,15 @@ describe("executeDispatchRound dsh owned-store token accounting", () => {
     );
     const events = fs.readFileSync(path.join(stateDir, "events", `${runId}.jsonl`), "utf8");
     assert.match(events, /"tokenDelta":250/, "the charged delta is the store's, not stdout's");
-    assert.doesNotMatch(events, /9\d{5}/, "no stdout-derived usage may land anywhere");
+    // Mask diagnostic pids ("pid=<n>") first: a 6+ digit pid containing 9
+    // followed by five digits (e.g. pid=2906286, or any 19xxxxx pid on a busy
+    // host) false-matches the sweep, while the stdout-usage sentinels this
+    // guards (900000 / 999999) never appear inside a pid.
+    assert.doesNotMatch(
+      events.replace(/pid=\d+/g, "pid=<masked>"),
+      /9\d{5}/,
+      "no stdout-derived usage may land anywhere",
+    );
     assert.ok(
       !readTamanduaLog().includes("--mode json may be off"),
       "the pi stdout-parse gate must not run for dsh rounds",

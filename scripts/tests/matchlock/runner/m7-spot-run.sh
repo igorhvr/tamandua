@@ -26,6 +26,13 @@
 # workdir/config reference (or the run's own diag bundle naming the exact id) —
 # before any exact-id `matchlock rm`. A failed/unknown removal RETAINS state and
 # fails; an unrelated pre-existing VM is NEVER touched.
+
+# v1.2 (US-003 self-cleaning candidate): the runtime captures VM evidence and
+# REMOVES each VM at round completion (`matchlock rm` drops the row + state
+# dir), so a HEALTHY attempt leaves the registry EMPTY. Diag-named ids absent
+# from BOTH inventories and the registry are recorded as owned (evidence
+# "self-cleaned-attempt-removal") so the anti-vacuity clause holds; an attempt
+# with NO attempt-owned evidence at all still fails closed.
 #
 # BOUND VERDICT: the evaluated outcome is written to `$B/m7.verdict`, and the
 # ABSOLUTE path of THAT invocation's file is recorded in
@@ -616,6 +623,24 @@ for vid in rows:
     if ev is not None:
         ev["evidence"] = list(ev["evidence"]) + ["stopped-row"]
         owned[vid] = ev
+
+# Icebox candidate (US-003): the runtime captures a VM's evidence and REMOVES
+# it at round completion (`matchlock rm` drops the row + state dir), so a
+# HEALTHY attempt leaves the registry EMPTY and the registry-based enumeration
+# above finds nothing - the anti-vacuity clause could then never hold. A
+# diag-bundle-named id that was absent from the before inventory and is absent
+# from BOTH the after inventory and the registry (clean read) was attempt-owned
+# and self-cleaned: record it as owned so the clause holds. It can never be
+# rm'd (never present) and never counts as a leftover.
+if read_ok:
+    for vid in sorted(diag_ids):
+        if vid in owned or vid in before or vid in after_set or vid in rows:
+            continue
+        owned[vid] = {
+            "status": "removed",
+            "created_at": "",
+            "evidence": ["diag-bundle-named-id", "self-cleaned-attempt-removal"],
+        }
 
 present_owned = sorted(v for v in owned if v in after_set)
 open(present_p, "w").write("\n".join(present_owned) + ("\n" if present_owned else ""))
