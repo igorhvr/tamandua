@@ -311,6 +311,21 @@ for uid in 1000 501; do
   nv=$(setpriv --reuid=$uid --regid=$uid --clear-groups env -i HOME=$h PATH=/usr/bin:/bin sudo -n nix --version 2>&1); rc=$?
   eq "$rc" "0" "uid $uid: sudo -n nix rc"
   has 'nix (Nix)' "$nv" "uid $uid: sudo -n nix --version via secure_path"
+  # v1.2 env_keep behavioral rows (icebox IMAGE-ENVKEEP; w3-f): the drop-in keeps the
+  # four matchlock MITM CA variables across sudo env_reset.
+  ck1=$(setpriv --reuid=$uid --regid=$uid --clear-groups env -i HOME=$h PATH=/usr/bin:/bin \
+        SSL_CERT_FILE=/x/ca.pem REQUESTS_CA_BUNDLE=/x/ca.pem CURL_CA_BUNDLE=/x/ca.pem NODE_EXTRA_CA_CERTS=/x/ca.pem \
+        sudo -n sh -c 'printf "%s|%s|%s|%s" "$SSL_CERT_FILE" "$REQUESTS_CA_BUNDLE" "$CURL_CA_BUNDLE" "$NODE_EXTRA_CA_CERTS"' 2>&1); rc=$?
+  eq "$rc" "0" "uid $uid: sudo CA-env probe rc"
+  eq "$ck1" "/x/ca.pem|/x/ca.pem|/x/ca.pem|/x/ca.pem" "uid $uid: sudo keeps the four CA vars (env_keep)"
+  ck2=$(setpriv --reuid=$uid --regid=$uid --clear-groups env -i HOME=$h PATH=/usr/bin:/bin \
+        ICEBOX_KEEP_SENTINEL=keepme sudo -n sh -c 'printf %s "${ICEBOX_KEEP_SENTINEL-UNSET}"' 2>&1); rc=$?
+  eq "$rc" "0" "uid $uid: sudo unrelated-env probe rc"
+  eq "$ck2" "UNSET" "uid $uid: an unrelated var is still reset (env_reset intact)"
+  ck3=$(setpriv --reuid=$uid --regid=$uid --clear-groups env -i HOME=$h PATH=/usr/bin:/bin \
+        sudo -n sh -c 'printf %s "${SSL_CERT_FILE-UNSET}"' 2>&1); rc=$?
+  eq "$rc" "0" "uid $uid: sudo absent-CA probe rc"
+  eq "$ck3" "UNSET" "uid $uid: no CA value manufactured when none supplied"
   eq "$(setpriv --reuid=$uid --regid=$uid --clear-groups awk '/NoNewPrivs/{print $2}' /proc/self/status)" "0" "uid $uid: NoNewPrivs=0 in plain container"
 done
 o=$(setpriv --no-new-privs --reuid=1000 --regid=1000 --clear-groups env -i HOME=/tmp PATH=/usr/bin:/bin sudo -n true 2>&1); rc=$?

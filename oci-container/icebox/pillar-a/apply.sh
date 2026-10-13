@@ -23,7 +23,9 @@
 #                                        settings to take effect
 #   /etc/sudoers.d/90-tamandua-guest     passwordless sudo for all users;
 #                                        secure_path with the nix profile bin
-#                                        FIRST; mode 440; visudo-checked here
+#                                        FIRST; env_keep for the four matchlock
+#                                        MITM CA vars (v1.2 IMAGE-ENVKEEP);
+#                                        mode 440; visudo-checked here
 #   /etc/nix/nix.conf                    experimental-features = nix-command flakes
 #
 # The image Dockerfile ALSO prepends /nix/var/nix/profiles/default/bin to PATH

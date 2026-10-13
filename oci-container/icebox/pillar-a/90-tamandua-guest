@@ -1,2 +1,5 @@
 Defaults secure_path="/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# v1.2 IMAGE-ENVKEEP (w3-f/czv): matchlock delivers its MITM CA ONLY via session
+# env vars; sudo env_reset stripped them, so root-context HTTPS (nix) failed TLS verify.
+Defaults env_keep += "SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS"
 ALL ALL=(ALL) NOPASSWD: ALL
