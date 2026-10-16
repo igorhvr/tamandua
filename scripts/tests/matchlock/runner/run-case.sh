@@ -63,6 +63,22 @@ export MTLK_WORKDIR="$WORKDIR"
 # utility's image-cache registry spelling was a defect and is never used.
 export MTLK_MATCHLOCK_STATE_DB="$(mtlk_matchlock_state_db)"
 
+# INTERACTIVE-SESSION RETAINED EVIDENCE ROOT. The interactive close path
+# (Rider CLEANUP-1, bead tamandua-me1) copies each session VM's retained
+# evidence (config.json + logs/) into
+# `<live-state-root>/matchlock/interactive-sessions/<vmId>/` and THEN removes
+# the VM record + state dir. The BEFORE/AFTER matchlock inventories therefore
+# cannot report an interactive case's VM, and in the v5 field runs of the TUI
+# cases (M5 pi / M6 hermes) the captured terminal text carried no raw vm id
+# either (the shell cases surface it via the guest prompt title). Phase 1
+# snapshots this root BEFORE launch and phase 3 counts ONLY entries that
+# appear afterwards, inside the case window, with a real retained-evidence
+# payload — never a pre-existing/stale dir. The default mirrors the product's
+# `resolveLiveStateRoot()` (TAMANDUA_STATE_DIR, else ~/.tamandua);
+# `MTLK_INTERACTIVE_EVIDENCE_ROOT` overrides it (controls).
+MTLK_INTERACTIVE_EVIDENCE_ROOT="${MTLK_INTERACTIVE_EVIDENCE_ROOT:-${TAMANDUA_STATE_DIR:-$HOME/.tamandua}/matchlock/interactive-sessions}"
+export MTLK_INTERACTIVE_EVIDENCE_ROOT
+
 # The matchlock pair is recorded as evidence; it is never replaced.
 export MTLK_MATCHLOCK_BIN="$ML"
 MTLK_MATCHLOCK_SHA="$(mtlk_sha256 "$ML" 2>/dev/null || true)"
@@ -91,7 +107,7 @@ CASE="$RENDERED"
 # 2 BEFORE the driver is invoked.
 # ---------------------------------------------------------------------------
 python3 - "$CASE" "$OUT" "$ML" <<'PYP'
-import json, os, re, subprocess, sys
+import json, os, re, stat, subprocess, sys
 case_p, out, ml = sys.argv[1], sys.argv[2], sys.argv[3]
 case = json.load(open(case_p))
 name = case["name"]
@@ -128,6 +144,75 @@ if case.get("mntchk"):
         json.dump(summary, open(os.path.join(out, "case-summary.json"), "w"), indent=2)
         print(json.dumps(summary))
         sys.exit(2)
+
+# ---------------------------------------------------------------------------
+# Retained interactive-session evidence: BEFORE snapshot.
+# The interactive close path (Rider CLEANUP-1) copies each session VM's
+# retained evidence into `<root>/<vmId>/` and THEN removes the VM record + its
+# state dir. That retained copy is the case-owned VM identity surface that
+# survives the case: the registry row is gone by the AFTER inventory, and in
+# the v5 field runs the captured TUI text carried no raw vm id (unlike the
+# shell cases, whose prompt title carries it). Phase 3 counts ONLY names that
+# appear after this snapshot, so a pre-existing/stale dir can never be
+# counted, even when it is touched during the case. The root is inspected
+# with lstat so "absent" is distinguishable from "cannot be inspected": only
+# ENOENT is absent; any other failure, a symlink root or a non-directory root
+# refuses BEFORE launch.
+root = os.environ.get("MTLK_INTERACTIVE_EVIDENCE_ROOT", "")
+ev_before = {"root": root, "status": "absent", "names": [], "error": ""}
+
+
+def inspect_root(path):
+    """('absent', None) on ENOENT, ('ok', stat) for a real directory,
+    ('invalid', reason) for anything else — never follows a symlink."""
+    try:
+        lst = os.lstat(path)
+    except FileNotFoundError:
+        return "absent", None
+    except OSError as err:
+        return "invalid", str(err)[:160]
+    if stat.S_ISLNK(lst.st_mode):
+        return "invalid", "symlink-root"
+    if not stat.S_ISDIR(lst.st_mode):
+        return "invalid", "not-a-directory"
+    return "ok", lst
+
+
+if not root:
+    ev_before["status"] = "invalid"
+    ev_before["error"] = "unbound-root"
+else:
+    kind, info = inspect_root(root)
+    if kind == "absent":
+        # Bind the private observation root to THIS case before the baseline:
+        # create it empty (the product's close path creates the same dir on
+        # first use; an EMPTY root is not evidence). If it cannot be created
+        # or does not come up as a real directory, refuse before launch — the
+        # observation surface would be unprovable, never "absent".
+        try:
+            os.makedirs(root, exist_ok=True)
+            kind, info = inspect_root(root)
+        except OSError as err:
+            kind, info = "invalid", "cannot-create-root:" + str(err)[:120]
+    if kind == "ok":
+        try:
+            ev_before["names"] = sorted(os.listdir(root))
+            ev_before["dev"] = info.st_dev
+            ev_before["ino"] = info.st_ino
+            ev_before["status"] = "ok"
+        except OSError as err:
+            kind, info = "invalid", str(err)[:160]
+    if kind != "ok":
+        ev_before["status"] = "invalid"
+        ev_before["error"] = info or "unreachable"
+json.dump(ev_before, open(os.path.join(out, "interactive-evidence-before.json"), "w"), indent=2)
+if ev_before["status"] == "invalid":
+    summary = {"case": name, "verdict": "FAIL",
+               "fail_reasons": ["interactive-evidence-before-invalid:" + ev_before["error"]],
+               "refused_before_launch": True, "interactive_evidence_before": ev_before}
+    json.dump(summary, open(os.path.join(out, "case-summary.json"), "w"), indent=2)
+    print(json.dumps(summary))
+    sys.exit(2)
 sys.exit(0)
 PYP
 PRC=$?
@@ -144,7 +229,7 @@ T1=$(date -u +%FT%TZ)
 # Phase 3 — fail-closed AFTER inventory, case-scoped ownership, mount verify.
 # ---------------------------------------------------------------------------
 MTLK_CASE_T0="$T0" MTLK_CASE_T1="$T1" python3 - "$CASE" "$OUT" "$RC" "$ML" <<'PY'
-import hashlib, json, os, re, sqlite3, subprocess, sys
+import hashlib, json, os, re, sqlite3, stat, subprocess, sys, time
 case_p, out, rc, ml = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 case = json.load(open(case_p))
 name = case["name"]
@@ -277,6 +362,163 @@ try:
 except Exception as e:
     summary["cleanup_read"] = "FAIL-CLOSED " + str(e)
 
+# ---------------------------------------------------------------------------
+# Retained interactive-session evidence: case-owned observation (after diff).
+# The interactive close path removes its own VM record + state dir, but FIRST
+# copies the VM's retained evidence to `<root>/<vmId>/` (config.json / logs).
+# For the TUI cases that dir is the ONLY genuine per-VM identity surface (the
+# registry row is already gone and the frozen driver's terminal-text scan
+# never sees the id). Count ONLY entries absent from the BEFORE snapshot
+# (a pre-existing/stale dir can never be counted, even if it is touched during
+# the case), and only real (non-symlink) directories carrying a real non-empty
+# retained payload. An unreadable observation surface is FAIL-CLOSED: it is
+# recorded and fails the case — it is never silently treated as clean.
+ev_root = os.environ.get("MTLK_INTERACTIVE_EVIDENCE_ROOT", "")
+ev = {"root": ev_root, "status": "absent", "new": [], "ignored": [], "root_identity": None}
+summary["interactive_evidence"] = ev
+summary["interactive_evidence_new_vms"] = []
+
+
+def evidence_payload(dirpath):
+    """Bounded scan of ONE retained-evidence dir for the product's exact copy
+    shape (`captureAndRemoveVm`): a non-empty regular top-level `config.json`
+    and/or regular non-empty files under the top-level `logs/` DIRECTORY
+    (nested dirs allowed, total entries budgeted). Symlinks are never followed
+    (a symlinked payload is not evidence), a regular FILE named `logs` is not a
+    logs directory, and foreign names do not count. Never raises."""
+    files = 0
+    total = 0
+    budget = 256
+    stack = [(dirpath, False)]
+    while stack and budget > 0:
+        cur, under_logs = stack.pop()
+        try:
+            entries = sorted(os.listdir(cur))
+        except OSError:
+            continue
+        for name in entries:
+            budget -= 1
+            if budget < 0:
+                break
+            full = os.path.join(cur, name)
+            try:
+                lst = os.lstat(full)
+            except OSError:
+                continue
+            if stat.S_ISLNK(lst.st_mode):
+                continue
+            if stat.S_ISDIR(lst.st_mode):
+                if under_logs or name == "logs":
+                    stack.append((full, True))
+                continue
+            if not stat.S_ISREG(lst.st_mode) or lst.st_size <= 0:
+                continue
+            if under_logs or name == "config.json":
+                files += 1
+                total += lst.st_size
+    return files, total
+
+
+try:
+    before_path = os.path.join(out, "interactive-evidence-before.json")
+    try:
+        with open(before_path, encoding="utf-8") as fh:
+            before = json.load(fh)
+    except (OSError, ValueError) as err:
+        raise RuntimeError("before-snapshot-unreadable:" + str(err)[:120])
+    if not isinstance(before, dict):
+        raise RuntimeError("before-snapshot-malformed")
+    if before.get("root") != ev_root:
+        raise RuntimeError("before-snapshot-root-mismatch")
+    # Phase 1 always creates + identity-binds the private observation root
+    # before the baseline (refusing otherwise), so a well-formed BEFORE
+    # snapshot is ALWAYS "ok" with (dev, ino): anything else is fail-closed.
+    if before.get("status") != "ok":
+        raise RuntimeError("before-snapshot-status:" + str(before.get("status")))
+    names = before.get("names")
+    if not isinstance(names, list) or any(not isinstance(n, str) for n in names):
+        raise RuntimeError("before-snapshot-names-malformed")
+    before_names = set(names)
+
+    # Classify the observation root NOW, fail-closed on anything that is not a
+    # real directory: a symlinked root, an unreadable root, or a root that
+    # vanished mid-case are all errors, never "absent".
+    if ev_root:
+        try:
+            root_lst = os.lstat(ev_root)
+        except FileNotFoundError:
+            raise RuntimeError("evidence-root-vanished")
+        except OSError as err:
+            raise RuntimeError("evidence-root-unreadable:" + str(err)[:160])
+        if stat.S_ISLNK(root_lst.st_mode):
+            raise RuntimeError("evidence-root-invalid:symlink")
+        if not stat.S_ISDIR(root_lst.st_mode):
+            raise RuntimeError("evidence-root-invalid:not-a-directory")
+    else:
+        raise RuntimeError("evidence-root-unbound")
+
+    # The baseline only means anything while the root is the SAME directory it
+    # was when snapshotted: identity is (dev, ino), never a timestamp.
+    if (before.get("dev"), before.get("ino")) != (root_lst.st_dev, root_lst.st_ino):
+        raise RuntimeError("evidence-root-replaced")
+
+    ev["root_identity"] = {"dev": root_lst.st_dev, "ino": root_lst.st_ino}
+    # Diagnostics are capped; the candidate scan itself is NEVER truncated
+    # (truncating it could hide a genuinely fresh VM dir). NOTE: the loop
+    # variable must NOT be `name` — that holds the CASE name and is read
+    # again below (the mount-nonce tag); clobbering it corrupts the
+    # mount-write-through verdict.
+    skipped = 0
+    for entry_name in sorted(os.listdir(ev_root)):
+        if entry_name in before_names:
+            continue  # pre-existing (stale or another case's): never ours
+        reason = ""
+        if entry_name == "vm-00000000":
+            reason = "placeholder-sentinel"
+        # fullmatch, not match: `$` also matches before a trailing newline, so
+        # a malformed dir name ("vm-xxxxxxxx\n") would pass as a vm id and
+        # could even evade the sentinel equality check above.
+        elif re.fullmatch(r"vm-[0-9a-f]{8}", entry_name) is None:
+            reason = "not-a-vm-id"
+        else:
+            full = os.path.join(ev_root, entry_name)
+            try:
+                lst = os.lstat(full)
+            except OSError as err:
+                reason = "unreadable:" + str(err)[:80]
+            else:
+                if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode):
+                    reason = "not-a-real-directory"
+                else:
+                    files, payload_bytes = evidence_payload(full)
+                    if files < 1 or payload_bytes < 1:
+                        reason = "no-retained-payload"
+                    else:
+                        ev["new"].append(
+                            {
+                                "id": entry_name,
+                                "files": files,
+                                "bytes": payload_bytes,
+                                "mtime": time.strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(lst.st_mtime)
+                                ),
+                            }
+                        )
+        if reason:
+            if len(ev["ignored"]) < 50:
+                ev["ignored"].append({"name": entry_name, "reason": reason})
+            else:
+                skipped += 1
+    if skipped:
+        ev["ignored"].append(
+            {"name": "(+%d more rejected)" % skipped, "reason": "diagnostics-capped"}
+        )
+    ev["status"] = "ok"
+    summary["interactive_evidence_new_vms"] = [d["id"] for d in ev["new"]]
+except Exception as err:
+    ev["status"] = "error"
+    summary["interactive_evidence_read"] = "FAIL-CLOSED " + str(err)[:160]
+
 if case.get("mntchk"):
     tag = name.split("-")[0]
     mnt_file = os.path.join(os.environ.get("MTLK_WORKDIR", ""), ".mntchk-" + tag + ".txt")
@@ -302,6 +544,8 @@ if driver_verdict != "PASS":
     reasons.append("driver-verdict:" + str(driver_verdict))
 if summary.get("cleanup_readable") is not True:
     reasons.append("cleanup-inventory-unreadable:" + str(summary.get("cleanup_read", ""))[:160])
+if summary.get("interactive_evidence_read"):
+    reasons.append("interactive-evidence-unreadable:" + str(summary["interactive_evidence_read"])[:160])
 if summary.get("new_live_vms"):
     reasons.append("live-vm-left:" + ",".join(summary["new_live_vms"]))
 if summary.get("unowned_new_vms"):

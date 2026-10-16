@@ -29,7 +29,9 @@
 #   5. runs `runner/run-cases.sh` for the requested VM tiers and
 #      `t1-fixtures.sh` for the no-VM T1 tier;
 #   6. after a requested real-VM tier, invokes the shared no-fake-green guard
-#      (`scripts/observed-rounds-guard.mjs`, zero-round PASS = exit 92);
+#      (`scripts/observed-rounds-guard.mjs`, zero-round PASS = exit 92), then a
+#      per-case attribution audit for t3 (every requested case must show its
+#      OWN observed VM round; refusal = exit 93);
 #   7. propagates the component exit codes (no masking). T1-only runs take no
 #      lock and boot no VM.
 #
@@ -47,6 +49,8 @@
 #   4   MTLK-IMAGE-STORE-FAIL (the private image store could not be seeded)
 #   6   MTLK-GATE-LOCK-FAIL (the shared gate lock could not be acquired)
 #   92  ZERO-ROUND REFUSAL (a requested real-VM tier produced no VM round)
+#   93  T3-ATTRIBUTION REFUSAL (a requested T3 case has no attributable VM
+#       round, or one observed VM is claimed by two cases)
 #   N   the failing component's exit code
 # =============================================================================
 set -u
@@ -236,6 +240,94 @@ if [ -n "$EV_ARG" ]; then
     printf 'MTLK-ABORT evidence-dir-not-fresh %s\n' "$EV" >&2
     exit 2
   fi
+  # A previous run's OBSERVATION outputs must never be re-consumed: the derive
+  # step reads every `**/case-summary.json` plus `M7/m7.log`, and the guard
+  # reads the derived `observed-rounds.json`, so a reused dir holding any of
+  # them would let this run report rounds it never observed. The policy is
+  # explicit and fail-closed:
+  #   - genuine absence (ENOENT) is the only "clean" outcome; any inspection
+  #     failure, an unreadable directory, or a symlinked directory refuses
+  #     (freshness must be PROVEN, never assumed);
+  #   - reserved observation names count as stale whether they are files or
+  #     directories;
+  #   - seeded config and a pre-existing private state / retained-session tree
+  #     stay allowed: they are inputs, not observations.
+  # The derive step below (`mtlk_derive_observed_rounds`) reads the same tree
+  # later with a recursive trailing-`**` glob, whose symlink traversal is
+  # version-dependent (on the suite's interpreter it DOES descend symlinked
+  # directories): rather than encode glob quirks, a symlinked directory is
+  # refused here — the walk must be able to SEE everything the glob could
+  # consume.
+  STALE_RC=0
+  python3 - "$EV" <<'PYADM' || STALE_RC=$?
+import os
+import stat
+import sys
+
+ev = os.path.abspath(sys.argv[1])
+stale = []
+problems = []
+
+try:
+    root_st = os.lstat(ev)
+except FileNotFoundError:
+    root_st = None  # genuine absence: nothing to reuse (created below)
+except OSError as err:
+    print("inspect-failed: " + str(err))
+    sys.exit(2)
+
+if root_st is not None:
+    if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
+        # A symlinked or non-directory evidence path cannot be PROVEN clean
+        # (and `mkdir -p` would fail closed anyway): refuse explicitly.
+        print("inspect-failed: evidence path is not a real directory: " + ev)
+        sys.exit(2)
+
+    # Reserved observation outputs: ANY entry (file, dir or symlink) is stale.
+    for rel in ("observed-rounds.json", os.path.join("M7", "m7.log")):
+        p = os.path.join(ev, rel)
+        try:
+            os.lstat(p)
+        except FileNotFoundError:
+            continue
+        except OSError as err:
+            problems.append(str(err))
+            continue
+        stale.append(p)
+
+    # Checked walk (NO link-following: a symlinked directory is an unprovable
+    # surface and refuses; fresh dirs contain none, and the trailing-glob
+    # derive must not be pointed at whatever a link hides).
+    def onerror(err):
+        problems.append(str(err))
+
+    for dirpath, dirnames, filenames in os.walk(ev, onerror=onerror):
+        for name in dirnames:
+            p = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(p)
+            except OSError as err:
+                problems.append(str(err))
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                problems.append("symlinked directory: " + p)
+            if name == "case-summary.json":
+                stale.append(p)
+        for name in filenames:
+            if name == "case-summary.json":
+                stale.append(os.path.join(dirpath, name))
+
+for p in problems[:5]:
+    print("inspect-failed: " + p)
+sys.exit(2 if problems else (1 if stale else 0))
+PYADM
+  if [ "$STALE_RC" = 1 ]; then
+    printf 'MTLK-ABORT evidence-dir-not-fresh %s (stale observation artifacts present)\n' "$EV" >&2
+    exit 2
+  elif [ "$STALE_RC" != 0 ]; then
+    printf 'MTLK-ABORT evidence-dir-not-fresh %s (uninspectable: cannot prove it holds no previous observations)\n' "$EV" >&2
+    exit 2
+  fi
   mkdir -p "$EV" || {
     printf 'MTLK-ABORT cannot-create-evidence %s\n' "$EV" >&2
     exit 2
@@ -316,6 +408,11 @@ if [ -n "$VM_TIERS" ]; then
   export TMPDIR="$EV/tmp"
   export TAMANDUA_STATE_DIR="$EV/state"
   export MTLK_WORKDIR="$EV/work"
+  # The retained-evidence observation root is FORCED to the private per-run
+  # state root (never inherited from the caller): acceptance counting must
+  # never read unrelated operator state, and the product's own close path
+  # writes exactly there (`<TAMANDUA_STATE_DIR>/matchlock/interactive-sessions`).
+  export MTLK_INTERACTIVE_EVIDENCE_ROOT="$TAMANDUA_STATE_DIR/matchlock/interactive-sessions"
   if [ "$NEED_VM_EXEC" = "1" ]; then
     mtlk_image_store_seed "$HOME" || exit $?
     mtlk_pi_agent_seed "$HOME" "$MTLK_OPERATOR_HOME" || {
@@ -335,8 +432,13 @@ mtlk_write_identity "$EV/identity.txt"
 # Observed-rounds evidence (no-fake-green). The shared guard reads
 # `<ev>/observed-rounds.json`; the case harness' own evidence is authoritative,
 # so the entrypoint only derives it when the run did not already produce it.
-# The count is derived from real observed/owned VM ids in the case summaries and
-# the M7 ownership log — it is never fabricated.
+# The count is derived from real observed/owned VM ids in the case summaries —
+# `owned_new_vms`/`vm_ids_seen` plus the per-case RETAINED-EVIDENCE ids
+# (`interactive_evidence_new_vms`: dirs that appeared under the private
+# interactive-sessions root during that case's own window with a real retained
+# payload) — and the M7 ownership log. Pre-existing session dirs are never
+# counted: the per-case wrapper diffs against its own before-snapshot. It is
+# never fabricated.
 # -----------------------------------------------------------------------------
 mtlk_derive_observed_rounds() {
   local ev="$1"
@@ -350,7 +452,7 @@ import sys
 
 ev = os.path.abspath(sys.argv[1])
 ids = set()
-vm_re = re.compile(r"^vm-[0-9a-f]{8}$")
+vm_re = re.compile(r"vm-[0-9a-f]{8}")
 # `vm-00000000` is matchlock's documented PLACEHOLDER id (it appears in the
 # longest-socket-path pre-flight error), never a real VM. The frozen driver's
 # vm-id scan can pick it out of that error text, so exclude the sentinel: a
@@ -362,7 +464,9 @@ def add(seq):
     if not seq:
         return
     for value in seq:
-        if isinstance(value, str) and vm_re.match(value) and value not in SENTINEL_IDS:
+        # fullmatch, not match: `$` would accept a trailing newline, letting a
+        # malformed value pass as a vm id (and evade the sentinel check).
+        if isinstance(value, str) and vm_re.fullmatch(value) and value not in SENTINEL_IDS:
             ids.add(value)
 
 
@@ -374,6 +478,10 @@ for path in glob.glob(os.path.join(ev, "**", "case-summary.json"), recursive=Tru
         continue
     add(data.get("owned_new_vms"))
     add(data.get("vm_ids_seen"))
+    # Case-owned retained interactive-session evidence: only the ids the
+    # per-case wrapper observed as NEW during that case's own window (never a
+    # pre-existing/stale session dir).
+    add(data.get("interactive_evidence_new_vms"))
 
 m7_log = os.path.join(ev, "M7", "m7.log")
 if os.path.isfile(m7_log):
@@ -398,6 +506,262 @@ with open(os.path.join(ev, "observed-rounds.json"), "w", encoding="utf-8") as fh
 PY
 }
 
+# mtlk_check_case_attribution <evdir> <tier> <requested-tiers> — per-case
+# completeness for a live-model tier (the E7 requirement is per COMMAND: every
+# requested case must show its OWN genuine VM round; the run-level guard above
+# only floors the whole tier, so one observed round would mask a case that
+# observed none). Reads the expected cases from the FROZEN manifest (never from
+# a guess), and for each requested case requires: exactly one case-summary.json
+# whose parent directory carries the case name, at the exact evidence path the
+# manifest recorded; verdict PASS; and at least one id from the STRONG channels
+# (fresh retained interactive evidence / case-scoped registry ownership; the
+# terminal-text channel stays diagnostics - ambiguity checks and run-level
+# consistency - and is never sole proof). One VM id attributed (by any
+# channel) to two cases is ambiguous and
+# refuses. Also refuses (fail-closed) a header mismatch, a malformed or
+# duplicate-case-row manifest, a missing freeze marker, a manifest whose
+# requested-row count drifted from the freeze-time scope.count snapshot, and a
+# passed tier with no recorded case rows; a tier DECLARED NOTRUN is skipped
+# (a declared non-success state is never judged as an observation); when the
+# tier is the ONLY requested VM tier, every run-level observed id must be
+# attributed to some case (no stray evidence). Exit 93 on refusal (distinct
+# from the guard's zero-round 92).
+mtlk_check_case_attribution() {
+  local ev="$1" tier="$2" tiers="${3:-}"
+  python3 - "$ev" "$tier" "$tiers" <<'PY'
+import glob
+import json
+import os
+import re
+import sys
+
+ev = os.path.abspath(sys.argv[1])
+tier = sys.argv[2]
+tier_set = set((sys.argv[3] if len(sys.argv) > 3 else "").split())
+manifest = os.path.join(ev, "manifest", "requested.tsv")
+vm_re = re.compile(r"vm-[0-9a-f]{8}")
+# `vm-00000000` is matchlock's documented placeholder id, never a real VM.
+SENTINEL_IDS = frozenset({"vm-00000000"})
+# STRONG channels are sufficient per-case proof of a case's own VM round
+# (fresh retained evidence, or registry ownership correlated to the case).
+# TERMINAL_TEXT is diagnostics only: it feeds the ambiguity check and the
+# run-level consistency check, but a case whose ONLY id comes from terminal
+# text is refused - a displayed id is not proof of a fresh launch.
+STRONG_FIELDS = ("interactive_evidence_new_vms", "owned_new_vms")
+DIAG_FIELDS = ("vm_ids_seen",)
+
+
+def fail(lines):
+    for line in lines:
+        print("%s-attribution: FAIL %s" % (tier, line))
+    sys.exit(93)
+
+
+try:
+    with open(manifest, encoding="utf-8", errors="replace") as fh:
+        rows = [ln.rstrip("\r\n").split("\t") for ln in fh]
+except OSError:
+    fail(["manifest-unreadable: " + manifest])
+
+HEADER = ["kind", "tier", "name", "requested", "required", "evidence", "status"]
+if not rows or rows[0] != HEADER:
+    fail(["manifest-header-mismatch"])
+data_rows = rows[1:]
+malformed = [i + 2 for i, cols in enumerate(data_rows) if len(cols) != 7]
+if malformed:
+    fail(["malformed-manifest-rows: " + ",".join(str(i) for i in malformed)])
+if not os.path.exists(os.path.join(ev, "manifest", "frozen")):
+    fail(["manifest-not-frozen"])
+
+# Reconcile the CURRENT manifest against the pre-execution scope SNAPSHOT:
+# mtlk_manifest_freeze recorded the number of requested rows BEFORE anything
+# ran; requested-row COUNT drift after freeze (a row removed, added or
+# un-requested) refuses here. This is a COUNT check: it does not catch a
+# same-count identity swap, which the per-case obligations below still have to
+# satisfy row-by-row against each recorded evidence path.
+try:
+    with open(
+        os.path.join(ev, "manifest", "scope.count"), encoding="utf-8", errors="replace"
+    ) as fh:
+        scope_line = fh.read().strip()
+except OSError:
+    fail(["manifest-scope-unreadable"])
+if not scope_line.startswith("scope=") or not scope_line[6:].isdigit():
+    fail(["manifest-scope-unreadable: " + scope_line[:60]])
+snapshot = int(scope_line[6:])
+now = sum(1 for cols in data_rows if cols[3] == "1")
+if snapshot != now:
+    fail(["manifest-scope-mismatch: scope.count=%d, requested-now=%d" % (snapshot, now)])
+
+tier_rows = [cols for cols in data_rows if cols[0] == "tier" and cols[1] == tier]
+if len(tier_rows) != 1:
+    fail(["%s-tier-row-missing (rows=%d)" % (tier, len(tier_rows))])
+tier_cols = tier_rows[0]
+if tier_cols[3] != "1":
+    fail(["%s-tier-not-requested-in-manifest" % tier])
+tier_status = tier_cols[6]
+if tier_status == "NOTRUN":
+    # A declared non-success state is skipped ONLY when it cannot contradict
+    # the evidence tree: a NOTRUN tier that still carries requested case rows
+    # or case summaries claiming execution is a contradiction and refuses.
+    conflict_rows = [
+        cols[2]
+        for cols in data_rows
+        if cols[0] == "case" and cols[1] == tier and cols[3] == "1"
+    ]
+    tier_dir = os.path.join(ev, tier)
+    conflict_files = []
+    if os.path.isdir(tier_dir):
+        conflict_files = glob.glob(
+            os.path.join(tier_dir, "**", "case-summary.json"), recursive=True
+        )
+    if conflict_rows or conflict_files:
+        fail(
+            [
+                "tier-NOTRUN-with-case-records: rows=[%s] files=[%s]"
+                % (
+                    ",".join(conflict_rows) or "-",
+                    ",".join(os.path.relpath(p, ev) for p in conflict_files[:5]) or "-",
+                )
+            ]
+        )
+    print(
+        "%s-attribution: SKIP %s declared NOTRUN (a declared non-success state; no case execution to audit)"
+        % (tier, tier)
+    )
+    sys.exit(0)
+if tier_status != "PASS":
+    fail(["%s-tier-status=%s (expected PASS or NOTRUN)" % (tier, tier_status)])
+
+requested = [
+    (cols[2], cols[5], cols[6])
+    for cols in data_rows
+    if cols[0] == "case" and cols[1] == tier and cols[3] == "1"
+]
+names = [name for name, _, _ in requested]
+if len(names) != len(set(names)):
+    fail(["duplicate-case-rows"])
+if not requested:
+    fail(["tier-executed-but-no-requested-case-rows"])
+
+try:
+    with open(os.path.join(ev, "observed-rounds.json"), encoding="utf-8") as fh:
+        observed_raw = json.load(fh)
+    observed = set(observed_raw.get("observed_vm_ids") or [])
+except (OSError, ValueError) as err:
+    fail(["observed-rounds-unreadable: " + str(err)[:120]])
+
+# One unambiguous summary per requested case: exactly one case-summary.json
+# whose parent directory carries the case's name, and it must live at the
+# evidence path the frozen manifest recorded. Identity is compared with
+# samefile (not a string compare): the darwin guest evidence runs on a
+# case-insensitive filesystem where the recorded spelling and the on-disk
+# spelling can differ in case while naming the same file.
+sums_by_name = {}
+for path in glob.glob(os.path.join(ev, "**", "case-summary.json"), recursive=True):
+    sums_by_name.setdefault(os.path.basename(os.path.dirname(path)), []).append(path)
+
+ev_real = os.path.realpath(ev)
+
+
+def same_file(left, right):
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return os.path.realpath(left) == os.path.realpath(right)
+
+
+def attribution_ids(summary, fields):
+    ids = set()
+    for field in fields:
+        seq = summary.get(field)
+        if isinstance(seq, list):
+            for value in seq:
+                if isinstance(value, str) and vm_re.fullmatch(value) and value not in SENTINEL_IDS:
+                    ids.add(value)
+    return ids
+
+
+problems = []
+claimed = {}
+allids = {}
+for name, evidence, row_status in requested:
+    if row_status != "PASS":
+        problems.append("%s: manifest-case-status=%s (must be PASS)" % (name, row_status))
+        continue
+    expected = os.path.join(ev, evidence, "case-summary.json")
+    exp_real = os.path.realpath(expected)
+    if not (exp_real == ev_real or exp_real.startswith(ev_real + os.sep)):
+        problems.append("%s: evidence-path-outside-root [%s]" % (name, evidence))
+        continue
+    candidates = sorted(sums_by_name.get(name, []))
+    if len(candidates) > 1:
+        problems.append(
+            "%s: duplicate-summaries [%s]"
+            % (name, ", ".join(os.path.relpath(p, ev) for p in candidates))
+        )
+        continue
+    if not candidates or not same_file(candidates[0], expected):
+        problems.append("%s: missing-summary at %s" % (name, os.path.relpath(expected, ev)))
+        continue
+    try:
+        with open(expected, encoding="utf-8") as fh:
+            summary = json.load(fh)
+    except (OSError, ValueError) as err:
+        problems.append("%s: summary-unreadable %s" % (name, str(err)[:120]))
+        continue
+    if not isinstance(summary, dict) or summary.get("verdict") != "PASS":
+        verdict = summary.get("verdict") if isinstance(summary, dict) else "(malformed)"
+        problems.append("%s: verdict=%s (must be PASS)" % (name, verdict))
+        continue
+    strong = attribution_ids(summary, STRONG_FIELDS)
+    diag = attribution_ids(summary, DIAG_FIELDS)
+    if not strong:
+        if diag:
+            problems.append(
+                "%s: no fresh retained-evidence or case-scoped ownership observation"
+                " (terminal-text ids: %s)" % (name, ",".join(sorted(diag)))
+            )
+        else:
+            problems.append("%s: no observed VM round (every attribution channel is empty)" % name)
+        continue
+    claimed[name] = sorted(strong)
+    allids[name] = sorted(strong | diag)
+
+# Cross-case reuse: one VM id must never be attributed to two cases, by ANY
+# channel (a case whose text names its sibling's id stays suspicious even
+# though text alone is not sufficient proof).
+owner = {}
+for name in sorted(allids):
+    for vm_id in allids[name]:
+        if vm_id in owner:
+            problems.append(
+                "ambiguous-attribution: %s claimed by %s and %s" % (vm_id, owner[vm_id], name)
+            )
+        else:
+            owner[vm_id] = name
+
+# Backing: every per-case claim must appear in the run-level evidence the
+# guard passed on; when this tier is the ONLY requested VM tier, nothing may
+# appear there that no case attributed (stray evidence is a refusal).
+unbacked = sorted(v for v in owner if v not in observed)
+if unbacked:
+    problems.append("claimed-but-not-observed: " + ",".join(unbacked))
+if tier_set == {"t3"}:
+    stray = sorted(v for v in observed if v not in owner)
+    if stray:
+        problems.append("observed-but-unattributed: " + ",".join(stray))
+
+if problems:
+    fail(problems)
+print(
+    "%s-attribution: OK cases=%s ids=%s"
+    % (tier, ",".join(names), ",".join(sorted(owner)))
+)
+sys.exit(0)
+PY
+}
+
 # -----------------------------------------------------------------------------
 # Execute the requested tiers. The VM tiers run under the shared lock, then the
 # no-fake-green guard, then the no-VM T1 tier (which a composed VM run also
@@ -406,6 +770,7 @@ PY
 T1_RC=0
 VM_RC=0
 GUARD_RC=0
+ATTR_RC=0
 
 if [ -n "$VM_TIERS" ]; then
   mtlk_gate_lock_acquire >>"$EV/lock.txt" 2>&1
@@ -417,6 +782,18 @@ if [ -n "$VM_TIERS" ]; then
     mtlk_derive_observed_rounds "$EV"
     node "$ROUNDS_GUARD" --dir "$EV" --gate interactive >>"$EV/guard.log" 2>&1
     GUARD_RC=$?
+    # Per-case completeness for t3 (E7 requirement: every requested live-model
+    # case must show its OWN genuine VM round). Runs only when the run-level
+    # guard PASSED and every component succeeded, so a zero-round refusal
+    # keeps its exact 92 semantics and a failed run keeps its component rc.
+    if [ "$GUARD_RC" = 0 ] && [ "$VM_RC" = 0 ]; then
+      case " $VM_TIERS " in
+        *" t3 "*)
+          mtlk_check_case_attribution "$EV" t3 "$VM_TIERS" >>"$EV/attribution.log" 2>&1
+          ATTR_RC=$?
+          ;;
+      esac
+    fi
   else
     printf 'MTLK-GUARD-SKIPPED no-VM-execution (declared NOTRUN tier)\n' >>"$EV/guard.log"
   fi
@@ -436,5 +813,9 @@ if [ "$GUARD_RC" = 92 ]; then
 fi
 if [ "$GUARD_RC" != 0 ]; then
   exit "$GUARD_RC"
+fi
+if [ "$ATTR_RC" != 0 ]; then
+  printf 'T3-ATTRIBUTION REFUSAL: the t3 per-case attribution audit refused (details: %s/attribution.log)\n' "$EV" >&2
+  exit "$ATTR_RC"
 fi
 exit "$VM_RC"

@@ -102,6 +102,48 @@ if os.environ.get("FDRV_VMDB"):
     con.execute("create table if not exists vms (id text, config_json blob, created_at text)")
     con.execute("insert into vms (id, config_json, created_at) values (?,?,?)", (vid, cfg.encode(), created))
     con.commit(); con.close()
+# Retained interactive-session evidence simulation (the product's close path).
+# OPT-IN only (FDRV_EVIDENCE=1): merely binding the observation root must never
+# make the fake driver emit evidence, or the zero-round/stale controls would
+# stop being zero. No swallowing here: a failed fixture setup must fail the
+# control (the driver exits non-zero, so the case is recorded FAIL).
+if os.environ.get("FDRV_EVIDENCE") == "1":
+    er = os.environ["MTLK_INTERACTIVE_EVIDENCE_ROOT"]
+    eid = os.environ.get("FDRV_EVIDENCE_ID", "vm-abcdef01")
+    mode = os.environ.get("FDRV_EVIDENCE_MODE", "payload")
+    if mode == "symlink":
+        target = os.path.join(er, "._target-" + eid)
+        os.makedirs(os.path.join(target, "logs"), exist_ok=True)
+        with open(os.path.join(target, "logs", "vm.log"), "w") as fh:
+            fh.write("payload behind a symlink\n")
+        os.symlink(target, os.path.join(er, eid))
+    else:
+        d = os.path.join(er, eid)
+        os.makedirs(d, exist_ok=True)
+        if mode == "payload":
+            # Linux (firecracker) observed shape: config.json + logs/.
+            with open(os.path.join(d, "config.json"), "w") as fh:
+                fh.write('{"boot-source": {}}\n')
+            os.makedirs(os.path.join(d, "logs"), exist_ok=True)
+            with open(os.path.join(d, "logs", "vm.log"), "w") as fh:
+                fh.write("boot ok\n")
+        elif mode == "logs-only":
+            # macOS/VZ observed shape: logs/ only, no config.json.
+            os.makedirs(os.path.join(d, "logs"), exist_ok=True)
+            with open(os.path.join(d, "logs", "vm.log"), "w") as fh:
+                fh.write("boot ok\n")
+        # "empty": the directory alone is not evidence.
+tp = os.environ.get("FDRV_TOUCH_EVIDENCE")
+if tp:
+    os.utime(tp, None)
+rp = os.environ.get("FDRV_REPLACE_ROOT")
+if rp:
+    os.rename(rp, rp + ".old")
+    os.makedirs(os.path.join(rp, "vm-feedface", "logs"), exist_ok=True)
+    with open(os.path.join(rp, "vm-feedface", "config.json"), "w") as fh:
+        fh.write('{"boot-source": {}}\n')
+    with open(os.path.join(rp, "vm-feedface", "logs", "vm.log"), "w") as fh:
+        fh.write("replaced root payload\n")
 res = {"name": name, "verdict": os.environ.get("FDRV_VERDICT", "PASS"),
        "vm_ids_seen": json.loads(os.environ.get("FDRV_SEEN", "[]"))}
 json.dump(res, open(os.path.join(out, name + ".json"), "w"))
@@ -123,6 +165,7 @@ run_case(){ # <outdir> [scenario-env...]
   rm -rf "$out"; rm -rf "$FIX/state"; mkdir -p "$FIX/state"
   env -i PATH="$PATH" HOME="${HOME:-$FIX/home}" FIX_STATE_DIR="$FIX/state" \
     MTLK_WORKDIR="$FIX/work" MTLK_DRIVER="$FIX/tools/pty-drive.py" \
+    MTLK_INTERACTIVE_EVIDENCE_ROOT="$FIX/evroot" \
     FDRV_MARKER="$FIX/invoked" "$@" \
     bash "$RUN_CASE" "$FIX/case.json" "$out" "$FIX/bin/matchlock"
 }
@@ -247,6 +290,88 @@ grep -q 'hygiene-rm vm-aaaaaaaa rc= 0' "$FIX/s18h.log" && okc 1 "s18 correlated 
 rm -f "$FIX/vmdb.sqlite"
 run_case "$FIX/out19" MTLK_MATCHLOCK_STATE_DB="$FIX/vmdb.sqlite" FDRV_VMDB="$FIX/vmdb.sqlite" FDRV_VM_CREATED="2020-01-01T00:00:00Z" FDRV_WRITE_MNT=1 FLIST_ROWS_AFTER="vm-aaaaaaaa  stopped" > "$FIX/s19.log" 2>&1; chk $? 1 "s19 uncorrelated rc=1 (fail-closed)"
 chk "$(python3 -c "import json;d=json.load(open('$FIX/out19/case-summary.json'));print('Y' if d.get('unowned_new_vms')==['vm-aaaaaaaa'] and not d.get('owned_new_vms') else 'N')" 2>/dev/null)" "Y" "s19 unowned recorded, not owned"
+
+echo ""
+echo '=== RETAINED INTERACTIVE-SESSION EVIDENCE FIXTURES (fresh, case-owned only) ==='
+EVR="$FIX/evroot"
+
+echo '--- S20 fresh session-evidence dir created during the case is counted ---'
+rm -rf "$EVR"
+run_case "$FIX/out20" FDRV_EVIDENCE=1 FDRV_EVIDENCE_ID=vm-abcdef01 FDRV_WRITE_MNT=1 > "$FIX/s20.log" 2>&1; chk $? 0 "s20 rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out20/case-summary.json'));print(','.join(d.get('interactive_evidence_new_vms',[])))" 2>/dev/null)" "vm-abcdef01" "s20 fresh evidence counted"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out20/case-summary.json'));print(d.get('interactive_evidence',{}).get('status'))" 2>/dev/null)" "ok" "s20 evidence status ok"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out20/case-summary.json'));print('empty' if not d.get('owned_new_vms') else d.get('owned_new_vms'))" 2>/dev/null)" "empty" "s20 evidence is not cleanup authority"
+
+echo '--- S20b logs-only shape (observed on macOS/VZ) is counted too ---'
+rm -rf "$EVR"
+run_case "$FIX/out20b" FDRV_EVIDENCE=1 FDRV_EVIDENCE_ID=vm-1234abcd FDRV_EVIDENCE_MODE=logs-only FDRV_WRITE_MNT=1 > "$FIX/s20b.log" 2>&1; chk $? 0 "s20b rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out20b/case-summary.json'));print(','.join(d.get('interactive_evidence_new_vms',[])))" 2>/dev/null)" "vm-1234abcd" "s20b logs-only evidence counted"
+
+echo '--- S21 pre-existing (stale) evidence dir is NEVER counted ---'
+rm -rf "$EVR"; mkdir -p "$EVR/vm-0000beef/logs"
+printf 'stale\n' > "$EVR/vm-0000beef/logs/vm.log"
+printf '{}\n' > "$EVR/vm-0000beef/config.json"
+run_case "$FIX/out21" FDRV_WRITE_MNT=1 > "$FIX/s21.log" 2>&1; chk $? 0 "s21 rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out21/case-summary.json'));print(len(d.get('interactive_evidence_new_vms',[])))" 2>/dev/null)" "0" "s21 stale evidence not counted"
+
+echo '--- S21b a stale dir whose contents are touched during the case stays excluded ---'
+rm -rf "$EVR"; mkdir -p "$EVR/vm-0000cafe/logs"
+printf 'stale\n' > "$EVR/vm-0000cafe/logs/vm.log"
+printf '{}\n' > "$EVR/vm-0000cafe/config.json"
+run_case "$FIX/out21b" FDRV_WRITE_MNT=1 FDRV_TOUCH_EVIDENCE="$EVR/vm-0000cafe/logs/vm.log" > "$FIX/s21b.log" 2>&1; chk $? 0 "s21b rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out21b/case-summary.json'));print(len(d.get('interactive_evidence_new_vms',[])))" 2>/dev/null)" "0" "s21b touched stale evidence not counted"
+
+echo '--- S22 a fresh but EMPTY dir (no payload) is not evidence ---'
+rm -rf "$EVR"
+run_case "$FIX/out22" FDRV_EVIDENCE=1 FDRV_EVIDENCE_ID=vm-00c0ffee FDRV_EVIDENCE_MODE=empty FDRV_WRITE_MNT=1 > "$FIX/s22.log" 2>&1; chk $? 0 "s22 rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out22/case-summary.json'));e=d.get('interactive_evidence',{});print(','.join(i['reason'] for i in e.get('ignored',[])) or 'none')" 2>/dev/null)" "no-retained-payload" "s22 empty dir rejected"
+
+echo '--- S23 a fresh SYMLINKED dir is not evidence ---'
+rm -rf "$EVR"
+run_case "$FIX/out23" FDRV_EVIDENCE=1 FDRV_EVIDENCE_ID=vm-00feed01 FDRV_EVIDENCE_MODE=symlink FDRV_WRITE_MNT=1 > "$FIX/s23.log" 2>&1; chk $? 0 "s23 rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out23/case-summary.json'));e=d.get('interactive_evidence',{});print([i['reason'] for i in e.get('ignored',[]) if i['name']=='vm-00feed01'][0])" 2>/dev/null)" "not-a-real-directory" "s23 symlinked dir rejected"
+
+echo '--- S24 the vm-00000000 placeholder sentinel is never counted ---'
+rm -rf "$EVR"
+run_case "$FIX/out24" FDRV_EVIDENCE=1 FDRV_EVIDENCE_ID=vm-00000000 FDRV_WRITE_MNT=1 > "$FIX/s24.log" 2>&1; chk $? 0 "s24 rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out24/case-summary.json'));e=d.get('interactive_evidence',{});print([i['reason'] for i in e.get('ignored',[]) if i['name']=='vm-00000000'][0])" 2>/dev/null)" "placeholder-sentinel" "s24 sentinel rejected"
+
+echo '--- S25 a root REPLACED during the case is fail-closed (never "all new") ---'
+rm -rf "$EVR"; mkdir -p "$EVR"
+run_case "$FIX/out25" FDRV_REPLACE_ROOT="$EVR" FDRV_WRITE_MNT=1 > "$FIX/s25.log" 2>&1; chk $? 1 "s25 replaced-root rc=1"
+grep -q 'interactive-evidence-unreadable:' "$FIX/out25/case-summary.json" && grep -q 'evidence-root-replaced' "$FIX/out25/case-summary.json" && okc 1 "s25 replaced-root fail-closed" || okc 0 "s25 replaced-root fail-closed"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out25/case-summary.json'));print(','.join(d.get('interactive_evidence_new_vms',[])))" 2>/dev/null)" "" "s25 replaced-root counts nothing"
+
+echo '--- S26 a non-directory root refuses BEFORE launch ---'
+rm -rf "$EVR"; : > "$EVR"
+rm -f "$FIX/invoked"
+run_case "$FIX/out26" FDRV_WRITE_MNT=1 > "$FIX/s26.log" 2>&1; chk $? 2 "s26 file-root rc=2"
+grep -q 'interactive-evidence-before-invalid:not-a-directory' "$FIX/out26/case-summary.json" && okc 1 "s26 file-root refusal recorded" || okc 0 "s26 file-root refusal recorded"
+[ ! -f "$FIX/invoked" ] && okc 1 "s26 driver not invoked" || okc 0 "s26 driver not invoked"
+rm -f "$EVR"
+
+echo '--- S27 a symlinked root refuses BEFORE launch ---'
+rm -rf "$EVR" "$FIX/evtarget"; mkdir -p "$FIX/evtarget"; ln -s "$FIX/evtarget" "$EVR"
+rm -f "$FIX/invoked"
+run_case "$FIX/out27" FDRV_WRITE_MNT=1 > "$FIX/s27.log" 2>&1; chk $? 2 "s27 symlink-root rc=2"
+grep -q 'interactive-evidence-before-invalid:symlink-root' "$FIX/out27/case-summary.json" && okc 1 "s27 symlink-root refusal recorded" || okc 0 "s27 symlink-root refusal recorded"
+[ ! -f "$FIX/invoked" ] && okc 1 "s27 driver not invoked" || okc 0 "s27 driver not invoked"
+rm -f "$EVR"; rm -rf "$FIX/evtarget"
+
+echo '--- S28 a malformed identity with a trailing newline is never a vm id ---'
+rm -rf "$EVR"
+run_case "$FIX/out28" FDRV_EVIDENCE=1 FDRV_EVIDENCE_ID=$'vm-00db00db\n' FDRV_WRITE_MNT=1 > "$FIX/s28.log" 2>&1; chk $? 0 "s28 rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out28/case-summary.json'));print(','.join(d.get('interactive_evidence_new_vms',[])) or 'none')" 2>/dev/null)" "none" "s28 newline id not counted"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out28/case-summary.json'));e=d.get('interactive_evidence',{});print([i['reason'] for i in e.get('ignored',[]) if i['name'].startswith('vm-00db00db')][0])" 2>/dev/null)" "not-a-vm-id" "s28 newline id rejected as malformed"
+rm -rf "$EVR"
+
+echo '--- S29 sequential cases: the second case counts only its OWN new dir ---'
+rm -rf "$EVR"
+run_case "$FIX/out29a" FDRV_EVIDENCE=1 FDRV_EVIDENCE_ID=vm-11112222 FDRV_WRITE_MNT=1 > "$FIX/s29a.log" 2>&1; chk $? 0 "s29a rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out29a/case-summary.json'));print(','.join(d.get('interactive_evidence_new_vms',[])))" 2>/dev/null)" "vm-11112222" "s29a first-case evidence counted"
+run_case "$FIX/out29b" FDRV_EVIDENCE=1 FDRV_EVIDENCE_ID=vm-33334444 FDRV_EVIDENCE_MODE=logs-only FDRV_WRITE_MNT=1 > "$FIX/s29b.log" 2>&1; chk $? 0 "s29b rc=0"
+chk "$(python3 -c "import json;d=json.load(open('$FIX/out29b/case-summary.json'));print(','.join(d.get('interactive_evidence_new_vms',[])))" 2>/dev/null)" "vm-33334444" "s29b second-case evidence counted (logs-only, prior dir excluded)"
+rm -rf "$EVR"
 
 echo ""
 echo "RUN-CASE FIXTURES RESULT: pass=$PASSN fail=$FAILN"

@@ -17,7 +17,16 @@
  *     malformed/unreadable inventory, reporting unowned ids without touching
  *     them;
  *   - configuration bindings are rendered from `{{MTLK_*}}` placeholders and an
- *     unset placeholder refuses before launch.
+ *     unset placeholder refuses before launch;
+ *   - retained interactive-session evidence is counted ONLY for dirs that
+ *     appear under the case's private observation root during that case's own
+ *     window with a real copy payload: fresh payloads (Linux config.json+logs
+ *     and macOS/VZ logs-only) are observed; a pre-existing (stale) dir is
+ *     excluded even when its contents are touched mid-case; an empty dir, a
+ *     symlinked dir, the `vm-00000000` placeholder sentinel and a root that is
+ *     replaced mid-case are never counted; a file/symlink root refuses before
+ *     launch. The observation is recorded in `interactive_evidence_new_vms`
+ *     and never grants cleanup authority (`owned_new_vms`).
  *
  * It also asserts the port carries no host-specific path (`/home/igorhvr`,
  * `li155-matrix`) and never references the known-wrong image-store registry
@@ -84,6 +93,32 @@ const DECISIVE_CONTROLS = [
   "s18 correlated VM removed",
   "s19 uncorrelated rc=1 (fail-closed)",
   "s19 unowned recorded, not owned",
+  // retained interactive-session evidence (case-owned observation only)
+  "s20 fresh evidence counted",
+  "s20 evidence status ok",
+  "s20 evidence is not cleanup authority",
+  "s20b logs-only evidence counted",
+  "s21 stale evidence not counted",
+  "s21b touched stale evidence not counted",
+  "s22 empty dir rejected",
+  "s23 symlinked dir rejected",
+  "s24 sentinel rejected",
+  "s25 replaced-root rc=1",
+  "s25 replaced-root fail-closed",
+  "s25 replaced-root counts nothing",
+  "s26 file-root rc=2",
+  "s26 file-root refusal recorded",
+  "s26 driver not invoked",
+  "s27 symlink-root rc=2",
+  "s27 symlink-root refusal recorded",
+  "s27 driver not invoked",
+  "s28 rc=0",
+  "s28 newline id not counted",
+  "s28 newline id rejected as malformed",
+  "s29a rc=0",
+  "s29a first-case evidence counted",
+  "s29b rc=0",
+  "s29b second-case evidence counted (logs-only, prior dir excluded)",
 ] as const;
 
 /** Recursively collect text files under `dir` (skips `__pycache__`/`.pyc`). */
