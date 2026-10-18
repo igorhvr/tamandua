@@ -485,7 +485,7 @@ Suite files (in the worktree at this commit):
 | `cases/M3.json` | `99e7dd692f5faefd0bd93e0cb6115cdea66b9c2d03669caf7f1d4cef532818d0` |
 | `cases/M4.json` | `8c8f82ccdb04f9a3969ff6e66e7ecee48b40239e50740eb416022e234fe74321` |
 | `cases/M5.json` | `c2b3d85fbf8a6b0943a56bc22f47ee3d15679ec445fe8db2145c106c4deded9c` |
-| `cases/M6.json` | `473033c204e6583b1459f81d5f90870b4e6f6840cfb300e00317ce191d8a7dab` |
+| `cases/M6.json` | `a1b98d73dcb933201b495f8179d71d761ddad22d66335dc9e57302daf6996862` |
 
 Host binaries (do NOT replace or reinstall; the matchlock pair is at
 `/usr/local/bin/`, `tamandua` from PATH):
