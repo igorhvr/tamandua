@@ -9,7 +9,10 @@
  * the only changes are the same configuration rebindings US-007 applied to
  * M0–M4 (argv[0]/cwd/workdir/allow-private/digest/uid/gid as `{{MTLK_*}}`
  * placeholders, and the host `env` block dropped because the runner owns the
- * private per-run environment). No assertion is weakened.
+ * private per-run environment). No assertion is weakened. M6's handshake was
+ * later strengthened by 99bae937 — the fresh-home consent menu and its 'Shared
+ * metrics off' dismissal acknowledgement are required before the U+276F prompt —
+ * and this contract pins that accepted ordering.
  *
  * The live-model tier is env-gated: `lib/common.sh` exposes `mtlk_t3_ready`
  * (explicit `MTLK_T3_ENABLED` AND credentials), `mtlk_t3_notrun_reason` /
@@ -124,21 +127,46 @@ describe("Matchlock interactive T3 live-model case contract (MTLK-INTERACTIVE-SU
     assert.ok(!m5.events.some((e) => e.sleep === 2.5), "M5 must NOT split the prompt across a pause");
   });
 
-  it("preserves the M6 telemetry-consent settle, U+276F prompt and SPLIT-SEND pause", () => {
+  it("requires the M6 consent handshake, U+276F prompt and SPLIT-SEND pause", () => {
     const m6 = loadCase("M6");
     const w = waitFors(m6);
-    assert.ok(w.includes("Help improve Hermes\\?"), "M6 must handle the optional telemetry-consent screen");
-    const consent = m6.events.find((e) => e.wait_for === "Help improve Hermes\\?");
-    assert.equal(consent?.required, false, "the telemetry-consent wait must stay optional/deterministic");
-    assert.ok(
-      m6.events.some((e) => e.send === "\r"),
-      "M6 must settle the optional consent screen with Enter (deterministic when absent)",
-    );
+    assert.ok(w.includes("Help improve Hermes\\?"), "M6 must wait for the mandatory telemetry-consent screen");
     assert.ok(w.includes(HERMES_PROMPT), "M6 must wait for the U+276F prompt character");
+
+    const consentIdx = m6.events.findIndex((e) => e.wait_for === "Help improve Hermes\\?");
+    assert.ok(consentIdx >= 0, "M6 must wait for the telemetry-consent screen");
+    assert.equal(
+      m6.events[consentIdx].required,
+      true,
+      "the telemetry-consent wait must be required for the fresh-home fixture",
+    );
+
+    const enterIdx = m6.events.findIndex((e) => e.send === "\r");
+    assert.ok(enterIdx > consentIdx, "M6 must settle the consent screen with Enter");
+    assert.ok(
+      m6.events.slice(consentIdx + 1, enterIdx).every((e) => e.sleep !== undefined),
+      "the first Enter must follow the shown consent menu, not an unrelated later Enter",
+    );
+
+    const ackIdx = m6.events.findIndex((e) => e.wait_for === "Shared metrics off");
+    assert.ok(ackIdx > enterIdx, "M6 must confirm the menu was dismissed before assuming a prompt");
+    assert.equal(
+      m6.events[ackIdx].required,
+      true,
+      "the 'Shared metrics off' dismissal acknowledgement must be required",
+    );
+    assert.ok(
+      m6.events.slice(enterIdx + 1, ackIdx).every((e) => e.sleep !== undefined),
+      "the dismissal acknowledgement must be the next observation after the consent Enter",
+    );
+
+    const promptIdx = m6.events.findIndex((e) => e.wait_for === HERMES_PROMPT);
+    assert.ok(promptIdx > ackIdx, "M6 must wait for the U+276F prompt only after the dismissal acknowledgement");
+    assert.notEqual(m6.events[promptIdx].required, false, "the U+276F prompt wait must stay required");
     assert.equal(HERMES_PROMPT.codePointAt(0), 0x276f, "the waited-for character must be U+276F");
 
     const idx = m6.events.findIndex((e) => e.send === PROMPT_TEXT);
-    assert.ok(idx > 0, "M6 must send the prompt text");
+    assert.ok(idx > promptIdx, "M6 must send the prompt text after the U+276F prompt appears");
     assert.equal(m6.events[idx + 1]?.sleep, 2.5, "M6 must pause ~2.5s between text and CR");
     assert.equal(m6.events[idx + 2]?.send, "\r", "M6 must send the CR as a separate write");
   });
