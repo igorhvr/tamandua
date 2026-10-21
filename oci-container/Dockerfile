@@ -14,7 +14,7 @@ MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 #   hermes-agent: 4d04303818b61bf3aa09278af48356315515965b
 #   pi:           bd3c9b823762b7383954aa49e13ee350471015fe
 #   dsh:          5badb15009ae1756c3afe0ae0cef1faafc290ccc
-#   tamandua:     470d3e11dc2601f9cc501c080ca1a2e60dd58f5d
+#   tamandua:     f2d4e75dabf87173e92c124733285676c906a180
 # Python runtime pin: 3.14.7 -- the NEWEST Python hermes main supports
 # (`requires-python >=3.11,<3.15`; upstream's own pm/lock.json names the exact
 # 3.14.7+20260901 artifact). Newest-supported is deliberate: older Pythons
@@ -27,7 +27,7 @@ LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
       com.tamandua.hermes.commit="4d04303818b61bf3aa09278af48356315515965b" \
       com.tamandua.pi.commit="bd3c9b823762b7383954aa49e13ee350471015fe" \
       com.tamandua.dsh.commit="5badb15009ae1756c3afe0ae0cef1faafc290ccc" \
-      com.tamandua.tamandua.commit="470d3e11dc2601f9cc501c080ca1a2e60dd58f5d" \
+      com.tamandua.tamandua.commit="f2d4e75dabf87173e92c124733285676c906a180" \
       com.tamandua.python.pin="3.14.7"
 
 # User-agnostic PATH: everything the image runs for any caller uid lives under
@@ -128,9 +128,9 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "470d3e11dc2601f9cc501c080ca1a2e60dd58f5d" ]; then \
-      git -C /opt/tamandua fetch --depth 1 origin 470d3e11dc2601f9cc501c080ca1a2e60dd58f5d; \
-      git -C /opt/tamandua checkout --detach 470d3e11dc2601f9cc501c080ca1a2e60dd58f5d; \
+    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "f2d4e75dabf87173e92c124733285676c906a180" ]; then \
+      git -C /opt/tamandua fetch --depth 1 origin f2d4e75dabf87173e92c124733285676c906a180; \
+      git -C /opt/tamandua checkout --detach f2d4e75dabf87173e92c124733285676c906a180; \
     fi; \
     git -C /opt/tamandua rev-parse HEAD; \
     bash /opt/tamandua/scripts/install.sh --local /opt/tamandua; \
