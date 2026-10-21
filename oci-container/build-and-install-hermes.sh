@@ -472,7 +472,8 @@ if [ -n "$PIP_VENDORED" ]; then
   case "$PIP_VENDORED_VER" in
     "$CERTIFI_FLOOR"|2026.1[1-9].*|202[7-9].*) : ;;
     *)
-      # Upgrading pip refreshes its vendored bundle as a side effect.
+      # Upgrading pip refreshes its vendored bundle as a side effect. Measured: pip 26.2.1
+      # carried certifi 2026.6.17; upgrading to pip 26.2.2 yields exactly 2026.10.19.
       "$STORE_PY" -m pip install --no-cache-dir --upgrade pip >/dev/null 2>&1 || true
       PIP_VENDORED_VER=$("$STORE_PY" -c 'import pip._vendor.certifi as c;print(getattr(c,"__version__","0"))' 2>/dev/null) || PIP_VENDORED_VER="0"
       ;;
@@ -480,7 +481,7 @@ if [ -n "$PIP_VENDORED" ]; then
   echo "-- certifi (pip vendored): ${PIP_VENDORED_VER} (floor ${CERTIFI_FLOOR})"
   case "$PIP_VENDORED_VER" in
     "$CERTIFI_FLOOR"|2026.1[1-9].*|202[7-9].*) : ;;
-    *) echo "-- note: pip's vendored certifi is ${PIP_VENDORED_VER}, below the floor; pip is a build-time\n--       tool in this image and no runtime path falls back to it. Disclosed rather than hidden." ;;
+    *) echo "FATAL: pip's vendored certifi is ${PIP_VENDORED_VER}, below the CA-remediation floor ${CERTIFI_FLOOR}. pip is a shipped, user-invocable tool in this image, so a pre-remediation bundle in it is not acceptable." >&2; exit 1 ;;
   esac
 fi
 
