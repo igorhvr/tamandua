@@ -1,4 +1,4 @@
-FROM igorhvr/bedlam-ubuntu@sha256:adc1ee27af2a29e76dc12a5613193d52195ec6e952da8523717c5b18044d7841 AS icebox-env
+FROM igorhvr/bedlam-ubuntu@sha256:d9004992867364ad9a1fbdd827a0b8d2dc9442d4e0af0d74efd3b8973c485c57 AS icebox-env
 MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 
 # ============================================================================
