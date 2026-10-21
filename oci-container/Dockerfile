@@ -11,10 +11,10 @@ MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 #
 # Frozen source SHAs for r4 (also recorded in /etc/tamandua-image-manifest.json
 # and the OCI labels below; users can `git pull` ahead of them at will):
-#   hermes-agent: 2943ee6f19a2abd0cc93384db55643469e80dfcb
-#   pi:           f10993bc7f28145df1375f3ff39c7f5c4cfc05f0
+#   hermes-agent: 4d04303818b61bf3aa09278af48356315515965b
+#   pi:           bd3c9b823762b7383954aa49e13ee350471015fe
 #   dsh:          5badb15009ae1756c3afe0ae0cef1faafc290ccc
-#   tamandua:     cf2e6c3a8737ac561f2ed71353f5627a408caa89
+#   tamandua:     470d3e11dc2601f9cc501c080ca1a2e60dd58f5d
 # Python runtime pin: 3.14.7 -- the NEWEST Python hermes main supports
 # (`requires-python >=3.11,<3.15`; upstream's own pm/lock.json names the exact
 # 3.14.7+20260901 artifact). Newest-supported is deliberate: older Pythons
@@ -24,10 +24,10 @@ MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
       org.opencontainers.image.source="https://github.com/igorhvr/tamandua" \
       org.opencontainers.image.description="Matchlock standard image: tamandua, dsh, pi and hermes (pi/hermes built from in-image source with build-and-install scripts)" \
-      com.tamandua.hermes.commit="2943ee6f19a2abd0cc93384db55643469e80dfcb" \
-      com.tamandua.pi.commit="f10993bc7f28145df1375f3ff39c7f5c4cfc05f0" \
+      com.tamandua.hermes.commit="4d04303818b61bf3aa09278af48356315515965b" \
+      com.tamandua.pi.commit="bd3c9b823762b7383954aa49e13ee350471015fe" \
       com.tamandua.dsh.commit="5badb15009ae1756c3afe0ae0cef1faafc290ccc" \
-      com.tamandua.tamandua.commit="cf2e6c3a8737ac561f2ed71353f5627a408caa89" \
+      com.tamandua.tamandua.commit="470d3e11dc2601f9cc501c080ca1a2e60dd58f5d" \
       com.tamandua.python.pin="3.14.7"
 
 # User-agnostic PATH: everything the image runs for any caller uid lives under
@@ -71,13 +71,13 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    git -C /opt/src/hermes-agent checkout -B main 2943ee6f19a2abd0cc93384db55643469e80dfcb; \
+    git -C /opt/src/hermes-agent checkout -B main 4d04303818b61bf3aa09278af48356315515965b; \
     git -C /opt/src/hermes-agent branch --set-upstream-to=origin/main main
 
 COPY build-and-install-hermes.sh /opt/src/hermes-agent/build-and-install
 RUN printf 'build-and-install\n' >> /opt/src/hermes-agent/.git/info/exclude \
  && chmod 755 /opt/src/hermes-agent/build-and-install \
- && EXPECT_HEAD=2943ee6f19a2abd0cc93384db55643469e80dfcb \
+ && EXPECT_HEAD=4d04303818b61bf3aa09278af48356315515965b \
     HERMES_SYSTEM_HOME=/opt/src/hermes-root \
     TAMANDUA_IMAGE_BUILD=1 \
     /opt/src/hermes-agent/build-and-install
@@ -91,13 +91,13 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    git -C /opt/src/pi checkout -B main f10993bc7f28145df1375f3ff39c7f5c4cfc05f0; \
+    git -C /opt/src/pi checkout -B main bd3c9b823762b7383954aa49e13ee350471015fe; \
     git -C /opt/src/pi branch --set-upstream-to=origin/main main
 
 COPY build-and-install-pi.sh /opt/src/pi/build-and-install
 RUN printf 'build-and-install\n' >> /opt/src/pi/.git/info/exclude \
  && chmod 755 /opt/src/pi/build-and-install \
- && TAMANDUA_IMAGE_BUILD=1 EXPECT_HEAD=f10993bc7f28145df1375f3ff39c7f5c4cfc05f0 /opt/src/pi/build-and-install
+ && TAMANDUA_IMAGE_BUILD=1 EXPECT_HEAD=bd3c9b823762b7383954aa49e13ee350471015fe /opt/src/pi/build-and-install
 
 # --- dsh / DeepSeek Harness (same shape as the previous image; pinned) -------
 RUN set -eu; \
@@ -128,9 +128,9 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "cf2e6c3a8737ac561f2ed71353f5627a408caa89" ]; then \
-      git -C /opt/tamandua fetch --depth 1 origin cf2e6c3a8737ac561f2ed71353f5627a408caa89; \
-      git -C /opt/tamandua checkout --detach cf2e6c3a8737ac561f2ed71353f5627a408caa89; \
+    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "470d3e11dc2601f9cc501c080ca1a2e60dd58f5d" ]; then \
+      git -C /opt/tamandua fetch --depth 1 origin 470d3e11dc2601f9cc501c080ca1a2e60dd58f5d; \
+      git -C /opt/tamandua checkout --detach 470d3e11dc2601f9cc501c080ca1a2e60dd58f5d; \
     fi; \
     git -C /opt/tamandua rev-parse HEAD; \
     bash /opt/tamandua/scripts/install.sh --local /opt/tamandua; \
