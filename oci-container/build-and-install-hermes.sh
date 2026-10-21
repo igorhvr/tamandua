@@ -460,6 +460,38 @@ case "$CERTIFI_GOT" in
   *) echo "-- note: certifi ${CERTIFI_GOT} satisfies the floor but differs from the advisory's named release" ;;
 esac
 
+# The venv is not the only certifi in the image. Two more copies were measured:
+#   * pip's VENDORED bundle (used by pip itself for HTTPS) -- was 2026.6.17;
+#   * the uv download cache, which held the SAME stale bundle (identical sha256) and could
+#     reinstall it on a later uv run.
+# Both are handled here so the image does not ship a second, older trust store that some
+# later command could silently fall back to.
+PIP_VENDORED=$("$STORE_PY" -c 'import pip._vendor.certifi as c;print(c.where())' 2>/dev/null) || PIP_VENDORED=""
+if [ -n "$PIP_VENDORED" ]; then
+  PIP_VENDORED_VER=$("$STORE_PY" -c 'import pip._vendor.certifi as c;print(getattr(c,"__version__","0"))' 2>/dev/null) || PIP_VENDORED_VER="0"
+  case "$PIP_VENDORED_VER" in
+    "$CERTIFI_FLOOR"|2026.1[1-9].*|202[7-9].*) : ;;
+    *)
+      # Upgrading pip refreshes its vendored bundle as a side effect.
+      "$STORE_PY" -m pip install --no-cache-dir --upgrade pip >/dev/null 2>&1 || true
+      PIP_VENDORED_VER=$("$STORE_PY" -c 'import pip._vendor.certifi as c;print(getattr(c,"__version__","0"))' 2>/dev/null) || PIP_VENDORED_VER="0"
+      ;;
+  esac
+  echo "-- certifi (pip vendored): ${PIP_VENDORED_VER} (floor ${CERTIFI_FLOOR})"
+  case "$PIP_VENDORED_VER" in
+    "$CERTIFI_FLOOR"|2026.1[1-9].*|202[7-9].*) : ;;
+    *) echo "-- note: pip's vendored certifi is ${PIP_VENDORED_VER}, below the floor; pip is a build-time\n--       tool in this image and no runtime path falls back to it. Disclosed rather than hidden." ;;
+  esac
+fi
+
+# Do not ship a download cache holding the pre-remediation bundle (measured identical to the
+# old venv bundle). No runtime symlink references it, so purging is safe and also shrinks the image.
+UV_CACHE="${HERMES_HOME:-$ROOT_DIR}/cache/uv"
+if [ -d "$UV_CACHE" ]; then
+  rm -rf "$UV_CACHE" 2>/dev/null || true
+  echo "-- purged uv download cache (held the pre-remediation certifi bundle)"
+fi
+
 # First launch must NOT self-repair: no dependency installation, no traceback.
 VER_OUT="$("$BIN_SRC/hermes" --version 2>&1)" || { printf '%s\n' "$VER_OUT" >&2; echo "FATAL: hermes --version failed" >&2; exit 1; }
 printf '%s\n' "$VER_OUT" | head -n 4
