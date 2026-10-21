@@ -14,7 +14,7 @@ MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 #   hermes-agent: 4d04303818b61bf3aa09278af48356315515965b
 #   pi:           bd3c9b823762b7383954aa49e13ee350471015fe
 #   dsh:          5badb15009ae1756c3afe0ae0cef1faafc290ccc
-#   tamandua:     f2d4e75dabf87173e92c124733285676c906a180
+#   tamandua:     3f5d008c8d2263017bf13059625606539a625f06
 # Python runtime pin: 3.14.7 -- the NEWEST Python hermes main supports
 # (`requires-python >=3.11,<3.15`; upstream's own pm/lock.json names the exact
 # 3.14.7+20260901 artifact). Newest-supported is deliberate: older Pythons
@@ -27,7 +27,7 @@ LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
       com.tamandua.hermes.commit="4d04303818b61bf3aa09278af48356315515965b" \
       com.tamandua.pi.commit="bd3c9b823762b7383954aa49e13ee350471015fe" \
       com.tamandua.dsh.commit="5badb15009ae1756c3afe0ae0cef1faafc290ccc" \
-      com.tamandua.tamandua.commit="f2d4e75dabf87173e92c124733285676c906a180" \
+      com.tamandua.tamandua.commit="3f5d008c8d2263017bf13059625606539a625f06" \
       com.tamandua.python.pin="3.14.7"
 
 # User-agnostic PATH: everything the image runs for any caller uid lives under
@@ -37,6 +37,14 @@ LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
 # without any shell rc.
 ENV PATH="/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV HOME="/root"
+
+# CA remediation: force OpenSSL-based clients (notably uv, and anything else that consults
+# SSL_CERT_FILE) onto the PATCHED system bundle. This image's system store is
+# ca-certificates 20260816ubuntu0.26.04.1, which rejects all 12 advisory chains. Node uses its
+# own compiled-in roots (node 24.22.1, patched) and hermes uses certifi, which the installer
+# upgrades and now gates on. Verified for uv 0.13.1: a bogus SSL_CERT_FILE makes a real
+# download fail, and this bundle makes it succeed.
+ENV SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
 
 # --- [icebox] Tier-A environment + passwordless-sudo drop-in (design v6 §2) --
 # One shared env stage. `docker build --target icebox-env` builds exactly this
@@ -128,9 +136,9 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "f2d4e75dabf87173e92c124733285676c906a180" ]; then \
-      git -C /opt/tamandua fetch --depth 1 origin f2d4e75dabf87173e92c124733285676c906a180; \
-      git -C /opt/tamandua checkout --detach f2d4e75dabf87173e92c124733285676c906a180; \
+    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "3f5d008c8d2263017bf13059625606539a625f06" ]; then \
+      git -C /opt/tamandua fetch --depth 1 origin 3f5d008c8d2263017bf13059625606539a625f06; \
+      git -C /opt/tamandua checkout --detach 3f5d008c8d2263017bf13059625606539a625f06; \
     fi; \
     git -C /opt/tamandua rev-parse HEAD; \
     bash /opt/tamandua/scripts/install.sh --local /opt/tamandua; \
