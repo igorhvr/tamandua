@@ -424,6 +424,42 @@ echo "-- application env:   $VENV_PY"
 "$VENV_PY" -c 'import ruamel.yaml, sqlite3; print("app-deps-ok")' \
   || { echo "FATAL: application dependencies are incomplete (ruamel missing)" >&2; exit 1; }
 
+# ---------------------------------------------------------------------------
+# CA remediation for the APPLICATION environment (eMudhra advisory, 2026-10-20).
+#
+# The base image's system store is patched, but hermes does NOT use it: it runs on
+# its own bundled interpreter and its HTTP clients (httpx/requests) default to
+# certifi. The hermes lock pins certifi 2026.5.20, and that bundle was measured to
+# ACCEPT chains signed by the compromised eMudhra intermediates (3 of 6 advisory
+# chains), while the patched certifi 2026.10.19 rejects all 6. So the system-store
+# fix alone does not cover hermes traffic, and this upgrade is required.
+#
+# Fail closed: an image whose application env still carries a pre-remediation
+# bundle must not build.
+#
+# Residual risk, stated rather than hidden: the upstream lock still pins 2026.5.20,
+# so a later `uv sync --locked` (e.g. a user re-running this script against a fresh
+# checkout) reverts to the old bundle. That is why the check lives HERE, in the
+# installer, and not only in the Dockerfile.
+# ---------------------------------------------------------------------------
+CERTIFI_FLOOR=2026.10.19
+if command -v uv >/dev/null 2>&1; then
+  uv pip install --python "$VENV_PY" --upgrade "certifi>=$CERTIFI_FLOOR" >/dev/null 2>&1 || true
+fi
+CERTIFI_GOT="$("$VENV_PY" -c 'import certifi;print(certifi.__version__)' 2>/dev/null)" || CERTIFI_GOT=""
+[ -n "$CERTIFI_GOT" ] || { echo "FATAL: certifi is not importable in the application environment" >&2; exit 1; }
+"$VENV_PY" -c "
+import sys, certifi
+got = tuple(int(x) for x in certifi.__version__.split('.')[:3])
+need = tuple(int(x) for x in '${CERTIFI_FLOOR}'.split('.'))
+sys.exit(0 if got >= need else 1)
+" || { echo "FATAL: certifi in the application env is ${CERTIFI_GOT}, below the CA-remediation floor ${CERTIFI_FLOOR}" >&2; exit 1; }
+echo "-- certifi (application env): ${CERTIFI_GOT} (floor ${CERTIFI_FLOOR})"
+case "$CERTIFI_GOT" in
+  "$CERTIFI_FLOOR"|2026.1[1-9].*|202[7-9].*) : ;;
+  *) echo "-- note: certifi ${CERTIFI_GOT} satisfies the floor but differs from the advisory's named release" ;;
+esac
+
 # First launch must NOT self-repair: no dependency installation, no traceback.
 VER_OUT="$("$BIN_SRC/hermes" --version 2>&1)" || { printf '%s\n' "$VER_OUT" >&2; echo "FATAL: hermes --version failed" >&2; exit 1; }
 printf '%s\n' "$VER_OUT" | head -n 4
