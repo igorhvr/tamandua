@@ -1,4 +1,4 @@
-FROM igorhvr/bedlam-ubuntu@sha256:1b21be58ec73d2347ecfe97cd725ec5ef6911097efd0cebb2878384c40936c28 AS icebox-env
+FROM igorhvr/bedlam-ubuntu@sha256:adc1ee27af2a29e76dc12a5613193d52195ec6e952da8523717c5b18044d7841 AS icebox-env
 MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 
 # ============================================================================
@@ -14,7 +14,7 @@ MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 #   hermes-agent: 2943ee6f19a2abd0cc93384db55643469e80dfcb
 #   pi:           f10993bc7f28145df1375f3ff39c7f5c4cfc05f0
 #   dsh:          5badb15009ae1756c3afe0ae0cef1faafc290ccc
-#   tamandua:     42cafe0d5ee158327ba522252fab5aeadbaece6b
+#   tamandua:     cf2e6c3a8737ac561f2ed71353f5627a408caa89
 # Python runtime pin: 3.14.7 -- the NEWEST Python hermes main supports
 # (`requires-python >=3.11,<3.15`; upstream's own pm/lock.json names the exact
 # 3.14.7+20260901 artifact). Newest-supported is deliberate: older Pythons
@@ -27,7 +27,7 @@ LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
       com.tamandua.hermes.commit="2943ee6f19a2abd0cc93384db55643469e80dfcb" \
       com.tamandua.pi.commit="f10993bc7f28145df1375f3ff39c7f5c4cfc05f0" \
       com.tamandua.dsh.commit="5badb15009ae1756c3afe0ae0cef1faafc290ccc" \
-      com.tamandua.tamandua.commit="42cafe0d5ee158327ba522252fab5aeadbaece6b" \
+      com.tamandua.tamandua.commit="cf2e6c3a8737ac561f2ed71353f5627a408caa89" \
       com.tamandua.python.pin="3.14.7"
 
 # User-agnostic PATH: everything the image runs for any caller uid lives under
@@ -128,9 +128,9 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "42cafe0d5ee158327ba522252fab5aeadbaece6b" ]; then \
-      git -C /opt/tamandua fetch --depth 1 origin 42cafe0d5ee158327ba522252fab5aeadbaece6b; \
-      git -C /opt/tamandua checkout --detach 42cafe0d5ee158327ba522252fab5aeadbaece6b; \
+    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "cf2e6c3a8737ac561f2ed71353f5627a408caa89" ]; then \
+      git -C /opt/tamandua fetch --depth 1 origin cf2e6c3a8737ac561f2ed71353f5627a408caa89; \
+      git -C /opt/tamandua checkout --detach cf2e6c3a8737ac561f2ed71353f5627a408caa89; \
     fi; \
     git -C /opt/tamandua rev-parse HEAD; \
     bash /opt/tamandua/scripts/install.sh --local /opt/tamandua; \
