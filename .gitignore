@@ -35,6 +35,8 @@ Thumbs.db
 
 # Logs
 *.log
+# Committed evidence: the G1 consolidated harness intentionally saves its log.
+!docs/gate/evidence/final-harness.log
 
 # Local scratch files
 PROMPT.md

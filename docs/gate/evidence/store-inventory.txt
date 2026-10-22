@@ -1,0 +1,122 @@
+# G1 US-003 store inventory probe output
+# captured_utc: 2026-10-22T03:51:46Z
+# host: vaimetal
+# command: docs/gate/probes/probe_store_inventory.sh (G1_KEEP_SCRATCH=1)
+# hermes: /home/kaladin/hermes-agent/venv/bin/hermes (Hermes Agent vgit.d623a66.dirty (2026.9.24) · upstream 8b66a510 · local d623a660 (+131 carried commits))
+# python: Python 3.14.7
+#
+probe_store_inventory: scratch_root=/tmp/g1-inv.FByi7k
+probe_store_inventory: hermes_src=/home/kaladin/hermes-agent
+probe_store_inventory: python=Python 3.14.7
+probe_store_inventory: real_home=/home/kaladin/.hermes (never opened by design)
+
+### trigger: hermes doctor
+hermes_home: /tmp/g1-inv.FByi7k/doctor/home
+exit: 1
+stdout: 
+stderr: hermes_scratch: HERMES_HOME=/tmp/g1-inv.FByi7k/doctor/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes doctor|
+db_files:
+  (none)
+headers:
+    (no SQLite store)
+
+### trigger: hermes sessions list
+hermes_home: /tmp/g1-inv.FByi7k/sessions-list/home
+exit: 0
+stdout: No sessions found.
+stderr: hermes_scratch: HERMES_HOME=/tmp/g1-inv.FByi7k/sessions-list/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes sessions list|
+db_files:
+  (none)
+headers:
+    (no SQLite store)
+
+### trigger: hermes kanban list
+hermes_home: /tmp/g1-inv.FByi7k/kanban-list/home
+exit: 0
+stdout: (no matching tasks)
+stderr: hermes_scratch: HERMES_HOME=/tmp/g1-inv.FByi7k/kanban-list/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes kanban list|
+db_files:
+  kanban.db	118784
+headers:
+  {"path": "/tmp/g1-inv.FByi7k/kanban-list/home/kanban.db", "size": 118784, "sha256": "1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52", "byte18": 2, "byte19": 2, "mode": "wal"}
+
+### trigger: hermes projects list
+hermes_home: /tmp/g1-inv.FByi7k/projects-list/home
+exit: 2
+stdout: 
+stderr: hermes_scratch: HERMES_HOME=/tmp/g1-inv.FByi7k/projects-list/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes projects list|hermes: 'projects' is not a `hermes` command.|
+db_files:
+  (none)
+headers:
+    (no SQLite store)
+
+### trigger: hermes project list
+hermes_home: /tmp/g1-inv.FByi7k/project-list/home
+exit: 0
+stdout: No projects yet. Create one with `hermes project create <name>`.
+stderr: hermes_scratch: HERMES_HOME=/tmp/g1-inv.FByi7k/project-list/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes project list|
+db_files:
+  projects.db	45056
+headers:
+  {"path": "/tmp/g1-inv.FByi7k/project-list/home/projects.db", "size": 45056, "sha256": "e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80", "byte18": 2, "byte19": 2, "mode": "wal"}
+
+### trigger: hermes cron list
+hermes_home: /tmp/g1-inv.FByi7k/cron-list/home
+exit: 0
+stdout: No scheduled jobs in profile 'default'.
+stderr: hermes_scratch: HERMES_HOME=/tmp/g1-inv.FByi7k/cron-list/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes cron list|
+db_files:
+  (none)
+headers:
+    (no SQLite store)
+
+### trigger: python -c SessionDB(); create_session(session_id="g1-inventory")
+hermes_home: /tmp/g1-inv.FByi7k/state-sessiondb/home
+exit: 0
+stdout: SessionDB created state.db|
+db_files:
+  state.db	274432
+headers:
+  {"path": "/tmp/g1-inv.FByi7k/state-sessiondb/home/state.db", "size": 274432, "sha256": "8a6a1d845e88d57d4980e96ffa8057ffc79334abe1739084eab9a9f612425fab", "byte18": 2, "byte19": 2, "mode": "wal"}
+
+### trigger: python -c record_verify_run(ok=True) with verify-on-stop OFF
+hermes_home: /tmp/g1-inv.FByi7k/verification-off/home
+exit: 0
+stdout: record_verify_run returned: None|
+db_files:
+  (none)
+headers:
+    (no SQLite store)
+
+### trigger: python -c record_verify_run(ok=True) with HERMES_VERIFY_ON_STOP=1
+hermes_home: /tmp/g1-inv.FByi7k/verification-on/home
+exit: 0
+stdout: record_verify_run returned id: 1|
+db_files:
+  verification_evidence.db	32768
+headers:
+  {"path": "/tmp/g1-inv.FByi7k/verification-on/home/verification_evidence.db", "size": 32768, "sha256": "834972c9d596d09ca7866705e146c0f6d04da8141dbdd006d1b575b16d6dbbb1", "byte18": 2, "byte19": 2, "mode": "wal"}
+
+== Attribution assertions ==
+ASSERT PASS: SessionDB() direct writer exists
+ASSERT PASS: hermes sessions list (read-only) did not create sessions-list/home/state.db
+ASSERT PASS: record_verify_run with verify-on-stop OFF did not create verification-off/home/verification_evidence.db
+ASSERT PASS: record_verify_run with verify-on-stop ON exists
+ASSERT PASS: hermes kanban list exists
+ASSERT PASS: hermes project list exists
+ASSERT PASS: hermes cron list (jobs.json, not SQLite) did not create cron-list/home/cron.db
+ASSERT PASS: hermes doctor (read-only health check) did not create doctor/home/state.db
+NOTE: 'hermes projects list' exited 2 (real CLI: not a command); no store asserted.
+
+== Store inventory summary ==
+store (relative)             trigger                                        fresh-home
+state.db                     SessionDB() + create_session()                 yes
+verification_evidence.db     record_verify_run() with verify-on-stop ON     yes
+kanban.db                    hermes kanban list                             yes
+projects.db                  hermes project list                            yes
+cron/jobs.json               hermes cron list (JSON, not SQLite)            n/a
+
+native_execution: /proc/1/cgroup=0::/init.scope 
+
+RESULT: PASS (all stores attributable; read-only triggers created no store)
+scratch root kept: /tmp/g1-inv.FByi7k

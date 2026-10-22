@@ -1,0 +1,47 @@
+# G1 store-open strace: hermes project list
+# captured_utc: 2026-10-22T03:50:56Z
+# host: vaimetal
+# scratch_home: /tmp/g1-strace.9JS6IU/project/home
+# hermes_bin: /home/kaladin/hermes-agent/venv/bin/hermes
+# command: HERMES_HOME=<scratch> strace -f -e trace=openat,open,creat -o <raw> -- docs/gate/probes/hermes_scratch.sh project list
+# exit: 0
+# total_syscall_lines: 7062
+# scratch_home_open_lines: 22
+# db_path_open_lines: 4
+# real_operator_home_open_lines: 0
+#
+# Filtered opens under the scratch HERMES_HOME (store paths first):
+3204272 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/project/home/projects.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 6
+3204272 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/project/home/projects.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3204272 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/project/home/projects.db-wal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3204272 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/project/home/projects.db-shm", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 8
+#
+# All further scratch-home opens (first 40, paths normalised to <scratch>):
+3204272 openat(AT_FDCWD, "<scratch>/cache/scratch/.last_prune", O_WRONLY|O_CREAT|O_CLOEXEC, 0666) = 3
+3204272 openat(AT_FDCWD, "<scratch>/cache/scratch", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3
+3204272 openat(AT_FDCWD, "<scratch>/SOUL.md", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 3
+3204272 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/plugins/platforms", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/plugins", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/logs/agent.log", O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, 0666) = 3
+3204272 openat(AT_FDCWD, "<scratch>/logs/errors.log", O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, 0666) = 4
+3204272 openat(AT_FDCWD, "<scratch>/serve_restart_pending/", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/tools/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/bootstrap/default.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/bootstrap/default.json.lock", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0777) = 6
+3204272 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/bootstrap/default.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/bootstrap/default.json.tmp", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 6
+3204272 openat(AT_FDCWD, "<scratch>/.container-mode", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/.container-mode", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3204272 openat(AT_FDCWD, "<scratch>/projects.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 6
+3204272 openat(AT_FDCWD, "<scratch>/projects.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3204272 openat(AT_FDCWD, "<scratch>", O_RDONLY|O_CLOEXEC) = 8
+3204272 openat(AT_FDCWD, "<scratch>/projects.db-wal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3204272 openat(AT_FDCWD, "<scratch>/projects.db-shm", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 8
+3204272 openat(AT_FDCWD, "<scratch>", O_RDONLY|O_CLOEXEC) = 9
+#
+# Final store listing:
+projects.db	45056
+#
+# Real-operator-home opens (must be empty):
+(none)

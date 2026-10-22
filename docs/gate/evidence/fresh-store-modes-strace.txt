@@ -1,0 +1,87 @@
+# G1 US-004 fresh-store journal-mode probe — strace summary
+# captured_utc: 2026-10-22T04:38:03Z
+# host: vaimetal
+# command: env -i PATH=... HOME=<scratch>/operator-home strace -f -e trace=openat,open,creat -o <raw> -- docs/gate/probes/probe_fresh_modes.sh
+# probe exit: 0
+# scratch root: /tmp/g1-fresh.i1lcst
+# scratch_home: /tmp/g1-fresh.i1lcst
+# total traced syscall lines: 81379
+# real_operator_home_open_lines: 0
+# path includes are paths named in the probe script or its own scratch root;
+# the probe imports the installed Hermes runtime read-only from /home/kaladin/hermes-agent.
+#
+Real-operator-home opens (must be empty):
+(none)
+
+Representative store opens (scratch path normalized to <scratch>; repeated opens deduplicated):
+
+## state-delete
+3446024 openat(AT_FDCWD, "<scratch>/state-delete/home/state.db", O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600) = 4
+3446024 openat(AT_FDCWD, "<scratch>/state-delete/home/state.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 4
+3446024 openat(AT_FDCWD, "<scratch>/state-delete/home/state.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 5
+3446024 openat(AT_FDCWD, "<scratch>/state-delete/home/state.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 6
+3446024 openat(AT_FDCWD, "<scratch>/state-delete/home/state.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 3
+3446024 openat(AT_FDCWD, "<scratch>/state-delete/home/state.db", O_RDONLY|O_CLOEXEC) = 3
+3446211 openat(AT_FDCWD, "<scratch>/state-delete/home/state.db", O_RDONLY|O_CLOEXEC) = 3
+3446295 openat(AT_FDCWD, "<scratch>/state-delete/home/state.db", O_RDONLY|O_CLOEXEC) = 3
+
+## state-wal
+3446462 openat(AT_FDCWD, "<scratch>/state-wal/home/state.db", O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600) = 4
+3446462 openat(AT_FDCWD, "<scratch>/state-wal/home/state.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 4
+3446462 openat(AT_FDCWD, "<scratch>/state-wal/home/state.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 5
+3446462 openat(AT_FDCWD, "<scratch>/state-wal/home/state.db-wal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 5
+3446462 openat(AT_FDCWD, "<scratch>/state-wal/home/state.db-shm", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 6
+3446462 openat(AT_FDCWD, "<scratch>/state-wal/home/state.db", O_RDONLY|O_CLOEXEC) = 3
+3446574 openat(AT_FDCWD, "<scratch>/state-wal/home/state.db", O_RDONLY|O_CLOEXEC) = 3
+3446636 openat(AT_FDCWD, "<scratch>/state-wal/home/state.db", O_RDONLY|O_CLOEXEC) = 3
+
+## verification_evidence-delete
+3446759 openat(AT_FDCWD, "<scratch>/verification_evidence-delete/home/verification_evidence.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 3
+3446759 openat(AT_FDCWD, "<scratch>/verification_evidence-delete/home/verification_evidence.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 4
+3446863 openat(AT_FDCWD, "<scratch>/verification_evidence-delete/home/verification_evidence.db", O_RDONLY|O_CLOEXEC) = 3
+3446944 openat(AT_FDCWD, "<scratch>/verification_evidence-delete/home/verification_evidence.db", O_RDONLY|O_CLOEXEC) = 3
+
+## verification_evidence-wal
+3447287 openat(AT_FDCWD, "<scratch>/verification_evidence-wal/home/verification_evidence.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 3
+3447287 openat(AT_FDCWD, "<scratch>/verification_evidence-wal/home/verification_evidence.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 4
+3447287 openat(AT_FDCWD, "<scratch>/verification_evidence-wal/home/verification_evidence.db-wal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 4
+3447287 openat(AT_FDCWD, "<scratch>/verification_evidence-wal/home/verification_evidence.db-shm", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 5
+3447630 openat(AT_FDCWD, "<scratch>/verification_evidence-wal/home/verification_evidence.db", O_RDONLY|O_CLOEXEC) = 3
+3447802 openat(AT_FDCWD, "<scratch>/verification_evidence-wal/home/verification_evidence.db", O_RDONLY|O_CLOEXEC) = 3
+
+## kanban-delete
+3448163 openat(AT_FDCWD, "<scratch>/kanban-delete/home/kanban.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3448163 openat(AT_FDCWD, "<scratch>/kanban-delete/home/kanban.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 8
+3448163 openat(AT_FDCWD, "<scratch>/kanban-delete/home/kanban.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 6
+3448875 openat(AT_FDCWD, "<scratch>/kanban-delete/home/kanban.db", O_RDONLY|O_CLOEXEC) = 3
+3449082 openat(AT_FDCWD, "<scratch>/kanban-delete/home/kanban.db", O_RDONLY|O_CLOEXEC) = 3
+
+## kanban-wal
+3449523 openat(AT_FDCWD, "<scratch>/kanban-wal/home/kanban.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3449523 openat(AT_FDCWD, "<scratch>/kanban-wal/home/kanban.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 8
+3449523 openat(AT_FDCWD, "<scratch>/kanban-wal/home/kanban.db-wal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 8
+3449523 openat(AT_FDCWD, "<scratch>/kanban-wal/home/kanban.db-shm", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 9
+3449523 openat(AT_FDCWD, "<scratch>/kanban-wal/home/kanban.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 6
+3449523 openat(AT_FDCWD, "<scratch>/kanban-wal/home/kanban.db-wal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3449523 openat(AT_FDCWD, "<scratch>/kanban-wal/home/kanban.db-shm", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 8
+3450664 openat(AT_FDCWD, "<scratch>/kanban-wal/home/kanban.db", O_RDONLY|O_CLOEXEC) = 3
+
+## projects-delete
+3451407 openat(AT_FDCWD, "<scratch>/projects-delete/home/projects.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 6
+3451407 openat(AT_FDCWD, "<scratch>/projects-delete/home/projects.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3451874 openat(AT_FDCWD, "<scratch>/projects-delete/home/projects.db", O_RDONLY|O_CLOEXEC) = 3
+3451997 openat(AT_FDCWD, "<scratch>/projects-delete/home/projects.db", O_RDONLY|O_CLOEXEC) = 3
+
+## projects-wal
+3452164 openat(AT_FDCWD, "<scratch>/projects-wal/home/projects.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 6
+3452164 openat(AT_FDCWD, "<scratch>/projects-wal/home/projects.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3452164 openat(AT_FDCWD, "<scratch>/projects-wal/home/projects.db-wal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 7
+3452164 openat(AT_FDCWD, "<scratch>/projects-wal/home/projects.db-shm", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 8
+3452630 openat(AT_FDCWD, "<scratch>/projects-wal/home/projects.db", O_RDONLY|O_CLOEXEC) = 3
+3452719 openat(AT_FDCWD, "<scratch>/projects-wal/home/projects.db", O_RDONLY|O_CLOEXEC) = 3
+
+Observation: the delete homes open only <store>.db and a transient
+<store>.db-journal (rollback journal, removed on commit/close); they never
+open <store>.db-wal or <store>.db-shm. The wal control homes open
+<store>.db-wal and <store>.db-shm in addition. This corroborates the raw
+header reading independently of any SQLite mode query.

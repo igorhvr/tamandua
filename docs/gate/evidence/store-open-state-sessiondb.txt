@@ -1,0 +1,25 @@
+# G1 store-open strace: SessionDB(); create_session(session_id="g1-inventory")
+# captured_utc: 2026-10-22T03:51:19Z
+# host: vaimetal
+# scratch_home: /tmp/g1-strace.9JS6IU/state-sessiondb/home
+# command: HERMES_HOME=<scratch> strace -f -e trace=openat,open,creat -o <raw> -- bash -c 'cd /home/kaladin/hermes-agent && venv/bin/python -c ...'
+# exit: 0
+# total_syscall_lines: 3746
+# scratch_home_open_lines: 16
+# real_operator_home_open_lines: 0
+#
+# Store opens under the scratch HERMES_HOME:
+3206787 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/state-sessiondb/home/state.db.quarantine.lock", O_RDWR|O_CREAT|O_APPEND|O_CLOEXEC, 0666) = 3
+3206787 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/state-sessiondb/home/state.db", O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600) = 4
+3206787 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/state-sessiondb/home/state.db", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 4
+3206787 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/state-sessiondb/home/state.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 5
+3206787 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/state-sessiondb/home/state.db-wal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 5
+3206787 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/state-sessiondb/home/state.db-shm", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0600) = 6
+3206787 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/state-sessiondb/home/state.db.fts_rebuild.lock", O_RDWR|O_CREAT|O_APPEND|O_CLOEXEC, 0666) = 7
+3206787 openat(AT_FDCWD, "/tmp/g1-strace.9JS6IU/state-sessiondb/home/state.db", O_RDONLY|O_CLOEXEC) = 3
+#
+# Final store listing:
+state.db	274432
+#
+# Real-operator-home opens (must be empty):
+(none)

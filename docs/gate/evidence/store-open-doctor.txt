@@ -1,0 +1,60 @@
+# G1 store-open strace: hermes doctor
+# captured_utc: 2026-10-22T03:51:17Z
+# host: vaimetal
+# scratch_home: /tmp/g1-strace.9JS6IU/doctor/home
+# hermes_bin: /home/kaladin/hermes-agent/venv/bin/hermes
+# command: HERMES_HOME=<scratch> strace -f -e trace=openat,open,creat -o <raw> -- docs/gate/probes/hermes_scratch.sh doctor
+# exit: 1
+# total_syscall_lines: 14031
+# scratch_home_open_lines: 188
+# db_path_open_lines: 0
+# real_operator_home_open_lines: 0
+#
+# Filtered opens under the scratch HERMES_HOME (store paths first):
+#
+# All further scratch-home opens (first 40, paths normalised to <scratch>):
+3205422 openat(AT_FDCWD, "<scratch>/cache/scratch/.last_prune", O_WRONLY|O_CREAT|O_CLOEXEC, 0666) = 3
+3205422 openat(AT_FDCWD, "<scratch>/cache/scratch", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3
+3205422 openat(AT_FDCWD, "<scratch>/SOUL.md", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 3
+3205422 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/plugins/platforms", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/plugins", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/logs/agent.log", O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, 0666) = 3
+3205422 openat(AT_FDCWD, "<scratch>/logs/errors.log", O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, 0666) = 4
+3205422 openat(AT_FDCWD, "<scratch>/serve_restart_pending/", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/tools/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/bootstrap/default.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/bootstrap/default.json.lock", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0777) = 6
+3205422 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/bootstrap/default.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/bootstrap/default.json.tmp", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 6
+3205422 openat(AT_FDCWD, "<scratch>/.container-mode", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/.container-mode", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/kanban/boards/", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205834 openat(AT_FDCWD, "<scratch>/SOUL.md", O_RDONLY|O_CLOEXEC) = 3
+3205834 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205834 openat(AT_FDCWD, "<scratch>/plugins/platforms", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3205834 openat(AT_FDCWD, "<scratch>/plugins", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/auth.lock", O_RDWR|O_CREAT|O_APPEND|O_CLOEXEC, 0666) = 6
+3205422 openat(AT_FDCWD, "<scratch>/cache/scratch", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 6
+3205422 openat(AT_FDCWD, "<scratch>/cache", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 6
+3205422 openat(AT_FDCWD, "<scratch>/SOUL.md", O_RDONLY|O_CLOEXEC) = 6
+3205422 openat(AT_FDCWD, "<scratch>/installs/73242aa64ae66d16/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/tools/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/tools/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/tools/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/tools/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/tools/facts.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3206212 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3206212 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3206212 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3206215 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3206215 openat(AT_FDCWD, "<scratch>/.env", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/cache/tool_discovery_cache.json", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+3205422 openat(AT_FDCWD, "<scratch>/cache/.tool_discovery_cache_wnqsjv32.tmp", O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600) = 6
+#
+# Final store listing:
+#
+# Real-operator-home opens (must be empty):
+(none)

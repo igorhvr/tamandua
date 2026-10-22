@@ -1,0 +1,174 @@
+probe_conversion_persistence: scratch_root=/tmp/g1-conversion.zzGFo1
+probe_conversion_persistence: hermes_src=/home/kaladin/hermes-agent
+probe_conversion_persistence: python=Python 3.14.7
+probe_conversion_persistence: hermes=Hermes Agent vgit.d623a66.dirty (2026.9.24) · upstream 8b66a510 · local d623a660 (+131 carried commits)
+probe_conversion_persistence: real_home=/home/kaladin/.hermes (never opened by design)
+probe_conversion_persistence: header_reader=/home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/read_header.py (raw bytes 18/19 only; no SQLite connection)
+probe_conversion_persistence: host_native=/proc/1/cgroup=0::/init.scope 
+
+== 1. Seed a real state.db under database.journal_mode: wal ==
+config_path: /tmp/g1-conversion.zzGFo1/seed-wal/home/config.yaml
+config_realpath: /tmp/g1-conversion.zzGFo1/seed-wal/home/config.yaml
+ASSERT PASS: seed-wal resolves database.journal_mode=wal before the writer
+writer: SessionDB() + create_session(session_id='g1-conversion-seed')
+writer_exit: 0
+writer_stdout: SessionDB() + create_session() closed: g1-conversion-seed|
+writer_stderr: 
+header_json: {"path": "/tmp/g1-conversion.zzGFo1/seed-wal/home/state.db", "size": 274432, "sha256": "a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591", "byte18": 2, "byte19": 2, "mode": "wal"}
+seed_wal_state_db_path: /tmp/g1-conversion.zzGFo1/seed-wal/home/state.db
+seed_wal_state_db_size: 274432
+seed_wal_state_db_sha256: a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591
+seed_wal_state_db_byte18: 2
+seed_wal_state_db_byte19: 2
+seed_wal_state_db_observed_mode: wal
+seed_wal_state_db_journal_sidecars:
+  (none)
+seed_wal_state_db_related_files (ls -la, store prefix only):
+  -rw-------	    274432	state.db
+  -rw-rw-r--	         0	state.db.fts_rebuild.lock
+  -rw-rw-r--	         0	state.db.quarantine.lock
+a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591 2 2 wal
+ASSERT PASS: seed_wal_state_db header is 2,2 (mode wal)
+original_sha256: a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591
+original_size: 274432
+
+== 2. Copy the WAL store with cp -a and prove the copy is byte-identical ==
+command: cp -a -- /tmp/g1-conversion.zzGFo1/seed-wal/home/state.db /tmp/g1-conversion.zzGFo1/conversion/state.db
+copy_sha256: a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591
+header_json: {"path": "/tmp/g1-conversion.zzGFo1/conversion/state.db", "size": 274432, "sha256": "a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591", "byte18": 2, "byte19": 2, "mode": "wal"}
+conversion_copy_before_path: /tmp/g1-conversion.zzGFo1/conversion/state.db
+conversion_copy_before_size: 274432
+conversion_copy_before_sha256: a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591
+conversion_copy_before_byte18: 2
+conversion_copy_before_byte19: 2
+conversion_copy_before_observed_mode: wal
+conversion_copy_before_journal_sidecars:
+  (none)
+conversion_copy_before_related_files (ls -la, store prefix only):
+  -rw-------	    274432	state.db
+a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591 2 2 wal
+ASSERT PASS: conversion_copy_before header is 2,2 (mode wal)
+ASSERT PASS: copy equals original before conversion (sha256 a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591)
+
+== 3. Convert the COPY offline with 'hermes sessions set-journal-mode delete' ==
+command: HERMES_HOME=/tmp/g1-conversion.zzGFo1/seed-wal/home /home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/hermes_scratch.sh sessions set-journal-mode delete --db /tmp/g1-conversion.zzGFo1/conversion/state.db
+conversion_exit: 0
+conversion_stdout:
+  ✓ /tmp/g1-conversion.zzGFo1/conversion/state.db: journal_mode wal → delete (header verified).
+    Note: config.yaml has database.journal_mode: wal — the next open would switch the file back. Set `database.journal_mode: delete` in config.yaml to keep it.
+conversion_stderr:
+  hermes_scratch: HERMES_HOME=/tmp/g1-conversion.zzGFo1/seed-wal/home
+  hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes sessions set-journal-mode delete --db /tmp/g1-conversion.zzGFo1/conversion/state.db
+header_json: {"path": "/tmp/g1-conversion.zzGFo1/conversion/state.db", "size": 274432, "sha256": "19ea36ec3855e13ee8f697f967687808d5adc91437912139702129dc959c3b04", "byte18": 1, "byte19": 1, "mode": "delete"}
+converted_copy_path: /tmp/g1-conversion.zzGFo1/conversion/state.db
+converted_copy_size: 274432
+converted_copy_sha256: 19ea36ec3855e13ee8f697f967687808d5adc91437912139702129dc959c3b04
+converted_copy_byte18: 1
+converted_copy_byte19: 1
+converted_copy_observed_mode: delete
+converted_copy_journal_sidecars:
+  (none)
+converted_copy_related_files (ls -la, store prefix only):
+  -rw-------	    274432	state.db
+19ea36ec3855e13ee8f697f967687808d5adc91437912139702129dc959c3b04 1 1 delete
+ASSERT PASS: converted_copy header is 1,1 (mode delete)
+original_sha256_before_conversion: a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591
+original_sha256_after_conversion:  a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591
+ASSERT PASS: original WAL store sha256 is unchanged by conversion of the copy
+converted_copy_sha256: 19ea36ec3855e13ee8f697f967687808d5adc91437912139702129dc959c3b04
+
+== 4. Writer TWICE against the converted copy under database.journal_mode: delete ==
+config_path: /tmp/g1-conversion.zzGFo1/delete/home/config.yaml
+config_realpath: /tmp/g1-conversion.zzGFo1/delete/home/config.yaml
+command: cp -a -- /tmp/g1-conversion.zzGFo1/conversion/state.db /tmp/g1-conversion.zzGFo1/delete/home/state.db
+ASSERT PASS: delete resolves database.journal_mode=delete before the writer
+
+writer_run: 1 (database.journal_mode=delete)
+writer_exit: 0
+writer_stdout: SessionDB() + create_session() closed: g1-conversion-delete-1|
+writer_stderr: 
+header_json: {"path": "/tmp/g1-conversion.zzGFo1/delete/home/state.db", "size": 274432, "sha256": "c90e5abef331fa9981604600ce1e2549581b14bf1dee42ea391b54968478824e", "byte18": 1, "byte19": 1, "mode": "delete"}
+delete_run_1_path: /tmp/g1-conversion.zzGFo1/delete/home/state.db
+delete_run_1_size: 274432
+delete_run_1_sha256: c90e5abef331fa9981604600ce1e2549581b14bf1dee42ea391b54968478824e
+delete_run_1_byte18: 1
+delete_run_1_byte19: 1
+delete_run_1_observed_mode: delete
+delete_run_1_journal_sidecars:
+  (none)
+delete_run_1_related_files (ls -la, store prefix only):
+  -rw-------	    274432	state.db
+c90e5abef331fa9981604600ce1e2549581b14bf1dee42ea391b54968478824e 1 1 delete
+ASSERT PASS: delete_run_1 header is 1,1 (mode delete)
+
+writer_run: 2 (database.journal_mode=delete)
+writer_exit: 0
+writer_stdout: SessionDB() + create_session() closed: g1-conversion-delete-2|
+writer_stderr: 
+header_json: {"path": "/tmp/g1-conversion.zzGFo1/delete/home/state.db", "size": 274432, "sha256": "af6e1b2ca7894e98e1bc81a362f5d05625649ac4ec98a28d092d911e9c39eb48", "byte18": 1, "byte19": 1, "mode": "delete"}
+delete_run_2_path: /tmp/g1-conversion.zzGFo1/delete/home/state.db
+delete_run_2_size: 274432
+delete_run_2_sha256: af6e1b2ca7894e98e1bc81a362f5d05625649ac4ec98a28d092d911e9c39eb48
+delete_run_2_byte18: 1
+delete_run_2_byte19: 1
+delete_run_2_observed_mode: delete
+delete_run_2_journal_sidecars:
+  (none)
+delete_run_2_related_files (ls -la, store prefix only):
+  -rw-------	    274432	state.db
+af6e1b2ca7894e98e1bc81a362f5d05625649ac4ec98a28d092d911e9c39eb48 1 1 delete
+ASSERT PASS: delete_run_2 header is 1,1 (mode delete)
+
+delete_home_sha256_after_run1: c90e5abef331fa9981604600ce1e2549581b14bf1dee42ea391b54968478824e
+delete_home_sha256_after_run2: af6e1b2ca7894e98e1bc81a362f5d05625649ac4ec98a28d092d911e9c39eb48
+
+== 5. Control: SAME converted copy under database.journal_mode: wal, writer ONCE ==
+purpose: prove the CONFIGURED value, not the conversion, decides the next open
+config_path: /tmp/g1-conversion.zzGFo1/wal-control/home/config.yaml
+config_realpath: /tmp/g1-conversion.zzGFo1/wal-control/home/config.yaml
+command: cp -a -- /tmp/g1-conversion.zzGFo1/conversion/state.db /tmp/g1-conversion.zzGFo1/wal-control/home/state.db
+ASSERT PASS: wal-control resolves database.journal_mode=wal before the writer
+writer_run: control (database.journal_mode=wal)
+writer_exit: 0
+writer_stdout: SessionDB() + create_session() closed: g1-conversion-wal-control|
+writer_stderr: state.db: on-disk journal_mode was delete and has been switched to WAL. This rewrites the database header and persists after this process exits. If delete was a deliberate choice (for example the mitigation for the SQLite WAL-reset bug, or a WAL-unsafe filesystem), setting it with PRAGMA on the file will not survive -- every open re-applies the configured mode. Set `database.journal_mode: delete` in config.yaml to make it stick. This message fires once per process per database.|
+header_json: {"path": "/tmp/g1-conversion.zzGFo1/wal-control/home/state.db", "size": 274432, "sha256": "bc029bee3e2fffe76e19421d795f1211addc0f45b78809c00bebc0fec6619234", "byte18": 2, "byte19": 2, "mode": "wal"}
+wal_control_run_path: /tmp/g1-conversion.zzGFo1/wal-control/home/state.db
+wal_control_run_size: 274432
+wal_control_run_sha256: bc029bee3e2fffe76e19421d795f1211addc0f45b78809c00bebc0fec6619234
+wal_control_run_byte18: 2
+wal_control_run_byte19: 2
+wal_control_run_observed_mode: wal
+wal_control_run_journal_sidecars:
+  (none)
+wal_control_run_related_files (ls -la, store prefix only):
+  -rw-------	    274432	state.db
+bc029bee3e2fffe76e19421d795f1211addc0f45b78809c00bebc0fec6619234 2 2 wal
+ASSERT PASS: wal_control_run header is 2,2 (mode wal)
+wal_control_sha256: bc029bee3e2fffe76e19421d795f1211addc0f45b78809c00bebc0fec6619234
+CONTROL: the converted 1,1 copy became 2,2 again because database.journal_mode=wal was
+CONTROL: configured for this home. The WAL control is config-driven, not a delete-mode failure.
+
+== 6. Conversion source integrity ==
+converted_copy_sha256_before_writers: 19ea36ec3855e13ee8f697f967687808d5adc91437912139702129dc959c3b04
+converted_copy_sha256_after_writers:  19ea36ec3855e13ee8f697f967687808d5adc91437912139702129dc959c3b04
+ASSERT PASS: conversion source copy was untouched by both writer homes (sha256 19ea36ec3855e13ee8f697f967687808d5adc91437912139702129dc959c3b04)
+original_wal_sha256_final: a2e4c5028d134406feff2af8b90c154cf6d2fa7f8888ccb45d2b8785075fb591
+ASSERT PASS: original WAL store sha256 is still unchanged at the end
+
+== state.db offline-conversion persistence verdict ==
+stage                          bytes      mode       writer_runs  result
+seed WAL                       2,2        wal        1 (create)   control baseline
+converted copy                 1,1        delete     offline      converted
+delete home after run 1        1,1        delete     2            kept rollback
+delete home after run 2        1,1        delete     2            kept rollback
+wal control after run          2,2        wal        1            config-driven
+
+STATE.DB VERDICT: HONOURING
+state.db was created WAL (2,2), converted offline on a copy to rollback (1,1),
+stayed 1,1 across two consecutive writer runs under database.journal_mode=delete,
+and returned to 2,2 only in the database.journal_mode=wal control.
+
+native_execution: /proc/1/cgroup=0::/init.scope 
+RESULT: PASS (state.db conversion persists across two delete-mode writer runs; WAL control flips to 2,2)
+scratch root kept: /tmp/g1-conversion.zzGFo1
