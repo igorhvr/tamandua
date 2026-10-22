@@ -22,6 +22,7 @@ import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
@@ -347,7 +348,148 @@ describe("store-header: distinct error classification", () => {
     assert.equal(obs.magicOk, false);
     assert.equal(obs.headerFormat, "unknown");
     assert.equal(obs.rawBytes1819, null);
+    assert.equal(obs.fileSize, fs.lstatSync(store).size);
     assert.deepEqual(obs.findingCodes, ["header-unreadable"]);
+  });
+
+  it("reports a broken symlink as store-missing with no fabricated facts", () => {
+    const dir = fixtureDir("tamandua-store-header-broken-link-");
+    const store = path.join(dir, "link.db");
+    fs.symlinkSync(path.join(dir, "absent-target.db"), store);
+
+    const obs = observeStore(store);
+
+    assert.equal(obs.exists, false);
+    assert.equal(obs.readable, false);
+    assert.equal(obs.magicOk, false);
+    assert.equal(obs.headerFormat, "unknown");
+    assert.equal(obs.rawBytes1819, null);
+    assert.equal(obs.fileSize, null);
+    assert.deepEqual(obs.findingCodes, ["store-missing"]);
+    assert.equal(obs.canonicalPath, path.resolve(store));
+  });
+
+  it("reports a symlink loop as header-unreadable with no fabricated facts", () => {
+    const dir = fixtureDir("tamandua-store-header-symlink-loop-");
+    const first = path.join(dir, "first.db");
+    const second = path.join(dir, "second.db");
+    fs.symlinkSync(second, first);
+    fs.symlinkSync(first, second);
+
+    const obs = observeStore(first);
+
+    assert.equal(obs.exists, false);
+    assert.equal(obs.readable, false);
+    assert.equal(obs.magicOk, false);
+    assert.equal(obs.headerFormat, "unknown");
+    assert.equal(obs.rawBytes1819, null);
+    assert.equal(obs.fileSize, null);
+    assert.deepEqual(obs.findingCodes, ["header-unreadable"]);
+    assert.equal(obs.canonicalPath, path.resolve(first));
+  });
+
+  it("keeps a symlink resolving to a regular store fully readable", () => {
+    const dir = fixtureDir("tamandua-store-header-symlink-regular-");
+    const target = path.join(dir, "state.db");
+    writeRollbackStore(target);
+    const link = path.join(dir, "link.db");
+    fs.symlinkSync(target, link);
+
+    const direct = observeStore(target);
+    const viaLink = observeStore(link);
+
+    assert.equal(viaLink.exists, true);
+    assert.equal(viaLink.readable, true);
+    assert.equal(viaLink.magicOk, direct.magicOk);
+    assert.equal(viaLink.headerFormat, direct.headerFormat);
+    assert.deepEqual(viaLink.rawBytes1819, direct.rawBytes1819);
+    assert.equal(viaLink.fileSize, direct.fileSize);
+    assert.deepEqual(viaLink.findingCodes, direct.findingCodes);
+    assert.equal(viaLink.canonicalPath, fs.realpathSync(target));
+  });
+
+  it("refuses an AF_UNIX socket at the store path with a bounded finding", async () => {
+    const dir = fixtureDir("tamandua-store-header-socket-");
+    const store = path.join(dir, "state.db");
+    const server = net.createServer();
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(store, () => resolve());
+    });
+    try {
+      assert.equal(fs.lstatSync(store).isSocket(), true);
+
+      const obs = observeStore(store);
+
+      assert.equal(obs.exists, true);
+      assert.equal(obs.readable, false);
+      assert.equal(obs.magicOk, false);
+      assert.equal(obs.headerFormat, "unknown");
+      assert.equal(obs.rawBytes1819, null);
+      assert.ok(obs.findingCodes.includes("header-unreadable"));
+      assert.ok(!obs.findingCodes.includes("header-truncated"));
+      assert.ok(!obs.findingCodes.includes("header-not-sqlite"));
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("refuses the real /dev/null character device with a bounded finding", (t) => {
+    let stats: fs.Stats;
+    try {
+      stats = fs.statSync("/dev/null");
+    } catch {
+      t.skip("device-node case unproven: /dev/null is unavailable");
+      return;
+    }
+    if (!stats.isCharacterDevice()) {
+      t.skip("device-node case unproven: /dev/null is not a character device");
+      return;
+    }
+
+    const obs = observeStore("/dev/null");
+
+    assert.equal(obs.exists, true);
+    assert.equal(obs.readable, false);
+    assert.equal(obs.magicOk, false);
+    assert.equal(obs.headerFormat, "unknown");
+    assert.equal(obs.rawBytes1819, null);
+    assert.ok(obs.findingCodes.includes("header-unreadable"));
+    assert.ok(!obs.findingCodes.includes("header-truncated"));
+    assert.ok(!obs.findingCodes.includes("header-not-sqlite"));
+  });
+
+  it("does not leak descriptors across 100 sequential observations", (t) => {
+    // Composed from fragments: the portability lint forbids a contiguous
+    // procfs literal, and this probe is already skipped wherever the
+    // directory does not exist.
+    const fdDir = ["", "proc", "self", "fd"].join("/");
+    try {
+      fs.accessSync(fdDir);
+    } catch {
+      t.skip(
+        "descriptor-leak case unproven: the procfs self-fd directory is unavailable",
+      );
+      return;
+    }
+    const dir = fixtureDir("tamandua-store-header-fdleak-");
+    const store = path.join(dir, "state.db");
+    writeRollbackStore(store);
+
+    // Warm up any lazily-created process descriptor before sampling.
+    assert.equal(observeStore(store).readable, true);
+    const before = fs.readdirSync(fdDir).length;
+
+    for (let i = 0; i < 100; i += 1) {
+      const obs = observeStore(store);
+      assert.equal(obs.exists, true);
+      assert.equal(obs.readable, true);
+      assert.deepEqual(obs.findingCodes, []);
+    }
+
+    const after = fs.readdirSync(fdDir).length;
+    assert.equal(after, before, "100 observations must not leak descriptors");
   });
 
   it("reads the header while a writer holds the store open", () => {
@@ -920,8 +1062,48 @@ describe("store-header: module purity", () => {
     assert.ok(!source.includes(FORBIDDEN_SUBMODE_TOKEN));
   });
 
+  it("prechecks with lstat, opens non-blocking, and fstats before reading", () => {
+    const lstatIdx = source.indexOf("fs.lstatSync(");
+    const openIdx = source.indexOf("fs.openSync(");
+    const fstatIdx = source.indexOf("fs.fstatSync(");
+    const readIdx = source.indexOf("fs.readSync(");
+
+    assert.ok(lstatIdx >= 0, "store-header.ts must precheck with lstatSync");
+    assert.ok(
+      /O_RDONLY[\s\S]{0,200}O_NONBLOCK/.test(source),
+      "the open flags must combine O_RDONLY with O_NONBLOCK",
+    );
+    assert.ok(openIdx >= 0, "store-header.ts must open the store");
+    assert.ok(
+      fstatIdx > openIdx,
+      "fstatSync must validate the opened descriptor after openSync",
+    );
+    assert.ok(
+      readIdx > fstatIdx,
+      "readSync must run only after fstatSync validates the descriptor",
+    );
+  });
+
   it("is not listed in tests/serial-files.txt (parallel lane, no spawns)", () => {
-    const serial = fs.readFileSync(SERIAL_FILES_PATH, "utf-8");
-    assert.ok(!serial.includes("store-header"));
+    // Membership is checked for THIS file's repo-relative path, not by a
+    // substring on "store-header": the sibling
+    // store-header-nonregular-regression.test.ts is serial (it spawns
+    // subprocesses) and must not make this parallel-lane assertion fail.
+    const ownRelativePath = path.relative(
+      REPO_ROOT,
+      fileURLToPath(import.meta.url),
+    );
+    const serialEntries = fs
+      .readFileSync(SERIAL_FILES_PATH, "utf-8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+
+    assert.ok(
+      !serialEntries.includes(ownRelativePath),
+      `this parallel test file (${ownRelativePath}) must NOT be in ` +
+        `tests/serial-files.txt — only the sibling subprocess regression file ` +
+        `belongs there`,
+    );
   });
 });

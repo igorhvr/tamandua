@@ -4,10 +4,30 @@
  * G3 STORE-HEADER-READER (bead tamandua-7p5.1.3). A host pre-flight gate must
  * decide whether a mapped Hermes store is safe to hand to a guest WITHOUT
  * opening that store through a database driver. This module supplies the
- * evidence for that decision from raw bytes and filesystem metadata only:
- * one `stat` (existence, size), then one `open("r")` plus one bounded read of
- * the first 100 bytes, closed in a `finally` block. A second, independent
- * `stat` classifies each sidecar.
+ * evidence for that decision from raw bytes and filesystem metadata only: one
+ * `lstat` precheck (existence, entry type, size); a follow-up `stat` only when
+ * the entry is a symlink, so a symlink resolving to a regular file stays
+ * observable; then one non-blocking `open`, one `fstat` on the opened
+ * descriptor and one bounded read of the first 100 bytes, closed in a
+ * `finally` block. A second, independent `stat` classifies each sidecar.
+ *
+ * Regular-file-only rule. Only a regular file is ever read. A directory, FIFO,
+ * AF_UNIX socket, character device, block device or any other non-regular path
+ * is refused with `header-unreadable` before any read is attempted, and its
+ * reported size comes from the `lstat` (or symlink-follow `stat`) precheck.
+ * The precheck is not trusted on its own: a regular file is opened with
+ * `O_RDONLY | O_NONBLOCK` (the non-blocking bit where the platform defines
+ * it), the opened descriptor is re-checked with `fstatSync` and must still be
+ * a regular file before the read, and the read plus the reported size come
+ * from that descriptor. A path swapped between the precheck and the open is
+ * therefore refused rather than read. The descriptor is closed in a `finally`
+ * on every exit path, including every refusal and every error; a close failure
+ * never throws.
+ *
+ * Scope honesty. The non-blocking open plus descriptor re-check fixes the
+ * demonstrated local FIFO hang and the local check-to-open race. It does NOT
+ * guarantee bounded execution against a stalled network filesystem; that case
+ * is unproven and is not claimed here.
  *
  * Hard properties — these are the whole point of the module:
  *
@@ -35,10 +55,11 @@
  *
  * Finding codes are deliberately separate and are never collapsed:
  * `store-missing` (ENOENT), `permission-denied` (EACCES/EPERM specifically),
- * `header-unreadable` (any other open/read error), `header-truncated` (fewer
- * than 100 header bytes), `header-not-sqlite` (16+ bytes that are not the
- * signature) and `sidecar-unresolved` (any sidecar holds bytes). Every
- * applicable code is reported once, in `STORE_REASON_CODE_ORDER`.
+ * `header-unreadable` (a non-regular store path, or any other open/read/fstat
+ * error), `header-truncated` (fewer than 100 header bytes), `header-not-sqlite`
+ * (16+ bytes that are not the signature) and `sidecar-unresolved` (any sidecar
+ * holds bytes). Every applicable code is reported once, in
+ * `STORE_REASON_CODE_ORDER`.
  *
  * Truncation trusts nothing: a header shorter than 100 bytes yields
  * `header-truncated`, `rawBytes1819 = null` and `headerFormat = "unknown"`,
@@ -180,22 +201,63 @@ export function observeStore(storePath: string): StoreObservation {
 
   let exists = false;
   let fileSize: number | null = null;
-  let storeGone = false;
+  let regularFilePrecheck = false;
 
-  // One stat for existence and size. A stat failure is classified here and
-  // then confirmed (or refined) by the header read below.
+  // lstat precheck: existence, entry type and size without following the final
+  // symlink, so a symlink that resolves to a regular file stays observable.
+  // A failed precheck is classified here and no read is attempted.
+  let precheck: fs.Stats | null = null;
   try {
-    const stats = fs.statSync(storePath);
-    exists = true;
-    fileSize = stats.size;
+    precheck = fs.lstatSync(storePath);
   } catch (err) {
     const code = errorCode(err);
     if (code === "ENOENT") {
       findings.add("store-missing");
-      storeGone = true;
     } else if (isPermissionError(code)) {
       findings.add("permission-denied");
     } else {
+      findings.add("header-unreadable");
+    }
+  }
+
+  // Classify the resolved path. A symlink is followed once for type
+  // classification only; a broken symlink or loop keeps the historical
+  // follow-stat behaviour (exists=false, fileSize=null).
+  if (precheck !== null) {
+    if (precheck.isSymbolicLink()) {
+      try {
+        const target = fs.statSync(storePath);
+        exists = true;
+        fileSize = target.size;
+        if (target.isFile()) {
+          regularFilePrecheck = true;
+        } else {
+          // Resolves to a directory, FIFO, socket, device or other non-regular
+          // entry: refuse before any open or read.
+          findings.add("header-unreadable");
+        }
+      } catch (err) {
+        const code = errorCode(err);
+        exists = false;
+        fileSize = null;
+        if (code === "ENOENT") {
+          findings.add("store-missing");
+        } else if (isPermissionError(code)) {
+          findings.add("permission-denied");
+        } else {
+          // ELOOP (symlink loop), EIO and friends.
+          findings.add("header-unreadable");
+        }
+      }
+    } else if (precheck.isFile()) {
+      exists = true;
+      fileSize = precheck.size;
+      regularFilePrecheck = true;
+    } else {
+      // Directory, FIFO, AF_UNIX socket, character/block device: a bounded
+      // refusal that never opens the path for reading.
+      exists = true;
+      fileSize = precheck.size;
       findings.add("header-unreadable");
     }
   }
@@ -205,35 +267,55 @@ export function observeStore(storePath: string): StoreObservation {
   let headerFormat: StoreHeaderFormat = "unknown";
   let rawBytes1819: [number, number] | null = null;
 
-  // One open + one bounded read, always closed. Reading requires no lock, so
-  // this succeeds while a writer holds the file open.
-  if (!storeGone) {
+  // Only a regular file is opened, and it is opened non-blockingly where the
+  // platform supports it so a path swapped to a FIFO between the precheck and
+  // the open cannot wedge the caller. The opened descriptor is re-validated
+  // before the one bounded read. Reading requires no lock, so this succeeds
+  // while a writer holds the file open. The descriptor is always closed.
+  if (regularFilePrecheck) {
     let fd: number | null = null;
     try {
-      fd = fs.openSync(storePath, "r");
-      const header = Buffer.alloc(DATABASE_HEADER_SIZE);
-      const bytesRead = fs.readSync(fd, header, 0, DATABASE_HEADER_SIZE, 0);
-      readable = true;
+      const openFlags =
+        fs.constants.O_RDONLY |
+        (typeof fs.constants.O_NONBLOCK === "number"
+          ? fs.constants.O_NONBLOCK
+          : 0);
+      fd = fs.openSync(storePath, openFlags);
 
-      if (bytesRead >= SQLITE_MAGIC_LENGTH) {
-        magicOk = header.subarray(0, SQLITE_MAGIC_LENGTH).equals(SQLITE_MAGIC);
-        if (!magicOk) findings.add("header-not-sqlite");
-      }
-
-      if (bytesRead < DATABASE_HEADER_SIZE) {
-        findings.add("header-truncated");
+      // Descriptor-derived facts only from here on: re-check the opened type,
+      // then take the size from fstat rather than the earlier pathname entry.
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile()) {
+        exists = true;
+        fileSize = opened.size;
+        findings.add("header-unreadable");
       } else {
-        const write = header[WRITE_VERSION_OFFSET];
-        const read = header[READ_VERSION_OFFSET];
-        rawBytes1819 = [write, read];
-        headerFormat = classifyHeaderPair(write, read);
+        exists = true;
+        fileSize = opened.size;
+        const header = Buffer.alloc(DATABASE_HEADER_SIZE);
+        const bytesRead = fs.readSync(fd, header, 0, DATABASE_HEADER_SIZE, 0);
+        readable = true;
+
+        if (bytesRead >= SQLITE_MAGIC_LENGTH) {
+          magicOk = header.subarray(0, SQLITE_MAGIC_LENGTH).equals(SQLITE_MAGIC);
+          if (!magicOk) findings.add("header-not-sqlite");
+        }
+
+        if (bytesRead < DATABASE_HEADER_SIZE) {
+          findings.add("header-truncated");
+        } else {
+          const write = header[WRITE_VERSION_OFFSET];
+          const read = header[READ_VERSION_OFFSET];
+          rawBytes1819 = [write, read];
+          headerFormat = classifyHeaderPair(write, read);
+        }
       }
     } catch (err) {
       const code = errorCode(err);
       if (code === "ENOENT") {
-        // Vanished between the stat and the open: report it as missing rather
-        // than as an unreadable store, and drop facts we can no longer stand
-        // behind.
+        // Vanished between the precheck and the open: report it as missing
+        // rather than as an unreadable store, and drop facts we can no longer
+        // stand behind.
         exists = false;
         fileSize = null;
         readable = false;
@@ -242,7 +324,7 @@ export function observeStore(storePath: string): StoreObservation {
       } else if (isPermissionError(code)) {
         findings.add("permission-denied");
       } else {
-        // EISDIR (a directory at the store path), EIO, ELOOP and friends.
+        // EISDIR (a directory that replaced the path), EIO and friends.
         findings.add("header-unreadable");
       }
     } finally {
