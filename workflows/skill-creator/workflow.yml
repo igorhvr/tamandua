@@ -1,0 +1,824 @@
+# Skill Creator workflow — creates well-structured AI agent skills for any repository.
+# All context about skill format, conventions, and structure is baked in here.
+# The user only needs to provide: what the skill should do.
+id: skill-creator
+name: Skill Creator Workflow
+version: 2
+description: |
+  Creates well-structured AI agent skills following best practices.
+  Bakes in all knowledge about SKILL.md format, directory structure,
+  MCP tool conventions, installation references, and coding standards.
+  User only provides a natural-language description of what the skill does.
+
+  After all stories are implemented and verified, the workflow pushes
+  the branch to the origin repository so the skill is available for review.
+
+polling:
+  model: default
+  timeoutSeconds: 120
+
+# ── PERSISTENT CONTEXT ──────────────────────────────────────────────
+# Everything below is injected into every step automatically.
+# The user never repeats this — only {{task}} varies per run.
+context:
+  skill_format: |
+    Every skill lives in: skills/<lowercase-hyphenated-name>/
+
+    ┌──────────────────────────────────────────────────────────┐
+    │ skills/<skill-name>/                                     │
+    │   ├── SKILL.md            ← main file (REQUIRED)         │
+    │   ├── README.md           ← project overview (REQUIRED)  │
+    │   ├── scripts/            ← executable code (if any)     │
+    │   │   └── .gitkeep                                      │
+    │   └── references/         ← examples, install guides     │
+    │       ├── .gitkeep                                      │
+    │       └── INSTALL_*.md    ← per-OS install instructions  │
+    └──────────────────────────────────────────────────────────┘
+
+  frontmatter_format: |
+    SKILL.md MUST start with YAML frontmatter delimited by --- lines:
+
+    ---
+    name: skill-name
+    description: One-sentence description. Keep it concise.
+    allowed-tools: Read, Write, Bash, AskUserQuestion, mcp__<provider>__<tool_name>, ...
+    ---
+
+    Rules for allowed-tools:
+    - Always include Read, Write, AskUserQuestion
+    - Bash for shell commands (use Bash(python:*) to allow Python scripts)
+    - MCP tools use format: mcp__<provider>__<tool_name>
+    - When a provider MCP is needed, list ALL tools from that provider (not just a few)
+      — consult the MCP TOOL CATALOG below for the full list per provider
+    - When MCP tools are included in allowed-tools, the skill MUST start with
+      Step 0: MCP Connection Verification (see MCP_VERIFICATION_PATTERN below)
+
+  mcp_catalog: |
+    Complete catalog of available MCP tools. When a skill needs a provider,
+    include EVERY tool from that provider in allowed-tools.
+
+    ── Jira MCP ──
+    mcp__jira__createJiraIssue — Criar issue
+    mcp__jira__editJiraIssue — Atualizar issue
+    mcp__jira__getJiraIssue — Detalhes de uma issue
+    mcp__jira__transitionJiraIssue — Transicionar status da issue
+    mcp__jira__getTransitionsForJiraIssue — Listar transições disponíveis
+    mcp__jira__addCommentToJiraIssue — Adicionar comentário
+    mcp__jira__addWorklogToJiraIssue — Registrar worklog
+    mcp__jira__createIssueLink — Criar link entre issues
+    mcp__jira__getIssueLinkTypes — Tipos de links disponíveis
+    mcp__jira__getJiraIssueRemoteIssueLinks — Links remotos de uma issue
+    mcp__jira__getJiraIssueTypeMetaWithFields — Metadados de campos por tipo
+    mcp__jira__getJiraProjectIssueTypesMetadata — Tipos de issue de um projeto
+    mcp__jira__search — Busca Jira + Confluence via Rovo Search
+    mcp__jira__searchJiraIssuesUsingJql — Busca com JQL
+    mcp__jira__getVisibleJiraProjects — Listar projetos
+    mcp__jira__lookupJiraAccountId — Buscar ID de usuário
+    mcp__jira__atlassianUserInfo — Info do usuário atual
+    mcp__jira__getAccessibleAtlassianResources — Recursos acessíveis (cloudId)
+    mcp__jira__fetch — Buscar objeto por ARI
+
+    ── Confluence MCP ──
+    mcp__confluence__createConfluencePage — Criar página ou blog post
+    mcp__confluence__updateConfluencePage — Atualizar página
+    mcp__confluence__getConfluencePage — Ler conteúdo de página
+    mcp__confluence__getPagesInConfluenceSpace — Listar páginas de um space
+    mcp__confluence__getConfluenceSpaces — Listar spaces
+    mcp__confluence__getConfluencePageDescendants — Páginas filhas
+    mcp__confluence__searchConfluenceUsingCql — Busca com CQL
+    mcp__confluence__createConfluenceFooterComment — Comentário de rodapé
+    mcp__confluence__createConfluenceInlineComment — Comentário inline em texto
+    mcp__confluence__getConfluencePageFooterComments — Listar comentários de rodapé
+    mcp__confluence__getConfluencePageInlineComments — Listar comentários inline
+    mcp__confluence__getConfluenceCommentChildren — Respostas de um comentário
+
+    ── Compass MCP ──
+    mcp__compass__createCompassComponent — Criar componente
+    mcp__compass__createCompassComponentRelationship — Criar relação entre componentes
+    mcp__compass__createCompassCustomFieldDefinition — Criar campo customizado
+    mcp__compass__getCompassComponent — Detalhes de um componente
+    mcp__compass__getCompassComponents — Listar componentes
+    mcp__compass__getCompassCustomFieldDefinitions — Listar campos customizados
+
+    ── Teamwork Graph MCP ──
+    mcp__atlassian__getTeamworkGraphContext — Relacionamentos de qualquer entidade Atlassian
+    mcp__atlassian__getTeamworkGraphObject — Dados completos de objetos por ARI
+
+    ── Slack MCP ──
+    mcp__slack__slack_search_public_and_private — Busca em todos os canais
+    mcp__slack__slack_search_public — Busca em canais públicos
+    mcp__slack__slack_search_channels — Buscar canais
+    mcp__slack__slack_search_users — Buscar usuários
+    mcp__slack__slack_read_user_profile — Perfil de usuário
+    mcp__slack__slack_read_channel — Ler canal
+    mcp__slack__slack_read_thread — Ler thread
+    mcp__slack__authenticate — Inicia OAuth flow
+    mcp__slack__complete_authentication — Conclui OAuth
+
+    ── Google Workspace MCP ──
+    mcp__google__list_calendars — Listar calendários
+    mcp__google__get_events — Listar eventos
+    mcp__google__search_drive_files — Buscar arquivos no Drive
+    mcp__google__get_doc_content — Ler conteúdo de documento
+    mcp__google__get_doc_as_markdown — Ler documento como Markdown
+    mcp__google__get_drive_file_content — Baixar arquivo do Drive
+    mcp__google__get_presentation — Ler apresentação
+
+    ── Databricks MCP ──
+    mcp__databricks__execute_sql — Executar queries SQL (DBSQL, Unity Catalog)
+    mcp__databricks__execute_sql_read_only — Executar queries read-only
+    mcp__databricks__poll_sql_result — Fazer polling de query longa
+
+    ── GenPlat MCP (iFood internal LLM) ──
+    mcp__genplat__list_models — Listar modelos disponíveis
+    mcp__genplat__get_model_info — Detalhes de um modelo
+    mcp__genplat__chat_completion — Chat completion
+    mcp__genplat__get_usage_stats — Estatísticas de uso
+
+  ask_user_question_rule: |
+    Always include AskUserQuestion in allowed-tools.
+    Use it to avoid repeatedly asking for confirmation on every action.
+    A good skill uses AskUserQuestion for critical decisions (e.g., "proceed with
+    deployment?", "which environment?") but proceeds autonomously for routine steps.
+
+  reference_install_pattern: |
+    Every skill that needs dependencies (Python, Node, etc.) MUST include
+    references/INSTALL_<TOOL>.md files with per-OS instructions.
+
+    Each INSTALL file covers: macOS (Homebrew), Linux (apt/dnf/pacman), Windows (official installer).
+    Every INSTALL file is structured in sections:
+    - ## macOS — Homebrew commands
+    - ## Linux — Distribution detection → apt / dnf / pacman
+    - ## Windows — Architecture detection (ARM64/AMD64/x86) → official installer
+    - ## Verification (All Platforms) — verify the tool works
+
+    The SKILL.md MUST reference install guides as a mandatory first step, like:
+
+    ⚠️ CRITICAL: This is the FIRST and MANDATORY step. <Tool> must be installed.
+    The AI will automatically:
+    1. Read references/INSTALL_<TOOL>.md completely
+    2. Detect your OS (macOS, Linux, Windows)
+    3. Check if <Tool> is already installed
+    4. If not installed, execute install commands EXACTLY as specified
+    5. Verify the installation succeeded
+
+    For Python specifically, include references/INSTALL_PYTHON.md in every
+    skill that runs Python scripts. The reference file tells the agent to
+    NEVER use winget/choco/scoop on Windows — only the official installer.
+
+  language: |
+    Write ALL skill content in English.
+    - SKILL.md: English
+    - README.md: English
+    - Agent persona / instructions: English
+    - Only exception: if the skill itself targets a Portuguese-speaking audience
+      (e.g., Brazilian regulatory docs), use Portuguese for the domain-specific
+      content but keep structural instructions in English.
+
+  mcp_verification_pattern: |
+    ⚠️ MANDATORY — EVERY skill that includes mcp__* in allowed-tools MUST
+    start with "Step 0: MCP Connection Verification" as the FIRST section
+    after frontmatter. This is NON-NEGOTIABLE.
+
+    Template (replace PROVIDER and TOOL names):
+
+    # ⚠️ CRITICAL RULE - READ THIS FIRST ⚠️
+
+    **BEFORE DOING ANYTHING ELSE**, you MUST execute Step 0: MCP Connection Verification.
+
+    If any required MCP fails verification:
+    - ❌ STOP IMMEDIATELY
+    - ❌ DO NOT proceed with any other step
+    - ❌ DO NOT offer workarounds
+    - ✅ ONLY show MCP installation instructions
+    - ✅ ONLY resume after user confirms all MCPs are connected
+
+    # 🚀 FIRST TIME SETUP
+
+    If this is your first time using this skill, connect the required MCPs:
+
+    ### <Provider> MCP (REQUIRED)
+    ```bash
+    claude mcp add --transport http <provider> <url> --scope user
+    ```
+
+    Then run `/mcp` to connect.
+
+    ## 0. MCP Connection Verification (MANDATORY - EXECUTE FIRST)
+
+    Run test calls for each MCP in parallel:
+    - Test <Provider>: Call mcp__<provider>__<tool>
+    - Expected: Success or no error
+
+    Output on SUCCESS:
+    ✅ <Provider> MCP: CONNECTED
+    ✅ ALL SYSTEMS READY!
+
+    Output on FAILURE:
+    ❌ <Provider> MCP: NOT CONNECTED
+    🚫 CANNOT PROCEED
+    <Setup instructions>
+
+  python_install_pattern: |
+    When a skill uses Python (Bash(python:*) in allowed-tools), the SKILL.md
+    MUST include a Python dependency step referencing references/INSTALL_PYTHON.md.
+
+    Template for SKILL.md:
+
+    ⚠️ **CRITICAL**: Python 3 must be installed before any analysis begins.
+
+    **The AI will automatically:**
+    1. Read `references/INSTALL_PYTHON.md` completely
+    2. Detect your operating system (macOS, Linux, or Windows)
+    3. Check if Python 3 is already installed
+    4. If not installed, execute installation commands EXACTLY as specified
+    5. Verify the installation succeeded
+
+    The AI reads the guide and handles everything automatically.
+
+  good_skill_qualities: |
+    A great skill has:
+    1. Clear, scannable frontmatter (name, description, allowed-tools)
+    2. ⚠️ Step 0: MCP Connection Verification (MANDATORY if mcp__* in allowed-tools)
+    3. ⚠️ Python dependency check via references/INSTALL_PYTHON.md (MANDATORY if Bash(python:*))
+    4. Structured sections with numbered steps or phases
+    5. Error handling: what to do when dependencies fail or tools are unavailable
+    6. First-time setup instructions — including MCP installation commands
+    7. Scripts in scripts/ folder, not inline in SKILL.md
+    8. References in references/ folder with real examples and INSTALL guides
+    9. AskUserQuestion for high-stakes decisions
+    10. Concise, actionable language — no fluff
+    11. Consistent formatting: bold headers, code blocks for commands, tables for options
+
+  skill_evolution_rules: |
+    When the user wants to EVOLVE (update/normalize/adapt) an EXISTING skill to
+    adhere to the official iFood Skills standard, apply these rules.
+
+    ### Core Principle
+    Do NOT rewrite the skill from scratch. Only complement what is missing.
+    Preserve 100% of existing behavior: workflow, execution flow, business logic,
+    tools, scripts, renderer, build_from_template.py, existing prompts,
+    and functional structure.
+
+    ### Mandatory Process (3 phases)
+
+    **Phase 1: Gap Analysis**
+    - Analyze the entire current skill
+    - Identify which standard requirements are already implemented
+    - Identify ONLY the missing requirements
+    - Produce a gap table: requirement | current status | action needed
+
+    **Phase 2: Patch Proposal**
+    - Generate minimal changes needed
+    - Preserve backward compatibility
+    - Only show the snippets that need to be added/modified
+
+    **Phase 3: Apply & Verify**
+    - Apply patches incrementally
+    - Verify nothing was broken
+    - Show only files that were effectively modified
+
+    ### What to Validate (iFood Standard)
+
+    **Frontmatter fields:**
+    - name, display_name, tagline, description
+    - category, subcategory
+    - metadata.author, metadata.version, metadata.output
+    - metadata.area, metadata.goal
+    - metadata.compatibility (mac, linux, windows — only if applicable)
+    - metadata.tier, metadata.tags
+    - If a field is missing → add only the missing field
+    - NEVER remove or rename existing fields
+
+    **Description quality:**
+    - Specific for routing (not generic)
+    - Has clear use cases
+    - Has explicit exclusions (when NOT to use)
+    - Improve only when necessary; never change original intent
+
+    **SKILL.md structure — ensure these sections exist:**
+    - ## What it does
+    - ## When to use
+    - ## When not to use
+    - ## Required environment
+    - ## Required input
+    - ## Limits and constraints
+    - If a section is missing → add it; keep all current content
+
+    **References:**
+    - If SKILL.md is excessively large → move auxiliary content to references/
+    - Keep SKILL.md as the entry point
+    - NEVER break existing workflows
+
+    **Naming conventions:**
+    - ID: lowercase, no spaces, no prefixes
+    - display_name: short
+    - tagline: follows standard pattern
+    - Do NOT rename if it breaks compatibility; only suggest
+
+    **Tags:**
+    - Ensure: output, area, goal
+    - Add free-form coherent tags
+    - NEVER remove existing tags
+
+    **Restrictions (NEVER):**
+    - Rewrite the skill from zero
+    - Replace existing prompts
+    - Change architecture, commands, tools
+    - Alter renderer or scripts
+    - Change the generation flow
+    - Always prefer incremental changes over complete restructures
+
+    ### Output Format for Evolution Planning
+    Reply with:
+    STATUS: done
+    MODE: evolve
+    SKILL_NAME: <existing-skill-name>
+    SKILL_PATH: <path to the skill directory>
+    REPO: <path to the target repository>
+    STORIES_JSON: [
+      {
+        "id": "S1",
+        "title": "Gap Analysis — read and audit current skill",
+        "description": "Read the entire skill, compare against iFood standard, produce gap table",
+        "acceptanceCriteria": [
+          "All existing files in the skill directory have been read",
+          "Gap table produced mapping requirement → status → action",
+          "Only missing requirements are flagged for action"
+        ]
+      },
+      {
+        "id": "S2",
+        "title": "Patch Proposal — generate minimal changes",
+        "description": "Based on gap analysis, produce only the snippets that need to be added",
+        "acceptanceCriteria": [
+          "Each proposed change addresses exactly one gap",
+          "No existing content is removed or renamed",
+          "Patches are incremental and preserve backward compatibility"
+        ]
+      },
+      {
+        "id": "S3",
+        "title": "Apply patches to SKILL.md and supporting files",
+        "description": "Apply the proposed changes to the skill files",
+        "acceptanceCriteria": [
+          "SKILL.md frontmatter has all required iFood fields",
+          "SKILL.md has all required sections (What it does, When to use, etc.)",
+          "Description is specific with use cases and exclusions",
+          "References/ folder created if auxiliary content was moved",
+          "All original behavior, tools, and scripts are preserved",
+          "Tags include output, area, goal plus free-form coherent tags"
+        ]
+      },
+      {
+        "id": "S4",
+        "title": "Verify evolved skill integrity",
+        "description": "Final verification that the evolved skill is compliant and nothing was broken",
+        "acceptanceCriteria": [
+          "All original functionality is intact",
+          "All iFood standard frontmatter fields are present",
+          "All required SKILL.md sections are present",
+          "Naming conventions are followed",
+          "No existing tools, scripts, or workflows were altered"
+        ]
+      }
+    ]
+
+    CRITICAL: The STORIES_JSON line MUST be valid JSON. Max 10 stories.
+
+agents:
+  - id: planner
+    name: Skill Planner
+    role: analysis
+    description: Analyzes the target repository and decomposes skill creation into ordered stories.
+    workspace:
+      baseDir: agents/planner
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/planner/AGENTS.md
+        SOUL.md: agents/planner/SOUL.md
+        IDENTITY.md: agents/planner/IDENTITY.md
+
+  - id: developer
+    name: Skill Developer
+    role: coding
+    description: Creates skill files following the defined format and conventions.
+    workspace:
+      baseDir: agents/developer
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/developer/AGENTS.md
+        SOUL.md: agents/developer/SOUL.md
+        IDENTITY.md: agents/developer/IDENTITY.md
+
+  - id: verifier
+    name: Skill Verifier
+    role: verification
+    description: Verifies the skill meets all format and quality requirements.
+    workspace:
+      baseDir: agents/verifier
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: ../../agents/shared/verifier/AGENTS.md
+        SOUL.md: ../../agents/shared/verifier/SOUL.md
+        IDENTITY.md: ../../agents/shared/verifier/IDENTITY.md
+
+  - id: merger
+    name: Merger
+    role: pr
+    description: Pushes the completed skill branch to the origin repository.
+    workspace:
+      baseDir: agents/merger
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/merger/AGENTS.md
+        SOUL.md: agents/merger/SOUL.md
+        IDENTITY.md: agents/merger/IDENTITY.md
+
+steps:
+  - id: plan
+    agent: planner
+    input: |
+      Plan the creation OR evolution of an AI agent skill.
+
+      TASK: {{task}}
+
+      SKILL FORMAT:
+      {{skill_format}}
+
+      FRONTMATTER FORMAT:
+      {{frontmatter_format}}
+
+      MCP TOOL CATALOG:
+      {{mcp_catalog}}
+
+      MCP VERIFICATION PATTERN:
+      {{mcp_verification_pattern}}
+
+      PYTHON INSTALL PATTERN:
+      {{python_install_pattern}}
+
+      ASK_USER_QUESTION RULE:
+      {{ask_user_question_rule}}
+
+      REFERENCE INSTALL PATTERN:
+      {{reference_install_pattern}}
+
+      LANGUAGE:
+      {{language}}
+
+      GOOD SKILL QUALITIES:
+      {{good_skill_qualities}}
+
+      SKILL EVOLUTION RULES:
+      {{skill_evolution_rules}}
+
+      RETRY FEEDBACK (only present if your previous attempt was rejected):
+      {{retry_feedback}}
+
+      Instructions:
+
+      ═══ STEP 0: DETECT MODE ═══
+      First, determine whether the user wants to CREATE a new skill or
+      EVOLVE an existing skill. Read the TASK carefully.
+
+      EVOLVE mode keywords: "evoluir", "evolve", "atualizar", "update",
+      "normalizar", "normalize", "adaptar", "adapt", "adequar",
+      "migrate", "upgrade skill", "improve skill", "review skill",
+      "audit skill", "padrão", "standard", "conformar".
+
+      If the TASK mentions an EXISTING skill by name or path → EVOLVE mode.
+      If the TASK describes building something NEW → CREATE mode.
+      If ambiguous, ask the user via AskUserQuestion.
+
+      ═══ CREATE MODE (default) ═══
+      1. Understand the TASK — what does the user want the skill to do?
+         Ask the user clarifying questions via AskUserQuestion if needed.
+      2. Explore existing skills in the repo's skills/ directory to understand
+         patterns, conventions, and how other skills are structured.
+         Look at skills/yoda (a complex, well-structured skill) as a reference.
+      3. Determine the skill name (lowercase-hyphenated).
+      4. Determine what tools the skill needs:
+         - Read, Write, AskUserQuestion (always)
+         - Bash (if scripts or shell commands needed)
+         - Bash(python:*) if Python scripts are involved (→ MUST include INSTALL_PYTHON.md)
+         - MCP tools (mcp__<provider>__<tool>) — consult MCP TOOL CATALOG above,
+           list ALL tools from each provider used (never partial)
+      5. If MCP tools are in allowed-tools, ALWAYS add a story for INSTALL_MCP.md
+         and ensure the SKILL.md starts with Step 0: MCP Connection Verification
+         (see MCP_VERIFICATION_PATTERN for the exact template)
+      6. If Python is needed, ALWAYS add a story for references/INSTALL_PYTHON.md
+         (see PYTHON_INSTALL_PATTERN for the exact template to embed in SKILL.md)
+      7. Plan stories in dependency order:
+         S1: Create directory structure (skills/<name>/, scripts/, references/)
+         S2: Write references/INSTALL_PYTHON.md (if Python is used)
+         S3: Write references/INSTALL_MCP.md with setup commands (if MCPs used)
+         S4: Write SKILL.md with YAML frontmatter + Step 0 MCP verification + workflow
+         S5: Write README.md with overview, install, usage
+         S6: Create scripts if the skill has executable code
+      8. Each story MUST be completable in one session.
+
+      Reply for CREATE mode:
+      STATUS: done
+      MODE: create
+      SKILL_NAME: <lowercase-hyphenated-name>
+      REPO: <path to the target repository>
+      STORIES_JSON: [...]
+
+      ═══ EVOLVE MODE ═══
+      Follow the SKILL EVOLUTION RULES above exactly.
+
+      1. Identify the existing skill — read its SKILL.md and all files in its directory.
+      2. Run Gap Analysis: compare against the iFood standard (frontmatter fields,
+         required sections, description quality, naming, tags).
+      3. Plan stories following the mandatory 3-phase process:
+         S1: Gap Analysis — read and audit current skill
+         S2: Patch Proposal — generate minimal changes
+         S3: Apply patches to SKILL.md and supporting files
+         S4: Verify evolved skill integrity
+      4. If the skill is very large, split S3 into multiple stories (e.g.,
+         S3a: frontmatter + description, S3b: sections + references, S3c: tags + naming).
+
+      Reply for EVOLVE mode:
+      STATUS: done
+      MODE: evolve
+      SKILL_NAME: <existing-skill-name>
+      SKILL_PATH: <path to the skill directory>
+      REPO: <path to the target repository>
+      STORIES_JSON: [...]
+
+      ═══ COMMON RULES (both modes) ═══
+      - CRITICAL: The STORIES_JSON line MUST be valid JSON.
+      - Every story MUST have: id, title, description, acceptanceCriteria (non-empty array).
+      - Max 10 stories. Do NOT exceed 10.
+      - Every story MUST be completable in one session.
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
+
+  - id: setup
+    agent: developer
+    input: |
+      Prepare the skill directory structure.
+
+      TASK: {{task}}
+      MODE: {{mode}}
+      SKILL_NAME: {{skill_name}}
+      REPO: {{repo}}
+
+      RETRY FEEDBACK:
+      {{retry_feedback}}
+
+      Instructions:
+      1. cd into {{repo}}
+      2. If MODE is "create":
+         - Create the skill directory: skills/{{skill_name}}/
+         - Create subdirectories: skills/{{skill_name}}/scripts/ and skills/{{skill_name}}/references/
+         - Add .gitkeep to scripts/ and references/
+         - Verify the structure matches:
+           skills/{{skill_name}}/
+             ├── scripts/.gitkeep
+             └── references/.gitkeep
+      3. If MODE is "evolve":
+         - The skill directory already exists. Verify it:
+           ls skills/{{skill_name}}/SKILL.md
+         - Ensure scripts/ and references/ subdirectories exist (create if missing)
+         - If SKILL.md does not exist at the expected path, check SKILL_PATH from plan
+         - Do NOT create a new directory — work on the existing one
+
+      Reply with:
+      STATUS: done
+      CHANGES: Created/verified skill directory structure for {{skill_name}}
+      MODE: {{mode}}
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
+
+  - id: implement
+    agent: developer
+    type: loop
+    loop:
+      over: stories
+      completion: all_done
+      fresh_session: true
+      verify_each: true
+      verify_step: verify
+    input: |
+      Implement the current story for the skill.
+
+      TASK (overall): {{task}}
+      MODE: {{mode}}
+      SKILL_NAME: {{skill_name}}
+      REPO: {{repo}}
+
+      SKILL FORMAT:
+      {{skill_format}}
+
+      FRONTMATTER FORMAT:
+      {{frontmatter_format}}
+
+      MCP TOOL CATALOG:
+      {{mcp_catalog}}
+
+      MCP VERIFICATION PATTERN:
+      {{mcp_verification_pattern}}
+
+      PYTHON INSTALL PATTERN:
+      {{python_install_pattern}}
+
+      ASK_USER_QUESTION RULE:
+      {{ask_user_question_rule}}
+
+      REFERENCE INSTALL PATTERN:
+      {{reference_install_pattern}}
+
+      LANGUAGE:
+      {{language}}
+
+      GOOD SKILL QUALITIES:
+      {{good_skill_qualities}}
+
+      SKILL EVOLUTION RULES:
+      {{skill_evolution_rules}}
+
+      CURRENT STORY:
+      {{current_story}}
+
+      COMPLETED STORIES:
+      {{completed_stories}}
+
+      STORIES REMAINING: {{stories_remaining}}
+
+      VERIFY FEEDBACK (if retrying):
+      {{verify_feedback}}
+
+      PROGRESS LOG:
+      {{progress}}
+
+      Instructions:
+      1. cd into {{repo}}
+      2. Read progress-{{run_id}}.txt for patterns and context
+      3. If MODE is "evolve", follow the Evolution Mode rules from your AGENTS.md:
+         - Gap Analysis: read all files, compare against iFood standard, produce gap table
+         - Patch Proposal: generate minimal oldText→newText snippets, never remove content
+         - Apply Patches: edit files incrementally, preserve 100% of existing behavior
+         See the SKILL EVOLUTION RULES above and your AGENTS.md for full details.
+      4. If MODE is "create", follow the standard creation process:
+         - For SKILL.md stories: Start with YAML frontmatter: name, description, allowed-tools
+         - Use the exact MCP tool names from the MCP TOOL CATALOG
+         - If MCP tools in allowed-tools → MANDATORY Step 0: MCP Connection Verification
+           right after frontmatter (copy the MCP_VERIFICATION_PATTERN template exactly)
+         - If Python used → MANDATORY Python dependency step (copy PYTHON_INSTALL_PATTERN template)
+         - Write clear, numbered workflow steps
+         - Include error handling and first-time setup
+         - ALL content in English
+      5. For README.md:
+         - Project overview, structure, installation, usage, troubleshooting
+      6. For references/INSTALL_PYTHON.md:
+         - Cover macOS, Linux, Windows with exact copy-paste commands
+         - Windows: NEVER winget/choco/scoop, ALWAYS official Python.org installer
+         - Include architecture detection (ARM64/AMD64/x86) for Windows
+      7. For references/INSTALL_MCP.md (if MCPs used):
+         - List claude mcp add commands for each provider
+         - Include /mcp activation step
+      8. For scripts:
+         - Keep code in scripts/, reference from SKILL.md via relative paths
+      9. Commit: feat({{skill_name}}): {{current_story_id}} - {{current_story_title}}
+         Every commit message MUST end with: Co-Authored-By: Tamandua <tamandua@tetradactyla.org>
+      10. Update progress-{{run_id}}.txt
+
+      Reply with:
+      STATUS: done
+      CHANGES: what files were created/edited
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
+
+  - id: verify
+    agent: verifier
+    input: |
+      Verify the skill meets all format and quality requirements.
+
+      TASK (overall): {{task}}
+      MODE: {{mode}}
+      SKILL_NAME: {{skill_name}}
+      REPO: {{repo}}
+      CHANGES: {{changes}}
+
+      CURRENT STORY:
+      {{current_story}}
+
+      SKILL FORMAT:
+      {{skill_format}}
+
+      FRONTMATTER FORMAT:
+      {{frontmatter_format}}
+
+      LANGUAGE:
+      {{language}}
+
+      PROGRESS LOG:
+      {{progress}}
+
+      Check:
+      1. File paths are correct: skills/{{skill_name}}/SKILL.md, README.md, etc.
+      2. SKILL.md starts with YAML frontmatter (--- delimited)
+      3. Frontmatter has: name, description, allowed-tools (all required)
+      4. allowed-tools includes: Read, Write, AskUserQuestion at minimum
+      5. MCP tool names follow format: mcp__<provider>__<tool_name>
+      6. Content is in English (unless domain requires Portuguese)
+      7. Scripts are in scripts/ folder, not inline in SKILL.md
+      8. References have per-OS installation instructions
+      9. Skill has clear, actionable instructions — not vague prose
+      10. SKILL.md references scripts/ and references/ using relative paths
+      11. ⚠️ If allowed-tools has mcp__*, SKILL.md MUST have Step 0: MCP Connection Verification
+          as the FIRST section after frontmatter, with ❌ STOP IMMEDIATELY rules
+      12. ⚠️ If allowed-tools has Bash(python:*), SKILL.md MUST reference references/INSTALL_PYTHON.md
+          as a critical first step, AND references/INSTALL_PYTHON.md must exist
+      13. references/INSTALL_PYTHON.md must cover macOS, Linux, Windows with exact commands
+      14. references/INSTALL_MCP.md must exist if MCP tools are used
+
+      ═══ EVOLUTION-SPECIFIC CHECKS (only when MODE is "evolve") ═══
+      15. Frontmatter has ALL iFood standard fields:
+          name, display_name, tagline, description, category, subcategory,
+          metadata.author, metadata.version, metadata.output, metadata.area,
+          metadata.goal, metadata.compatibility, metadata.tier, metadata.tags
+      16. SKILL.md has all required sections:
+          ## What it does, ## When to use, ## When not to use,
+          ## Required environment, ## Required input, ## Limits and constraints
+      17. Description is specific for routing with clear use cases and explicit exclusions
+      18. Naming conventions: lowercase ID, no spaces, no prefixes, short display_name
+      19. Tags include: output, area, goal — no existing tags were removed
+      20. CRITICAL: Existing behavior is 100% preserved — no tools, scripts,
+          renderers, prompts, or workflows were altered. Only additions were made.
+
+      Check the actual files — run `ls`, `head`, `cat` to inspect them.
+      Do not trust the CHANGES summary alone.
+
+      For SKILL.md content quality:
+      - Instructions are numbered and actionable
+      - Error handling covers common failure modes
+      - First-time setup section exists
+      - AskUserQuestion is used appropriately
+      - MCP verification is NON-NEGOTIABLE — no workarounds, no exceptions
+      - Python install is automated via INSTALL_PYTHON.md reference
+
+      Reply with:
+      STATUS: done
+      VERIFIED: What you confirmed
+
+      Or if issues found:
+      STATUS: retry
+      ISSUES:
+      - Specific issue with file path or content
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: implement
+      max_retries: 4
+      on_exhausted:
+        escalate_to: human
+
+  - id: finalize
+    agent: merger
+    input: |
+      Push the completed skill branch to the origin repository.
+
+      TASK: {{task}}
+      SKILL_NAME: {{skill_name}}
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+      ORIGINAL_BRANCH: {{original_branch}}
+      WORKTREE_ORIGIN_REPOSITORY: {{worktree_origin_repository}}
+
+      PROGRESS LOG:
+      {{progress}}
+
+      Instructions:
+      1. Verify the skill was created:
+         ls skills/{{skill_name}}/SKILL.md
+         ls skills/{{skill_name}}/README.md
+      2. Push the feature branch to origin:
+         cd {{worktree_origin_repository}} && git push origin {{branch}}
+         (If worktree_origin_repository is empty, push from {{repo}} directly)
+      3. Report what was pushed and where
+
+      Reply with:
+      STATUS: done
+      BRANCH: {{branch}}
+      PUSHED: true
+      FILES_CREATED: <summary of files>
+
+      On failure:
+      STATUS: retry
+      FAILURE: <reason>
+    expects: "STATUS: done"
+    max_retries: 2
+    on_fail:
+      escalate_to: human
