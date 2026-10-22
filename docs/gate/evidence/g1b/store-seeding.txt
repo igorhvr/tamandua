@@ -1,0 +1,798 @@
+# G1-B US-002 — in-image WAL seeding harness with unique marker records
+# generated (UTC): 2026-10-22T14:26:22Z
+
+SCRATCH_ROOT=/tmp/g1b-store-seeding.VZM1Ul
+SCRATCH_ROOT_KEPT=yes (G1-B never deletes its fixtures)
+
+PROBE_RUNID=20261022T142622Z-1870467
+MARKER_SCHEME=g1b-<store>-<probe-runid>-<n>
+
+## Docker artifact
+IMAGE_REF=igorhvr/tamandua:latest
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+OS=linux
+REQUIRED_IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+REQUIRED_HERMES_REVISION=4d04303818b61bf3aa09278af48356315515965b
+MATCHLOCK_ARTIFACT_ID=sha256:9140629c9f408a6e9c285434eb6ab0cebd67db146c324db33e2798bac4fb7dff
+MATCHLOCK_ARTIFACT_RELATIONSHIP=UNVERIFIED (no equality claim)
+
+## Probe tools (pinned by sha256)
+
+read_header bootstrap: /tmp/g1b-store-seeding.VZM1Ul/tools/read_header.py sha256=3e91665695a5b2925d4825e5abc85a0a385e0c9b7dd0b55cc3b85e20784abe01
+READ_HEADER_BOOTSTRAP_RC=0
+TOOL /tmp/g1b-store-seeding.VZM1Ul/tools/g1b_writers.py sha256=9a088761b61c1419cd444a2c5b1e86dd7b39336b5ac815aabd3a2376e0539a8a
+TOOL /tmp/g1b-store-seeding.VZM1Ul/tools/g1b_readonly.py sha256=e76a9f2595bfbe4b2cb3261866eaba5f0b684f6a677314106cc8fe0db94dffcc
+TOOL /tmp/g1b-store-seeding.VZM1Ul/tools/g1b_seed_container.sh sha256=ca8af7c59b72e787553e8d78c7d64a585a04065b48bba1f68a80ad1886e2feb5
+
+
+## Store state.db
+
+STORE_KEY=state
+STORE_HOME=/tmp/g1b-store-seeding.VZM1Ul/homes/state (container /work/homes/state)
+CONFIG_EXPECTED=database.journal_mode: wal
+MARKER_1=g1b-state-20261022T142622Z-1870467-1
+MARKER_2=g1b-state-20261022T142622Z-1870467-2
+NOT_WRITTEN_MARKER=g1b-state-20261022T142622Z-1870467-never-written
+CONTAINER_LOG=/tmp/g1b-store-seeding.VZM1Ul/logs/state.container.log
+
+CONTAINER_RC=0
+
+  CONTAINER_INVOCATION: docker run --rm --network none --platform linux/amd64 --user 1000:1000 -v /tmp/g1b-store-seeding.VZM1Ul:/work -w /work -e HOME=/work/home igorhvr/tamandua:latest bash -c <script>
+  STORE=state.db
+  STORE_KEY=state
+  STORE_HOME=/work/homes/state
+  STORE_DB=/work/homes/state/state.db
+  MARKER_1=g1b-state-20261022T142622Z-1870467-1
+  MARKER_2=g1b-state-20261022T142622Z-1870467-2
+  ABSENT_MARKER=g1b-state-20261022T142622Z-1870467-never-written
+  CONFIG_CONTENT=database:|  journal_mode: wal|
+  RESOLVED_MODE=wal
+  RESOLVED_MODE_RC=0
+  STOCK_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_REVISION_RC=0
+  STOCK_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_STATUS_RC=0
+  WRITER1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py state g1b-state-20261022T142622Z-1870467-1 --home /work/homes/state --scratch /work/scratch
+  WRITER1_EXIT=0
+  WRITER_STORE=state.db
+  WRITER_MARKER=g1b-state-20261022T142622Z-1870467-1
+  WRITER_HOME=/work/homes/state
+  WRITER_RECORD_TABLE=sessions
+  WRITER_RECORD_COLUMN=id
+  WRITER_RECORD_ID=g1b-state-20261022T142622Z-1870467-1
+  WRITER_EXIT=0
+  RECORD1_TABLE=sessions
+  RECORD1_COLUMN=id
+  RECORD1_ID=g1b-state-20261022T142622Z-1870467-1
+  RECORD1_TITLE=
+  RECORD1_SLUG=
+  RECORD1_NAME=
+  SEED1_EXISTS=yes
+  SEED1_RC=0
+  SEED1_JSON={"path": "/work/homes/state/state.db", "size": 327680, "sha256": "986222ae9e5aed206fa86a2a560650ca02448730636bf00c3a479eb7f54d922f", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED1_SIZE=327680
+  SEED1_SHA256=986222ae9e5aed206fa86a2a560650ca02448730636bf00c3a479eb7f54d922f
+  SEED1_BYTE18=2
+  SEED1_BYTE19=2
+  SEED1_MODE=wal
+  SEED1_SIDECAR_WAL_STATE=absent
+  SEED1_SIDECAR_SHM_STATE=absent
+  SEED1_SIDECAR_JOURNAL_STATE=absent
+  WRITER2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py state g1b-state-20261022T142622Z-1870467-2 --home /work/homes/state --scratch /work/scratch
+  WRITER2_EXIT=0
+  WRITER_STORE=state.db
+  WRITER_MARKER=g1b-state-20261022T142622Z-1870467-2
+  WRITER_HOME=/work/homes/state
+  WRITER_RECORD_TABLE=sessions
+  WRITER_RECORD_COLUMN=id
+  WRITER_RECORD_ID=g1b-state-20261022T142622Z-1870467-2
+  WRITER_EXIT=0
+  RECORD2_TABLE=sessions
+  RECORD2_COLUMN=id
+  RECORD2_ID=g1b-state-20261022T142622Z-1870467-2
+  RECORD2_TITLE=
+  RECORD2_SLUG=
+  RECORD2_NAME=
+  SEED2_EXISTS=yes
+  SEED2_RC=0
+  SEED2_JSON={"path": "/work/homes/state/state.db", "size": 327680, "sha256": "c749ea96734745d14b29a0162e63819ef82eea0f3498999a9cce2579b265fb65", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED2_SIZE=327680
+  SEED2_SHA256=c749ea96734745d14b29a0162e63819ef82eea0f3498999a9cce2579b265fb65
+  SEED2_BYTE18=2
+  SEED2_BYTE19=2
+  SEED2_MODE=wal
+  SEED2_SIDECAR_WAL_STATE=absent
+  SEED2_SIDECAR_SHM_STATE=absent
+  SEED2_SIDECAR_JOURNAL_STATE=absent
+  STOCK_AFTER_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_AFTER_REVISION_RC=0
+  STOCK_AFTER_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_AFTER_STATUS_RC=0
+  READONLY_RECORD_TABLE=sessions
+  READONLY_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/state/state.db --marker g1b-state-20261022T142622Z-1870467-1
+  READONLY_MARK1_EXIT=0
+  READONLY_DB=/work/homes/state/state.db
+  READONLY_OPEN_URI=file:/work/homes/state/state.db?mode=ro
+  READONLY_MARKER=g1b-state-20261022T142622Z-1870467-1
+  READONLY_TABLES=async_delegations,compression_locks,conversation_generations,gateway_heartbeats,gateway_hygiene_state,gateway_routing,messages,messages_fts,messages_fts_config,messages_fts_data,messages_fts_docsize,messages_fts_idx,messages_fts_trigram,messages_fts_trigram_config,messages_fts_trigram_data,messages_fts_trigram_docsize,messages_fts_trigram_idx,runtime_epoch,schema_version,session_admissions,session_model_usage,session_turn_leases,sessions,state_meta,system_prompts,worker_executions,worker_receipts
+  READONLY_TABLE_COUNT table=async_delegations count=0
+  READONLY_SQL table=async_delegations: SELECT COUNT(*) FROM "async_delegations" WHERE CAST("delegation_id" AS TEXT) = ? OR CAST("origin_session" AS TEXT) = ? OR CAST("origin_ui_session_id" AS TEXT) = ? OR CAST("parent_session_id" AS TEXT) = ? OR CAST("state" AS TEXT) = ? OR CAST("event_json" AS TEXT) = ? OR CAST("result_json" AS TEXT) = ? OR CAST("delivery_state" AS TEXT) = ? OR CAST("task_json" AS TEXT) = ? OR CAST("owner_execution_id" AS TEXT) = ? OR CAST("delivery_claim" AS TEXT) = ? OR CAST("origin_session_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=compression_locks count=0
+  READONLY_SQL table=compression_locks: SELECT COUNT(*) FROM "compression_locks" WHERE CAST("session_id" AS TEXT) = ? OR CAST("holder" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=conversation_generations count=0
+  READONLY_SQL table=conversation_generations: SELECT COUNT(*) FROM "conversation_generations" WHERE CAST("source" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_heartbeats count=0
+  READONLY_SQL table=gateway_heartbeats: SELECT COUNT(*) FROM "gateway_heartbeats" WHERE CAST("backend_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("host" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_hygiene_state count=0
+  READONLY_SQL table=gateway_hygiene_state: SELECT COUNT(*) FROM "gateway_hygiene_state" WHERE CAST("session_key" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_routing count=0
+  READONLY_SQL table=gateway_routing: SELECT COUNT(*) FROM "gateway_routing" WHERE CAST("scope" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ? OR CAST("entry_json" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages count=0
+  READONLY_SQL table=messages: SELECT COUNT(*) FROM "messages" WHERE CAST("session_id" AS TEXT) = ? OR CAST("role" AS TEXT) = ? OR CAST("content" AS TEXT) = ? OR CAST("tool_call_id" AS TEXT) = ? OR CAST("tool_calls" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ? OR CAST("effect_disposition" AS TEXT) = ? OR CAST("finish_reason" AS TEXT) = ? OR CAST("reasoning" AS TEXT) = ? OR CAST("reasoning_content" AS TEXT) = ? OR CAST("reasoning_details" AS TEXT) = ? OR CAST("codex_reasoning_items" AS TEXT) = ? OR CAST("codex_message_items" AS TEXT) = ? OR CAST("platform_message_id" AS TEXT) = ? OR CAST("api_content" AS TEXT) = ? OR CAST("display_kind" AS TEXT) = ? OR CAST("display_metadata" AS TEXT) = ? OR CAST("message_uid" AS TEXT) = ? OR CAST("absorbed_message_uids" AS TEXT) = ? OR CAST("tool_call_uids" AS TEXT) = ? OR CAST("tool_call_uid" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts count=0
+  READONLY_SQL table=messages_fts: SELECT COUNT(*) FROM "messages_fts" WHERE CAST("content" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ? OR CAST("tool_calls" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_config count=0
+  READONLY_SQL table=messages_fts_config: SELECT COUNT(*) FROM "messages_fts_config" WHERE CAST("k" AS TEXT) = ? OR CAST("v" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_data count=0
+  READONLY_SQL table=messages_fts_data: SELECT COUNT(*) FROM "messages_fts_data" WHERE CAST("id" AS TEXT) = ? OR CAST("block" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_docsize count=0
+  READONLY_SQL table=messages_fts_docsize: SELECT COUNT(*) FROM "messages_fts_docsize" WHERE CAST("id" AS TEXT) = ? OR CAST("sz" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_idx count=0
+  READONLY_SQL table=messages_fts_idx: SELECT COUNT(*) FROM "messages_fts_idx" WHERE CAST("segid" AS TEXT) = ? OR CAST("term" AS TEXT) = ? OR CAST("pgno" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram count=0
+  READONLY_SQL table=messages_fts_trigram: SELECT COUNT(*) FROM "messages_fts_trigram" WHERE CAST("content" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_config count=0
+  READONLY_SQL table=messages_fts_trigram_config: SELECT COUNT(*) FROM "messages_fts_trigram_config" WHERE CAST("k" AS TEXT) = ? OR CAST("v" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_data count=0
+  READONLY_SQL table=messages_fts_trigram_data: SELECT COUNT(*) FROM "messages_fts_trigram_data" WHERE CAST("id" AS TEXT) = ? OR CAST("block" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_docsize count=0
+  READONLY_SQL table=messages_fts_trigram_docsize: SELECT COUNT(*) FROM "messages_fts_trigram_docsize" WHERE CAST("id" AS TEXT) = ? OR CAST("sz" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_idx count=0
+  READONLY_SQL table=messages_fts_trigram_idx: SELECT COUNT(*) FROM "messages_fts_trigram_idx" WHERE CAST("segid" AS TEXT) = ? OR CAST("term" AS TEXT) = ? OR CAST("pgno" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=runtime_epoch count=0
+  READONLY_SQL table=runtime_epoch: SELECT COUNT(*) FROM "runtime_epoch" WHERE CAST("instance_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=schema_version count=0
+  READONLY_SQL table=schema_version: SELECT COUNT(*) FROM "schema_version" WHERE CAST("version" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_admissions count=0
+  READONLY_SQL table=session_admissions: SELECT COUNT(*) FROM "session_admissions" WHERE CAST("admission_id" AS TEXT) = ? OR CAST("request_id" AS TEXT) = ? OR CAST("principal_id" AS TEXT) = ? OR CAST("target_session_id" AS TEXT) = ? OR CAST("lineage_json" AS TEXT) = ? OR CAST("payload_json" AS TEXT) = ? OR CAST("payload_digest" AS TEXT) = ? OR CAST("intent" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_model_usage count=0
+  READONLY_SQL table=session_model_usage: SELECT COUNT(*) FROM "session_model_usage" WHERE CAST("session_id" AS TEXT) = ? OR CAST("model" AS TEXT) = ? OR CAST("billing_provider" AS TEXT) = ? OR CAST("billing_base_url" AS TEXT) = ? OR CAST("billing_mode" AS TEXT) = ? OR CAST("task" AS TEXT) = ? OR CAST("cost_status" AS TEXT) = ? OR CAST("cost_source" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_turn_leases count=0
+  READONLY_SQL table=session_turn_leases: SELECT COUNT(*) FROM "session_turn_leases" WHERE CAST("conversation_id" AS TEXT) = ? OR CAST("holder" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=sessions count=1
+  READONLY_SQL table=sessions: SELECT COUNT(*) FROM "sessions" WHERE CAST("id" AS TEXT) = ? OR CAST("source" AS TEXT) = ? OR CAST("created_source" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("display_name" AS TEXT) = ? OR CAST("origin_json" AS TEXT) = ? OR CAST("model" AS TEXT) = ? OR CAST("model_config" AS TEXT) = ? OR CAST("system_prompt" AS TEXT) = ? OR CAST("system_prompt_hash" AS TEXT) = ? OR CAST("parent_session_id" AS TEXT) = ? OR CAST("end_reason" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("git_branch" AS TEXT) = ? OR CAST("git_repo_root" AS TEXT) = ? OR CAST("billing_provider" AS TEXT) = ? OR CAST("billing_base_url" AS TEXT) = ? OR CAST("billing_mode" AS TEXT) = ? OR CAST("cost_status" AS TEXT) = ? OR CAST("cost_source" AS TEXT) = ? OR CAST("pricing_version" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("title_source" AS TEXT) = ? OR CAST("last_activity_description" AS TEXT) = ? OR CAST("last_activity_provenance" AS TEXT) = ? OR CAST("handoff_state" AS TEXT) = ? OR CAST("handoff_platform" AS TEXT) = ? OR CAST("handoff_error" AS TEXT) = ? OR CAST("compression_failure_error" AS TEXT) = ? OR CAST("profile_name" AS TEXT) = ? OR CAST("transport_profile" AS TEXT) = ? OR CAST("tool_names" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=state_meta count=0
+  READONLY_SQL table=state_meta: SELECT COUNT(*) FROM "state_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=system_prompts count=0
+  READONLY_SQL table=system_prompts: SELECT COUNT(*) FROM "system_prompts" WHERE CAST("hash" AS TEXT) = ? OR CAST("prompt" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=worker_executions count=0
+  READONLY_SQL table=worker_executions: SELECT COUNT(*) FROM "worker_executions" WHERE CAST("execution_id" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("adoption_digest" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=worker_receipts count=0
+  READONLY_SQL table=worker_receipts: SELECT COUNT(*) FROM "worker_receipts" WHERE CAST("execution_id" AS TEXT) = ? OR CAST("payload_digest" AS TEXT) = ? OR CAST("result_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=sessions
+  READONLY_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/state/state.db --marker g1b-state-20261022T142622Z-1870467-2
+  READONLY_MARK2_EXIT=0
+  READONLY_DB=/work/homes/state/state.db
+  READONLY_OPEN_URI=file:/work/homes/state/state.db?mode=ro
+  READONLY_MARKER=g1b-state-20261022T142622Z-1870467-2
+  READONLY_TABLES=async_delegations,compression_locks,conversation_generations,gateway_heartbeats,gateway_hygiene_state,gateway_routing,messages,messages_fts,messages_fts_config,messages_fts_data,messages_fts_docsize,messages_fts_idx,messages_fts_trigram,messages_fts_trigram_config,messages_fts_trigram_data,messages_fts_trigram_docsize,messages_fts_trigram_idx,runtime_epoch,schema_version,session_admissions,session_model_usage,session_turn_leases,sessions,state_meta,system_prompts,worker_executions,worker_receipts
+  READONLY_TABLE_COUNT table=async_delegations count=0
+  READONLY_SQL table=async_delegations: SELECT COUNT(*) FROM "async_delegations" WHERE CAST("delegation_id" AS TEXT) = ? OR CAST("origin_session" AS TEXT) = ? OR CAST("origin_ui_session_id" AS TEXT) = ? OR CAST("parent_session_id" AS TEXT) = ? OR CAST("state" AS TEXT) = ? OR CAST("event_json" AS TEXT) = ? OR CAST("result_json" AS TEXT) = ? OR CAST("delivery_state" AS TEXT) = ? OR CAST("task_json" AS TEXT) = ? OR CAST("owner_execution_id" AS TEXT) = ? OR CAST("delivery_claim" AS TEXT) = ? OR CAST("origin_session_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=compression_locks count=0
+  READONLY_SQL table=compression_locks: SELECT COUNT(*) FROM "compression_locks" WHERE CAST("session_id" AS TEXT) = ? OR CAST("holder" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=conversation_generations count=0
+  READONLY_SQL table=conversation_generations: SELECT COUNT(*) FROM "conversation_generations" WHERE CAST("source" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_heartbeats count=0
+  READONLY_SQL table=gateway_heartbeats: SELECT COUNT(*) FROM "gateway_heartbeats" WHERE CAST("backend_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("host" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_hygiene_state count=0
+  READONLY_SQL table=gateway_hygiene_state: SELECT COUNT(*) FROM "gateway_hygiene_state" WHERE CAST("session_key" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_routing count=0
+  READONLY_SQL table=gateway_routing: SELECT COUNT(*) FROM "gateway_routing" WHERE CAST("scope" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ? OR CAST("entry_json" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages count=0
+  READONLY_SQL table=messages: SELECT COUNT(*) FROM "messages" WHERE CAST("session_id" AS TEXT) = ? OR CAST("role" AS TEXT) = ? OR CAST("content" AS TEXT) = ? OR CAST("tool_call_id" AS TEXT) = ? OR CAST("tool_calls" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ? OR CAST("effect_disposition" AS TEXT) = ? OR CAST("finish_reason" AS TEXT) = ? OR CAST("reasoning" AS TEXT) = ? OR CAST("reasoning_content" AS TEXT) = ? OR CAST("reasoning_details" AS TEXT) = ? OR CAST("codex_reasoning_items" AS TEXT) = ? OR CAST("codex_message_items" AS TEXT) = ? OR CAST("platform_message_id" AS TEXT) = ? OR CAST("api_content" AS TEXT) = ? OR CAST("display_kind" AS TEXT) = ? OR CAST("display_metadata" AS TEXT) = ? OR CAST("message_uid" AS TEXT) = ? OR CAST("absorbed_message_uids" AS TEXT) = ? OR CAST("tool_call_uids" AS TEXT) = ? OR CAST("tool_call_uid" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts count=0
+  READONLY_SQL table=messages_fts: SELECT COUNT(*) FROM "messages_fts" WHERE CAST("content" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ? OR CAST("tool_calls" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_config count=0
+  READONLY_SQL table=messages_fts_config: SELECT COUNT(*) FROM "messages_fts_config" WHERE CAST("k" AS TEXT) = ? OR CAST("v" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_data count=0
+  READONLY_SQL table=messages_fts_data: SELECT COUNT(*) FROM "messages_fts_data" WHERE CAST("id" AS TEXT) = ? OR CAST("block" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_docsize count=0
+  READONLY_SQL table=messages_fts_docsize: SELECT COUNT(*) FROM "messages_fts_docsize" WHERE CAST("id" AS TEXT) = ? OR CAST("sz" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_idx count=0
+  READONLY_SQL table=messages_fts_idx: SELECT COUNT(*) FROM "messages_fts_idx" WHERE CAST("segid" AS TEXT) = ? OR CAST("term" AS TEXT) = ? OR CAST("pgno" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram count=0
+  READONLY_SQL table=messages_fts_trigram: SELECT COUNT(*) FROM "messages_fts_trigram" WHERE CAST("content" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_config count=0
+  READONLY_SQL table=messages_fts_trigram_config: SELECT COUNT(*) FROM "messages_fts_trigram_config" WHERE CAST("k" AS TEXT) = ? OR CAST("v" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_data count=0
+  READONLY_SQL table=messages_fts_trigram_data: SELECT COUNT(*) FROM "messages_fts_trigram_data" WHERE CAST("id" AS TEXT) = ? OR CAST("block" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_docsize count=0
+  READONLY_SQL table=messages_fts_trigram_docsize: SELECT COUNT(*) FROM "messages_fts_trigram_docsize" WHERE CAST("id" AS TEXT) = ? OR CAST("sz" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_idx count=0
+  READONLY_SQL table=messages_fts_trigram_idx: SELECT COUNT(*) FROM "messages_fts_trigram_idx" WHERE CAST("segid" AS TEXT) = ? OR CAST("term" AS TEXT) = ? OR CAST("pgno" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=runtime_epoch count=0
+  READONLY_SQL table=runtime_epoch: SELECT COUNT(*) FROM "runtime_epoch" WHERE CAST("instance_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=schema_version count=0
+  READONLY_SQL table=schema_version: SELECT COUNT(*) FROM "schema_version" WHERE CAST("version" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_admissions count=0
+  READONLY_SQL table=session_admissions: SELECT COUNT(*) FROM "session_admissions" WHERE CAST("admission_id" AS TEXT) = ? OR CAST("request_id" AS TEXT) = ? OR CAST("principal_id" AS TEXT) = ? OR CAST("target_session_id" AS TEXT) = ? OR CAST("lineage_json" AS TEXT) = ? OR CAST("payload_json" AS TEXT) = ? OR CAST("payload_digest" AS TEXT) = ? OR CAST("intent" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_model_usage count=0
+  READONLY_SQL table=session_model_usage: SELECT COUNT(*) FROM "session_model_usage" WHERE CAST("session_id" AS TEXT) = ? OR CAST("model" AS TEXT) = ? OR CAST("billing_provider" AS TEXT) = ? OR CAST("billing_base_url" AS TEXT) = ? OR CAST("billing_mode" AS TEXT) = ? OR CAST("task" AS TEXT) = ? OR CAST("cost_status" AS TEXT) = ? OR CAST("cost_source" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_turn_leases count=0
+  READONLY_SQL table=session_turn_leases: SELECT COUNT(*) FROM "session_turn_leases" WHERE CAST("conversation_id" AS TEXT) = ? OR CAST("holder" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=sessions count=1
+  READONLY_SQL table=sessions: SELECT COUNT(*) FROM "sessions" WHERE CAST("id" AS TEXT) = ? OR CAST("source" AS TEXT) = ? OR CAST("created_source" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("display_name" AS TEXT) = ? OR CAST("origin_json" AS TEXT) = ? OR CAST("model" AS TEXT) = ? OR CAST("model_config" AS TEXT) = ? OR CAST("system_prompt" AS TEXT) = ? OR CAST("system_prompt_hash" AS TEXT) = ? OR CAST("parent_session_id" AS TEXT) = ? OR CAST("end_reason" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("git_branch" AS TEXT) = ? OR CAST("git_repo_root" AS TEXT) = ? OR CAST("billing_provider" AS TEXT) = ? OR CAST("billing_base_url" AS TEXT) = ? OR CAST("billing_mode" AS TEXT) = ? OR CAST("cost_status" AS TEXT) = ? OR CAST("cost_source" AS TEXT) = ? OR CAST("pricing_version" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("title_source" AS TEXT) = ? OR CAST("last_activity_description" AS TEXT) = ? OR CAST("last_activity_provenance" AS TEXT) = ? OR CAST("handoff_state" AS TEXT) = ? OR CAST("handoff_platform" AS TEXT) = ? OR CAST("handoff_error" AS TEXT) = ? OR CAST("compression_failure_error" AS TEXT) = ? OR CAST("profile_name" AS TEXT) = ? OR CAST("transport_profile" AS TEXT) = ? OR CAST("tool_names" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=state_meta count=0
+  READONLY_SQL table=state_meta: SELECT COUNT(*) FROM "state_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=system_prompts count=0
+  READONLY_SQL table=system_prompts: SELECT COUNT(*) FROM "system_prompts" WHERE CAST("hash" AS TEXT) = ? OR CAST("prompt" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=worker_executions count=0
+  READONLY_SQL table=worker_executions: SELECT COUNT(*) FROM "worker_executions" WHERE CAST("execution_id" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("adoption_digest" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=worker_receipts count=0
+  READONLY_SQL table=worker_receipts: SELECT COUNT(*) FROM "worker_receipts" WHERE CAST("execution_id" AS TEXT) = ? OR CAST("payload_digest" AS TEXT) = ? OR CAST("result_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=sessions
+  READONLY_NOTWRITTEN_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/state/state.db --marker g1b-state-20261022T142622Z-1870467-never-written
+  READONLY_NOTWRITTEN_EXIT=0
+  READONLY_DB=/work/homes/state/state.db
+  READONLY_OPEN_URI=file:/work/homes/state/state.db?mode=ro
+  READONLY_MARKER=g1b-state-20261022T142622Z-1870467-never-written
+  READONLY_TABLES=async_delegations,compression_locks,conversation_generations,gateway_heartbeats,gateway_hygiene_state,gateway_routing,messages,messages_fts,messages_fts_config,messages_fts_data,messages_fts_docsize,messages_fts_idx,messages_fts_trigram,messages_fts_trigram_config,messages_fts_trigram_data,messages_fts_trigram_docsize,messages_fts_trigram_idx,runtime_epoch,schema_version,session_admissions,session_model_usage,session_turn_leases,sessions,state_meta,system_prompts,worker_executions,worker_receipts
+  READONLY_TABLE_COUNT table=async_delegations count=0
+  READONLY_SQL table=async_delegations: SELECT COUNT(*) FROM "async_delegations" WHERE CAST("delegation_id" AS TEXT) = ? OR CAST("origin_session" AS TEXT) = ? OR CAST("origin_ui_session_id" AS TEXT) = ? OR CAST("parent_session_id" AS TEXT) = ? OR CAST("state" AS TEXT) = ? OR CAST("event_json" AS TEXT) = ? OR CAST("result_json" AS TEXT) = ? OR CAST("delivery_state" AS TEXT) = ? OR CAST("task_json" AS TEXT) = ? OR CAST("owner_execution_id" AS TEXT) = ? OR CAST("delivery_claim" AS TEXT) = ? OR CAST("origin_session_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=compression_locks count=0
+  READONLY_SQL table=compression_locks: SELECT COUNT(*) FROM "compression_locks" WHERE CAST("session_id" AS TEXT) = ? OR CAST("holder" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=conversation_generations count=0
+  READONLY_SQL table=conversation_generations: SELECT COUNT(*) FROM "conversation_generations" WHERE CAST("source" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_heartbeats count=0
+  READONLY_SQL table=gateway_heartbeats: SELECT COUNT(*) FROM "gateway_heartbeats" WHERE CAST("backend_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("host" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_hygiene_state count=0
+  READONLY_SQL table=gateway_hygiene_state: SELECT COUNT(*) FROM "gateway_hygiene_state" WHERE CAST("session_key" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=gateway_routing count=0
+  READONLY_SQL table=gateway_routing: SELECT COUNT(*) FROM "gateway_routing" WHERE CAST("scope" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ? OR CAST("entry_json" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages count=0
+  READONLY_SQL table=messages: SELECT COUNT(*) FROM "messages" WHERE CAST("session_id" AS TEXT) = ? OR CAST("role" AS TEXT) = ? OR CAST("content" AS TEXT) = ? OR CAST("tool_call_id" AS TEXT) = ? OR CAST("tool_calls" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ? OR CAST("effect_disposition" AS TEXT) = ? OR CAST("finish_reason" AS TEXT) = ? OR CAST("reasoning" AS TEXT) = ? OR CAST("reasoning_content" AS TEXT) = ? OR CAST("reasoning_details" AS TEXT) = ? OR CAST("codex_reasoning_items" AS TEXT) = ? OR CAST("codex_message_items" AS TEXT) = ? OR CAST("platform_message_id" AS TEXT) = ? OR CAST("api_content" AS TEXT) = ? OR CAST("display_kind" AS TEXT) = ? OR CAST("display_metadata" AS TEXT) = ? OR CAST("message_uid" AS TEXT) = ? OR CAST("absorbed_message_uids" AS TEXT) = ? OR CAST("tool_call_uids" AS TEXT) = ? OR CAST("tool_call_uid" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts count=0
+  READONLY_SQL table=messages_fts: SELECT COUNT(*) FROM "messages_fts" WHERE CAST("content" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ? OR CAST("tool_calls" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_config count=0
+  READONLY_SQL table=messages_fts_config: SELECT COUNT(*) FROM "messages_fts_config" WHERE CAST("k" AS TEXT) = ? OR CAST("v" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_data count=0
+  READONLY_SQL table=messages_fts_data: SELECT COUNT(*) FROM "messages_fts_data" WHERE CAST("id" AS TEXT) = ? OR CAST("block" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_docsize count=0
+  READONLY_SQL table=messages_fts_docsize: SELECT COUNT(*) FROM "messages_fts_docsize" WHERE CAST("id" AS TEXT) = ? OR CAST("sz" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_idx count=0
+  READONLY_SQL table=messages_fts_idx: SELECT COUNT(*) FROM "messages_fts_idx" WHERE CAST("segid" AS TEXT) = ? OR CAST("term" AS TEXT) = ? OR CAST("pgno" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram count=0
+  READONLY_SQL table=messages_fts_trigram: SELECT COUNT(*) FROM "messages_fts_trigram" WHERE CAST("content" AS TEXT) = ? OR CAST("tool_name" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_config count=0
+  READONLY_SQL table=messages_fts_trigram_config: SELECT COUNT(*) FROM "messages_fts_trigram_config" WHERE CAST("k" AS TEXT) = ? OR CAST("v" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_data count=0
+  READONLY_SQL table=messages_fts_trigram_data: SELECT COUNT(*) FROM "messages_fts_trigram_data" WHERE CAST("id" AS TEXT) = ? OR CAST("block" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_docsize count=0
+  READONLY_SQL table=messages_fts_trigram_docsize: SELECT COUNT(*) FROM "messages_fts_trigram_docsize" WHERE CAST("id" AS TEXT) = ? OR CAST("sz" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=messages_fts_trigram_idx count=0
+  READONLY_SQL table=messages_fts_trigram_idx: SELECT COUNT(*) FROM "messages_fts_trigram_idx" WHERE CAST("segid" AS TEXT) = ? OR CAST("term" AS TEXT) = ? OR CAST("pgno" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=runtime_epoch count=0
+  READONLY_SQL table=runtime_epoch: SELECT COUNT(*) FROM "runtime_epoch" WHERE CAST("instance_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=schema_version count=0
+  READONLY_SQL table=schema_version: SELECT COUNT(*) FROM "schema_version" WHERE CAST("version" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_admissions count=0
+  READONLY_SQL table=session_admissions: SELECT COUNT(*) FROM "session_admissions" WHERE CAST("admission_id" AS TEXT) = ? OR CAST("request_id" AS TEXT) = ? OR CAST("principal_id" AS TEXT) = ? OR CAST("target_session_id" AS TEXT) = ? OR CAST("lineage_json" AS TEXT) = ? OR CAST("payload_json" AS TEXT) = ? OR CAST("payload_digest" AS TEXT) = ? OR CAST("intent" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_model_usage count=0
+  READONLY_SQL table=session_model_usage: SELECT COUNT(*) FROM "session_model_usage" WHERE CAST("session_id" AS TEXT) = ? OR CAST("model" AS TEXT) = ? OR CAST("billing_provider" AS TEXT) = ? OR CAST("billing_base_url" AS TEXT) = ? OR CAST("billing_mode" AS TEXT) = ? OR CAST("task" AS TEXT) = ? OR CAST("cost_status" AS TEXT) = ? OR CAST("cost_source" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=session_turn_leases count=0
+  READONLY_SQL table=session_turn_leases: SELECT COUNT(*) FROM "session_turn_leases" WHERE CAST("conversation_id" AS TEXT) = ? OR CAST("holder" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=sessions count=0
+  READONLY_SQL table=sessions: SELECT COUNT(*) FROM "sessions" WHERE CAST("id" AS TEXT) = ? OR CAST("source" AS TEXT) = ? OR CAST("created_source" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("session_key" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("display_name" AS TEXT) = ? OR CAST("origin_json" AS TEXT) = ? OR CAST("model" AS TEXT) = ? OR CAST("model_config" AS TEXT) = ? OR CAST("system_prompt" AS TEXT) = ? OR CAST("system_prompt_hash" AS TEXT) = ? OR CAST("parent_session_id" AS TEXT) = ? OR CAST("end_reason" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("git_branch" AS TEXT) = ? OR CAST("git_repo_root" AS TEXT) = ? OR CAST("billing_provider" AS TEXT) = ? OR CAST("billing_base_url" AS TEXT) = ? OR CAST("billing_mode" AS TEXT) = ? OR CAST("cost_status" AS TEXT) = ? OR CAST("cost_source" AS TEXT) = ? OR CAST("pricing_version" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("title_source" AS TEXT) = ? OR CAST("last_activity_description" AS TEXT) = ? OR CAST("last_activity_provenance" AS TEXT) = ? OR CAST("handoff_state" AS TEXT) = ? OR CAST("handoff_platform" AS TEXT) = ? OR CAST("handoff_error" AS TEXT) = ? OR CAST("compression_failure_error" AS TEXT) = ? OR CAST("profile_name" AS TEXT) = ? OR CAST("transport_profile" AS TEXT) = ? OR CAST("tool_names" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=state_meta count=0
+  READONLY_SQL table=state_meta: SELECT COUNT(*) FROM "state_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=system_prompts count=0
+  READONLY_SQL table=system_prompts: SELECT COUNT(*) FROM "system_prompts" WHERE CAST("hash" AS TEXT) = ? OR CAST("prompt" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=worker_executions count=0
+  READONLY_SQL table=worker_executions: SELECT COUNT(*) FROM "worker_executions" WHERE CAST("execution_id" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("adoption_digest" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=worker_receipts count=0
+  READONLY_SQL table=worker_receipts: SELECT COUNT(*) FROM "worker_receipts" WHERE CAST("execution_id" AS TEXT) = ? OR CAST("payload_digest" AS TEXT) = ? OR CAST("result_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  READONLY_MARK1_TABLE_COUNT=1
+  READONLY_MARK1_TOTAL=1
+  READONLY_MARK2_TABLE_COUNT=1
+  READONLY_MARK2_TOTAL=1
+  READONLY_NOTWRITTEN_TABLE_COUNT=0
+  READONLY_NOTWRITTEN_TOTAL=0
+  SEED_STORE_EXIT=0
+
+STORE_SUMMARY state.db:
+  RECORD_1 table=sessions column=id id=g1b-state-20261022T142622Z-1870467-1 title= slug=
+  RECORD_2 table=sessions column=id id=g1b-state-20261022T142622Z-1870467-2 title= slug=
+  HEADER_AFTER_RUN_1 bytes=2,2 mode=wal size=327680 sha256=986222ae9e5aed206fa86a2a560650ca02448730636bf00c3a479eb7f54d922f
+  HEADER_AFTER_RUN_2 bytes=2,2 mode=wal size=327680 sha256=c749ea96734745d14b29a0162e63819ef82eea0f3498999a9cce2579b265fb65
+  SIDECARS_AFTER_RUN_1 -wal=absent -shm=absent -journal=absent
+  SIDECARS_AFTER_RUN_2 -wal=absent -shm=absent -journal=absent
+  STOCK_PURITY revision=4d04303818b61bf3aa09278af48356315515965b porcelain_empty=yes after_revision=4d04303818b61bf3aa09278af48356315515965b after_porcelain_empty=yes
+
+
+## Store verification_evidence.db
+
+STORE_KEY=verification
+STORE_HOME=/tmp/g1b-store-seeding.VZM1Ul/homes/verification (container /work/homes/verification)
+CONFIG_EXPECTED=database.journal_mode: wal
+MARKER_1=g1b-verification-20261022T142622Z-1870467-1
+MARKER_2=g1b-verification-20261022T142622Z-1870467-2
+NOT_WRITTEN_MARKER=g1b-verification-20261022T142622Z-1870467-never-written
+CONTAINER_LOG=/tmp/g1b-store-seeding.VZM1Ul/logs/verification.container.log
+
+CONTAINER_RC=0
+
+  CONTAINER_INVOCATION: docker run --rm --network none --platform linux/amd64 --user 1000:1000 -v /tmp/g1b-store-seeding.VZM1Ul:/work -w /work -e HOME=/work/home igorhvr/tamandua:latest bash -c <script>
+  STORE=verification_evidence.db
+  STORE_KEY=verification
+  STORE_HOME=/work/homes/verification
+  STORE_DB=/work/homes/verification/verification_evidence.db
+  MARKER_1=g1b-verification-20261022T142622Z-1870467-1
+  MARKER_2=g1b-verification-20261022T142622Z-1870467-2
+  ABSENT_MARKER=g1b-verification-20261022T142622Z-1870467-never-written
+  CONFIG_CONTENT=database:|  journal_mode: wal|agent:|  verify_on_stop: true|
+  RESOLVED_MODE=wal
+  RESOLVED_MODE_RC=0
+  STOCK_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_REVISION_RC=0
+  STOCK_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_STATUS_RC=0
+  WRITER1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py verification g1b-verification-20261022T142622Z-1870467-1 --home /work/homes/verification --scratch /work/scratch
+  WRITER1_EXIT=0
+  WRITER_VERIFY_ON_STOP=1
+  WRITER_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  WRITER_STORE=verification_evidence.db
+  WRITER_MARKER=g1b-verification-20261022T142622Z-1870467-1
+  WRITER_HOME=/work/homes/verification
+  WRITER_RECORD_TABLE=verification_events
+  WRITER_RECORD_COLUMN=session_id
+  WRITER_RECORD_ID=1
+  WRITER_EXIT=0
+  RECORD1_TABLE=verification_events
+  RECORD1_COLUMN=session_id
+  RECORD1_ID=1
+  RECORD1_TITLE=
+  RECORD1_SLUG=
+  RECORD1_NAME=
+  SEED1_EXISTS=yes
+  SEED1_RC=0
+  SEED1_JSON={"path": "/work/homes/verification/verification_evidence.db", "size": 32768, "sha256": "ff241518930c6a469a8684c536050220d9d2dcc3bead29b16368e545945232a6", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED1_SIZE=32768
+  SEED1_SHA256=ff241518930c6a469a8684c536050220d9d2dcc3bead29b16368e545945232a6
+  SEED1_BYTE18=2
+  SEED1_BYTE19=2
+  SEED1_MODE=wal
+  SEED1_SIDECAR_WAL_STATE=absent
+  SEED1_SIDECAR_SHM_STATE=absent
+  SEED1_SIDECAR_JOURNAL_STATE=absent
+  WRITER2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py verification g1b-verification-20261022T142622Z-1870467-2 --home /work/homes/verification --scratch /work/scratch
+  WRITER2_EXIT=0
+  WRITER_VERIFY_ON_STOP=1
+  WRITER_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  WRITER_STORE=verification_evidence.db
+  WRITER_MARKER=g1b-verification-20261022T142622Z-1870467-2
+  WRITER_HOME=/work/homes/verification
+  WRITER_RECORD_TABLE=verification_events
+  WRITER_RECORD_COLUMN=session_id
+  WRITER_RECORD_ID=2
+  WRITER_EXIT=0
+  RECORD2_TABLE=verification_events
+  RECORD2_COLUMN=session_id
+  RECORD2_ID=2
+  RECORD2_TITLE=
+  RECORD2_SLUG=
+  RECORD2_NAME=
+  SEED2_EXISTS=yes
+  SEED2_RC=0
+  SEED2_JSON={"path": "/work/homes/verification/verification_evidence.db", "size": 32768, "sha256": "eadc957f27e9a27a331dbce2ff5f758aed089a66eca45ac17b9d86eabe0d4c39", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED2_SIZE=32768
+  SEED2_SHA256=eadc957f27e9a27a331dbce2ff5f758aed089a66eca45ac17b9d86eabe0d4c39
+  SEED2_BYTE18=2
+  SEED2_BYTE19=2
+  SEED2_MODE=wal
+  SEED2_SIDECAR_WAL_STATE=absent
+  SEED2_SIDECAR_SHM_STATE=absent
+  SEED2_SIDECAR_JOURNAL_STATE=absent
+  STOCK_AFTER_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_AFTER_REVISION_RC=0
+  STOCK_AFTER_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_AFTER_STATUS_RC=0
+  READONLY_RECORD_TABLE=verification_events
+  READONLY_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/verification/verification_evidence.db --marker g1b-verification-20261022T142622Z-1870467-1
+  READONLY_MARK1_EXIT=0
+  READONLY_DB=/work/homes/verification/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/homes/verification/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T142622Z-1870467-1
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=1
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=1
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=2
+  READONLY_MATCHED_TABLES=verification_events,verification_state
+  READONLY_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/verification/verification_evidence.db --marker g1b-verification-20261022T142622Z-1870467-2
+  READONLY_MARK2_EXIT=0
+  READONLY_DB=/work/homes/verification/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/homes/verification/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T142622Z-1870467-2
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=1
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=1
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=2
+  READONLY_MATCHED_TABLES=verification_events,verification_state
+  READONLY_NOTWRITTEN_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/verification/verification_evidence.db --marker g1b-verification-20261022T142622Z-1870467-never-written
+  READONLY_NOTWRITTEN_EXIT=0
+  READONLY_DB=/work/homes/verification/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/homes/verification/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T142622Z-1870467-never-written
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=0
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=0
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  READONLY_MARK1_TABLE_COUNT=1
+  READONLY_MARK1_TOTAL=2
+  READONLY_MARK2_TABLE_COUNT=1
+  READONLY_MARK2_TOTAL=2
+  READONLY_NOTWRITTEN_TABLE_COUNT=0
+  READONLY_NOTWRITTEN_TOTAL=0
+  SEED_STORE_EXIT=0
+
+STORE_SUMMARY verification_evidence.db:
+  RECORD_1 table=verification_events column=session_id id=1 title= slug=
+  RECORD_2 table=verification_events column=session_id id=2 title= slug=
+  HEADER_AFTER_RUN_1 bytes=2,2 mode=wal size=32768 sha256=ff241518930c6a469a8684c536050220d9d2dcc3bead29b16368e545945232a6
+  HEADER_AFTER_RUN_2 bytes=2,2 mode=wal size=32768 sha256=eadc957f27e9a27a331dbce2ff5f758aed089a66eca45ac17b9d86eabe0d4c39
+  SIDECARS_AFTER_RUN_1 -wal=absent -shm=absent -journal=absent
+  SIDECARS_AFTER_RUN_2 -wal=absent -shm=absent -journal=absent
+  STOCK_PURITY revision=4d04303818b61bf3aa09278af48356315515965b porcelain_empty=yes after_revision=4d04303818b61bf3aa09278af48356315515965b after_porcelain_empty=yes
+
+
+## Store kanban.db
+
+STORE_KEY=kanban
+STORE_HOME=/tmp/g1b-store-seeding.VZM1Ul/homes/kanban (container /work/homes/kanban)
+CONFIG_EXPECTED=database.journal_mode: wal
+MARKER_1=g1b-kanban-20261022T142622Z-1870467-1
+MARKER_2=g1b-kanban-20261022T142622Z-1870467-2
+NOT_WRITTEN_MARKER=g1b-kanban-20261022T142622Z-1870467-never-written
+CONTAINER_LOG=/tmp/g1b-store-seeding.VZM1Ul/logs/kanban.container.log
+
+CONTAINER_RC=0
+
+  CONTAINER_INVOCATION: docker run --rm --network none --platform linux/amd64 --user 1000:1000 -v /tmp/g1b-store-seeding.VZM1Ul:/work -w /work -e HOME=/work/home igorhvr/tamandua:latest bash -c <script>
+  STORE=kanban.db
+  STORE_KEY=kanban
+  STORE_HOME=/work/homes/kanban
+  STORE_DB=/work/homes/kanban/kanban.db
+  MARKER_1=g1b-kanban-20261022T142622Z-1870467-1
+  MARKER_2=g1b-kanban-20261022T142622Z-1870467-2
+  ABSENT_MARKER=g1b-kanban-20261022T142622Z-1870467-never-written
+  CONFIG_CONTENT=database:|  journal_mode: wal|
+  RESOLVED_MODE=wal
+  RESOLVED_MODE_RC=0
+  STOCK_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_REVISION_RC=0
+  STOCK_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_STATUS_RC=0
+  WRITER1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py kanban g1b-kanban-20261022T142622Z-1870467-1 --home /work/homes/kanban --scratch /work/scratch
+  WRITER1_EXIT=0
+  WRITER_STORE=kanban.db
+  WRITER_MARKER=g1b-kanban-20261022T142622Z-1870467-1
+  WRITER_HOME=/work/homes/kanban
+  WRITER_RECORD_TABLE=tasks
+  WRITER_RECORD_COLUMN=id
+  WRITER_RECORD_ID=t_4186e401
+  WRITER_RECORD_TITLE=g1b-kanban-20261022T142622Z-1870467-1
+  WRITER_EXIT=0
+  RECORD1_TABLE=tasks
+  RECORD1_COLUMN=id
+  RECORD1_ID=t_4186e401
+  RECORD1_TITLE=g1b-kanban-20261022T142622Z-1870467-1
+  RECORD1_SLUG=
+  RECORD1_NAME=
+  SEED1_EXISTS=yes
+  SEED1_RC=0
+  SEED1_JSON={"path": "/work/homes/kanban/kanban.db", "size": 118784, "sha256": "f4e67cd7a91fc8f9e37b55700422b40c0ff242e9978db3f4a29b5cbe6627984e", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED1_SIZE=118784
+  SEED1_SHA256=f4e67cd7a91fc8f9e37b55700422b40c0ff242e9978db3f4a29b5cbe6627984e
+  SEED1_BYTE18=2
+  SEED1_BYTE19=2
+  SEED1_MODE=wal
+  SEED1_SIDECAR_WAL_STATE=absent
+  SEED1_SIDECAR_SHM_STATE=absent
+  SEED1_SIDECAR_JOURNAL_STATE=absent
+  WRITER2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py kanban g1b-kanban-20261022T142622Z-1870467-2 --home /work/homes/kanban --scratch /work/scratch
+  WRITER2_EXIT=0
+  WRITER_STORE=kanban.db
+  WRITER_MARKER=g1b-kanban-20261022T142622Z-1870467-2
+  WRITER_HOME=/work/homes/kanban
+  WRITER_RECORD_TABLE=tasks
+  WRITER_RECORD_COLUMN=id
+  WRITER_RECORD_ID=t_407e011a
+  WRITER_RECORD_TITLE=g1b-kanban-20261022T142622Z-1870467-2
+  WRITER_EXIT=0
+  RECORD2_TABLE=tasks
+  RECORD2_COLUMN=id
+  RECORD2_ID=t_407e011a
+  RECORD2_TITLE=g1b-kanban-20261022T142622Z-1870467-2
+  RECORD2_SLUG=
+  RECORD2_NAME=
+  SEED2_EXISTS=yes
+  SEED2_RC=0
+  SEED2_JSON={"path": "/work/homes/kanban/kanban.db", "size": 118784, "sha256": "74bbfa7d29b987de1925691768de310367c5182fa36fffcbf67420a7ecf65db9", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED2_SIZE=118784
+  SEED2_SHA256=74bbfa7d29b987de1925691768de310367c5182fa36fffcbf67420a7ecf65db9
+  SEED2_BYTE18=2
+  SEED2_BYTE19=2
+  SEED2_MODE=wal
+  SEED2_SIDECAR_WAL_STATE=absent
+  SEED2_SIDECAR_SHM_STATE=absent
+  SEED2_SIDECAR_JOURNAL_STATE=absent
+  STOCK_AFTER_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_AFTER_REVISION_RC=0
+  STOCK_AFTER_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_AFTER_STATUS_RC=0
+  READONLY_RECORD_TABLE=tasks
+  READONLY_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/kanban/kanban.db --marker g1b-kanban-20261022T142622Z-1870467-1
+  READONLY_MARK1_EXIT=0
+  READONLY_DB=/work/homes/kanban/kanban.db
+  READONLY_OPEN_URI=file:/work/homes/kanban/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T142622Z-1870467-1
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=1
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=tasks
+  READONLY_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/kanban/kanban.db --marker g1b-kanban-20261022T142622Z-1870467-2
+  READONLY_MARK2_EXIT=0
+  READONLY_DB=/work/homes/kanban/kanban.db
+  READONLY_OPEN_URI=file:/work/homes/kanban/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T142622Z-1870467-2
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=1
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=tasks
+  READONLY_NOTWRITTEN_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/kanban/kanban.db --marker g1b-kanban-20261022T142622Z-1870467-never-written
+  READONLY_NOTWRITTEN_EXIT=0
+  READONLY_DB=/work/homes/kanban/kanban.db
+  READONLY_OPEN_URI=file:/work/homes/kanban/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T142622Z-1870467-never-written
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=0
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  READONLY_MARK1_TABLE_COUNT=1
+  READONLY_MARK1_TOTAL=1
+  READONLY_MARK2_TABLE_COUNT=1
+  READONLY_MARK2_TOTAL=1
+  READONLY_NOTWRITTEN_TABLE_COUNT=0
+  READONLY_NOTWRITTEN_TOTAL=0
+  SEED_STORE_EXIT=0
+
+STORE_SUMMARY kanban.db:
+  RECORD_1 table=tasks column=id id=t_4186e401 title=g1b-kanban-20261022T142622Z-1870467-1 slug=
+  RECORD_2 table=tasks column=id id=t_407e011a title=g1b-kanban-20261022T142622Z-1870467-2 slug=
+  HEADER_AFTER_RUN_1 bytes=2,2 mode=wal size=118784 sha256=f4e67cd7a91fc8f9e37b55700422b40c0ff242e9978db3f4a29b5cbe6627984e
+  HEADER_AFTER_RUN_2 bytes=2,2 mode=wal size=118784 sha256=74bbfa7d29b987de1925691768de310367c5182fa36fffcbf67420a7ecf65db9
+  SIDECARS_AFTER_RUN_1 -wal=absent -shm=absent -journal=absent
+  SIDECARS_AFTER_RUN_2 -wal=absent -shm=absent -journal=absent
+  STOCK_PURITY revision=4d04303818b61bf3aa09278af48356315515965b porcelain_empty=yes after_revision=4d04303818b61bf3aa09278af48356315515965b after_porcelain_empty=yes
+
+
+## Store projects.db
+
+STORE_KEY=projects
+STORE_HOME=/tmp/g1b-store-seeding.VZM1Ul/homes/projects (container /work/homes/projects)
+CONFIG_EXPECTED=database.journal_mode: wal
+MARKER_1=g1b-projects-20261022T142622Z-1870467-1
+MARKER_2=g1b-projects-20261022T142622Z-1870467-2
+NOT_WRITTEN_MARKER=g1b-projects-20261022T142622Z-1870467-never-written
+CONTAINER_LOG=/tmp/g1b-store-seeding.VZM1Ul/logs/projects.container.log
+
+CONTAINER_RC=0
+
+  CONTAINER_INVOCATION: docker run --rm --network none --platform linux/amd64 --user 1000:1000 -v /tmp/g1b-store-seeding.VZM1Ul:/work -w /work -e HOME=/work/home igorhvr/tamandua:latest bash -c <script>
+  STORE=projects.db
+  STORE_KEY=projects
+  STORE_HOME=/work/homes/projects
+  STORE_DB=/work/homes/projects/projects.db
+  MARKER_1=g1b-projects-20261022T142622Z-1870467-1
+  MARKER_2=g1b-projects-20261022T142622Z-1870467-2
+  ABSENT_MARKER=g1b-projects-20261022T142622Z-1870467-never-written
+  CONFIG_CONTENT=database:|  journal_mode: wal|
+  RESOLVED_MODE=wal
+  RESOLVED_MODE_RC=0
+  STOCK_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_REVISION_RC=0
+  STOCK_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_STATUS_RC=0
+  WRITER1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py projects g1b-projects-20261022T142622Z-1870467-1 --home /work/homes/projects --scratch /work/scratch
+  WRITER1_EXIT=0
+  WRITER_STORE=projects.db
+  WRITER_MARKER=g1b-projects-20261022T142622Z-1870467-1
+  WRITER_HOME=/work/homes/projects
+  WRITER_RECORD_TABLE=projects
+  WRITER_RECORD_COLUMN=slug
+  WRITER_RECORD_ID=p_7019c861
+  WRITER_RECORD_SLUG=g1b-projects-20261022T142622Z-1870467-1
+  WRITER_RECORD_NAME=g1b-projects-20261022T142622Z-1870467-1
+  WRITER_EXIT=0
+  RECORD1_TABLE=projects
+  RECORD1_COLUMN=slug
+  RECORD1_ID=p_7019c861
+  RECORD1_TITLE=
+  RECORD1_SLUG=g1b-projects-20261022T142622Z-1870467-1
+  RECORD1_NAME=g1b-projects-20261022T142622Z-1870467-1
+  SEED1_EXISTS=yes
+  SEED1_RC=0
+  SEED1_JSON={"path": "/work/homes/projects/projects.db", "size": 45056, "sha256": "8e57572dda3ad7798d0d3c69698c5e82753b9dc22643916c7f3a90e74ba41e0f", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED1_SIZE=45056
+  SEED1_SHA256=8e57572dda3ad7798d0d3c69698c5e82753b9dc22643916c7f3a90e74ba41e0f
+  SEED1_BYTE18=2
+  SEED1_BYTE19=2
+  SEED1_MODE=wal
+  SEED1_SIDECAR_WAL_STATE=absent
+  SEED1_SIDECAR_SHM_STATE=absent
+  SEED1_SIDECAR_JOURNAL_STATE=absent
+  WRITER2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py projects g1b-projects-20261022T142622Z-1870467-2 --home /work/homes/projects --scratch /work/scratch
+  WRITER2_EXIT=0
+  WRITER_STORE=projects.db
+  WRITER_MARKER=g1b-projects-20261022T142622Z-1870467-2
+  WRITER_HOME=/work/homes/projects
+  WRITER_RECORD_TABLE=projects
+  WRITER_RECORD_COLUMN=slug
+  WRITER_RECORD_ID=p_b7b5c4cc
+  WRITER_RECORD_SLUG=g1b-projects-20261022T142622Z-1870467-2
+  WRITER_RECORD_NAME=g1b-projects-20261022T142622Z-1870467-2
+  WRITER_EXIT=0
+  RECORD2_TABLE=projects
+  RECORD2_COLUMN=slug
+  RECORD2_ID=p_b7b5c4cc
+  RECORD2_TITLE=
+  RECORD2_SLUG=g1b-projects-20261022T142622Z-1870467-2
+  RECORD2_NAME=g1b-projects-20261022T142622Z-1870467-2
+  SEED2_EXISTS=yes
+  SEED2_RC=0
+  SEED2_JSON={"path": "/work/homes/projects/projects.db", "size": 45056, "sha256": "d6a2047e4704a57abe645751002168665b81bffd93d407abd73a2e795f312629", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED2_SIZE=45056
+  SEED2_SHA256=d6a2047e4704a57abe645751002168665b81bffd93d407abd73a2e795f312629
+  SEED2_BYTE18=2
+  SEED2_BYTE19=2
+  SEED2_MODE=wal
+  SEED2_SIDECAR_WAL_STATE=absent
+  SEED2_SIDECAR_SHM_STATE=absent
+  SEED2_SIDECAR_JOURNAL_STATE=absent
+  STOCK_AFTER_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_AFTER_REVISION_RC=0
+  STOCK_AFTER_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_AFTER_STATUS_RC=0
+  READONLY_RECORD_TABLE=projects
+  READONLY_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/projects/projects.db --marker g1b-projects-20261022T142622Z-1870467-1
+  READONLY_MARK1_EXIT=0
+  READONLY_DB=/work/homes/projects/projects.db
+  READONLY_OPEN_URI=file:/work/homes/projects/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T142622Z-1870467-1
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=1
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=projects
+  READONLY_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/projects/projects.db --marker g1b-projects-20261022T142622Z-1870467-2
+  READONLY_MARK2_EXIT=0
+  READONLY_DB=/work/homes/projects/projects.db
+  READONLY_OPEN_URI=file:/work/homes/projects/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T142622Z-1870467-2
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=1
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=projects
+  READONLY_NOTWRITTEN_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/homes/projects/projects.db --marker g1b-projects-20261022T142622Z-1870467-never-written
+  READONLY_NOTWRITTEN_EXIT=0
+  READONLY_DB=/work/homes/projects/projects.db
+  READONLY_OPEN_URI=file:/work/homes/projects/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T142622Z-1870467-never-written
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=0
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  READONLY_MARK1_TABLE_COUNT=1
+  READONLY_MARK1_TOTAL=1
+  READONLY_MARK2_TABLE_COUNT=1
+  READONLY_MARK2_TOTAL=1
+  READONLY_NOTWRITTEN_TABLE_COUNT=0
+  READONLY_NOTWRITTEN_TOTAL=0
+  SEED_STORE_EXIT=0
+
+STORE_SUMMARY projects.db:
+  RECORD_1 table=projects column=slug id=p_7019c861 title= slug=g1b-projects-20261022T142622Z-1870467-1
+  RECORD_2 table=projects column=slug id=p_b7b5c4cc title= slug=g1b-projects-20261022T142622Z-1870467-2
+  HEADER_AFTER_RUN_1 bytes=2,2 mode=wal size=45056 sha256=8e57572dda3ad7798d0d3c69698c5e82753b9dc22643916c7f3a90e74ba41e0f
+  HEADER_AFTER_RUN_2 bytes=2,2 mode=wal size=45056 sha256=d6a2047e4704a57abe645751002168665b81bffd93d407abd73a2e795f312629
+  SIDECARS_AFTER_RUN_1 -wal=absent -shm=absent -journal=absent
+  SIDECARS_AFTER_RUN_2 -wal=absent -shm=absent -journal=absent
+  STOCK_PURITY revision=4d04303818b61bf3aa09278af48356315515965b porcelain_empty=yes after_revision=4d04303818b61bf3aa09278af48356315515965b after_porcelain_empty=yes
+
+
+## Summary
+SCRATCH_ROOT=/tmp/g1b-store-seeding.VZM1Ul
+SCRATCH_ROOT_KEPT=yes
+PROBE_RUNID=20261022T142622Z-1870467
+STORES_SEEDED=state verification kanban projects
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+OS=linux
+
+ASSERT SUMMARY: pass=147 fail=0

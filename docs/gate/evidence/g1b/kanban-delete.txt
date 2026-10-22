@@ -1,0 +1,715 @@
+# G1-B US-005 — offline conversion persistence for kanban.db (delete mode)
+# generated (UTC): 2026-10-22T18:09:04Z
+# store identity: kanban.db = OPTIONAL kanban board store, the DEFAULT board at kanban_home()/kanban.db
+# store path resolution: kanban_home() = HERMES_KANBAN_HOME else get_default_hermes_root(); the board root is shared across profiles BY DESIGN
+# store trigger: the real `hermes kanban create "<marker>"` (kanban list commits no record and is NOT the writer)
+
+SCRATCH_ROOT=/tmp/g1b-kanban-delete.R1lAlg
+SCRATCH_ROOT_KEPT=yes (G1-B never deletes its fixtures; this is the reproducer on a BLOCKER)
+
+PROBE_RUNID=20261022T180904Z-2507659
+MARKER_SCHEME=g1b-kanban-<probe-runid>-{seed,1,2,control,never-written}
+MARKER_SEED=g1b-kanban-20261022T180904Z-2507659-seed
+MARKER_1=g1b-kanban-20261022T180904Z-2507659-1
+MARKER_2=g1b-kanban-20261022T180904Z-2507659-2
+MARKER_CONTROL=g1b-kanban-20261022T180904Z-2507659-control
+MARKER_NEVER_WRITTEN=g1b-kanban-20261022T180904Z-2507659-never-written
+
+## Docker artifact
+IMAGE_REF=igorhvr/tamandua:latest
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+OS=linux
+REQUIRED_IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+REQUIRED_HERMES_REVISION=4d04303818b61bf3aa09278af48356315515965b
+MATCHLOCK_ARTIFACT_ID=sha256:9140629c9f408a6e9c285434eb6ab0cebd67db146c324db33e2798bac4fb7dff
+MATCHLOCK_ARTIFACT_RELATIONSHIP=UNVERIFIED (no equality claim)
+
+
+## Probe tools (pinned by sha256)
+
+read_header bootstrap: /tmp/g1b-kanban-delete.R1lAlg/tools/read_header.py sha256=3e91665695a5b2925d4825e5abc85a0a385e0c9b7dd0b55cc3b85e20784abe01
+READ_HEADER_BOOTSTRAP_RC=0
+TOOL /tmp/g1b-kanban-delete.R1lAlg/tools/g1b_writers.py sha256=9a088761b61c1419cd444a2c5b1e86dd7b39336b5ac815aabd3a2376e0539a8a
+TOOL /tmp/g1b-kanban-delete.R1lAlg/tools/g1b_readonly.py sha256=e76a9f2595bfbe4b2cb3261866eaba5f0b684f6a677314106cc8fe0db94dffcc
+TOOL /tmp/g1b-kanban-delete.R1lAlg/tools/g1b_kanban_delete_container.sh sha256=393347b3e28bd0c4bb681899ea4248d8eedc28bd444c66c252ac384dea58c473
+
+## Container run (single gateway)
+CONTAINER_LOG=/tmp/g1b-kanban-delete.R1lAlg/logs/kanban-delete.container.log
+
+CONTAINER_RC=0
+
+  CONTAINER_INVOCATION: docker run --rm --network none --platform linux/amd64 --user 1000:1000 -v /tmp/g1b-kanban-delete.R1lAlg:/work -w /work -e HOME=/work/home igorhvr/tamandua:latest bash -c <script>
+  STORE_KEY=kanban
+  STORE_DB_NAME=kanban.db
+  SEED_HOME=/work/kanban-delete/seed-wal/home
+  CONVERSION_DB=/work/kanban-delete/conversion/kanban.db
+  DELETE_HOME=/work/kanban-delete/delete/home
+  CONTROL_HOME=/work/kanban-delete/wal-control/home
+  PROFILE_HOME=/work/kanban-delete/profile-resolution/profiles/named
+  MARKER_SEED=g1b-kanban-20261022T180904Z-2507659-seed
+  MARKER_1=g1b-kanban-20261022T180904Z-2507659-1
+  MARKER_2=g1b-kanban-20261022T180904Z-2507659-2
+  MARKER_CONTROL=g1b-kanban-20261022T180904Z-2507659-control
+  MARKER_NEVER_WRITTEN=g1b-kanban-20261022T180904Z-2507659-never-written
+  KANBAN_ENV_OVERRIDES_UNSET=yes
+  PYTHON_VERSION=Python 3.14.7
+  HERMES_VERSION=Hermes Agent v0.22.4 (2026.9.24) · stable
+  NATIVE_EXECUTION_CGROUP=0::/ 
+  STOCK_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_REVISION_RC=0
+  STOCK_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_STATUS_RC=0
+  == 0. prove kanban path resolution (kanban_home()/get_default_hermes_root()) ==
+  CONFIG path=/work/kanban-delete/seed-wal/home/config.yaml content=database:|  journal_mode: wal|
+  PATH_CHECK_RESOLVED_MODE=wal
+  PATH_CHECK_RESOLVED_MODE_RC=0
+  DEFAULT_PROFILE_PATH_PROBE_RC=0
+  DEFAULT_PROFILE_PATH_ROOT=/work/kanban-delete/seed-wal/home
+  DEFAULT_PROFILE_PATH_KANBAN_HOME=/work/kanban-delete/seed-wal/home
+  DEFAULT_PROFILE_PATH_BOARDS_ROOT=/work/kanban-delete/seed-wal/home/kanban/boards
+  DEFAULT_PROFILE_PATH_CURRENT_BOARD=default
+  DEFAULT_PROFILE_PATH_DEFAULT_BOARD=default
+  DEFAULT_PROFILE_PATH_DB=/work/kanban-delete/seed-wal/home/kanban.db
+  DEFAULT_PROFILE_PATH_PROBE_EXIT=0
+  NAMED_PROFILE_PATH_PROBE_RC=0
+  NAMED_PROFILE_PATH_ROOT=/work/kanban-delete/profile-resolution
+  NAMED_PROFILE_PATH_KANBAN_HOME=/work/kanban-delete/profile-resolution
+  NAMED_PROFILE_PATH_BOARDS_ROOT=/work/kanban-delete/profile-resolution/kanban/boards
+  NAMED_PROFILE_PATH_CURRENT_BOARD=default
+  NAMED_PROFILE_PATH_DEFAULT_BOARD=default
+  NAMED_PROFILE_PATH_DB=/work/kanban-delete/profile-resolution/kanban.db
+  NAMED_PROFILE_PATH_PROBE_EXIT=0
+  KANBAN_HOME_RESOLVED=/work/kanban-delete/seed-wal/home
+  KANBAN_DB_RESOLVED=/work/kanban-delete/seed-wal/home/kanban.db
+  KANBAN_FIXTURE_IS_DEFAULT_PROFILE_ROOT=yes
+  == 1. seed a real kanban.db under database.journal_mode: wal ==
+  SEED_RESOLVED_MODE=wal
+  SEED_RESOLVED_MODE_RC=0
+  SEED_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py kanban g1b-kanban-20261022T180904Z-2507659-seed --home /work/kanban-delete/seed-wal/home --scratch /work/scratch
+  SEED_EXIT=0
+  WRITER_STORE=kanban.db
+  WRITER_MARKER=g1b-kanban-20261022T180904Z-2507659-seed
+  WRITER_HOME=/work/kanban-delete/seed-wal/home
+  WRITER_RECORD_TABLE=tasks
+  WRITER_RECORD_COLUMN=id
+  WRITER_RECORD_ID=t_d15f61a4
+  WRITER_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-seed
+  WRITER_EXIT=0
+  SEED_RECORD_TABLE=tasks
+  SEED_RECORD_COLUMN=id
+  SEED_RECORD_ID=t_d15f61a4
+  SEED_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-seed
+  SEED_EXISTS=yes
+  SEED_PATH=/work/kanban-delete/seed-wal/home/kanban.db
+  SEED_RC=0
+  SEED_JSON={"path": "/work/kanban-delete/seed-wal/home/kanban.db", "size": 118784, "sha256": "1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED_SIZE=118784
+  SEED_SHA256=1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230
+  SEED_BYTE18=2
+  SEED_BYTE19=2
+  SEED_MODE=wal
+  SEED_SIDECAR_WAL_STATE=absent
+  SEED_SIDECAR_SHM_STATE=absent
+  SEED_SIDECAR_JOURNAL_STATE=absent
+  SEED_INIT_LOCK_STATE=present
+  SEED_INIT_LOCK_SIZE=0
+  SEED_SHA256_HOST=1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230
+  SEED_RECORD_TABLE=tasks
+  SEED_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-seed
+  == 2. cp -a the WAL store aside and prove byte identity ==
+  COPY_CMD=cp -a -- /work/kanban-delete/seed-wal/home/kanban.db /work/kanban-delete/conversion/kanban.db
+  COPY_RC=0
+  COPY_SHA256=1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230
+  SEED_SHA256_AT_COPY=1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230
+  COPY_CMP_RC=0
+  COPY_BEFORE_EXISTS=yes
+  COPY_BEFORE_PATH=/work/kanban-delete/conversion/kanban.db
+  COPY_BEFORE_RC=0
+  COPY_BEFORE_JSON={"path": "/work/kanban-delete/conversion/kanban.db", "size": 118784, "sha256": "1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230", "byte18": 2, "byte19": 2, "mode": "wal"}
+  COPY_BEFORE_SIZE=118784
+  COPY_BEFORE_SHA256=1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230
+  COPY_BEFORE_BYTE18=2
+  COPY_BEFORE_BYTE19=2
+  COPY_BEFORE_MODE=wal
+  COPY_BEFORE_SIDECAR_WAL_STATE=absent
+  COPY_BEFORE_SIDECAR_SHM_STATE=absent
+  COPY_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  COPY_BEFORE_INIT_LOCK_STATE=absent
+  COPY_BYTE_IDENTICAL=yes
+  == 3. convert ONLY the copy offline with `hermes sessions set-journal-mode delete` ==
+  CONVERT_CMD=HERMES_HOME=/work/kanban-delete/seed-wal/home /usr/local/bin/hermes sessions set-journal-mode delete --db /work/kanban-delete/conversion/kanban.db
+  CONVERT_EXIT=0
+  CONVERT_STDOUT=✓ /work/kanban-delete/conversion/kanban.db: journal_mode wal → delete (header verified).|  Note: config.yaml has database.journal_mode: wal — the next open would switch the file back. Set `database.journal_mode: delete` in config.yaml to keep it.|
+  CONVERT_STDERR=
+  CONVERTED_EXISTS=yes
+  CONVERTED_PATH=/work/kanban-delete/conversion/kanban.db
+  CONVERTED_RC=0
+  CONVERTED_JSON={"path": "/work/kanban-delete/conversion/kanban.db", "size": 118784, "sha256": "f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a", "byte18": 1, "byte19": 1, "mode": "delete"}
+  CONVERTED_SIZE=118784
+  CONVERTED_SHA256=f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a
+  CONVERTED_BYTE18=1
+  CONVERTED_BYTE19=1
+  CONVERTED_MODE=delete
+  CONVERTED_SIDECAR_WAL_STATE=absent
+  CONVERTED_SIDECAR_SHM_STATE=absent
+  CONVERTED_SIDECAR_JOURNAL_STATE=absent
+  CONVERTED_INIT_LOCK_STATE=absent
+  CONVERTED_SHA256=f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a
+  SEED_SHA256_AFTER_CONVERT=1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230
+  SEED_UNCHANGED_BY_CONVERSION=yes
+  CONVERSION_CHANGED_COPY=yes
+  == 4. real trigger TWICE under database.journal_mode: delete ==
+  CONFIG path=/work/kanban-delete/delete/home/config.yaml content=database:|  journal_mode: delete|
+  PLACE_CMD=cp -a -- /work/kanban-delete/conversion/kanban.db /work/kanban-delete/delete/home/kanban.db
+  PLACE_RC=0
+  DELETE_RESOLVED_MODE=delete
+  DELETE_RESOLVED_MODE_RC=0
+  DELETE_BEFORE_EXISTS=yes
+  DELETE_BEFORE_PATH=/work/kanban-delete/delete/home/kanban.db
+  DELETE_BEFORE_RC=0
+  DELETE_BEFORE_JSON={"path": "/work/kanban-delete/delete/home/kanban.db", "size": 118784, "sha256": "f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a", "byte18": 1, "byte19": 1, "mode": "delete"}
+  DELETE_BEFORE_SIZE=118784
+  DELETE_BEFORE_SHA256=f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a
+  DELETE_BEFORE_BYTE18=1
+  DELETE_BEFORE_BYTE19=1
+  DELETE_BEFORE_MODE=delete
+  DELETE_BEFORE_SIDECAR_WAL_STATE=absent
+  DELETE_BEFORE_SIDECAR_SHM_STATE=absent
+  DELETE_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  DELETE_BEFORE_INIT_LOCK_STATE=absent
+  RO_DELETE_PRE_SEED_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-seed
+  RO_DELETE_PRE_SEED_EXIT=0
+  RO_DELETE_PRE_SEED_MARKER=g1b-kanban-20261022T180904Z-2507659-seed
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-seed
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=1
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=tasks
+  RO_DELETE_PRE_SEED_TASK_COUNT=1
+  RO_DELETE_PRE_SEED_TOTAL=1
+  RO_DELETE_PRE_SEED_MATCHED_TABLES=tasks
+  EVIDENCE_TABLE=tasks
+  EVIDENCE_TABLE_WRITER_TABLE=tasks
+  EVIDENCE_TABLE_ROW_ID=t_d15f61a4
+  EVIDENCE_TABLE_MARKER_COLUMN=title
+  RO_RUN1_BEFORE_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-1
+  RO_RUN1_BEFORE_MARK1_EXIT=0
+  RO_RUN1_BEFORE_MARK1_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=0
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_BEFORE_MARK1_TASK_COUNT=0
+  RO_RUN1_BEFORE_MARK1_TOTAL=0
+  RO_RUN1_BEFORE_MARK1_MATCHED_TABLES=(none)
+  RO_RUN1_BEFORE_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-2
+  RO_RUN1_BEFORE_MARK2_EXIT=0
+  RO_RUN1_BEFORE_MARK2_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=0
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_BEFORE_MARK2_TASK_COUNT=0
+  RO_RUN1_BEFORE_MARK2_TOTAL=0
+  RO_RUN1_BEFORE_MARK2_MATCHED_TABLES=(none)
+  RUN1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py kanban g1b-kanban-20261022T180904Z-2507659-1 --home /work/kanban-delete/delete/home --scratch /work/scratch
+  RUN1_EXIT=0
+  WRITER_STORE=kanban.db
+  WRITER_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  WRITER_HOME=/work/kanban-delete/delete/home
+  WRITER_RECORD_TABLE=tasks
+  WRITER_RECORD_COLUMN=id
+  WRITER_RECORD_ID=t_67855fed
+  WRITER_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-1
+  WRITER_EXIT=0
+  RUN1_RECORD_TABLE=tasks
+  RUN1_RECORD_COLUMN=id
+  RUN1_RECORD_ID=t_67855fed
+  RUN1_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-1
+  RUN1_EXISTS=yes
+  RUN1_PATH=/work/kanban-delete/delete/home/kanban.db
+  RUN1_RC=0
+  RUN1_JSON={"path": "/work/kanban-delete/delete/home/kanban.db", "size": 118784, "sha256": "ab36e424825c089bc1b831b9a014f67e1341f25eebb229954412bca2fac19c41", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN1_SIZE=118784
+  RUN1_SHA256=ab36e424825c089bc1b831b9a014f67e1341f25eebb229954412bca2fac19c41
+  RUN1_BYTE18=1
+  RUN1_BYTE19=1
+  RUN1_MODE=delete
+  RUN1_SIDECAR_WAL_STATE=absent
+  RUN1_SIDECAR_SHM_STATE=absent
+  RUN1_SIDECAR_JOURNAL_STATE=absent
+  RUN1_INIT_LOCK_STATE=present
+  RUN1_INIT_LOCK_SIZE=0
+  RO_RUN1_AFTER_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-1
+  RO_RUN1_AFTER_MARK1_EXIT=0
+  RO_RUN1_AFTER_MARK1_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=1
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=tasks
+  RO_RUN1_AFTER_MARK1_TASK_COUNT=1
+  RO_RUN1_AFTER_MARK1_TOTAL=1
+  RO_RUN1_AFTER_MARK1_MATCHED_TABLES=tasks
+  RO_RUN1_AFTER_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-2
+  RO_RUN1_AFTER_MARK2_EXIT=0
+  RO_RUN1_AFTER_MARK2_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=0
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_AFTER_MARK2_TASK_COUNT=0
+  RO_RUN1_AFTER_MARK2_TOTAL=0
+  RO_RUN1_AFTER_MARK2_MATCHED_TABLES=(none)
+  RUN1_AFTER_READONLY_EXISTS=yes
+  RUN1_AFTER_READONLY_PATH=/work/kanban-delete/delete/home/kanban.db
+  RUN1_AFTER_READONLY_RC=0
+  RUN1_AFTER_READONLY_JSON={"path": "/work/kanban-delete/delete/home/kanban.db", "size": 118784, "sha256": "ab36e424825c089bc1b831b9a014f67e1341f25eebb229954412bca2fac19c41", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN1_AFTER_READONLY_SIZE=118784
+  RUN1_AFTER_READONLY_SHA256=ab36e424825c089bc1b831b9a014f67e1341f25eebb229954412bca2fac19c41
+  RUN1_AFTER_READONLY_BYTE18=1
+  RUN1_AFTER_READONLY_BYTE19=1
+  RUN1_AFTER_READONLY_MODE=delete
+  RO_RUN2_BEFORE_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-1
+  RO_RUN2_BEFORE_MARK1_EXIT=0
+  RO_RUN2_BEFORE_MARK1_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=1
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=tasks
+  RO_RUN2_BEFORE_MARK1_TASK_COUNT=1
+  RO_RUN2_BEFORE_MARK1_TOTAL=1
+  RO_RUN2_BEFORE_MARK1_MATCHED_TABLES=tasks
+  RO_RUN2_BEFORE_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-2
+  RO_RUN2_BEFORE_MARK2_EXIT=0
+  RO_RUN2_BEFORE_MARK2_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=0
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN2_BEFORE_MARK2_TASK_COUNT=0
+  RO_RUN2_BEFORE_MARK2_TOTAL=0
+  RO_RUN2_BEFORE_MARK2_MATCHED_TABLES=(none)
+  RUN2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py kanban g1b-kanban-20261022T180904Z-2507659-2 --home /work/kanban-delete/delete/home --scratch /work/scratch
+  RUN2_EXIT=0
+  WRITER_STORE=kanban.db
+  WRITER_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  WRITER_HOME=/work/kanban-delete/delete/home
+  WRITER_RECORD_TABLE=tasks
+  WRITER_RECORD_COLUMN=id
+  WRITER_RECORD_ID=t_e11cba74
+  WRITER_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-2
+  WRITER_EXIT=0
+  RUN2_RECORD_TABLE=tasks
+  RUN2_RECORD_COLUMN=id
+  RUN2_RECORD_ID=t_e11cba74
+  RUN2_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-2
+  RUN2_EXISTS=yes
+  RUN2_PATH=/work/kanban-delete/delete/home/kanban.db
+  RUN2_RC=0
+  RUN2_JSON={"path": "/work/kanban-delete/delete/home/kanban.db", "size": 118784, "sha256": "ffa43297d58c9de44183839ea54049ad69e2b1611be24d0f428065d7d57af48c", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN2_SIZE=118784
+  RUN2_SHA256=ffa43297d58c9de44183839ea54049ad69e2b1611be24d0f428065d7d57af48c
+  RUN2_BYTE18=1
+  RUN2_BYTE19=1
+  RUN2_MODE=delete
+  RUN2_SIDECAR_WAL_STATE=absent
+  RUN2_SIDECAR_SHM_STATE=absent
+  RUN2_SIDECAR_JOURNAL_STATE=absent
+  RUN2_INIT_LOCK_STATE=present
+  RUN2_INIT_LOCK_SIZE=0
+  RO_RUN2_AFTER_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-1
+  RO_RUN2_AFTER_MARK1_EXIT=0
+  RO_RUN2_AFTER_MARK1_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-1
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=1
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=tasks
+  RO_RUN2_AFTER_MARK1_TASK_COUNT=1
+  RO_RUN2_AFTER_MARK1_TOTAL=1
+  RO_RUN2_AFTER_MARK1_MATCHED_TABLES=tasks
+  RO_RUN2_AFTER_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-2
+  RO_RUN2_AFTER_MARK2_EXIT=0
+  RO_RUN2_AFTER_MARK2_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-2
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=1
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=tasks
+  RO_RUN2_AFTER_MARK2_TASK_COUNT=1
+  RO_RUN2_AFTER_MARK2_TOTAL=1
+  RO_RUN2_AFTER_MARK2_MATCHED_TABLES=tasks
+  RUN2_AFTER_READONLY_EXISTS=yes
+  RUN2_AFTER_READONLY_PATH=/work/kanban-delete/delete/home/kanban.db
+  RUN2_AFTER_READONLY_RC=0
+  RUN2_AFTER_READONLY_JSON={"path": "/work/kanban-delete/delete/home/kanban.db", "size": 118784, "sha256": "ffa43297d58c9de44183839ea54049ad69e2b1611be24d0f428065d7d57af48c", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN2_AFTER_READONLY_SIZE=118784
+  RUN2_AFTER_READONLY_SHA256=ffa43297d58c9de44183839ea54049ad69e2b1611be24d0f428065d7d57af48c
+  RUN2_AFTER_READONLY_BYTE18=1
+  RUN2_AFTER_READONLY_BYTE19=1
+  RUN2_AFTER_READONLY_MODE=delete
+  RO_NEVER_WRITTEN_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/delete/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-never-written
+  RO_NEVER_WRITTEN_EXIT=0
+  RO_NEVER_WRITTEN_MARKER=g1b-kanban-20261022T180904Z-2507659-never-written
+  READONLY_DB=/work/kanban-delete/delete/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/delete/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-never-written
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=0
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_NEVER_WRITTEN_TASK_COUNT=0
+  RO_NEVER_WRITTEN_TOTAL=0
+  RO_NEVER_WRITTEN_MATCHED_TABLES=(none)
+  == 5. WAL control: SAME converted copy under database.journal_mode: wal ==
+  CONFIG path=/work/kanban-delete/wal-control/home/config.yaml content=database:|  journal_mode: wal|
+  CONTROL_PLACE_CMD=cp -a -- /work/kanban-delete/conversion/kanban.db /work/kanban-delete/wal-control/home/kanban.db
+  CONTROL_PLACE_RC=0
+  CONTROL_RESOLVED_MODE=wal
+  CONTROL_RESOLVED_MODE_RC=0
+  CONTROL_BEFORE_EXISTS=yes
+  CONTROL_BEFORE_PATH=/work/kanban-delete/wal-control/home/kanban.db
+  CONTROL_BEFORE_RC=0
+  CONTROL_BEFORE_JSON={"path": "/work/kanban-delete/wal-control/home/kanban.db", "size": 118784, "sha256": "f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a", "byte18": 1, "byte19": 1, "mode": "delete"}
+  CONTROL_BEFORE_SIZE=118784
+  CONTROL_BEFORE_SHA256=f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a
+  CONTROL_BEFORE_BYTE18=1
+  CONTROL_BEFORE_BYTE19=1
+  CONTROL_BEFORE_MODE=delete
+  CONTROL_BEFORE_SIDECAR_WAL_STATE=absent
+  CONTROL_BEFORE_SIDECAR_SHM_STATE=absent
+  CONTROL_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  CONTROL_BEFORE_INIT_LOCK_STATE=absent
+  RO_CONTROL_BEFORE_MARK_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/wal-control/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-control
+  RO_CONTROL_BEFORE_MARK_EXIT=0
+  RO_CONTROL_BEFORE_MARK_MARKER=g1b-kanban-20261022T180904Z-2507659-control
+  READONLY_DB=/work/kanban-delete/wal-control/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/wal-control/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-control
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=0
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_CONTROL_BEFORE_MARK_TASK_COUNT=0
+  RO_CONTROL_BEFORE_MARK_TOTAL=0
+  RO_CONTROL_BEFORE_MARK_MATCHED_TABLES=(none)
+  CONTROL_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py kanban g1b-kanban-20261022T180904Z-2507659-control --home /work/kanban-delete/wal-control/home --scratch /work/scratch
+  CONTROL_EXIT=0
+  WRITER_STORE=kanban.db
+  WRITER_MARKER=g1b-kanban-20261022T180904Z-2507659-control
+  WRITER_HOME=/work/kanban-delete/wal-control/home
+  WRITER_RECORD_TABLE=tasks
+  WRITER_RECORD_COLUMN=id
+  WRITER_RECORD_ID=t_78f4fd00
+  WRITER_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-control
+  WRITER_EXIT=0
+  CONTROL_RECORD_TABLE=tasks
+  CONTROL_RECORD_COLUMN=id
+  CONTROL_RECORD_ID=t_78f4fd00
+  CONTROL_RECORD_TITLE=g1b-kanban-20261022T180904Z-2507659-control
+  CONTROL_EXISTS=yes
+  CONTROL_PATH=/work/kanban-delete/wal-control/home/kanban.db
+  CONTROL_RC=0
+  CONTROL_JSON={"path": "/work/kanban-delete/wal-control/home/kanban.db", "size": 118784, "sha256": "8e2e01a175839017ca57e79985cd83777b9cfdbb91a61307428dc6723108583a", "byte18": 2, "byte19": 2, "mode": "wal"}
+  CONTROL_SIZE=118784
+  CONTROL_SHA256=8e2e01a175839017ca57e79985cd83777b9cfdbb91a61307428dc6723108583a
+  CONTROL_BYTE18=2
+  CONTROL_BYTE19=2
+  CONTROL_MODE=wal
+  CONTROL_SIDECAR_WAL_STATE=absent
+  CONTROL_SIDECAR_SHM_STATE=absent
+  CONTROL_SIDECAR_JOURNAL_STATE=absent
+  CONTROL_INIT_LOCK_STATE=present
+  CONTROL_INIT_LOCK_SIZE=0
+  RO_CONTROL_AFTER_MARK_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/kanban-delete/wal-control/home/kanban.db --marker g1b-kanban-20261022T180904Z-2507659-control
+  RO_CONTROL_AFTER_MARK_EXIT=0
+  RO_CONTROL_AFTER_MARK_MARKER=g1b-kanban-20261022T180904Z-2507659-control
+  READONLY_DB=/work/kanban-delete/wal-control/home/kanban.db
+  READONLY_OPEN_URI=file:/work/kanban-delete/wal-control/home/kanban.db?mode=ro
+  READONLY_MARKER=g1b-kanban-20261022T180904Z-2507659-control
+  READONLY_TABLES=kanban_notify_subs,task_attachments,task_comments,task_events,task_links,task_runs,tasks
+  READONLY_TABLE_COUNT table=kanban_notify_subs count=0
+  READONLY_SQL table=kanban_notify_subs: SELECT COUNT(*) FROM "kanban_notify_subs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("platform" AS TEXT) = ? OR CAST("chat_id" AS TEXT) = ? OR CAST("thread_id" AS TEXT) = ? OR CAST("user_id" AS TEXT) = ? OR CAST("user_id_alt" AS TEXT) = ? OR CAST("chat_type" AS TEXT) = ? OR CAST("notifier_profile" AS TEXT) = ? OR CAST("delivery_mode" AS TEXT) = ? OR CAST("delivery_metadata" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_attachments count=0
+  READONLY_SQL table=task_attachments: SELECT COUNT(*) FROM "task_attachments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("filename" AS TEXT) = ? OR CAST("stored_path" AS TEXT) = ? OR CAST("content_type" AS TEXT) = ? OR CAST("uploaded_by" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_comments count=0
+  READONLY_SQL table=task_comments: SELECT COUNT(*) FROM "task_comments" WHERE CAST("task_id" AS TEXT) = ? OR CAST("author" AS TEXT) = ? OR CAST("body" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_events count=0
+  READONLY_SQL table=task_events: SELECT COUNT(*) FROM "task_events" WHERE CAST("task_id" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("payload" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_links count=0
+  READONLY_SQL table=task_links: SELECT COUNT(*) FROM "task_links" WHERE CAST("parent_id" AS TEXT) = ? OR CAST("child_id" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=task_runs count=0
+  READONLY_SQL table=task_runs: SELECT COUNT(*) FROM "task_runs" WHERE CAST("task_id" AS TEXT) = ? OR CAST("profile" AS TEXT) = ? OR CAST("step_key" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("outcome" AS TEXT) = ? OR CAST("summary" AS TEXT) = ? OR CAST("metadata" AS TEXT) = ? OR CAST("error" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=tasks count=1
+  READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=tasks
+  RO_CONTROL_AFTER_MARK_TASK_COUNT=1
+  RO_CONTROL_AFTER_MARK_TOTAL=1
+  RO_CONTROL_AFTER_MARK_MATCHED_TABLES=tasks
+  CONTROL_AFTER_READONLY_EXISTS=yes
+  CONTROL_AFTER_READONLY_PATH=/work/kanban-delete/wal-control/home/kanban.db
+  CONTROL_AFTER_READONLY_RC=0
+  CONTROL_AFTER_READONLY_JSON={"path": "/work/kanban-delete/wal-control/home/kanban.db", "size": 118784, "sha256": "8e2e01a175839017ca57e79985cd83777b9cfdbb91a61307428dc6723108583a", "byte18": 2, "byte19": 2, "mode": "wal"}
+  CONTROL_AFTER_READONLY_SIZE=118784
+  CONTROL_AFTER_READONLY_SHA256=8e2e01a175839017ca57e79985cd83777b9cfdbb91a61307428dc6723108583a
+  CONTROL_AFTER_READONLY_BYTE18=2
+  CONTROL_AFTER_READONLY_BYTE19=2
+  CONTROL_AFTER_READONLY_MODE=wal
+  == 6. integrity and stock purity ==
+  CONVERTED_SHA256_BEFORE_WRITERS=f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a
+  CONVERTED_SHA256_AFTER_WRITERS=f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a
+  CONVERSION_SOURCE_UNTOUCHED=yes
+  SEED_SHA256_FINAL=1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230
+  SEED_UNCHANGED_AT_END=yes
+  STOCK_AFTER_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_AFTER_REVISION_RC=0
+  STOCK_AFTER_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_AFTER_STATUS_RC=0
+  KANBAN_DELETE_CONTAINER_EXIT=0
+
+STOCK_PURITY revision=4d04303818b61bf3aa09278af48356315515965b porcelain_empty=yes after_revision=4d04303818b61bf3aa09278af48356315515965b after_porcelain_empty=yes
+
+## Stage 0 — kanban path resolution (kanban_home() / get_default_hermes_root())
+KANBAN_RESOLUTION_RULE=kanban_home() = HERMES_KANBAN_HOME else get_default_hermes_root(); default board = <kanban_home>/kanban.db
+KANBAN_SHARED_ROOT_NUANCE=the board root is shared across profiles BY DESIGN: a named profile HERMES_HOME=<root>/profiles/<name> resolves the board to <root>/kanban.db, never a per-profile store
+KANBAN_FIXTURE_ROOT_KIND=default-profile fixture root (HERMES_HOME IS the board root)
+DEFAULT_PROFILE_HERMES_HOME=/work/kanban-delete/seed-wal/home
+DEFAULT_PROFILE_ROOT=/work/kanban-delete/seed-wal/home
+DEFAULT_PROFILE_KANBAN_HOME=/work/kanban-delete/seed-wal/home
+DEFAULT_PROFILE_KANBAN_DB=/work/kanban-delete/seed-wal/home/kanban.db
+DEFAULT_PROFILE_BOARDS_ROOT=/work/kanban-delete/seed-wal/home/kanban/boards
+DEFAULT_PROFILE_CURRENT_BOARD=default
+NAMED_PROFILE_HERMES_HOME=/work/kanban-delete/profile-resolution/profiles/named
+NAMED_PROFILE_ROOT=/work/kanban-delete/profile-resolution
+NAMED_PROFILE_KANBAN_HOME=/work/kanban-delete/profile-resolution
+NAMED_PROFILE_KANBAN_DB=/work/kanban-delete/profile-resolution/kanban.db
+KANBAN_ENV_OVERRIDES_UNSET=yes
+KANBAN_FIXTURE_IS_DEFAULT_PROFILE_ROOT=yes
+
+## Stage 1 — seed a real WAL kanban.db (real `hermes kanban create` trigger)
+SEED_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py kanban g1b-kanban-20261022T180904Z-2507659-seed --home /work/kanban-delete/seed-wal/home --scratch /work/scratch
+
+## Stage 2 — cp -a copy of the WAL store
+COPY_CMD=cp -a -- /work/kanban-delete/seed-wal/home/kanban.db /work/kanban-delete/conversion/kanban.db
+
+## Stage 3 — offline conversion of the COPY only
+CONVERT_CMD=HERMES_HOME=/work/kanban-delete/seed-wal/home /usr/local/bin/hermes sessions set-journal-mode delete --db /work/kanban-delete/conversion/kanban.db
+
+## Stage 4 — real `hermes kanban create` TWICE under database.journal_mode: delete
+DELETE_HOME=/work/kanban-delete/delete/home
+
+## Stage 5 — WAL control: SAME converted copy under database.journal_mode: wal
+CONTROL_HOME=/work/kanban-delete/wal-control/home
+
+## Integrity
+
+## Per-stage table
+stage | path | size | sha256 | header18/19 | mode | sidecars | writer_runs
+seed WAL | /work/kanban-delete/seed-wal/home/kanban.db | 118784 | 1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230 | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 1 (seed trigger)
+copy before conversion | /work/kanban-delete/conversion/kanban.db | 118784 | 1f957c3de65ad24fc025d0e7d95053ac70ab017ab9b0ce3f0ce52c60c83be230 | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 0
+converted copy | /work/kanban-delete/conversion/kanban.db | 118784 | f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 0 (offline conversion)
+delete home before writers | /work/kanban-delete/delete/home/kanban.db | 118784 | f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 1 (seed task carried over)
+delete home after run 1 | /work/kanban-delete/delete/home/kanban.db | 118784 | ab36e424825c089bc1b831b9a014f67e1341f25eebb229954412bca2fac19c41 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 2
+delete home after run 2 | /work/kanban-delete/delete/home/kanban.db | 118784 | ffa43297d58c9de44183839ea54049ad69e2b1611be24d0f428065d7d57af48c | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 3
+wal control before writer | /work/kanban-delete/wal-control/home/kanban.db | 118784 | f3509acf0bb7e17622c9f51eaf7839c330331c377aca8c752a0871d453b86d1a | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 1 (seed task carried over)
+wal control after writer | /work/kanban-delete/wal-control/home/kanban.db | 118784 | 8e2e01a175839017ca57e79985cd83777b9cfdbb91a61307428dc6723108583a | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 2
+
+## Identifiable-record assertion (read-only, after each writer close)
+EVIDENCE_TABLE=tasks (confirmed by the read-only marker match AND reported by the stock writer; the identifiable row is tasks.title = the marker)
+RUN1 record table=tasks task_id=t_67855fed title=g1b-kanban-20261022T180904Z-2507659-1
+  before run 1: tasks count=0 total=0
+  after run 1 close: tasks count=1 total=1
+  exact SQL: READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+RUN2 record table=tasks task_id=t_e11cba74 title=g1b-kanban-20261022T180904Z-2507659-2
+  before run 2: tasks count=0 total=0
+  after run 2 close: tasks count=1 total=1
+  exact SQL: READONLY_SQL table=tasks: SELECT COUNT(*) FROM "tasks" WHERE CAST("id" AS TEXT) = ? OR CAST("title" AS TEXT) = ? OR CAST("body" AS TEXT) = ? OR CAST("assignee" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("created_by" AS TEXT) = ? OR CAST("workspace_kind" AS TEXT) = ? OR CAST("workspace_path" AS TEXT) = ? OR CAST("branch_name" AS TEXT) = ? OR CAST("project_id" AS TEXT) = ? OR CAST("claim_lock" AS TEXT) = ? OR CAST("tenant" AS TEXT) = ? OR CAST("result" AS TEXT) = ? OR CAST("idempotency_key" AS TEXT) = ? OR CAST("last_failure_error" AS TEXT) = ? OR CAST("workflow_template_id" AS TEXT) = ? OR CAST("current_step_key" AS TEXT) = ? OR CAST("skills" AS TEXT) = ? OR CAST("model_override" AS TEXT) = ? OR CAST("provider_override" AS TEXT) = ? OR CAST("reasoning_effort" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("block_kind" AS TEXT) = ? OR CAST("completion_contract" AS TEXT) = ?
+NEVER-WRITTEN marker g1b-kanban-20261022T180904Z-2507659-never-written: total=0 (must be 0)
+
+## Verdict
+STORE=kanban.db
+STORE_IDENTITY=OPTIONAL kanban board store: the DEFAULT board at kanban_home()/kanban.db, kanban_home() = HERMES_KANBAN_HOME else get_default_hermes_root()
+PATH_RESOLUTION=default-profile fixture root (HERMES_HOME IS the board root); the board root is shared across profiles BY DESIGN (a named profile resolves the board to the shared root, never a per-profile store); HERMES_KANBAN_HOME/HERMES_KANBAN_DB/HERMES_KANBAN_BOARD unset
+TRIGGER=real /usr/local/bin/hermes kanban create "<marker>" --json (kanban list commits no record and is NOT the writer)
+EVIDENCE_TABLE=tasks (identifiable row = tasks.title marker; store-assigned id t_... recorded per run)
+VERDICT: kanban.db HONOURING
+VERDICT_LINE: Verdict: `kanban.db` HONOURING
+WAL_CONTROL: converted copy under database.journal_mode: wal -> header 2,2 (mode wal)
+PERSISTENCE_ASSERTION: run 1 task marker absent->present, run 2 task marker absent->present (separate read-only connections)
+SCOPE: a container run answers "do that image's writers honour configuration"; it does NOT qualify Matchlock's shared-filesystem behaviour across a guest boundary.
+MATCHLOCK_ARTIFACT_RELATIONSHIP=UNVERIFIED
+SCRATCH_ROOT=/tmp/g1b-kanban-delete.R1lAlg (kept as evidence)
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+STOCK_HERMES_REVISION=4d04303818b61bf3aa09278af48356315515965b
+
+ASSERT SUMMARY: pass=112 fail=0

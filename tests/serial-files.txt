@@ -194,6 +194,7 @@ tests/g1-fresh-store-modes.test.ts
 tests/g1-store-control-discovery-harness.test.ts
 tests/g1-store-inventory.test.ts
 tests/g1-verification-conversion.test.ts
+tests/g1b-harness.test.ts
 tests/get-ready-dashboard-port.test.ts
 tests/harness-stderr-tail.test.ts
 tests/harness-working-directory.test.ts
