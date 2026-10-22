@@ -1,0 +1,631 @@
+# G1-B US-006 — offline conversion persistence for projects.db (delete mode)
+# generated (UTC): 2026-10-22T19:01:28Z
+# store identity: projects.db = PER-PROFILE first-class Projects store (hermes_cli/projects_db.py)
+# store path resolution: projects_db_path() = get_hermes_home()/projects.db; get_hermes_home() = context override -> HERMES_HOME -> platform default
+# store trigger: the real `hermes project create "<marker>" --slug <marker>` (project list commits no record and is NOT the writer; no folder/--primary needed)
+
+SCRATCH_ROOT=/tmp/g1b-projects-delete.iIrirJ
+SCRATCH_ROOT_KEPT=yes (G1-B never deletes its fixtures; this is the reproducer on a BLOCKER)
+
+PROBE_RUNID=20261022T190128Z-2747439
+MARKER_SCHEME=g1b-projects-<probe-runid>-{seed,1,2,control,never-written}
+MARKER_SEED=g1b-projects-20261022T190128Z-2747439-seed
+MARKER_1=g1b-projects-20261022T190128Z-2747439-1
+MARKER_2=g1b-projects-20261022T190128Z-2747439-2
+MARKER_CONTROL=g1b-projects-20261022T190128Z-2747439-control
+MARKER_NEVER_WRITTEN=g1b-projects-20261022T190128Z-2747439-never-written
+
+## Docker artifact
+IMAGE_REF=igorhvr/tamandua:latest
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+OS=linux
+REQUIRED_IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+REQUIRED_HERMES_REVISION=4d04303818b61bf3aa09278af48356315515965b
+MATCHLOCK_ARTIFACT_ID=sha256:9140629c9f408a6e9c285434eb6ab0cebd67db146c324db33e2798bac4fb7dff
+MATCHLOCK_ARTIFACT_RELATIONSHIP=UNVERIFIED (no equality claim)
+
+
+## Probe tools (pinned by sha256)
+
+read_header bootstrap: /tmp/g1b-projects-delete.iIrirJ/tools/read_header.py sha256=3e91665695a5b2925d4825e5abc85a0a385e0c9b7dd0b55cc3b85e20784abe01
+READ_HEADER_BOOTSTRAP_RC=0
+TOOL /tmp/g1b-projects-delete.iIrirJ/tools/g1b_writers.py sha256=9a088761b61c1419cd444a2c5b1e86dd7b39336b5ac815aabd3a2376e0539a8a
+TOOL /tmp/g1b-projects-delete.iIrirJ/tools/g1b_readonly.py sha256=e76a9f2595bfbe4b2cb3261866eaba5f0b684f6a677314106cc8fe0db94dffcc
+TOOL /tmp/g1b-projects-delete.iIrirJ/tools/g1b_projects_delete_container.sh sha256=617e75cff161313c0d56a50838f38143ddcb8e7f3c6400a55159f7468c55be37
+
+## Container run (single gateway)
+CONTAINER_LOG=/tmp/g1b-projects-delete.iIrirJ/logs/projects-delete.container.log
+
+CONTAINER_RC=0
+
+  CONTAINER_INVOCATION: docker run --rm --network none --platform linux/amd64 --user 1000:1000 -v /tmp/g1b-projects-delete.iIrirJ:/work -w /work -e HOME=/work/home igorhvr/tamandua:latest bash -c <script>
+  STORE_KEY=projects
+  STORE_DB_NAME=projects.db
+  SEED_HOME=/work/projects-delete/seed-wal/home
+  CONVERSION_DB=/work/projects-delete/conversion/projects.db
+  DELETE_HOME=/work/projects-delete/delete/home
+  CONTROL_HOME=/work/projects-delete/wal-control/home
+  PROFILE_HOME=/work/projects-delete/profile-resolution/profiles/named
+  MARKER_SEED=g1b-projects-20261022T190128Z-2747439-seed
+  MARKER_1=g1b-projects-20261022T190128Z-2747439-1
+  MARKER_2=g1b-projects-20261022T190128Z-2747439-2
+  MARKER_CONTROL=g1b-projects-20261022T190128Z-2747439-control
+  MARKER_NEVER_WRITTEN=g1b-projects-20261022T190128Z-2747439-never-written
+  PYTHON_VERSION=Python 3.14.7
+  HERMES_VERSION=Hermes Agent v0.22.4 (2026.9.24) · stable
+  NATIVE_EXECUTION_CGROUP=0::/ 
+  STOCK_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_REVISION_RC=0
+  STOCK_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_STATUS_RC=0
+  == 0. prove projects path resolution (get_hermes_home()/projects_db_path()) ==
+  CONFIG path=/work/projects-delete/seed-wal/home/config.yaml content=database:|  journal_mode: wal|
+  PATH_CHECK_RESOLVED_MODE=wal
+  PATH_CHECK_RESOLVED_MODE_RC=0
+  DEFAULT_PROFILE_PATH_PROBE_RC=0
+  DEFAULT_PROFILE_PATH_HERMES_HOME=/work/projects-delete/seed-wal/home
+  DEFAULT_PROFILE_PATH_PROJECTS_DB=/work/projects-delete/seed-wal/home/projects.db
+  DEFAULT_PROFILE_PATH_DB_PARENT=/work/projects-delete/seed-wal/home
+  DEFAULT_PROFILE_PATH_DB_NAME=projects.db
+  DEFAULT_PROFILE_PATH_PROBE_EXIT=0
+  NAMED_PROFILE_PATH_PROBE_RC=0
+  NAMED_PROFILE_PATH_HERMES_HOME=/work/projects-delete/profile-resolution/profiles/named
+  NAMED_PROFILE_PATH_PROJECTS_DB=/work/projects-delete/profile-resolution/profiles/named/projects.db
+  NAMED_PROFILE_PATH_DB_PARENT=/work/projects-delete/profile-resolution/profiles/named
+  NAMED_PROFILE_PATH_DB_NAME=projects.db
+  NAMED_PROFILE_PATH_PROBE_EXIT=0
+  PROJECTS_PATH_OVERRIDE_ENV=none (there is no projects-specific path override; projects_db_path() = get_hermes_home()/projects.db)
+  PROJECTS_SLUG_NORMALIZATION=normalize_slug() lowercases the --slug argument; the marker is stored verbatim as projects.name, which is what the read-only check matches
+  == 1. seed a real projects.db under database.journal_mode: wal ==
+  SEED_RESOLVED_MODE=wal
+  SEED_RESOLVED_MODE_RC=0
+  SEED_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py projects g1b-projects-20261022T190128Z-2747439-seed --home /work/projects-delete/seed-wal/home --scratch /work/scratch
+  SEED_EXIT=0
+  WRITER_STORE=projects.db
+  WRITER_MARKER=g1b-projects-20261022T190128Z-2747439-seed
+  WRITER_HOME=/work/projects-delete/seed-wal/home
+  WRITER_RECORD_TABLE=projects
+  WRITER_RECORD_COLUMN=slug
+  WRITER_RECORD_ID=p_369a7302
+  WRITER_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-seed
+  WRITER_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-seed
+  WRITER_EXIT=0
+  SEED_RECORD_TABLE=projects
+  SEED_RECORD_COLUMN=slug
+  SEED_RECORD_ID=p_369a7302
+  SEED_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-seed
+  SEED_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-seed
+  SEED_EXISTS=yes
+  SEED_PATH=/work/projects-delete/seed-wal/home/projects.db
+  SEED_RC=0
+  SEED_JSON={"path": "/work/projects-delete/seed-wal/home/projects.db", "size": 45056, "sha256": "fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED_SIZE=45056
+  SEED_SHA256=fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c
+  SEED_BYTE18=2
+  SEED_BYTE19=2
+  SEED_MODE=wal
+  SEED_SIDECAR_WAL_STATE=absent
+  SEED_SIDECAR_SHM_STATE=absent
+  SEED_SIDECAR_JOURNAL_STATE=absent
+  SEED_SHA256_HOST=fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c
+  SEED_RECORD_TABLE=projects
+  SEED_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-seed
+  SEED_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-seed
+  == 2. cp -a the WAL store aside and prove byte identity ==
+  COPY_CMD=cp -a -- /work/projects-delete/seed-wal/home/projects.db /work/projects-delete/conversion/projects.db
+  COPY_RC=0
+  COPY_SHA256=fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c
+  SEED_SHA256_AT_COPY=fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c
+  COPY_CMP_RC=0
+  COPY_BEFORE_EXISTS=yes
+  COPY_BEFORE_PATH=/work/projects-delete/conversion/projects.db
+  COPY_BEFORE_RC=0
+  COPY_BEFORE_JSON={"path": "/work/projects-delete/conversion/projects.db", "size": 45056, "sha256": "fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c", "byte18": 2, "byte19": 2, "mode": "wal"}
+  COPY_BEFORE_SIZE=45056
+  COPY_BEFORE_SHA256=fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c
+  COPY_BEFORE_BYTE18=2
+  COPY_BEFORE_BYTE19=2
+  COPY_BEFORE_MODE=wal
+  COPY_BEFORE_SIDECAR_WAL_STATE=absent
+  COPY_BEFORE_SIDECAR_SHM_STATE=absent
+  COPY_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  COPY_BYTE_IDENTICAL=yes
+  == 3. convert ONLY the copy offline with `hermes sessions set-journal-mode delete` ==
+  CONVERT_CMD=HERMES_HOME=/work/projects-delete/seed-wal/home /usr/local/bin/hermes sessions set-journal-mode delete --db /work/projects-delete/conversion/projects.db
+  CONVERT_EXIT=0
+  CONVERT_STDOUT=✓ /work/projects-delete/conversion/projects.db: journal_mode wal → delete (header verified).|  Note: config.yaml has database.journal_mode: wal — the next open would switch the file back. Set `database.journal_mode: delete` in config.yaml to keep it.|
+  CONVERT_STDERR=
+  CONVERTED_EXISTS=yes
+  CONVERTED_PATH=/work/projects-delete/conversion/projects.db
+  CONVERTED_RC=0
+  CONVERTED_JSON={"path": "/work/projects-delete/conversion/projects.db", "size": 45056, "sha256": "5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3", "byte18": 1, "byte19": 1, "mode": "delete"}
+  CONVERTED_SIZE=45056
+  CONVERTED_SHA256=5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3
+  CONVERTED_BYTE18=1
+  CONVERTED_BYTE19=1
+  CONVERTED_MODE=delete
+  CONVERTED_SIDECAR_WAL_STATE=absent
+  CONVERTED_SIDECAR_SHM_STATE=absent
+  CONVERTED_SIDECAR_JOURNAL_STATE=absent
+  CONVERTED_SHA256=5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3
+  SEED_SHA256_AFTER_CONVERT=fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c
+  SEED_UNCHANGED_BY_CONVERSION=yes
+  CONVERSION_CHANGED_COPY=yes
+  == 4. real trigger TWICE under database.journal_mode: delete ==
+  CONFIG path=/work/projects-delete/delete/home/config.yaml content=database:|  journal_mode: delete|
+  PLACE_CMD=cp -a -- /work/projects-delete/conversion/projects.db /work/projects-delete/delete/home/projects.db
+  PLACE_RC=0
+  DELETE_RESOLVED_MODE=delete
+  DELETE_RESOLVED_MODE_RC=0
+  DELETE_BEFORE_EXISTS=yes
+  DELETE_BEFORE_PATH=/work/projects-delete/delete/home/projects.db
+  DELETE_BEFORE_RC=0
+  DELETE_BEFORE_JSON={"path": "/work/projects-delete/delete/home/projects.db", "size": 45056, "sha256": "5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3", "byte18": 1, "byte19": 1, "mode": "delete"}
+  DELETE_BEFORE_SIZE=45056
+  DELETE_BEFORE_SHA256=5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3
+  DELETE_BEFORE_BYTE18=1
+  DELETE_BEFORE_BYTE19=1
+  DELETE_BEFORE_MODE=delete
+  DELETE_BEFORE_SIDECAR_WAL_STATE=absent
+  DELETE_BEFORE_SIDECAR_SHM_STATE=absent
+  DELETE_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  RO_DELETE_PRE_SEED_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-seed
+  RO_DELETE_PRE_SEED_EXIT=0
+  RO_DELETE_PRE_SEED_MARKER=g1b-projects-20261022T190128Z-2747439-seed
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-seed
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=1
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=projects
+  RO_DELETE_PRE_SEED_PROJECT_COUNT=1
+  RO_DELETE_PRE_SEED_TOTAL=1
+  RO_DELETE_PRE_SEED_MATCHED_TABLES=projects
+  EVIDENCE_TABLE=projects
+  EVIDENCE_TABLE_WRITER_TABLE=projects
+  EVIDENCE_TABLE_ROW_ID=p_369a7302
+  EVIDENCE_TABLE_MARKER_COLUMN=name (the stored slug is the normalized marker)
+  RO_RUN1_BEFORE_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-1
+  RO_RUN1_BEFORE_MARK1_EXIT=0
+  RO_RUN1_BEFORE_MARK1_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=0
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_BEFORE_MARK1_PROJECT_COUNT=0
+  RO_RUN1_BEFORE_MARK1_TOTAL=0
+  RO_RUN1_BEFORE_MARK1_MATCHED_TABLES=(none)
+  RO_RUN1_BEFORE_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-2
+  RO_RUN1_BEFORE_MARK2_EXIT=0
+  RO_RUN1_BEFORE_MARK2_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=0
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_BEFORE_MARK2_PROJECT_COUNT=0
+  RO_RUN1_BEFORE_MARK2_TOTAL=0
+  RO_RUN1_BEFORE_MARK2_MATCHED_TABLES=(none)
+  RUN1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py projects g1b-projects-20261022T190128Z-2747439-1 --home /work/projects-delete/delete/home --scratch /work/scratch
+  RUN1_EXIT=0
+  WRITER_STORE=projects.db
+  WRITER_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  WRITER_HOME=/work/projects-delete/delete/home
+  WRITER_RECORD_TABLE=projects
+  WRITER_RECORD_COLUMN=slug
+  WRITER_RECORD_ID=p_80e276d1
+  WRITER_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-1
+  WRITER_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-1
+  WRITER_EXIT=0
+  RUN1_RECORD_TABLE=projects
+  RUN1_RECORD_COLUMN=slug
+  RUN1_RECORD_ID=p_80e276d1
+  RUN1_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-1
+  RUN1_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-1
+  RUN1_EXISTS=yes
+  RUN1_PATH=/work/projects-delete/delete/home/projects.db
+  RUN1_RC=0
+  RUN1_JSON={"path": "/work/projects-delete/delete/home/projects.db", "size": 45056, "sha256": "35f30141b7a828b51a610cdcf5f0edd420ca52b49937b27a7d5020c3b88c2090", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN1_SIZE=45056
+  RUN1_SHA256=35f30141b7a828b51a610cdcf5f0edd420ca52b49937b27a7d5020c3b88c2090
+  RUN1_BYTE18=1
+  RUN1_BYTE19=1
+  RUN1_MODE=delete
+  RUN1_SIDECAR_WAL_STATE=absent
+  RUN1_SIDECAR_SHM_STATE=absent
+  RUN1_SIDECAR_JOURNAL_STATE=absent
+  RO_RUN1_AFTER_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-1
+  RO_RUN1_AFTER_MARK1_EXIT=0
+  RO_RUN1_AFTER_MARK1_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=1
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=projects
+  RO_RUN1_AFTER_MARK1_PROJECT_COUNT=1
+  RO_RUN1_AFTER_MARK1_TOTAL=1
+  RO_RUN1_AFTER_MARK1_MATCHED_TABLES=projects
+  RO_RUN1_AFTER_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-2
+  RO_RUN1_AFTER_MARK2_EXIT=0
+  RO_RUN1_AFTER_MARK2_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=0
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_AFTER_MARK2_PROJECT_COUNT=0
+  RO_RUN1_AFTER_MARK2_TOTAL=0
+  RO_RUN1_AFTER_MARK2_MATCHED_TABLES=(none)
+  RUN1_AFTER_READONLY_EXISTS=yes
+  RUN1_AFTER_READONLY_PATH=/work/projects-delete/delete/home/projects.db
+  RUN1_AFTER_READONLY_RC=0
+  RUN1_AFTER_READONLY_JSON={"path": "/work/projects-delete/delete/home/projects.db", "size": 45056, "sha256": "35f30141b7a828b51a610cdcf5f0edd420ca52b49937b27a7d5020c3b88c2090", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN1_AFTER_READONLY_SIZE=45056
+  RUN1_AFTER_READONLY_SHA256=35f30141b7a828b51a610cdcf5f0edd420ca52b49937b27a7d5020c3b88c2090
+  RUN1_AFTER_READONLY_BYTE18=1
+  RUN1_AFTER_READONLY_BYTE19=1
+  RUN1_AFTER_READONLY_MODE=delete
+  RO_RUN2_BEFORE_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-1
+  RO_RUN2_BEFORE_MARK1_EXIT=0
+  RO_RUN2_BEFORE_MARK1_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=1
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=projects
+  RO_RUN2_BEFORE_MARK1_PROJECT_COUNT=1
+  RO_RUN2_BEFORE_MARK1_TOTAL=1
+  RO_RUN2_BEFORE_MARK1_MATCHED_TABLES=projects
+  RO_RUN2_BEFORE_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-2
+  RO_RUN2_BEFORE_MARK2_EXIT=0
+  RO_RUN2_BEFORE_MARK2_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=0
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN2_BEFORE_MARK2_PROJECT_COUNT=0
+  RO_RUN2_BEFORE_MARK2_TOTAL=0
+  RO_RUN2_BEFORE_MARK2_MATCHED_TABLES=(none)
+  RUN2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py projects g1b-projects-20261022T190128Z-2747439-2 --home /work/projects-delete/delete/home --scratch /work/scratch
+  RUN2_EXIT=0
+  WRITER_STORE=projects.db
+  WRITER_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  WRITER_HOME=/work/projects-delete/delete/home
+  WRITER_RECORD_TABLE=projects
+  WRITER_RECORD_COLUMN=slug
+  WRITER_RECORD_ID=p_556afdd1
+  WRITER_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-2
+  WRITER_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-2
+  WRITER_EXIT=0
+  RUN2_RECORD_TABLE=projects
+  RUN2_RECORD_COLUMN=slug
+  RUN2_RECORD_ID=p_556afdd1
+  RUN2_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-2
+  RUN2_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-2
+  RUN2_EXISTS=yes
+  RUN2_PATH=/work/projects-delete/delete/home/projects.db
+  RUN2_RC=0
+  RUN2_JSON={"path": "/work/projects-delete/delete/home/projects.db", "size": 45056, "sha256": "61099d9e8d49d406c6bcebc9653ea323e63533a2e4a62a8b8b266de7139fe5a7", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN2_SIZE=45056
+  RUN2_SHA256=61099d9e8d49d406c6bcebc9653ea323e63533a2e4a62a8b8b266de7139fe5a7
+  RUN2_BYTE18=1
+  RUN2_BYTE19=1
+  RUN2_MODE=delete
+  RUN2_SIDECAR_WAL_STATE=absent
+  RUN2_SIDECAR_SHM_STATE=absent
+  RUN2_SIDECAR_JOURNAL_STATE=absent
+  RO_RUN2_AFTER_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-1
+  RO_RUN2_AFTER_MARK1_EXIT=0
+  RO_RUN2_AFTER_MARK1_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-1
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=1
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=projects
+  RO_RUN2_AFTER_MARK1_PROJECT_COUNT=1
+  RO_RUN2_AFTER_MARK1_TOTAL=1
+  RO_RUN2_AFTER_MARK1_MATCHED_TABLES=projects
+  RO_RUN2_AFTER_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-2
+  RO_RUN2_AFTER_MARK2_EXIT=0
+  RO_RUN2_AFTER_MARK2_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-2
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=1
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=projects
+  RO_RUN2_AFTER_MARK2_PROJECT_COUNT=1
+  RO_RUN2_AFTER_MARK2_TOTAL=1
+  RO_RUN2_AFTER_MARK2_MATCHED_TABLES=projects
+  RUN2_AFTER_READONLY_EXISTS=yes
+  RUN2_AFTER_READONLY_PATH=/work/projects-delete/delete/home/projects.db
+  RUN2_AFTER_READONLY_RC=0
+  RUN2_AFTER_READONLY_JSON={"path": "/work/projects-delete/delete/home/projects.db", "size": 45056, "sha256": "61099d9e8d49d406c6bcebc9653ea323e63533a2e4a62a8b8b266de7139fe5a7", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN2_AFTER_READONLY_SIZE=45056
+  RUN2_AFTER_READONLY_SHA256=61099d9e8d49d406c6bcebc9653ea323e63533a2e4a62a8b8b266de7139fe5a7
+  RUN2_AFTER_READONLY_BYTE18=1
+  RUN2_AFTER_READONLY_BYTE19=1
+  RUN2_AFTER_READONLY_MODE=delete
+  RO_NEVER_WRITTEN_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/delete/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-never-written
+  RO_NEVER_WRITTEN_EXIT=0
+  RO_NEVER_WRITTEN_MARKER=g1b-projects-20261022T190128Z-2747439-never-written
+  READONLY_DB=/work/projects-delete/delete/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/delete/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-never-written
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=0
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_NEVER_WRITTEN_PROJECT_COUNT=0
+  RO_NEVER_WRITTEN_TOTAL=0
+  RO_NEVER_WRITTEN_MATCHED_TABLES=(none)
+  == 5. WAL control: SAME converted copy under database.journal_mode: wal ==
+  CONFIG path=/work/projects-delete/wal-control/home/config.yaml content=database:|  journal_mode: wal|
+  CONTROL_PLACE_CMD=cp -a -- /work/projects-delete/conversion/projects.db /work/projects-delete/wal-control/home/projects.db
+  CONTROL_PLACE_RC=0
+  CONTROL_RESOLVED_MODE=wal
+  CONTROL_RESOLVED_MODE_RC=0
+  CONTROL_BEFORE_EXISTS=yes
+  CONTROL_BEFORE_PATH=/work/projects-delete/wal-control/home/projects.db
+  CONTROL_BEFORE_RC=0
+  CONTROL_BEFORE_JSON={"path": "/work/projects-delete/wal-control/home/projects.db", "size": 45056, "sha256": "5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3", "byte18": 1, "byte19": 1, "mode": "delete"}
+  CONTROL_BEFORE_SIZE=45056
+  CONTROL_BEFORE_SHA256=5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3
+  CONTROL_BEFORE_BYTE18=1
+  CONTROL_BEFORE_BYTE19=1
+  CONTROL_BEFORE_MODE=delete
+  CONTROL_BEFORE_SIDECAR_WAL_STATE=absent
+  CONTROL_BEFORE_SIDECAR_SHM_STATE=absent
+  CONTROL_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  RO_CONTROL_BEFORE_MARK_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/wal-control/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-control
+  RO_CONTROL_BEFORE_MARK_EXIT=0
+  RO_CONTROL_BEFORE_MARK_MARKER=g1b-projects-20261022T190128Z-2747439-control
+  READONLY_DB=/work/projects-delete/wal-control/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/wal-control/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-control
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=0
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_CONTROL_BEFORE_MARK_PROJECT_COUNT=0
+  RO_CONTROL_BEFORE_MARK_TOTAL=0
+  RO_CONTROL_BEFORE_MARK_MATCHED_TABLES=(none)
+  CONTROL_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py projects g1b-projects-20261022T190128Z-2747439-control --home /work/projects-delete/wal-control/home --scratch /work/scratch
+  CONTROL_EXIT=0
+  WRITER_STORE=projects.db
+  WRITER_MARKER=g1b-projects-20261022T190128Z-2747439-control
+  WRITER_HOME=/work/projects-delete/wal-control/home
+  WRITER_RECORD_TABLE=projects
+  WRITER_RECORD_COLUMN=slug
+  WRITER_RECORD_ID=p_23363eb1
+  WRITER_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-control
+  WRITER_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-control
+  WRITER_EXIT=0
+  CONTROL_RECORD_TABLE=projects
+  CONTROL_RECORD_COLUMN=slug
+  CONTROL_RECORD_ID=p_23363eb1
+  CONTROL_RECORD_SLUG=g1b-projects-20261022T190128Z-2747439-control
+  CONTROL_RECORD_NAME=g1b-projects-20261022T190128Z-2747439-control
+  CONTROL_EXISTS=yes
+  CONTROL_PATH=/work/projects-delete/wal-control/home/projects.db
+  CONTROL_RC=0
+  CONTROL_JSON={"path": "/work/projects-delete/wal-control/home/projects.db", "size": 45056, "sha256": "859a8cee0862bc23879ffb9307010514fb860994728f004acc0d763db829d2c2", "byte18": 2, "byte19": 2, "mode": "wal"}
+  CONTROL_SIZE=45056
+  CONTROL_SHA256=859a8cee0862bc23879ffb9307010514fb860994728f004acc0d763db829d2c2
+  CONTROL_BYTE18=2
+  CONTROL_BYTE19=2
+  CONTROL_MODE=wal
+  CONTROL_SIDECAR_WAL_STATE=absent
+  CONTROL_SIDECAR_SHM_STATE=absent
+  CONTROL_SIDECAR_JOURNAL_STATE=absent
+  RO_CONTROL_AFTER_MARK_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/projects-delete/wal-control/home/projects.db --marker g1b-projects-20261022T190128Z-2747439-control
+  RO_CONTROL_AFTER_MARK_EXIT=0
+  RO_CONTROL_AFTER_MARK_MARKER=g1b-projects-20261022T190128Z-2747439-control
+  READONLY_DB=/work/projects-delete/wal-control/home/projects.db
+  READONLY_OPEN_URI=file:/work/projects-delete/wal-control/home/projects.db?mode=ro
+  READONLY_MARKER=g1b-projects-20261022T190128Z-2747439-control
+  READONLY_TABLES=discovered_repos,project_folders,project_meta,projects
+  READONLY_TABLE_COUNT table=discovered_repos count=0
+  READONLY_SQL table=discovered_repos: SELECT COUNT(*) FROM "discovered_repos" WHERE CAST("root" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_folders count=0
+  READONLY_SQL table=project_folders: SELECT COUNT(*) FROM "project_folders" WHERE CAST("project_id" AS TEXT) = ? OR CAST("path" AS TEXT) = ? OR CAST("label" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=project_meta count=0
+  READONLY_SQL table=project_meta: SELECT COUNT(*) FROM "project_meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=projects count=1
+  READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=1
+  READONLY_MATCHED_TABLES=projects
+  RO_CONTROL_AFTER_MARK_PROJECT_COUNT=1
+  RO_CONTROL_AFTER_MARK_TOTAL=1
+  RO_CONTROL_AFTER_MARK_MATCHED_TABLES=projects
+  CONTROL_AFTER_READONLY_EXISTS=yes
+  CONTROL_AFTER_READONLY_PATH=/work/projects-delete/wal-control/home/projects.db
+  CONTROL_AFTER_READONLY_RC=0
+  CONTROL_AFTER_READONLY_JSON={"path": "/work/projects-delete/wal-control/home/projects.db", "size": 45056, "sha256": "859a8cee0862bc23879ffb9307010514fb860994728f004acc0d763db829d2c2", "byte18": 2, "byte19": 2, "mode": "wal"}
+  CONTROL_AFTER_READONLY_SIZE=45056
+  CONTROL_AFTER_READONLY_SHA256=859a8cee0862bc23879ffb9307010514fb860994728f004acc0d763db829d2c2
+  CONTROL_AFTER_READONLY_BYTE18=2
+  CONTROL_AFTER_READONLY_BYTE19=2
+  CONTROL_AFTER_READONLY_MODE=wal
+  == 6. integrity and stock purity ==
+  CONVERTED_SHA256_BEFORE_WRITERS=5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3
+  CONVERTED_SHA256_AFTER_WRITERS=5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3
+  CONVERSION_SOURCE_UNTOUCHED=yes
+  SEED_SHA256_FINAL=fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c
+  SEED_UNCHANGED_AT_END=yes
+  STOCK_AFTER_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_AFTER_REVISION_RC=0
+  STOCK_AFTER_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_AFTER_STATUS_RC=0
+  PROJECTS_DELETE_CONTAINER_EXIT=0
+
+STOCK_PURITY revision=4d04303818b61bf3aa09278af48356315515965b porcelain_empty=yes after_revision=4d04303818b61bf3aa09278af48356315515965b after_porcelain_empty=yes
+
+## Stage 0 — projects path resolution (get_hermes_home()/projects_db_path())
+PROJECTS_RESOLUTION_RULE=projects_db_path() = get_hermes_home()/projects.db; get_hermes_home() = context override -> HERMES_HOME env -> platform default
+PROJECTS_PER_PROFILE_NUANCE=projects.db is PER-PROFILE: a named profile HERMES_HOME=<root>/profiles/<name> resolves its OWN <root>/profiles/<name>/projects.db, never a shared-root store (that shared-root rule belongs to the kanban board store)
+PROJECTS_PATH_OVERRIDE_ENV=none (there is no projects-specific path override; projects_db_path() = get_hermes_home()/projects.db)
+PROJECTS_SLUG_NORMALIZATION=normalize_slug() lowercases the --slug argument; the marker is stored verbatim as projects.name, which is what the read-only check matches
+DEFAULT_PROFILE_HERMES_HOME=/work/projects-delete/seed-wal/home
+DEFAULT_PROFILE_PATH_HERMES_HOME=/work/projects-delete/seed-wal/home
+DEFAULT_PROFILE_PATH_PROJECTS_DB=/work/projects-delete/seed-wal/home/projects.db
+DEFAULT_PROFILE_PATH_DB_PARENT=/work/projects-delete/seed-wal/home
+NAMED_PROFILE_HERMES_HOME=/work/projects-delete/profile-resolution/profiles/named
+NAMED_PROFILE_PATH_HERMES_HOME=/work/projects-delete/profile-resolution/profiles/named
+NAMED_PROFILE_PATH_PROJECTS_DB=/work/projects-delete/profile-resolution/profiles/named/projects.db
+NAMED_PROFILE_PATH_DB_PARENT=/work/projects-delete/profile-resolution/profiles/named
+
+## Stage 1 — seed a real WAL projects.db (real `hermes project create` trigger)
+SEED_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py projects g1b-projects-20261022T190128Z-2747439-seed --home /work/projects-delete/seed-wal/home --scratch /work/scratch
+
+## Stage 2 — cp -a copy of the WAL store
+COPY_CMD=cp -a -- /work/projects-delete/seed-wal/home/projects.db /work/projects-delete/conversion/projects.db
+
+## Stage 3 — offline conversion of the COPY only
+CONVERT_CMD=HERMES_HOME=/work/projects-delete/seed-wal/home /usr/local/bin/hermes sessions set-journal-mode delete --db /work/projects-delete/conversion/projects.db
+
+## Stage 4 — real `hermes project create` TWICE under database.journal_mode: delete
+DELETE_HOME=/work/projects-delete/delete/home
+
+## Stage 5 — WAL control: SAME converted copy under database.journal_mode: wal
+CONTROL_HOME=/work/projects-delete/wal-control/home
+
+## Integrity
+
+## Per-stage table
+stage | path | size | sha256 | header18/19 | mode | sidecars | writer_runs
+seed WAL | /work/projects-delete/seed-wal/home/projects.db | 45056 | fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 1 (seed trigger)
+copy before conversion | /work/projects-delete/conversion/projects.db | 45056 | fc925457ca0e6945ced9b69806ec5eda049798d0358de9bc1a58362d6407693c | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 0
+converted copy | /work/projects-delete/conversion/projects.db | 45056 | 5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 0 (offline conversion)
+delete home before writers | /work/projects-delete/delete/home/projects.db | 45056 | 5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 1 (seed project carried over)
+delete home after run 1 | /work/projects-delete/delete/home/projects.db | 45056 | 35f30141b7a828b51a610cdcf5f0edd420ca52b49937b27a7d5020c3b88c2090 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 2
+delete home after run 2 | /work/projects-delete/delete/home/projects.db | 45056 | 61099d9e8d49d406c6bcebc9653ea323e63533a2e4a62a8b8b266de7139fe5a7 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 3
+wal control before writer | /work/projects-delete/wal-control/home/projects.db | 45056 | 5f4c19f2dd9e2c012b78294cf816f18ddf68a2a3f0909b1bd7107244a28948c3 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 1 (seed project carried over)
+wal control after writer | /work/projects-delete/wal-control/home/projects.db | 45056 | 859a8cee0862bc23879ffb9307010514fb860994728f004acc0d763db829d2c2 | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 2
+
+## Identifiable-record assertion (read-only, after each writer close)
+EVIDENCE_TABLE=projects (confirmed by the read-only marker match AND reported by the stock writer; the identifiable row is projects.name = the marker, with the stored slug being the normalized marker)
+RUN1 record table=projects project_id=p_80e276d1 slug_arg=g1b-projects-20261022T190128Z-2747439-1
+  before run 1: projects count=0 total=0
+  after run 1 close: projects count=1 total=1
+  exact SQL: READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+RUN2 record table=projects project_id=p_556afdd1 slug_arg=g1b-projects-20261022T190128Z-2747439-2
+  before run 2: projects count=0 total=0
+  after run 2 close: projects count=1 total=1
+  exact SQL: READONLY_SQL table=projects: SELECT COUNT(*) FROM "projects" WHERE CAST("id" AS TEXT) = ? OR CAST("slug" AS TEXT) = ? OR CAST("name" AS TEXT) = ? OR CAST("description" AS TEXT) = ? OR CAST("icon" AS TEXT) = ? OR CAST("color" AS TEXT) = ? OR CAST("board_slug" AS TEXT) = ? OR CAST("primary_path" AS TEXT) = ?
+NEVER-WRITTEN marker g1b-projects-20261022T190128Z-2747439-never-written: total=0 (must be 0)
+
+## Verdict
+STORE=projects.db
+STORE_IDENTITY=PER-PROFILE first-class Projects store: projects_db_path() = get_hermes_home()/projects.db (hermes_cli/projects_db.py)
+PATH_RESOLUTION=get_hermes_home() = context override -> HERMES_HOME env -> platform default; the fixture home IS the profile home and there is no projects-specific path override env var; a named profile resolves its OWN per-profile store
+TRIGGER=real /usr/local/bin/hermes project create "<marker>" --slug <marker> (project list commits no record and is NOT the writer; no folder/--primary path needed)
+EVIDENCE_TABLE=projects (identifiable row = projects.name marker; stored slug is the normalized marker; store-assigned id p_... recorded per run)
+VERDICT: projects.db HONOURING
+VERDICT_LINE: Verdict: `projects.db` HONOURING
+WAL_CONTROL: converted copy under database.journal_mode: wal -> header 2,2 (mode wal)
+PERSISTENCE_ASSERTION: run 1 project marker absent->present, run 2 project marker absent->present (separate read-only connections)
+SCOPE: a container run answers "do that image's writers honour configuration"; it does NOT qualify Matchlock's shared-filesystem behaviour across a guest boundary.
+MATCHLOCK_ARTIFACT_RELATIONSHIP=UNVERIFIED
+SCRATCH_ROOT=/tmp/g1b-projects-delete.iIrirJ (kept as evidence)
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+STOCK_HERMES_REVISION=4d04303818b61bf3aa09278af48356315515965b
+
+ASSERT SUMMARY: pass=114 fail=0

@@ -1,0 +1,223 @@
+# G1 US-004 fresh-store journal-mode probe output
+# captured_utc: 2026-10-22T04:40:06Z
+# host: vaimetal
+# command: docs/gate/probes/probe_fresh_modes.sh (G1_KEEP_SCRATCH=1)
+# hermes: /home/kaladin/hermes-agent/venv/bin/hermes (Hermes Agent vgit.d623a66.dirty (2026.9.24) · upstream 8b66a510 · local d623a660 (+131 carried commits))
+# python: Python 3.14.7
+# header reader: docs/gate/probes/read_header.py (raw bytes 18/19; no SQLite connection)
+#
+probe_fresh_modes: scratch_root=/tmp/g1-fresh.bVfXCg
+probe_fresh_modes: hermes_src=/home/kaladin/hermes-agent
+probe_fresh_modes: python=Python 3.14.7
+probe_fresh_modes: hermes=Hermes Agent vgit.d623a66.dirty (2026.9.24) · upstream 8b66a510 · local d623a660 (+131 carried commits)
+probe_fresh_modes: real_home=/home/kaladin/.hermes (never opened by design)
+probe_fresh_modes: header_reader=/home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/read_header.py (raw bytes 18/19 only; no SQLite connection)
+
+### store: state.db config: delete
+hermes_home: /tmp/g1-fresh.bVfXCg/state-delete/home
+config_path: /tmp/g1-fresh.bVfXCg/state-delete/home/config.yaml
+config_realpath: /tmp/g1-fresh.bVfXCg/state-delete/home/config.yaml
+config_contents: database:|  journal_mode: delete|
+ASSERT PASS: state-delete resolves database.journal_mode=delete before the writer
+writer: SessionDB() + create_session()
+writer_exit: 0
+writer_stdout: SessionDB created state.db|
+writer_stderr: 
+header_json: {"path": "/tmp/g1-fresh.bVfXCg/state-delete/home/state.db", "size": 274432, "sha256": "43e51474b83bc0ebe565358da578a60495efd9dc7d4c83740e2f140177553069", "byte18": 1, "byte19": 1, "mode": "delete"}
+store_path: /tmp/g1-fresh.bVfXCg/state-delete/home/state.db
+store_size: 274432
+store_sha256: 43e51474b83bc0ebe565358da578a60495efd9dc7d4c83740e2f140177553069
+byte18: 1
+byte19: 1
+observed_mode: delete
+journal_sidecars:
+  (none)
+related_files (ls -la, store prefix only):
+  -rw-------	    274432	state.db
+  -rw-rw-r--	         0	state.db.fts_rebuild.lock
+  -rw-rw-r--	         0	state.db.quarantine.lock
+
+### store: state.db config: wal
+hermes_home: /tmp/g1-fresh.bVfXCg/state-wal/home
+config_path: /tmp/g1-fresh.bVfXCg/state-wal/home/config.yaml
+config_realpath: /tmp/g1-fresh.bVfXCg/state-wal/home/config.yaml
+config_contents: database:|  journal_mode: wal|
+ASSERT PASS: state-wal resolves database.journal_mode=wal before the writer
+writer: SessionDB() + create_session()
+writer_exit: 0
+writer_stdout: SessionDB created state.db|
+writer_stderr: 
+header_json: {"path": "/tmp/g1-fresh.bVfXCg/state-wal/home/state.db", "size": 274432, "sha256": "492a579abe6cbbae29669fb192264c8448db1ee02b483de3ba522b4037e5bff0", "byte18": 2, "byte19": 2, "mode": "wal"}
+store_path: /tmp/g1-fresh.bVfXCg/state-wal/home/state.db
+store_size: 274432
+store_sha256: 492a579abe6cbbae29669fb192264c8448db1ee02b483de3ba522b4037e5bff0
+byte18: 2
+byte19: 2
+observed_mode: wal
+journal_sidecars:
+  (none)
+related_files (ls -la, store prefix only):
+  -rw-------	    274432	state.db
+  -rw-rw-r--	         0	state.db.fts_rebuild.lock
+  -rw-rw-r--	         0	state.db.quarantine.lock
+
+### store: verification_evidence.db config: delete
+hermes_home: /tmp/g1-fresh.bVfXCg/verification_evidence-delete/home
+config_path: /tmp/g1-fresh.bVfXCg/verification_evidence-delete/home/config.yaml
+config_realpath: /tmp/g1-fresh.bVfXCg/verification_evidence-delete/home/config.yaml
+config_contents: database:|  journal_mode: delete|
+ASSERT PASS: verification_evidence-delete resolves database.journal_mode=delete before the writer
+writer: record_verify_run() with HERMES_VERIFY_ON_STOP=1
+writer_exit: 0
+writer_stdout: record_verify_run id: 1|
+writer_stderr: 
+header_json: {"path": "/tmp/g1-fresh.bVfXCg/verification_evidence-delete/home/verification_evidence.db", "size": 32768, "sha256": "a7a2ea628c41c8d1912d91d3c2278142d80db222c6e90afe4d6590a1e8f3770d", "byte18": 1, "byte19": 1, "mode": "delete"}
+store_path: /tmp/g1-fresh.bVfXCg/verification_evidence-delete/home/verification_evidence.db
+store_size: 32768
+store_sha256: a7a2ea628c41c8d1912d91d3c2278142d80db222c6e90afe4d6590a1e8f3770d
+byte18: 1
+byte19: 1
+observed_mode: delete
+journal_sidecars:
+  (none)
+related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+
+### store: verification_evidence.db config: wal
+hermes_home: /tmp/g1-fresh.bVfXCg/verification_evidence-wal/home
+config_path: /tmp/g1-fresh.bVfXCg/verification_evidence-wal/home/config.yaml
+config_realpath: /tmp/g1-fresh.bVfXCg/verification_evidence-wal/home/config.yaml
+config_contents: database:|  journal_mode: wal|
+ASSERT PASS: verification_evidence-wal resolves database.journal_mode=wal before the writer
+writer: record_verify_run() with HERMES_VERIFY_ON_STOP=1
+writer_exit: 0
+writer_stdout: record_verify_run id: 1|
+writer_stderr: 
+header_json: {"path": "/tmp/g1-fresh.bVfXCg/verification_evidence-wal/home/verification_evidence.db", "size": 32768, "sha256": "f79f95cc0a39760d71d40759d9c41384489271d510bb1f2f4fe5fe3956724969", "byte18": 2, "byte19": 2, "mode": "wal"}
+store_path: /tmp/g1-fresh.bVfXCg/verification_evidence-wal/home/verification_evidence.db
+store_size: 32768
+store_sha256: f79f95cc0a39760d71d40759d9c41384489271d510bb1f2f4fe5fe3956724969
+byte18: 2
+byte19: 2
+observed_mode: wal
+journal_sidecars:
+  (none)
+related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+
+### store: kanban.db config: delete
+hermes_home: /tmp/g1-fresh.bVfXCg/kanban-delete/home
+config_path: /tmp/g1-fresh.bVfXCg/kanban-delete/home/config.yaml
+config_realpath: /tmp/g1-fresh.bVfXCg/kanban-delete/home/config.yaml
+config_contents: database:|  journal_mode: delete|
+ASSERT PASS: kanban-delete resolves database.journal_mode=delete before the writer
+writer: hermes kanban list
+writer_exit: 0
+writer_stdout: (no matching tasks)|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-fresh.bVfXCg/kanban-delete/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes kanban list|
+header_json: {"path": "/tmp/g1-fresh.bVfXCg/kanban-delete/home/kanban.db", "size": 118784, "sha256": "e8ce52281798e509d324262a269c5732a2ab1c5b721b216cf49e2d08ff5d15ae", "byte18": 1, "byte19": 1, "mode": "delete"}
+store_path: /tmp/g1-fresh.bVfXCg/kanban-delete/home/kanban.db
+store_size: 118784
+store_sha256: e8ce52281798e509d324262a269c5732a2ab1c5b721b216cf49e2d08ff5d15ae
+byte18: 1
+byte19: 1
+observed_mode: delete
+journal_sidecars:
+  (none)
+related_files (ls -la, store prefix only):
+  -rw-r--r--	    118784	kanban.db
+  -rw-rw-r--	         0	kanban.db.init.lock
+
+### store: kanban.db config: wal
+hermes_home: /tmp/g1-fresh.bVfXCg/kanban-wal/home
+config_path: /tmp/g1-fresh.bVfXCg/kanban-wal/home/config.yaml
+config_realpath: /tmp/g1-fresh.bVfXCg/kanban-wal/home/config.yaml
+config_contents: database:|  journal_mode: wal|
+ASSERT PASS: kanban-wal resolves database.journal_mode=wal before the writer
+writer: hermes kanban list
+writer_exit: 0
+writer_stdout: (no matching tasks)|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-fresh.bVfXCg/kanban-wal/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes kanban list|
+header_json: {"path": "/tmp/g1-fresh.bVfXCg/kanban-wal/home/kanban.db", "size": 118784, "sha256": "1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52", "byte18": 2, "byte19": 2, "mode": "wal"}
+store_path: /tmp/g1-fresh.bVfXCg/kanban-wal/home/kanban.db
+store_size: 118784
+store_sha256: 1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52
+byte18: 2
+byte19: 2
+observed_mode: wal
+journal_sidecars:
+  (none)
+related_files (ls -la, store prefix only):
+  -rw-r--r--	    118784	kanban.db
+  -rw-rw-r--	         0	kanban.db.init.lock
+
+### store: projects.db config: delete
+hermes_home: /tmp/g1-fresh.bVfXCg/projects-delete/home
+config_path: /tmp/g1-fresh.bVfXCg/projects-delete/home/config.yaml
+config_realpath: /tmp/g1-fresh.bVfXCg/projects-delete/home/config.yaml
+config_contents: database:|  journal_mode: delete|
+ASSERT PASS: projects-delete resolves database.journal_mode=delete before the writer
+writer: hermes project list
+writer_exit: 0
+writer_stdout: No projects yet. Create one with `hermes project create <name>`.|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-fresh.bVfXCg/projects-delete/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes project list|
+header_json: {"path": "/tmp/g1-fresh.bVfXCg/projects-delete/home/projects.db", "size": 45056, "sha256": "be5297cecf6c2ea9b023e494f3e51a460007de9f6c9b9a2446c23e3bd9a02862", "byte18": 1, "byte19": 1, "mode": "delete"}
+store_path: /tmp/g1-fresh.bVfXCg/projects-delete/home/projects.db
+store_size: 45056
+store_sha256: be5297cecf6c2ea9b023e494f3e51a460007de9f6c9b9a2446c23e3bd9a02862
+byte18: 1
+byte19: 1
+observed_mode: delete
+journal_sidecars:
+  (none)
+related_files (ls -la, store prefix only):
+  -rw-r--r--	     45056	projects.db
+
+### store: projects.db config: wal
+hermes_home: /tmp/g1-fresh.bVfXCg/projects-wal/home
+config_path: /tmp/g1-fresh.bVfXCg/projects-wal/home/config.yaml
+config_realpath: /tmp/g1-fresh.bVfXCg/projects-wal/home/config.yaml
+config_contents: database:|  journal_mode: wal|
+ASSERT PASS: projects-wal resolves database.journal_mode=wal before the writer
+writer: hermes project list
+writer_exit: 0
+writer_stdout: No projects yet. Create one with `hermes project create <name>`.|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-fresh.bVfXCg/projects-wal/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes project list|
+header_json: {"path": "/tmp/g1-fresh.bVfXCg/projects-wal/home/projects.db", "size": 45056, "sha256": "e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80", "byte18": 2, "byte19": 2, "mode": "wal"}
+store_path: /tmp/g1-fresh.bVfXCg/projects-wal/home/projects.db
+store_size: 45056
+store_sha256: e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80
+byte18: 2
+byte19: 2
+observed_mode: wal
+journal_sidecars:
+  (none)
+related_files (ls -la, store prefix only):
+  -rw-r--r--	     45056	projects.db
+
+== Per-store fresh-creation verdicts ==
+store                        delete_header  wal_header     verdict
+ASSERT PASS: state.db fresh delete header is 1,1 and wal control is 2,2
+state.db                     1 1            2 2            HONOURING
+ASSERT PASS: verification_evidence.db fresh delete header is 1,1 and wal control is 2,2
+verification_evidence.db     1 1            2 2            HONOURING
+ASSERT PASS: kanban.db fresh delete header is 1,1 and wal control is 2,2
+kanban.db                    1 1            2 2            HONOURING
+ASSERT PASS: projects.db fresh delete header is 1,1 and wal control is 2,2
+projects.db                  1 1            2 2            HONOURING
+
+== Summary table ==
+store                        config_mode   header_bytes  observed_mode fresh_verdict
+state.db                     delete        1 1           delete        HONOURING
+state.db                     wal           2 2           wal           control
+verification_evidence.db     delete        1 1           delete        HONOURING
+verification_evidence.db     wal           2 2           wal           control
+kanban.db                    delete        1 1           delete        HONOURING
+kanban.db                    wal           2 2           wal           control
+projects.db                  delete        1 1           delete        HONOURING
+projects.db                  wal           2 2           wal           control
+
+native_execution: /proc/1/cgroup=0::/init.scope 
+
+RESULT: PASS (every delete home created its store at 1,1; every wal control at 2,2)
+scratch root kept: /tmp/g1-fresh.bVfXCg

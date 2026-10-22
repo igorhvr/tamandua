@@ -1,0 +1,682 @@
+# G1-B US-004 — offline conversion persistence for verification_evidence.db (delete mode)
+# generated (UTC): 2026-10-22T16:05:57Z
+# store identity: verification_evidence.db = OPTIONAL verify-on-stop evidence ledger, created/opened only when the guard is enabled, through open_db() -> apply_wal_with_fallback()
+# store gate: opt-in (agent.verify_on_stop / HERMES_VERIFY_ON_STOP); proven BEFORE the experiment
+
+SCRATCH_ROOT=/tmp/g1b-verification-delete.0lnpqn
+SCRATCH_ROOT_KEPT=yes (G1-B never deletes its fixtures; this is the reproducer on a BLOCKER)
+
+PROBE_RUNID=20261022T160557Z-2309635
+MARKER_SCHEME=g1b-verification-<probe-runid>-{seed,1,2,control,never-written}
+MARKER_SEED=g1b-verification-20261022T160557Z-2309635-seed
+MARKER_1=g1b-verification-20261022T160557Z-2309635-1
+MARKER_2=g1b-verification-20261022T160557Z-2309635-2
+MARKER_CONTROL=g1b-verification-20261022T160557Z-2309635-control
+MARKER_NEVER_WRITTEN=g1b-verification-20261022T160557Z-2309635-never-written
+
+## Docker artifact
+IMAGE_REF=igorhvr/tamandua:latest
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+OS=linux
+REQUIRED_IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+REQUIRED_HERMES_REVISION=4d04303818b61bf3aa09278af48356315515965b
+MATCHLOCK_ARTIFACT_ID=sha256:9140629c9f408a6e9c285434eb6ab0cebd67db146c324db33e2798bac4fb7dff
+MATCHLOCK_ARTIFACT_RELATIONSHIP=UNVERIFIED (no equality claim)
+
+
+## Probe tools (pinned by sha256)
+
+read_header bootstrap: /tmp/g1b-verification-delete.0lnpqn/tools/read_header.py sha256=3e91665695a5b2925d4825e5abc85a0a385e0c9b7dd0b55cc3b85e20784abe01
+READ_HEADER_BOOTSTRAP_RC=0
+TOOL /tmp/g1b-verification-delete.0lnpqn/tools/g1b_writers.py sha256=9a088761b61c1419cd444a2c5b1e86dd7b39336b5ac815aabd3a2376e0539a8a
+TOOL /tmp/g1b-verification-delete.0lnpqn/tools/g1b_readonly.py sha256=e76a9f2595bfbe4b2cb3261866eaba5f0b684f6a677314106cc8fe0db94dffcc
+TOOL /tmp/g1b-verification-delete.0lnpqn/tools/g1b_verify_gate.py sha256=da13744310912799c2e082965498d51ec00d33f988541d8f2ace2c549aa99a93
+TOOL /tmp/g1b-verification-delete.0lnpqn/tools/g1b_verification_delete_container.sh sha256=6ebc1ee201e2ae1efb17853b040ae940ee7875c3077b3471edc78f04cb2829e1
+
+## Container run (single gateway)
+CONTAINER_LOG=/tmp/g1b-verification-delete.0lnpqn/logs/verification-delete.container.log
+
+CONTAINER_RC=0
+
+  CONTAINER_INVOCATION: docker run --rm --network none --platform linux/amd64 --user 1000:1000 -v /tmp/g1b-verification-delete.0lnpqn:/work -w /work -e HOME=/work/home igorhvr/tamandua:latest bash -c <script>
+  STORE_KEY=verification
+  STORE_DB_NAME=verification_evidence.db
+  GATE_OFF_HOME=/work/verification-delete/gate-off/home
+  GATE_ON_HOME=/work/verification-delete/gate-on/home
+  GATE_ENV_HOME=/work/verification-delete/gate-env/home
+  SEED_HOME=/work/verification-delete/seed-wal/home
+  CONVERSION_DB=/work/verification-delete/conversion/verification_evidence.db
+  DELETE_HOME=/work/verification-delete/delete/home
+  CONTROL_HOME=/work/verification-delete/wal-control/home
+  MARKER_SEED=g1b-verification-20261022T160557Z-2309635-seed
+  MARKER_1=g1b-verification-20261022T160557Z-2309635-1
+  MARKER_2=g1b-verification-20261022T160557Z-2309635-2
+  MARKER_CONTROL=g1b-verification-20261022T160557Z-2309635-control
+  MARKER_NEVER_WRITTEN=g1b-verification-20261022T160557Z-2309635-never-written
+  PYTHON_VERSION=Python 3.14.7
+  HERMES_VERSION=Hermes Agent v0.22.4 (2026.9.24) · stable
+  NATIVE_EXECUTION_CGROUP=0::/ 
+  STOCK_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_REVISION_RC=0
+  STOCK_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_STATUS_RC=0
+  == 0. prove the verify-on-stop opt-in gate before the experiment ==
+  CONFIG path=/work/verification-delete/gate-off/home/config.yaml content=database:|  journal_mode: delete|
+  GATE_OFF_RESOLVED_MODE=delete
+  GATE_OFF_RESOLVED_MODE_RC=0
+  GATE_OFF_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_verify_gate.py --home /work/verification-delete/gate-off/home --workspace /work/verification-delete/gate-workspace --marker g1b-verification-20261022T160557Z-2309635-seed-gate-off --expect disabled
+  GATE_OFF_EXIT=0
+  GATE_HERMES_HOME=/work/verification-delete/gate-off/home
+  GATE_DB_PATH=/work/verification-delete/gate-off/home/verification_evidence.db
+  GATE_ENV_HERMES_VERIFY_ON_STOP=(unset)
+  GATE_EXPECT=disabled
+  GATE_MARKER=g1b-verification-20261022T160557Z-2309635-seed-gate-off
+  GATE_ENABLED=no
+  GATE_ENABLED_MATCHES_EXPECT=yes
+  GATE_DB_EXISTS_BEFORE=no
+  GATE_RECORD_IS_NONE=yes
+  GATE_RECORD_ID=(none)
+  GATE_RECORD_SESSION_ID=(none)
+  GATE_DB_EXISTS_AFTER=no
+  GATE_EVIDENCE_TABLES=(absent)
+  GATE_EVIDENCE_TABLE=(none)
+  GATE_MARKER_MATCHED_TABLES=(none)
+  GATE_EXIT=0
+  GATE_OFF_ENABLED=no
+  GATE_OFF_ENABLED_MATCHES_EXPECT=yes
+  GATE_OFF_RECORD_IS_NONE=yes
+  GATE_OFF_RECORD_ID=(none)
+  GATE_OFF_DB_EXISTS_BEFORE=no
+  GATE_OFF_DB_EXISTS_AFTER=no
+  GATE_OFF_EVIDENCE_TABLES=(absent)
+  GATE_OFF_EVIDENCE_TABLE=(none)
+  GATE_OFF_MARKER_MATCHED_TABLES=(none)
+  CONFIG path=/work/verification-delete/gate-on/home/config.yaml content=database:|  journal_mode: delete|agent:|  verify_on_stop: true|
+  GATE_ON_RESOLVED_MODE=delete
+  GATE_ON_RESOLVED_MODE_RC=0
+  GATE_CONFIG_ON_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_verify_gate.py --home /work/verification-delete/gate-on/home --workspace /work/verification-delete/gate-workspace --marker g1b-verification-20261022T160557Z-2309635-seed-gate-on --expect enabled
+  GATE_CONFIG_ON_EXIT=0
+  GATE_HERMES_HOME=/work/verification-delete/gate-on/home
+  GATE_DB_PATH=/work/verification-delete/gate-on/home/verification_evidence.db
+  GATE_ENV_HERMES_VERIFY_ON_STOP=(unset)
+  GATE_EXPECT=enabled
+  GATE_MARKER=g1b-verification-20261022T160557Z-2309635-seed-gate-on
+  GATE_ENABLED=yes
+  GATE_ENABLED_MATCHES_EXPECT=yes
+  GATE_DB_EXISTS_BEFORE=no
+  GATE_RECORD_IS_NONE=no
+  GATE_RECORD_ID=1
+  GATE_RECORD_SESSION_ID=g1b-verification-20261022T160557Z-2309635-seed-gate-on
+  GATE_DB_EXISTS_AFTER=yes
+  GATE_EVIDENCE_TABLES=meta,verification_events,verification_state
+  GATE_EVIDENCE_TABLE=verification_events
+  GATE_MARKER_MATCHED_TABLES=verification_events,verification_state
+  GATE_EXIT=0
+  GATE_CONFIG_ON_ENABLED=yes
+  GATE_CONFIG_ON_ENABLED_MATCHES_EXPECT=yes
+  GATE_CONFIG_ON_RECORD_IS_NONE=no
+  GATE_CONFIG_ON_RECORD_ID=1
+  GATE_CONFIG_ON_DB_EXISTS_BEFORE=no
+  GATE_CONFIG_ON_DB_EXISTS_AFTER=yes
+  GATE_CONFIG_ON_EVIDENCE_TABLES=meta,verification_events,verification_state
+  GATE_CONFIG_ON_EVIDENCE_TABLE=verification_events
+  GATE_CONFIG_ON_MARKER_MATCHED_TABLES=verification_events,verification_state
+  CONFIG path=/work/verification-delete/gate-env/home/config.yaml content=database:|  journal_mode: delete|
+  GATE_ENV_RESOLVED_MODE=delete
+  GATE_ENV_RESOLVED_MODE_RC=0
+  GATE_ENV_FORM_CMD=HERMES_VERIFY_ON_STOP=1 /opt/src/hermes-venv/bin/python /work/tools/g1b_verify_gate.py --home /work/verification-delete/gate-env/home --workspace /work/verification-delete/gate-workspace --marker g1b-verification-20261022T160557Z-2309635-seed-gate-env --expect enabled
+  GATE_ENV_FORM_EXIT=0
+  GATE_HERMES_HOME=/work/verification-delete/gate-env/home
+  GATE_DB_PATH=/work/verification-delete/gate-env/home/verification_evidence.db
+  GATE_ENV_HERMES_VERIFY_ON_STOP=1
+  GATE_EXPECT=enabled
+  GATE_MARKER=g1b-verification-20261022T160557Z-2309635-seed-gate-env
+  GATE_ENABLED=yes
+  GATE_ENABLED_MATCHES_EXPECT=yes
+  GATE_DB_EXISTS_BEFORE=no
+  GATE_RECORD_IS_NONE=no
+  GATE_RECORD_ID=1
+  GATE_RECORD_SESSION_ID=g1b-verification-20261022T160557Z-2309635-seed-gate-env
+  GATE_DB_EXISTS_AFTER=yes
+  GATE_EVIDENCE_TABLES=meta,verification_events,verification_state
+  GATE_EVIDENCE_TABLE=verification_events
+  GATE_MARKER_MATCHED_TABLES=verification_events,verification_state
+  GATE_EXIT=0
+  GATE_ENV_FORM_ENABLED=yes
+  GATE_ENV_FORM_ENABLED_MATCHES_EXPECT=yes
+  GATE_ENV_FORM_RECORD_IS_NONE=no
+  GATE_ENV_FORM_RECORD_ID=1
+  GATE_ENV_FORM_DB_EXISTS_BEFORE=no
+  GATE_ENV_FORM_DB_EXISTS_AFTER=yes
+  GATE_ENV_FORM_EVIDENCE_TABLES=meta,verification_events,verification_state
+  GATE_ENV_FORM_EVIDENCE_TABLE=verification_events
+  GATE_ENV_FORM_MARKER_MATCHED_TABLES=verification_events,verification_state
+  GATE_ON_DB_EXISTS=yes
+  GATE_ON_DB_PATH=/work/verification-delete/gate-on/home/verification_evidence.db
+  GATE_ON_DB_RC=0
+  GATE_ON_DB_JSON={"path": "/work/verification-delete/gate-on/home/verification_evidence.db", "size": 32768, "sha256": "4b101ad095405f706686f0907631a33eff889d6fbfa2d9370b4ead2891f93ee8", "byte18": 1, "byte19": 1, "mode": "delete"}
+  GATE_ON_DB_SIZE=32768
+  GATE_ON_DB_SHA256=4b101ad095405f706686f0907631a33eff889d6fbfa2d9370b4ead2891f93ee8
+  GATE_ON_DB_BYTE18=1
+  GATE_ON_DB_BYTE19=1
+  GATE_ON_DB_MODE=delete
+  GATE_ON_DB_SIDECAR_WAL_STATE=absent
+  GATE_ON_DB_SIDECAR_SHM_STATE=absent
+  GATE_ON_DB_SIDECAR_JOURNAL_STATE=absent
+  GATE_ENV_DB_EXISTS=yes
+  GATE_ENV_DB_PATH=/work/verification-delete/gate-env/home/verification_evidence.db
+  GATE_ENV_DB_RC=0
+  GATE_ENV_DB_JSON={"path": "/work/verification-delete/gate-env/home/verification_evidence.db", "size": 32768, "sha256": "684dc3164c9197809ebca33032597f83785940d3c9b745c6fbd59b6e125a30dc", "byte18": 1, "byte19": 1, "mode": "delete"}
+  GATE_ENV_DB_SIZE=32768
+  GATE_ENV_DB_SHA256=684dc3164c9197809ebca33032597f83785940d3c9b745c6fbd59b6e125a30dc
+  GATE_ENV_DB_BYTE18=1
+  GATE_ENV_DB_BYTE19=1
+  GATE_ENV_DB_MODE=delete
+  GATE_ENV_DB_SIDECAR_WAL_STATE=absent
+  GATE_ENV_DB_SIDECAR_SHM_STATE=absent
+  GATE_ENV_DB_SIDECAR_JOURNAL_STATE=absent
+  EVIDENCE_TABLE=verification_events
+  == 1. seed a real verification_evidence.db under database.journal_mode: wal ==
+  CONFIG path=/work/verification-delete/seed-wal/home/config.yaml content=database:|  journal_mode: wal|agent:|  verify_on_stop: true|
+  SEED_RESOLVED_MODE=wal
+  SEED_RESOLVED_MODE_RC=0
+  SEED_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py verification g1b-verification-20261022T160557Z-2309635-seed --home /work/verification-delete/seed-wal/home --scratch /work/scratch
+  SEED_EXIT=0
+  WRITER_VERIFY_ON_STOP=1
+  WRITER_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  WRITER_STORE=verification_evidence.db
+  WRITER_MARKER=g1b-verification-20261022T160557Z-2309635-seed
+  WRITER_HOME=/work/verification-delete/seed-wal/home
+  WRITER_RECORD_TABLE=verification_events
+  WRITER_RECORD_COLUMN=session_id
+  WRITER_RECORD_ID=1
+  WRITER_EXIT=0
+  SEED_RECORD_TABLE=verification_events
+  SEED_RECORD_COLUMN=session_id
+  SEED_RECORD_ID=1
+  SEED_VERIFY_ON_STOP=1
+  SEED_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  SEED_EXISTS=yes
+  SEED_PATH=/work/verification-delete/seed-wal/home/verification_evidence.db
+  SEED_RC=0
+  SEED_JSON={"path": "/work/verification-delete/seed-wal/home/verification_evidence.db", "size": 32768, "sha256": "8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a", "byte18": 2, "byte19": 2, "mode": "wal"}
+  SEED_SIZE=32768
+  SEED_SHA256=8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a
+  SEED_BYTE18=2
+  SEED_BYTE19=2
+  SEED_MODE=wal
+  SEED_SIDECAR_WAL_STATE=absent
+  SEED_SIDECAR_SHM_STATE=absent
+  SEED_SIDECAR_JOURNAL_STATE=absent
+  SEED_SHA256_HOST=8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a
+  == 2. cp -a the WAL store aside and prove byte identity ==
+  COPY_CMD=cp -a -- /work/verification-delete/seed-wal/home/verification_evidence.db /work/verification-delete/conversion/verification_evidence.db
+  COPY_RC=0
+  COPY_SHA256=8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a
+  SEED_SHA256_AT_COPY=8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a
+  COPY_CMP_RC=0
+  COPY_BEFORE_EXISTS=yes
+  COPY_BEFORE_PATH=/work/verification-delete/conversion/verification_evidence.db
+  COPY_BEFORE_RC=0
+  COPY_BEFORE_JSON={"path": "/work/verification-delete/conversion/verification_evidence.db", "size": 32768, "sha256": "8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a", "byte18": 2, "byte19": 2, "mode": "wal"}
+  COPY_BEFORE_SIZE=32768
+  COPY_BEFORE_SHA256=8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a
+  COPY_BEFORE_BYTE18=2
+  COPY_BEFORE_BYTE19=2
+  COPY_BEFORE_MODE=wal
+  COPY_BEFORE_SIDECAR_WAL_STATE=absent
+  COPY_BEFORE_SIDECAR_SHM_STATE=absent
+  COPY_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  COPY_BYTE_IDENTICAL=yes
+  == 3. convert ONLY the copy offline with `hermes sessions set-journal-mode delete` ==
+  CONVERT_CMD=HERMES_HOME=/work/verification-delete/seed-wal/home /usr/local/bin/hermes sessions set-journal-mode delete --db /work/verification-delete/conversion/verification_evidence.db
+  CONVERT_EXIT=0
+  CONVERT_STDOUT=✓ /work/verification-delete/conversion/verification_evidence.db: journal_mode wal → delete (header verified).|  Note: config.yaml has database.journal_mode: wal — the next open would switch the file back. Set `database.journal_mode: delete` in config.yaml to keep it.|
+  CONVERT_STDERR=
+  CONVERTED_EXISTS=yes
+  CONVERTED_PATH=/work/verification-delete/conversion/verification_evidence.db
+  CONVERTED_RC=0
+  CONVERTED_JSON={"path": "/work/verification-delete/conversion/verification_evidence.db", "size": 32768, "sha256": "92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205", "byte18": 1, "byte19": 1, "mode": "delete"}
+  CONVERTED_SIZE=32768
+  CONVERTED_SHA256=92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205
+  CONVERTED_BYTE18=1
+  CONVERTED_BYTE19=1
+  CONVERTED_MODE=delete
+  CONVERTED_SIDECAR_WAL_STATE=absent
+  CONVERTED_SIDECAR_SHM_STATE=absent
+  CONVERTED_SIDECAR_JOURNAL_STATE=absent
+  CONVERTED_SHA256=92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205
+  SEED_SHA256_AFTER_CONVERT=8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a
+  SEED_UNCHANGED_BY_CONVERSION=yes
+  CONVERSION_CHANGED_COPY=yes
+  == 4. real writer TWICE under database.journal_mode: delete (gate on) ==
+  CONFIG path=/work/verification-delete/delete/home/config.yaml content=database:|  journal_mode: delete|agent:|  verify_on_stop: true|
+  PLACE_CMD=cp -a -- /work/verification-delete/conversion/verification_evidence.db /work/verification-delete/delete/home/verification_evidence.db
+  PLACE_RC=0
+  DELETE_RESOLVED_MODE=delete
+  DELETE_RESOLVED_MODE_RC=0
+  DELETE_BEFORE_EXISTS=yes
+  DELETE_BEFORE_PATH=/work/verification-delete/delete/home/verification_evidence.db
+  DELETE_BEFORE_RC=0
+  DELETE_BEFORE_JSON={"path": "/work/verification-delete/delete/home/verification_evidence.db", "size": 32768, "sha256": "92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205", "byte18": 1, "byte19": 1, "mode": "delete"}
+  DELETE_BEFORE_SIZE=32768
+  DELETE_BEFORE_SHA256=92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205
+  DELETE_BEFORE_BYTE18=1
+  DELETE_BEFORE_BYTE19=1
+  DELETE_BEFORE_MODE=delete
+  DELETE_BEFORE_SIDECAR_WAL_STATE=absent
+  DELETE_BEFORE_SIDECAR_SHM_STATE=absent
+  DELETE_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  RO_DELETE_PRE_SEED_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-seed
+  RO_DELETE_PRE_SEED_EXIT=0
+  RO_DELETE_PRE_SEED_MARKER=g1b-verification-20261022T160557Z-2309635-seed
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-seed
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=1
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=1
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=2
+  READONLY_MATCHED_TABLES=verification_events,verification_state
+  RO_DELETE_PRE_SEED_EVENTS_COUNT=1
+  RO_DELETE_PRE_SEED_TOTAL=2
+  RO_RUN1_BEFORE_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-1
+  RO_RUN1_BEFORE_MARK1_EXIT=0
+  RO_RUN1_BEFORE_MARK1_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=0
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=0
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_BEFORE_MARK1_EVENTS_COUNT=0
+  RO_RUN1_BEFORE_MARK1_TOTAL=0
+  RO_RUN1_BEFORE_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-2
+  RO_RUN1_BEFORE_MARK2_EXIT=0
+  RO_RUN1_BEFORE_MARK2_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=0
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=0
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_BEFORE_MARK2_EVENTS_COUNT=0
+  RO_RUN1_BEFORE_MARK2_TOTAL=0
+  RUN1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py verification g1b-verification-20261022T160557Z-2309635-1 --home /work/verification-delete/delete/home --scratch /work/scratch
+  RUN1_EXIT=0
+  WRITER_VERIFY_ON_STOP=1
+  WRITER_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  WRITER_STORE=verification_evidence.db
+  WRITER_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  WRITER_HOME=/work/verification-delete/delete/home
+  WRITER_RECORD_TABLE=verification_events
+  WRITER_RECORD_COLUMN=session_id
+  WRITER_RECORD_ID=2
+  WRITER_EXIT=0
+  RUN1_RECORD_TABLE=verification_events
+  RUN1_RECORD_COLUMN=session_id
+  RUN1_RECORD_ID=2
+  RUN1_VERIFY_ON_STOP=1
+  RUN1_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  RUN1_EXISTS=yes
+  RUN1_PATH=/work/verification-delete/delete/home/verification_evidence.db
+  RUN1_RC=0
+  RUN1_JSON={"path": "/work/verification-delete/delete/home/verification_evidence.db", "size": 32768, "sha256": "f8f9b6e04e16708a680f4708c094fed64aa5784a6accd34cf573557a243c98d9", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN1_SIZE=32768
+  RUN1_SHA256=f8f9b6e04e16708a680f4708c094fed64aa5784a6accd34cf573557a243c98d9
+  RUN1_BYTE18=1
+  RUN1_BYTE19=1
+  RUN1_MODE=delete
+  RUN1_SIDECAR_WAL_STATE=absent
+  RUN1_SIDECAR_SHM_STATE=absent
+  RUN1_SIDECAR_JOURNAL_STATE=absent
+  RO_RUN1_AFTER_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-1
+  RO_RUN1_AFTER_MARK1_EXIT=0
+  RO_RUN1_AFTER_MARK1_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=1
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=1
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=2
+  READONLY_MATCHED_TABLES=verification_events,verification_state
+  RO_RUN1_AFTER_MARK1_EVENTS_COUNT=1
+  RO_RUN1_AFTER_MARK1_TOTAL=2
+  RO_RUN1_AFTER_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-2
+  RO_RUN1_AFTER_MARK2_EXIT=0
+  RO_RUN1_AFTER_MARK2_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=0
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=0
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN1_AFTER_MARK2_EVENTS_COUNT=0
+  RO_RUN1_AFTER_MARK2_TOTAL=0
+  RUN1_AFTER_READONLY_EXISTS=yes
+  RUN1_AFTER_READONLY_PATH=/work/verification-delete/delete/home/verification_evidence.db
+  RUN1_AFTER_READONLY_RC=0
+  RUN1_AFTER_READONLY_JSON={"path": "/work/verification-delete/delete/home/verification_evidence.db", "size": 32768, "sha256": "f8f9b6e04e16708a680f4708c094fed64aa5784a6accd34cf573557a243c98d9", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN1_AFTER_READONLY_SIZE=32768
+  RUN1_AFTER_READONLY_SHA256=f8f9b6e04e16708a680f4708c094fed64aa5784a6accd34cf573557a243c98d9
+  RUN1_AFTER_READONLY_BYTE18=1
+  RUN1_AFTER_READONLY_BYTE19=1
+  RUN1_AFTER_READONLY_MODE=delete
+  RO_RUN2_BEFORE_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-1
+  RO_RUN2_BEFORE_MARK1_EXIT=0
+  RO_RUN2_BEFORE_MARK1_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=1
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=1
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=2
+  READONLY_MATCHED_TABLES=verification_events,verification_state
+  RO_RUN2_BEFORE_MARK1_EVENTS_COUNT=1
+  RO_RUN2_BEFORE_MARK1_TOTAL=2
+  RO_RUN2_BEFORE_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-2
+  RO_RUN2_BEFORE_MARK2_EXIT=0
+  RO_RUN2_BEFORE_MARK2_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=0
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=0
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_RUN2_BEFORE_MARK2_EVENTS_COUNT=0
+  RO_RUN2_BEFORE_MARK2_TOTAL=0
+  RUN2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py verification g1b-verification-20261022T160557Z-2309635-2 --home /work/verification-delete/delete/home --scratch /work/scratch
+  RUN2_EXIT=0
+  WRITER_VERIFY_ON_STOP=1
+  WRITER_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  WRITER_STORE=verification_evidence.db
+  WRITER_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  WRITER_HOME=/work/verification-delete/delete/home
+  WRITER_RECORD_TABLE=verification_events
+  WRITER_RECORD_COLUMN=session_id
+  WRITER_RECORD_ID=3
+  WRITER_EXIT=0
+  RUN2_RECORD_TABLE=verification_events
+  RUN2_RECORD_COLUMN=session_id
+  RUN2_RECORD_ID=3
+  RUN2_VERIFY_ON_STOP=1
+  RUN2_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  RUN2_EXISTS=yes
+  RUN2_PATH=/work/verification-delete/delete/home/verification_evidence.db
+  RUN2_RC=0
+  RUN2_JSON={"path": "/work/verification-delete/delete/home/verification_evidence.db", "size": 32768, "sha256": "2678fa7e2a5db30ea007c61de8c41146ff587efcd7f862f6dfeebb5a75bc0703", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN2_SIZE=32768
+  RUN2_SHA256=2678fa7e2a5db30ea007c61de8c41146ff587efcd7f862f6dfeebb5a75bc0703
+  RUN2_BYTE18=1
+  RUN2_BYTE19=1
+  RUN2_MODE=delete
+  RUN2_SIDECAR_WAL_STATE=absent
+  RUN2_SIDECAR_SHM_STATE=absent
+  RUN2_SIDECAR_JOURNAL_STATE=absent
+  RO_RUN2_AFTER_MARK1_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-1
+  RO_RUN2_AFTER_MARK1_EXIT=0
+  RO_RUN2_AFTER_MARK1_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-1
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=1
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=1
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=2
+  READONLY_MATCHED_TABLES=verification_events,verification_state
+  RO_RUN2_AFTER_MARK1_EVENTS_COUNT=1
+  RO_RUN2_AFTER_MARK1_TOTAL=2
+  RO_RUN2_AFTER_MARK2_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-2
+  RO_RUN2_AFTER_MARK2_EXIT=0
+  RO_RUN2_AFTER_MARK2_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-2
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=1
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=1
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=2
+  READONLY_MATCHED_TABLES=verification_events,verification_state
+  RO_RUN2_AFTER_MARK2_EVENTS_COUNT=1
+  RO_RUN2_AFTER_MARK2_TOTAL=2
+  RUN2_AFTER_READONLY_EXISTS=yes
+  RUN2_AFTER_READONLY_PATH=/work/verification-delete/delete/home/verification_evidence.db
+  RUN2_AFTER_READONLY_RC=0
+  RUN2_AFTER_READONLY_JSON={"path": "/work/verification-delete/delete/home/verification_evidence.db", "size": 32768, "sha256": "2678fa7e2a5db30ea007c61de8c41146ff587efcd7f862f6dfeebb5a75bc0703", "byte18": 1, "byte19": 1, "mode": "delete"}
+  RUN2_AFTER_READONLY_SIZE=32768
+  RUN2_AFTER_READONLY_SHA256=2678fa7e2a5db30ea007c61de8c41146ff587efcd7f862f6dfeebb5a75bc0703
+  RUN2_AFTER_READONLY_BYTE18=1
+  RUN2_AFTER_READONLY_BYTE19=1
+  RUN2_AFTER_READONLY_MODE=delete
+  RO_NEVER_WRITTEN_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/delete/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-never-written
+  RO_NEVER_WRITTEN_EXIT=0
+  RO_NEVER_WRITTEN_MARKER=g1b-verification-20261022T160557Z-2309635-never-written
+  READONLY_DB=/work/verification-delete/delete/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/delete/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-never-written
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=0
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=0
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_NEVER_WRITTEN_EVENTS_COUNT=0
+  RO_NEVER_WRITTEN_TOTAL=0
+  == 5. WAL control: SAME converted copy under database.journal_mode: wal ==
+  CONFIG path=/work/verification-delete/wal-control/home/config.yaml content=database:|  journal_mode: wal|agent:|  verify_on_stop: true|
+  CONTROL_PLACE_CMD=cp -a -- /work/verification-delete/conversion/verification_evidence.db /work/verification-delete/wal-control/home/verification_evidence.db
+  CONTROL_PLACE_RC=0
+  CONTROL_RESOLVED_MODE=wal
+  CONTROL_RESOLVED_MODE_RC=0
+  CONTROL_BEFORE_EXISTS=yes
+  CONTROL_BEFORE_PATH=/work/verification-delete/wal-control/home/verification_evidence.db
+  CONTROL_BEFORE_RC=0
+  CONTROL_BEFORE_JSON={"path": "/work/verification-delete/wal-control/home/verification_evidence.db", "size": 32768, "sha256": "92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205", "byte18": 1, "byte19": 1, "mode": "delete"}
+  CONTROL_BEFORE_SIZE=32768
+  CONTROL_BEFORE_SHA256=92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205
+  CONTROL_BEFORE_BYTE18=1
+  CONTROL_BEFORE_BYTE19=1
+  CONTROL_BEFORE_MODE=delete
+  CONTROL_BEFORE_SIDECAR_WAL_STATE=absent
+  CONTROL_BEFORE_SIDECAR_SHM_STATE=absent
+  CONTROL_BEFORE_SIDECAR_JOURNAL_STATE=absent
+  RO_CONTROL_BEFORE_MARK_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/wal-control/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-control
+  RO_CONTROL_BEFORE_MARK_EXIT=0
+  RO_CONTROL_BEFORE_MARK_MARKER=g1b-verification-20261022T160557Z-2309635-control
+  READONLY_DB=/work/verification-delete/wal-control/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/wal-control/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-control
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=0
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=0
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=0
+  READONLY_MATCHED_TABLES=(none)
+  RO_CONTROL_BEFORE_MARK_EVENTS_COUNT=0
+  RO_CONTROL_BEFORE_MARK_TOTAL=0
+  CONTROL_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_writers.py verification g1b-verification-20261022T160557Z-2309635-control --home /work/verification-delete/wal-control/home --scratch /work/scratch
+  CONTROL_EXIT=0
+  verification_evidence.db: on-disk journal_mode was delete and has been switched to WAL. This rewrites the database header and persists after this process exits. If delete was a deliberate choice (for example the mitigation for the SQLite WAL-reset bug, or a WAL-unsafe filesystem), setting it with PRAGMA on the file will not survive -- every open re-applies the configured mode. Set `database.journal_mode: delete` in config.yaml to make it stick. This message fires once per process per database.
+  WRITER_VERIFY_ON_STOP=1
+  WRITER_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  WRITER_STORE=verification_evidence.db
+  WRITER_MARKER=g1b-verification-20261022T160557Z-2309635-control
+  WRITER_HOME=/work/verification-delete/wal-control/home
+  WRITER_RECORD_TABLE=verification_events
+  WRITER_RECORD_COLUMN=session_id
+  WRITER_RECORD_ID=2
+  WRITER_EXIT=0
+  CONTROL_RECORD_TABLE=verification_events
+  CONTROL_RECORD_COLUMN=session_id
+  CONTROL_RECORD_ID=2
+  CONTROL_VERIFY_ON_STOP=1
+  CONTROL_VERIFY_WORKSPACE=/work/scratch/verification-workspace
+  CONTROL_EXISTS=yes
+  CONTROL_PATH=/work/verification-delete/wal-control/home/verification_evidence.db
+  CONTROL_RC=0
+  CONTROL_JSON={"path": "/work/verification-delete/wal-control/home/verification_evidence.db", "size": 32768, "sha256": "266cc69417b9e6771d817ec1fc8ed5bd2cc2b88e55a86f7e525e0457a04988f9", "byte18": 2, "byte19": 2, "mode": "wal"}
+  CONTROL_SIZE=32768
+  CONTROL_SHA256=266cc69417b9e6771d817ec1fc8ed5bd2cc2b88e55a86f7e525e0457a04988f9
+  CONTROL_BYTE18=2
+  CONTROL_BYTE19=2
+  CONTROL_MODE=wal
+  CONTROL_SIDECAR_WAL_STATE=absent
+  CONTROL_SIDECAR_SHM_STATE=absent
+  CONTROL_SIDECAR_JOURNAL_STATE=absent
+  RO_CONTROL_AFTER_MARK_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_readonly.py --db /work/verification-delete/wal-control/home/verification_evidence.db --marker g1b-verification-20261022T160557Z-2309635-control
+  RO_CONTROL_AFTER_MARK_EXIT=0
+  RO_CONTROL_AFTER_MARK_MARKER=g1b-verification-20261022T160557Z-2309635-control
+  READONLY_DB=/work/verification-delete/wal-control/home/verification_evidence.db
+  READONLY_OPEN_URI=file:/work/verification-delete/wal-control/home/verification_evidence.db?mode=ro
+  READONLY_MARKER=g1b-verification-20261022T160557Z-2309635-control
+  READONLY_TABLES=meta,verification_events,verification_state
+  READONLY_TABLE_COUNT table=meta count=0
+  READONLY_SQL table=meta: SELECT COUNT(*) FROM "meta" WHERE CAST("key" AS TEXT) = ? OR CAST("value" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_events count=1
+  READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+  READONLY_TABLE_COUNT table=verification_state count=1
+  READONLY_SQL table=verification_state: SELECT COUNT(*) FROM "verification_state" WHERE CAST("session_id" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("last_edit_at" AS TEXT) = ? OR CAST("changed_paths_json" AS TEXT) = ?
+  READONLY_MATCH_COUNT_TOTAL=2
+  READONLY_MATCHED_TABLES=verification_events,verification_state
+  RO_CONTROL_AFTER_MARK_EVENTS_COUNT=1
+  RO_CONTROL_AFTER_MARK_TOTAL=2
+  CONTROL_AFTER_READONLY_EXISTS=yes
+  CONTROL_AFTER_READONLY_PATH=/work/verification-delete/wal-control/home/verification_evidence.db
+  CONTROL_AFTER_READONLY_RC=0
+  CONTROL_AFTER_READONLY_JSON={"path": "/work/verification-delete/wal-control/home/verification_evidence.db", "size": 32768, "sha256": "266cc69417b9e6771d817ec1fc8ed5bd2cc2b88e55a86f7e525e0457a04988f9", "byte18": 2, "byte19": 2, "mode": "wal"}
+  CONTROL_AFTER_READONLY_SIZE=32768
+  CONTROL_AFTER_READONLY_SHA256=266cc69417b9e6771d817ec1fc8ed5bd2cc2b88e55a86f7e525e0457a04988f9
+  CONTROL_AFTER_READONLY_BYTE18=2
+  CONTROL_AFTER_READONLY_BYTE19=2
+  CONTROL_AFTER_READONLY_MODE=wal
+  == 6. integrity and stock purity ==
+  CONVERTED_SHA256_BEFORE_WRITERS=92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205
+  CONVERTED_SHA256_AFTER_WRITERS=92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205
+  CONVERSION_SOURCE_UNTOUCHED=yes
+  SEED_SHA256_FINAL=8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a
+  SEED_UNCHANGED_AT_END=yes
+  STOCK_AFTER_REVISION=4d04303818b61bf3aa09278af48356315515965b
+  STOCK_AFTER_REVISION_RC=0
+  STOCK_AFTER_STATUS_PORCELAIN_EMPTY=yes
+  STOCK_AFTER_STATUS_RC=0
+  VERIFICATION_DELETE_CONTAINER_EXIT=0
+
+STOCK_PURITY revision=4d04303818b61bf3aa09278af48356315515965b porcelain_empty=yes after_revision=4d04303818b61bf3aa09278af48356315515965b after_porcelain_empty=yes
+
+## Stage 0 — opt-in gate proof (a default session never touches this store)
+GATE_OFF_HOME=/work/verification-delete/gate-off/home
+GATE_ON_HOME=/work/verification-delete/gate-on/home
+GATE_ENV_HOME=/work/verification-delete/gate-env/home
+GATE_OFF_CMD=/opt/src/hermes-venv/bin/python /work/tools/g1b_verify_gate.py --home /work/verification-delete/gate-off/home --workspace /work/verification-delete/gate-workspace --marker g1b-verification-20261022T160557Z-2309635-seed-gate-off --expect disabled
+GATE_ENV_FORM_CMD=HERMES_VERIFY_ON_STOP=1 /opt/src/hermes-venv/bin/python /work/tools/g1b_verify_gate.py --home /work/verification-delete/gate-env/home --workspace /work/verification-delete/gate-workspace --marker g1b-verification-20261022T160557Z-2309635-seed-gate-env --expect enabled
+EVIDENCE_TABLE=verification_events
+
+## Stage 1 — seed a real WAL verification_evidence.db (gate ON)
+
+## Stage 2 — cp -a copy of the WAL store
+COPY_CMD=cp -a -- /work/verification-delete/seed-wal/home/verification_evidence.db /work/verification-delete/conversion/verification_evidence.db
+
+## Stage 3 — offline conversion of the COPY only
+CONVERT_CMD=HERMES_HOME=/work/verification-delete/seed-wal/home /usr/local/bin/hermes sessions set-journal-mode delete --db /work/verification-delete/conversion/verification_evidence.db
+
+## Stage 4 — real writer TWICE under database.journal_mode: delete (gate ON)
+DELETE_HOME=/work/verification-delete/delete/home
+
+## Stage 5 — WAL control: SAME converted copy under database.journal_mode: wal
+CONTROL_HOME=/work/verification-delete/wal-control/home
+
+## Integrity
+
+## Per-stage table
+stage | path | size | sha256 | header18/19 | mode | sidecars | writer_runs
+seed WAL | /work/verification-delete/seed-wal/home/verification_evidence.db | 32768 | 8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 1 (seed writer)
+copy before conversion | /work/verification-delete/conversion/verification_evidence.db | 32768 | 8b5372250c60a6af0ef1873036eb09007b99336c905bfa8f8ffd2febaae0b24a | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 0
+converted copy | /work/verification-delete/conversion/verification_evidence.db | 32768 | 92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 0 (offline conversion)
+delete home before writers | /work/verification-delete/delete/home/verification_evidence.db | 32768 | 92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 1 (seed row carried over)
+delete home after run 1 | /work/verification-delete/delete/home/verification_evidence.db | 32768 | f8f9b6e04e16708a680f4708c094fed64aa5784a6accd34cf573557a243c98d9 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 2
+delete home after run 2 | /work/verification-delete/delete/home/verification_evidence.db | 32768 | 2678fa7e2a5db30ea007c61de8c41146ff587efcd7f862f6dfeebb5a75bc0703 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 3
+wal control before writer | /work/verification-delete/wal-control/home/verification_evidence.db | 32768 | 92e2d727f8de49087095be08a0d6e6fd4cba65968140289aaa28b59a89cbe205 | 1,1 | delete | -wal=absent,-shm=absent,-journal=absent | 1 (seed row carried over)
+wal control after writer | /work/verification-delete/wal-control/home/verification_evidence.db | 32768 | 266cc69417b9e6771d817ec1fc8ed5bd2cc2b88e55a86f7e525e0457a04988f9 | 2,2 | wal | -wal=absent,-shm=absent,-journal=absent | 2
+
+## Identifiable-record assertion (read-only, after each writer close)
+EVIDENCE_TABLE=verification_events (discovered from sqlite_master; marker matched against its text columns)
+RUN1 record table=verification_events column=session_id marker=g1b-verification-20261022T160557Z-2309635-1
+  before run 1: verification_events count=0 total=0
+  after run 1 close: verification_events count=1 total=2
+  exact SQL: READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+RUN2 record table=verification_events column=session_id marker=g1b-verification-20261022T160557Z-2309635-2
+  before run 2: verification_events count=0 total=0
+  after run 2 close: verification_events count=1 total=2
+  exact SQL: READONLY_SQL table=verification_events: SELECT COUNT(*) FROM "verification_events" WHERE CAST("created_at" AS TEXT) = ? OR CAST("session_id" AS TEXT) = ? OR CAST("cwd" AS TEXT) = ? OR CAST("root" AS TEXT) = ? OR CAST("command" AS TEXT) = ? OR CAST("canonical_command" AS TEXT) = ? OR CAST("kind" AS TEXT) = ? OR CAST("scope" AS TEXT) = ? OR CAST("status" AS TEXT) = ? OR CAST("output_summary" AS TEXT) = ?
+NEVER-WRITTEN marker g1b-verification-20261022T160557Z-2309635-never-written: total=0 (must be 0)
+
+## Verdict
+STORE=verification_evidence.db
+STORE_IDENTITY=OPTIONAL verify-on-stop evidence ledger, created/opened only with the guard enabled, through open_db() -> apply_wal_with_fallback()
+OPT_IN_GATE=agent.verify_on_stop: true (fixture config) and HERMES_VERIFY_ON_STOP=1 (env form); proven OFF -> None + absent, ON -> enabled + store appears
+EVIDENCE_TABLE=verification_events (discovered from sqlite_master)
+VERDICT: verification_evidence.db HONOURING
+VERDICT_LINE: Verdict: `verification_evidence.db` HONOURING
+WAL_CONTROL: converted copy under database.journal_mode: wal -> header 2,2 (mode wal)
+PERSISTENCE_ASSERTION: run 1 marker absent->present, run 2 marker absent->present (separate read-only connections)
+SCOPE: a container run answers "do that image's writers honour configuration"; it does NOT qualify Matchlock's shared-filesystem behaviour across a guest boundary.
+MATCHLOCK_ARTIFACT_RELATIONSHIP=UNVERIFIED
+SCRATCH_ROOT=/tmp/g1b-verification-delete.0lnpqn (kept as evidence)
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+STOCK_HERMES_REVISION=4d04303818b61bf3aa09278af48356315515965b
+
+ASSERT SUMMARY: pass=128 fail=0

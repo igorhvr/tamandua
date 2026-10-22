@@ -1,0 +1,28 @@
+# US-002 config-resolution probe under strace
+#
+# Exact commands and their captured output.  The purpose of this trace is to
+# prove that the probe (including its in-process Hermes imports and its
+# `hermes config path` subprocess) never opens a path under the real operator
+# home.  The full strace file lived only in the disposable scratch directory
+# shown below and was not committed; only this summary is retained.
+
+$ cd /home/kaladin/hermes-agent
+$ scratch="$(mktemp -d /tmp/g1-trace-XXXXXX)"
+$ /usr/bin/strace -f -e trace=openat,open,creat \
+      -o "$scratch/probe.strace" \
+      /home/kaladin/hermes-agent/venv/bin/python \
+      /home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/probe_config.py \
+      > "$scratch/probe.stdout" 2> "$scratch/probe.stderr"
+$ echo "probe_exit=$?"
+probe_exit=0
+$ echo "strace_lines=$(wc -l < "$scratch/probe.strace")"
+strace_lines=38784
+$ echo "real_home_openat_hits=$(grep -c '/home/kaladin/\.hermes' "$scratch/probe.strace" || true)"
+real_home_openat_hits=0
+$ grep '/home/kaladin/\.hermes' "$scratch/probe.strace"
+(no output)
+$ tail -2 "$scratch/probe.stdout"
+{"all_passed": true, "cwd": "/home/kaladin/hermes-agent", "hermes_bin": "/home/kaladin/hermes-agent/venv/bin/hermes", "hermes_src": "/home/kaladin/hermes-agent", "host_managed_dir_note": "get_managed_dir() with this process environment; scenarios 1-4 patch it to None so each layer is measured in isolation, and scenario 5 patches it to a scratch dir", "host_managed_dir_observed": null, "probe": "US-002 config resolution", "python": "3.14.7", "scenarios": ["default-no-database-section", "user-config-delete", "invalid-value-bogus", "env-var-does-not-override", "managed-overlay-wins"], "scratch_base": "/tmp/g1-config-mkwyz4l7"}
+probe_config: all 5 scenarios passed
+
+# Scratch trace directory: /tmp/g1-trace-XD2mHp (disposable; removed after capture).

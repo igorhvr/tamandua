@@ -1,0 +1,327 @@
+probe_optional_conversion: scratch_root=/tmp/g1-optional.D9v9Sw
+probe_optional_conversion: hermes_src=/home/kaladin/hermes-agent
+probe_optional_conversion: python=Python 3.14.7
+probe_optional_conversion: hermes=Hermes Agent vgit.d623a66.dirty (2026.9.24) · upstream 8b66a510 · local d623a660 (+131 carried commits)
+probe_optional_conversion: real_home=/home/kaladin/.hermes (never opened by design)
+probe_optional_conversion: header_reader=/home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/read_header.py (raw bytes 18/19 only; no SQLite connection)
+probe_optional_conversion: host_native=/proc/1/cgroup=0::/init.scope 
+
+########################################################################
+== kanban.db ==
+########################################################################
+
+== kanban.db 1. Seed a real store under database.journal_mode: wal ==
+config_path: /tmp/g1-optional.D9v9Sw/kanban/seed-wal/home/config.yaml
+config_realpath: /tmp/g1-optional.D9v9Sw/kanban/seed-wal/home/config.yaml
+ASSERT PASS: seed-wal resolves database.journal_mode=wal before the writer
+trigger: hermes kanban list
+writer_exit: 0
+writer_stdout: (no matching tasks)|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/kanban/seed-wal/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes kanban list|
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/kanban/seed-wal/home/kanban.db", "size": 118784, "sha256": "1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52", "byte18": 2, "byte19": 2, "mode": "wal"}
+seed_wal_kanban_path: /tmp/g1-optional.D9v9Sw/kanban/seed-wal/home/kanban.db
+seed_wal_kanban_size: 118784
+seed_wal_kanban_sha256: 1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52
+seed_wal_kanban_byte18: 2
+seed_wal_kanban_byte19: 2
+seed_wal_kanban_observed_mode: wal
+seed_wal_kanban_journal_sidecars:
+  (none)
+seed_wal_kanban_related_files (ls -la, store prefix only):
+  -rw-r--r--	    118784	kanban.db
+  -rw-rw-r--	         0	kanban.db.init.lock
+ASSERT PASS: seed_wal_kanban header is 2,2 (mode wal)
+original_sha256: 1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52
+original_size: 118784
+
+== kanban.db 2. Copy the WAL store with cp -a and prove the copy is byte-identical ==
+command: cp -a -- /tmp/g1-optional.D9v9Sw/kanban/seed-wal/home/kanban.db /tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db
+copy_sha256: 1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db", "size": 118784, "sha256": "1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52", "byte18": 2, "byte19": 2, "mode": "wal"}
+conversion_copy_before_kanban_path: /tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db
+conversion_copy_before_kanban_size: 118784
+conversion_copy_before_kanban_sha256: 1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52
+conversion_copy_before_kanban_byte18: 2
+conversion_copy_before_kanban_byte19: 2
+conversion_copy_before_kanban_observed_mode: wal
+conversion_copy_before_kanban_journal_sidecars:
+  (none)
+conversion_copy_before_kanban_related_files (ls -la, store prefix only):
+  -rw-r--r--	    118784	kanban.db
+ASSERT PASS: conversion_copy_before_kanban header is 2,2 (mode wal)
+ASSERT PASS: kanban.db copy equals original before conversion (sha256 1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52)
+
+== kanban.db 3. Convert the COPY offline with 'hermes sessions set-journal-mode delete' ==
+command: HERMES_HOME=/tmp/g1-optional.D9v9Sw/kanban/seed-wal/home /home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/hermes_scratch.sh sessions set-journal-mode delete --db /tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db
+conversion_exit: 0
+conversion_stdout:
+  ✓ /tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db: journal_mode wal → delete (header verified).
+    Note: config.yaml has database.journal_mode: wal — the next open would switch the file back. Set `database.journal_mode: delete` in config.yaml to keep it.
+conversion_stderr:
+  hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/kanban/seed-wal/home
+  hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes sessions set-journal-mode delete --db /tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db", "size": 118784, "sha256": "f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131", "byte18": 1, "byte19": 1, "mode": "delete"}
+converted_copy_kanban_path: /tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db
+converted_copy_kanban_size: 118784
+converted_copy_kanban_sha256: f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131
+converted_copy_kanban_byte18: 1
+converted_copy_kanban_byte19: 1
+converted_copy_kanban_observed_mode: delete
+converted_copy_kanban_journal_sidecars:
+  (none)
+converted_copy_kanban_related_files (ls -la, store prefix only):
+  -rw-r--r--	    118784	kanban.db
+ASSERT PASS: converted_copy_kanban header is 1,1 (mode delete)
+original_sha256_before_conversion: 1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52
+original_sha256_after_conversion:  1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52
+ASSERT PASS: kanban.db original WAL store sha256 is unchanged by conversion of the copy
+converted_copy_sha256: f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131
+
+== kanban.db 4. Trigger TWICE against the converted copy under database.journal_mode: delete ==
+config_path: /tmp/g1-optional.D9v9Sw/kanban/delete/home/config.yaml
+config_realpath: /tmp/g1-optional.D9v9Sw/kanban/delete/home/config.yaml
+command: cp -a -- /tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db /tmp/g1-optional.D9v9Sw/kanban/delete/home/kanban.db
+ASSERT PASS: delete resolves database.journal_mode=delete before the writer
+
+writer_run: 1 (database.journal_mode=delete)
+trigger: hermes kanban list
+writer_exit: 0
+writer_stdout: (no matching tasks)|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/kanban/delete/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes kanban list|
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/kanban/delete/home/kanban.db", "size": 118784, "sha256": "f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131", "byte18": 1, "byte19": 1, "mode": "delete"}
+delete_run_1_kanban_path: /tmp/g1-optional.D9v9Sw/kanban/delete/home/kanban.db
+delete_run_1_kanban_size: 118784
+delete_run_1_kanban_sha256: f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131
+delete_run_1_kanban_byte18: 1
+delete_run_1_kanban_byte19: 1
+delete_run_1_kanban_observed_mode: delete
+delete_run_1_kanban_journal_sidecars:
+  (none)
+delete_run_1_kanban_related_files (ls -la, store prefix only):
+  -rw-r--r--	    118784	kanban.db
+  -rw-rw-r--	         0	kanban.db.init.lock
+ASSERT PASS: delete_run_1_kanban header is 1,1 (mode delete)
+
+writer_run: 2 (database.journal_mode=delete)
+trigger: hermes kanban list
+writer_exit: 0
+writer_stdout: (no matching tasks)|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/kanban/delete/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes kanban list|
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/kanban/delete/home/kanban.db", "size": 118784, "sha256": "f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131", "byte18": 1, "byte19": 1, "mode": "delete"}
+delete_run_2_kanban_path: /tmp/g1-optional.D9v9Sw/kanban/delete/home/kanban.db
+delete_run_2_kanban_size: 118784
+delete_run_2_kanban_sha256: f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131
+delete_run_2_kanban_byte18: 1
+delete_run_2_kanban_byte19: 1
+delete_run_2_kanban_observed_mode: delete
+delete_run_2_kanban_journal_sidecars:
+  (none)
+delete_run_2_kanban_related_files (ls -la, store prefix only):
+  -rw-r--r--	    118784	kanban.db
+  -rw-rw-r--	         0	kanban.db.init.lock
+ASSERT PASS: delete_run_2_kanban header is 1,1 (mode delete)
+delete_home_sha256_after_run1: f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131
+delete_home_sha256_after_run2: f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131
+
+== kanban.db 5. Control: SAME converted copy under database.journal_mode: wal, trigger ONCE ==
+purpose: prove the CONFIGURED value, not the conversion, decides the next open
+config_path: /tmp/g1-optional.D9v9Sw/kanban/wal-control/home/config.yaml
+config_realpath: /tmp/g1-optional.D9v9Sw/kanban/wal-control/home/config.yaml
+command: cp -a -- /tmp/g1-optional.D9v9Sw/kanban/conversion/kanban.db /tmp/g1-optional.D9v9Sw/kanban/wal-control/home/kanban.db
+ASSERT PASS: wal-control resolves database.journal_mode=wal before the writer
+writer_run: control (database.journal_mode=wal)
+trigger: hermes kanban list
+writer_exit: 0
+writer_stdout: (no matching tasks)|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/kanban/wal-control/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes kanban list|
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/kanban/wal-control/home/kanban.db", "size": 118784, "sha256": "01a2197a9795c3d4115060405c19f8d26b52aa973465694bf27555920cde6492", "byte18": 2, "byte19": 2, "mode": "wal"}
+wal_control_run_kanban_path: /tmp/g1-optional.D9v9Sw/kanban/wal-control/home/kanban.db
+wal_control_run_kanban_size: 118784
+wal_control_run_kanban_sha256: 01a2197a9795c3d4115060405c19f8d26b52aa973465694bf27555920cde6492
+wal_control_run_kanban_byte18: 2
+wal_control_run_kanban_byte19: 2
+wal_control_run_kanban_observed_mode: wal
+wal_control_run_kanban_journal_sidecars:
+  (none)
+wal_control_run_kanban_related_files (ls -la, store prefix only):
+  -rw-r--r--	    118784	kanban.db
+  -rw-rw-r--	         0	kanban.db.init.lock
+ASSERT PASS: wal_control_run_kanban header is 2,2 (mode wal)
+wal_control_sha256: 01a2197a9795c3d4115060405c19f8d26b52aa973465694bf27555920cde6492
+CONTROL: the converted 1,1 copy became 2,2 again because database.journal_mode=wal
+CONTROL: was configured for this home. The WAL control is config-driven, not a
+CONTROL: delete-mode failure.
+
+== kanban.db 6. Conversion source integrity ==
+converted_copy_sha256_before_writers: f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131
+converted_copy_sha256_after_writers:  f94d6e92ba2780d5a7665f31173c9fabc8ff1f1fbd1918b396acb8749b286131
+ASSERT PASS: kanban.db conversion source copy was untouched by the writer/control homes
+original_wal_sha256_final: 1a119305a0a4fc10af8f81b4555af51f8834feec07c6ba135e4d66a244359b52
+ASSERT PASS: kanban.db original WAL store sha256 is still unchanged at the end
+kanban.db VERDICT: HONOURING
+
+########################################################################
+== projects.db ==
+########################################################################
+
+== projects.db 1. Seed a real store under database.journal_mode: wal ==
+config_path: /tmp/g1-optional.D9v9Sw/projects/seed-wal/home/config.yaml
+config_realpath: /tmp/g1-optional.D9v9Sw/projects/seed-wal/home/config.yaml
+ASSERT PASS: seed-wal resolves database.journal_mode=wal before the writer
+trigger: hermes project list
+writer_exit: 0
+writer_stdout: No projects yet. Create one with `hermes project create <name>`.|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/projects/seed-wal/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes project list|
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/projects/seed-wal/home/projects.db", "size": 45056, "sha256": "e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80", "byte18": 2, "byte19": 2, "mode": "wal"}
+seed_wal_projects_path: /tmp/g1-optional.D9v9Sw/projects/seed-wal/home/projects.db
+seed_wal_projects_size: 45056
+seed_wal_projects_sha256: e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80
+seed_wal_projects_byte18: 2
+seed_wal_projects_byte19: 2
+seed_wal_projects_observed_mode: wal
+seed_wal_projects_journal_sidecars:
+  (none)
+seed_wal_projects_related_files (ls -la, store prefix only):
+  -rw-r--r--	     45056	projects.db
+ASSERT PASS: seed_wal_projects header is 2,2 (mode wal)
+original_sha256: e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80
+original_size: 45056
+
+== projects.db 2. Copy the WAL store with cp -a and prove the copy is byte-identical ==
+command: cp -a -- /tmp/g1-optional.D9v9Sw/projects/seed-wal/home/projects.db /tmp/g1-optional.D9v9Sw/projects/conversion/projects.db
+copy_sha256: e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/projects/conversion/projects.db", "size": 45056, "sha256": "e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80", "byte18": 2, "byte19": 2, "mode": "wal"}
+conversion_copy_before_projects_path: /tmp/g1-optional.D9v9Sw/projects/conversion/projects.db
+conversion_copy_before_projects_size: 45056
+conversion_copy_before_projects_sha256: e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80
+conversion_copy_before_projects_byte18: 2
+conversion_copy_before_projects_byte19: 2
+conversion_copy_before_projects_observed_mode: wal
+conversion_copy_before_projects_journal_sidecars:
+  (none)
+conversion_copy_before_projects_related_files (ls -la, store prefix only):
+  -rw-r--r--	     45056	projects.db
+ASSERT PASS: conversion_copy_before_projects header is 2,2 (mode wal)
+ASSERT PASS: projects.db copy equals original before conversion (sha256 e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80)
+
+== projects.db 3. Convert the COPY offline with 'hermes sessions set-journal-mode delete' ==
+command: HERMES_HOME=/tmp/g1-optional.D9v9Sw/projects/seed-wal/home /home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/hermes_scratch.sh sessions set-journal-mode delete --db /tmp/g1-optional.D9v9Sw/projects/conversion/projects.db
+conversion_exit: 0
+conversion_stdout:
+  ✓ /tmp/g1-optional.D9v9Sw/projects/conversion/projects.db: journal_mode wal → delete (header verified).
+    Note: config.yaml has database.journal_mode: wal — the next open would switch the file back. Set `database.journal_mode: delete` in config.yaml to keep it.
+conversion_stderr:
+  hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/projects/seed-wal/home
+  hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes sessions set-journal-mode delete --db /tmp/g1-optional.D9v9Sw/projects/conversion/projects.db
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/projects/conversion/projects.db", "size": 45056, "sha256": "91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071", "byte18": 1, "byte19": 1, "mode": "delete"}
+converted_copy_projects_path: /tmp/g1-optional.D9v9Sw/projects/conversion/projects.db
+converted_copy_projects_size: 45056
+converted_copy_projects_sha256: 91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071
+converted_copy_projects_byte18: 1
+converted_copy_projects_byte19: 1
+converted_copy_projects_observed_mode: delete
+converted_copy_projects_journal_sidecars:
+  (none)
+converted_copy_projects_related_files (ls -la, store prefix only):
+  -rw-r--r--	     45056	projects.db
+ASSERT PASS: converted_copy_projects header is 1,1 (mode delete)
+original_sha256_before_conversion: e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80
+original_sha256_after_conversion:  e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80
+ASSERT PASS: projects.db original WAL store sha256 is unchanged by conversion of the copy
+converted_copy_sha256: 91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071
+
+== projects.db 4. Trigger TWICE against the converted copy under database.journal_mode: delete ==
+config_path: /tmp/g1-optional.D9v9Sw/projects/delete/home/config.yaml
+config_realpath: /tmp/g1-optional.D9v9Sw/projects/delete/home/config.yaml
+command: cp -a -- /tmp/g1-optional.D9v9Sw/projects/conversion/projects.db /tmp/g1-optional.D9v9Sw/projects/delete/home/projects.db
+ASSERT PASS: delete resolves database.journal_mode=delete before the writer
+
+writer_run: 1 (database.journal_mode=delete)
+trigger: hermes project list
+writer_exit: 0
+writer_stdout: No projects yet. Create one with `hermes project create <name>`.|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/projects/delete/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes project list|
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/projects/delete/home/projects.db", "size": 45056, "sha256": "91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071", "byte18": 1, "byte19": 1, "mode": "delete"}
+delete_run_1_projects_path: /tmp/g1-optional.D9v9Sw/projects/delete/home/projects.db
+delete_run_1_projects_size: 45056
+delete_run_1_projects_sha256: 91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071
+delete_run_1_projects_byte18: 1
+delete_run_1_projects_byte19: 1
+delete_run_1_projects_observed_mode: delete
+delete_run_1_projects_journal_sidecars:
+  (none)
+delete_run_1_projects_related_files (ls -la, store prefix only):
+  -rw-r--r--	     45056	projects.db
+ASSERT PASS: delete_run_1_projects header is 1,1 (mode delete)
+
+writer_run: 2 (database.journal_mode=delete)
+trigger: hermes project list
+writer_exit: 0
+writer_stdout: No projects yet. Create one with `hermes project create <name>`.|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/projects/delete/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes project list|
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/projects/delete/home/projects.db", "size": 45056, "sha256": "91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071", "byte18": 1, "byte19": 1, "mode": "delete"}
+delete_run_2_projects_path: /tmp/g1-optional.D9v9Sw/projects/delete/home/projects.db
+delete_run_2_projects_size: 45056
+delete_run_2_projects_sha256: 91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071
+delete_run_2_projects_byte18: 1
+delete_run_2_projects_byte19: 1
+delete_run_2_projects_observed_mode: delete
+delete_run_2_projects_journal_sidecars:
+  (none)
+delete_run_2_projects_related_files (ls -la, store prefix only):
+  -rw-r--r--	     45056	projects.db
+ASSERT PASS: delete_run_2_projects header is 1,1 (mode delete)
+delete_home_sha256_after_run1: 91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071
+delete_home_sha256_after_run2: 91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071
+
+== projects.db 5. Control: SAME converted copy under database.journal_mode: wal, trigger ONCE ==
+purpose: prove the CONFIGURED value, not the conversion, decides the next open
+config_path: /tmp/g1-optional.D9v9Sw/projects/wal-control/home/config.yaml
+config_realpath: /tmp/g1-optional.D9v9Sw/projects/wal-control/home/config.yaml
+command: cp -a -- /tmp/g1-optional.D9v9Sw/projects/conversion/projects.db /tmp/g1-optional.D9v9Sw/projects/wal-control/home/projects.db
+ASSERT PASS: wal-control resolves database.journal_mode=wal before the writer
+writer_run: control (database.journal_mode=wal)
+trigger: hermes project list
+writer_exit: 0
+writer_stdout: No projects yet. Create one with `hermes project create <name>`.|
+writer_stderr: hermes_scratch: HERMES_HOME=/tmp/g1-optional.D9v9Sw/projects/wal-control/home|hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes project list|
+header_json: {"path": "/tmp/g1-optional.D9v9Sw/projects/wal-control/home/projects.db", "size": 45056, "sha256": "8e074bff26e929b555d1d5be7d319dbcd3d6383d02c1f89383348ef2e097e736", "byte18": 2, "byte19": 2, "mode": "wal"}
+wal_control_run_projects_path: /tmp/g1-optional.D9v9Sw/projects/wal-control/home/projects.db
+wal_control_run_projects_size: 45056
+wal_control_run_projects_sha256: 8e074bff26e929b555d1d5be7d319dbcd3d6383d02c1f89383348ef2e097e736
+wal_control_run_projects_byte18: 2
+wal_control_run_projects_byte19: 2
+wal_control_run_projects_observed_mode: wal
+wal_control_run_projects_journal_sidecars:
+  (none)
+wal_control_run_projects_related_files (ls -la, store prefix only):
+  -rw-r--r--	     45056	projects.db
+ASSERT PASS: wal_control_run_projects header is 2,2 (mode wal)
+wal_control_sha256: 8e074bff26e929b555d1d5be7d319dbcd3d6383d02c1f89383348ef2e097e736
+CONTROL: the converted 1,1 copy became 2,2 again because database.journal_mode=wal
+CONTROL: was configured for this home. The WAL control is config-driven, not a
+CONTROL: delete-mode failure.
+
+== projects.db 6. Conversion source integrity ==
+converted_copy_sha256_before_writers: 91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071
+converted_copy_sha256_after_writers:  91aa3cd406cc51558a1ce60253023a68bc35375c36831c9d3a043c32dedf7071
+ASSERT PASS: projects.db conversion source copy was untouched by the writer/control homes
+original_wal_sha256_final: e710b33f6a2ea7b406f778192b38a2c78bb03ff1d146494a1782e525e67e3f80
+ASSERT PASS: projects.db original WAL store sha256 is still unchanged at the end
+projects.db VERDICT: HONOURING
+
+== optional-store offline-conversion persistence verdict ==
+store            header     mode       next_writers result
+kanban.db        1,1        delete     2            kept rollback
+projects.db      1,1        delete     2            kept rollback
+both WAL controls 2,2        wal        1            config-driven
+
+KANBAN.DB VERDICT: HONOURING
+PROJECTS.DB VERDICT: HONOURING
+Both optional stores were created WAL (2,2), converted offline on copies to
+rollback (1,1), and stayed 1,1 across two consecutive real trigger runs under
+database.journal_mode=delete; their WAL controls flipped the same copies to 2,2.
+
+native_execution: /proc/1/cgroup=0::/init.scope 
+RESULT: PASS (kanban.db and projects.db conversions persist across two delete-mode trigger runs; WAL controls flip to 2,2)
+scratch root kept: /tmp/g1-optional.D9v9Sw

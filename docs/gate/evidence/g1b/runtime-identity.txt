@@ -1,0 +1,68 @@
+# G1-B US-001 — stock-runtime identity
+# generated (UTC): 2026-10-22T11:58:39Z
+
+SCRATCH_ROOT=/tmp/g1b-runtime-identity.Hrj8QZ
+SCRATCH_ROOT_KEPT=yes (G1-B never deletes its fixtures)
+
+## Host-side docker artifact facts
+
+IMAGE_REF=igorhvr/tamandua:latest
+TAG_MAPPING igorhvr/tamandua:latest -> sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+  Id=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+  Architecture=amd64
+  Os=linux
+  RepoDigests=["igorhvr/tamandua@sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a"]
+  docker_image_inspect_rc=0
+
+IMAGE_REF=igorhvr/tamandua:amd64
+TAG_MAPPING igorhvr/tamandua:amd64 -> sha256:9140629c9f408a6e9c285434eb6ab0cebd67db146c324db33e2798bac4fb7dff
+  Id=sha256:9140629c9f408a6e9c285434eb6ab0cebd67db146c324db33e2798bac4fb7dff
+  Architecture=amd64
+  Os=linux
+  RepoDigests=["igorhvr/tamandua@sha256:9140629c9f408a6e9c285434eb6ab0cebd67db146c324db33e2798bac4fb7dff"]
+  docker_image_inspect_rc=0
+
+REQUIRED_IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+REQUIRED_ARCH=amd64
+REQUIRED_OS=linux
+MATCHLOCK_ARTIFACT_ID=sha256:9140629c9f408a6e9c285434eb6ab0cebd67db146c324db33e2798bac4fb7dff
+MATCHLOCK_ARTIFACT_RELATIONSHIP=UNVERIFIED (no equality claim)
+
+## Container-side runtime identity
+
+CONTAINER_INVOCATION: docker run --rm --network none --platform linux/amd64 --user 1000:1000 -v /tmp/g1b-runtime-identity.Hrj8QZ:/work -w /work -e HOME=/work/home igorhvr/tamandua:latest bash -c <script>
+GIT_REVISION=4d04303818b61bf3aa09278af48356315515965b
+GIT_REVISION_RC=0
+GIT_STATUS_PORCELAIN_EMPTY=yes
+GIT_STATUS_RC=0
+HERMES_VERSION=Hermes Agent v0.22.4 (2026.9.24) · stable
+HERMES_VERSION_RC=0
+HERMES_BIN=/usr/local/bin/hermes
+HERMES_BIN_EXISTS=yes
+PYTHON_VERSION=Python 3.14.7
+PYTHON_VERSION_RC=0
+PYTHON_BIN=/opt/src/hermes-venv/bin/python
+SQLITE_VERSION=3.53.1
+SQLITE_VERSION_RC=0
+IMPORT_HERMES_STATE=IMPORT_OK
+IMPORT_HERMES_STATE_RC=0
+PROC_1_CGROUP=0::/;
+RESOLVED_DELETE=delete
+RESOLVED_DELETE_RC=0
+RESOLVED_WAL=wal
+RESOLVED_WAL_RC=0
+CONTAINER_RC=0
+
+## read_header bootstrap
+read_header bootstrap: /tmp/g1b-runtime-identity.Hrj8QZ/tools/read_header.py sha256=3e91665695a5b2925d4825e5abc85a0a385e0c9b7dd0b55cc3b85e20784abe01
+READ_HEADER_BOOTSTRAP_RC=0
+
+## Summary
+IMAGE_ID=sha256:d15b7b377d679c6561315f7054e16f0310b3956cff872c23818d90073b29934a
+ARCH=amd64
+OS=linux
+HERMES_REVISION=4d04303818b61bf3aa09278af48356315515965b
+SCRATCH_ROOT=/tmp/g1b-runtime-identity.Hrj8QZ
+SCRATCH_ROOT_KEPT=yes
+
+ASSERT SUMMARY: pass=24 fail=0

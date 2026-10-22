@@ -1,0 +1,276 @@
+probe_verification_conversion: scratch_root=/tmp/g1-verification.yqQ8Zz
+probe_verification_conversion: hermes_src=/home/kaladin/hermes-agent
+probe_verification_conversion: python=Python 3.14.7
+probe_verification_conversion: hermes=Hermes Agent vgit.d623a66.dirty (2026.9.24) · upstream 8b66a510 · local d623a660 (+131 carried commits)
+probe_verification_conversion: real_home=/home/kaladin/.hermes (never opened by design)
+probe_verification_conversion: header_reader=/home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/read_header.py (raw bytes 18/19 only; no SQLite connection)
+probe_verification_conversion: host_native=/proc/1/cgroup=0::/init.scope 
+probe_verification_conversion: verify_on_stop precedence (agent/verification_stop.py):
+  HERMES_VERIFY_ON_STOP env (if set) -> agent.verify_on_stop config -> default OFF; 'auto' is surface-aware
+
+== 1. verify-on-stop OFF: optionality boundary ==
+config_path: /tmp/g1-verification.yqQ8Zz/optionality/off/home/config.yaml
+config_contents: database:|  journal_mode: wal|
+ASSERT PASS: optionality-off resolves database.journal_mode=wal before the writer
+ASSERT PASS: optionality-off (no env) verify_on_stop_enabled()=false
+ASSERT PASS: optionality-off + HERMES_VERIFY_ON_STOP=1 verify_on_stop_enabled()=true
+writer_exit: 0
+writer_stdout: record_verify_run_return: None|event_id: None|
+writer_stderr: 
+ASSERT PASS: record_verify_run() returned None with verify-on-stop off
+ASSERT PASS: verification_evidence.db is absent when verify-on-stop is off
+
+== 2. verify-on-stop ON via agent.verify_on_stop: true ==
+config_path: /tmp/g1-verification.yqQ8Zz/optionality/on/home/config.yaml
+config_contents: database:|  journal_mode: wal|agent:|  verify_on_stop: true|
+ASSERT PASS: optionality-on resolves database.journal_mode=wal before the writer
+ASSERT PASS: optionality-on (config true) verify_on_stop_enabled()=true
+ASSERT PASS: optionality-on + HERMES_VERIFY_ON_STOP=0 verify_on_stop_enabled()=false
+writer_exit: 0
+writer_stdout: record_verify_run_return: {'id': 1, 'command': 'hermes verify', 'canonical_command': 'hermes verify', 'kind': 'verify', 'scope': 'full', 'status': 'passed', 'exit_code': 0, 'cwd': '/tmp/g1-verification.yqQ8Zz/workspace', 'root': '/tmp/g1-verification.yqQ8Zz/workspace', 'session_id': 'g1-verification-optionality-on', 'output_summary': '', 'created_at': '2026-10-22T06:50:03.084832+00:00'}|event_id: 1|
+writer_stderr: 
+ASSERT PASS: record_verify_run() recorded an event (id 1) with verify-on-stop on
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/optionality/on/home/verification_evidence.db", "size": 32768, "sha256": "82cb4e37334bd0c7fb1791baba0ca51f118349183ecc22a0c6febea04805005d", "byte18": 2, "byte19": 2, "mode": "wal"}
+optionality_on_store_path: /tmp/g1-verification.yqQ8Zz/optionality/on/home/verification_evidence.db
+optionality_on_store_size: 32768
+optionality_on_store_sha256: 82cb4e37334bd0c7fb1791baba0ca51f118349183ecc22a0c6febea04805005d
+optionality_on_store_byte18: 2
+optionality_on_store_byte19: 2
+optionality_on_store_observed_mode: wal
+optionality_on_store_journal_sidecars:
+  (none)
+optionality_on_store_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+82cb4e37334bd0c7fb1791baba0ca51f118349183ecc22a0c6febea04805005d 2 2 wal
+ASSERT PASS: optionality_on_store header is 2,2 (mode wal)
+
+== 3. Seed a real verification_evidence.db under database.journal_mode: wal ==
+config_path: /tmp/g1-verification.yqQ8Zz/seed-wal/home/config.yaml
+config_realpath: /tmp/g1-verification.yqQ8Zz/seed-wal/home/config.yaml
+config_contents: database:|  journal_mode: wal|agent:|  verify_on_stop: true|
+ASSERT PASS: seed-wal resolves database.journal_mode=wal before the writer
+ASSERT PASS: seed-wal verify_on_stop_enabled()=true
+writer: record_verify_run(session_id='g1-verification-seed', ok=True)
+writer_exit: 0
+writer_stdout: record_verify_run_return: {'id': 1, 'command': 'hermes verify', 'canonical_command': 'hermes verify', 'kind': 'verify', 'scope': 'full', 'status': 'passed', 'exit_code': 0, 'cwd': '/tmp/g1-verification.yqQ8Zz/workspace', 'root': '/tmp/g1-verification.yqQ8Zz/workspace', 'session_id': 'g1-verification-seed', 'output_summary': '', 'created_at': '2026-10-22T06:50:06.223435+00:00'}|event_id: 1|
+writer_stderr: 
+seed_event_id: 1
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/seed-wal/home/verification_evidence.db", "size": 32768, "sha256": "9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b", "byte18": 2, "byte19": 2, "mode": "wal"}
+seed_wal_verification_evidence_db_path: /tmp/g1-verification.yqQ8Zz/seed-wal/home/verification_evidence.db
+seed_wal_verification_evidence_db_size: 32768
+seed_wal_verification_evidence_db_sha256: 9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b
+seed_wal_verification_evidence_db_byte18: 2
+seed_wal_verification_evidence_db_byte19: 2
+seed_wal_verification_evidence_db_observed_mode: wal
+seed_wal_verification_evidence_db_journal_sidecars:
+  (none)
+seed_wal_verification_evidence_db_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b 2 2 wal
+ASSERT PASS: seed_wal_verification_evidence_db header is 2,2 (mode wal)
+original_sha256: 9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b
+original_size: 32768
+
+== 4. Copy the WAL store with cp -a and prove the copy is byte-identical ==
+command: cp -a -- /tmp/g1-verification.yqQ8Zz/seed-wal/home/verification_evidence.db /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db
+copy_sha256: 9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db", "size": 32768, "sha256": "9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b", "byte18": 2, "byte19": 2, "mode": "wal"}
+conversion_copy_before_path: /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db
+conversion_copy_before_size: 32768
+conversion_copy_before_sha256: 9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b
+conversion_copy_before_byte18: 2
+conversion_copy_before_byte19: 2
+conversion_copy_before_observed_mode: wal
+conversion_copy_before_journal_sidecars:
+  (none)
+conversion_copy_before_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b 2 2 wal
+ASSERT PASS: conversion_copy_before header is 2,2 (mode wal)
+ASSERT PASS: copy equals original before conversion (sha256 9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b)
+
+== 5. Convert the COPY offline with 'hermes sessions set-journal-mode delete' ==
+command: HERMES_HOME=/tmp/g1-verification.yqQ8Zz/seed-wal/home /home/kaladin/.tamandua/worktrees/tamandua-origin-dev16-afd82b30/168-2869e550/docs/gate/probes/hermes_scratch.sh sessions set-journal-mode delete --db /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db
+conversion_exit: 0
+conversion_stdout:
+  ✓ /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db: journal_mode wal → delete (header verified).
+    Note: config.yaml has database.journal_mode: wal — the next open would switch the file back. Set `database.journal_mode: delete` in config.yaml to keep it.
+conversion_stderr:
+  hermes_scratch: HERMES_HOME=/tmp/g1-verification.yqQ8Zz/seed-wal/home
+  hermes_scratch: exec /home/kaladin/hermes-agent/venv/bin/hermes sessions set-journal-mode delete --db /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db", "size": 32768, "sha256": "27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0", "byte18": 1, "byte19": 1, "mode": "delete"}
+converted_copy_path: /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db
+converted_copy_size: 32768
+converted_copy_sha256: 27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0
+converted_copy_byte18: 1
+converted_copy_byte19: 1
+converted_copy_observed_mode: delete
+converted_copy_journal_sidecars:
+  (none)
+converted_copy_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0 1 1 delete
+ASSERT PASS: converted_copy header is 1,1 (mode delete)
+original_sha256_before_conversion: 9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b
+original_sha256_after_conversion:  9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b
+ASSERT PASS: original WAL store sha256 is unchanged by conversion of the copy
+converted_copy_sha256: 27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0
+
+== 6. Writer TWICE against the converted copy under database.journal_mode: delete ==
+config_path: /tmp/g1-verification.yqQ8Zz/delete/home/config.yaml
+config_realpath: /tmp/g1-verification.yqQ8Zz/delete/home/config.yaml
+config_contents: database:|  journal_mode: delete|agent:|  verify_on_stop: true|
+command: cp -a -- /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db /tmp/g1-verification.yqQ8Zz/delete/home/verification_evidence.db
+ASSERT PASS: delete-home resolves database.journal_mode=delete before the writer
+ASSERT PASS: delete-home verify_on_stop_enabled()=true
+
+writer_run: 1 (database.journal_mode=delete, verify-on-stop on)
+writer_exit: 0
+writer_stdout: record_verify_run_return: {'id': 2, 'command': 'hermes verify', 'canonical_command': 'hermes verify', 'kind': 'verify', 'scope': 'full', 'status': 'passed', 'exit_code': 0, 'cwd': '/tmp/g1-verification.yqQ8Zz/workspace', 'root': '/tmp/g1-verification.yqQ8Zz/workspace', 'session_id': 'g1-verification-delete-1', 'output_summary': '', 'created_at': '2026-10-22T06:50:12.610966+00:00'}|event_id: 2|
+writer_stderr: 
+delete_run_1_event_id: 2
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/delete/home/verification_evidence.db", "size": 32768, "sha256": "d06c77ca7ae7f0077f21e48212937e8b0723a5a4414152b86c275581fb7b5917", "byte18": 1, "byte19": 1, "mode": "delete"}
+delete_run_1_path: /tmp/g1-verification.yqQ8Zz/delete/home/verification_evidence.db
+delete_run_1_size: 32768
+delete_run_1_sha256: d06c77ca7ae7f0077f21e48212937e8b0723a5a4414152b86c275581fb7b5917
+delete_run_1_byte18: 1
+delete_run_1_byte19: 1
+delete_run_1_observed_mode: delete
+delete_run_1_journal_sidecars:
+  (none)
+delete_run_1_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+d06c77ca7ae7f0077f21e48212937e8b0723a5a4414152b86c275581fb7b5917 1 1 delete
+ASSERT PASS: delete_run_1 header is 1,1 (mode delete)
+
+writer_run: 2 (database.journal_mode=delete, verify-on-stop on)
+writer_exit: 0
+writer_stdout: record_verify_run_return: {'id': 3, 'command': 'hermes verify', 'canonical_command': 'hermes verify', 'kind': 'verify', 'scope': 'full', 'status': 'passed', 'exit_code': 0, 'cwd': '/tmp/g1-verification.yqQ8Zz/workspace', 'root': '/tmp/g1-verification.yqQ8Zz/workspace', 'session_id': 'g1-verification-delete-2', 'output_summary': '', 'created_at': '2026-10-22T06:50:14.017069+00:00'}|event_id: 3|
+writer_stderr: 
+delete_run_2_event_id: 3
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/delete/home/verification_evidence.db", "size": 32768, "sha256": "7e88e4eed99605724f72805a0fcd16ad78b87d827e10ebb8cbb28c2104651af4", "byte18": 1, "byte19": 1, "mode": "delete"}
+delete_run_2_path: /tmp/g1-verification.yqQ8Zz/delete/home/verification_evidence.db
+delete_run_2_size: 32768
+delete_run_2_sha256: 7e88e4eed99605724f72805a0fcd16ad78b87d827e10ebb8cbb28c2104651af4
+delete_run_2_byte18: 1
+delete_run_2_byte19: 1
+delete_run_2_observed_mode: delete
+delete_run_2_journal_sidecars:
+  (none)
+delete_run_2_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+7e88e4eed99605724f72805a0fcd16ad78b87d827e10ebb8cbb28c2104651af4 1 1 delete
+ASSERT PASS: delete_run_2 header is 1,1 (mode delete)
+
+delete_home_sha256_after_run1: d06c77ca7ae7f0077f21e48212937e8b0723a5a4414152b86c275581fb7b5917
+delete_home_sha256_after_run2: 7e88e4eed99605724f72805a0fcd16ad78b87d827e10ebb8cbb28c2104651af4
+
+== 7. Read-only paths against a converted copy under database.journal_mode: delete ==
+config_path: /tmp/g1-verification.yqQ8Zz/read-path/home/config.yaml
+command: cp -a -- /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db /tmp/g1-verification.yqQ8Zz/read-path/home/verification_evidence.db
+ASSERT PASS: read-path-home resolves database.journal_mode=delete before the writer
+ASSERT PASS: read-path-home verify_on_stop_enabled()=true
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/read-path/home/verification_evidence.db", "size": 32768, "sha256": "27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0", "byte18": 1, "byte19": 1, "mode": "delete"}
+read_path_before_reads_path: /tmp/g1-verification.yqQ8Zz/read-path/home/verification_evidence.db
+read_path_before_reads_size: 32768
+read_path_before_reads_sha256: 27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0
+read_path_before_reads_byte18: 1
+read_path_before_reads_byte19: 1
+read_path_before_reads_observed_mode: delete
+read_path_before_reads_journal_sidecars:
+  (none)
+read_path_before_reads_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0 1 1 delete
+ASSERT PASS: read_path_before_reads header is 1,1 (mode delete)
+verification_status_exit: 0
+verification_status_stdout: verification_status: {"changed_paths": [], "evidence": {"canonical_command": "hermes verify", "command": "hermes verify", "created_at": "2026-10-22T06:50:06.223435+00:00", "cwd": "/tmp/g1-verification.yqQ8Zz/workspace", "exit_code": 0, "id": 1, "kind": "verify", "output_summary": "", "root": "/tmp/g1-verification.yqQ8Zz/workspace", "scope": "full", "session_id": "g1-verification-seed", "status": "passed"}, "root": "/tmp/g1-verification.yqQ8Zz/workspace", "session_id": "g1-verification-seed", "status": "passed"}|
+verification_status_stderr: 
+ASSERT PASS: verification_status() resolved the recorded seed event as passed
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/read-path/home/verification_evidence.db", "size": 32768, "sha256": "31d9cd322c766c26b57582de0ac5fd84ab451bf653a87689da62754a7511102e", "byte18": 1, "byte19": 1, "mode": "delete"}
+read_path_after_verification_status_path: /tmp/g1-verification.yqQ8Zz/read-path/home/verification_evidence.db
+read_path_after_verification_status_size: 32768
+read_path_after_verification_status_sha256: 31d9cd322c766c26b57582de0ac5fd84ab451bf653a87689da62754a7511102e
+read_path_after_verification_status_byte18: 1
+read_path_after_verification_status_byte19: 1
+read_path_after_verification_status_observed_mode: delete
+read_path_after_verification_status_journal_sidecars:
+  (none)
+read_path_after_verification_status_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+31d9cd322c766c26b57582de0ac5fd84ab451bf653a87689da62754a7511102e 1 1 delete
+ASSERT PASS: read_path_after_verification_status header is 1,1 (mode delete)
+connect_read_exit: 0
+connect_read_stdout: connect_read_event_count: 1|
+connect_read_stderr: 
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/read-path/home/verification_evidence.db", "size": 32768, "sha256": "eea73d05ecd8b8c09db20fa5d1c78891f34ae9aa5e2f234f0a689ece9a539f5f", "byte18": 1, "byte19": 1, "mode": "delete"}
+read_path_after_connect_path: /tmp/g1-verification.yqQ8Zz/read-path/home/verification_evidence.db
+read_path_after_connect_size: 32768
+read_path_after_connect_sha256: eea73d05ecd8b8c09db20fa5d1c78891f34ae9aa5e2f234f0a689ece9a539f5f
+read_path_after_connect_byte18: 1
+read_path_after_connect_byte19: 1
+read_path_after_connect_observed_mode: delete
+read_path_after_connect_journal_sidecars:
+  (none)
+read_path_after_connect_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+eea73d05ecd8b8c09db20fa5d1c78891f34ae9aa5e2f234f0a689ece9a539f5f 1 1 delete
+ASSERT PASS: read_path_after_connect header is 1,1 (mode delete)
+read_path_sha256: eea73d05ecd8b8c09db20fa5d1c78891f34ae9aa5e2f234f0a689ece9a539f5f
+
+== 8. Control: SAME converted copy under database.journal_mode: wal, writer ONCE ==
+purpose: prove the CONFIGURED value, not the conversion, decides the next open
+config_path: /tmp/g1-verification.yqQ8Zz/wal-control/home/config.yaml
+command: cp -a -- /tmp/g1-verification.yqQ8Zz/conversion/verification_evidence.db /tmp/g1-verification.yqQ8Zz/wal-control/home/verification_evidence.db
+ASSERT PASS: wal-control-home resolves database.journal_mode=wal before the writer
+ASSERT PASS: wal-control-home verify_on_stop_enabled()=true
+writer_run: control (database.journal_mode=wal)
+writer_exit: 0
+writer_stdout: record_verify_run_return: {'id': 2, 'command': 'hermes verify', 'canonical_command': 'hermes verify', 'kind': 'verify', 'scope': 'full', 'status': 'passed', 'exit_code': 0, 'cwd': '/tmp/g1-verification.yqQ8Zz/workspace', 'root': '/tmp/g1-verification.yqQ8Zz/workspace', 'session_id': 'g1-verification-wal-control', 'output_summary': '', 'created_at': '2026-10-22T06:50:22.273147+00:00'}|event_id: 2|
+writer_stderr: verification_evidence.db: on-disk journal_mode was delete and has been switched to WAL. This rewrites the database header and persists after this process exits. If delete was a deliberate choice (for example the mitigation for the SQLite WAL-reset bug, or a WAL-unsafe filesystem), setting it with PRAGMA on the file will not survive -- every open re-applies the configured mode. Set `database.journal_mode: delete` in config.yaml to make it stick. This message fires once per process per database.|
+header_json: {"path": "/tmp/g1-verification.yqQ8Zz/wal-control/home/verification_evidence.db", "size": 32768, "sha256": "7697058a661885d4aaf92e1785b26cbbe1d7fc71ac8bf2ec5f0acbb5bf22ba05", "byte18": 2, "byte19": 2, "mode": "wal"}
+wal_control_run_path: /tmp/g1-verification.yqQ8Zz/wal-control/home/verification_evidence.db
+wal_control_run_size: 32768
+wal_control_run_sha256: 7697058a661885d4aaf92e1785b26cbbe1d7fc71ac8bf2ec5f0acbb5bf22ba05
+wal_control_run_byte18: 2
+wal_control_run_byte19: 2
+wal_control_run_observed_mode: wal
+wal_control_run_journal_sidecars:
+  (none)
+wal_control_run_related_files (ls -la, store prefix only):
+  -rw-r--r--	     32768	verification_evidence.db
+7697058a661885d4aaf92e1785b26cbbe1d7fc71ac8bf2ec5f0acbb5bf22ba05 2 2 wal
+ASSERT PASS: wal_control_run header is 2,2 (mode wal)
+wal_control_sha256: 7697058a661885d4aaf92e1785b26cbbe1d7fc71ac8bf2ec5f0acbb5bf22ba05
+CONTROL: the converted 1,1 copy became 2,2 again because database.journal_mode=wal was
+CONTROL: configured for this home. The WAL control is config-driven, not a delete-mode failure.
+
+== 9. Conversion source and original integrity ==
+converted_copy_sha256_before_writers: 27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0
+converted_copy_sha256_after_writers:  27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0
+ASSERT PASS: conversion source copy was untouched by the delete/read/control homes (sha256 27cb270327a9438e63047c316760872961b102a4cdb458c52e67b3f2069019f0)
+original_wal_sha256_final: 9750cf6d72b29e7a0384caa3cc3986f40394d1b4022c81e66d6b77db738c4b4b
+ASSERT PASS: original WAL store sha256 is still unchanged at the end
+
+== verification_evidence.db optionality + conversion-persistence verdict ==
+stage                              header    mode     writer_runs   result
+verify OFF                         absent    -        0             optional store not created
+verify ON (config)                 2,2       wal      1 (create)    optional store created
+seed WAL                           2,2       wal      1 (create)    control baseline
+converted copy                     1,1       delete   offline       converted
+delete home after run 1            1,1       delete   1             next-writer result
+delete home after run 2            1,1       delete   2             next-writer result
+read path (status + connect)       1,1       delete   0             reads did not flip
+wal control after run              2,2       wal      1             config-driven
+
+VERIFICATION_EVIDENCE.DB VERDICT: HONOURING
+verification_evidence.db is OPTIONAL: verify-on-stop gates its existence (off -> absent,
+record_verify_run() -> None; on -> created with a recorded event).
+It was created WAL (2,2), converted offline on a copy to rollback (1,1), stayed 1,1 across
+two consecutive real writer runs under database.journal_mode=delete, and stayed 1,1 across
+verification_status() and a direct _connect() read. The WAL control flipped the same
+converted copy to 2,2, so the configured value decides the next open.
+
+native_execution: /proc/1/cgroup=0::/init.scope 
+RESULT: PASS (verification_evidence.db conversion persists across two delete-mode writer runs; reads do not flip it)
+scratch root kept: /tmp/g1-verification.yqQ8Zz
