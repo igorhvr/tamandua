@@ -89,6 +89,7 @@ src/installer/matchlock/progress-resource.test.ts
 src/installer/matchlock/repository-scope.test.ts
 src/installer/matchlock/rpc-client.test.ts
 src/installer/matchlock/store-header-nonregular-regression.test.ts
+src/installer/matchlock/store-holder-detect-runner.test.ts
 src/installer/matchlock/suite-wire-pack.test.ts
 src/installer/matchlock/swap-support.test.ts
 src/installer/matchlock/vm-evidence.test.ts
