@@ -81,6 +81,18 @@ export function isProcfsPath(candidate: string): boolean {
   return candidate === "/proc" || candidate.startsWith("/proc/");
 }
 
+/**
+ * Build a path under the Linux procfs for one pid (its root, or a child such
+ * as `fd` or `cmdline`).
+ *
+ * The procfs spelling lives here, in the allow-listed process-introspection
+ * helper, so a caller that enumerates a pid's open files never spells it
+ * itself (the portability lint forbids that outside this module).
+ */
+export function procfsPidPath(pid: number, ...segments: string[]): string {
+  return path.join("/proc", String(pid), ...segments);
+}
+
 /** Run ps with the given args; null on any failure (including missing ps). */
 function ps(args: string[]): string | null {
   try {
