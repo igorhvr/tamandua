@@ -688,7 +688,15 @@ describe("CORE-MOTOR US-003 execution binding + evidence verification (pure)", (
     assert.deepEqual(child.killCalls, [], "no kill on a child that never spawned");
   });
 
-  it("attachRunCliLifecycle: launch timeout rejects ready and stop() still attempts exact cleanup", async () => {
+  it("attachRunCliLifecycle: launch timeout rejects ready and stop() still attempts exact cleanup", async (t) => {
+    // The executor deliberately unref()'s its readyTimer and the VIRTUAL fake
+    // child holds no ref'd handle, so under node22 the event loop can drain
+    // while we await lc.ready and the test runner cancels this subtest (and
+    // every later one) with "Promise resolution is still pending". Hold a
+    // REF'd keep-alive for the duration of the subtest; t.after clears it on
+    // both the pass and fail paths so node24 runs are not slowed.
+    const keepAlive = setInterval(() => {}, 1000);
+    t.after(() => clearInterval(keepAlive));
     const mod = await loadExecutor();
     const child = fakeChild();
     const lc = mod.attachRunCliLifecycle({ child, readyTimeoutMs: 60, naturalExitGraceMs: 0, sigkillAfterMs: 120, settleAfterSigkillMs: 100 });
