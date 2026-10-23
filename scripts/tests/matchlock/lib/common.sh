@@ -13,7 +13,10 @@
 #     hardcoded assertions. The same case set must serve vaimetal (Linux/KVM)
 #     and mac (macOS/VZ) and both matchlock backends.
 #   * `MTLK_MATCHLOCK_RPC_BIN` and `MTLK_GUEST_INIT` are resolved by
-#     `mtlk_resolve_runtime` BEFORE any PATH/HOME change.
+#     `mtlk_resolve_runtime` BEFORE any PATH/HOME change, and the resolved pair
+#     is ALSO exported under the product spellings the launcher reads
+#     (`TAMANDUA_MATCHLOCK_RPC_BIN` / `MATCHLOCK_GUEST_INIT`) so a candidate can
+#     never be replaced by a PATH fallback across a child-process boundary.
 #   * CANDIDATE mode builds this worktree and execs `<repo>/dist/cli/cli.js`;
 #     INSTALLED mode execs the `tamandua` resolved from PATH and never rebuilds
 #     or replaces what it verifies.
@@ -125,6 +128,21 @@ MTLK_NODE_BIN="${MTLK_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
 # Matchlock runtime pair, resolved lazily by mtlk_resolve_runtime. The
 # TAMANDUA_MATCHLOCK_RPC_BIN / MATCHLOCK_GUEST_INIT spellings are the repo's
 # existing runner overrides and are honored as fallbacks.
+#
+# EXPLICIT-REQUEST PROVENANCE (SUITE-BRIDGE US-001) is captured BEFORE the
+# defaults so a candidate an operator actually asked for can never be silently
+# replaced by an installed binary found on PATH. MTLK_* wins over the product
+# spelling; a non-empty value in EITHER spelling counts as an explicit request.
+if [ -n "${MTLK_MATCHLOCK_RPC_BIN:-}" ] || [ -n "${TAMANDUA_MATCHLOCK_RPC_BIN:-}" ]; then
+  _MTLK_EXPLICIT_MATCHLOCK_REQUEST=1
+else
+  _MTLK_EXPLICIT_MATCHLOCK_REQUEST=0
+fi
+if [ -n "${MTLK_GUEST_INIT:-}" ] || [ -n "${MATCHLOCK_GUEST_INIT:-}" ]; then
+  _MTLK_EXPLICIT_GUEST_INIT_REQUEST=1
+else
+  _MTLK_EXPLICIT_GUEST_INIT_REQUEST=0
+fi
 MTLK_MATCHLOCK_RPC_BIN="${MTLK_MATCHLOCK_RPC_BIN:-${TAMANDUA_MATCHLOCK_RPC_BIN:-}}"
 MTLK_GUEST_INIT="${MTLK_GUEST_INIT:-${MATCHLOCK_GUEST_INIT:-}}"
 
@@ -243,25 +261,119 @@ os.replace(tmp, dst)
 PYR
 }
 
+# mtlk_abs_path <path> — print an absolute spelling of <path>.
+#
+# Deliberately avoids a realpath(1) dependency: an already-absolute value is
+# returned unchanged, otherwise the parent directory is `cd`-resolved and the
+# basename re-attached. Returns 1 when the parent cannot be resolved.
+mtlk_abs_path() {
+  local value="${1:-}" dir base
+  [ -n "$value" ] || return 1
+  case "$value" in
+    /*)
+      printf '%s\n' "$value"
+      return 0
+      ;;
+  esac
+  base="$(basename -- "$value")" || return 1
+  dir="$(dirname -- "$value")" || return 1
+  dir="$(cd -- "$dir" 2>/dev/null && pwd)" || return 1
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+# mtlk_validate_candidate <kind> <value> — validate an EXPLICIT candidate.
+#
+# `kind` is `matchlock` or `guest-init`. A missing path, a path that is not a
+# regular file (a directory is NOT a file) or a non-executable file prints
+# exactly one `MTLK-ABORT <kind>-candidate-<reason> <requested>` line and
+# returns 2. Success prints nothing and returns 0; the caller normalizes the
+# selected value with mtlk_abs_path. An explicit request NEVER falls back to
+# PATH, regardless of MTLK_REQUIRE_GUEST_INIT.
+mtlk_validate_candidate() {
+  local kind="$1" value="${2:-}"
+  if [ -z "$value" ] || [ ! -e "$value" ]; then
+    printf 'MTLK-ABORT %s-candidate-missing %s\n' "$kind" "$value"
+    return 2
+  fi
+  if [ ! -f "$value" ]; then
+    printf 'MTLK-ABORT %s-candidate-not-a-file %s\n' "$kind" "$value"
+    return 2
+  fi
+  if [ ! -x "$value" ]; then
+    printf 'MTLK-ABORT %s-candidate-not-executable %s\n' "$kind" "$value"
+    return 2
+  fi
+  return 0
+}
+
 # mtlk_resolve_runtime — fill MTLK_MATCHLOCK_RPC_BIN / MTLK_GUEST_INIT.
 # MUST be called BEFORE any PATH/HOME change so the operator's tools are found.
+#
+# An explicitly requested candidate (either spelling) is validated and
+# normalized to an absolute path; a bad explicit candidate fails closed
+# (return 2) instead of quietly resolving an installed binary from PATH. With
+# no explicit request the historical resolution is preserved exactly: PATH
+# matchlock, then the sibling guest-init next to that matchlock, then PATH
+# guest-init.
 mtlk_resolve_runtime() {
-  if [ -z "${MTLK_MATCHLOCK_RPC_BIN:-}" ]; then
+  local resolved
+
+  if [ "${_MTLK_EXPLICIT_MATCHLOCK_REQUEST:-0}" = "1" ]; then
+    mtlk_validate_candidate matchlock "${MTLK_MATCHLOCK_RPC_BIN:-}" || return $?
+    resolved="$(mtlk_abs_path "${MTLK_MATCHLOCK_RPC_BIN:-}")" || {
+      printf 'MTLK-ABORT matchlock-candidate-missing %s\n' "${MTLK_MATCHLOCK_RPC_BIN:-}"
+      return 2
+    }
+    MTLK_MATCHLOCK_RPC_BIN="$resolved"
+  elif [ -z "${MTLK_MATCHLOCK_RPC_BIN:-}" ]; then
     MTLK_MATCHLOCK_RPC_BIN="$(command -v matchlock 2>/dev/null || true)"
   fi
 
-  if [ -z "${MTLK_GUEST_INIT:-}" ] && [ -n "${MTLK_MATCHLOCK_RPC_BIN:-}" ]; then
-    local bin_dir
-    bin_dir="$(cd -- "$(dirname -- "$MTLK_MATCHLOCK_RPC_BIN")" 2>/dev/null && pwd)"
-    if [ -n "$bin_dir" ] && [ -x "$bin_dir/guest-init" ]; then
-      MTLK_GUEST_INIT="$bin_dir/guest-init"
+  if [ "${_MTLK_EXPLICIT_GUEST_INIT_REQUEST:-0}" = "1" ]; then
+    mtlk_validate_candidate guest-init "${MTLK_GUEST_INIT:-}" || return $?
+    resolved="$(mtlk_abs_path "${MTLK_GUEST_INIT:-}")" || {
+      printf 'MTLK-ABORT guest-init-candidate-missing %s\n' "${MTLK_GUEST_INIT:-}"
+      return 2
+    }
+    MTLK_GUEST_INIT="$resolved"
+  else
+    if [ -z "${MTLK_GUEST_INIT:-}" ] && [ -n "${MTLK_MATCHLOCK_RPC_BIN:-}" ]; then
+      local bin_dir
+      bin_dir="$(cd -- "$(dirname -- "$MTLK_MATCHLOCK_RPC_BIN")" 2>/dev/null && pwd)"
+      if [ -n "$bin_dir" ] && [ -x "$bin_dir/guest-init" ]; then
+        MTLK_GUEST_INIT="$bin_dir/guest-init"
+      fi
+    fi
+    if [ -z "${MTLK_GUEST_INIT:-}" ]; then
+      MTLK_GUEST_INIT="$(command -v guest-init 2>/dev/null || true)"
     fi
   fi
-  if [ -z "${MTLK_GUEST_INIT:-}" ]; then
-    MTLK_GUEST_INIT="$(command -v guest-init 2>/dev/null || true)"
+
+  # ---------------------------------------------------------------------------
+  # SUITE-BRIDGE (US-002) — propagate the RESOLVED runtime to BOTH naming
+  # schemes.
+  #
+  # The suite speaks MTLK_*; the product launcher reads
+  # TAMANDUA_MATCHLOCK_RPC_BIN (`MATCHLOCK_RPC_BIN_ENV`, admission.ts) and
+  # MATCHLOCK_GUEST_INIT. Exporting ONLY the suite spelling meant a candidate
+  # supplied the documented suite way never reached the launcher, which then
+  # fell back to `matchlock` on PATH — a green run that booted an installed
+  # binary that was never under test. Both names now carry the same resolved
+  # value, so the selection survives every env-scrubbing child-process boundary.
+  #
+  # An EMPTY resolution (nothing requested, nothing found) NEVER overwrites a
+  # product name: the historical installed-runtime PATH fallback must keep
+  # working exactly as before, and no fabricated non-empty value is exported.
+  # ---------------------------------------------------------------------------
+  if [ -n "${MTLK_MATCHLOCK_RPC_BIN:-}" ]; then
+    export TAMANDUA_MATCHLOCK_RPC_BIN="$MTLK_MATCHLOCK_RPC_BIN"
+  fi
+  if [ -n "${MTLK_GUEST_INIT:-}" ]; then
+    export MATCHLOCK_GUEST_INIT="$MTLK_GUEST_INIT"
   fi
 
   export MTLK_MATCHLOCK_RPC_BIN MTLK_GUEST_INIT
+  return 0
 }
 
 # mtlk_export_backend — propagate the configured backend to matchlock.
@@ -326,13 +438,14 @@ mtlk_probe_capabilities() {
 
   [ -n "${MTLK_MATCHLOCK_RPC_BIN:-}" ] ||
     mtlk_cap_fail "no-matchlock"
-  [ -x "$MTLK_MATCHLOCK_RPC_BIN" ] ||
+  # -f AND -x: a directory is executable but is never a runnable candidate.
+  { [ -f "$MTLK_MATCHLOCK_RPC_BIN" ] && [ -x "$MTLK_MATCHLOCK_RPC_BIN" ]; } ||
     mtlk_cap_fail "matchlock-not-executable:$MTLK_MATCHLOCK_RPC_BIN"
 
   if mtlk_is_truthy "${MTLK_REQUIRE_GUEST_INIT:-1}"; then
     [ -n "${MTLK_GUEST_INIT:-}" ] ||
       mtlk_cap_fail "no-guest-init"
-    [ -x "$MTLK_GUEST_INIT" ] ||
+    { [ -f "$MTLK_GUEST_INIT" ] && [ -x "$MTLK_GUEST_INIT" ]; } ||
       mtlk_cap_fail "guest-init-not-executable:$MTLK_GUEST_INIT"
   fi
   return 0

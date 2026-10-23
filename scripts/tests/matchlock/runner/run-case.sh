@@ -54,6 +54,21 @@ if [ -z "$CASE_ARG" ] || [ -z "$OUT" ]; then
 fi
 ML="${3:-${MTLK_MATCHLOCK_RPC_BIN:-matchlock}}"
 
+# SUITE-BRIDGE (US-002) — an ABSOLUTE $3 override is the binary THIS case's
+# BEFORE/AFTER inventory uses AND the binary the launched tamandua must use.
+# Sync it under the product spelling (and the suite spelling) before the driver
+# is spawned so the inventory binary and the launcher binary cannot diverge.
+# A BARE name is deliberately NOT propagated: the product resolves an override
+# through `path.resolve()` rather than a PATH search, so exporting `matchlock`
+# would name a cwd-relative file instead of the PATH binary this case
+# inventoried (the no-override case already exports the PATH-resolved pair).
+case "$ML" in
+  /*)
+    export MTLK_MATCHLOCK_RPC_BIN="$ML"
+    export TAMANDUA_MATCHLOCK_RPC_BIN="$ML"
+    ;;
+esac
+
 # Workdir binding (common.sh default) exported for the driver + embedded python.
 WORKDIR="${MTLK_WORKDIR:-$SUITE_DIR/work}"
 export MTLK_WORKDIR="$WORKDIR"

@@ -159,7 +159,7 @@ mtlk_tier_cases() {
 # VM tier is actually requested, so a t1-only run needs no hypervisor.
 # -----------------------------------------------------------------------------
 mtlk_prepare() {
-  mtlk_resolve_runtime
+  mtlk_resolve_runtime || return $?
   mtlk_require_digest
   if [ -z "${MTLK_TAMANDUA_BIN:-}" ]; then
     mtlk_resolve_mode || return 2

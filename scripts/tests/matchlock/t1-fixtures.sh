@@ -6,9 +6,12 @@
 #
 # T1 is the fast, no-VM, no-model tier. It runs, in order:
 #
-#   runner/pty-selftest.sh          the frozen PTY driver behavioral self-test
-#   fixtures/fixtures-test.sh       run-case.sh + hygiene.sh negative controls
-#   fixtures/fixtures-validator.sh  the tier-aware validator + manifest controls
+#   runner/pty-selftest.sh              the frozen PTY driver behavioral self-test
+#   fixtures/fixtures-test.sh           run-case.sh + hygiene.sh negative controls
+#   fixtures/fixtures-validator.sh      the tier-aware validator + manifest controls
+#   fixtures/candidate-binding-test.sh  runtime candidate-binding negative controls
+#                                       (candidate vs PATH decoy, fail-closed
+#                                       explicit candidates, installed fallback)
 #
 # It boots NO VM, touches NO model, and takes NO gate lock, so it is safe to run
 # anywhere (including a sandbox without /dev/kvm). A composed runner (the
@@ -48,6 +51,7 @@ SUITE_DIR="$SELF_DIR"
 SELFTEST="${MTLK_PTY_SELFTEST:-$SUITE_DIR/runner/pty-selftest.sh}"
 FIX_TEST="${MTLK_T1_FIXTURES_TEST:-$SUITE_DIR/fixtures/fixtures-test.sh}"
 FIX_VALIDATOR="${MTLK_T1_FIXTURES_VALIDATOR:-$SUITE_DIR/fixtures/fixtures-validator.sh}"
+CAND_BINDING="${MTLK_T1_CANDIDATE_BINDING_TEST:-$SUITE_DIR/fixtures/candidate-binding-test.sh}"
 
 EV_ARG="${1:-}"
 T1_OWNED=0
@@ -141,6 +145,8 @@ echo '--- T1 run-case/hygiene fixtures ---'
 run_component fixtures-test "$FIX_TEST" "$SUITE_DIR"
 echo '--- T1 validator fixtures ---'
 run_component fixtures-validator "$FIX_VALIDATOR"
+echo '--- T1 runtime candidate-binding fixtures ---'
+run_component candidate-binding "$CAND_BINDING"
 
 # -----------------------------------------------------------------------------
 # Terminal verdict from the component results only.
