@@ -1,0 +1,27 @@
+MATCHLOCK LAUNCH GATE: LAUNCH REFUSED
+stores evaluated: 1
+stores failing: 1
+findings: 1
+store-set findings: 0
+holders observed: 0
+The gate runs before any VM is created and before any mount is made: this refusal launched nothing and mounted nothing.
+The ten reason codes are closed; operational failures (receipt write, revalidation, evaluation crash) are a separate class and are never renumbered into them.
+Holders are informational only: they identify live processes so this text is actionable, and they are never a lease, an ownership claim or a reason code.
+
+STORE 1/1: /profile/stores/wal.db
+  presence: present
+  codes: sidecar-unresolved
+  evidence: presence=present; required=yes; config="delete" source=merged-config observed=yes; header=rollback pair=(1,1) bytes=4096; sidecars: -wal=presentNonEmpty -shm=absent -journal=absent
+  finding [sidecar-unresolved]: Unresolved sidecar state: -wal=presentNonEmpty.
+  remedy:
+    - The -wal sidecar is nonempty; checkpointing it is legitimate. Quiesce every writer, then checkpoint the write-ahead-log so the sidecar can be removed before relaunching.
+  holders: none observed
+
+HOLDER PROBE (informational)
+  observation complete: yes
+  probe failures: none recorded
+  A failed holder probe is informational: no reason code covers it, it adds no finding and it never changes the verdict.
+
+RELAUNCH
+  Launch again only after every finding above is addressed.
+  Relaunch: tamandua matchlock hermes --profile demo

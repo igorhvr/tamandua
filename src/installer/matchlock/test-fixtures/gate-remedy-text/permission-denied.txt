@@ -1,0 +1,29 @@
+MATCHLOCK LAUNCH GATE: LAUNCH REFUSED
+stores evaluated: 1
+stores failing: 1
+findings: 2
+store-set findings: 0
+holders observed: 0
+The gate runs before any VM is created and before any mount is made: this refusal launched nothing and mounted nothing.
+The ten reason codes are closed; operational failures (receipt write, revalidation, evaluation crash) are a separate class and are never renumbered into them.
+Holders are informational only: they identify live processes so this text is actionable, and they are never a lease, an ownership claim or a reason code.
+
+STORE 1/1: /profile/stores/main.db
+  presence: unresolved
+  codes: path-unresolved, permission-denied
+  evidence: presence=unresolved; required=yes; config=unobserved; header=unobserved; sidecars=unobserved
+  finding [path-unresolved]: The store path could not be resolved; cannot-determine is not absence.
+  finding [permission-denied]: Resolving the store path failed with a permission error; a permission failure is never absence.
+  remedy:
+    - Resolve the path or permission error so the store path can be determined, then re-run the gate. Cannot-determine is not absence.
+    - Grant read access to the store path, or use a readable location, then re-run the gate. A permission failure is never absence.
+  holders: none observed
+
+HOLDER PROBE (informational)
+  observation complete: yes
+  probe failures: none recorded
+  A failed holder probe is informational: no reason code covers it, it adds no finding and it never changes the verdict.
+
+RELAUNCH
+  Launch again only after every finding above is addressed.
+  Relaunch: tamandua matchlock hermes --profile demo

@@ -1,0 +1,28 @@
+MATCHLOCK LAUNCH GATE: LAUNCH REFUSED
+stores evaluated: 1
+stores failing: 1
+findings: 1
+store-set findings: 0
+holders observed: 0
+The gate runs before any VM is created and before any mount is made: this refusal launched nothing and mounted nothing.
+The ten reason codes are closed; operational failures (receipt write, revalidation, evaluation crash) are a separate class and are never renumbered into them.
+Holders are informational only: they identify live processes so this text is actionable, and they are never a lease, an ownership claim or a reason code.
+
+STORE 1/1: /profile/stores/main.db
+  presence: present
+  codes: header-unreadable
+  evidence: presence=present; required=yes; config="delete" source=merged-config observed=yes; header=unknown pair=(2,1) bytes=4096; sidecars: -wal=absent -shm=absent -journal=absent
+  finding [header-unreadable]: The store header carries the unrecognised version pair (2,1); rollback-format is required.
+  remedy:
+    - Re-observe the store header with every writer quiescent, then relaunch. The observed version pair is (2,1); it is not rollback-format.
+    - If the header stays unreadable, collect the store and its sidecars as evidence and restore the store from a known-good copy before relaunching.
+  holders: none observed
+
+HOLDER PROBE (informational)
+  observation complete: yes
+  probe failures: none recorded
+  A failed holder probe is informational: no reason code covers it, it adds no finding and it never changes the verdict.
+
+RELAUNCH
+  Launch again only after every finding above is addressed.
+  Relaunch: tamandua matchlock hermes --profile demo
