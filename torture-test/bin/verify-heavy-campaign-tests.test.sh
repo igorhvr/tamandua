@@ -117,8 +117,10 @@ for base in "${HEAVY_TESTS[@]}"; do
     if [ "$rc" -eq 0 ]; then
         pass "$base"
     elif [ "$rc" -eq 124 ]; then
-        fail "$base: TIMED OUT after ${PER_TEST_TIMEOUT_SEC}s. Run it individually and clean any leaked"
-        echo "       daemons on ports 5334/5338/5339 (e.g. pkill -f tt-controller) before rerunning."
+        fail "$base: TIMED OUT after ${PER_TEST_TIMEOUT_SEC}s. Run it individually."
+        echo "       If it left daemons on ports 5334/5338/5339, stop ONLY the PIDs this run recorded"
+        echo "       (campaign/daemon PID files under torture-test/var/, or PIDs printed by this run)."
+        echo "       Never name-sweep processes on a shared host - another run's daemon can match."
         tail -20 "$log" | sed 's/^/    /'
     else
         fail "$base: node --test exited $rc (see tail below)"
