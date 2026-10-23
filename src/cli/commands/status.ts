@@ -24,7 +24,7 @@ export function getDoctorHelp(): string {
 
 Usage: tamandua doctor [--repair]
 
-Runs a comprehensive health check across six categories and prints a
+Runs a comprehensive health check across seven categories and prints a
 pass/fail icon for each check. On failure, the exact remedy command is
 shown alongside the failure.
 
@@ -59,6 +59,11 @@ Check categories:
                On mismatch, tells you to restart the daemon.
   STATE        Database opens, and medic-style run anomaly detection
                (zombie runs, long-stuck steps).
+  LAUNCH GATE  Report-only Matchlock hermes pre-flight: reports whether a
+               launch would refuse or would allow, based on rollback-format
+               store headers plus the effective delete journal-mode config,
+               and lists informational store holders. It never writes
+               receipts, creates VMs or changes config.
   LLM PROMPT   Per-step key-emission rates from workflow runs — measures
   ADHERENCE    how often agents deliver expected output keys declared in
                step Reply-with contracts. Reports rates per key, warns on

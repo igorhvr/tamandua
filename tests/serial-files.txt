@@ -61,6 +61,8 @@ src/installer/ledger-gate.test.ts
 src/installer/matchlock/admission.test.ts
 src/installer/matchlock/allow-private-support.test.ts
 src/installer/matchlock/controller.test.ts
+src/installer/matchlock/doctor-gate-report-only.test.ts
+src/installer/matchlock/doctor-gate.test.ts
 src/installer/matchlock/dsh-scheduler-seam.test.ts
 src/installer/matchlock/execution-boundary.test.ts
 src/installer/matchlock/fake-rpc-driver.test.ts

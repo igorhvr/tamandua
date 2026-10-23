@@ -14,9 +14,20 @@ describe("SPL2 status and doctor command module", () => {
     assert.match(getStatusHelp(), /--json/);
     assert.match(getDoctorHelp(), /tamandua doctor/);
     assert.match(getDoctorHelp(), /LIVENESS/);
+    assert.match(getDoctorHelp(), /LAUNCH GATE/);
+    assert.match(getDoctorHelp(), /would refuse/);
     assert.match(getDoctorHelp(), /LLM PROMPT/);
     assert.match(getDoctorHelp(), /--repair/);
     assert.match(getDoctorHelp(), /tamandua doctor --repair/);
+  });
+
+  it("documents the LAUNCH GATE category as a report-only launch-scoped pre-flight", () => {
+    const help = getDoctorHelp();
+    assert.match(help, /seven categories/);
+    assert.match(help, /LAUNCH GATE/);
+    assert.match(help, /would refuse/);
+    assert.match(help, /would allow/);
+    assert.match(help, /never writes\s+receipts, creates VMs or changes config/);
   });
 
   it("declines commands owned by other command groups", async () => {

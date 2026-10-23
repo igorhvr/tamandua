@@ -1,8 +1,9 @@
 /**
  * Doctor — tamandua one-shot diagnostic tool.
  *
- * Runs grouped health checks (ENVIRONMENT, SERVICES, LIVENESS, STALENESS, STATE, LLM PROMPT ADHERENCE)
- * and produces pass/fail output with exact remedy commands for failures.
+ * Runs grouped health checks (ENVIRONMENT, SERVICES, LIVENESS, STALENESS, STATE,
+ * LAUNCH GATE, LLM PROMPT ADHERENCE) and produces pass/fail output with exact
+ * remedy commands for failures.
  * All functions return results rather than printing directly, so the
  * CLI layer handles I/O and tests can assert on data.
  */
@@ -95,6 +96,8 @@ import {
   resolveMatchlockPaths,
 } from "./installer/matchlock-setup.js";
 import type { MaybePromise } from "./installer/matchlock-setup.js";
+import { runLaunchGateChecks } from "./installer/matchlock/doctor-gate.js";
+import type { RunLaunchGateChecksOptions } from "./installer/matchlock/doctor-gate.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -1287,6 +1290,13 @@ export interface DoctorOpts {
    * (tests). `homeDir` is also threaded into the default kernel-cache read.
    */
   matchlockSetupReadinessDeps?: MatchlockSetupReadinessDeps;
+  /**
+   * Injectable, report-only seams for the LAUNCH GATE group
+   * ({@link runLaunchGateChecks}). Doctor passes `homeDir` separately; anything
+   * here (e.g. the frozen `hermesHomeEnv` snapshot) pins the evaluated profile
+   * deterministically in tests.
+   */
+  launchGateDeps?: RunLaunchGateChecksOptions;
 }
 
 // ── Catalog Staleness check (US-002) ───────────────────────────
@@ -2654,6 +2664,15 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
   const leakChecks = await guardedChecks("Process-leak scan", () => runProcessLeakChecks(opts));
   stateChecks.push(...leakChecks);
 
+  // LAUNCH GATE — report-only Matchlock hermes launch gate (G7 DOCTOR-GATE).
+  // It calls the SAME resolve + observe + evaluate functions the launch path
+  // calls, so a doctor verdict cannot disagree with the gate. Nothing here
+  // writes a receipt, converts a store or creates a VM; a would-refuse is a
+  // `fail` check, which trips the existing hasFailures exit-code path.
+  const launchGateChecks = await guardedChecks("Launch gate checks", () =>
+    runLaunchGateChecks({ homeDir: opts?.homeDir, ...opts?.launchGateDeps }),
+  );
+
   // LLM PROMPT ADHERENCE — wired in US-001
   const adherenceChecks = await guardedChecks("LLM prompt adherence", () => runLlmPromptAdherenceChecks(opts));
 
@@ -2663,6 +2682,7 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
     { label: "LIVENESS", checks: livenessChecks },
     { label: "STALENESS", checks: stalenessChecks },
     { label: "STATE", checks: stateChecks },
+    { label: "LAUNCH GATE", checks: launchGateChecks },
     { label: "LLM PROMPT ADHERENCE", checks: adherenceChecks },
   ];
 }
