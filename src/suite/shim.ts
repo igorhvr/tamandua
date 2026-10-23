@@ -34,16 +34,13 @@ import {
   isTstxEnabled,
 } from "./config.js";
 import { composeLogTail } from "./log-tail.js";
+import {
+  TREE_DRIFT_EXIT_CODE,
+  INTERRUPTED_EXIT_CODE,
+  TREE_DIRTY_EXIT_CODE,
+} from "./exit-codes.js";
 
 const SINGLEFLIGHT_POLL_INTERVAL_MS = 1000; // 1s
-/** Dedicated fail-closed exit when a passing command cannot be attributed. */
-const TREE_DRIFT_EXIT_CODE = 86;
-/** Dedicated red-ledger exit for executions interrupted by a catchable signal
- *  from the CALLER (e.g., command timeout, external kill). The suite was
- *  terminated before it could finish; no usable evidence was produced. */
-const INTERRUPTED_EXIT_CODE = 87;
-/** Dedicated refusal when tracked files are already dirty before testing. */
-const TREE_DIRTY_EXIT_CODE = 88;
 const FORWARDED_SIGNALS: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"];
 
 // Module-level variables so the catch handler at the bottom can reach the

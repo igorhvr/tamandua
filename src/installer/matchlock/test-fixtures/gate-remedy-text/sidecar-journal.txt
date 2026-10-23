@@ -1,0 +1,32 @@
+MATCHLOCK LAUNCH GATE: LAUNCH REFUSED
+stores evaluated: 1
+stores failing: 1
+findings: 1
+store-set findings: 0
+holders observed: 0
+The gate runs before any VM is created and before any mount is made: this refusal launched nothing and mounted nothing.
+The ten reason codes are closed; operational failures (receipt write, revalidation, evaluation crash) are a separate class and are never renumbered into them.
+Holders are informational only: they identify live processes so this text is actionable, and they are never a lease, an ownership claim or a reason code.
+
+STORE 1/1: /profile/stores/journal.db
+  presence: present
+  codes: sidecar-unresolved
+  evidence: presence=present; required=yes; config="delete" source=merged-config observed=yes; header=rollback pair=(1,1) bytes=4096; sidecars: -wal=absent -shm=absent -journal=presentNonEmpty
+  finding [sidecar-unresolved]: Unresolved sidecar state: -journal=presentNonEmpty.
+  remedy:
+    - The -journal sidecar is nonempty: this is a ROLLBACK journal, not a write-ahead-log, so a checkpoint is NOT a treatment for it.
+    - The refusal may be TRANSIENT while a healthy delete-journal transaction is in flight: wait for quiescence (every writer stopped), then re-observe the store before relaunching.
+    - If the -journal sidecar persists after quiescence, use the supported recovery/conversion path. The -journal file is never deleted.
+      command: hermes sessions set-journal-mode delete --db /profile/stores/journal.db
+    - For a quiescent NATIVE store, the exact reverse conversion restores the wal journal mode:
+      command: hermes sessions set-journal-mode wal --db /profile/stores/journal.db
+  holders: none observed
+
+HOLDER PROBE (informational)
+  observation complete: yes
+  probe failures: none recorded
+  A failed holder probe is informational: no reason code covers it, it adds no finding and it never changes the verdict.
+
+RELAUNCH
+  Launch again only after every finding above is addressed.
+  Relaunch: tamandua matchlock hermes --profile demo

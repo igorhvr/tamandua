@@ -67,6 +67,8 @@ src/installer/matchlock/dsh-scheduler-seam.test.ts
 src/installer/matchlock/execution-boundary.test.ts
 src/installer/matchlock/fake-rpc-driver.test.ts
 src/installer/matchlock/finalizer-ledger-seam.test.ts
+# Spawns `node tests/fixtures/gate-refusal-demo.mjs` and asserts its exit status.
+src/installer/matchlock/gate-refusal-demo.test.ts
 src/installer/matchlock/guest-bridge.test.ts
 src/installer/matchlock/guest-suite.test.ts
 src/installer/matchlock/harness-workflow-matrix.test.ts

@@ -1,0 +1,28 @@
+MATCHLOCK LAUNCH GATE: LAUNCH REFUSED
+stores evaluated: 1
+stores failing: 1
+findings: 1
+store-set findings: 0
+holders observed: 0
+The gate runs before any VM is created and before any mount is made: this refusal launched nothing and mounted nothing.
+The ten reason codes are closed; operational failures (receipt write, revalidation, evaluation crash) are a separate class and are never renumbered into them.
+Holders are informational only: they identify live processes so this text is actionable, and they are never a lease, an ownership claim or a reason code.
+
+STORE 1/1: /profile/stores/main.db
+  presence: confirmed-absent
+  codes: store-missing
+  evidence: presence=confirmed-absent; required=yes; config=unobserved; header=unobserved; sidecars: -wal=absent -shm=absent -journal=absent
+  finding [store-missing]: The store is required but definitively absent (ENOENT); an absent path has no identity and no canonical path is synthesized.
+  remedy:
+    - This required store is absent. A fresh or absent store must be initialised natively first; the gate never creates a store.
+    - Relaunch only after the store exists natively.
+  holders: none observed
+
+HOLDER PROBE (informational)
+  observation complete: yes
+  probe failures: none recorded
+  A failed holder probe is informational: no reason code covers it, it adds no finding and it never changes the verdict.
+
+RELAUNCH
+  Launch again only after every finding above is addressed.
+  Relaunch: tamandua matchlock hermes --profile demo

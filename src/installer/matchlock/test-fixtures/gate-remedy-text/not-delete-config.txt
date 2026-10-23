@@ -1,0 +1,32 @@
+MATCHLOCK LAUNCH GATE: LAUNCH REFUSED
+stores evaluated: 1
+stores failing: 1
+findings: 1
+store-set findings: 0
+holders observed: 0
+The gate runs before any VM is created and before any mount is made: this refusal launched nothing and mounted nothing.
+The ten reason codes are closed; operational failures (receipt write, revalidation, evaluation crash) are a separate class and are never renumbered into them.
+Holders are informational only: they identify live processes so this text is actionable, and they are never a lease, an ownership claim or a reason code.
+
+STORE 1/1: /profile/stores/main.db
+  presence: present
+  codes: not-delete-config
+  evidence: presence=present; required=yes; config="wal" source=merged-config observed=yes; header=rollback pair=(1,1) bytes=4096; sidecars: -wal=absent -shm=absent -journal=absent
+  finding [not-delete-config]: The effective journal-mode configuration (source merged-config) requests "wal"; the runtime must request the delete journal mode.
+  remedy:
+    - Set `database.journal_mode: delete` in the configuration the GUEST reads (/guest/.hermes/config.yaml), not in the host's configuration. A missing, malformed or unrecognised value resolves fail-safe to wal, so the guest-visible value must be explicit.
+    - Quiesce every writer before converting: a conversion under a live writer is not safe.
+    - Apply the delete journal mode to the store so its on-disk format matches the guest-visible configuration:
+      command: hermes sessions set-journal-mode delete --db /profile/stores/main.db
+    - For a quiescent NATIVE store, the exact reverse conversion restores the wal journal mode:
+      command: hermes sessions set-journal-mode wal --db /profile/stores/main.db
+  holders: none observed
+
+HOLDER PROBE (informational)
+  observation complete: yes
+  probe failures: none recorded
+  A failed holder probe is informational: no reason code covers it, it adds no finding and it never changes the verdict.
+
+RELAUNCH
+  Launch again only after every finding above is addressed.
+  Relaunch: tamandua matchlock hermes --profile demo

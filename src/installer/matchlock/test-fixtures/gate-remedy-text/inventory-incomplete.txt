@@ -1,0 +1,24 @@
+MATCHLOCK LAUNCH GATE: LAUNCH REFUSED
+stores evaluated: 0
+stores failing: 0
+findings: 1
+store-set findings: 1
+holders observed: 0
+The gate runs before any VM is created and before any mount is made: this refusal launched nothing and mounted nothing.
+The ten reason codes are closed; operational failures (receipt write, revalidation, evaluation crash) are a separate class and are never renumbered into them.
+Holders are informational only: they identify live processes so this text is actionable, and they are never a lease, an ownership claim or a reason code.
+
+STORE SET
+  finding [inventory-incomplete]: Store enumeration did not complete (contract-incomplete:seed); the store set is unknown, so no conclusion may be drawn about which stores exist.
+  remedy:
+    - Fix store enumeration and re-run the gate. An incomplete inventory means the store set is unknown and is never evidence that no stores exist.
+    - Collect the incomplete reasons above and re-observe every store before relaunching.
+
+HOLDER PROBE (informational)
+  observation complete: yes
+  probe failures: none recorded
+  A failed holder probe is informational: no reason code covers it, it adds no finding and it never changes the verdict.
+
+RELAUNCH
+  Launch again only after every finding above is addressed.
+  Relaunch: tamandua matchlock hermes --profile demo
