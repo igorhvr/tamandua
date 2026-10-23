@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# tt-reap-owned-cargo — ownership-scoped reaper for stale tt-rust cargo-test
+# processes belonging to ONE build-golden invocation.
+#
+# Usage:
+#   tt-reap-owned-cargo --token <token> [--grace-seconds N]
+#
+# Ownership rule (all must hold before a PID is signalled):
+#   * the PID belongs to this UID (discovery is `ps -U "$(id -u)"`)
+#   * the PID is alive at discovery and at every signal boundary
+#   * the process ENVIRONMENT carries TT_RUST_BUILD_INVOCATION_ID=<token>
+#   * the token does NOT appear in the process's plain argv
+#   * the process start identity (`ps -p <pid> -o lstart=`) is unchanged
+#     since discovery — guards against PID reuse
+#
+# The token is unique per build-golden invocation (derived from the builder's
+# mktemp work directory and PID), so a concurrent run's cargo test can never
+# match. This helper deliberately performs no name/pattern sweep: it never
+# reaches a process it cannot prove this invocation started.
+#
+# Exit status: 0 on a valid run (whether or not anything was reaped);
+# 2 on invalid usage.
+set -euo pipefail
+
+ENV_KEY="TT_RUST_BUILD_INVOCATION_ID"
+
+usage() {
+    printf 'usage: tt-reap-owned-cargo --token <token> [--grace-seconds N]\n' >&2
+}
+
+token=""
+grace_seconds=2
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --token)
+            [ "$#" -ge 2 ] || { usage; exit 2; }
+            token="$2"
+            shift 2
+            ;;
+        --token=*)
+            token="${1#--token=}"
+            shift
+            ;;
+        --grace-seconds)
+            [ "$#" -ge 2 ] || { usage; exit 2; }
+            grace_seconds="$2"
+            shift 2
+            ;;
+        --grace-seconds=*)
+            grace_seconds="${1#--grace-seconds=}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'tt-reap-owned-cargo: unknown argument: %s\n' "$1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+if [ -z "$token" ]; then
+    printf 'tt-reap-owned-cargo: --token is required\n' >&2
+    usage
+    exit 2
+fi
+
+case "$grace_seconds" in
+    ''|*[!0-9]*)
+        printf 'tt-reap-owned-cargo: --grace-seconds must be a non-negative integer\n' >&2
+        exit 2
+        ;;
+esac
+
+needle="$ENV_KEY=$token"
+
+# One line per same-UID process: pid, then the command line with its
+# environment appended by `eww`.
+discovery_file="$(mktemp "${TMPDIR:-/tmp}/tt-reap-owned-cargo.XXXXXX")"
+cleanup_discovery() {
+    rm -f "$discovery_file"
+}
+trap cleanup_discovery EXIT INT TERM
+
+# Process start identity used for the PID-reuse guard. Raw output is compared
+# byte-for-byte between discovery and the signal boundary (same ps invocation,
+# same host), so no normalisation is needed.
+process_start_identity() {
+    ps -p "$1" -o lstart= 2>/dev/null
+}
+
+# Does the process ENVIRONMENT carry the per-invocation token? `ps eww` appends
+# the environment to the command line; the plain-argv guard below rejects
+# processes that merely carry the token as an argument.
+process_has_owned_env() {
+    local pid=$1 details
+    details="$(ps eww -p "$pid" -o args= 2>/dev/null)" || return 1
+    printf '%s\n' "$details" | grep -F -q -- "$needle"
+}
+
+# Does the token appear in the plain argv? Such a process is never signalled:
+# it could be this reaper, its caller, or an argv-only decoy that merely
+# mentions the token.
+process_argv_contains_token() {
+    local pid=$1 argv
+    argv="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+    printf '%s\n' "$argv" | grep -F -q -- "$token"
+}
+
+# Is the PID still a LIVE process? A zombie (state Z) is already terminated
+# and may linger until its parent reaps it; treating it as gone keeps the
+# final reaped count truthful and avoids signalling a dead PID.
+process_is_running() {
+    local pid=$1 state
+    kill -0 "$pid" 2>/dev/null || return 1
+    state="$(ps -p "$pid" -o stat= 2>/dev/null)" || return 1
+    [ -n "$state" ] || return 1
+    case "$state" in
+        Z*) return 1 ;;
+    esac
+    return 0
+}
+
+# Re-check everything that must hold immediately before a signal. Returns 0
+# only for a live, same-UID, env-token-owned process whose start identity is
+# still the one recorded at discovery and whose argv does not carry the token.
+still_owned() {
+    local pid=$1 identity=$2 current
+    kill -0 "$pid" 2>/dev/null || return 1
+    current="$(process_start_identity "$pid")" || return 1
+    [ "$current" = "$identity" ] || return 1
+    process_argv_contains_token "$pid" && return 1
+    process_has_owned_env "$pid" || return 1
+    return 0
+}
+
+ps -U "$(id -u)" eww -o pid= -o args= >"$discovery_file" 2>/dev/null || true
+
+reaped_count=0
+
+while IFS= read -r line; do
+    # Trim leading whitespace, then split off the leading pid field.
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [ -n "$trimmed" ] || continue
+    pid="${trimmed%%[[:space:]]*}"
+    case "$pid" in
+        ''|*[!0-9]*) continue ;;
+    esac
+    [ "$pid" -gt 1 ] || continue
+    [ "$pid" != "$$" ] || continue
+    [ "$pid" != "$PPID" ] || continue
+
+    kill -0 "$pid" 2>/dev/null || continue
+    # An argv-only mention of the token is NOT ownership.
+    process_argv_contains_token "$pid" && continue
+    process_has_owned_env "$pid" || continue
+
+    start_identity="$(process_start_identity "$pid")"
+    [ -n "$start_identity" ] || continue
+
+    # Re-read the identity and the env token immediately before TERM.
+    still_owned "$pid" "$start_identity" || continue
+
+    if ! kill -TERM "$pid" 2>/dev/null; then
+        continue
+    fi
+    printf 'TERM pid=%s identity=%s\n' "$pid" "$start_identity"
+
+    # Graceful poll: give the process `grace_seconds` to exit on SIGTERM.
+    waited=0
+    while [ "$waited" -lt "$grace_seconds" ]; do
+        process_is_running "$pid" || break
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if process_is_running "$pid"; then
+        # Re-verify identity + env token immediately before the hard kill.
+        if still_owned "$pid" "$start_identity"; then
+            if kill -KILL "$pid" 2>/dev/null; then
+                printf 'KILL pid=%s identity=%s\n' "$pid" "$start_identity"
+            fi
+        fi
+    fi
+
+    # Count it reaped only once the PID is no longer a live process.
+    if ! process_is_running "$pid"; then
+        reaped_count=$((reaped_count + 1))
+    fi
+done <"$discovery_file"
+
+printf 'reaped=%d owned process(es)\n' "$reaped_count"

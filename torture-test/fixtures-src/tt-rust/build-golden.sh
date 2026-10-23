@@ -40,6 +40,12 @@ rm -rf "$GOLDEN_BARE"
 # ── Prepare work tree ──────────────────────────────────────────────
 # Copy fixture source excluding generated crud that shouldn't be committed.
 WORK_DIR="$(mktemp -d "$VAR_DIR/tmp.build-golden.XXXXXX")"
+# Per-invocation ownership token: WORK_DIR is mktemp-unique and $$ is this
+# builder's PID, so no concurrent run can produce the same token. Deliberately
+# NOT exported: only the cargo test command below carries it in its
+# environment, which is what lets the ownership reaper distinguish this
+# invocation's stale cargo processes from every other process on the host.
+TT_RUST_BUILD_INVOCATION_ID="tt-rust-build.$WORK_DIR.$$"
 cleanup_work() { rm -rf "$WORK_DIR"; }
 trap cleanup_work EXIT
 
@@ -280,15 +286,19 @@ for seed_id in "${SEED_ORDER[@]}"; do
     # Checkout the seed ref and clean any artifacts from previous runs
     (cd "$SCRATCH_DIR" && git checkout -q "seed/$seed_id" && git clean -fdq)
 
-    # Run tests with timeout (BUG-R3 hangs by design — A3 infinite loop)
-    if timeout 15 cargo test --quiet >/dev/null 2>&1; then
+    # Run tests with timeout (BUG-R3 hangs by design — A3 infinite loop).
+    # The per-invocation token is passed ONLY on this command's environment so
+    # the ownership reaper can prove which cargo processes this run started.
+    if TT_RUST_BUILD_INVOCATION_ID="$TT_RUST_BUILD_INVOCATION_ID" timeout 15 cargo test --quiet >/dev/null 2>&1; then
         echo "  • seed/$seed_id: tests GREEN (bugs are dormant on this test suite)"
     else
         echo "  • seed/$seed_id: tests RED or TIMEOUT (expected symptom — this is a seeded defect)"
     fi
 
-    # Clean up any stale cargo processes left by hanging tests (e.g. BUG-R3)
-    pkill -f "cargo test.*ttrust" 2>/dev/null || true
+    # Clean up any stale cargo processes left by hanging tests (e.g. BUG-R3).
+    # Ownership-scoped: the reaper signals only PIDs carrying this invocation's
+    # token in their environment; a concurrent run's cargo test is never touched.
+    "$REPO_ROOT/torture-test/bin/tt-reap-owned-cargo" --token "$TT_RUST_BUILD_INVOCATION_ID" || true
     sleep 1
 
     # Restore clean working tree on top of the seed ref

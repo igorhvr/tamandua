@@ -282,6 +282,24 @@ const AUDITS: KillAudit[] = [
     identityRefs: [/\bproc_start_time\b/, /\bsentinel_is_alive\b/],
     scanVars: [],
   },
+  {
+    // TT-RUST-BUILDER-PKILL (bead tamandua-47v): the ownership-scoped reaper
+    // that replaces the tt-rust golden builder's host-wide pattern sweep.
+    // Discovery enumerates same-UID processes with `ps ... eww -o pid= -o
+    // args=`; a pid becomes a target only when its ENVIRONMENT carries the
+    // unique per-build-invocation TT_RUST_BUILD_INVOCATION_ID token AND the
+    // token is absent from its plain argv. Immediately before TERM and KILL
+    // the helper re-reads process_start_identity (`ps ... lstart=`) and the
+    // env token, so a dead, changed or PID-reused process is skipped; $$,
+    // $BASHPID and $PPID are excluded. Its only kill targets are "$pid"
+    // values from that env-token registry — never a name/pattern sweep.
+    file: "bin/tt-reap-owned-cargo",
+    killLine: /\bkill[ \t]+(-{1,2}[A-Za-z0-9-]*[ \t]+)?[\$"]/,
+    liveness: [/\bkill[ \t]+-0([ \t]+|["']|$)/],
+    allowed: [/\bkill[ \t]+-[A-Z0-9]+[ \t]+"\$pid"/],
+    identityRefs: [/\bprocess_start_identity\b/, /\blstart\b/, /TT_RUST_BUILD_INVOCATION_ID/],
+    scanVars: [],
+  },
 ];
 
 // ── helpers ────────────────────────────────────────────────────────
