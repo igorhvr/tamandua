@@ -1207,10 +1207,15 @@ it is the sanctioned replacement for the `sleep 2; tamandua get-ready` idiom.
 
 `tamandua doctor` is a one-shot diagnostic that checks environment
 (Node.js >= 22, pi on PATH, gh on PATH), services (dashboard, daemon, MCP), daemon staleness (running daemon matches installed
-build), database state (run-level anomalies), and LLM prompt adherence
+build), database state (run-level anomalies), the Matchlock hermes launch
+gate (a report-only, launch-scoped pre-flight that reports whether a launch
+**would refuse** or **would allow**, based on rollback-format store headers
+plus the effective delete journal-mode config, and lists informational store
+holders), and LLM prompt adherence
 (per-step key-emission rates from workflow runs, measuring how often
 agents deliver expected output keys). Each check prints **pass/fail**
-status and on failure prints the **exact remedy command** to run.
+status and on failure prints the **exact remedy command** to run. The launch
+gate is report-only: it never writes receipts, creates VMs or changes config.
 
 ```bash
 tamandua doctor

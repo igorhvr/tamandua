@@ -353,15 +353,15 @@ describe("CheckGroup type", () => {
 });
 
 describe("runDoctorChecks", () => {
-  it("returns six check groups", async () => {
+  it("returns seven check groups", async () => {
     const groups = await runDoctorChecks();
-    assert.strictEqual(groups.length, 6, `Expected 6 check groups, got ${groups.length}`);
+    assert.strictEqual(groups.length, 7, `Expected 7 check groups, got ${groups.length}`);
   });
 
   it("each group has a label and checks array", async () => {
     const groups = await runDoctorChecks();
     const labels = groups.map((g) => g.label);
-    assert.deepStrictEqual(labels, ["ENVIRONMENT", "SERVICES", "LIVENESS", "STALENESS", "STATE", "LLM PROMPT ADHERENCE"]);
+    assert.deepStrictEqual(labels, ["ENVIRONMENT", "SERVICES", "LIVENESS", "STALENESS", "STATE", "LAUNCH GATE", "LLM PROMPT ADHERENCE"]);
     for (const group of groups) {
       if (group.label === "LLM PROMPT ADHERENCE") {
         // LLM PROMPT ADHERENCE can have 0 checks on an empty database
@@ -415,6 +415,98 @@ describe("runDoctorChecks", () => {
     assert.ok(dbCheck, "Expected 'Database opens' check");
     assert.ok(["pass", "fail"].includes(dbCheck!.status),
       `Database opens check should be pass or fail, got: ${dbCheck!.status}`);
+  });
+
+  it("pins LAUNCH GATE at index 5, after STATE and before LLM PROMPT ADHERENCE", async () => {
+    const groups = await runDoctorChecks();
+    assert.strictEqual(groups[5]?.label, "LAUNCH GATE");
+    assert.strictEqual(groups[6]?.label, "LLM PROMPT ADHERENCE");
+
+    const launchGate = groups[5]!;
+    assert.ok(launchGate.checks.length > 0, "LAUNCH GATE should always emit at least one check");
+    for (const check of launchGate.checks) {
+      assert.strictEqual(typeof check.name, "string");
+      assert.ok(check.name.length > 0, "check name must be non-empty");
+      assert.ok(["pass", "fail", "warn", "info"].includes(check.status),
+        `LAUNCH GATE check "${check.name}" has invalid status: ${check.status}`);
+      assert.strictEqual(typeof check.message, "string");
+      if (check.remedy !== undefined) {
+        assert.strictEqual(typeof check.remedy, "string");
+      }
+    }
+  });
+});
+
+// ── LAUNCH GATE group wiring (G7 DOCTOR-GATE US-006) ──────────────
+
+/**
+ * Write a disposable hermes profile whose one store matches `journalMode`:
+ * `delete` pairs with a rollback header (1,1), `wal` with a WAL header (2,2).
+ * The profile lives under the test's isolated HOME, never the operator's.
+ */
+function writeLaunchGateProfile(
+  homeDir: string,
+  journalMode: "delete" | "wal",
+): { profileDir: string; launchGateDeps: { hermesHomeEnv: string; env: Record<string, string>; managedDir: null } } {
+  const profileDir = path.join(homeDir, "hermes-profile");
+  fs.mkdirSync(profileDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(profileDir, "config.yaml"),
+    `database:\n  journal_mode: ${journalMode}\n`,
+    "utf8",
+  );
+
+  // Synthesize a complete 100-byte SQLite header: signature at 0 and the
+  // write/read format bytes at 18/19. (2,2) = WAL, (1,1) = rollback.
+  const header = Buffer.alloc(100);
+  header.write("SQLite format 3\u0000", 0, "latin1");
+  header[18] = journalMode === "wal" ? 2 : 1;
+  header[19] = header[18]!;
+  fs.writeFileSync(path.join(profileDir, "state.db"), header);
+
+  return {
+    profileDir,
+    // Pin the managed scope and environment so the fixture is deterministic
+    // on every host (no /etc/hermes, no ambient HERMES_* influence).
+    launchGateDeps: { hermesHomeEnv: profileDir, env: {}, managedDir: null },
+  };
+}
+
+describe("LAUNCH GATE group (US-006)", () => {
+  it("fails for an unconverted store and trips formatDoctorOutput.hasFailures", async () => {
+    const { launchGateDeps } = writeLaunchGateProfile(guardHomeDir, "wal");
+
+    const groups = await runDoctorChecks({ homeDir: guardHomeDir, launchGateDeps });
+    const launchGate = groups.find((g) => g.label === "LAUNCH GATE");
+    assert.ok(launchGate, "Expected a LAUNCH GATE group");
+
+    const failing = launchGate!.checks.filter((c) => c.status === "fail");
+    assert.ok(failing.length > 0, "an unconverted store must produce a fail check");
+    const summary = launchGate!.checks.find((c) => c.name === "Matchlock hermes launch gate");
+    assert.ok(summary, "Expected the summary launch-gate check");
+    assert.strictEqual(summary!.status, "fail");
+    assert.ok(summary!.message.includes("would refuse"), summary!.message);
+    assert.ok(
+      failing.some((c) => c.message.includes("inventory-incomplete") || c.message.includes("journal-mode")),
+      `Expected a real reason code in: ${failing.map((c) => c.message).join(" | ")}`,
+    );
+
+    assert.strictEqual(formatDoctorOutput(groups).hasFailures, true);
+  });
+
+  it("does not fail for a converted store", async () => {
+    const { launchGateDeps } = writeLaunchGateProfile(guardHomeDir, "delete");
+
+    const groups = await runDoctorChecks({ homeDir: guardHomeDir, launchGateDeps });
+    const launchGate = groups.find((g) => g.label === "LAUNCH GATE");
+    assert.ok(launchGate, "Expected a LAUNCH GATE group");
+
+    const failing = launchGate!.checks.filter((c) => c.status === "fail");
+    assert.deepStrictEqual(failing, [], `converted store must not fail: ${failing.map((c) => c.message).join(" | ")}`);
+    const summary = launchGate!.checks.find((c) => c.name === "Matchlock hermes launch gate");
+    assert.ok(summary, "Expected the summary launch-gate check");
+    assert.strictEqual(summary!.status, "pass");
+    assert.ok(summary!.message.includes("would allow"), summary!.message);
   });
 });
 
@@ -1632,7 +1724,7 @@ describe("ENVIRONMENT dsh checks (US-009)", () => {
     assert.ok(discoveryCheck!.remedy, "Warn should carry a remedy");
 
     // Doctor still runs all groups and never fails on dsh.
-    assert.strictEqual(groups.length, 6, "All six doctor groups still present");
+    assert.strictEqual(groups.length, 7, "All seven doctor groups still present");
   });
 
   it("discovery reports the PATH tier", async () => {

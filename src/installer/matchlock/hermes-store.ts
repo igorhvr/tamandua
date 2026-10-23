@@ -19,8 +19,24 @@
  */
 
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+
+/**
+ * Lazily resolved SQLite driver.
+ *
+ * `node:sqlite` is imported at CALL time, never at module load. Many modules
+ * consume this reader's pure helpers (`computeHermesTokenTotal`,
+ * `storeDirWithinScope`) — including the Hermes adapter, which the launch-gate
+ * selection resolver imports — so an eager driver import would load SQLite into
+ * processes that only observe metadata. That is exactly what the G7
+ * DOCTOR-GATE report-only proof forbids: `tamandua doctor` must not load a
+ * database driver to answer "would this launch refuse?".
+ */
+function loadSqliteDriver(): typeof import("node:sqlite") {
+  return createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+}
 
 export type HermesStoreStatus = "ok" | "unavailable" | "ambiguous" | "truncated";
 
@@ -84,7 +100,10 @@ export function scanHermesStoreTokens(
 
   let db: DatabaseSync | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    // Loaded only when a caller actually reads a store. The doctor launch gate
+    // never reaches this point: it observes header BYTES only.
+    const { DatabaseSync: SqliteDatabase } = loadSqliteDriver();
+    db = new SqliteDatabase(dbPath, { readOnly: true });
 
     const columns = db
       .prepare("SELECT name FROM pragma_table_info('sessions')")
