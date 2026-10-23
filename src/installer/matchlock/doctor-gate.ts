@@ -47,13 +47,15 @@
  * unavailable probe is RECORDED as an incomplete observation and reported as a
  * single `info` check.
  *
- * PREFLIGHT NOTE (G6 dependency): as of this story the G6 modules
- * `store-holder-detect.ts` / `store-holder-detect-runner.ts` do NOT exist on
- * this branch (`ls` reports both absent). This module therefore defines the
- * probe seam structurally and ships a default that FAILS CLOSED as an
- * incomplete observation — it never invents a detector. When G6 lands, replace
- * the default with `detectStoreHolders(...)` + `createDefaultHolderProbeDeps()`
- * and keep the rendering below unchanged.
+ * DEFAULT HOLDER PROBE (G6 wiring). The default probe is the REAL detector:
+ * {@link createStoreHolderProbe} stats every evaluated store for its filesystem
+ * identity and hands it to G6's `detectStoreHolders` through
+ * `createDefaultHolderProbeDeps()` (procfs on Linux, the bounded lsof probe on
+ * darwin). The listing stays informational: a probe that cannot observe (an
+ * unsupported platform, an unreadable descriptor directory, a store whose
+ * identity cannot be read) is RECORDED as an incomplete observation and
+ * rendered as ONE `info` check — never a refusal, never a reason code and never
+ * a summary change. Tests keep injecting a probe through the unchanged seam.
  */
 
 import fs from "node:fs";
@@ -65,6 +67,12 @@ import { parse as parseYaml } from "yaml";
 // this module's runtime dependency graph and cannot form an import cycle.
 import type { DoctorCheckResult } from "../../doctor.js";
 
+import {
+  detectStoreHolders,
+  type HolderProbeDeps,
+  type HolderStore,
+} from "./store-holder-detect.js";
+import { createDefaultHolderProbeDeps } from "./store-holder-detect-runner.js";
 import {
   evaluateGate,
   type EvaluatedStore,
@@ -432,9 +440,11 @@ export interface RunLaunchGateChecksOptions {
   /**
    * Informational store-holder probe (spec sections 5 and 8).
    *
-   * Defaults to {@link listOpenFileHolders}, which fails closed as an
-   * incomplete observation because the G6 detector is not present on this
-   * branch. Tests inject a probe here; nothing about the verdict depends on it.
+   * Defaults to {@link listOpenFileHolders}, the REAL G6-backed probe built by
+   * {@link createStoreHolderProbe} (stat each evaluated store, then
+   * `detectStoreHolders` with the default runner deps). A probe that cannot
+   * observe is recorded as an incomplete observation. Tests inject a probe here;
+   * nothing about the verdict depends on it.
    */
   holderProbe?: StoreHolderProbe;
 }
@@ -497,31 +507,91 @@ export const HOLDER_PROBE_SCOPE = "holder-probe";
 /** Longest sanitized holder description this module renders, in characters. */
 export const HOLDER_DESCRIPTION_MAX_LENGTH = 200;
 
+/** Errno code of a thrown filesystem error, when it has one. */
+function statErrorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return typeof code === "string" && code.length > 0 ? code : "unknown";
+}
+
 /**
- * The documented UNAVAILABLE default probe.
+ * Build the REAL store-holder probe on top of G6's detector.
  *
- * The G6 store-holder detector is not on this branch, so this probe cannot
- * observe anything. It FAILS CLOSED: `observationComplete: false` with a named
- * failure, never a fabricated empty holder list presented as complete. A failed
- * holder probe is recorded informationally and is never a refusal (spec
- * section 5).
+ * The seam here is `(storePaths) => StoreHolderProbeResult`, while G6 wants the
+ * filesystem IDENTITY of each store (`(dev, ino)` as DECIMAL STRINGS — a 64-bit
+ * inode is lossy as a double), so each probe path is `statSync`ed with
+ * `{ bigint: true }` and handed to `detectStoreHolders` together with the
+ * injected `HolderProbeDeps`. G6 remains the authority for the identity match,
+ * the sidecar rule, the redaction and the ordering; this factory only adapts
+ * shapes (`holders` -> `candidates`, `probeFailures` -> `failures`).
  *
- * It performs no I/O, spawns nothing and reads no process metadata, so the
- * doctor's report-only guarantee is unaffected.
+ * A store whose identity cannot be read is recorded as ONE
+ * {@link StoreHolderProbeFailure} and never throws: inability to inspect is a
+ * gap in the observation, never a silent "no holder" presented as complete.
+ * The returned probe never throws for any probe outcome — that is what keeps a
+ * holder listing informational and verdict-neutral (spec section 5).
  */
-export const listOpenFileHolders: StoreHolderProbe = (storePaths) => ({
-  observationComplete: false,
-  candidates: [],
-  failures: [
-    {
-      scope: HOLDER_PROBE_SCOPE,
-      reason:
-        "store holder detection is unavailable in this build, so holders of " +
-        `${storePaths.length} evaluated store(s) were not observed ` +
-        "(informational only; this never affects the launch verdict)",
-    },
-  ],
-});
+export function createStoreHolderProbe(
+  depsFactory: () => HolderProbeDeps = () => createDefaultHolderProbeDeps(),
+): StoreHolderProbe {
+  return (storePaths) => {
+    const stores: HolderStore[] = [];
+    const failures: StoreHolderProbeFailure[] = [];
+
+    for (const storePath of storePaths) {
+      try {
+        const stat = fs.statSync(storePath, { bigint: true });
+        stores.push({
+          canonicalPath: storePath,
+          dev: stat.dev.toString(),
+          ino: stat.ino.toString(),
+        });
+      } catch (error) {
+        failures.push({
+          scope: storePath,
+          reason: `store identity could not be read (${statErrorCode(error)})`,
+        });
+      }
+    }
+
+    // `detectStoreHolders` never throws for a probe outcome: a throwing or
+    // malformed deps probe becomes a recorded probeFailure with
+    // `observationComplete: false`, which is exactly the incomplete-observation
+    // shape this seam reports. With an empty store list it calls no deps probe
+    // at all (that is a complete observation of no holders).
+    const detection = detectStoreHolders(stores, depsFactory());
+
+    return {
+      observationComplete:
+        detection.observationComplete && failures.length === 0,
+      candidates: detection.holders.map((holder) => ({
+        pid: holder.pid,
+        startIdentity: holder.startIdentity,
+        description: holder.commandDescription,
+        heldPaths: holder.storePaths,
+      })),
+      failures: [
+        ...failures,
+        ...detection.probeFailures.map((failure) => ({
+          scope: failure.scope,
+          reason: failure.reason,
+        })),
+      ],
+    };
+  };
+}
+
+/**
+ * The default holder probe: the real G6-backed detector.
+ *
+ * It stats each evaluated store and delegates the process enumeration and match
+ * to `detectStoreHolders` with `createDefaultHolderProbeDeps()`. A probe that
+ * cannot observe (unsupported platform, unreadable descriptors, unreadable
+ * store identity) is recorded as an incomplete observation and rendered as ONE
+ * `info` check; it is never a refusal (spec section 5). The probe only reads
+ * process and file metadata — it opens no database driver, takes no lock and
+ * signals nothing — so the doctor's report-only guarantee is unaffected.
+ */
+export const listOpenFileHolders: StoreHolderProbe = createStoreHolderProbe();
 
 /**
  * Sanitize a command description for display (spec section 8).

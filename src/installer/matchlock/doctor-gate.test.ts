@@ -35,6 +35,7 @@
 
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -49,6 +50,7 @@ import {
   LAUNCH_GATE_STORE_SET_CHECK_NAME,
   LAUNCH_GATE_SUMMARY_CHECK_NAME,
   HOLDER_PROBE_SCOPE,
+  createStoreHolderProbe,
   interactiveStoreMountPlan,
   listOpenFileHolders,
   resolveEffectiveJournalMode,
@@ -56,6 +58,7 @@ import {
   runLaunchGateChecks,
   sanitizeHolderDescription,
 } from "../../../dist/installer/matchlock/doctor-gate.js";
+import { HolderProbeError } from "../../../dist/installer/matchlock/store-holder-detect.js";
 import { evaluateGate } from "../../../dist/installer/matchlock/launch-gate.js";
 import { buildInteractiveSessionCreateConfig } from "../../../dist/installer/matchlock/mount-plan.js";
 import { observeStore } from "../../../dist/installer/matchlock/store-header.js";
@@ -464,6 +467,60 @@ function observationOptions(
     managedDir: null,
     ...extra,
   };
+}
+
+/**
+ * Wait (bounded) until a spawned holder child reports READY on stdout.
+ *
+ * Rejects when the child exits early instead of reporting READY, so the live
+ * regression cannot silently observe a dead process's (empty) descriptor set.
+ */
+function waitForHolderReady(child: ChildProcess): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let seen = "";
+    const timer = setTimeout(() => {
+      reject(new Error("the holder child did not report READY in time"));
+    }, 10_000);
+
+    const finish = (error?: Error): void => {
+      clearTimeout(timer);
+      child.stdout?.removeListener("data", onData);
+      if (error === undefined) resolve();
+      else reject(error);
+    };
+
+    const onData = (chunk: Buffer | string): void => {
+      seen += chunk.toString();
+      if (seen.includes("READY")) finish();
+    };
+
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", onData);
+    child.once("error", (error) => finish(error));
+    child.once("exit", (code, signal) => {
+      finish(
+        new Error(`the holder child exited early (code ${code}, signal ${signal})`),
+      );
+    });
+  });
+}
+
+/**
+ * Release a holder child: SIGKILL, then await its exit even when the test body
+ * failed. The bounded race is a final guard so teardown can never hang a run.
+ */
+async function releaseHolder(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
+  const exited = new Promise<void>((resolve) => {
+    child.once("exit", () => resolve());
+    child.once("error", () => resolve());
+  });
+  child.kill("SIGKILL");
+  await Promise.race([
+    exited,
+    new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref()),
+  ]);
 }
 
 describe("interactiveStoreMountPlan", () => {
@@ -1052,30 +1109,195 @@ describe("runLaunchGateChecks holder listing", () => {
     assert.match(incomplete.message, /<redacted>/);
   });
 
-  it("reports the unavailable default probe informationally and keeps the summary pass", () => {
+  it("reports an unavailable detector as ONE incomplete info check and keeps the summary pass", () => {
     const profile = freshCandidateProfile({
       journalMode: "delete",
       stores: { "state.db": [1, 1] },
     });
 
-    // No holderProbe injected: the documented default must FAIL CLOSED rather
-    // than present an empty list as a complete observation.
-    const checks = runLaunchGateChecks(observationOptions(profile));
+    // An unavailable detector (here: an unsupported platform raised by the
+    // runner) is an INCOMPLETE observation, never a refusal and never a
+    // silently complete empty listing.
+    const probe = createStoreHolderProbe(() => ({
+      listOpenFileHolders: () => {
+        throw new HolderProbeError("platform:freebsd", "unsupported platform");
+      },
+    }));
 
+    const checks = runLaunchGateChecks(
+      observationOptions(profile, { holderProbe: probe }),
+    );
+
+    assert.equal(checks[0].status, "pass");
+    assert.ok(!checks.some((check) => check.status === "fail"));
+    const infoChecks = checks.filter((check) => check.status === "info");
+    assert.equal(infoChecks.length, 1, "an unavailable probe records ONE info check");
+    assert.equal(infoChecks[0].name, LAUNCH_GATE_HOLDER_OBSERVATION_CHECK_NAME);
+    assert.match(infoChecks[0].message, /holder observation was incomplete/);
+    assert.ok(infoChecks[0].message.includes("platform:freebsd"));
+    assert.match(infoChecks[0].message, /unsupported platform/);
+    assert.doesNotMatch(infoChecks[0].message, /never affects the launch verdict/);
+  });
+
+  it("maps a real detector holder through createStoreHolderProbe to ONE info check", () => {
+    const profile = freshCandidateProfile({
+      journalMode: "delete",
+      stores: { "state.db": [1, 1] },
+    });
+    const stateDb = path.join(profile, "state.db");
+
+    // No process spawn: the G6 deps seam is injected, so the mapping, the
+    // sanitization and the rendering are fully deterministic.
+    const probe = createStoreHolderProbe(() => ({
+      listOpenFileHolders: (paths: readonly string[]) => {
+        assert.ok(paths.includes(stateDb), "the probe sees the evaluated store path");
+        return [
+          {
+            pid: 4321,
+            startIdentity: "v2:4321:1690000000000",
+            argv: ["/usr/bin/node", "holder-script.mjs", "token=supersecret-value"],
+            openPaths: [stateDb],
+          },
+        ];
+      },
+    }));
+
+    const mapped = probe([stateDb]);
+    assert.equal(mapped.observationComplete, true);
+    assert.deepEqual(mapped.failures, []);
+    assert.equal(mapped.candidates.length, 1);
+    const [candidate] = mapped.candidates;
+    assert.equal(candidate.pid, 4321);
+    assert.equal(candidate.startIdentity, "v2:4321:1690000000000");
+    assert.equal(
+      candidate.description,
+      "node holder-script.mjs token=[redacted]",
+      "the description comes from commandDescription and is sanitized",
+    );
+    assert.deepEqual(candidate.heldPaths, [stateDb]);
+
+    const checks = runLaunchGateChecks(
+      observationOptions(profile, { holderProbe: probe }),
+    );
+
+    assert.equal(checks[0].status, "pass");
+    assert.ok(!checks.some((check) => check.status === "fail"));
+
+    const holderChecks = checks.filter((check) =>
+      check.name.startsWith(LAUNCH_GATE_HOLDER_CHECK_NAME),
+    );
+    assert.equal(holderChecks.length, 1, "one holder records ONE info check");
+    const [holder] = holderChecks;
+    assert.equal(holder.name, `${LAUNCH_GATE_HOLDER_CHECK_NAME} pid 4321`);
+    assert.equal(holder.status, "info");
+    assert.match(holder.message, /^holder pid 4321;/);
+    assert.ok(holder.message.includes(stateDb), "the held store path is named");
+    // G6 redacts the credential-shaped argument to `token=[redacted]`; the
+    // renderer sanitizes again (defense in depth) to `token=<redacted>`.
+    assert.match(holder.message, /command: node holder-script\.mjs token=<redacted>/);
+    assert.doesNotMatch(holder.message, /supersecret-value/);
+    assert.equal(holder.remedy, undefined);
+  });
+
+  it("records a throwing detector deps probe as ONE incomplete info check", () => {
+    const profile = freshCandidateProfile({
+      journalMode: "delete",
+      stores: { "state.db": [1, 1] },
+    });
+
+    const probe = createStoreHolderProbe(() => ({
+      listOpenFileHolders: () => {
+        throw new HolderProbeError(
+          "lsof:timeout",
+          "lsof probe timed out after 5000ms token=abc123",
+        );
+      },
+    }));
+
+    const mapped = probe([path.join(profile, "state.db")]);
+    assert.equal(mapped.observationComplete, false);
+    assert.deepEqual(mapped.candidates, []);
+    assert.equal(mapped.failures.length, 1);
+    assert.equal(mapped.failures[0].scope, "lsof:timeout");
+
+    const checks = runLaunchGateChecks(
+      observationOptions(profile, { holderProbe: probe }),
+    );
+
+    assert.equal(checks[0].status, "pass");
+    assert.ok(!checks.some((check) => check.status === "fail"));
+    const infoChecks = checks.filter((check) => check.status === "info");
+    assert.equal(infoChecks.length, 1, "every failure collapses into ONE info check");
+    assert.equal(infoChecks[0].name, LAUNCH_GATE_HOLDER_OBSERVATION_CHECK_NAME);
+    assert.match(infoChecks[0].message, /holder observation was incomplete/);
+    assert.ok(infoChecks[0].message.includes("lsof:timeout"));
+    assert.match(infoChecks[0].message, /lsof probe timed out/);
+    // Credential-shaped probe text is redacted, never echoed.
+    assert.doesNotMatch(infoChecks[0].message, /abc123/);
+    assert.match(infoChecks[0].message, /<redacted>/);
+  });
+
+  it("records an unreadable store identity as ONE failure and never throws", () => {
+    const profile = freshCandidateProfile({
+      journalMode: "delete",
+      stores: { "state.db": [1, 1] },
+    });
+    const stateDb = path.join(profile, "state.db");
+    const missing = path.join(profile, "ghost.db");
+
+    let depsCalled = false;
+    const probe = createStoreHolderProbe(() => ({
+      listOpenFileHolders: (paths: readonly string[]) => {
+        depsCalled = true;
+        assert.ok(paths.includes(stateDb), "the readable store is still probed");
+        assert.ok(!paths.includes(missing), "the unreadable store is not fabricated");
+        return [];
+      },
+    }));
+
+    const mapped = probe([stateDb, missing]);
+    assert.equal(mapped.observationComplete, false);
+    assert.equal(mapped.failures.length, 1, "one unreadable store => one failure");
+    assert.equal(mapped.failures[0].scope, missing);
+    assert.match(mapped.failures[0].reason, /store identity could not be read \(ENOENT\)/);
+    assert.deepEqual(mapped.candidates, []);
+    assert.ok(
+      depsCalled,
+      "aggregation outranks short-circuiting: the readable store is still probed",
+    );
+
+    // Through the check mapper the stat failure collapses into the SAME one
+    // incomplete info check, and the summary is still a pass.
+    const checks = runLaunchGateChecks(
+      observationOptions(profile, {
+        holderProbe: (paths: readonly string[]) => probe([...paths, missing]),
+      }),
+    );
     assert.equal(checks[0].status, "pass");
     assert.ok(!checks.some((check) => check.status === "fail"));
     const infoChecks = checks.filter((check) => check.status === "info");
     assert.equal(infoChecks.length, 1);
     assert.equal(infoChecks[0].name, LAUNCH_GATE_HOLDER_OBSERVATION_CHECK_NAME);
-    assert.match(infoChecks[0].message, /holder detection is unavailable in this build/);
-    assert.match(infoChecks[0].message, /never affects the launch verdict/);
+    assert.ok(infoChecks[0].message.includes(missing), "the unreadable path is named");
+  });
 
-    // The default is honest about being incomplete.
-    const observed = listOpenFileHolders([path.join(profile, "state.db")]);
+  it("backs listOpenFileHolders with the real G6 probe, not a placeholder", () => {
+    const profile = freshCandidateProfile({
+      journalMode: "delete",
+      stores: { "state.db": [1, 1] },
+    });
+    const missing = path.join(profile, "ghost.db");
+
+    // A store whose identity cannot be read is recorded through the REAL
+    // default: the placeholder text is gone, and no process enumeration is
+    // needed here (an empty resolvable store list never calls the deps probe).
+    const observed = listOpenFileHolders([missing]);
     assert.equal(observed.observationComplete, false);
-    assert.equal(observed.candidates.length, 0);
+    assert.deepEqual(observed.candidates, []);
     assert.equal(observed.failures.length, 1);
-    assert.equal(observed.failures[0].scope, HOLDER_PROBE_SCOPE);
+    assert.equal(observed.failures[0].scope, missing);
+    assert.doesNotMatch(observed.failures[0].reason, /unavailable in this build/);
+    assert.notEqual(observed.failures[0].scope, HOLDER_PROBE_SCOPE);
   });
 
   it("never changes the reason codes or the verdict for an unconverted fixture", () => {
@@ -1220,4 +1442,74 @@ describe("runLaunchGateChecks holder listing", () => {
     assert.equal(checks[0].status, "info");
     assert.equal(probed, false, "no stores were observed, so there is nothing to probe");
   });
+
+  it(
+    "names a real local process holding state.db through the default probe",
+    { timeout: 30_000 },
+    async () => {
+      const profile = freshCandidateProfile({
+        journalMode: "delete",
+        stores: { "state.db": [1, 1] },
+      });
+      const stateDb = path.join(profile, "state.db");
+
+      // A same-user child that holds the store open and keeps running. The
+      // credential-shaped argv token must never reach the rendered message.
+      const script = [
+        'const fs = require("node:fs");',
+        `const fd = fs.openSync(${JSON.stringify(stateDb)}, "r");`,
+        'process.stdout.write("READY\\n");',
+        "setInterval(() => {}, 1000);",
+        "void fd;",
+      ].join("\n");
+
+      const child = spawn(
+        process.execPath,
+        ["-e", script, "token=supersecret-value"],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const childPid = child.pid;
+      if (childPid === undefined) throw new Error("the holder child has no pid");
+
+      try {
+        await waitForHolderReady(child);
+
+        // NO holderProbe injected: this exercises the REAL default path.
+        const checks = runLaunchGateChecks(observationOptions(profile));
+
+        assert.equal(checks[0].status, "pass");
+        assert.ok(!checks.some((check) => check.status === "fail"));
+
+        const holderChecks = checks.filter((check) =>
+          check.name.startsWith(LAUNCH_GATE_HOLDER_CHECK_NAME),
+        );
+        assert.equal(holderChecks.length, 1, "the live holder is named exactly once");
+        const [holder] = holderChecks;
+        assert.equal(
+          holder.name,
+          `${LAUNCH_GATE_HOLDER_CHECK_NAME} pid ${childPid}`,
+        );
+        assert.equal(holder.status, "info");
+        assert.ok(
+          holder.message.startsWith(`holder pid ${childPid};`),
+          `unexpected holder message: ${holder.message}`,
+        );
+        assert.ok(holder.message.includes(stateDb), "the held state.db is named");
+        assert.match(holder.message, /command: /);
+        assert.ok(
+          holder.message.includes(path.basename(process.execPath)),
+          `the command description names the holder executable: ${holder.message}`,
+        );
+        assert.ok(!holder.message.includes("\n"), "the message is one line");
+        assert.ok(
+          holder.message.length <= 1000,
+          `the holder message is bounded (${holder.message.length} chars)`,
+        );
+        assert.doesNotMatch(holder.message, /supersecret-value/);
+        assert.equal(holder.remedy, undefined);
+      } finally {
+        await releaseHolder(child);
+      }
+    },
+  );
 });
