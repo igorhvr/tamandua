@@ -39,10 +39,12 @@ const FORBIDDEN_LITERALS: readonly RegExp[] = [
 ] as const;
 
 const SPAWN_CAPABLE_INTERACTIVE_TESTS = [
+  "tests/matchlock-interactive-candidate-binding.test.ts",
   "tests/matchlock-interactive-common-config.test.ts",
   "tests/matchlock-interactive-entrypoint.test.ts",
   "tests/matchlock-interactive-image-store.test.ts",
   "tests/matchlock-interactive-run-case-controls.test.ts",
+  "tests/matchlock-interactive-suite-bridge-launch.test.ts",
   "tests/matchlock-interactive-t1-driver.test.ts",
   "tests/matchlock-interactive-validator-controls.test.ts",
 ] as const;

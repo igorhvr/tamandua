@@ -114,10 +114,99 @@ are passed to `--matchlock-allow-private`.
 
 | Tier | Scope | VM | Model tokens |
 | --- | --- | --- | --- |
-| `t1` | Fixture controls + frozen PTY driver self-test (`pty-selftest.sh`, `fixtures-test.sh`, `fixtures-validator.sh`) | no | none |
+| `t1` | Fixture controls + frozen PTY driver self-test (`pty-selftest.sh`, `fixtures-test.sh`, `fixtures-validator.sh`, `candidate-binding-test.sh`) | no | none |
 | `t2` | Real-VM mechanics M0–M4 (boot, banner, image provenance/identity, guest identity, mount write-through, swap variants, PTY resize, exit-code propagation, disconnect) | yes | none |
 | `t3` | Live-model TUI turns M5/M6 (pi + hermes); env-gated on credentials | yes | yes (disclosed) |
 | `t4` | Scheduled `tamandua workflow run --matchlock` spot-run M7; opt-in and bounded | yes | yes (disclosed) |
+
+T1's `fixtures/candidate-binding-test.sh` is the negative control for the runtime
+candidate BINDING: it proves a requested matchlock/guest-init candidate reaches the
+launch boundary (not a `matchlock` shim earlier on `PATH`), that a missing /
+non-executable / directory explicit candidate fails closed before any launch, and
+that the installed `PATH` runtime still works when no candidate was requested. It
+drives the real `lib/common.sh`; its boundary shims are explicitly labelled
+simulations, so they prove selection only — never real guest execution.
+
+## Candidate binding (SUITE-BRIDGE)
+
+The suite's runtime selection is bound to the product launcher's environment, so
+an explicitly requested candidate can never be silently replaced by an installed
+`matchlock` found on `PATH` (bead `tamandua-qz4`). `lib/common.sh` is the single
+resolution point: `mtlk_resolve_runtime` runs in the entrypoint (and in every
+composed child runner) BEFORE any `PATH`/`HOME` change.
+
+**Both naming schemes.** The suite reads and writes the suite spelling
+`MTLK_MATCHLOCK_RPC_BIN` / `MTLK_GUEST_INIT`; the product launcher reads
+`TAMANDUA_MATCHLOCK_RPC_BIN` (canonical `MATCHLOCK_RPC_BIN_ENV`) and
+`MATCHLOCK_GUEST_INIT`. Input precedence: `MTLK_*` wins over its product sibling,
+and a non-empty value in EITHER spelling counts as an EXPLICIT request. After
+resolution the resolved pair is exported under BOTH schemes so the selection
+survives every env-scrubbing child-process boundary between the suite and the
+launcher. A product name is written only when the resolved value is non-empty;
+no fabricated value is ever exported.
+
+**Fail-closed explicit candidates.** An explicitly requested candidate that is
+missing, not a regular file, or not executable aborts with
+`MTLK-ABORT <kind>-candidate-missing <requested>`,
+`<kind>-candidate-not-a-file <requested>` (a directory) or
+`<kind>-candidate-not-executable <requested>` (present but `chmod -x`), and
+exit 2 BEFORE any launch or capability probe. There is no PATH fallback for an
+explicit request.
+
+**Installed-runtime preservation.** When neither spelling was requested, the
+historical resolution is unchanged: the installed `matchlock` on `PATH`, then a
+sibling `guest-init`, then `guest-init` on `PATH`. Nothing is fabricated and the
+installed runtime keeps working exactly as before.
+
+**Real-launch-chain integration.** The serial-lane
+`tests/matchlock-interactive-suite-bridge-launch.test.ts` proves the binding
+arrives continuously through the actual launch chain, not just that a resolved
+value exists. Its bash child sources the real `lib/common.sh`, calls the real
+`mtlk_resolve_runtime`, and `exec`s a node child that runs the SHIPPING resolver
+and capability probe (`dist/installer/matchlock/swap-support.js`) on the
+**inherited** environment; the selected `matchlock` shim then spawns the
+`guest-init` shim exactly as the launcher would. No helper reconstructs the
+child environment from printed values, and the journaling shims record what the
+selected executables actually inherited at each real subprocess boundary.
+
+**Negative controls A–E.** The T1 component
+`fixtures/candidate-binding-test.sh` (evidence
+`<evidence-dir>/T1/candidate-binding.log`), the serial-lane
+`tests/matchlock-interactive-candidate-binding.test.ts`, and the serial-lane
+real-launch-chain `tests/matchlock-interactive-suite-bridge-launch.test.ts`
+cover:
+
+| Control | What it proves |
+| --- | --- |
+| A | A suite-spelled (A1) or product-spelled (A2) candidate is selected over a PATH decoy placed earlier on `PATH`; the serial-lane launch test A1/A2 adds the real spawn chain through the shipping resolver/probe. |
+| B | A missing explicit candidate fails closed (`candidate-missing`) and the decoy is never launched; the launch test B records the exact abort with no probe. |
+| C | A non-executable (`chmod -x`) or directory explicit candidate fails closed (`not-executable` / `not-a-file`); the launch test C1/C2 records the exact abort with no probe. |
+| D | With no candidate requested, the installed PATH runtime is still selected; the launch test D spawns the installed PATH matchlock and guest-init shims. |
+| E | Explicit `guest-init` selection crosses the matchlock child boundary under both spellings; a missing/non-executable guest-init fails closed; the launch test E1/E1b and E2a/E2b cover both. |
+
+The entrypoint integration control in
+`tests/matchlock-interactive-entrypoint.test.ts` additionally spawns a STUB T1
+fixture child that records the inherited `TAMANDUA_MATCHLOCK_RPC_BIN` and
+`MATCHLOCK_GUEST_INIT` and asserts they equal the suite-resolved candidate.
+
+**Defect-restoring control.** `MTLK_SUITE_BRIDGE_RESTORE_PREFIX_BUG=1`
+reproduces the pre-fix one-way export: after suite resolution it unsets the
+product spellings (`TAMANDUA_MATCHLOCK_RPC_BIN`, `MATCHLOCK_GUEST_INIT`) before
+the `exec` into the shipping probe, so the production resolver falls back to
+`PATH` and selects the decoy and the A1 test goes red. The switch is test-local
+(it exists only in the launch test) and the committed
+`runChain({ restorePrefixBug: true })` control pins that sensitivity by
+asserting the decoy is selected, so A1 cannot pass independently of the fix.
+
+**Evidence limit — read before citing.** The launch-boundary and matchlock child
+shims are SIMULATIONS: the `matchlock`/`guest-init` executables in the T1
+fixture and in the launch test are substituted journaling shims, so no VM boots
+and no real guest executes. They journal the executable they actually selected
+and what it actually inherited, so they prove SELECTION only — plus that the
+selection propagates continuously across real subprocess spawns.
+They do NOT prove real guest execution and do NOT exercise matchlock internals
+beyond the documented environment names it reads. Real execution remains the
+exclusive proof of the t2–t4 real-VM tiers.
 
 ## T2 mechanics cases (`cases/M0`–`M4`)
 
@@ -216,7 +305,7 @@ compose around it).
 | --- | --- | --- | --- | --- | --- |
 | `README.md` | The suite index and this explicit membership table | markdown | no | none | n/a (committed) |
 | `run-interactive-suite.sh` | The one-command entrypoint: tiers, mode, required digest, fresh evidence dir, private HOME/TMPDIR/state, single-layer gate lock, observed-rounds guard | bash | yes (t2/t3/t4) | t3/t4 only | fresh `mktemp -d` evidence dir (or `--evidence-dir`) |
-| `t1-fixtures.sh` | T1 no-VM runner: driver self-test + run-case/hygiene + validator fixture controls, non-zero on any fail | bash + python3 | no | none | `<evidence-dir>/T1/` |
+| `t1-fixtures.sh` | T1 no-VM runner: driver self-test + run-case/hygiene + validator + runtime candidate-binding fixture controls, non-zero on any fail | bash + python3 | no | none | `<evidence-dir>/T1/` |
 | `lib/common.sh` | Platform bindings, capability probe (fail-closed), CANDIDATE/INSTALLED mode resolution, run identity, T3 credential gate + token-spend disclosure | bash (sourced) | no | none | `<evidence-dir>/identity.txt`, `<evidence-dir>/T3/` |
 | `lib/manifest.sh` | The REQUESTED manifest recorded before execution; tier/case status is `UNEXECUTED`/`PASS`/`FAIL` | bash (sourced) | no | none | `<evidence-dir>/manifest/` |
 | `lib/image-store.sh` | Private, fully usable per-run matchlock image store seeded from the operator store (hardlinked blobs, independent mutable metadata) | bash (sourced) | no | none | `<evidence-dir>/image-store/` |
@@ -229,6 +318,7 @@ compose around it).
 | `runner/m7-spot-run.sh` | T4 scheduled spot-run M7: isolated daemon, ownership-verified stop, bound verdict file, stopped-VM accounting fix (tamandua-sus) | bash | yes (t4) | t4 | `<evidence-dir>/M7/` |
 | `fixtures/fixtures-test.sh` | Run-case/hygiene negative controls (inventory fail-closed, mount missing/bad, ownership fake, hygiene leftovers) | bash | no | none | `<evidence-dir>/T1/fixtures-test.log` |
 | `fixtures/fixtures-validator.sh` | Tier-aware validator negative controls (missing case, unrequested tier, failed verdict, unowned VM, contradictory markers, identity mismatch, M7 binding, HALTED) | bash | no | none | `<evidence-dir>/T1/fixtures-validator.log` |
+| `fixtures/candidate-binding-test.sh` | Runtime candidate-binding negative controls (candidate vs PATH decoy under both env spellings, missing/non-executable/directory explicit candidates fail closed, installed PATH fallback preserved, guest-init selection, relative candidate absolutized) | bash | no | none | `<evidence-dir>/T1/candidate-binding.log` |
 | `validator/validate-receipts.sh` | The tier-aware fail-closed receipt validator reading evidence FILES only | bash | no | none | `<evidence-dir>/validation.txt` |
 
 ## Conventions

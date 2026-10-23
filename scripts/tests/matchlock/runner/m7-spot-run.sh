@@ -97,7 +97,7 @@ mtlk_m7_skip_notice
 # Preflight: resolve the runtime + mode + required digest BEFORE any PATH/HOME
 # change, then bind the repo and the configured scratch inputs.
 # -----------------------------------------------------------------------------
-mtlk_resolve_runtime
+mtlk_resolve_runtime || exit $?
 mtlk_probe_capabilities
 mtlk_require_digest
 mtlk_resolve_mode || exit $?

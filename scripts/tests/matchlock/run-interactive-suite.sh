@@ -188,7 +188,7 @@ unset _tier
 # the runner input digest and a working host capability set; a T1-only run needs
 # neither a hypervisor nor an image digest.
 # -----------------------------------------------------------------------------
-mtlk_resolve_runtime
+mtlk_resolve_runtime || exit $?
 
 if [ -n "$MODE_ARG" ]; then
   MTLK_MODE="$MODE_ARG"

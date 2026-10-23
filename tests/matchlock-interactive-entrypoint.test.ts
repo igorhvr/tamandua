@@ -84,6 +84,7 @@ const RESET = [
   "unset MTLK_COMMON_SOURCED MTLK_MANIFEST_SOURCED MTLK_LOCK_SOURCED MTLK_IMAGE_STORE_SOURCED",
   "unset MTLK_MODE MTLK_EXPECT_DIGEST MTLK_GATE_LOCK MTLK_OPERATOR_CACHE",
   "unset MTLK_MATCHLOCK_RPC_BIN MTLK_GUEST_INIT MTLK_TAMANDUA_BIN MTLK_TAMANDUA_SHA",
+  "unset TAMANDUA_MATCHLOCK_RPC_BIN MATCHLOCK_GUEST_INIT",
   "unset MTLK_REQUIRE_KVM MTLK_KVM_DEVICE MTLK_REQUIRE_GUEST_INIT MTLK_SKIP_BUILD",
   "unset MTLK_RUN_CASES_SH MTLK_T1_FIXTURES_SH MTLK_OBSERVED_ROUNDS_GUARD",
   "unset MTLK_T3_ENABLED MTLK_MODEL_API_KEY TAMANDUA_MODEL_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY",
@@ -138,8 +139,14 @@ describe("Matchlock interactive entrypoint (MTLK-INTERACTIVE-SUITE US-011)", () 
       assert.match(result.output, /PTY-SELFTEST-SUMMARY pass=\d+ fail=0/);
       assert.match(result.output, /RUN-CASE FIXTURES RESULT: pass=\d+ fail=0/);
       assert.match(result.output, /VALIDATOR FIXTURES RESULT: pass=\d+ fail=0/);
+      assert.match(result.output, /CANDIDATE-BINDING FIXTURES RESULT: pass=\d+ fail=0/);
 
-      for (const log of ["pty-selftest.log", "fixtures-test.log", "fixtures-validator.log"]) {
+      for (const log of [
+        "pty-selftest.log",
+        "fixtures-test.log",
+        "fixtures-validator.log",
+        "candidate-binding.log",
+      ]) {
         const full = path.join(ev, "T1", log);
         assert.ok(existsSync(full), `missing T1 evidence ${full}`);
         assert.match(readFileSync(full, "utf-8"), /pass=\d+ fail=0/);
@@ -155,6 +162,89 @@ describe("Matchlock interactive entrypoint (MTLK-INTERACTIVE-SUITE US-011)", () 
       const validation = runBash(`exec bash ${shQuote(validatorPath)} ${shQuote(ev)} ${shQuote(DIGEST)}`);
       assert.equal(validation.status, 0, `T1 receipt must validate:\n${validation.output}`);
       assert.match(validation.output, /^VALIDATION-OK /m);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("carries the suite-resolved candidate into the T1 child under both schemes", () => {
+    // SUITE-BRIDGE (US-005): the entrypoint must export the resolved runtime
+    // under the PRODUCT spellings, so a child process it spawns (here a STUB T1
+    // fixture, a real bash child) actually inherits the requested candidate.
+    // The stub records what it inherited and exits 0; the assertions read that
+    // record, never the parent's environment far away from the boundary.
+    const tmp = tamanduaTempDir("mtlk-entrypoint-binding-");
+    try {
+      const bin = writeStubBin(tmp);
+      const ev = path.join(tmp, "evidence");
+      const candidateDir = path.join(tmp, "candidate");
+      mkdirSync(candidateDir, { recursive: true });
+      const candidateMatchlock = writeStub(candidateDir, "matchlock", "#!/bin/sh\nexit 0\n");
+      const candidateGuestInit = writeStub(candidateDir, "guest-init", "#!/bin/sh\nexit 0\n");
+      const inherited = path.join(tmp, "inherited.env");
+
+      const stub = writeStub(
+        tmp,
+        "t1-binding-stub.sh",
+        [
+          "#!/usr/bin/env bash",
+          "set -u",
+          'ev="$1"',
+          'mkdir -p "$ev/T1" "$ev/matrix"',
+          "{",
+          '  printf \'MTLK_MATCHLOCK_RPC_BIN=%s\\n\' "${MTLK_MATCHLOCK_RPC_BIN:-}"',
+          '  printf \'MTLK_GUEST_INIT=%s\\n\' "${MTLK_GUEST_INIT:-}"',
+          '  printf \'TAMANDUA_MATCHLOCK_RPC_BIN=%s\\n\' "${TAMANDUA_MATCHLOCK_RPC_BIN:-}"',
+          '  printf \'MATCHLOCK_GUEST_INIT=%s\\n\' "${MATCHLOCK_GUEST_INIT:-}"',
+          `} > ${shQuote(inherited)}`,
+          'printf \'{"case":"T1","verdict":"PASS","fail_reasons":[],"unowned_new_vms":[]}\\n\' > "$ev/T1/case-summary.json"',
+          'printf \'T1 FIXTURES RESULT: pass=1 fail=0\\n\'',
+          "exit 0",
+          "",
+        ].join("\n"),
+      );
+
+      const script = [
+        RESET,
+        `export PATH=${shQuote(bin)}:"$PATH"`,
+        `export MTLK_T1_FIXTURES_SH=${shQuote(stub)}`,
+        `export MTLK_MATCHLOCK_RPC_BIN=${shQuote(candidateMatchlock)}`,
+        `export MTLK_GUEST_INIT=${shQuote(candidateGuestInit)}`,
+        `exec bash ${shQuote(entrypointPath)} --tier t1 --mode installed ` +
+          `--evidence-dir ${shQuote(ev)}`,
+      ].join("\n");
+      const result = runBash(script);
+      assert.equal(
+        result.status,
+        0,
+        `a valid explicit candidate must not refuse a T1 run:\n${result.output}`,
+      );
+
+      const values = new Map(
+        readFileSync(inherited, "utf-8")
+          .split("\n")
+          .filter((line) => line.includes("="))
+          .map((line) => {
+            const at = line.indexOf("=");
+            return [line.slice(0, at), line.slice(at + 1)] as const;
+          }),
+      );
+      // The suite spelling is what the operator requested...
+      assert.equal(values.get("MTLK_MATCHLOCK_RPC_BIN"), candidateMatchlock);
+      assert.equal(values.get("MTLK_GUEST_INIT"), candidateGuestInit);
+      // ...and the PRODUCT spelling is what the launcher reads. A child process
+      // the entrypoint spawned must see the SAME resolved selection (never the
+      // PATH stub that also exists in this fixture).
+      assert.equal(
+        values.get("TAMANDUA_MATCHLOCK_RPC_BIN"),
+        candidateMatchlock,
+        "the T1 child must inherit the resolved candidate under the product rpc spelling",
+      );
+      assert.equal(
+        values.get("MATCHLOCK_GUEST_INIT"),
+        candidateGuestInit,
+        "the T1 child must inherit the resolved candidate guest-init under the product spelling",
+      );
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

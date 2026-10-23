@@ -18,7 +18,7 @@
  *     private `HOME`/`TMPDIR`/`TAMANDUA_STATE_DIR`, takes the shared gate lock
  *     exactly once for VM tiers, and invokes the no-fake-green observed-rounds
  *     guard (exit 92) AFTER the VM tier;
- *   - `t1-fixtures.sh` is the no-VM T1 runner over the three T1 controls.
+ *   - `t1-fixtures.sh` is the no-VM T1 runner over the four T1 controls.
  *
  * Pure filesystem reads (no child_process, no dist import, no daemon, no VM, no
  * network), so this file stays in the parallel lane and needs no
@@ -53,6 +53,7 @@ const MEMBERSHIP_PATHS = [
   "runner/m7-spot-run.sh",
   "fixtures/fixtures-test.sh",
   "fixtures/fixtures-validator.sh",
+  "fixtures/candidate-binding-test.sh",
   "validator/validate-receipts.sh",
 ] as const;
 
@@ -246,6 +247,56 @@ describe("Matchlock interactive acceptance suite layout (MTLK-INTERACTIVE-SUITE 
     );
   });
 
+  it("documents the candidate binding contract and its evidence limits", () => {
+    // SUITE-BRIDGE (US-005): the binding contract is what makes a green run
+    // attributable to the requested candidate, so the README must state both
+    // naming schemes, the fail-closed rules, the installed-runtime preservation
+    // and the SIMULATION caveat — and must not silently lose them.
+    const doc = readSuiteReadme();
+    assert.match(doc, /## Candidate binding \(SUITE-BRIDGE\)/);
+    for (const token of [
+      "MTLK_MATCHLOCK_RPC_BIN",
+      "MTLK_GUEST_INIT",
+      "TAMANDUA_MATCHLOCK_RPC_BIN",
+      "MATCHLOCK_GUEST_INIT",
+      "MATCHLOCK_RPC_BIN_ENV",
+    ]) {
+      assert.ok(doc.includes(token), `candidate-binding docs must name ${token}`);
+    }
+    assert.ok(doc.includes("MTLK_*"), "docs must name the suite-spelling precedence");
+    assert.match(doc, /wins over its product sibling/i, "docs must state the input precedence");
+    for (const reason of ["candidate-missing", "candidate-not-a-file", "candidate-not-executable"]) {
+      assert.ok(doc.includes(reason), `candidate-binding docs must state ${reason}`);
+    }
+    assert.match(doc, /no PATH fallback/i, "docs must state the fail-closed no-PATH-fallback rule");
+    assert.match(doc, /installed runtime keeps working/i, "docs must preserve the installed-runtime path");
+    assert.match(doc, /Negative controls A–E/, "docs must map the A–E controls");
+    for (const control of ["A", "B", "C", "D", "E"]) {
+      assert.ok(
+        doc.includes(`| ${control} |`),
+        `candidate-binding docs must map control ${control}`,
+      );
+    }
+    assert.match(doc, /SIMULATIONS/, "docs must label the boundary shims as simulations");
+    assert.match(doc, /prove SELECTION only/, "docs must limit the evidence to selection");
+    assert.match(doc, /do NOT prove real guest\s+execution/i);
+    // The real-launch-chain integration test and its defect-restoring control
+    // are part of the documented contract, not an undocumented extra.
+    assert.ok(
+      doc.includes("tests/matchlock-interactive-suite-bridge-launch.test.ts"),
+      "candidate-binding docs must name the real-launch-chain serial-lane test",
+    );
+    assert.ok(
+      doc.includes("MTLK_SUITE_BRIDGE_RESTORE_PREFIX_BUG=1"),
+      "candidate-binding docs must name the defect-restoring switch",
+    );
+    assert.match(
+      doc,
+      /No helper reconstructs the\s+child environment from printed values/i,
+      "docs must state that the launch chain inherits the environment",
+    );
+  });
+
   it("points AGENTS.md at the suite README", () => {
     const agents = readFileSync(agentsPath, "utf-8");
     assert.match(agents, /### Matchlock interactive acceptance suite \(MTLK-INTERACTIVE-SUITE\)/);
@@ -335,7 +386,7 @@ describe("Matchlock interactive entrypoint wiring (MTLK-INTERACTIVE-SUITE US-011
 });
 
 describe("Matchlock T1 no-VM runner (MTLK-INTERACTIVE-SUITE US-011)", () => {
-  it("runs the three T1 controls and fails nonzero on any fail", () => {
+  it("runs the four T1 controls and fails nonzero on any fail", () => {
     assert.ok(existsSync(t1FixturesPath), `missing T1 runner ${t1FixturesPath}`);
     const text = readFileSync(t1FixturesPath, "utf-8");
     assert.ok(text.includes("runner/pty-selftest.sh") || text.includes("pty-selftest.sh"));
@@ -343,6 +394,11 @@ describe("Matchlock T1 no-VM runner (MTLK-INTERACTIVE-SUITE US-011)", () => {
     assert.ok(
       text.includes("fixtures/fixtures-validator.sh") || text.includes("fixtures-validator.sh"),
     );
+    assert.ok(
+      text.includes("candidate-binding-test.sh"),
+      "T1 must run the runtime candidate-binding controls",
+    );
+    assert.match(text, /MTLK_T1_CANDIDATE_BINDING_TEST/);
     assert.match(text, /T1 FIXTURES RESULT: pass=/);
     assert.doesNotMatch(text, /\bflock\b/, "the no-VM T1 runner must take no gate lock");
     assert.match(text, /exit 1/, "T1 must exit nonzero on any fail");
