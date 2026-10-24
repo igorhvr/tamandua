@@ -27,6 +27,17 @@ FAILURES=0
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 
+# grep_body: grep a pattern against an already-captured body via a here-string.
+# Never write `... | grep -q ...` for this: under `set -o pipefail`, grep -q
+# exits on its first match while the upstream writer is still writing, so the
+# writer dies with EPIPE ("write error: Broken pipe") and the pipeline goes red
+# even though the pattern matched. Capture into a variable first, then grep it.
+grep_body() {
+  local pattern="$1"
+  local body="$2"
+  grep -q -- "$pattern" <<< "$body"
+}
+
 # port_listen: portable TCP-connect liveness probe (MACP4 US-001). Bounded
 # connect (default 1s, optional $2 seconds) to $1 on the loopback addresses
 # (127.0.0.1 first — every TT daemon listener binds 127.0.0.1 by default —
@@ -92,7 +103,7 @@ echo "--- Test: --help content ---"
 help_out="$("$TOOL" --help 2>&1)"
 
 for cmd in start stop restart status reset-state; do
-  if echo "$help_out" | grep -q "$cmd"; then
+  if grep_body "$cmd" "$help_out"; then
     pass "--help mentions subcommand '$cmd'"
   else
     fail "--help missing subcommand '$cmd'"
@@ -1809,7 +1820,8 @@ if grep -A 100 '^write_provenance()' "$TOOL" | grep -q 'empty startTime identity
 else
   fail "write_provenance missing the empty-startTime refusal"
 fi
-if grep -A 400 '^cmd_start()' "$TOOL" | grep -q 'FATAL — cannot read startTime identity'; then
+cmd_start_fatal_body="$(grep -A 400 '^cmd_start()' "$TOOL" || true)"
+if grep_body 'FATAL — cannot read startTime identity' "$cmd_start_fatal_body"; then
   pass "cmd_start fails closed instead of WARNING-and-continue when the identity read fails at record time"
 else
   fail "cmd_start still tolerates an unreadable startTime identity (WARNING-and-continue)"
