@@ -435,16 +435,22 @@ npx tsc --noEmit -p tsconfig.json
    scenarios now exist (A1 always runs; A2/C1 require a VM-capable host and
    otherwise record ENVIRONMENT and the zero-round guard refuses PASS with exit
    92). Update it when the driver is next touched.
-4. **The AGENTS.md G8 section has NOT been applied.** The write was blocked by
-   the harness protection on agent-instruction files (the approval prompt timed
-   out; silence is not consent, and this agent does not retry a blocked write or
-   route it through another path). The exact section text is in Appendix A so an
-   interactive session can apply it with one paste. `tests/g8-admission-docs.test.ts`
-   pins this disclosure: it fails if AGENTS.md lacks the anchor AND the document
-   stops recording the gap, so the requirement can neither be forgotten nor
-   silently claimed.
+4. **APPLIED — the AGENTS.md G8 section is in place.** Applied by run
+   `b991d85c-fb79-43f0-80f1-fdbb5256f5b3` (run number 196) on 2026-10-24, which
+   inserted the Appendix A block verbatim as
+   `### G8 launch-gate admission (G8-ADMISSION-INTEGRATION)` immediately before
+   `## Real-VM gates cannot run in the developer agent sandbox`. Historically,
+   the earlier hermes session's `AGENTS.md` write was blocked by the harness
+   protection on agent-instruction files: the approval prompt timed out,
+   silence is not consent, and that session did not retry or route the write
+   another way. The exact text is kept in Appendix A for reference.
+   `tests/g8-admission-docs.test.ts` exercises its applied branch and pins the
+   anchor plus its required phrases, including
+   `src/installer/matchlock/launch-gate-wiring.ts`,
+   `LAUNCH_GATE_REFUSAL_EXIT_CODE`, `78`, `no-lease`, and
+   `NO_LEASE_LIMITATION`.
 
-## Appendix A — AGENTS.md G8 section (text to apply; currently NOT applied)
+## Appendix A - AGENTS.md G8 section (applied; text kept for reference)
 
 ```markdown
 ### G8 launch-gate admission (G8-ADMISSION-INTEGRATION)
