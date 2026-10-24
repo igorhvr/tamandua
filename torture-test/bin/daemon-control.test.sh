@@ -4142,6 +4142,149 @@ else
 fi
 rm -f "$REAL_STATE_SNAPSHOT" "$REAL_STATE_AFTER"
 
+# ── Test 98: TT_VAR becomes TT_ROOT (STORM-TTVAR-GUARD US-001) ────────
+echo ""
+echo "--- Test: TT_VAR under torture-test/var becomes TT_ROOT (provenance follows) ---"
+
+TTVAR_BASE="$SCRIPT_DIR/../var"
+TTVAR_LEAF="ttvar-guard-$$-$(date +%s)"
+TTVAR_DIR="$TTVAR_BASE/$TTVAR_LEAF"
+TTVAR_REL_LEAF="${TTVAR_LEAF}-rel"
+TTVAR_REL_DIR="$TTVAR_BASE/$TTVAR_REL_LEAF"
+TTVAR_OUTSIDE_DIR=""
+TTVAR_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tt-dc-ttvar.XXXXXX")"
+TTVAR_DEFAULT_PROV="$TTVAR_BASE/daemon-control/scripted.json"
+TTVAR_PROV_BACKUP=""
+
+cleanup_ttvar() {
+  if [ -n "$TTVAR_PROV_BACKUP" ] && [ -f "$TTVAR_PROV_BACKUP" ]; then
+    mv -f "$TTVAR_PROV_BACKUP" "$TTVAR_DEFAULT_PROV"
+  fi
+  rm -rf "$TTVAR_DIR" "$TTVAR_REL_DIR" "$TTVAR_TMP"
+  if [ -n "$TTVAR_OUTSIDE_DIR" ]; then rm -rf "$TTVAR_OUTSIDE_DIR"; fi
+  cleanup_test_dir
+}
+trap cleanup_ttvar EXIT
+
+mkdir -p "$TTVAR_DIR" "$TTVAR_REL_DIR"
+TTVAR_DIR_RP="$(cd "$TTVAR_DIR" && pwd -P)"
+TTVAR_REL_RP="$(cd "$TTVAR_REL_DIR" && pwd -P)"
+TTVAR_BASE_RP="$(cd "$TTVAR_BASE" && pwd -P)"
+
+# Fake scripted env for the campaign root: HOME and TAMANDUA_STATE_DIR live
+# UNDER TT_VAR, exactly as tt-storm renders them for a real campaign. Only
+# the TT_DC_ENV_SCRIPTED test seam selects it; production env scripts are
+# untouched.
+cat > "$TTVAR_TMP/fake-env-scripted.sh" <<TTENV
+#!/usr/bin/env bash
+if [ "\${1:-}" = "print" ]; then
+  printf 'TT_REPO_ROOT=%s\n' "$TEST_REPO_ROOT"
+  printf 'TT_ROOT=%s\n' "$TTVAR_DIR"
+  printf 'HOME=%s\n' "$TTVAR_DIR/home-scripted"
+  printf 'TAMANDUA_STATE_DIR=%s\n' "$TTVAR_DIR/home-scripted/.tamandua"
+  printf 'TAMANDUA_CONTROL_PORT=5339\n'
+  printf 'TAMANDUA_MCP_PORT=5338\n'
+  printf 'TAMANDUA_DASHBOARD_PORT=5334\n'
+  printf 'PATH=%s\n' "\$PATH"
+fi
+TTENV
+chmod +x "$TTVAR_TMP/fake-env-scripted.sh"
+cat > "$TTVAR_TMP/fake-env-scripted-rel.sh" <<TTENV
+#!/usr/bin/env bash
+if [ "\${1:-}" = "print" ]; then
+  printf 'TT_REPO_ROOT=%s\n' "$TEST_REPO_ROOT"
+  printf 'TT_ROOT=%s\n' "$TTVAR_REL_DIR"
+  printf 'HOME=%s\n' "$TTVAR_REL_DIR/home-scripted"
+  printf 'TAMANDUA_STATE_DIR=%s\n' "$TTVAR_REL_DIR/home-scripted/.tamandua"
+  printf 'TAMANDUA_CONTROL_PORT=5339\n'
+  printf 'TAMANDUA_MCP_PORT=5338\n'
+  printf 'TAMANDUA_DASHBOARD_PORT=5334\n'
+  printf 'PATH=%s\n' "\$PATH"
+fi
+TTENV
+chmod +x "$TTVAR_TMP/fake-env-scripted-rel.sh"
+
+set +e
+ttvar_out="$(TT_VAR="$TTVAR_DIR" TT_DC_ENV_SCRIPTED="$TTVAR_TMP/fake-env-scripted.sh" "$TOOL" scripted status 2>&1)"
+ttvar_rc=$?
+set -e
+if [ "$ttvar_rc" -eq 0 ] && grep_body "no provenance file at $TTVAR_DIR_RP/daemon-control/scripted.json" "$ttvar_out"; then
+  pass "TT_VAR under torture-test/var: status rc=0 and the provenance path follows TT_VAR"
+else
+  fail "TT_VAR under torture-test/var: expected rc=0 with provenance at $TTVAR_DIR_RP/daemon-control/scripted.json (rc=$ttvar_rc): $(echo "$ttvar_out" | tail -3 | tr '\n' ' ')"
+fi
+if [ -d "$TTVAR_DIR_RP/daemon-control" ]; then
+  pass "TT_VAR under torture-test/var: provenance dir created under TT_VAR"
+else
+  fail "TT_VAR under torture-test/var: provenance dir missing under TT_VAR"
+fi
+
+# A relative TT_VAR resolves against the invocation cwd (repo root here).
+set +e
+ttvar_rel_out="$(cd "$TEST_REPO_ROOT" && TT_VAR="torture-test/var/$TTVAR_REL_LEAF" TT_DC_ENV_SCRIPTED="$TTVAR_TMP/fake-env-scripted-rel.sh" "$TOOL" scripted status 2>&1)"
+ttvar_rel_rc=$?
+set -e
+if [ "$ttvar_rel_rc" -eq 0 ] && grep_body "no provenance file at $TTVAR_REL_RP/daemon-control/scripted.json" "$ttvar_rel_out"; then
+  pass "relative TT_VAR resolves against the invocation cwd and becomes TT_ROOT"
+else
+  fail "relative TT_VAR: expected rc=0 with provenance at $TTVAR_REL_RP/daemon-control/scripted.json (rc=$ttvar_rel_rc): $(echo "$ttvar_rel_out" | tail -3 | tr '\n' ' ')"
+fi
+
+# ── Test 99: TT_VAR outside torture-test/var is refused (exit 2, remedy) ──
+echo ""
+echo "--- Test: TT_VAR outside torture-test/var is refused (exit 2, remedy named) ---"
+
+set +e
+ttvar_tt_out="$(TT_VAR="$TTVAR_BASE/.." "$TOOL" scripted status 2>&1)"
+ttvar_tt_rc=$?
+set -e
+if [ "$ttvar_tt_rc" -eq 2 ] && grep_body "set TT_VAR under torture-test/var, e.g. torture-test/var/<campaign>" "$ttvar_tt_out"; then
+  pass "TT_VAR=<repo>/torture-test exits 2 and names the remedy"
+else
+  fail "TT_VAR=<repo>/torture-test expected exit 2 with the remedy (rc=$ttvar_tt_rc): $(echo "$ttvar_tt_out" | tail -3 | tr '\n' ' ')"
+fi
+
+TTVAR_OUTSIDE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tt-dc-ttvar-outside.XXXXXX")"
+set +e
+ttvar_outside_out="$(TT_VAR="$TTVAR_OUTSIDE_DIR" "$TOOL" scripted status 2>&1)"
+ttvar_outside_rc=$?
+set -e
+if [ "$ttvar_outside_rc" -eq 2 ] && grep_body "set TT_VAR under torture-test/var, e.g. torture-test/var/<campaign>" "$ttvar_outside_out"; then
+  pass "TT_VAR=<tmp outside var> exits 2 and names the remedy"
+else
+  fail "TT_VAR=<tmp outside var> expected exit 2 with the remedy (rc=$ttvar_outside_rc): $(echo "$ttvar_outside_out" | tail -3 | tr '\n' ' ')"
+fi
+if [ ! -e "$TTVAR_OUTSIDE_DIR/daemon-control" ]; then
+  pass "refused TT_VAR creates no provenance directory (refusal precedes any write)"
+else
+  fail "refused TT_VAR created $TTVAR_OUTSIDE_DIR/daemon-control — the refusal must precede any write"
+fi
+
+# ── Test 100: TT_VAR unset keeps the historical default TT_ROOT ────────
+echo ""
+echo "--- Test: TT_VAR unset keeps the default TT_ROOT ---"
+
+# Deterministic NO_PROVENANCE: temporarily move any provenance left by the
+# earlier start/stop tests aside (restored immediately after, and by the
+# EXIT trap on failure — never deleted).
+if [ -f "$TTVAR_DEFAULT_PROV" ]; then
+  TTVAR_PROV_BACKUP="$TTVAR_TMP/scripted.json.bak"
+  mv -f "$TTVAR_DEFAULT_PROV" "$TTVAR_PROV_BACKUP"
+fi
+set +e
+ttvar_default_out="$(env -u TT_VAR "$TOOL" scripted status 2>&1)"
+ttvar_default_rc=$?
+set -e
+if [ "$ttvar_default_rc" -eq 0 ] && grep_body "no provenance file at $TTVAR_BASE_RP/daemon-control/scripted.json" "$ttvar_default_out"; then
+  pass "TT_VAR unset: status reports the historical default provenance path"
+else
+  fail "TT_VAR unset: expected default provenance path $TTVAR_BASE_RP/daemon-control/scripted.json (rc=$ttvar_default_rc): $(echo "$ttvar_default_out" | tail -3 | tr '\n' ' ')"
+fi
+if [ -n "$TTVAR_PROV_BACKUP" ] && [ -f "$TTVAR_PROV_BACKUP" ]; then
+  mv -f "$TTVAR_PROV_BACKUP" "$TTVAR_DEFAULT_PROV"
+  TTVAR_PROV_BACKUP=""
+fi
+
 echo ""
 echo "================================================"
 if [ "$FAILURES" -eq 0 ]; then
