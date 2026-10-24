@@ -397,14 +397,48 @@ credential_env_lines() {
   done
 }
 
+# contained_home_has_pending_credential_invalidation: CRED-SUPPRESS
+# (bead tamandua-uvr, decision CRED-SUPPRESS) predicate. Takes the
+# CONTAINED home as its ONLY argument and returns 0 iff
+#   (a) it is an ABSOLUTE path (leading slash — anything else NEVER
+#       suppresses), AND
+#   (b) at least one EXISTING `<home>/.pi/agent/*.tt-invalidated` entry is
+#       present (auth.json.tt-invalidated / models.json.tt-invalidated —
+#       the same markers the controller's invalidate/restore already use).
+# The `test -e` per glob match is mandatory: an unmatched glob expands to
+# the literal pattern (with or without `nullglob`), so this check FAILS
+# CLOSED on an absent marker and on a missing `.pi/agent` directory — a
+# bare `[ -n "$glob" ]` would otherwise always pass.
+contained_home_has_pending_credential_invalidation() {
+  local home="${1:-}"
+  local marker
+  case "$home" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  for marker in "$home/.pi/agent/"*.tt-invalidated; do
+    if [ -e "$marker" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # env_for_kind: prints environment variables for the given kind
 # (real|scripted) as KEY=VALUE lines, suitable for `env $(...)` composition.
 # This NEVER sources into the caller shell.
 env_for_kind() {
   local kind="$1"
+  local printed_env=""
   case "$kind" in
     real)
-      env -i bash "$TT_ENV_REAL" print
+      printed_env="$(env -i bash "$TT_ENV_REAL" print)"
+      # Re-emit the captured env-script output byte-identically: emit the
+      # trailing newline only when the script emitted anything (a bare
+      # `printf '%s\n' ""` would otherwise add a stray blank line).
+      if [ -n "$printed_env" ]; then
+        printf '%s\n' "$printed_env"
+      fi
       ;;
     scripted)
       env -i bash "$TT_ENV_SCRIPTED" print
@@ -428,7 +462,25 @@ env_for_kind() {
   # caller env is NOT visible to them — the env-wins precedence is resolved
   # HERE, in the caller-visible env_for_kind.
   if [ "$kind" = "real" ]; then
-    credential_env_lines
+    # CRED-SUPPRESS (tamandua-uvr): while the CONTAINED home carries a
+    # pending credential-invalidation marker, do NOT re-surface the
+    # enumerated credential lines. The controller deliberately invalidated
+    # the credential (auth.json.tt-invalidated / models.json.tt-invalidated);
+    # re-exporting the still-cached caller-env / hermes-dotenv value here
+    # would silently undo that invalidation inside the contained daemon.
+    # The decision is SUITE-SIDE only (this env composition seam) — it never
+    # touches the operator home, the caller env, or credential_env_lines'
+    # own env-wins / hermes-dotenv precedence. The contained home comes
+    # ONLY from the env script's own printed `^HOME=` line captured above —
+    # never the caller HOME, never OPERATOR_HOME. No marker present =>
+    # behaviour byte-identical to before.
+    local contained_home=""
+    contained_home="$(printf '%s\n' "$printed_env" | grep '^HOME=' | head -n1 | cut -d= -f2- || true)"
+    if contained_home_has_pending_credential_invalidation "$contained_home"; then
+      : # CRED-SUPPRESS: pending invalidation marker present — skip the keys.
+    else
+      credential_env_lines
+    fi
   fi
 }
 
