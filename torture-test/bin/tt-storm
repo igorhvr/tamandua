@@ -641,7 +641,7 @@ export function realCtx({ bopts, execCtx, campaignDir }) {
             proc,
             kind,
             fsx: REAL_FS,
-            provenanceDir: path.join(TT_DIR, 'var', 'daemon-control'),
+            provenanceDir: path.join(VAR_ROOT, 'daemon-control'),
           });
           // US-004 (S6): the handler also reaps the campaign's standalone
           // dashboard/MCP children by provenance and verifies the campaign's
@@ -725,7 +725,7 @@ export async function materializeRehearsalDaemon({ state, campaignDir, execCtx, 
         nodeBinDir: path.dirname(process.execPath),
         pathExtra: rehearsalDaemonPathExtra(REPO_ROOT),
         repoRoot: REPO_ROOT,
-        ttRoot: path.join(TT_DIR, 'var'),
+        ttRoot: VAR_ROOT,
         maxActiveTimers: state?.source?.active_cap ?? null,
       });
     } else {
@@ -756,7 +756,7 @@ export async function materializeRehearsalDaemon({ state, campaignDir, execCtx, 
         nodeBinDir: path.dirname(process.execPath),
         pathExtra: rehearsalDaemonPathExtra(REPO_ROOT),
         repoRoot: REPO_ROOT,
-        ttRoot: path.join(TT_DIR, 'var'),
+        ttRoot: VAR_ROOT,
         scriptedBehaviors: scriptedRuntime?.behaviors_file ?? null,
         scriptedStateDir: scriptedRuntime?.state_dir ?? null,
         maxActiveTimers: state?.source?.active_cap ?? null,
@@ -1238,7 +1238,7 @@ async function main(argv) {
       process.stderr.write(`REFUSED: cannot materialize the rehearsal daemon: ${daemonRes.reason ?? 'unknown'}\n`);
       process.exit(3);
     }
-    const ctx = realCtx({ bopts: { ...bopts, daemonKind: daemonRes.daemonKind, daemonEnv: daemonRes.daemonEnv, daemonProvenanceDir: path.join(TT_DIR, 'var', 'daemon-control'), controlUrl: daemonRes.ports?.controlUrl ?? st.state.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
+    const ctx = realCtx({ bopts: { ...bopts, daemonKind: daemonRes.daemonKind, daemonEnv: daemonRes.daemonEnv, daemonProvenanceDir: path.join(VAR_ROOT, 'daemon-control'), controlUrl: daemonRes.ports?.controlUrl ?? st.state.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
     ctx.opts.rehearsalRun = true;
     process.stdout.write(`Rehearsal approved for campaign ${campaignId} (round ${round}); gate hashes matched. Executing round ${round} with the real contained adapters.\n`);
     await stormRunRehearsal(ctx, { round });
@@ -1362,7 +1362,7 @@ async function main(argv) {
         process.stderr.write(`REFUSED: cannot materialize the rehearsal daemon: ${daemonRes.reason ?? 'unknown'}\n`);
         process.exit(3);
       }
-      const ctx = realCtx({ bopts: { ...bopts, daemonKind: daemonRes.daemonKind, daemonEnv: daemonRes.daemonEnv, daemonProvenanceDir: path.join(TT_DIR, 'var', 'daemon-control'), controlUrl: daemonRes.ports?.controlUrl ?? st.state.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
+      const ctx = realCtx({ bopts: { ...bopts, daemonKind: daemonRes.daemonKind, daemonEnv: daemonRes.daemonEnv, daemonProvenanceDir: path.join(VAR_ROOT, 'daemon-control'), controlUrl: daemonRes.ports?.controlUrl ?? st.state.daemon_ports?.controlUrl ?? null }, execCtx, campaignDir });
       ctx.opts.rehearsalRun = true;
       await stormRunRehearsal(ctx, { round });
     } else {

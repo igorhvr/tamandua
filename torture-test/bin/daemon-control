@@ -101,7 +101,94 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
 TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
-export TT_ROOT="${TT_REPO_ROOT}/torture-test/var"
+DEFAULT_TT_ROOT="${TT_REPO_ROOT}/torture-test/var"
+
+# resolve_tt_path: canonicalize a (possibly relative, possibly not-yet-
+# existing) directory path for TT_VAR/TT_ROOT resolution. Portable shell —
+# no GNU realpath dependency. A relative path resolves against the
+# invocation cwd. Existing components are resolved through `cd -P` (so
+# symlinks are followed and `..` is applied to the PHYSICAL parent); the
+# not-yet-existing tail is appended lexically, with `..` REFUSED there (a
+# future component cannot safely re-enter or escape the resolved prefix).
+# Prints the resolved path on success, nothing on failure.
+resolve_tt_path() {
+  local path="$1"
+  case "$path" in
+    /*) ;;
+    *) path="$PWD/$path" ;;
+  esac
+  local resolved="/" rest comp candidate tail
+  rest="${path#/}"
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*) comp="${rest%%/*}"; rest="${rest#*/}" ;;
+      *) comp="$rest"; rest="" ;;
+    esac
+    [ -z "$comp" ] && continue
+    case "$comp" in
+      .) continue ;;
+      ..)
+        resolved="$(cd "$resolved/.." 2>/dev/null && pwd -P)" || return 1
+        ;;
+      *)
+        candidate="${resolved%/}/$comp"
+        if [ -L "$candidate" ] || [ -e "$candidate" ]; then
+          [ -d "$candidate" ] || return 1
+          resolved="$(cd "$candidate" 2>/dev/null && pwd -P)" || return 1
+        else
+          tail="/$comp"
+          while [ -n "$rest" ]; do
+            case "$rest" in
+              */*) comp="${rest%%/*}"; rest="${rest#*/}" ;;
+              *) comp="$rest"; rest="" ;;
+            esac
+            [ -z "$comp" ] && continue
+            case "$comp" in
+              .) ;;
+              ..) return 1 ;;
+              *) tail="$tail/$comp" ;;
+            esac
+          done
+          printf '%s' "${resolved%/}$tail"
+          return 0
+        fi
+        ;;
+    esac
+  done
+  printf '%s' "${resolved:-/}"
+}
+
+# STORM-TTVAR-GUARD (tamandua-6sy.6.8): a campaign's private home and its
+# provenance MUST share one containment root. TT_VAR is the campaign root
+# (it holds home/, home-scripted/, and daemon-control/); when it is set,
+# TT_ROOT FOLLOWS it. When it is unset, TT_ROOT stays byte-identical to the
+# historical <repo>/torture-test/var. A TT_VAR that resolves outside
+# torture-test/var is REFUSED (exit 2) with the remedy — silently
+# proceeding is the split defect that made an approved real campaign
+# unrunnable (the private home landed outside TT_ROOT, so the production
+# guard refused 'state dir ... is production') and left provenance in the
+# wrong root (owned cleanup then stopped only the recorded daemon pid).
+DEFAULT_TT_ROOT_RP="$(resolve_tt_path "$DEFAULT_TT_ROOT")"
+if [ -z "$DEFAULT_TT_ROOT_RP" ]; then
+  echo "daemon-control: ERROR — cannot resolve the default containment root ($DEFAULT_TT_ROOT)" >&2
+  exit 2
+fi
+if [ -n "${TT_VAR:-}" ]; then
+  if ! TT_ROOT="$(resolve_tt_path "$TT_VAR")" || [ -z "$TT_ROOT" ]; then
+    echo "daemon-control: REFUSING — TT_VAR '$TT_VAR' does not resolve to a directory; set TT_VAR under torture-test/var, e.g. torture-test/var/<campaign>" >&2
+    exit 2
+  fi
+  case "$TT_ROOT" in
+    "$DEFAULT_TT_ROOT_RP"|"$DEFAULT_TT_ROOT_RP"/*) ;;
+    *)
+      echo "daemon-control: REFUSING — TT_VAR '$TT_VAR' (resolves to '$TT_ROOT') is outside the torture-test containment root; set TT_VAR under torture-test/var, e.g. torture-test/var/<campaign>" >&2
+      exit 2
+      ;;
+  esac
+else
+  TT_ROOT="$DEFAULT_TT_ROOT"
+fi
+export TT_ROOT
 
 # ── shared port-probe helper (MACP4 US-001) ──────────────────────────
 # The port liveness probes (port_probe / is_port_listening /

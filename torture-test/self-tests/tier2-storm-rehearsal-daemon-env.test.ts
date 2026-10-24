@@ -40,6 +40,10 @@
 //       the rendered daemon PATH (real campaign renderer + all four e2e harness
 //       builders), so the contained scripted worker can resolve and execute the
 //       bare `tamandua-test` the shim-wrapped TEST_CMD invokes.
+//   E10 (STORM-TTVAR-GUARD) every daemonControl dispatch carries
+//       TT_VAR=execCtx.var_root, NO other effect channel gains TT_VAR, and
+//       tt-storm derives all provenance/ttRoot paths from VAR_ROOT (never the
+//       fixed TT_DIR/var), including the cleanup handler's provenanceDir.
 //
 // Everything runs under test-owned scratch dirs (removed in finally). No
 // daemon/harness/workflow is ever spawned: the spawn boundary is an injected
@@ -152,6 +156,10 @@ describe("STORM-REHEARSAL US-002 (S1): campaign daemon env delivery", () => {
         assert.equal(c.argv[1], REHEARSAL_DAEMON_KIND, "argv[1] is the rehearsal daemon kind");
         assert.equal(c.env.TT_DC_ENV_SCRIPTED, envScript, "TT_DC_ENV_SCRIPTED names the campaign daemon.env.sh");
         assert.equal(c.env.TT_FORCE_NO_SYSTEMD, "1", "TT_FORCE_NO_SYSTEMD is delivered");
+        // STORM-TTVAR-GUARD: daemon-control resolves TT_ROOT from TT_VAR, so
+        // every dispatch must carry the campaign context's var root (which is
+        // where its private home and provenance actually live).
+        assert.equal(c.env.TT_VAR, execCtx.var_root, "TT_VAR is the exec context's var_root on every dispatch");
         assert.equal(c.env.HOME, execCtx.home_root, "HOME stays the private root");
         assert.equal(c.env.TAMANDUA_STATE_DIR, execCtx.state_root, "TAMANDUA_STATE_DIR stays the private root");
         assert.equal(c.env.TAMANDUA_DB_PATH, execCtx.db_path, "TAMANDUA_DB_PATH stays the private campaign DB");
@@ -190,6 +198,7 @@ describe("STORM-REHEARSAL US-002 (S1): campaign daemon env delivery", () => {
       for (const c of calls) {
         assert.equal(c.env.TT_DC_ENV_SCRIPTED, envScript, "the control handle's dispatch carries the campaign env script");
         assert.equal(c.env.TT_FORCE_NO_SYSTEMD, "1", "the control handle's dispatch carries TT_FORCE_NO_SYSTEMD");
+        assert.equal(c.env.TT_VAR, execCtx.var_root, "the control handle's dispatch carries the campaign var root as TT_VAR");
       }
 
       // Protected per-call override still refuses (no HOME escape through env).
@@ -318,6 +327,48 @@ describe("STORM-REHEARSAL US-002 (S1): campaign daemon env delivery", () => {
       /fsx\.mkdirSync\(scriptedRuntime\.state_dir,\s*\{\s*recursive:\s*true\s*\}\)/,
       "materializeRehearsalDaemon creates the scripted state dir before the daemon start",
     );
+  });
+
+  it("E10: only the daemonControl channel carries TT_VAR, and tt-storm derives provenance/ttRoot from VAR_ROOT", async () => {
+    const tmp = ownedTmpDir("ttvar");
+    try {
+      const varRoot = path.join(tmp, "var");
+      const execCtx = buildPrivateExecContext({
+        varRoot,
+        binaries: { tamandua: TAMANDUA_BIN, daemonControl: DC_BIN, ttChaos: path.join(repoRoot, "torture-test", "bin", "tt-chaos") },
+        ownerRef: "e10-ttvar",
+      });
+      const { proc, calls } = makeRecordingProc(execCtx, { TT_DC_ENV_SCRIPTED: path.join(tmp, "daemon.env.sh") });
+      await proc.daemonControl(["daemon-control", REHEARSAL_DAEMON_KIND, "status"], {});
+      await proc.tamandua(["tamandua", "status"], {});
+      await proc.launchWorkflow(["tamandua", "status"], {});
+      await proc.chaosAction(["tt-chaos", "status"], {});
+      assert.equal(calls.length, 4, "one recorded spawn per channel");
+      assert.equal(calls[0].env.TT_VAR, execCtx.var_root, "the daemonControl channel carries TT_VAR=<execCtx.var_root>");
+      for (const c of calls.slice(1)) {
+        assert.equal(c.env.TT_VAR, undefined, `${c.argv[0]} (non-daemonControl channel) must never receive TT_VAR`);
+      }
+
+      const src = fs.readFileSync(TT_STORM_SRC, "utf8");
+      assert.doesNotMatch(
+        src,
+        /path\.join\(TT_DIR,\s*['"]var['"],\s*['"]daemon-control['"]\)/,
+        "no provenance dir is derived from the fixed TT_DIR/var root",
+      );
+      assert.doesNotMatch(
+        src,
+        /ttRoot:\s*path\.join\(TT_DIR,\s*['"]var['"]\)/,
+        "no rendered ttRoot is derived from the fixed TT_DIR/var root",
+      );
+      const daemonProvenance = src.match(/daemonProvenanceDir:\s*path\.join\(VAR_ROOT,\s*['"]daemon-control['"]\)/g) ?? [];
+      assert.equal(daemonProvenance.length, 2, "BOTH the run and rehearse bopts derive daemonProvenanceDir from VAR_ROOT");
+      const cleanupProvenance = src.match(/\bprovenanceDir:\s*path\.join\(VAR_ROOT,\s*['"]daemon-control['"]\)/g) ?? [];
+      assert.equal(cleanupProvenance.length, 1, "the owned-cleanup makeRehearsalDaemonControl is wired with provenanceDir=<VAR_ROOT>/daemon-control");
+      const ttRoots = src.match(/ttRoot:\s*VAR_ROOT/g) ?? [];
+      assert.equal(ttRoots.length, 2, "both rendered daemon env scripts receive ttRoot: VAR_ROOT");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it("E5: renderRehearsalDaemonEnvScript emits the scripted-runtime contract + derived cap (and omits it when not supplied)", () => {

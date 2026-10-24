@@ -1839,9 +1839,16 @@ export function makeRealProc({ execCtx, daemonEnv = null, controlUrl = null, spa
     launchWorkflow: (argv, opts) => call(argv, opts),
     tamandua: (argv, opts) => call(argv, opts),
     chaosAction: (argv, opts) => call(argv, opts),
+    // STORM-TTVAR-GUARD: daemon-control resolves its containment/provenance
+    // root from TT_VAR. Hand it the exec context's var_root on EVERY dispatch
+    // so a campaign whose private home lives under TT_VAR cannot be split
+    // across the fixed default root (default TT_ROOT would otherwise remain
+    // <repo>/torture-test/var and refuse the campaign's home as production).
+    // TT_VAR is set AFTER boundDaemonEnv so a rendered env script can never
+    // redirect it; no other effect channel receives TT_VAR.
     daemonControl: (argv, opts) => call(argv, {
       ...(opts ?? {}),
-      env: { ...(opts?.env ?? {}), ...(boundDaemonEnv ?? {}) },
+      env: { ...(opts?.env ?? {}), ...(boundDaemonEnv ?? {}), TT_VAR: execCtx.var_root },
     }),
     httpGet: makeRealHttpGet(),
     // SF-3: the campaign's private control-plane read seam. controlUrl is the
