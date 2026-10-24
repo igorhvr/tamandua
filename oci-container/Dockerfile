@@ -1,4 +1,4 @@
-FROM igorhvr/bedlam-ubuntu@sha256:1b21be58ec73d2347ecfe97cd725ec5ef6911097efd0cebb2878384c40936c28 AS icebox-env
+FROM igorhvr/bedlam-ubuntu@sha256:d9004992867364ad9a1fbdd827a0b8d2dc9442d4e0af0d74efd3b8973c485c57 AS icebox-env
 MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 
 # ============================================================================
@@ -11,10 +11,10 @@ MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 #
 # Frozen source SHAs for r4 (also recorded in /etc/tamandua-image-manifest.json
 # and the OCI labels below; users can `git pull` ahead of them at will):
-#   hermes-agent: 2943ee6f19a2abd0cc93384db55643469e80dfcb
-#   pi:           f10993bc7f28145df1375f3ff39c7f5c4cfc05f0
+#   hermes-agent: 4d04303818b61bf3aa09278af48356315515965b
+#   pi:           bd3c9b823762b7383954aa49e13ee350471015fe
 #   dsh:          5badb15009ae1756c3afe0ae0cef1faafc290ccc
-#   tamandua:     42cafe0d5ee158327ba522252fab5aeadbaece6b
+#   tamandua:     3f5d008c8d2263017bf13059625606539a625f06
 # Python runtime pin: 3.14.7 -- the NEWEST Python hermes main supports
 # (`requires-python >=3.11,<3.15`; upstream's own pm/lock.json names the exact
 # 3.14.7+20260901 artifact). Newest-supported is deliberate: older Pythons
@@ -24,10 +24,10 @@ MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
       org.opencontainers.image.source="https://github.com/igorhvr/tamandua" \
       org.opencontainers.image.description="Matchlock standard image: tamandua, dsh, pi and hermes (pi/hermes built from in-image source with build-and-install scripts)" \
-      com.tamandua.hermes.commit="2943ee6f19a2abd0cc93384db55643469e80dfcb" \
-      com.tamandua.pi.commit="f10993bc7f28145df1375f3ff39c7f5c4cfc05f0" \
+      com.tamandua.hermes.commit="4d04303818b61bf3aa09278af48356315515965b" \
+      com.tamandua.pi.commit="bd3c9b823762b7383954aa49e13ee350471015fe" \
       com.tamandua.dsh.commit="5badb15009ae1756c3afe0ae0cef1faafc290ccc" \
-      com.tamandua.tamandua.commit="42cafe0d5ee158327ba522252fab5aeadbaece6b" \
+      com.tamandua.tamandua.commit="3f5d008c8d2263017bf13059625606539a625f06" \
       com.tamandua.python.pin="3.14.7"
 
 # User-agnostic PATH: everything the image runs for any caller uid lives under
@@ -37,6 +37,14 @@ LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
 # without any shell rc.
 ENV PATH="/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV HOME="/root"
+
+# CA remediation: force OpenSSL-based clients (notably uv, and anything else that consults
+# SSL_CERT_FILE) onto the PATCHED system bundle. This image's system store is
+# ca-certificates 20260816ubuntu0.26.04.1, which rejects all 12 advisory chains. Node uses its
+# own compiled-in roots (node 24.22.1, patched) and hermes uses certifi, which the installer
+# upgrades and now gates on. Verified for uv 0.13.1: a bogus SSL_CERT_FILE makes a real
+# download fail, and this bundle makes it succeed.
+ENV SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
 
 # --- [icebox] Tier-A environment + passwordless-sudo drop-in (design v6 §2) --
 # One shared env stage. `docker build --target icebox-env` builds exactly this
@@ -71,13 +79,13 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    git -C /opt/src/hermes-agent checkout -B main 2943ee6f19a2abd0cc93384db55643469e80dfcb; \
+    git -C /opt/src/hermes-agent checkout -B main 4d04303818b61bf3aa09278af48356315515965b; \
     git -C /opt/src/hermes-agent branch --set-upstream-to=origin/main main
 
 COPY build-and-install-hermes.sh /opt/src/hermes-agent/build-and-install
 RUN printf 'build-and-install\n' >> /opt/src/hermes-agent/.git/info/exclude \
  && chmod 755 /opt/src/hermes-agent/build-and-install \
- && EXPECT_HEAD=2943ee6f19a2abd0cc93384db55643469e80dfcb \
+ && EXPECT_HEAD=4d04303818b61bf3aa09278af48356315515965b \
     HERMES_SYSTEM_HOME=/opt/src/hermes-root \
     TAMANDUA_IMAGE_BUILD=1 \
     /opt/src/hermes-agent/build-and-install
@@ -91,13 +99,13 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    git -C /opt/src/pi checkout -B main f10993bc7f28145df1375f3ff39c7f5c4cfc05f0; \
+    git -C /opt/src/pi checkout -B main bd3c9b823762b7383954aa49e13ee350471015fe; \
     git -C /opt/src/pi branch --set-upstream-to=origin/main main
 
 COPY build-and-install-pi.sh /opt/src/pi/build-and-install
 RUN printf 'build-and-install\n' >> /opt/src/pi/.git/info/exclude \
  && chmod 755 /opt/src/pi/build-and-install \
- && TAMANDUA_IMAGE_BUILD=1 EXPECT_HEAD=f10993bc7f28145df1375f3ff39c7f5c4cfc05f0 /opt/src/pi/build-and-install
+ && TAMANDUA_IMAGE_BUILD=1 EXPECT_HEAD=bd3c9b823762b7383954aa49e13ee350471015fe /opt/src/pi/build-and-install
 
 # --- dsh / DeepSeek Harness (same shape as the previous image; pinned) -------
 RUN set -eu; \
@@ -128,9 +136,9 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "42cafe0d5ee158327ba522252fab5aeadbaece6b" ]; then \
-      git -C /opt/tamandua fetch --depth 1 origin 42cafe0d5ee158327ba522252fab5aeadbaece6b; \
-      git -C /opt/tamandua checkout --detach 42cafe0d5ee158327ba522252fab5aeadbaece6b; \
+    if [ "$(git -C /opt/tamandua rev-parse HEAD)" != "3f5d008c8d2263017bf13059625606539a625f06" ]; then \
+      git -C /opt/tamandua fetch --depth 1 origin 3f5d008c8d2263017bf13059625606539a625f06; \
+      git -C /opt/tamandua checkout --detach 3f5d008c8d2263017bf13059625606539a625f06; \
     fi; \
     git -C /opt/tamandua rev-parse HEAD; \
     bash /opt/tamandua/scripts/install.sh --local /opt/tamandua; \
