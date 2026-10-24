@@ -115,8 +115,9 @@ describe("US-007 matchlock gate runners resolve the system runtime (no pins)", (
   it("no matchlock gate runner carries the retired accepted-hash pins", () => {
     // Union port MTLK-UNPIN: the whole gate family is system-runtime based;
     // the retired pins must not reappear in any driver. The UNPIN residue
-    // follow-up enrolled the four merge-worktree drivers, so all thirteen
-    // `run-matchlock-*` drivers are covered here.
+    // follow-up enrolled the four merge-worktree drivers, and G8 US-011 added
+    // the admission-qualification driver, so all fourteen `run-matchlock-*`
+    // drivers are covered here.
     const drivers = [
       "run-matchlock-synthetic-e2e-test",
       "run-matchlock-dsh-gate-e2e-test",
@@ -131,6 +132,7 @@ describe("US-007 matchlock gate runners resolve the system runtime (no pins)", (
       "run-matchlock-dsh-merge-worktree-canary-e2e-test",
       "run-matchlock-hermes-merge-worktree-e2e-test",
       "run-matchlock-hermes-merge-worktree-canary-e2e-test",
+      "run-matchlock-admission-qualification-e2e-test",
     ] as const;
     for (const name of drivers) {
       const content = readRunner(name);

@@ -40,6 +40,17 @@
  *  5. CLEANUP: every VM the gate owns is positively closed and removed (exact
  *     owned ids recorded in an evidence ledger). A failed/unknown `rm` throws
  *     — an inventory error is never certified as a clean list.
+ *  6. OVERLAP (final test, REAL-RUNNER-WHEN-RUN): two REAL invocations of ONE
+ *     run in BOTH teardown orders. The waiting invocation's per-invocation
+ *     overlay root must survive the peer's wire-confirmed-close cleanup
+ *     (which removes exactly its own root); the waiting guest is then
+ *     released and performs REAL NEW $DSH_HOME writes, and BOTH invocations'
+ *     session artifacts must survive on the host. The host farm and the host
+ *     `profiles/` tree stay byte-identical throughout. It was NOT executed in
+ *     the delivering run: a nested VM cannot boot in-guest (and the developer
+ *     sandbox suppresses matchlock's file capabilities), so the
+ *     operator/coordinator runs it outside that sandbox under the shared gate
+ *     lock.
  *
  * CREDENTIALS: only the synthetic placeholder written by
  * `prepareComposedDshHome` is ever touched. The gate never reads, points at, or
@@ -82,6 +93,7 @@ import {
   DSH_GATE_FIRST_REQUEST_PLUGIN,
   DshOverlayObserver,
   guestFarmLinksAreGuestInstall,
+  invocationRoots,
   nativeDshBootPlan,
   parseFirstRequestOutput,
   prepareComposedDshHome,
@@ -103,6 +115,13 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 // so the gate observes the transient lock deterministically.
 const BOOT_LOCK_HOLD_MS = 4000;
 const DSH_OVERLAY_OBSERVER_INTERVAL_MS = 20;
+/**
+ * OVERLAY-INV-SCOPED overlap arm: how long the waiting invocation may block on
+ * the host release file (bounded, explicit ack — never a timing guess). Kept
+ * well below the runner's 150s guest timeout so a stuck predecessor fails the
+ * arm loudly instead of hanging the gate.
+ */
+const OVERLAP_WAIT_MS = 120_000;
 /** The durable profile config files prepareDshProfileOverlay stages privately. */
 const DURABLE_PROFILE_CONFIG_FILES = [
   "package.json",
@@ -363,9 +382,9 @@ async function loadAdmission(): Promise<{
   return { admitMatchlockRun: mod.admitMatchlockRun };
 }
 
-async function loadOverlayRoot(): Promise<(runId: string, liveStateRoot: string) => string> {
+async function loadInvocationGroupRoot(): Promise<(runId: string, liveStateRoot: string) => string> {
   const mod = await import(`${repoRoot}/dist/installer/matchlock/dsh-profile-overlay.js`);
-  return mod.dshProfileOverlayRoot as (runId: string, liveStateRoot: string) => string;
+  return mod.dshProfileInvocationGroupRoot as (runId: string, liveStateRoot: string) => string;
 }
 
 async function loadHomeAlias(): Promise<(realHome: string) => string> {
@@ -438,6 +457,11 @@ async function directFirstRequestRound(opts: {
   policy: Record<string, unknown>;
   workdir: string;
   runId: string;
+  /**
+   * Optional custom prompt (the overlap arm drives the same production runner
+   * with a wait-then-chat marker). Defaults to the first-request probe prompt.
+   */
+  promptText?: string;
 }): Promise<DirectRecord> {
   const runner = await loadDirectRunner();
   const record: DirectRecord = {
@@ -457,8 +481,9 @@ async function directFirstRequestRound(opts: {
       opts.workdir,
       // US-004: ask the synthetic boot to hold the real withFileLock sibling
       // lock for a bounded window so the on-host observer captures it.
-      "SYNTHETIC-DSH-FIRST-REQUEST: resolve the request-extension provider module through the private profile farm (zero provider tokens) " +
-        `${DSH_GATE_BOOT_LOCK_HOLD_MARKER}:${BOOT_LOCK_HOLD_MS}`,
+      opts.promptText ??
+        ("SYNTHETIC-DSH-FIRST-REQUEST: resolve the request-extension provider module through the private profile farm (zero provider tokens) " +
+          `${DSH_GATE_BOOT_LOCK_HOLD_MARKER}:${BOOT_LOCK_HOLD_MS}`),
       opts.runId,
     );
     const result = await runner.runDshInvocation(options);
@@ -474,6 +499,76 @@ async function directFirstRequestRound(opts: {
     record.error = err instanceof Error ? err.message : String(err);
   }
   return record;
+}
+
+// ── OVERLAY-INV-SCOPED real-runner overlap helpers ────────────────────────
+
+/**
+ * Bounded poll for a host-visible synchronization file (explicit ack).
+ *
+ * EVENT-LOOP SAFETY (OVERLAP-ARM-ASYNC-FIX): the invocation this arm waits
+ * for runs IN-PROCESS on THIS event loop (`directFirstRequestRound` ->
+ * `runDshInvocation` is dynamically imported into the test process). Any
+ * host-side wait here MUST yield with an awaited timer. A synchronous
+ * busy-wait (an Atomics-based sleep or a spin) holds the only JS thread and
+ * starves that in-process runner, so its create response, bridge exec,
+ * handshake and guest marker write cannot progress and the marker only
+ * appears ~0.4s AFTER the wait deadline (the deterministic 120s failure of
+ * gate attempt 1 — ~118s of zero host-visible activity after the waiting VM
+ * went `running`). Do NOT reintroduce a synchronous wait in this path: no
+ * synchronous bounded-sleep helper, no Atomics-based main-thread sleep. The hermetic
+ * starvation control in tests/matchlock-dsh-profile-overlay-gate-helpers.test.ts
+ * pins this, and its source pin fails on a tree that has one.
+ */
+async function waitForPath(p: string, timeoutMs: number, what: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(p)) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}: ${p}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/**
+ * Bounded poll until at least one live invocation root exists for the run.
+ * Already yielding (awaited timer), so it is safe next to an in-process
+ * invocation on the same event loop.
+ */
+async function waitForInvocationRoot(groupRoot: string, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const roots = invocationRoots(groupRoot);
+    if (roots.length > 0) return roots[0];
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out after ${timeoutMs}ms waiting for a live invocation root under ${groupRoot}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/** The chat session id a `runPlainChat` invocation reported on stderr. */
+function chatSessionId(record: DirectRecord): string | null {
+  const m = /synthetic-dsh chat session:\s*(\S+)/.exec(record.stderrTail);
+  return m ? m[1] : null;
+}
+
+/** Every session artifact under the synthetic host home whose path names `id`. */
+function sessionArtifactsForId(home: string, id: string): string[] {
+  const root = path.join(home, "sessions");
+  if (!fs.existsSync(root)) return [];
+  const out: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (full.includes(id)) out.push(full);
+    }
+  };
+  walk(root);
+  return out.sort();
 }
 
 // ── build the production dsh policy for the synthetic home ────────────────
@@ -703,7 +798,7 @@ describe(
           );
         }
 
-        const overlayRootForRun = await loadOverlayRoot();
+        const invocationGroupRootForRun = await loadInvocationGroupRoot();
         const sessionsBefore = fs.existsSync(path.join(synthHome, "sessions"))
           ? fs.readdirSync(path.join(synthHome, "sessions"))
           : [];
@@ -712,13 +807,18 @@ describe(
         for (let round = 1; round <= 2; round += 1) {
           // 4. IN-VM first-request round through the production dsh runner.
           const runId = randomUUID();
-          const overlayRoot = overlayRootForRun(runId, tamanduaDir);
+          // OVERLAY-INV-SCOPED: the exact overlay root is bound to the
+          // controller's host-generated invocation id (unknown while the round
+          // is live), so observe the per-run grouping dir and sample whichever
+          // invocation root is active.
+          const invocationGroupRoot = invocationGroupRootForRun(runId, tamanduaDir);
           assert.ok(
-            overlayRoot.startsWith(tamanduaDir + path.sep),
-            `private overlay root must live under the attested live state: ${overlayRoot}`,
+            invocationGroupRoot.startsWith(tamanduaDir + path.sep),
+            `invocation group root must live under the attested live state: ${invocationGroupRoot}`,
           );
-          const observer = new DshOverlayObserver(overlayRoot, {
+          const observer = new DshOverlayObserver(invocationGroupRoot, {
             intervalMs: DSH_OVERLAY_OBSERVER_INTERVAL_MS,
+            invocationGroupDir: true,
           }).start();
           const rec = await directFirstRequestRound({
             label: `first-request-round-${round}`,
@@ -727,6 +827,7 @@ describe(
             runId,
           });
           const observed = observer.stop();
+          const overlayRoot = invocationGroupRoot;
           const afterFarm = snapshotDshInstallDerivedFarms(synthHome, layout.installDerivedDirs);
           const afterProfiles = snapshotDshProfilesInvariance(synthHome);
 
@@ -974,6 +1075,197 @@ describe(
           `[dsh-profile-overlay-gate] OK — host farm + host profiles/ tree byte-identical across ${rounds.length} in-VM rounds; ` +
             `private profiles/node_modules.lock observed in every private overlay; ` +
             `VMs positively closed: ${observedVmIds.join(",")}`,
+        );
+      },
+    );
+
+    // ── OVERLAY-INV-SCOPED cross-invocation overlap arm ──────────────────
+    //
+    // REAL-RUNNER-WHEN-RUN: this arm drives the PRODUCTION dsh invocation
+    // runner twice (two REAL fresh Matchlock VMs) against ONE per-run
+    // invocation grouping dir. It is only executable on a host that can boot
+    // VMs.
+    //
+    // NOT RUN IN THIS DELIVERING RUN: the delivering agent runs INSIDE a
+    // Tamandua worker round, and a nested VM cannot boot in-guest (the
+    // developer sandbox also has `NoNewPrivs: 1` / `CapEff: 0`, which
+    // suppresses matchlock's file capabilities -> the first VM create fails
+    // `TUNSETIFF: operation not permitted`). The operator/coordinator runs
+    // this gate outside that sandbox under the shared gate lock; the arm's
+    // wiring is pinned by tests/matchlock-dsh-overlay-gate-wiring.test.ts and
+    // its host-side wait safety hermetically by
+    // tests/matchlock-dsh-profile-overlay-gate-helpers.test.ts. Nothing here
+    // is a proxy: when run, every assertion below is real VM behaviour.
+    it(
+      "keeps a live invocation across the peer's cleanup and publishes BOTH invocations' REAL new artifacts (both teardown orders)",
+      { timeout: GATE_TIMEOUT_MS },
+      async () => {
+        assert.ok(synthLayout, "before() must initialize the synthetic home layout");
+        const layout = synthLayout;
+        const policy = await admitDshPolicy();
+        const invocationGroupRootForRun = await loadInvocationGroupRoot();
+        const baselineFarm = snapshotDshInstallDerivedFarms(synthHome, layout.installDerivedDirs);
+        const baselineProfiles = snapshotDshProfilesInvariance(synthHome);
+        const overlapEvidence: Array<Record<string, unknown>> = [];
+
+        // Both directions: in one arm the SUCCESSOR waits (and performs its
+        // NEW file ops after the predecessor's teardown); in the other the
+        // PREDECESSOR waits. Both real teardown orders are therefore covered.
+        for (const arm of [
+          { name: "successor-waits", waitingRole: "successor" },
+          { name: "predecessor-waits", waitingRole: "predecessor" },
+        ] as const) {
+          const runId = randomUUID();
+          const groupRoot = invocationGroupRootForRun(runId, tamanduaDir);
+          const syncDir = path.join(wd, ".overlap-sync", runId);
+          fs.mkdirSync(syncDir, { recursive: true });
+          const readyPath = path.join(syncDir, "waiting-ready");
+          const releasePath = path.join(syncDir, "waiting-release");
+
+          // 1. The WAITING invocation boots first and blocks on the release
+          //    file; its NEW $DSH_HOME writes happen ONLY after release.
+          const waiting = directFirstRequestRound({
+            label: `overlap-${arm.name}-${arm.waitingRole}`,
+            policy,
+            workdir: wd,
+            runId,
+            promptText: `SYNTHETIC-DSH-WAIT-THEN-CHAT:${readyPath}:${releasePath}:${OVERLAP_WAIT_MS}`,
+          });
+
+          // Explicit sync (bounded, event-loop-safe polls — no timing
+          // guesses): the waiting invocation's overlay root exists and its
+          // guest is RUNNING before the peer starts. Because it is the only
+          // live invocation, the group dir cannot yet contain the peer's root.
+          const waitingRoot = await waitForInvocationRoot(groupRoot, OVERLAP_WAIT_MS);
+          await waitForPath(readyPath, OVERLAP_WAIT_MS, "waiting invocation ready marker");
+
+          // 2. The PEER starts, does its real work, and tears down
+          //    (publish + remove exactly its own root) while the waiting
+          //    invocation's VM is still live.
+          const peer = directFirstRequestRound({
+            label: `overlap-${arm.name}-peer`,
+            policy,
+            workdir: wd,
+            runId,
+            promptText: "SYNTHETIC-DSH-OVERLAP-PEER-CHAT",
+          });
+          const peerRecord = await peer;
+          assert.ok(peerRecord.ok, `${arm.name}: peer must succeed: ${peerRecord.error}`);
+          assert.equal(peerRecord.exitCode, 0, `${arm.name}: peer must exit 0`);
+          assert.equal(peerRecord.cleanupConfirmed, true, `${arm.name}: peer VM must be positively closed`);
+
+          // The peer's cleanup removed exactly ITS root: the live waiting root
+          // SURVIVED with its mounted source intact.
+          assert.ok(
+            fs.existsSync(waitingRoot),
+            `${arm.name}: the live invocation root must survive the peer's cleanup`,
+          );
+          const remaining = invocationRoots(groupRoot);
+          assert.equal(
+            remaining.length,
+            1,
+            `${arm.name}: exactly the waiting invocation root may remain after the peer cleanup: ${JSON.stringify(remaining)}`,
+          );
+          assert.equal(remaining[0], waitingRoot);
+
+          // Host farm + host profiles/ tree unchanged while both were live.
+          assert.deepEqual(
+            snapshotDshInstallDerivedFarms(synthHome, layout.installDerivedDirs),
+            baselineFarm,
+            `${arm.name}: the HOST farm must stay byte-identical`,
+          );
+          assert.deepEqual(
+            snapshotDshProfilesInvariance(synthHome),
+            baselineProfiles,
+            `${arm.name}: the HOST profiles/ tree must stay byte-identical`,
+          );
+
+          // 3. Release the waiting invocation: it now performs REAL NEW file
+          //    operations under the mounted $DSH_HOME and publishes them.
+          fs.writeFileSync(releasePath, "release\n", "utf-8");
+          const waitingRecord = await waiting;
+          assert.ok(waitingRecord.ok, `${arm.name}: waiting invocation must succeed: ${waitingRecord.error}`);
+          assert.equal(waitingRecord.exitCode, 0, `${arm.name}: waiting invocation must exit 0`);
+          assert.equal(
+            waitingRecord.cleanupConfirmed,
+            true,
+            `${arm.name}: waiting VM must be positively closed`,
+          );
+
+          // 4. BOTH invocations' REAL session artifacts survive on the host.
+          const peerSession = chatSessionId(peerRecord);
+          const waitingSession = chatSessionId(waitingRecord);
+          assert.ok(peerSession, `${arm.name}: peer must report a chat session id`);
+          assert.ok(waitingSession, `${arm.name}: waiting invocation must report a chat session id`);
+          assert.notEqual(peerSession, waitingSession, `${arm.name}: distinct session artifacts`);
+          assert.ok(
+            sessionArtifactsForId(synthHome, peerSession as string).length > 0,
+            `${arm.name}: the peer's session artifact must survive on the host`,
+          );
+          assert.ok(
+            sessionArtifactsForId(synthHome, waitingSession as string).length > 0,
+            `${arm.name}: the waiting invocation's session artifact must survive on the host`,
+          );
+
+          // All roots gone after both confirmed closes; the host profile farm
+          // and profiles/ tree are still byte-identical.
+          assert.equal(invocationRoots(groupRoot).length, 0, `${arm.name}: all invocation roots removed`);
+          const farmAfter = snapshotDshInstallDerivedFarms(synthHome, layout.installDerivedDirs);
+          const profilesAfter = snapshotDshProfilesInvariance(synthHome);
+          assert.deepEqual(
+            farmAfter,
+            baselineFarm,
+            `${arm.name}: the HOST farm must stay byte-identical after both teardowns`,
+          );
+          assert.deepEqual(
+            profilesAfter,
+            baselineProfiles,
+            `${arm.name}: the HOST profiles/ tree must stay byte-identical after both teardowns`,
+          );
+
+          overlapEvidence.push({
+            arm: arm.name,
+            waitingRole: arm.waitingRole,
+            runId,
+            groupRoot,
+            waitingRoot,
+            peerVmId: peerRecord.vmId,
+            waitingVmId: waitingRecord.vmId,
+            peerSession,
+            waitingSession,
+            peerCleanupConfirmed: peerRecord.cleanupConfirmed,
+            waitingCleanupConfirmed: waitingRecord.cleanupConfirmed,
+            waitingRootSurvivedPeerCleanup: true,
+            bothArtifactsSurvived: true,
+            hostFarmByteIdentical: JSON.stringify(farmAfter) === JSON.stringify(baselineFarm),
+            hostProfilesByteIdentical:
+              JSON.stringify(profilesAfter) === JSON.stringify(baselineProfiles),
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        writeEvidence(
+          "profile-overlay-overlap.json",
+          JSON.stringify(
+            {
+              gate: "matchlock-dsh-profile-overlay-gate",
+              contract: "OVERLAY-INV-SCOPED cross-invocation overlap",
+              arms: overlapEvidence,
+              honestNotes:
+                "REAL-RUNNER-WHEN-RUN, not run in the delivering run (a nested VM cannot boot inside a Tamandua worker round, and the developer sandbox suppresses matchlock's file capabilities). Two REAL invocations of ONE run through the production dsh runner. The waiting invocation's overlay root stays mounted while the peer's wire-confirmed-close cleanup removes exactly its own root; the waiting guest is then released and performs REAL new file operations under $DSH_HOME (a fresh plain-chat session plus durable category markers) which are published back to the host. Both teardown orders are covered (successor waits / predecessor waits). Host synchronization uses explicit ready/release files with bounded, event-loop-safe polls (awaited timers — never a synchronous busy-wait, which would starve the in-process runner). No provider credentials and no model call are used anywhere, so the arm spends zero model tokens. The HOST profiles/ tree (files, links, no lock) and the host farm stay byte-identical.",
+              zeroModelTokens: true,
+              timestamp: new Date().toISOString(),
+            },
+            null,
+            2,
+          ),
+        );
+
+        // Authoritative (throwing) VM cleanup for this arm as well.
+        const ledger = cleanupOwnedVms(homeDir, ledgerPath, observedVmIds);
+        assert.ok(ledger.length > 0, "cleanup ledger must be recorded");
+        console.log(
+          `[dsh-profile-overlay-gate] OVERLAP OK — ${overlapEvidence.length} arm(s); both invocations' artifacts survived; host farm + profiles byte-identical`,
         );
       },
     );

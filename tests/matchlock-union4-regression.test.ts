@@ -534,7 +534,11 @@ describe("union4 regression — matchlock lineage: runner, mount plan, probe wir
       "export function runMatchlockSchedulerRound",
       "export function matchlockProductionRunnerKind",
       "runMatchlockInvocation({",
-      "runHermesInvocation({",
+      // G8 ADMISSION-INTEGRATION US-006 threads the hermes call through the
+      // narrow attempt-gate test seam. The seam's DEFAULT must remain the
+      // production runner, which is exactly what this token pins: a hermetic
+      // test replacement can never become the production default.
+      "testHermesInvocationRunner ?? runHermesInvocation",
       "runDshSchedulerRound(",
     ]);
     const dsh = readSource("src/installer/matchlock/scheduler-dsh.ts");

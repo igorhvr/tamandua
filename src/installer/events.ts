@@ -188,6 +188,24 @@ export interface TamanduaEvent {
    */
   harness?: string;
   /**
+   * G8 ADMISSION-INTEGRATION (US-005): the Matchlock launch-gate evidence
+   * carried by a `run.matchlock_gate_refused` record.
+   *
+   * `invocationId` is the gate invocation the refusal is bound to
+   * (`run:<runId>:round:<jobId>:dispatch|attempt`); `storeSetKey` is the
+   * receipt's own identity key (`sha256:` over the observed store identities,
+   * or the receipt's `unreadable` sentinel when the receipt could not be
+   * written); `receiptPath` is where the refusal receipt lives;
+   * `findingCodes` is the refused reason-code list from that receipt; and
+   * `exitCode` is the G9 launch-gate refusal status. Emitted exactly once per
+   * invocation: the run is force-failed immediately afterwards, so no
+   * subsequent dispatch tick can produce a second record.
+   */
+  invocationId?: string;
+  storeSetKey?: string;
+  receiptPath?: string;
+  findingCodes?: string[];
+  /**
    * KHYG US-002: the effective native signal-isolation mode of one harness
    * execution — 'landlock' | 'seatbelt' | 'unprotected-fallback'. Present on
    * run.harness_isolation records along with the run/execution identity,
@@ -384,6 +402,15 @@ export const RUN_DIAGNOSTIC_EVENTS: readonly string[] = Object.freeze([
   "run.harness_probe_ok",
   "run.harness_probe_failed",
   "run.harness_isolation",
+  /**
+   * G8 ADMISSION-INTEGRATION (US-005): a scheduled Hermes dispatch was refused
+   * by the Matchlock launch gate. The record carries the gate invocation id,
+   * the receipt's store-set key, the receipt path, the refused reason codes and
+   * the G9 exit status; the run is force-failed immediately afterwards
+   * (`run.force_failed`), which is what makes a refusal terminal instead of a
+   * retry loop. Emitted at most once per gate invocation.
+   */
+  "run.matchlock_gate_refused",
 ]);
 
 

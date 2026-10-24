@@ -30,6 +30,9 @@ import {
   type MatchlockResourceHostProbe,
 } from "../../installer/matchlock/resource-limits.js";
 import { MatchlockIsolationSettingError } from "../../installer/matchlock/isolation-settings.js";
+import { LAUNCH_GATE_REFUSAL_EXIT_CODE } from "../../installer/matchlock/gate-exit-code.js";
+import { LaunchGateRefusalError } from "../../installer/matchlock/launch-gate-wiring.js";
+import { renderInteractiveLaunchGateRefusal } from "../../installer/matchlock/launch-gate-interactive.js";
 import {
   runInteractiveSession,
   type RunInteractiveSessionOptions,
@@ -320,11 +323,29 @@ nothing is installed.`
 interactive mode as the mapped guest user. The guest configuration and the
 working directory are mounted read-write at their identical absolute paths.`;
 
+  // G8 US-003: the Hermes surfaces evaluate the launch gate. It is a refusal
+  // the operator sees before anything is created, with its own exit status
+  // (taken from the G9 allocation below, never spelled as a literal).
+  const launchGateNote =
+    harness === "Hermes"
+      ? `
+
+Launch gate (exit status ${LAUNCH_GATE_REFUSAL_EXIT_CODE}):
+  Before any VM is created and before any mount is made, the effective
+  profile's stores are evaluated. A store that is not rollback-format, or a
+  configuration that does not request the delete journal mode, refuses the
+  launch: the remedies and the refusal receipt path are printed, nothing is
+  created or mounted, and the command exits
+  ${LAUNCH_GATE_REFUSAL_EXIT_CODE}. ${harness} is the gated harness; native pi
+  sessions are not gated.`
+      : "";
+
   return `tamandua matchlock ${subcommand} — ${shell ? `Prepare a ${harness} guest and run zsh` : `Run ${harness} in a disposable Matchlock VM`}
 
 Usage: tamandua matchlock ${subcommand} [--working-directory-for-harness <dir>] [Matchlock options]
 
 ${body}
+${launchGateNote}
 
 ${MATCHLOCK_OPTIONS_HELP}`;
 }
@@ -441,6 +462,20 @@ export async function handleMatchlock(
   try {
     exitCode = await runSession(parsed);
   } catch (error) {
+    if (error instanceof LaunchGateRefusalError) {
+      // US-003: the launch gate refused BEFORE any VM was created and before
+      // any mount was made. Print G9's remedy text for the recorded findings,
+      // then the refusal detail and the receipt path, and exit with the gate's
+      // OWN status (LAUNCH_GATE_REFUSAL_EXIT_CODE). Only the parsed subcommand
+      // is echoed — never raw argv, which can carry credentials.
+      stderr(
+        `${renderInteractiveLaunchGateRefusal(error.refusal, {
+          relaunchCommand: `tamandua matchlock ${parsed.subcommand}`,
+        })}\n`,
+      );
+      exit(error.exitCode);
+      return true;
+    }
     if (error instanceof MatchlockSessionUnavailableError) {
       stderr(`Error: ${error.message}\n`);
       exit(1);

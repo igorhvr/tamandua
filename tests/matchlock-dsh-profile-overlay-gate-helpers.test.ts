@@ -53,6 +53,11 @@ import {
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const FAKE_DSH = path.join(REPO_ROOT, "e2e-tests", "dsh-fixture", "fake-dsh.mjs");
+const GATE_SOURCE = path.join(
+  REPO_ROOT,
+  "e2e-tests",
+  "matchlock-dsh-profile-overlay-gate.test.ts",
+);
 
 function baseEnv(extra: Record<string, string>): Record<string, string> {
   return {
@@ -420,8 +425,8 @@ describe("matchlock dsh profile-overlay gate helpers (DSH-PROFILE-OVERLAY US-005
     const liveState = tamanduaTempDir("mtlk-dsh-us003-lived-");
     const runId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     try {
-      prepareDshProfileOverlay(runId, liveState, hostHome);
-      const overlayRoot = dshProfileOverlayRoot(runId, liveState);
+      prepareDshProfileOverlay(runId, "inv-aaaaaaaa-11111111", liveState, hostHome);
+      const overlayRoot = dshProfileOverlayRoot(runId, "inv-aaaaaaaa-11111111", liveState);
       const guestInstallRoot = path.join(root, "us003-guest-install");
       const run = spawnSync(
         process.execPath,
@@ -460,6 +465,177 @@ describe("matchlock dsh profile-overlay gate helpers (DSH-PROFILE-OVERLAY US-005
     } finally {
       fs.rmSync(liveState, { recursive: true, force: true });
     }
+  });
+
+  // ── OVERLAY-INV-SCOPED overlap arm: wait-then-chat fixture controls ─────
+  //
+  // These are FIXTURE CONTROLS, not VM execution: the deterministic guest
+  // (`e2e-tests/dsh-fixture/fake-dsh.mjs`) is spawned natively with node and
+  // no VM/daemon/provider participates. They prove the guest-side ordering the
+  // real-runner overlap arm depends on.
+
+  it("the overlap wait-then-chat marker blocks on the release file and THEN performs REAL new $DSH_HOME writes", async () => {
+    // OVERLAY-INV-SCOPED real-runner overlap arm (fast, no-VM control): the
+    // waiting fixture must NOT write before the host releases it, and must
+    // write a REAL session afterwards. This is exactly the guest-side behavior
+    // the gate's two-invocation overlap arm depends on.
+    const home = path.join(root, "overlap-wait-home");
+    prepareComposedDshHome(home);
+    const syncDir = path.join(root, "overlap-sync");
+    fs.mkdirSync(syncDir, { recursive: true });
+    const readyPath = path.join(syncDir, "waiting-ready");
+    const releasePath = path.join(syncDir, "waiting-release");
+
+    const env = baseEnv({ HOME: path.join(root, "iso-home"), DSH_HOME: home });
+    const child = spawn(
+      process.execPath,
+      [
+        FAKE_DSH,
+        "--profile",
+        "headless",
+        `SYNTHETIC-DSH-WAIT-THEN-CHAT:${readyPath}:${releasePath}:15000`,
+      ],
+      { env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    const waitDeadline = Date.now() + 10_000;
+    while (!fs.existsSync(readyPath)) {
+      if (Date.now() > waitDeadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(fs.existsSync(readyPath), "the waiting fixture must write its ready marker");
+
+    // BLOCKED before release: no session may exist yet.
+    assert.equal(sessionCount(home), 0, "the fixture must not write before it is released");
+    assert.equal(fs.existsSync(releasePath), false);
+
+    fs.writeFileSync(releasePath, "release\n", "utf-8");
+    const code: number | null = await new Promise((resolve) => child.on("close", resolve));
+    assert.equal(code, 0, `wait-then-chat must exit 0 after release: ${stderr}`);
+    assert.ok(sessionCount(home) > 0, "the fixture must write a REAL session after release");
+    assert.match(stderr, /synthetic-dsh chat session:/);
+  });
+
+  it("the overlap wait-then-chat marker exits 9 with a bounded-timeout stderr message when never released", async () => {
+    // Criterion 3: a never-released invocation must not hang the gate — the
+    // bounded wait exits non-zero (9) with an explicit timeout diagnostic and
+    // writes NO session (nothing is fabricated while it is blocked).
+    const home = path.join(root, "overlap-timeout-home");
+    prepareComposedDshHome(home);
+    const syncDir = path.join(root, "overlap-timeout-sync");
+    fs.mkdirSync(syncDir, { recursive: true });
+    const readyPath = path.join(syncDir, "never-ready-release");
+    const releasePath = path.join(syncDir, "never-created-release");
+
+    const env = baseEnv({ HOME: path.join(root, "iso-home"), DSH_HOME: home });
+    const child = spawn(
+      process.execPath,
+      [
+        FAKE_DSH,
+        "--profile",
+        "headless",
+        `SYNTHETIC-DSH-WAIT-THEN-CHAT:${readyPath}:${releasePath}:250`,
+      ],
+      { env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    const code: number | null = await new Promise((resolve) => child.on("close", resolve));
+    assert.equal(code, 9, `an unreleased wait-then-chat must exit 9: ${stderr}`);
+    assert.match(stderr, /overlap release timed out after 250ms/);
+    assert.ok(fs.existsSync(readyPath), "the ready marker is written before the bounded wait");
+    assert.equal(fs.existsSync(releasePath), false);
+    assert.equal(sessionCount(home), 0, "a timed-out invocation must not fabricate a session");
+  });
+
+  it("the overlap arm's host wait is event-loop-safe: a synchronous Atomics sleep cannot observe an in-process async producer, and the arm source uses no sync wait", async () => {
+    // OVERLAP-ARM-ASYNC-FIX red-prefix control (hermetic, no VM, no child
+    // process). The real overlap arm synchronizes with a waiting invocation
+    // that is NOT an external process: `directFirstRequestRound` ->
+    // `runDshInvocation` is dynamically imported into the test process, so it
+    // shares the one JS event loop. A synchronous busy-wait holds that thread
+    // and starves the producer; the source pin below fails on the pre-fix tree
+    // and passes only once the arm's wait path yields.
+
+    // 1. Model the starved scheduler in miniature: an IN-PROCESS async
+    //    producer (`setTimeout`, exactly like the invocation's create/bridge/
+    //    handshake/marker progress) that can only run when the loop yields.
+    const marker = path.join(root, "overlap-sync-starvation-marker");
+    fs.rmSync(marker, { force: true });
+    setTimeout(() => fs.writeFileSync(marker, "ready\n", "utf-8"), 10);
+
+    // Hold the only JS thread for ~300ms in the same synchronous
+    // Atomics-sleep poll the pre-fix `waitForPath` used. The overdue 10ms
+    // producer CANNOT fire, so the marker is still absent IMMEDIATELY after
+    // the synchronous wait returns.
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+    } catch {
+      /* Atomics.wait unavailable: the sync wait is a no-op, which only strengthens the point */
+    }
+    const existsImmediatelyAfterSyncWait = fs.existsSync(marker);
+
+    // 2. An await-based bounded wait yields the loop, so the same producer
+    //    fires and the marker becomes observable.
+    const deadline = Date.now() + 1_000;
+    while (!fs.existsSync(marker)) {
+      if (Date.now() > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const existsAfterAwait = fs.existsSync(marker);
+
+    assert.equal(
+      existsImmediatelyAfterSyncWait,
+      false,
+      "a synchronous Atomics sleep holds the only JS thread, so the in-process producer cannot write",
+    );
+    assert.equal(
+      existsAfterAwait,
+      true,
+      "an awaited timer yields the loop, so the same producer's output becomes observable",
+    );
+    fs.rmSync(marker, { force: true });
+
+    // 3. Source pins: the real overlap arm must wait the event-loop-safe way,
+    //    and must carry the helpers the arm needs. These FAIL on the pre-fix
+    //    tree, whose `waitForPath` polled with a synchronous Atomics-based
+    //    sleep on the main thread (and which had no async `waitForPath`).
+    assert.ok(fs.existsSync(GATE_SOURCE), `the gate source must exist: ${GATE_SOURCE}`);
+    const gateSource = fs.readFileSync(GATE_SOURCE, "utf-8");
+    assert.ok(
+      !gateSource.includes("Atomics.wait"),
+      "the overlap arm's host-side wait path must never use a synchronous Atomics.wait: it starves the in-process runner on the same event loop",
+    );
+    assert.ok(
+      !gateSource.includes("boundedSleepSyncMs"),
+      "the synchronous bounded sleep must stay deleted: every host-side wait yields",
+    );
+    assert.match(
+      gateSource,
+      /async function waitForPath\(/,
+      "waitForPath must stay async so its call sites await/yield the event loop",
+    );
+    assert.match(
+      gateSource,
+      /async function waitForInvocationRoot\(groupRoot: string, timeoutMs: number\): Promise<string>/,
+      "waitForInvocationRoot must exist and be async/yielding",
+    );
+    assert.match(
+      gateSource,
+      /const OVERLAP_WAIT_MS = 120_000;/,
+      "the overlap wait budget must stay bounded below the runner's guest timeout",
+    );
+    assert.match(
+      gateSource,
+      /promptText\?: string;/,
+      "directFirstRequestRound must accept an optional promptText for the overlap arm",
+    );
   });
 
   it("the first-request probe fails with the exact node_modules.lock ENOENT shape when the profiles parent is absent (old per-child plan)", () => {
@@ -619,6 +795,7 @@ describe("matchlock dsh profile-overlay gate helpers (DSH-PROFILE-OVERLAY US-005
     try {
       const overlay = prepareDshProfileOverlay(
         "11111111-2222-3333-4444-555555555555",
+        "inv-aaaaaaaa-11111111",
         liveState,
         destinationHome,
       );

@@ -48,6 +48,10 @@ const WIRED_GATE_RUNNERS: readonly string[] = [
   // (driver writes observed-rounds.json; runner invokes the shared guard and
   // refuses a zero-round PASS), so it joins the WIRED family.
   "run-matchlock-allow-private-e2e-test",
+  // G8 ADMISSION-INTEGRATION US-011: the on-demand admission-qualification gate
+  // is guard-wired the same way. Its scenario tier lands in US-012/US-013, so a
+  // run today records zero rounds and refuses a green result — by design.
+  "run-matchlock-admission-qualification-e2e-test",
 ];
 
 /**

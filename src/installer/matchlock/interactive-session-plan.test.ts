@@ -32,6 +32,9 @@ import {
   MatchlockRootUsageError,
 } from "../../../dist/installer/matchlock/root-gate.js";
 import { MATCHLOCK_SWAP_UNSUPPORTED_CODE } from "../../../dist/installer/matchlock/swap-support.js";
+import type {
+  EvaluateInteractiveLaunchGate,
+} from "../../../dist/installer/matchlock/launch-gate-interactive.js";
 import { STANDARD_MATCHLOCK_IMAGE } from "../../../dist/installer/matchlock/standard-image.js";
 import { MATCHLOCK_POLICY_VERSION, type ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
 import { writeFakeRpcDriver, tempTranscriptPath } from "../../../dist/installer/matchlock/fake-rpc-driver.js";
@@ -151,6 +154,37 @@ function throwingAdmitter(err: unknown): AdmitInteractiveSession {
   };
 }
 
+/**
+ * An ALLOW-shaped launch-gate seam for the admission / mount tests in this
+ * file.
+ *
+ * Those cases pin the admission plumbing (frozen submission snapshot, config
+ * capture, mount wiring), not the gate, and their Hermes homes are synthetic
+ * (`/home/tester/.hermes`) rather than disposable profiles with real stores.
+ * The PRODUCTION gate — allow AND refusal against real on-disk SQLite stores,
+ * with its receipt and admission anchor — is covered by
+ * `launch-gate-interactive.test.ts`.
+ */
+function allowLaunchGate(): EvaluateInteractiveLaunchGate {
+  return (_selection, args, deps) => ({
+    action: "allow",
+    binding: {
+      invocationId: deps?.invocationId ?? "test-invocation",
+      kind:
+        args.harness === "hermes" && args.shell === true
+          ? "interactive-hermes-shell"
+          : "interactive-hermes",
+      storeSetKey: `sha256:${"0".repeat(64)}`,
+      receiptPath: "",
+      decidedAt: "2026-01-02T03:04:05.000Z",
+      stores: [],
+      configJournalMode: "delete",
+      configSource: "test",
+    },
+    receiptInput: {} as never,
+  });
+}
+
 describe("US-004 planInteractiveSession admission", () => {
   it("admits pi through the admitMatchlockRun seam with direct workspace mode", async () => {
     const args = baseArgs();
@@ -220,6 +254,7 @@ describe("US-004 planInteractiveSession admission", () => {
         hermesHomeEnv: "/home/tester/.hermes",
         hermesAdapterPlan: FAKE_HERMES_PLAN,
         hermesIsDirectory: () => true,
+        launchGate: allowLaunchGate(),
       }),
     );
 
@@ -247,6 +282,7 @@ describe("US-004 planInteractiveSession admission", () => {
         admit,
         hermesAdapterPlan: FAKE_HERMES_PLAN,
         hermesIsDirectory: () => true,
+        launchGate: allowLaunchGate(),
       }),
     );
 
@@ -769,6 +805,10 @@ describe("US-004 real admission seam through the fake RPC driver", () => {
       rpcBinaryPath: process.execPath,
       rpcArgs: [fakeDriver],
       admission: { home: os.homedir() },
+      // This case pins the MOUNT wiring; the production gate (which would
+      // refuse this store-less fixture) is covered in
+      // launch-gate-interactive.test.ts.
+      launchGate: allowLaunchGate(),
     });
 
     const direct = await planInteractiveSession(

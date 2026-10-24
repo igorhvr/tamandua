@@ -299,14 +299,21 @@ function readTokensSpent(tamanduaDir: string, runId: string): number {
 }
 
 let overlayHelpersMemo:
-  | { root: (runId: string, liveStateRoot: string) => string }
+  | { groupRoot: (runId: string, liveStateRoot: string) => string }
   | undefined;
+/**
+ * OVERLAY-INV-SCOPED: the controller binds its overlay root to a host-random
+ * invocation id, so the whole-path gate observes the per-run grouping dir
+ * (`<...>/dsh-profile-invocations/<runId>`) rather than a predicted leaf.
+ */
 async function overlayRootForRun(runId: string): Promise<string> {
   if (!overlayHelpersMemo) {
     const mod = await import(`${repoRoot}/dist/installer/matchlock/dsh-profile-overlay.js`);
-    overlayHelpersMemo = { root: (r, live) => mod.dshProfileOverlayRoot(r, live) as string };
+    overlayHelpersMemo = {
+      groupRoot: (r, live) => mod.dshProfileInvocationGroupRoot(r, live) as string,
+    };
   }
-  return overlayHelpersMemo.root(runId, tamanduaDir);
+  return overlayHelpersMemo.groupRoot(runId, tamanduaDir);
 }
 
 // ── shared state ──────────────────────────────────────────────────────────
@@ -419,7 +426,10 @@ async function runWholePathScenario(): Promise<void> {
       runId = resolveFullRunId(prefix, tamanduaDir);
       lastRunId = runId;
       const overlayRoot = await overlayRootForRun(runId);
-      const overlay = new DshOverlayObserver(overlayRoot, { intervalMs: 50 }).start();
+      const overlay = new DshOverlayObserver(overlayRoot, {
+        intervalMs: 50,
+        invocationGroupDir: true,
+      }).start();
       let status = "";
       try {
         status = await pollTerminalWithNudge(runId, scenarioEnv, tamanduaDir);

@@ -555,6 +555,60 @@ describe("interactive session controller core (US-010)", () => {
     assert.equal(removals[0].vmId, "vm-1", "removal targets this session's own VM");
   });
 
+  it("G8 US-004: binds the controller backstop to the plan's launch-gate verdict", async () => {
+    const gateBinding = {
+      invocationId: "interactive:hermes:4242:2026-10-23T00:00:00.000Z",
+      kind: "interactive-hermes",
+      storeSetKey: `sha256:${"b".repeat(64)}`,
+      receiptPath: "/var/lib/tamandua/matchlock/gate/interactive-hermes-4242.json",
+      decidedAt: "2026-10-23T00:00:00.000Z",
+      stores: [],
+      configJournalMode: "delete",
+      configSource: "/home/u/.hermes/config.yaml",
+    };
+    const plan = makePlan({ subcommand: "hermes", harness: "hermes", launchGate: gateBinding });
+    const { controller, backend, factoryCalls } = makeHarness(plan, makePrep({ harness: "hermes" }));
+
+    const runPromise = controller.run();
+    await until(() => backend.ttyCalls.length === 1, "exec_tty launch");
+    assert.equal(factoryCalls.length, 1);
+    assert.deepEqual(
+      factoryCalls[0].options.launchGate,
+      { invocationId: gateBinding.invocationId, binding: gateBinding },
+      "the session passes THIS plan's verdict (and its invocation id) to the controller backstop",
+    );
+    backend.tty.resolve(0);
+    await runPromise;
+  });
+
+  it("G8 US-004: a hermes plan without a verdict passes an explicit NULL binding (refusal, never a silent ungated launch)", async () => {
+    const plan = makePlan({ subcommand: "hermes-shell", harness: "hermes", shell: true });
+    const { controller, backend, factoryCalls } = makeHarness(plan, makePrep({ harness: "hermes", shell: true }));
+
+    const runPromise = controller.run();
+    await until(() => backend.ttyCalls.length === 1, "exec_tty launch");
+    assert.deepEqual(
+      factoryCalls[0].options.launchGate,
+      { invocationId: "interactive:hermes-shell:unbound", binding: null },
+      "a hermes plan that somehow lost its verdict is refused by the controller, not launched ungated",
+    );
+    backend.tty.resolve(0);
+    await runPromise;
+  });
+
+  it("G8 US-004: a native pi plan carries no launchGate context at all (byte-identical path)", async () => {
+    const { controller, backend, factoryCalls } = makeHarness();
+    const runPromise = controller.run();
+    await until(() => backend.ttyCalls.length === 1, "exec_tty launch");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(factoryCalls[0].options, "launchGate"),
+      false,
+      "native pi controller options must be unchanged",
+    );
+    backend.tty.resolve(0);
+    await runPromise;
+  });
+
   it("forwards host stdin only after exec_tty.ready and honors bounded backpressure", async () => {
     const { controller, backend, stdin } = makeHarness(makePlan(), makePrep(), {
       stdinHighWaterBytes: 4,

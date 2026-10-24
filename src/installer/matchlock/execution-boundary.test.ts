@@ -37,6 +37,7 @@ import {
   runMatchlockSchedulerRound,
   setMatchlockHomeAliasResolverForTest,
   setMatchlockProductionRouteRunnerForTest,
+  setMatchlockScheduledLaunchGateForTest,
   type MatchlockSchedulerRound,
   type MatchlockSchedulerRoundResult,
 } from "../../../dist/installer/matchlock/scheduler-matchlock.js";
@@ -299,6 +300,11 @@ describe("US-004 runMatchlockSchedulerRound execution-boundary wiring", () => {
     routeCalls = [];
     routeBinaryPaths = [];
     setMatchlockHomeAliasResolverForTest(() => "/home/alias-fixture/tamandua/4242/h");
+    // G8 US-005: these boundary tests are not about the Hermes launch gate and
+    // use synthetic profiles, so the gate is SKIPPED (it would otherwise
+    // refuse the round before the route it is meant to exercise). The gate has
+    // its own dedicated suites.
+    setMatchlockScheduledLaunchGateForTest({ evaluate: () => null, evaluateAttempt: () => null });
     for (const kind of ["pi", "hermes", "dsh"] as const) {
       setMatchlockProductionRouteRunnerForTest(kind, async (r) => {
         routeCalls.push({ kind, runId: r.identity.runId });
@@ -314,6 +320,7 @@ describe("US-004 runMatchlockSchedulerRound execution-boundary wiring", () => {
     setMatchlockProductionRouteRunnerForTest("dsh", null);
     setMatchlockHomeAliasResolverForTest(null);
     setMatchlockExecutionBoundarySeamsForTest(null);
+    setMatchlockScheduledLaunchGateForTest(null);
     if (savedRpcBin === undefined) delete process.env[MATCHLOCK_RPC_BIN_ENV];
     else process.env[MATCHLOCK_RPC_BIN_ENV] = savedRpcBin;
   });
@@ -636,9 +643,14 @@ describe("MTLK-ISO2-CORRECTIVE F1: probed executable === actual RPC child", () =
     savedCwd = process.cwd();
     savedPath = process.env.PATH;
     process.chdir(cwdDir);
+    // G8 US-005: this family proves probe==child path binding for the REAL RPC
+    // transport, not the Hermes launch gate; the synthetic profiles here could
+    // never pass a real gate, so it is SKIPPED.
+    setMatchlockScheduledLaunchGateForTest({ evaluate: () => null, evaluateAttempt: () => null });
   });
 
   afterEach(() => {
+    setMatchlockScheduledLaunchGateForTest(null);
     process.chdir(savedCwd);
     if (savedPath === undefined) delete process.env.PATH;
     else process.env.PATH = savedPath;

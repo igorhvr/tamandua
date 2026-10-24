@@ -59,6 +59,7 @@ import {
   runMatchlockSchedulerRound,
   setMatchlockProductionRouteRunnerForTest,
   setMatchlockHomeAliasResolverForTest,
+  setMatchlockScheduledLaunchGateForTest,
   type MatchlockSchedulerRound,
 } from "../../../dist/installer/matchlock/scheduler-matchlock.js";
 import { createMergeServiceForContext } from "../../../dist/installer/matchlock/merge-invocation-wiring.js";
@@ -212,11 +213,17 @@ describe("harness x workflow admission matrix (MTLK-ALL-WORKFLOWS US-003/US-005)
     setMatchlockExecutionBoundarySeamsForTest({
       swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
     });
+    // G8 US-005: this matrix routes synthetic policies to their harness-keyed
+    // runners; it is not about the Hermes launch gate (whose real observation
+    // would refuse a synthetic `/home/operator` profile), so the gate is
+    // SKIPPED here.
+    setMatchlockScheduledLaunchGateForTest({ evaluate: () => null, evaluateAttempt: () => null });
   });
 
   after(() => {
     setMatchlockHomeAliasResolverForTest(null);
     setMatchlockExecutionBoundarySeamsForTest(null);
+    setMatchlockScheduledLaunchGateForTest(null);
   });
 
   it("declares harness parity: every harness supports the full capability-closed set (no allow-list)", () => {

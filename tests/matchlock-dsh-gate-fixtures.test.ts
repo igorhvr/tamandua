@@ -29,6 +29,7 @@ import {
   snapshotDshFarmLinks,
   snapshotDshTreeDirs,
   snapshotDshTreeLinks,
+  invocationRoots,
 } from "../e2e-tests/helpers/matchlock-dsh-gate-fixtures.ts";
 
 describe("matchlock dsh gate composed-home fixtures (DSH-PROFILE-OVERLAY US-004)", () => {
@@ -108,8 +109,8 @@ describe("matchlock dsh gate composed-home fixtures (DSH-PROFILE-OVERLAY US-004)
     const runId = "11111111-2222-3333-4444-555555555555";
     const guestRoot = "/workspace/config/dsh";
     try {
-      prepareDshProfileOverlay(runId, liveState, home);
-      const overlayRoot = dshProfileOverlayRoot(runId, liveState);
+      prepareDshProfileOverlay(runId, "inv-aaaaaaaa-11111111", liveState, home);
+      const overlayRoot = dshProfileOverlayRoot(runId, "inv-aaaaaaaa-11111111", liveState);
       const mounts = planDshHomeMounts(home, overlayRoot, guestRoot);
 
       // Exactly ONE destination: the whole effective home at the guest root,
@@ -245,5 +246,192 @@ describe("matchlock dsh gate composed-home fixtures (DSH-PROFILE-OVERLAY US-004)
     const observed = observer.stop();
     assert.equal(observed.rootSeen, false);
     assert.deepEqual(observed.links, {});
+    // OVERLAY-INV-SCOPED: the default single-root mode records no invocation
+    // dirs at all (the field is additive and always present).
+    assert.deepEqual(observed.invocationDirs, []);
+  });
+
+  // ── OVERLAY-INV-SCOPED: per-run invocation grouping dir ────────────────
+  //
+  // The overlay leaf is now bound to a host-generated invocation id a live
+  // gate cannot predict, so the observer can be pointed at the per-run
+  // grouping dir (`dshProfileInvocationGroupRoot`) and told to sample every
+  // immediate invocation subdirectory. SIMULATED: these controls create plain
+  // directories with no VM, no daemon and no dsh process.
+
+  it("group-dir observer samples an invocation root created AFTER start() and reports paths relative to it", async () => {
+    const group = path.join(root, "inv-group-late");
+    // The grouping dir itself does not exist at start(): the controller creates
+    // it (and the invocation leaf) only once the round is dispatched.
+    const observer = new DshOverlayObserver(group, {
+      intervalMs: 5,
+      invocationGroupDir: true,
+    }).start();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const invocationRoot = path.join(group, "inv-bbbbbbbb-99999999");
+      fs.mkdirSync(path.join(invocationRoot, "profiles", "node_modules"), {
+        recursive: true,
+      });
+      fs.symlinkSync(
+        "/opt/synthetic-guest-install/node_modules/commander",
+        path.join(invocationRoot, "profiles", "node_modules", "commander"),
+      );
+      fs.writeFileSync(
+        path.join(invocationRoot, "profiles", DSH_GATE_BOOT_LOCK_BASENAME),
+        "",
+        "utf-8",
+      );
+      // Give the interval sampler more than one tick to see the new root.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const observed = observer.stop();
+
+      assert.equal(observed.rootSeen, true, "the late-created invocation root must be observed");
+      assert.deepEqual(observed.invocationDirs, ["inv-bbbbbbbb-99999999"]);
+      // Paths are RELATIVE to the invocation root, never prefixed by it.
+      assert.deepEqual(observed.links, {
+        [path.join("profiles", "node_modules", "commander")]:
+          "/opt/synthetic-guest-install/node_modules/commander",
+      });
+      assert.ok(
+        observed.files.includes(path.join("profiles", DSH_GATE_BOOT_LOCK_BASENAME)),
+        `the invocation-relative boot lock must be observed: ${JSON.stringify(observed.files)}`,
+      );
+      assert.ok(
+        observed.dirs.includes(path.join("profiles", "node_modules")),
+        `the invocation-relative dirs must be observed: ${JSON.stringify(observed.dirs)}`,
+      );
+    } finally {
+      observer.stop();
+    }
+  });
+
+  it("group-dir observer never treats a .prepare.json sibling or a symlink entry as an invocation root", async () => {
+    const group = path.join(root, "inv-group-siblings");
+    fs.mkdirSync(group, { recursive: true });
+    // The R3 publish manifest is a FILE sibling of the invocation dirs.
+    fs.writeFileSync(path.join(group, "inv-dddddddd.prepare.json"), "{}\n", "utf-8");
+    // A symlink entry that happens to point at a real directory is still not
+    // an invocation root (the controller never creates one).
+    const target = path.join(root, "symlink-target-inv");
+    fs.mkdirSync(path.join(target, "profiles"), { recursive: true });
+    fs.symlinkSync(target, path.join(group, "inv-eeeeeeee-symlink"));
+
+    const observer = new DshOverlayObserver(group, {
+      intervalMs: 5,
+      invocationGroupDir: true,
+    }).start();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const observed = observer.stop();
+      assert.equal(observed.rootSeen, false, "no real invocation dir exists yet");
+      assert.deepEqual(observed.invocationDirs, []);
+      assert.deepEqual(observed.links, {});
+      assert.deepEqual(observed.dirs, []);
+    } finally {
+      observer.stop();
+    }
+
+    // Now add ONE real invocation dir alongside them: only that one is sampled.
+    const realInvocation = path.join(group, "inv-ffffffff-real");
+    fs.mkdirSync(path.join(realInvocation, "profiles"), { recursive: true });
+    fs.symlinkSync("/guest/a", path.join(realInvocation, "profiles", "a"));
+    const second = new DshOverlayObserver(group, {
+      intervalMs: 5,
+      invocationGroupDir: true,
+    }).start();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const observed = second.stop();
+      assert.equal(observed.rootSeen, true);
+      assert.deepEqual(observed.invocationDirs, ["inv-ffffffff-real"]);
+      assert.deepEqual(observed.links, { [path.join("profiles", "a")]: "/guest/a" });
+    } finally {
+      second.stop();
+    }
+  });
+
+  it("invocationRoots returns only real immediate invocation directories and ignores .prepare.json manifest siblings", () => {
+    // OVERLAY-INV-SCOPED US-005: the live gates reason about teardown order via
+    // this helper, so it must agree with the observer exactly: only REAL
+    // immediate subdirectories under the per-run grouping dir are invocation
+    // roots. The R3 publish manifest (`<invocationId>.prepare.json`) is a file
+    // sibling, and a symlink or regular file entry is never a root.
+    const group = path.join(root, "inv-roots-group");
+    assert.deepEqual(invocationRoots(group), [], "a missing grouping dir must yield [] (never throw)");
+
+    fs.mkdirSync(path.join(group, "inv-00000002-two", "profiles"), { recursive: true });
+    fs.mkdirSync(path.join(group, "inv-00000001-one", "profiles"), { recursive: true });
+    fs.writeFileSync(path.join(group, "inv-00000001-one.prepare.json"), "{}\n", "utf-8");
+    fs.writeFileSync(path.join(group, "stray-file"), "x\n", "utf-8");
+    const symlinkTarget = path.join(root, "inv-roots-symlink-target");
+    fs.mkdirSync(symlinkTarget, { recursive: true });
+    fs.symlinkSync(symlinkTarget, path.join(group, "inv-00000003-symlink"));
+    // A DANGLING symlink must not throw (the lstat check is authoritative).
+    fs.symlinkSync(path.join(root, "nowhere-at-all"), path.join(group, "inv-00000004-dangling"));
+
+    assert.deepEqual(
+      invocationRoots(group),
+      [
+        path.join(group, "inv-00000001-one"),
+        path.join(group, "inv-00000002-two"),
+      ],
+      "only real immediate invocation dirs, sorted, with no .prepare.json/file/symlink entry",
+    );
+
+    // Removing one root shrinks the set (the helper reads live fs state).
+    fs.rmSync(path.join(group, "inv-00000001-one"), { recursive: true, force: true });
+    assert.deepEqual(invocationRoots(group), [path.join(group, "inv-00000002-two")]);
+  });
+
+  it("group-dir observer stop() ends sampling", async () => {
+    const group = path.join(root, "inv-group-stop");
+    const firstInvocation = path.join(group, "inv-11111111-one");
+    fs.mkdirSync(path.join(firstInvocation, "profiles"), { recursive: true });
+    fs.symlinkSync("/guest/one", path.join(firstInvocation, "profiles", "one"));
+
+    const observer = new DshOverlayObserver(group, {
+      intervalMs: 5,
+      invocationGroupDir: true,
+    }).start();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const stopped = observer.stop();
+    assert.deepEqual(stopped.invocationDirs, ["inv-11111111-one"]);
+
+    // Anything appearing after stop() must never be sampled again.
+    const lateInvocation = path.join(group, "inv-22222222-two");
+    fs.mkdirSync(path.join(lateInvocation, "profiles"), { recursive: true });
+    fs.symlinkSync("/guest/two", path.join(lateInvocation, "profiles", "two"));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const afterStop = observer.stop();
+    assert.equal(afterStop.ticks, stopped.ticks, "stop() must freeze the tick count");
+    assert.deepEqual(afterStop.invocationDirs, ["inv-11111111-one"]);
+    assert.equal(
+      Object.keys(afterStop.links).includes(path.join("profiles", "two")),
+      false,
+      "a post-stop invocation must never be observed",
+    );
+  });
+
+  it("default observer mode samples only its single root and does not treat children as invocation roots", async () => {
+    const group = path.join(root, "inv-group-default");
+    const invocation = path.join(group, "inv-33333333-child");
+    fs.mkdirSync(path.join(invocation, "profiles"), { recursive: true });
+    fs.symlinkSync("/guest/child", path.join(invocation, "profiles", "child"));
+
+    const observer = new DshOverlayObserver(group, { intervalMs: 5 }).start();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const observed = observer.stop();
+      assert.equal(observed.rootSeen, true);
+      assert.deepEqual(observed.invocationDirs, []);
+      // The default mode walks the given root as ONE tree: the child keeps its
+      // prefix instead of being sampled as its own root.
+      assert.deepEqual(observed.links, {
+        [path.join("inv-33333333-child", "profiles", "child")]: "/guest/child",
+      });
+    } finally {
+      observer.stop();
+    }
   });
 });

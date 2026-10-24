@@ -80,6 +80,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { HarnessRoundResult } from "../harness-adapter.js";
 import type { ExecutionIsolation } from "./policy.js";
+import type { LaunchGateBinding, LaunchGateDecision } from "./launch-gate-wiring.js";
+import { writeLaunchGateLaunchReceipt } from "./launch-gate-wiring.js";
 import { MatchlockController, MatchlockControllerError } from "./controller.js";
 import { decodeFrameBytes, type MatchlockPipeHandle } from "./rpc-client.js";
 import type { MatchlockStreamFrame } from "./types.js";
@@ -146,12 +148,22 @@ import {
 import {
   isBroadHostSource,
   shadowsProtectedGuestRoot,
+  MATCHLOCK_GUEST_RUNTIME_ROOT,
   type MountAdmissionContext,
 } from "./mount-plan.js";
 import type { HostBrokerHandle } from "./broker.js";
 import { createHostBroker } from "./broker.js";
 import { Deadline, type ClockFn } from "../../lib/instant.js";
 import { MatchlockRoundTiming } from "./round-timing.js";
+// G8 ADMISSION-INTEGRATION US-010: guest-visible effective config, measured
+// INSIDE the still-owned VM after boot and recorded next to this invocation's
+// gate receipt. Evidence only — it can never refuse a launch or change the
+// verdict. The module is Node-core only (the guest exec is the seam below), so
+// the runner's dependency shape is unchanged and it stays in the parallel lane.
+import {
+  recordGuestVisibilityAfterBoot,
+  type GuestConfigProbeExecSeam,
+} from "./gate-guest-visibility.js";
 // MTLK-ALL-WORKFLOWS US-001: the host-attested scoped merge service is built
 // OUTSIDE this module (scheduler seam `merge-invocation-wiring.ts`) and
 // forwarded here verbatim; guest input/env can never enable it. When absent
@@ -261,6 +273,31 @@ export interface RunHermesInvocationOptions {
   workerOwnership?: HostWorkerOwnership;
   /** Mount-plan admission context override (deterministic home/live-state root for tests). */
   mountAdmission?: MountAdmissionContext;
+  /**
+   * G8 US-004/US-006 — the launch-gate ALLOW verdict bound to THIS scheduled
+   * attempt. The scheduler seam evaluates the attempt gate immediately before
+   * the round (US-006) and supplies the resulting binding here; this runner
+   * forwards it to the controller backstop, which refuses to create a VM when
+   * no verdict exists for THIS invocation or when the verdict belongs to a
+   * different invocation. The value is only ever the caller's binding — the
+   * runner never fabricates one. Absent ⇒ the controller keeps its
+   * byte-identical prior behaviour (call paths not yet gate-wired: native
+   * pi/dsh and pre-US-006 hermes rounds).
+   */
+  launchGate?: LaunchGateBinding;
+  /**
+   * G8 US-012 — the FULL allow decision the attempt gate returned for THIS
+   * invocation (binding + the receipt input captured before any VM existed).
+   *
+   * The binding above authorises the create; this decision is what makes the
+   * launch EVIDENCE possible: the runner writes the `action: "launched"`
+   * receipt immediately after `prepareAndCreate` returns a VM id, which is the
+   * first instant at which `vmCreated: true` is an observed fact. A receipt-
+   * write failure is logged (the VM already exists and is NOT un-created); it
+   * never fabricates a launch record. Absent ⇒ no launch receipt is written
+   * (an ungated or pre-US-012 round keeps its byte-identical behaviour).
+   */
+  launchGateDecision?: Extract<LaunchGateDecision, { action: "allow" }>;
   /** Trusted guest usage-helper argv prefix (default ["node"]); the store dir
    *  and session ref are appended. Test seam to pin a node binary. */
   usageHelperArgv?: string[];
@@ -1451,6 +1488,16 @@ export async function runHermesInvocation(opts: RunHermesInvocationOptions): Pro
       rpcBinaryPath: opts.rpcBinaryPath ?? (process.env.TAMANDUA_MATCHLOCK_RPC_BIN?.trim() || undefined),
       rpcArgs: opts.rpcArgs,
       rpcEnv: opts.rpcEnv,
+      // G8 US-004 — the launch-gate BACKSTOP context for THIS invocation. The
+      // binding comes ONLY from the caller (the attempt-time evaluation in
+      // scheduler-matchlock.ts, US-006); this runner never fabricates an allow
+      // and never reuses a dispatch-time verdict. When the caller supplies no
+      // binding the key is absent, so the controller behaves exactly as before
+      // (the attempt gate wiring that always supplies one lands in US-006).
+      launchGate:
+        opts.launchGate !== undefined
+          ? { invocationId: opts.launchGate.invocationId, binding: opts.launchGate }
+          : undefined,
       helperPackHostPath: opts.helperPackHostPath,
       onLog: opts.onLog,
       requestTimeoutMs: opts.requestTimeoutMs,
@@ -1492,6 +1539,25 @@ export async function runHermesInvocation(opts: RunHermesInvocationOptions): Pro
     const createdResult = await controller.prepareAndCreate(pin);
     owned.controllerCreatedVm = true;
     vmId = createdResult.vmId;
+
+    // ── 7b. G8 US-012: the launch receipt, the FIRST instant it is honest ──
+    // `vmCreated: true` is an observed fact only now, so the `action:
+    // "launched"` receipt is written HERE and never before (the wiring refuses
+    // a pre-create write itself). The receipt lands at the SAME path a refusal
+    // would have used (the binding's `receiptPath`), so an operator finds one
+    // evidence slot per (run, round, phase).
+    //
+    // A write failure is NOT a launch refusal: the VM already exists, so
+    // refusing here could not prevent a create — it would only mislabel the
+    // record. It is logged loudly instead, and the round proceeds.
+    if (opts.launchGateDecision !== undefined && opts.launchGateDecision.action === "allow") {
+      const launchReceipt = writeLaunchGateLaunchReceipt(opts.launchGateDecision, true);
+      diag(
+        launchReceipt.ok
+          ? `launch receipt: launched recorded at ${launchReceipt.path}`
+          : `launch receipt: NOT recorded (${launchReceipt.code}: ${launchReceipt.detail}) at ${launchReceipt.path}`,
+      );
+    }
 
     // Abort landed while the VM was being created: the late VM is an exact
     // owned cleanup obligation — positively close ONLY it, never launch work.
@@ -1583,6 +1649,86 @@ export async function runHermesInvocation(opts: RunHermesInvocationOptions): Pro
     if (aborted) {
       await cleanup("invocation canceled by host during store inventory");
       return canceledRound("during store inventory", vmId);
+    }
+
+    // ── 9c. G8 US-010 guest-visible effective config (evidence, not a decision) ──
+    // The gate's journal-mode observation is a HOST read. What the guest's
+    // Hermes actually sees is the config merged INSIDE this VM, so the packed
+    // probe helper is executed here — after boot, before the harness — and its
+    // per-store result is attached to THIS invocation's qualification record.
+    //
+    // It cannot refuse the launch and cannot change the verdict: a failed,
+    // timed-out or unparseable probe records provenance 'unmeasured' (never a
+    // fabricated 'delete'), a record-write failure is logged, and a host/guest
+    // disagreement sets the record's `discrepancy` flag + one WARN. Gated on the
+    // allow binding, so an ungated path (native pi, or a hermes round without a
+    // verdict) performs no probe at all and stays byte-identical.
+    if (opts.launchGate !== undefined) {
+      const matchlockBinaryPath =
+        opts.rpcBinaryPath ?? (process.env.TAMANDUA_MATCHLOCK_RPC_BIN?.trim() || "matchlock");
+      const guestVisibilityExec: GuestConfigProbeExecSeam = {
+        exec: async ({ argv, timeoutMs }) => {
+          const state = createCaptureState(64 * 1024);
+          try {
+            const result = await controller.execStream(
+              { command: argv.map((a) => quoteShellArg(a)).join(" "), working_dir: "/" },
+              (frame) => captureNotify(state, frame),
+              timeoutMs,
+            );
+            return { exitCode: result.exit_code, stdout: captureBytes(state.stdout) };
+          } catch (error) {
+            // A rejected/timeout exec is "not measured", never a refusal.
+            return {
+              exitCode: null,
+              stdout: "",
+              failure: boundMatchlockErrorText(
+                error instanceof Error ? error.message : String(error),
+                300,
+              ),
+            };
+          }
+        },
+      };
+      try {
+        const visibility = await recordGuestVisibilityAfterBoot(
+          {
+            binding: opts.launchGate,
+            hostConfigDir: mount.hostConfigDir,
+            guestConfigDir: mount.guestConfigDir,
+            helperGuestPath: `${MATCHLOCK_GUEST_RUNTIME_ROOT}/lib/installer/matchlock/gate-config-probe.js`,
+            runId,
+            roundId: opts.identity.jobId,
+            qualification: {
+              image: { pinnedIdentity: pin, reference: pin.tag },
+              matchlock: { path: matchlockBinaryPath },
+              candidate: { executedBinaryPaths: [matchlockBinaryPath] },
+            },
+          },
+          {
+            exec: guestVisibilityExec,
+            log: (level, message, fields) => {
+              try {
+                opts.onLog?.(level, message, fields);
+              } catch {
+                /* logging must never affect the round */
+              }
+            },
+          },
+        );
+        diag(
+          `guest-visible config: ${visibility.observations.length} store observation(s), ` +
+            `recordWritten=${String(visibility.written)}, discrepancy=${String(visibility.discrepancy)}` +
+            (visibility.writeFailure === undefined ? "" : `, writeFailure=${visibility.writeFailure}`),
+        );
+      } catch (error) {
+        // Belt and braces: the capture is total by contract, and a bug in the
+        // evidence path must still never fail a launch the gate allowed.
+        diag(
+          `guest-visible config capture degraded: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     }
 
     // ── 10. harness exec (probe/work) with remaining-wall-budget timeout ──

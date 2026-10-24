@@ -67,6 +67,8 @@ src/installer/matchlock/dsh-scheduler-seam.test.ts
 src/installer/matchlock/execution-boundary.test.ts
 src/installer/matchlock/fake-rpc-driver.test.ts
 src/installer/matchlock/finalizer-ledger-seam.test.ts
+# Runs the compiled packed guest config probe with `node` against temp profiles.
+src/installer/matchlock/gate-config-probe-fixture.test.ts
 # Spawns `node tests/fixtures/gate-refusal-demo.mjs` and asserts its exit status.
 src/installer/matchlock/gate-refusal-demo.test.ts
 src/installer/matchlock/guest-bridge.test.ts
@@ -80,6 +82,11 @@ src/installer/matchlock/host-suite-service.test.ts
 src/installer/matchlock/interactive-session-plan.test.ts
 src/installer/matchlock/interactive-session-synthetic-e2e.test.ts
 src/installer/matchlock/interactive-session.test.ts
+src/installer/matchlock/launch-gate-backstop.test.ts
+src/installer/matchlock/launch-gate-integration.test.ts
+src/installer/matchlock/launch-gate-interactive.test.ts
+src/installer/matchlock/launch-gate-overlay-combined.test.ts
+src/installer/matchlock/launch-gate-scheduled-dispatch.test.ts
 src/installer/matchlock/merge-core.test.ts
 src/installer/matchlock/mount-plan.test.ts
 src/installer/matchlock/native-step-broker.test.ts
@@ -226,6 +233,7 @@ tests/matchlock-interactive-run-case-controls.test.ts
 tests/matchlock-interactive-suite-bridge-launch.test.ts
 tests/matchlock-interactive-t1-driver.test.ts
 tests/matchlock-interactive-validator-controls.test.ts
+tests/matchlock-scenario-c-controls.test.ts
 tests/matchlock-setup-integration.test.ts
 tests/matchlock-union4-merge.test.ts
 tests/mcp-cli.test.ts

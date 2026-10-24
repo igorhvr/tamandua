@@ -2339,7 +2339,11 @@ export async function executeDispatchRound(
   const harnessType = job.harnessType ?? "pi";
 
   // Declared outside try so catch/post-round handlers can access exit diagnostics
-  let result: HarnessRoundResult | undefined;
+  // G8 ADMISSION-INTEGRATION (US-005): a Matchlock round may return
+  // `gateRefused: true` — the launch gate refused the invocation, so no
+  // harness ran and the run is ALREADY terminal. That result is handled
+  // immediately after the call and never reaches the post-round processing.
+  let result: (HarnessRoundResult & { gateRefused?: boolean }) | undefined;
   // Round-start stopwatch for instant-fail classification (RSPN). The
   // adapters now report their own durationMs on resolved rounds; this
   // capture covers the adapter-throw path (deleted/broken harness binary
@@ -2886,6 +2890,19 @@ export async function executeDispatchRound(
           });
         }
 
+        if (probeOutcome.gateRefused) {
+          // G8 ADMISSION-INTEGRATION (US-005): the launch gate refused the
+          // probe invocation BEFORE any VM. The gate already recorded the
+          // refusal and force-failed the run; the probe is neither a pass nor
+          // a failure, so nothing is recorded (no run.harness_probe_failed,
+          // no work round, no retry) — the run is terminal.
+          logger.info("Dispatch round — probe not run: launch gate refused this invocation", {
+            ...context,
+            reason: "matchlock_launch_gate_refused",
+          });
+          return;
+        }
+
         if (probeOutcome.canceled) {
           // The round's launch-cancellation signal fired mid-probe (run
           // teardown/cancel in progress). Record nothing — the run is going
@@ -3133,6 +3150,21 @@ export async function executeDispatchRound(
         ...(matchlockPolicy.imagePath ? { imagePath: matchlockPolicy.imagePath } : {}),
         ...(matchlockMergeContext ? { merge: matchlockMergeContext } : {}),
       });
+      // G8 ADMISSION-INTEGRATION (US-005): the launch gate refused this
+      // invocation. NO harness ran and no VM was created; the gate already
+      // wrote the receipt, emitted run.matchlock_gate_refused and force-failed
+      // the run (status 'failed', scheduling_status NULL, crons torn down).
+      // Return WITHOUT any post-round classification: an empty round must not
+      // be mistaken for a lost claim, and an instant-fail/pre-claim charge
+      // would be accounting for a round that never happened — exactly the
+      // retry-loop shape a refusal must never reproduce.
+      if (result.gateRefused === true) {
+        logger.info("Work round skipped — Matchlock launch gate refused this invocation", {
+          ...context,
+          reason: "matchlock_launch_gate_refused",
+        });
+        return;
+      }
       output = result.output;
     } else {
       const onSpawn = ({ pid, pgid }: { pid: number; pgid: number }) => {
@@ -3983,6 +4015,13 @@ interface LaunchTimeProbeOutcome {
    * the run is going down; no failure block is produced.
    */
   canceled?: boolean;
+  /**
+   * G8 ADMISSION-INTEGRATION (US-005): the launch gate refused this probe
+   * invocation, so the probe NEVER ran (no VM, no harness) and the run is
+   * already terminal. Nothing is recorded about the probe — it is neither a
+   * failure nor a pass — and the caller returns immediately.
+   */
+  gateRefused?: boolean;
   /** Present when passed === false: the mechanical failure keyline block. */
   failureBlock: string;
   /** Present when passed === false: capped single-line observed message (≤400 chars). */
@@ -4406,7 +4445,7 @@ async function runMatchlockLaunchTimeHarnessProbe(params: {
     );
   }
 
-  let result: HarnessRoundResult & { canceled?: boolean };
+  let result: HarnessRoundResult & { canceled?: boolean; gateRefused?: boolean };
   try {
     result = await runMatchlockSchedulerRound({
       policy,
@@ -4449,6 +4488,29 @@ async function runMatchlockLaunchTimeHarnessProbe(params: {
       durationMs: undefined,
       stderrTail: `matchlock probe invocation failed: ${describeMatchlockError(err)}`,
     });
+  }
+
+  if (result.gateRefused === true) {
+    // G8 ADMISSION-INTEGRATION (US-005): the launch gate refused this probe
+    // invocation BEFORE any VM was created. The gate already recorded the
+    // refusal (receipt + run.matchlock_gate_refused) and force-failed the run,
+    // so the probe is neither a pass nor a failure: nothing is recorded and the
+    // caller returns without a work round. An unprobed run keeps its
+    // reservation state; the run is terminal, so no later tick re-probes it.
+    return {
+      passed: false,
+      gateRefused: true,
+      harness: harnessType,
+      probeCmd,
+      expected: expectedPath,
+      durationMs: Math.max(0, probeWatch.elapsedMs()),
+      tokens: 0,
+      failureBlock: "",
+      observed: "",
+      exitCode: null,
+      signal: null,
+      stderrTail: "",
+    };
   }
 
   if (signal.aborted || result.canceled) {

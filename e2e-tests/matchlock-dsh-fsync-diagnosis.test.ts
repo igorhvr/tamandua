@@ -226,9 +226,14 @@ async function loadAdmission(): Promise<{
 }
 
 async function loadOverlayHelpers(): Promise<{
-  prepare: (runId: string, liveStateRoot: string, hostHome: string) => { overlayRoot: string };
-  root: (runId: string, liveStateRoot: string) => string;
-  cleanup: (runId: string, liveStateRoot: string) => void;
+  prepare: (
+    runId: string,
+    invocationId: string,
+    liveStateRoot: string,
+    hostHome: string,
+  ) => { overlayRoot: string };
+  root: (runId: string, invocationId: string, liveStateRoot: string) => string;
+  cleanup: (runId: string, invocationId: string, liveStateRoot: string) => void;
   planDshHomeMounts: (
     hostHome: string,
     overlayRoot: string,
@@ -237,13 +242,30 @@ async function loadOverlayHelpers(): Promise<{
 }> {
   const mod = await import(`${repoRoot}/dist/installer/matchlock/dsh-profile-overlay.js`);
   return {
-    prepare: (runId, liveStateRoot, hostHome) =>
-      mod.prepareDshProfileOverlay(runId, liveStateRoot, hostHome) as { overlayRoot: string },
-    root: (runId, liveStateRoot) => mod.dshProfileOverlayRoot(runId, liveStateRoot) as string,
-    cleanup: (runId, liveStateRoot) => mod.cleanupDshProfileOverlay(runId, liveStateRoot) as void,
+    prepare: (runId, invocationId, liveStateRoot, hostHome) =>
+      mod.prepareDshProfileOverlay(
+        runId,
+        invocationId,
+        liveStateRoot,
+        hostHome,
+      ) as { overlayRoot: string },
+    root: (runId, invocationId, liveStateRoot) =>
+      mod.dshProfileOverlayRoot(runId, invocationId, liveStateRoot) as string,
+    cleanup: (runId, invocationId, liveStateRoot) =>
+      mod.cleanupDshProfileOverlay(runId, invocationId, liveStateRoot) as void,
     planDshHomeMounts: (hostHome, overlayRoot, guestRoot) =>
       mod.planDshHomeMounts(hostHome, overlayRoot, guestRoot) as Record<string, unknown>,
   };
+}
+
+/**
+ * OVERLAY-INV-SCOPED: an explicit stand-in invocation identity for a host
+ * pre-seed. The LIVE controller generates its own host-random invocation id, so
+ * real-runner gates observe the per-run grouping dir instead.
+ */
+function deterministicInvocationId(runId: string): string {
+  const hex = runId.replace(/[^0-9a-f]/gi, "").slice(0, 12).padEnd(12, "0");
+  return `inv-${hex}-00000000`;
 }
 
 async function resolveControlHomeAlias(realHome: string): Promise<string> {
@@ -508,14 +530,22 @@ describe(
         // 1. The composed plan the CURRENT build emits, for reconciliation.
         const overlayHelpers = await loadOverlayHelpers();
         const planRunId = randomUUID();
-        const planOverlay = overlayHelpers.prepare(planRunId, tamanduaDir, dshHome).overlayRoot;
+        // Stand-in invocation identity: a host pre-seed cannot predict the LIVE
+        // controller's host-random invocation id.
+        const planInvocationId = deterministicInvocationId(planRunId);
+        const planOverlay = overlayHelpers.prepare(
+          planRunId,
+          planInvocationId,
+          tamanduaDir,
+          dshHome,
+        ).overlayRoot;
         const plan = overlayHelpers.planDshHomeMounts(
           dshHome,
           planOverlay,
           "/workspace/config/dsh",
         );
         const plannedDestinations = Object.keys(plan).sort();
-        overlayHelpers.cleanup(planRunId, tamanduaDir);
+        overlayHelpers.cleanup(planRunId, planInvocationId, tamanduaDir);
         assert.ok(
           plannedDestinations.length >= 1,
           `the composed plan must name at least the effective-home root destination: ${JSON.stringify(plannedDestinations)}`,

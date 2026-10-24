@@ -439,7 +439,15 @@ export interface RunInteractiveSessionOptions {
   stderr?: (text: string) => void;
 }
 
-/** True for the typed refusal errors the CLI reports as a clean non-zero. */
+/**
+ * True for the typed refusal errors the CLI reports as a clean non-zero.
+ *
+ * DELIBERATELY EXCLUDES the launch gate's `LaunchGateRefusalError` (G8 US-003):
+ * that refusal carries its own dedicated exit status (78) and its own rendered
+ * remedy text, so it must reach the CLI surface UNCHANGED rather than being
+ * flattened into the generic exit-1 refusal path here. Adding it to this set
+ * would silently turn every gate refusal into a 1 with no remedy output.
+ */
 function isTypedRefusal(error: unknown): error is Error & { code: string } {
   return (
     error instanceof InteractiveSessionPlanError ||

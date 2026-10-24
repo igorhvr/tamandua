@@ -24,6 +24,15 @@
  *      the parser-resolved resource limits/allow-private list to obtain the
  *      version-3 policy and immutable pinned identity (the hermes branch
  *      re-resolves the same frozen submission).
+ *   7. For the hermes harness, evaluate the launch gate (G8 US-003) through
+ *      `launch-gate-interactive.ts` — AFTER the selection is resolved and AFTER
+ *      admission pinned the image, and BEFORE the plan is handed to the
+ *      controller (the last point at which a VM create can still be prevented).
+ *      An allow binds the plan (`launchGate`); a refusal throws the wiring's
+ *      `LaunchGateRefusalError` with the G9 exit status and the recorded
+ *      receipt, so a plan is never returned for an unconverted store. The gate
+ *      writes evidence (receipt/anchor) but creates no VM and makes no mount;
+ *      native pi sessions are not gated.
  *
  * Fail-closed boundaries (never permissive admission, never a silent skip,
  * never a host-execution fallback):
@@ -78,6 +87,17 @@ import {
   type InteractiveHermesAdapterSource,
   type InteractiveHermesSelection,
 } from "./interactive-hermes-selection.js";
+import { nowIso } from "../../lib/instant.js";
+import {
+  evaluateInteractiveLaunchGate,
+  interactiveLaunchGateInvocationId,
+  type EvaluateInteractiveLaunchGate,
+  type InteractiveLaunchGateDeps,
+} from "./launch-gate-interactive.js";
+import {
+  LaunchGateRefusalError,
+  type LaunchGateBinding,
+} from "./launch-gate-wiring.js";
 import type {
   InteractiveSessionArgs,
   InteractiveSessionHarness,
@@ -164,6 +184,24 @@ export interface PlanInteractiveSessionOptions {
   allowPrivateSupportProbe?: MatchlockAllowPrivateSupportProbe;
   /** Injected admission seam (tests); defaults to `admitMatchlockRun`. */
   admit?: AdmitInteractiveSession;
+  /**
+   * Interactive launch-gate evaluation seam (tests); defaults to
+   * `evaluateInteractiveLaunchGate`. It runs for the hermes harness only,
+   * AFTER admission and BEFORE the plan is returned.
+   */
+  launchGate?: EvaluateInteractiveLaunchGate;
+  /**
+   * Launch-gate deps forwarded to the production seam (tests / callers): the
+   * state dir, the clock, the revalidation and observation seams, the
+   * journal-mode options and the admission identity override. The invocation
+   * id is supplied separately by {@link launchGateInvocationId}.
+   */
+  launchGateDeps?: Omit<InteractiveLaunchGateDeps, "invocationId" | "admissionIdentity">;
+  /**
+   * The invocation id binding this plan's verdict (tests pin it). Defaults to
+   * `interactiveLaunchGateInvocationId(pid, <plan start instant>, subcommand)`.
+   */
+  launchGateInvocationId?: string;
   /** Override the matchlock rpc binary (tests inject a fake driver). */
   rpcBinaryPath?: string;
   /** Override the matchlock rpc args (tests pass [driverPath]). */
@@ -210,6 +248,15 @@ export interface InteractiveSessionPlan {
   policy: ExecutionIsolation;
   /** The pinned immutable image identity (also embedded in the policy). */
   pinnedIdentity: PinnedImageIdentity;
+  /**
+   * US-003: the bound launch-gate decision for this interactive Hermes
+   * invocation (hermes harness only). Present only on an ALLOW: a refusal
+   * throws `LaunchGateRefusalError` before any plan is returned, so a plan can
+   * never carry a refusal-shaped verdict. The controller backstop compares
+   * this binding's invocation id and store-set key to the invocation it is
+   * about to create a VM for.
+   */
+  launchGate?: LaunchGateBinding;
   /**
    * MTLK-RPC-BIN-SPLIT (tamandua-dwl): the ONE frozen rpc invocation this
    * session admitted and probed. The session controller MUST launch exactly
@@ -379,6 +426,10 @@ export async function planInteractiveSession(
   options: PlanInteractiveSessionOptions = {},
 ): Promise<InteractiveSessionPlan> {
   const env = options.env ?? process.env;
+  // The plan's START instant: captured once, before any awaited work, so the
+  // launch-gate invocation id (pid + start instant) cannot drift while
+  // admission performs RPC work.
+  const planStartedAt = nowIso();
 
   // 1. Capture identity/config BEFORE anything could mutate the process env.
   const identity = captureIdentity(args, options, env);
@@ -567,6 +618,39 @@ export async function planInteractiveSession(
     rethrowImageAdmissionFailure(err, imageSource, image);
   }
 
+  // 8. THE LAUNCH GATE (US-003), immediately before the plan is handed to the
+  //    controller — which is the last point at which a VM create can still be
+  //    prevented without a partial mount. It runs AFTER admission on purpose:
+  //    the gate receipt/anchor names the pinned image identity admission
+  //    returned, so the evidence binds a decision to the artifacts that would
+  //    have executed. Hermes only: native pi sessions have no Hermes store.
+  //
+  //    A refusal throws the wiring's `LaunchGateRefusalError` UNCHANGED (it
+  //    carries the G9 exit status) and is never re-wrapped into a plan.
+  let launchGate: LaunchGateBinding | undefined;
+  if (args.harness === "hermes" && hermesSelection !== undefined) {
+    const evaluateGate = options.launchGate ?? evaluateInteractiveLaunchGate;
+    const invocationId =
+      options.launchGateInvocationId ??
+      interactiveLaunchGateInvocationId({
+        pid: process.pid,
+        startedAt: planStartedAt,
+        subcommand: args.subcommand,
+      });
+    const decision = evaluateGate(hermesSelection, args, {
+      ...options.launchGateDeps,
+      invocationId,
+      // Ours wins: the anchor must record the identity THIS admission pinned.
+      admissionIdentity: admitted.identity,
+    });
+    if (decision.action !== "allow") {
+      // A seam that RETURNS a refusal (instead of throwing it) still cannot
+      // produce a plan: the plan's invariant is "an allow binding or nothing".
+      throw new LaunchGateRefusalError(decision.refusal);
+    }
+    launchGate = decision.binding;
+  }
+
   return {
     subcommand: args.subcommand,
     harness: args.harness,
@@ -583,6 +667,7 @@ export async function planInteractiveSession(
     ...(rootUsageWarning !== undefined ? { rootUsageWarning } : {}),
     policy: admitted.policy,
     pinnedIdentity: admitted.identity,
+    ...(launchGate !== undefined ? { launchGate } : {}),
     resolvedRpc,
   };
 }

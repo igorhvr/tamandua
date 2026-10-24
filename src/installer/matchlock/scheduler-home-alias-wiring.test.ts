@@ -25,6 +25,7 @@ import {
   setMatchlockHomeAliasResolverForTest,
   setMatchlockProductionRouteRunnerForTest,
   setMatchlockSchedulerRoundRunnerForTest,
+  setMatchlockScheduledLaunchGateForTest,
   MatchlockRunnerError,
   type MatchlockSchedulerRound,
   type MatchlockSchedulerRoundResult,
@@ -160,9 +161,14 @@ describe("Matchlock short-HOME alias wiring (US-002)", () => {
     setMatchlockExecutionBoundarySeamsForTest({
       swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
     });
+    // G8 US-005: this suite is about the short-HOME alias, not the Hermes
+    // launch gate; the synthetic profiles used here could never pass a real
+    // gate, so it is SKIPPED.
+    setMatchlockScheduledLaunchGateForTest({ evaluate: () => null, evaluateAttempt: () => null });
   });
 
   afterEach(() => {
+    setMatchlockScheduledLaunchGateForTest(null);
     setMatchlockHomeAliasResolverForTest(null);
     setMatchlockExecutionBoundarySeamsForTest(null);
     setMatchlockSchedulerRoundRunnerForTest(null);

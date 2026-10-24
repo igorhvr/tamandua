@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Run the G8 ADMISSION-QUALIFICATION real-VM gate (bead tamandua-7p5.1.8).
+#
+# ⚠️  SLOW REAL-VM GATE — DO NOT RUN BY DEFAULT ⚠️
+#
+# This tier boots fresh Firecracker VMs on vaimetal and is deliberately NOT
+# part of any default fast lane (npm test / run-all-smoke-e2e-tests /
+# run-all-scripted-e2e-tests / run-all-e2e-tests). Run it on demand:
+#
+#   ./run-matchlock-admission-qualification-e2e-test
+#
+# It takes the SHARED host gate lock exactly once, through the suite library
+# (scripts/tests/matchlock/lib/lock.sh), which runs
+#
+#   flock --exclusive /home/kaladin/matchlock-work/vaivm-gate.lock
+#
+# and exports MTLK_GATE_LOCK_HELD=1 as the handshake, so a composed caller that
+# already holds the lock SKIPS acquisition instead of deadlocking on a nested
+# flock of the same file. The lock is released on exit (by this layer only).
+#
+# What it does:
+#   1. resolves the matchlock + guest-init pair from PATH (with the optional
+#      TAMANDUA_MATCHLOCK_RPC_BIN / MATCHLOCK_GUEST_INIT / MATCHLOCK_GUEST_FUSED
+#      overrides) and records the OBSERVED version and sha256 hashes — no
+#      runtime pin is checked or embedded (MTLK-UNPIN, tamandua-6sy.33.10.36)
+#   2. npm run build (the compiled dist is the artifact the run executes)
+#   3. allocates a NEW mkdtemp evidence directory OUTSIDE the worktree, plus a
+#      private HOME / TMPDIR / TAMANDUA_STATE_DIR inside it, so no probe can
+#      read or write the operator's live state or /home/kaladin/.hermes
+#   4. seeds a PRIVATE matchlock image store from the operator store (matchlock
+#      is never started against an empty/unseeded store; seeding fails closed)
+#   5. runs e2e-tests/matchlock-admission-qualification-gate.test.ts while the
+#      lock is held, tee-ing every log line into the evidence dir
+#   6. runs the shared no-fake-green observed-rounds guard AFTER the tier: an
+#      observed_rounds of zero refuses PASS with exit 92
+#   7. propagates the real exit code (cleanup failures included)
+#
+# Scenario note: the qualification scenarios that drive the REAL run path are
+# A1 (refusal before any VM), A2 (admission + a real VM), C1 (the mixed
+# native/guest overlap on an admitted store) and C2 (the transient
+# rollback-journal refusal, which needs no VM). On a VM-capable host A2 and C1
+# produce the in-VM rounds; in a sandbox that cannot boot a VM they record
+# ENVIRONMENT, so the observed-rounds guard still refuses PASS (exit 92) — a
+# real-VM gate that drove no round must never report green.
+set -u
+
+cd "$(dirname "$0")"
+REPO_ROOT="$(pwd)"
+SUITE_LIB="$REPO_ROOT/scripts/tests/matchlock/lib"
+
+fail() { echo "run-matchlock-admission-qualification-e2e-test: FATAL: $*" >&2; exit 90; }
+
+# The operator HOME / image cache are captured BEFORE any private HOME is
+# installed: lib/common.sh binds MTLK_OPERATOR_CACHE on source, and the gate is
+# handed the operator home as an explicit "must stay untouched" reference.
+OPERATOR_HOME="$HOME"
+[ -f "$SUITE_LIB/lock.sh" ] || fail "suite gate-lock library missing: $SUITE_LIB/lock.sh"
+[ -f "$SUITE_LIB/image-store.sh" ] || fail "suite image-store library missing: $SUITE_LIB/image-store.sh"
+# shellcheck source=scripts/tests/matchlock/lib/lock.sh
+. "$SUITE_LIB/lock.sh"
+# shellcheck source=scripts/tests/matchlock/lib/image-store.sh
+. "$SUITE_LIB/image-store.sh"
+OPERATOR_CACHE="$(mtlk_operator_cache_dir)"
+
+# -- shared gate lock (MTLK_GATE_LOCK_HELD handshake) ------------------------
+# lib/lock.sh acquires at ONE layer only: this layer takes the lock, exports
+# MTLK_GATE_LOCK_HELD=1, and an inner composer skips (never a nested flock).
+TAMANDUA_GATE_LOCK="${TAMANDUA_GATE_LOCK:-/home/kaladin/matchlock-work/vaivm-gate.lock}"
+MTLK_GATE_LOCK="$TAMANDUA_GATE_LOCK"
+export MTLK_GATE_LOCK
+mkdir -p "$(dirname -- "$MTLK_GATE_LOCK")" || fail "cannot create the gate lock directory: $(dirname -- "$MTLK_GATE_LOCK")"
+
+# -- UNPINNED runtime resolution (MTLK-UNPIN, tamandua-6sy.33.10.36) --------
+# No runtime sha256 pins: default to whatever `matchlock` resolves on PATH and
+# let matchlock resolve its own guest-init when unset. The overrides exist for
+# operators who keep the pair elsewhere. The observed version and hashes are
+# recorded as gate evidence instead of being checked against a pin.
+if [ -n "${TAMANDUA_MATCHLOCK_RPC_BIN:-}" ]; then
+  MATCHLOCK_RPC_BIN="$TAMANDUA_MATCHLOCK_RPC_BIN"
+else
+  MATCHLOCK_RPC_BIN="$(command -v matchlock 2>/dev/null || true)"
+fi
+[ -n "$MATCHLOCK_RPC_BIN" ] || fail "matchlock not found on PATH; set TAMANDUA_MATCHLOCK_RPC_BIN to the matchlock CLI"
+[ -f "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not found: $MATCHLOCK_RPC_BIN"
+[ -x "$MATCHLOCK_RPC_BIN" ] || fail "matchlock binary not executable: $MATCHLOCK_RPC_BIN"
+
+# Default guest-init: `guest-init` next to the resolved matchlock binary, else
+# `guest-init` on PATH. An unresolved value stays UNSET so the matchlock CLI
+# resolves it itself.
+matchlock_default_guest_init() {
+  local dir candidate
+  dir="$(dirname -- "$1")"
+  candidate="$dir/guest-init"
+  if [ -f "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
+  command -v guest-init 2>/dev/null || true
+}
+if [ -n "${MATCHLOCK_GUEST_INIT:-}" ]; then
+  GUEST_INIT="$MATCHLOCK_GUEST_INIT"
+else
+  GUEST_INIT="$(matchlock_default_guest_init "$MATCHLOCK_RPC_BIN")"
+fi
+if [ -n "${MATCHLOCK_GUEST_FUSED:-}" ]; then
+  GUEST_FUSED="$MATCHLOCK_GUEST_FUSED"
+else
+  GUEST_FUSED="$GUEST_INIT"
+fi
+if [ -n "$GUEST_INIT" ]; then
+  [ -f "$GUEST_INIT" ] || fail "guest-init not found: $GUEST_INIT (unset MATCHLOCK_GUEST_INIT to let matchlock resolve it)"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  [ -f "$GUEST_FUSED" ] || fail "guest-fused not found: $GUEST_FUSED (unset MATCHLOCK_GUEST_FUSED to let matchlock resolve it)"
+fi
+
+# Observed (NOT pinned) runtime identity: recorded into the gate evidence dir.
+OBSERVED_MATCHLOCK_VERSION="$("$MATCHLOCK_RPC_BIN" --version 2>&1 | head -n 1 || true)"
+OBSERVED_MATCHLOCK_SHA="$(sha256sum "$MATCHLOCK_RPC_BIN" | awk '{print $1}')"
+if [ -n "$GUEST_INIT" ]; then
+  OBSERVED_GUEST_INIT_SHA="$(sha256sum "$GUEST_INIT" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_INIT_SHA="unset => resolved by matchlock"
+fi
+if [ -n "$GUEST_FUSED" ]; then
+  OBSERVED_GUEST_FUSED_SHA="$(sha256sum "$GUEST_FUSED" | awk '{print $1}')"
+else
+  OBSERVED_GUEST_FUSED_SHA="unset => resolved by matchlock"
+fi
+echo "runtime observed (unpinned): matchlock ${OBSERVED_MATCHLOCK_VERSION:-no-version} sha256 $OBSERVED_MATCHLOCK_SHA"
+echo "runtime observed (unpinned): guest-init ${GUEST_INIT:-resolved-by-matchlock} sha256 $OBSERVED_GUEST_INIT_SHA"
+echo "runtime observed (unpinned): guest-fused ${GUEST_FUSED:-resolved-by-matchlock} sha256 $OBSERVED_GUEST_FUSED_SHA"
+
+npm run build || fail "npm run build failed"
+
+EVIDENCE_ROOT="${TAMANDUA_GATE_EVIDENCE_ROOT:-/home/kaladin/matchlock-work/evidence}"
+mkdir -p "$EVIDENCE_ROOT" || fail "cannot create the evidence root: $EVIDENCE_ROOT"
+# A NEW unique evidence directory every run — never a pre-clean of anything
+# under the evidence root, and never inside the worktree.
+EV="$(mktemp -d "$EVIDENCE_ROOT/admission-qualification-XXXXXX")" || fail "mktemp -d under $EVIDENCE_ROOT failed"
+case "$EV" in
+  "$REPO_ROOT"|"$REPO_ROOT"/*) fail "evidence dir must live OUTSIDE the worktree: $EV" ;;
+esac
+echo "evidence dir: $EV"
+
+# Take the shared lock for the VM-bearing part of the run (after the build, so
+# a long build never blocks another gate) and release it on exit. The acquire
+# MUST run in THIS shell (never in a command substitution): it opens the lock
+# fd here and exports MTLK_GATE_LOCK_HELD for every child, and a subshell would
+# drop both the fd and the export the moment it returned.
+echo "gate lock: acquiring $MTLK_GATE_LOCK"
+mtlk_gate_lock_acquire || exit $?
+LOCK_STATUS="held=${MTLK_GATE_LOCK_HELD:-0} owned=${MTLK_GATE_LOCK_OWNED:-0} lock=$MTLK_GATE_LOCK"
+trap 'mtlk_gate_lock_release' EXIT
+
+# -- private, disposable execution surroundings ----------------------------
+export HOME="$EV/home"
+export TAMANDUA_STATE_DIR="$EV/state"
+export TMPDIR="$EV/tmp"
+mkdir -p "$HOME" "$TAMANDUA_STATE_DIR" "$TMPDIR" || fail "cannot create private HOME/state/TMPDIR under $EV"
+
+export TAMANDUA_MATCHLOCK_RPC_BIN="$MATCHLOCK_RPC_BIN"
+if [ -n "$GUEST_INIT" ]; then export MATCHLOCK_GUEST_INIT="$GUEST_INIT"; fi
+if [ -n "$GUEST_FUSED" ]; then export MATCHLOCK_GUEST_FUSED="$GUEST_FUSED"; fi
+
+export TAMANDUA_GATE_EVIDENCE_DIR="$EV"
+export TAMANDUA_GATE_EVIDENCE_ROOT="$EVIDENCE_ROOT"
+# The operator home/cache are recorded so the gate can assert it never touched
+# them (they are REFERENCES, never mounts or write targets).
+export TAMANDUA_GATE_OPERATOR_HOME="$OPERATOR_HOME"
+export TAMANDUA_GATE_OPERATOR_CACHE="$OPERATOR_CACHE"
+export TAMANDUA_GATE_IMAGE_STORE="$HOME/.cache/matchlock"
+
+# Observed-not-pinned runtime evidence (MTLK-UNPIN): the gate accepts whatever
+# `matchlock` resolves and records the observed version/hashes here.
+RUNTIME_OBSERVED="$EV/runtime-observed.txt"
+{
+  echo "matchlock.path=$MATCHLOCK_RPC_BIN"
+  echo "matchlock.version=${OBSERVED_MATCHLOCK_VERSION:-no-version}"
+  echo "matchlock.sha256=$OBSERVED_MATCHLOCK_SHA"
+  echo "guest_init.path=${GUEST_INIT:-unset => resolved by matchlock}"
+  echo "guest_init.sha256=$OBSERVED_GUEST_INIT_SHA"
+  echo "guest_fused.path=${GUEST_FUSED:-unset => resolved by matchlock}"
+  echo "guest_fused.sha256=$OBSERVED_GUEST_FUSED_SHA"
+  echo "operator_home=$OPERATOR_HOME"
+  echo "operator_cache=$OPERATOR_CACHE"
+  echo "image_store=$TAMANDUA_GATE_IMAGE_STORE"
+  echo "private_home=$HOME"
+  echo "private_state_dir=$TAMANDUA_STATE_DIR"
+  echo "gate_lock=$MTLK_GATE_LOCK"
+  echo "gate_lock_status=$LOCK_STATUS"
+  echo "evidence_dir=$EV"
+} > "$RUNTIME_OBSERVED"
+echo "runtime evidence: $RUNTIME_OBSERVED"
+cat "$RUNTIME_OBSERVED"
+
+# Seed a PRIVATE image store from the operator store (hardlinked immutable
+# blobs, copied mutable metadata). Fails closed with exit 4 and the exact line
+# MTLK-IMAGE-STORE-FAIL <reason> when the store cannot be made usable; the
+# operator store is read-only throughout.
+mtlk_image_store_seed "$HOME" || fail "private image store seeding failed"
+if [ ! -f "$TAMANDUA_GATE_IMAGE_STORE/images/metadata.db" ]; then
+  fail "private image store is missing images/metadata.db after seeding: $TAMANDUA_GATE_IMAGE_STORE"
+fi
+
+LOG="$EV/gate-run.log"
+echo "=== MATCHLOCK ADMISSION-QUALIFICATION GATE START $(date -u +%FT%TZ) EV=$EV ===" | tee "$LOG"
+echo "runtime: $MATCHLOCK_RPC_BIN" | tee -a "$LOG"
+node --test e2e-tests/matchlock-admission-qualification-gate.test.ts 2>&1 | tee -a "$LOG"
+RC=${PIPESTATUS[0]}
+echo "=== MATCHLOCK ADMISSION-QUALIFICATION GATE END $(date -u +%FT%TZ) rc=$RC ===" | tee -a "$LOG"
+
+# ── no-fake-green: refuse PASS when no in-VM round was observed ──────────
+# The gate writes <EV>/observed-rounds.json through the shared helper. This
+# guard reads it and exits 92 — distinct from a test failure (1) and this
+# runner's FATAL (90) — when the count is zero or the evidence is
+# missing/malformed. A gate whose VM creation fails (or whose scenario never
+# reached a round) must fail loudly, never report a vacuous green run.
+GUARD_RC=0
+node scripts/observed-rounds-guard.mjs --dir "$EV" --gate admission-qualification 2>&1 | tee -a "$LOG"
+GUARD_RC=${PIPESTATUS[0]}
+if [ "$GUARD_RC" -eq 92 ]; then
+  echo "run-matchlock-admission-qualification-e2e-test: ZERO-ROUND REFUSAL: no VM round observed (VM creation or probe failed before any round)" >&2
+  exit 92
+fi
+exit "$RC"

@@ -912,13 +912,28 @@ describe("pi invocation runner (mock local-VM driver; real broker/services/pack)
         string,
         { host_path?: string; readonly?: boolean }
       >;
-      const overlayRoot = path.join(rig.root, "state", "matchlock", "dsh-profile-overlays", RUN);
-      // ONE real effective-home root from the private overlay: the home root is
-      // host-backed (fsync-able) while profiles/ stays the private copy.
+      // OVERLAY-INV-SCOPED: the root is bound to the controller's own
+      // host-generated invocation identity, so the exact leaf is not knowable
+      // ahead of time — read it from the wire and assert the disjoint
+      // per-invocation namespace + effective-home shape.
+      const overlayRoot = mounts["/workspace/config/dsh"]?.host_path;
+      assert.ok(overlayRoot, "the effective home root is mounted");
+      const invocationParent = path.join(
+        rig.root,
+        "state",
+        "matchlock",
+        "dsh-profile-invocations",
+        RUN,
+      );
       assert.equal(
-        mounts["/workspace/config/dsh"]?.host_path,
-        overlayRoot,
-        "the effective home root must be sourced from the private per-run overlay",
+        overlayRoot!.startsWith(invocationParent + path.sep),
+        true,
+        `the effective home root must live under the per-invocation namespace ${invocationParent}`,
+      );
+      assert.match(
+        overlayRoot!.slice(invocationParent.length + 1),
+        /^inv-[0-9a-f]+-[0-9a-f]+$/i,
+        "the overlay root leaf is the host-generated invocation id",
       );
       assert.notEqual(
         mounts["/workspace/config/dsh"]?.host_path,

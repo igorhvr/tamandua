@@ -171,22 +171,28 @@ const PINNED_RUN_ALERT_VOCABULARY = [
 
 /**
  * The launch-time harness probe / per-execution isolation diagnostic
- * vocabulary (IFLB + KHYG US-002). These are NON-terminal run-diagnostics
- * emitted around the once-per-run probe that precedes a run's first real
- * dispatch — run.harness_probe_ok records a passing probe (harness answered
- * `<launcher> skill-path` with the expected PATH), run.harness_probe_failed
- * records a failing one (the run is force-failed immediately afterwards) —
- * plus run.harness_isolation, which records the effective signal-isolation
- * mode ('landlock' | 'seatbelt' | 'unprotected-fallback') with reason on
- * fallback. Protected records fire once per harness execution (work rounds
- * AND the probe round); the unprotected-fallback record is deduped to once
- * per run per daemon start (WNOI) so a long run does not flood the stream.
- * Pinned alongside the lifecycle and alert vocabularies.
+ * vocabulary (IFLB + KHYG US-002) plus the Matchlock launch-gate refusal
+ * record (G8 ADMISSION-INTEGRATION US-005). These are NON-terminal
+ * run-diagnostics emitted around the once-per-run probe that precedes a run's
+ * first real dispatch — run.harness_probe_ok records a passing probe (harness
+ * answered `<launcher> skill-path` with the expected PATH),
+ * run.harness_probe_failed records a failing one (the run is force-failed
+ * immediately afterwards) — plus run.harness_isolation, which records the
+ * effective signal-isolation mode ('landlock' | 'seatbelt' |
+ * 'unprotected-fallback') with reason on fallback, plus
+ * run.matchlock_gate_refused, which records a launch-gate refusal of a
+ * scheduled dispatch (the run is force-failed immediately afterwards, so a
+ * refusal can never become a retry loop). Protected records fire once per
+ * harness execution (work rounds AND the probe round); the
+ * unprotected-fallback record is deduped to once per run per daemon start
+ * (WNOI) so a long run does not flood the stream. Pinned alongside the
+ * lifecycle and alert vocabularies.
  */
 const PINNED_RUN_DIAGNOSTIC_VOCABULARY = [
   "run.harness_probe_ok",
   "run.harness_probe_failed",
   "run.harness_isolation",
+  "run.matchlock_gate_refused",
 ];
 
 // ── Test suite ─────────────────────────────────────────────────────────
