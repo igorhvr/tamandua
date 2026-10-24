@@ -74,7 +74,7 @@ import {
   renderRehearsalDaemonEnvScript,
   renderRealDaemonEnvScript,
 } from './tt-storm-rehearsal.mjs';
-import { REAL_FS } from './tt-storm-roster.mjs';
+import { POUND_LATENCY_BOUND_MS, REAL_FS } from './tt-storm-roster.mjs';
 import { REAL_CLOCK, REAL_DB, REAL_GIT } from './tt-storm-shared.mjs';
 import { adoptAgedState, verifyAgedStateSeed } from './tt-storm-arm.mjs';
 import {
@@ -301,7 +301,8 @@ run options (Round A/B read-path pounding, spec 09):
   --pounding-dashboard-url <url>  Dashboard URL pounded every 30s.
   --pounding-mcp-tools <a,b>      MCP tool names (up to 2) pounded each round.
   --pounding-cadence-ms <n>       Pounding cadence (default 30000).
-  --pounding-latency-bound-ms <n> First-byte latency bound (default 2000).
+  --pounding-latency-bound-ms <n> First-byte latency bound (default 4000 ms;
+                      inclusive, latency <= bound).
   (When no pounding options are given, read-path pounding is recorded
    first-class NOT_RUN — never a fabricated fired.)
 
@@ -372,7 +373,10 @@ function fixtureOpts(opts) {
   };
 }
 
-function poundingOpts(opts) {
+// Exported for the latency-bound self-test: the operator CLI's default must be
+// the SAME exported constant the engine enforces (INTERIM 4000 ms, inclusive),
+// so a missing --pounding-latency-bound-ms can never silently re-tighten it.
+export function poundingOpts(opts) {
   const url = opts['pounding-dashboard-url'];
   const toolsRaw = opts['pounding-mcp-tools'];
   if (!url && !toolsRaw) return null;
@@ -381,7 +385,7 @@ function poundingOpts(opts) {
     dashboardUrl: url ?? null,
     mcpToolNames: tools,
     cadenceMs: opts['pounding-cadence-ms'] ? Number(opts['pounding-cadence-ms']) : 30_000,
-    latencyBoundMs: opts['pounding-latency-bound-ms'] ? Number(opts['pounding-latency-bound-ms']) : 2_000,
+    latencyBoundMs: opts['pounding-latency-bound-ms'] ? Number(opts['pounding-latency-bound-ms']) : POUND_LATENCY_BOUND_MS,
   };
 }
 

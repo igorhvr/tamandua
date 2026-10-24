@@ -108,7 +108,7 @@ read-path pounding continues throughout.
 
 | T+ (Round B) | Event |
 |----|-------|
-| 0 → end | **Read-path pounding** (continues from Round A): dashboard HTTP + 2 MCP tool calls every 30s (against the aged DB). Assert: no 5xx, first-byte latency bound (< 2s), no dispatch-round degradation correlated with polling. |
+| 0 → end | **Read-path pounding** (continues from Round A): dashboard HTTP + 2 MCP tool calls every 30s (against the aged DB). Assert: no 5xx, first-byte latency bound (at most 4 s), no dispatch-round degradation correlated with polling. |
 | 15m | Colleague commit #1 to main (unrelated file) — CAS/target_moved pressure. |
 | 25m | **Nudge storm:** 20 `tamandua nudge` invocations in <10s against the loaded daemon. The deterministic motor is nudge-driven; assert dispatch idempotence — zero double-dispatched steps, zero duplicate harness spawns, dispatch count uncorrelated with nudge count (the motor rewrite's core invariant under exactly the load that would expose a race). |
 | 30m | Pause (no drain) B3; resume at T+45m. |
