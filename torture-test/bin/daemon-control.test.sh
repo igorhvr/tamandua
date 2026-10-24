@@ -553,6 +553,301 @@ else
   pass "daemon-control source contains no literal credential values"
 fi
 
+# ── Test 9d: pending credential invalidation suppresses the enumerated
+#    credential lines (CRED-SUPPRESS — bead tamandua-uvr) ─────────────
+#
+# While the CONTAINED home carries a pending credential-invalidation
+# marker (`<home>/.pi/agent/*.tt-invalidated` — the markers the controller's
+# invalidate/restore already use), env_for_kind's REAL branch must NOT
+# re-surface the enumerated credential lines: re-exporting the still-cached
+# caller-env / hermes-dotenv value would silently undo the deliberate
+# invalidation inside the contained daemon. The decision is suite-side only
+# (this env composition seam) and adds NO new env knob.
+#
+# Fixtures (TT_DC_ENV_REAL / TT_DC_OPERATOR_HOME seams — never the real
+# operator home): a CONTAINED home whose .pi/agent holds the markers, a
+# fixture OPERATOR home, and a fixture CALLER home used ONLY to prove the
+# predicate never reads it. The fixture env script is a static `print`
+# emitter whose HOME is the contained home — the same HOME contract
+# torture-test/env/tt-env.sh prints.
+echo ""
+echo "--- Test: pending credential invalidation suppresses enumerated credential lines (uvr CRED-SUPPRESS) ---"
+
+US004_ROOT="$(mktemp -d)"
+US004_HOME="$US004_ROOT/home"
+US004_OP_HOME="$US004_ROOT/operator-home"
+US004_CALLER_HOME="$US004_ROOT/caller-home"
+US004_ENV_SCRIPT="$US004_ROOT/fixture-env.sh"
+us004_cleanup() { rm -rf "$US004_ROOT"; }
+# CHAIN the EXIT trap (the US-003 arms already replaced it twice) so no
+# fixture of this test file leaks.
+trap 'us003_cleanup_fixture; us003_cleanup_empty; us004_cleanup' EXIT
+
+mkdir -p "$US004_HOME/.pi/agent" "$US004_OP_HOME" "$US004_CALLER_HOME/.pi/agent"
+cat > "$US004_ENV_SCRIPT" <<FIXTURE_ENV
+#!/usr/bin/env bash
+# fixture contained env script (CRED-SUPPRESS self-test): static `print`
+# emitter mirroring torture-test/env/tt-env.sh's HOME contract.
+if [ "\${1:-}" = "print" ]; then
+  printf 'TT_ROOT=%s\n' "$US004_ROOT/var"
+  printf 'TT_HOME=%s\n' "$US004_HOME"
+  printf 'HOME=%s\n' "$US004_HOME"
+  printf 'TAMANDUA_STATE_DIR=%s\n' "$US004_HOME/.tamandua"
+fi
+FIXTURE_ENV
+chmod +x "$US004_ENV_SCRIPT"
+
+# us004_env_print: run the env-print seam with the fixture env script, the
+# fixture operator home and a caller-env DEEPSEEK_API_KEY. Extra args (e.g.
+# `env HOME=<dir>`) are prepended by the caller.
+us004_env_print() {
+  TT_DC_ENV_REAL="$US004_ENV_SCRIPT" \
+  TT_DC_OPERATOR_HOME="$US004_OP_HOME" \
+  TT_DAEMON_CONTROL_ENV_PRINT=real \
+  DEEPSEEK_API_KEY="$US004_KEY" \
+  "$@"
+}
+
+# us004_snap: sha256 over every file in the three fixture homes (read-only
+# seam proof — the env print must never write anywhere).
+us004_snap() {
+  find "$US004_HOME" "$US004_OP_HOME" "$US004_CALLER_HOME" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum
+}
+
+# us004_tt_marker_snap: sha256 over the REAL suite contained marker dir —
+# this test must never create, delete or modify anything there.
+us004_tt_marker_snap() {
+  if [ -d "$TEST_REPO_ROOT/torture-test/var/home/.pi/agent" ]; then
+    find "$TEST_REPO_ROOT/torture-test/var/home/.pi/agent" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum
+  else
+    printf 'absent'
+  fi
+}
+
+US004_TT_SNAP_BEFORE="$(us004_tt_marker_snap)"
+
+# us004_readonly_ok: compare two fixture-home snapshots for one arm label.
+us004_readonly_ok() {
+  if [ "$1" = "$2" ]; then
+    pass "CRED-SUPPRESS $3: fixture contained/operator/caller homes are read-only (sha256 snapshot identical)"
+  else
+    fail "CRED-SUPPRESS $3: the env print seam WROTE under a fixture home (sha256 snapshot differs)!"
+  fi
+}
+
+# Arm A: auth.json.tt-invalidated present in the CONTAINED home => the
+# surface MUST NOT carry a DEEPSEEK_API_KEY line, and the seam still exits 0
+# with the env-script lines (including HOME) printed back unchanged.
+US004_KEY="sk-credsuppress-caller-arm-a"
+: > "$US004_HOME/.pi/agent/auth.json.tt-invalidated"
+US004_SNAP_BEFORE="$(us004_snap)"
+set +e
+US004_A_OUT="$(us004_env_print "$TOOL" 2>/dev/null)"
+US004_A_RC=$?
+set -e
+US004_SNAP_AFTER="$(us004_snap)"
+if ! printf '%s\n' "$US004_A_OUT" | grep -q '^DEEPSEEK_API_KEY='; then
+  pass "CRED-SUPPRESS arm A: auth.json.tt-invalidated suppresses the enumerated DEEPSEEK_API_KEY line"
+else
+  fail "CRED-SUPPRESS arm A: a pending auth.json.tt-invalidated marker must suppress the credential line (got: $(printf '%s\n' "$US004_A_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+if [ "$US004_A_RC" -eq 0 ]; then
+  pass "CRED-SUPPRESS arm A: suppressed env print seam exits 0"
+else
+  fail "CRED-SUPPRESS arm A: suppressed env print seam exited non-zero (rc=$US004_A_RC)"
+fi
+if printf '%s\n' "$US004_A_OUT" | grep -q "^HOME=$US004_HOME$"; then
+  pass "CRED-SUPPRESS arm A: the env-script lines are still printed (HOME=$US004_HOME captured and re-emitted)"
+else
+  fail "CRED-SUPPRESS arm A: the env-script lines must still be printed back (captured print output)"
+fi
+if [ "$US004_SNAP_BEFORE" = "$US004_SNAP_AFTER" ]; then
+  pass "CRED-SUPPRESS arm A: fixture contained/operator/caller homes are read-only (sha256 snapshot identical)"
+else
+  fail "CRED-SUPPRESS arm A: the env print seam WROTE under a fixture home (sha256 snapshot differs)!"
+fi
+
+# Arm B: identical fixture WITHOUT the marker => the key IS still surfaced
+# (no regression for the CRED-SURF behaviour).
+rm -f "$US004_HOME/.pi/agent/auth.json.tt-invalidated"
+US004_KEY="sk-credsuppress-caller-arm-b"
+US004_SNAP_BEFORE="$(us004_snap)"
+set +e
+US004_B_OUT="$(us004_env_print "$TOOL" 2>/dev/null)"
+US004_B_RC=$?
+set -e
+US004_SNAP_AFTER="$(us004_snap)"
+if printf '%s\n' "$US004_B_OUT" | grep -q "^DEEPSEEK_API_KEY=$US004_KEY$"; then
+  pass "CRED-SUPPRESS arm B: without a marker the enumerated DEEPSEEK_API_KEY line still carries the caller value"
+else
+  fail "CRED-SUPPRESS arm B: without a marker the credential line must still be surfaced (got: $(printf '%s\n' "$US004_B_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+if [ "$US004_B_RC" -eq 0 ]; then
+  pass "CRED-SUPPRESS arm B: unsuppressed env print seam exits 0"
+else
+  fail "CRED-SUPPRESS arm B: unsuppressed env print seam exited non-zero (rc=$US004_B_RC)"
+fi
+if [ "$US004_SNAP_BEFORE" = "$US004_SNAP_AFTER" ]; then
+  pass "CRED-SUPPRESS arm B: fixture contained/operator/caller homes are read-only (sha256 snapshot identical)"
+else
+  fail "CRED-SUPPRESS arm B: the env print seam WROTE under a fixture home (sha256 snapshot differs)!"
+fi
+
+# Arm C: the SECOND marker (models.json.tt-invalidated) suppresses too.
+: > "$US004_HOME/.pi/agent/models.json.tt-invalidated"
+US004_KEY="sk-credsuppress-caller-arm-c"
+US004_SNAP_BEFORE="$(us004_snap)"
+set +e
+US004_C_OUT="$(us004_env_print "$TOOL" 2>/dev/null)"
+US004_C_RC=$?
+set -e
+US004_SNAP_AFTER="$(us004_snap)"
+if ! printf '%s\n' "$US004_C_OUT" | grep -q '^DEEPSEEK_API_KEY='; then
+  pass "CRED-SUPPRESS arm C: models.json.tt-invalidated suppresses the enumerated DEEPSEEK_API_KEY line"
+else
+  fail "CRED-SUPPRESS arm C: a pending models.json.tt-invalidated marker must suppress the credential line (got: $(printf '%s\n' "$US004_C_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+if [ "$US004_C_RC" -eq 0 ]; then
+  pass "CRED-SUPPRESS arm C: suppressed env print seam exits 0"
+else
+  fail "CRED-SUPPRESS arm C: suppressed env print seam exited non-zero (rc=$US004_C_RC)"
+fi
+us004_readonly_ok "$US004_SNAP_BEFORE" "$US004_SNAP_AFTER" "arm C"
+rm -f "$US004_HOME/.pi/agent/models.json.tt-invalidated"
+
+# Arm D (fail-closed negatives): every shape that is NOT a real marker in the
+# contained home must still surface the key.
+# D1: `.pi/agent` absent entirely.
+rm -rf "$US004_HOME/.pi"
+US004_KEY="sk-credsuppress-caller-arm-d1"
+US004_SNAP_BEFORE="$(us004_snap)"
+set +e
+US004_D1_OUT="$(us004_env_print "$TOOL" 2>/dev/null)"
+US004_D1_RC=$?
+set -e
+US004_SNAP_AFTER="$(us004_snap)"
+if printf '%s\n' "$US004_D1_OUT" | grep -q "^DEEPSEEK_API_KEY=$US004_KEY$"; then
+  pass "CRED-SUPPRESS arm D1: absent .pi/agent fails closed — the credential line is still surfaced"
+else
+  fail "CRED-SUPPRESS arm D1: an absent .pi/agent must not suppress the credential line (got: $(printf '%s\n' "$US004_D1_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+if [ "$US004_D1_RC" -eq 0 ]; then
+  pass "CRED-SUPPRESS arm D1: env print seam exits 0 with .pi/agent absent"
+else
+  fail "CRED-SUPPRESS arm D1: env print seam exited non-zero (rc=$US004_D1_RC)"
+fi
+us004_readonly_ok "$US004_SNAP_BEFORE" "$US004_SNAP_AFTER" "arm D1"
+
+# D2: `.pi/agent` present but only NEAR-MISS filenames (no real marker).
+mkdir -p "$US004_HOME/.pi/agent"
+: > "$US004_HOME/.pi/agent/auth.json.tt-invalidated.bak"
+: > "$US004_HOME/.pi/agent/auth.json.invalidated"
+US004_KEY="sk-credsuppress-caller-arm-d2"
+US004_SNAP_BEFORE="$(us004_snap)"
+set +e
+US004_D2_OUT="$(us004_env_print "$TOOL" 2>/dev/null)"
+US004_D2_RC=$?
+set -e
+US004_SNAP_AFTER="$(us004_snap)"
+if printf '%s\n' "$US004_D2_OUT" | grep -q "^DEEPSEEK_API_KEY=$US004_KEY$"; then
+  pass "CRED-SUPPRESS arm D2: near-miss marker names (auth.json.tt-invalidated.bak, auth.json.invalidated) do not suppress"
+else
+  fail "CRED-SUPPRESS arm D2: near-miss marker names must not suppress the credential line (got: $(printf '%s\n' "$US004_D2_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+if [ "$US004_D2_RC" -eq 0 ]; then
+  pass "CRED-SUPPRESS arm D2: env print seam exits 0 with near-miss names only"
+else
+  fail "CRED-SUPPRESS arm D2: env print seam exited non-zero (rc=$US004_D2_RC)"
+fi
+us004_readonly_ok "$US004_SNAP_BEFORE" "$US004_SNAP_AFTER" "arm D2"
+
+# D3: a marker ONLY in the fixture operator home (TT_DC_OPERATOR_HOME) and
+# ONLY in the caller HOME, while the contained home has none => still
+# surfaced. This proves the decision reads the env script's ^HOME= line and
+# never OPERATOR_HOME / the caller HOME.
+mkdir -p "$US004_OP_HOME/.pi/agent"
+: > "$US004_OP_HOME/.pi/agent/auth.json.tt-invalidated"
+: > "$US004_CALLER_HOME/.pi/agent/auth.json.tt-invalidated"
+US004_KEY="sk-credsuppress-caller-arm-d3"
+US004_SNAP_BEFORE="$(us004_snap)"
+set +e
+US004_D3_OUT="$(us004_env_print env HOME="$US004_CALLER_HOME" "$TOOL" 2>/dev/null)"
+US004_D3_RC=$?
+set -e
+US004_SNAP_AFTER="$(us004_snap)"
+if printf '%s\n' "$US004_D3_OUT" | grep -q "^DEEPSEEK_API_KEY=$US004_KEY$"; then
+  pass "CRED-SUPPRESS arm D3: markers only in the operator home / caller HOME never suppress (contained home wins)"
+else
+  fail "CRED-SUPPRESS arm D3: the predicate must read ONLY the contained home's markers (got: $(printf '%s\n' "$US004_D3_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+if [ "$US004_D3_RC" -eq 0 ]; then
+  pass "CRED-SUPPRESS arm D3: env print seam exits 0 with foreign-home markers only"
+else
+  fail "CRED-SUPPRESS arm D3: env print seam exited non-zero (rc=$US004_D3_RC)"
+fi
+us004_readonly_ok "$US004_SNAP_BEFORE" "$US004_SNAP_AFTER" "arm D3"
+
+# Nothing under the REAL suite contained marker dir was created, deleted or
+# modified by any of the arms.
+US004_TT_SNAP_AFTER="$(us004_tt_marker_snap)"
+if [ "$US004_TT_SNAP_BEFORE" = "$US004_TT_SNAP_AFTER" ]; then
+  pass "CRED-SUPPRESS: torture-test/var/home/.pi/agent untouched by the new arms (sha256 snapshot identical)"
+else
+  fail "CRED-SUPPRESS: the new arms modified torture-test/var/home/.pi/agent!"
+fi
+
+# Direct fail-closed predicate negative: the extracted predicate helper must
+# return non-zero for every non-marker shape (an unmatched glob expands to
+# the literal pattern, so a bare non-empty check would pass — the explicit
+# `-e` test is what keeps this closed).
+US004_PRED_SRC="$(awk '/^contained_home_has_pending_credential_invalidation\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$TOOL")"
+if [ -n "$US004_PRED_SRC" ]; then
+  pass "CRED-SUPPRESS: contained_home_has_pending_credential_invalidation predicate is extractable from the tool"
+else
+  fail "CRED-SUPPRESS: contained_home_has_pending_credential_invalidation predicate missing from the tool"
+fi
+us004_pred_rc() {
+  bash -c "$US004_PRED_SRC
+contained_home_has_pending_credential_invalidation \"\$1\"" _ "$1" >/dev/null 2>&1
+}
+US004_EMPTY_MARKER_HOME="$US004_ROOT/empty-marker-home"
+mkdir -p "$US004_EMPTY_MARKER_HOME/.pi/agent"
+US004_PRED_MARKER_HOME="$US004_ROOT/pred-marker-home"
+mkdir -p "$US004_PRED_MARKER_HOME/.pi/agent"
+: > "$US004_PRED_MARKER_HOME/.pi/agent/auth.json.tt-invalidated"
+set +e
+us004_pred_rc "$US004_EMPTY_MARKER_HOME"; US004_PRED_RC_NO_MARKER=$?
+us004_pred_rc "$US004_ROOT/does-not-exist"; US004_PRED_RC_NO_DIR=$?
+us004_pred_rc "relative/home"; US004_PRED_RC_RELATIVE=$?
+us004_pred_rc ""; US004_PRED_RC_EMPTY=$?
+us004_pred_rc "$US004_PRED_MARKER_HOME"; US004_PRED_RC_MARKER=$?
+set -e
+if [ "$US004_PRED_RC_NO_MARKER" -ne 0 ]; then
+  pass "CRED-SUPPRESS fail-closed: predicate returns non-zero for an existing .pi/agent with NO marker (rc=$US004_PRED_RC_NO_MARKER)"
+else
+  fail "CRED-SUPPRESS fail-closed: predicate PASSED on an absent marker (rc=$US004_PRED_RC_NO_MARKER)"
+fi
+if [ "$US004_PRED_RC_NO_DIR" -ne 0 ]; then
+  pass "CRED-SUPPRESS fail-closed: predicate returns non-zero for a nonexistent home (rc=$US004_PRED_RC_NO_DIR)"
+else
+  fail "CRED-SUPPRESS fail-closed: predicate PASSED on a nonexistent home (rc=$US004_PRED_RC_NO_DIR)"
+fi
+if [ "$US004_PRED_RC_RELATIVE" -ne 0 ]; then
+  pass "CRED-SUPPRESS fail-closed: predicate rejects a non-absolute home (rc=$US004_PRED_RC_RELATIVE)"
+else
+  fail "CRED-SUPPRESS fail-closed: predicate ACCEPTED a non-absolute home (rc=$US004_PRED_RC_RELATIVE)"
+fi
+if [ "$US004_PRED_RC_EMPTY" -ne 0 ]; then
+  pass "CRED-SUPPRESS fail-closed: predicate rejects an empty home (rc=$US004_PRED_RC_EMPTY)"
+else
+  fail "CRED-SUPPRESS fail-closed: predicate ACCEPTED an empty home (rc=$US004_PRED_RC_EMPTY)"
+fi
+if [ "$US004_PRED_RC_MARKER" -eq 0 ]; then
+  pass "CRED-SUPPRESS predicate: returns zero for an absolute home carrying auth.json.tt-invalidated"
+else
+  fail "CRED-SUPPRESS predicate: must return zero for a real marker (rc=$US004_PRED_RC_MARKER)"
+fi
+
 # ── Test 10: directory setup ─────────────────────────────────────────
 echo ""
 echo "--- Test: directory setup ---"
