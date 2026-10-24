@@ -43,6 +43,10 @@
  *     fixtures) — a canned plain-text "chat" reply; also writes a
  *     whole-home persistence probe file under $DSH_HOME (see below). No step
  *     is ever claimed.
+ *  4. OVERLAP ARM (`SYNTHETIC-DSH-WAIT-THEN-CHAT:<readyPath>:<releasePath>:
+ *     <timeoutMs>`) — writes the ready marker, blocks until the host creates
+ *     the release file, and only THEN performs the mode-3 real new $DSH_HOME
+ *     writes (bounded wait; exits 9 on timeout).
  *
  * Session/usage semantics (mirrors the REAL dsh >= 0.1.5 v3 store shape the
  * host scheduler attributes from the MOUNTED DSH_HOME — see dsh-contract.json
@@ -90,6 +94,13 @@ const HARNESS_PROBE_MARKER = "TAMANDUA_HARNESS_PROBE: skill-path";
 //    guest-install links there.
 const NATIVE_HEAL_MARKER = "SYNTHETIC-DSH-NATIVE-HEAL";
 const FIRST_REQUEST_MARKER = "SYNTHETIC-DSH-FIRST-REQUEST";
+// OVERLAY-INV-SCOPED real-runner overlap arm: the waiting invocation signals
+// readiness on a host-visible marker, blocks until the host creates a release
+// file, and ONLY THEN performs REAL new $DSH_HOME file operations (the plain-
+// chat session + category markers). That is the ordering the gate needs to
+// prove a live invocation survives a predecessor's cleanup and still writes.
+// Format: SYNTHETIC-DSH-WAIT-THEN-CHAT:<readyPath>:<releasePath>:<timeoutMs>
+const WAIT_THEN_CHAT_MARKER = "SYNTHETIC-DSH-WAIT-THEN-CHAT";
 const NATIVE_INSTALL_ROOT_ENV = "SYNTHETIC_DSH_INSTALL_ROOT";
 // The guest install root is fixed inside the VM; the fast helper test overrides
 // it to a scratch dir so it never writes to the host's /opt.
@@ -908,6 +919,64 @@ function runPlainChat() {
   process.exit(0);
 }
 
+// ── OVERLAY-INV-SCOPED real-runner overlap arm ────────────────────────────
+
+/**
+ * Synchronous bounded sleep for the GUEST fixture (a separate process, so
+ * blocking its event loop is fine and keeps the poll loop trivial). The
+ * MONOTONIC clock (`performance.now()`) bounds the wait, so a wall-clock jump
+ * can neither extend nor shorten the timeout.
+ */
+function boundedSleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* bounded poll fallback */
+  }
+}
+
+/** Parse `SYNTHETIC-DSH-WAIT-THEN-CHAT:<readyPath>:<releasePath>:<timeoutMs>`. */
+function parseWaitThenChat(text) {
+  const m = new RegExp(`${WAIT_THEN_CHAT_MARKER}:([^\\s:]+):([^\\s:]+):(\\d+)`).exec(
+    String(text ?? ""),
+  );
+  if (!m) return null;
+  const timeoutMs = Number(m[3]);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;
+  return { readyPath: m[1], releasePath: m[2], timeoutMs };
+}
+
+/**
+ * Signal readiness, block (bounded) until the host releases this invocation,
+ * then perform the REAL new $DSH_HOME writes via runPlainChat. The new session
+ * and category markers are therefore created AFTER the peer invocation's
+ * teardown — exactly the overlap ordering the regression must exercise.
+ *
+ * Exit codes: 8 = ready marker could not be written, 9 = release timed out.
+ */
+function runWaitThenChat(spec) {
+  try {
+    fs.mkdirSync(path.dirname(spec.readyPath), { recursive: true });
+    fs.writeFileSync(spec.readyPath, `${process.pid}\n`, "utf-8");
+  } catch (err) {
+    process.stderr.write(
+      `synthetic-dsh: overlap ready marker failed: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    process.exit(8);
+  }
+  const deadline = performance.now() + spec.timeoutMs;
+  while (!fs.existsSync(spec.releasePath)) {
+    if (performance.now() > deadline) {
+      process.stderr.write(
+        `synthetic-dsh: overlap release timed out after ${spec.timeoutMs}ms\n`,
+      );
+      process.exit(9);
+    }
+    boundedSleepSync(25);
+  }
+  runPlainChat();
+}
+
 // ── DSH-PROFILE-OVERLAY US-005 probes ─────────────────────────────────────
 // Validate the synthetic home carries the REAL headless profile layout
 // (package.json with dsh.profile.bundles) before either probe touches a farm.
@@ -1165,6 +1234,14 @@ if (prompt.includes(NATIVE_HEAL_MARKER)) {
 }
 if (prompt.includes(FIRST_REQUEST_MARKER)) {
   runFirstRequestProbe();
+}
+// Must run BEFORE the harness-probe/work dispatch: a wait-then-chat prompt is
+// not a real work prompt, so it must never fall through to parseWorkPrompt().
+if (prompt.includes(WAIT_THEN_CHAT_MARKER)) {
+  const waitThenChat = parseWaitThenChat(prompt);
+  if (waitThenChat) {
+    runWaitThenChat(waitThenChat);
+  }
 }
 if (isHarnessProbePrompt(prompt)) {
   runProbe(prompt);

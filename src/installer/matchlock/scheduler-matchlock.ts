@@ -48,6 +48,7 @@ import {
 import {
   runHermesInvocation,
   type HermesInvocationResult,
+  type RunHermesInvocationOptions,
 } from "./hermes-invocation-runner.js";
 import {
   runDshSchedulerRound,
@@ -68,6 +69,15 @@ import {
   assertMatchlockExecutionBoundary,
   type MatchlockExecutionBoundarySeams,
 } from "./execution-boundary.js";
+import {
+  evaluateScheduledAttemptGate,
+  evaluateScheduledDispatchGate,
+  recordScheduledLaunchGateRefusal,
+  type ScheduledGateRefusalDeps,
+  type ScheduledLaunchGateDeps,
+  type ScheduledLaunchGateEvaluator,
+} from "./launch-gate-scheduled.js";
+import type { LaunchGateBinding, LaunchGateDecision } from "./launch-gate-wiring.js";
 
 // ── guest-path constants (probe gate + guest work prompt) ────────────────
 
@@ -201,6 +211,20 @@ export interface MatchlockSchedulerRound {
  */
 export type MatchlockSchedulerRoundResult = HarnessRoundResult & {
   canceled?: boolean;
+  /**
+   * G8 ADMISSION-INTEGRATION (US-005): true when the launch gate refused this
+   * invocation and the round therefore NEVER ran. No harness was spawned, no
+   * VM was created, no step was claimed, and the run has already been put in
+   * its terminal blocked-equivalent state by the gate's refusal recorder.
+   *
+   * The scheduler MUST treat this result as "nothing happened": it must not
+   * parse an (empty) output, must not recover orphaned claims, must not
+   * charge an instant-fail or pre-claim-death round, and must not force-fail
+   * the run a second time — the refusal is terminal already, and a second
+   * classification is exactly how the eighteen-round retry loop this bead
+   * exists for would become reproducible.
+   */
+  gateRefused?: boolean;
 };
 
 /**
@@ -374,6 +398,210 @@ export function buildMatchlockRoundRpcEnv(
 }
 
 /**
+ * G8 ADMISSION-INTEGRATION (US-005/US-006): the per-round launch-gate seams.
+ *
+ * Production installs nothing: the round evaluates the REAL scheduled gates
+ * (`evaluateScheduledDispatchGate` at dispatch, `evaluateScheduledAttemptGate`
+ * immediately before the VM create) and records a refusal with the real
+ * recorder. A deterministic test installs
+ * {@link setMatchlockScheduledLaunchGateForTest} to (a) SKIP both gates
+ * (`evaluate: () => null, evaluateAttempt: () => null`, for suites that
+ * exercise routing/motor semantics on synthetic profiles that could never pass
+ * a real gate) or (b) inject clock / state-dir / journal-mode seams for a real
+ * end-to-end refusal.
+ */
+export interface MatchlockScheduledLaunchGateSeams {
+  /**
+   * Gate evaluator for the DISPATCH phase. Default
+   * `evaluateScheduledDispatchGate`.
+   */
+  evaluate?: ScheduledLaunchGateEvaluator;
+  /**
+   * Gate evaluator for the ATTEMPT phase (US-006). Default
+   * `evaluateScheduledAttemptGate`.
+   *
+   * The two phases have SEPARATE seams on purpose: a stub installed for the
+   * dispatch phase must never silently answer the attempt-time question (a
+   * dispatch-time allow is exactly the stale verdict the attempt re-evaluation
+   * exists to reject). A suite that must skip the gate entirely installs
+   * `() => null` for BOTH phases.
+   */
+  evaluateAttempt?: ScheduledLaunchGateEvaluator;
+  /** Refusal recorder. Default `recordScheduledLaunchGateRefusal`. */
+  recordRefusal?: typeof recordScheduledLaunchGateRefusal;
+  /** Deps forwarded to both seams (state dir, clock, config options, writers). */
+  gateDeps?: ScheduledLaunchGateDeps & ScheduledGateRefusalDeps;
+}
+
+let testLaunchGateSeams: MatchlockScheduledLaunchGateSeams | null = null;
+
+/**
+ * NARROW injectable seam for scheduler tests (mirrors
+ * `setMatchlockSchedulerRoundRunnerForTest`). Pass `null` to restore the
+ * production gate. NEVER used outside tests.
+ */
+export function setMatchlockScheduledLaunchGateForTest(
+  seams: MatchlockScheduledLaunchGateSeams | null,
+): void {
+  testLaunchGateSeams = seams;
+}
+
+/** The gateRefused result: a round-shaped "nothing ran" answer. */
+function gateRefusedResult(): MatchlockSchedulerRoundResult {
+  return {
+    output: "",
+    exitCode: null,
+    signal: null,
+    stderrTail: "",
+    timedOut: false,
+    durationMs: 0,
+    canceled: false,
+    gateRefused: true,
+  };
+}
+
+/**
+ * Evaluate ONE gated round, translating a THROWING evaluator into the typed
+ * infrastructure failure the scheduler force-fails.
+ *
+ * The wiring core refuses rather than throws, so a throwing evaluator is a
+ * gate-machinery failure, not a guest outcome. Surfacing it as a TYPED
+ * `MatchlockRunnerError` lets the scheduler's existing typed-infra path
+ * force-fail the run with THIS reason instead of classifying a spawn-less,
+ * VM-less round as an instant fail (which would burn the instant-fail /
+ * pre-claim streak budgets on a failure that never ran).
+ */
+function evaluateRoundGate(
+  evaluate: ScheduledLaunchGateEvaluator,
+  round: MatchlockSchedulerRound,
+  seams: MatchlockScheduledLaunchGateSeams | null,
+): LaunchGateDecision | null {
+  try {
+    return evaluate(round, seams?.gateDeps ?? {});
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new MatchlockRunnerError(
+      "matchlock_gate_evaluation_failed",
+      `The Matchlock launch gate could not evaluate this invocation (${message}); refusing before any VM create.`,
+    );
+  }
+}
+
+/**
+ * Run the launch gate for ONE round's DISPATCH phase, immediately before the
+ * route dispatch.
+ *
+ * Returns the gateRefused result when the gate refused (the run has already
+ * been force-failed by the recorder), or `null` when the round may proceed.
+ * A pi or dsh policy makes NO gate call at all (the evaluator returns null),
+ * so those routes are byte-identical to before this story.
+ */
+async function applyScheduledLaunchGate(
+  round: MatchlockSchedulerRound,
+): Promise<MatchlockSchedulerRoundResult | null> {
+  const seams = testLaunchGateSeams;
+  const decision = evaluateRoundGate(
+    seams?.evaluate ?? evaluateScheduledDispatchGate,
+    round,
+    seams,
+  );
+  if (decision === null || decision.action === "allow") return null;
+  const record = seams?.recordRefusal ?? recordScheduledLaunchGateRefusal;
+  await record(round, decision.refusal, {
+    phase: "dispatch",
+    ...(seams?.gateDeps ?? {}),
+  });
+  return gateRefusedResult();
+}
+
+/** What an attempt-time evaluation means for the round that is about to run. */
+type ScheduledAttemptGateOutcome =
+  | { refused: true; result: MatchlockSchedulerRoundResult }
+  | {
+      refused: false;
+      binding: LaunchGateBinding | null;
+      /**
+       * G8 US-012: the FULL allow decision (binding + the receipt input captured
+       * before any VM existed). The binding authorises the controller backstop;
+       * the decision additionally lets the invocation runner record the
+       * `action: "launched"` receipt ONCE the VM exists. Null exactly when the
+       * policy is not gated (a test seam skip), so an ungated round does not
+       * fabricate a launch record.
+       */
+      decision: Extract<LaunchGateDecision, { action: "allow" }> | null;
+    };
+
+/**
+ * G8 ADMISSION-INTEGRATION (US-006): re-evaluate the gate for the ATTEMPT
+ * phase, immediately before the VM create.
+ *
+ * A queued round can wait hours between the dispatch preflight and its actual
+ * launch, so the dispatch-time verdict is evidence about the PAST. This runs
+ * the same wiring core from FRESH state (its own observation, its own
+ * revalidation, its own receipt slot `...:attempt`) and never consults the
+ * dispatch verdict:
+ *
+ *   - allow  -> the attempt binding is handed to the controller backstop
+ *               (`RunHermesInvocationOptions.launchGate`), which refuses when
+ *               the binding does not belong to THIS invocation;
+ *   - refuse -> the wiring has already written the refusal receipt; the
+ *               US-005 recorder (the ONE emitter of the fixed-shape refusal
+ *               evidence) records the attempt refusal and force-fails the run,
+ *               and the round returns the gateRefused result so the scheduler
+ *               performs no post-round accounting and no later tick
+ *               re-dispatches;
+ *   - null   -> this policy is not gated (a test seam skip).
+ *
+ * NOTHING here constructs a VM, mounts anything or spawns a harness: the
+ * caller only reaches `runHermesInvocation` after an allow.
+ */
+async function applyScheduledAttemptGate(
+  round: MatchlockSchedulerRound,
+): Promise<ScheduledAttemptGateOutcome> {
+  const seams = testLaunchGateSeams;
+  const decision = evaluateRoundGate(
+    seams?.evaluateAttempt ?? evaluateScheduledAttemptGate,
+    round,
+    seams,
+  );
+  if (decision === null) return { refused: false, binding: null, decision: null };
+  if (decision.action === "allow") {
+    return { refused: false, binding: decision.binding, decision };
+  }
+  const record = seams?.recordRefusal ?? recordScheduledLaunchGateRefusal;
+  await record(round, decision.refusal, {
+    phase: "attempt",
+    ...(seams?.gateDeps ?? {}),
+  });
+  return { refused: true, result: gateRefusedResult() };
+}
+
+// ── hermes invocation runner seam (US-006 attempt-gate tests) ────────────
+
+/** The production Hermes round-runner call shape. */
+export type MatchlockHermesInvocationRunner = (
+  opts: RunHermesInvocationOptions,
+) => Promise<HermesInvocationResult>;
+
+let testHermesInvocationRunner: MatchlockHermesInvocationRunner | null = null;
+
+/**
+ * NARROW injectable seam for the US-006 attempt-gate tests: it replaces ONLY
+ * the final `runHermesInvocation` call inside the PRODUCTION hermes round
+ * runner, so the real attempt evaluation, its receipt and its recorder remain
+ * the code under test while no VM is ever constructed.
+ *
+ * `setMatchlockSchedulerRoundRunnerForTest` sits ABOVE the production runner
+ * and therefore bypasses the attempt gate entirely — it cannot cover US-006.
+ * Pass `null` to restore the production runner. NEVER used outside tests.
+ */
+export function setMatchlockHermesInvocationRunnerForTest(
+  runner: MatchlockHermesInvocationRunner | null,
+): void {
+  testHermesInvocationRunner = runner;
+}
+
+/**
  * Run ONE opted-in scheduler round (probe or work) through the SINGLE
  * harness-keyed production runner seam. Dispatch is decided ONLY by
  * `matchlockProductionRunnerKind(policy)`:
@@ -384,6 +612,15 @@ export function buildMatchlockRoundRpcEnv(
  *   - "dsh" runs through the dsh scheduler route (which owns its own
  *     `setDshSchedulerRoundRunnerForTest` seam and the DSH_HOME/headless
  *     profile behavior).
+ *
+ * G8 ADMISSION-INTEGRATION US-005: a `hermes` round is gated FIRST, right
+ * before the route dispatch (after the execution-boundary and short-HOME
+ * alias checks, so the verdict is as fresh as the host can make it). The gate
+ * observes the ADMITTED profile store set, evaluates it, revalidates it by
+ * identity and refuses before any route — zero VM creates, no partial mount.
+ * A refusal is terminal for the run (receipt + `run.matchlock_gate_refused` +
+ * force-fail) and this function returns a `gateRefused` result instead of
+ * dispatching. pi and dsh policies never reach the gate.
  *
  * Every round first re-verifies the DAEMON execution boundary (MTLK-ISO-SLICE2
  * US-004): the executing process's effective uid (R13 root gate) and a FRESH
@@ -417,7 +654,7 @@ export function runMatchlockSchedulerRound(
         round.executionBoundary?.env ??
         ({ ...process.env, ...(round.rpcEnv ?? {}) } as NodeJS.ProcessEnv),
     },
-  ).then((resolvedBinaryPath) => {
+  ).then(async (resolvedBinaryPath) => {
     const kind = matchlockProductionRunnerKind(round.policy);
     const rpcEnv = buildMatchlockRoundRpcEnv(round.rpcEnv);
     // Thread the ONE probed absolute path into the transport seam; the runners
@@ -427,6 +664,11 @@ export function runMatchlockSchedulerRound(
       rpcEnv,
       rpcBinaryPath: resolvedBinaryPath,
     };
+    // G8 US-005: the launch gate runs BEFORE any route dispatch, on the fully
+    // resolved round. A refusal returns WITHOUT spawning a harness or creating
+    // a VM; the run is already terminal.
+    const gateRefused = await applyScheduledLaunchGate(roundWithAliasHome);
+    if (gateRefused !== null) return gateRefused;
     const routeOverride = productionRouteRunners.get(kind);
     if (routeOverride) {
       return routeOverride(roundWithAliasHome);
@@ -781,14 +1023,27 @@ async function runProductionMatchlockRound(
  * pi path, so a hermes merge workflow can land through the scoped host merge
  * service. Absence keeps merge ops UNSUPPORTED (the caller preflight above
  * refuses a merge-capability work round with no context BEFORE any VM).
+ *
+ * G8 ADMISSION-INTEGRATION (US-006): the ATTEMPT-time launch gate runs FIRST,
+ * from fresh state, on this fully resolved round (the dispatch-time verdict is
+ * never reused). The evaluation resolves the adapter plan and admits the
+ * config mount itself — exactly the admission the runner repeats for its
+ * create policy — so an allow means the profile the VM is about to mount was
+ * observed, evaluated and revalidated by identity moments before the create.
+ * A refusal returns a `gateRefused` result; `runHermesInvocation` (and with it
+ * every VM/RPC construction) is never reached. This is the ONLY attempt-gate
+ * call site in the module: pi and dsh rounds are structurally ungated.
  */
 async function runProductionHermesRound(
   round: MatchlockSchedulerRound,
   invocationId: string,
   helperPackHostPath: string,
   suite: MatchlockInvocationSuite | undefined,
-): Promise<HermesInvocationResult> {
-  return runHermesInvocation({
+): Promise<MatchlockSchedulerRoundResult> {
+  const attemptGate = await applyScheduledAttemptGate(round);
+  if (attemptGate.refused) return attemptGate.result;
+  const runHermes = testHermesInvocationRunner ?? runHermesInvocation;
+  return runHermes({
     policy: round.policy,
     identity: {
       runId: round.identity.runId,
@@ -814,6 +1069,15 @@ async function runProductionHermesRound(
     // FROZEN submission inputs (homeDir + HERMES_HOME snapshot + cwd
     // captured at run creation) — never daemon HOME/ambient state.
     submission: hermesSubmissionFromPolicy(round.policy),
+    // US-004/US-006: the controller backstop's authority for THIS attempt.
+    // The binding is this attempt's own fresh verdict — never the dispatch
+    // one, never a fabricated allow — so a verdict for another invocation
+    // cannot authorise the create. Absent only when the policy is not gated.
+    ...(attemptGate.binding !== null ? { launchGate: attemptGate.binding } : {}),
+    // G8 US-012: the allow DECISION travels with the binding so the invocation
+    // runner can record the `action: "launched"` receipt once — and only once —
+    // the VM exists. A non-gated round carries neither key.
+    ...(attemptGate.decision !== null ? { launchGateDecision: attemptGate.decision } : {}),
     // Bounded production stage budgets (mirror the pi runner).
     createTimeoutMs: 240_000,
     readyTimeoutMs: 30_000,

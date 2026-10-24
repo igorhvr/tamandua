@@ -1218,6 +1218,28 @@ export class InteractiveSessionController {
     const controllerOptions: MatchlockControllerOptions = {
       requireHelperPack: false,
       ...transportRpc,
+      // G8 US-004 — the launch-gate BACKSTOP context for THIS session. The
+      // admitted plan carries the allow binding for a hermes session (a
+      // refusal throws before a plan exists), so the binding passed here is
+      // the verdict for THIS invocation id. A hermes plan that somehow has no
+      // binding is passed as an EXPLICIT null binding — the controller refuses
+      // to create rather than silently launching an ungated hermes VM. Native
+      // pi plans carry no launchGate key at all (byte-identical behaviour).
+      ...(this.plan.launchGate !== undefined
+        ? {
+            launchGate: {
+              invocationId: this.plan.launchGate.invocationId,
+              binding: this.plan.launchGate,
+            },
+          }
+        : this.plan.harness === "hermes"
+          ? {
+              launchGate: {
+                invocationId: `interactive:${this.plan.subcommand}:unbound`,
+                binding: null,
+              },
+            }
+          : {}),
       ...(this.transportRpcEnv !== undefined ? { rpcEnv: this.transportRpcEnv } : {}),
       ...(this.options.onLog !== undefined ? { onLog: this.options.onLog } : {}),
       ...(this.options.requestTimeoutMs !== undefined

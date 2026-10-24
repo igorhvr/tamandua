@@ -62,23 +62,30 @@ host provider and every durable entry inside it is writable and `fsync`-able
 
 `prepareDshProfileOverlay` stages the effective home before the VM is created
 and `planDshHomeMounts` emits exactly that ONE destination.
-`cleanupDshProfileOverlay` removes exactly that attested root only after a
-wire-confirmed VM close (best-effort on dispose). After the close,
-`publishDshHomeOverlayToHost` merges every durable effective-home entry EXCEPT
-`profiles/` back to the real host home, so the host-side pre/post session
-inventory sees the round's new records. Only the `profiles/` tree is private
-and never host-published.
+`cleanupDshProfileOverlay` removes exactly that invocation's attested root only
+after a wire-confirmed VM close (and only for a provably-unused overlay on the
+no-consumer dispose path; a hard dispose with a possibly-live VM RETAINS it —
+see §5.1). After the close, `publishDshHomeOverlayToHost` merges every durable
+effective-home entry EXCEPT `profiles/` back to the real host home, so the
+host-side pre/post session inventory sees the round's new records. Only the
+`profiles/` tree is private and never host-published.
 
-The private effective home is deterministic and host-attested:
+The private effective home is per-INVOCATION and host-attested (the
+OVERLAY-INV-SCOPED layout). Each invocation of a run owns a DISJOINT root keyed
+by the controller's host-generated `invocationId`; the namespace is a versioned
+sibling of the legacy run-scoped one, so an old-runtime cleanup that recursively
+removes `<...>/dsh-profile-overlays/<runId>` can never delete a live invocation
+root. The legacy namespace is never touched (no reclaim, no deletion, no
+migration):
 
 ```text
-<liveStateRoot>/matchlock/dsh-profile-overlays/<bareRunId>/
+<liveStateRoot>/matchlock/dsh-profile-invocations/<bareRunId>/<invocationId>/
     .credentials.yaml                  # hard link / copy of the durable host file
     .anonymous-user-id                 # hard link / copy of the durable host file
     sessions/                          # EMPTY at boot; guest-created records merge back
     storages/                          # EMPTY at boot; guest-created records merge back
     <any other durable entry>          # recursive hard-linked tree (copy fallback)
-    profiles/                          # private per-run copy: the ONE profiles/ source
+    profiles/                          # private per-invocation copy: the ONE profiles/ source
         node_modules/                  # EMPTY at boot; the guest heals it from its own install
         node_modules.lock              # dsh's transient boot writer lock (guest-created)
         <profile>/
@@ -89,6 +96,10 @@ The private effective home is deterministic and host-attested:
             .dsh-module-fallback/      # EMPTY at boot; guest-owned
                 node_modules/          # EMPTY at boot; guest-owned
 ```
+
+`<liveStateRoot>/matchlock/dsh-profile-overlays/<bareRunId>` is the LEGACY
+run-scoped shape and is NEVER a valid overlay source or cleanup target under the
+new lifecycle.
 
 `prepareDshProfileOverlay` stages that effective home **before** the VM is
 created: every durable host profile file is copied byte-identically, every
@@ -142,10 +153,10 @@ refuses `mount destination %q collides with (is nested inside) %q`, even for
 same-source nesting and even when the outer destination is `type:"memory"`).
 The only runtime-valid shape is **ONE real host-backed root mount**:
 
-- `prepareDshProfileOverlay` stages the per-run EFFECTIVE HOME under
-  `<liveStateRoot>/matchlock/dsh-profile-overlays/<bareRunId>` (hard-linked
-  durable files, empty `sessions/`/`storages/` real directories, the private
-  `profiles/` copy);
+- `prepareDshProfileOverlay` stages the per-invocation EFFECTIVE HOME under
+  `<liveStateRoot>/matchlock/dsh-profile-invocations/<bareRunId>/<invocationId>`
+  (hard-linked durable files, empty `sessions/`/`storages/` real directories,
+  the private `profiles/` copy);
 - `planDshHomeMounts` emits exactly ONE
   `{ guestConfigurationRoot -> overlayRoot }` `host_fs` RW destination, so the
   home root has a real provider and `fsync` succeeds while the private
@@ -508,31 +519,96 @@ read as green:
    environment-blocked in the developer sandbox, exactly like the two #31
    gate runs above).
 
-### 5.1 Per-run dsh profile-overlay lifecycle race (overlapping rounds)
+### 5.1 Per-run dsh profile-overlay lifecycle race — FIXED (OVERLAY-INV-SCOPED)
 
-The dsh profile-overlay root is derived from the RUN id
-(`<liveStateRoot>/matchlock/dsh-profile-overlays/<bareRunId>`), while the
-controller that stages and removes it is created per INVOCATION. The scheduler
+Historically the dsh profile-overlay root was derived from the RUN id
+(`<liveStateRoot>/matchlock/dsh-profile-overlays/<bareRunId>`) while the
+controller that staged and removed it is created per INVOCATION. The scheduler
 can start the next round of a run before the previous round's teardown settles
 (the union-final union tree showed overlapping `Work round start` /
 `Work round complete` pairs seconds apart for one run), so two invocations
-share one overlay root and the earlier invocation's `cleanupDshProfileOverlay`
-removes it while the later invocation's VM is still mounted on it. The guest
-then finds `$DSH_HOME` (`/workspace/config/dsh`) gone:
+shared one overlay root and the earlier invocation's `cleanupDshProfileOverlay`
+removed it while the later invocation's VM was still mounted on it. The guest
+then found `$DSH_HOME` (`/workspace/config/dsh`) gone:
 `lstat('/workspace/config/dsh')` -> `ENOENT`, so
-`mkdir('<DSH_HOME>/sessions/<key>/session-<id>', {recursive:true})` fails with
-`ENOTDIR` and the harness exits without a report.
+`mkdir('<DSH_HOME>/sessions/<key>/session-<id>', {recursive:true})` failed with
+`ENOTDIR` and the harness exited without a report. A second, overlap-free
+defect removed the root on the hard-dispose path (and the failed-close
+fallback), equating RPC transport death with VM termination.
 
-Roles whose step allows a retry recover on the following round; the
-`finalize_merge` step has `maxRetries: 0`, so the whole-path dsh merge-worktree
-gate (`e2e-tests/matchlock-dsh-merge-worktree-gate.test.ts`, run by
-`./run-matchlock-dsh-merge-worktree-e2e-test`) cannot land: it reroutes to
-`test` and exhausts the reroute budget. The retained per-round component
-diagnostic (produced with a temporary instrumented fixture) is
+The retained per-round component diagnostic from the wedge (produced with a
+temporary instrumented fixture) is
 `/home/kaladin/matchlock-work/union-final-matchlock-gates/us012/dsh-merge-mkdir-diag.txt`
-(`/workspace/config/dsh -> stat:ENOENT`). This is a pre-existing union-port
-overlay-lifecycle limitation, not a regression of the three landings; the pi
-merge-worktree gate (no dsh overlay) is unaffected.
+(`/workspace/config/dsh -> stat:ENOENT`). Roles whose step allows a retry
+recovered on the following round; the `finalize_merge` step has `maxRetries:
+0`, so the whole-path dsh merge-worktree gate
+(`e2e-tests/matchlock-dsh-merge-worktree-gate.test.ts`, run by
+`./run-matchlock-dsh-merge-worktree-e2e-test`) could not land before the fix;
+the pi merge-worktree gate (no dsh overlay) was unaffected.
+
+The repair binds the overlay lifecycle to a host-generated per-invocation
+identity in a DISJOINT versioned namespace:
+
+- every invocation allocates its OWN root
+  `<liveStateRoot>/matchlock/dsh-profile-invocations/<bareRunId>/<invocationId>`
+  EXCLUSIVELY (a preexisting directory under that identity is refused, never
+  adopted), so a successor never reuses a predecessor's root;
+- publish/remove run ONLY under proven consumer quiescence: a wire-confirmed VM
+  close (the normal path: publish THEN remove own root), or a provably-unused
+  overlay (no create was ever dispatched and work revocation is irrevocable).
+  On any other path — hard dispose/abort, transport death with no wire close,
+  late/unknown VM state — the root is RETAINED with an explicit typed
+  incomplete-cleanup disposition, never removed; RPC transport exit is never
+  treated as VM termination;
+- finalization is tracked INDEPENDENTLY of the VM `closed` flag. A
+  `published+removed` result is terminal; a failed/retained result is
+  re-attempted (when quiescence is now proven) or re-reported by later
+  `close()`/`dispose()` calls, so a failed publish/cleanup can never be masked
+  as an apparent success;
+- **publish collision/conflict policy (host-side prepare-time provenance).**
+  `prepareDshProfileOverlay` records a HOST-side provenance manifest
+  (`<groupingDir>/<invocationId>.prepare.json` — a sibling of the mounted root,
+  never inside the guest-writable overlay) holding one `lstat` fingerprint
+  (`dev`/`ino`/`size`/`mtimeMs`) per durable host file, `profiles/` excluded.
+  Publication of one destination then classifies:
+  same inode as the staged hard link ⇒ write-through, nothing to do;
+  byte-identical destination ⇒ retry-safe no-op; fingerprint unchanged since
+  prepare ⇒ a LEGITIMATE UPDATE flows; anything else (destination changed or
+  removed independently, or created by a different invocation at a path that
+  was absent at prepare) ⇒ a TRUE CONFLICT is RETAINED with a typed
+  `dsh_profile_overlay_publish_conflict` disposition and the invocation root is
+  kept, so the losing copy is never silently overwritten and never lost.
+  `ctime` is deliberately excluded from the fingerprint because unlinking our
+  own staged hard link between prepare and publish bumps the host inode's ctime
+  without changing its identity or content (that must stay a legitimate update,
+  not a spurious conflict);
+- **concurrent finalization is serialized at the shared host-home boundary.**
+  Publication takes a BOUNDED cross-process lock (`mkdir`-atomic, keyed by the
+  host home, stored under the host-only live state at
+  `<liveState>/matchlock/.dsh-profile-publish-locks/<sha256(hostHome)>`), so a
+  run's two invocations finishing simultaneously cannot lose an artifact through
+  a read-modify-write race. The wait is bounded on the MONOTONIC clock
+  (`process.hrtime.bigint`, never wall-clock arithmetic) and the lock records
+  its owner pid, so a lock whose owner is positively dead (`ESRCH`) is broken
+  and a crashed holder can never deadlock a later invocation; a live or
+  indeterminate owner is never broken. The guest can never reach the lock: only
+  the invocation ROOT is mounted;
+- the LEGACY `<...>/dsh-profile-overlays` namespace is never touched: no
+  reclaim, no deletion, no migration. Stale invocation dirs left by crashes are
+  handled conservatively and are never removed from age or pid alone.
+
+Both defects are covered by hermetic regression tests
+(`src/installer/matchlock/dsh-profile-overlay.test.ts`,
+`src/installer/matchlock/controller.test.ts` — including two REAL
+worker-thread publishers synchronized at the publication step, a shared
+destination resolving to exactly one winner plus a retained conflict, and the
+unpublished losing copy surviving in the retained invocation root) and by the
+opt-in real-runner overlap arm written (not run in this delivering run) into
+`e2e-tests/matchlock-dsh-profile-overlay-gate.test.ts`.
+
+The opt-in real-runner overlap arm is written but was NOT run in this
+delivering run: it cannot boot nested VMs in-guest, so exercising it remains a
+host/coordinator step (the developer-agent sandbox also cannot create a VM).
 
 ## 6. Real production recipe (operator)
 

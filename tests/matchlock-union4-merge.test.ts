@@ -9,7 +9,10 @@
  *   2. HEAD ancestry is the two-parent union merge (or its post-squash
  *      single-parent descendant on the integration branch — the merge is
  *      deliberately squashed there, so the parents are only asserted when HEAD
- *      actually is the merge commit);
+ *      actually is the merge commit). A two-parent HEAD that carries NEITHER
+ *      recorded tip is a different history (a work branch that integrated
+ *      another line with a merge commit); the union parents are not asserted
+ *      against it, and a HEAD carrying exactly ONE tip is still a defect;
  *   3. the ONE schema chain tops out at SCHEMA_VERSION 14 (13 at the union
  *      landing plus LEDGER-DIAG's 13->14 suite_results.log_path step) with the
  *      `runs.matchlock_policy` (12->13) and `steps.target_moved_reroute_count`
@@ -173,10 +176,34 @@ describe("matchlock-union4 merge deliverable", () => {
         );
         return;
       }
-      assert.deepEqual(
-        new Set(parents),
-        new Set([MAIN_TIP, UNION_TIP]),
-        `merge parents were ${parents.join(", ")}`,
+      // The union parents are asserted ONLY when HEAD actually IS the union
+      // merge (both recorded tips are its direct parents). A two-parent HEAD
+      // that carries neither tip belongs to a different history — a work branch
+      // that integrated another line with a merge commit (e.g. the G8 combined
+      // candidate merging its dsh overlay fix), which the union-port delivery
+      // says nothing about. Treating EVERY two-parent HEAD as the union merge
+      // made this file fail on any merge-composed candidate even though the
+      // documented intent (see the header) is "parents asserted only when HEAD
+      // actually is the merge commit".
+      const isUnionMerge = [MAIN_TIP, UNION_TIP].every((sha) => parents.includes(sha));
+      if (isUnionMerge) {
+        assert.deepEqual(
+          new Set(parents),
+          new Set([MAIN_TIP, UNION_TIP]),
+          `merge parents were ${parents.join(", ")}`,
+        );
+        return;
+      }
+      // A HEAD that carries exactly ONE recorded tip is a rewritten/partial
+      // union merge — still a defect, never a "different history".
+      const carriesOneTip = [MAIN_TIP, UNION_TIP].some((sha) => parents.includes(sha));
+      assert.equal(
+        carriesOneTip,
+        false,
+        `HEAD has only one union parent: ${parents.join(", ")}`,
+      );
+      t.diagnostic(
+        `HEAD is an unrelated two-parent merge (parents ${parents.join(", ")}); union parents are not asserted for another history`,
       );
     } else {
       // The merger squash-merges the union onto integration/union-20260916 as

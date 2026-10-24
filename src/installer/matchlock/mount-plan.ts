@@ -16,8 +16,9 @@
  * ping-pongs that farm between host and guest. For `harness:"dsh"` the plan
  * instead mounts the EFFECTIVE HOME from `planDshHomeMounts`: ONE host_fs
  * destination at `guestConfigurationRoot` sourced from a private, host-attested
- * per-run effective home under `<liveState>/matchlock/dsh-profile-overlays/
- * <runId>`. The effective home carries the private `profiles/` copy (durable
+ * per-invocation effective home under
+ * `<liveState>/matchlock/dsh-profile-invocations/<runId>/<invocationId>`. The
+ * effective home carries the private `profiles/` copy (durable
  * config staged, install-derived dirs empty) plus one real entry per durable
  * top-level host entry — credentials/`.anonymous-user-id` hard links, empty
  * `sessions/`/`storages/` whose new artifacts merge back after the round, and
@@ -343,20 +344,20 @@ export interface BuildMatchlockCreateConfigOptions {
    * REQUIRED for `harness:"dsh"` (refused with a typed mount-plan error when
    * absent). The effective-home plan mounts ONE host_fs directory at
    * `guestConfigurationRoot` sourced from `<liveStateRoot>/matchlock/
-   * dsh-profile-overlays/<runId>`: the private staged `profiles/` copy plus one
-   * real entry per durable top-level host entry (credentials/identity hard
-   * links, empty `sessions/`/`storages/`, other durable entries). The guest
+   * dsh-profile-invocations/<runId>/<invocationId>`: the private staged `profiles/`
+   * copy plus one real entry per durable top-level host entry (credentials/identity
+   * hard links, empty `sessions/`/`storages/`, other durable entries). The guest
    * `$DSH_HOME` root is therefore a real, fsync-able host-backed directory, and
    * an in-VM dsh boot can create sibling boot artifacts
    * (`profiles/node_modules.lock`) and re-point its private farm without ever
    * touching the host farm or the host lock.
    *
-   * The overlay root is derived deterministically from the bound run id and
-   * the live state root; the option can never name an arbitrary path. Durable
-   * `sessions/`/`storages/` artifacts written during the round are merged back
-   * to the real host home after the VM close.
+   * The overlay root is derived deterministically from the bound run id, the
+   * host-generated invocation id and the live state root; the option can never
+   * name an arbitrary path. Durable `sessions/`/`storages/` artifacts written
+   * during the round are merged back to the real host home after the VM close.
    */
-  dshProfileOverlay?: { runId: string; liveStateRoot: string };
+  dshProfileOverlay?: { runId: string; liveStateRoot: string; invocationId: string };
 }
 
 function assertBroadHostSource(hostPath: string, ctx?: MountAdmissionContext): void {
@@ -525,8 +526,8 @@ function liveStateRootFor(ctx?: MountAdmissionContext): string {
 /**
  * Compose the dsh `$DSH_HOME` mount set (DSH-OVERLAY-FSYNC-FIX US-003): ONE
  * host_fs RW destination at `guestConfigurationRoot`, sourced from the private,
- * host-attested per-run EFFECTIVE HOME (`<liveState>/matchlock/
- * dsh-profile-overlays/<runId>`). The effective home carries the private
+ * host-attested per-invocation EFFECTIVE HOME (`<liveState>/matchlock/
+ * dsh-profile-invocations/<runId>/<invocationId>`). The effective home carries the private
  * `profiles/` copy plus one real entry for every durable top-level host entry
  * (credentials/identity hard links, empty `sessions/`/`storages/` whose new
  * artifacts merge back after the round, and any other durable entry), so the
@@ -550,13 +551,13 @@ function placeDshComposedConfigurationMounts(
   if (!overlay) {
     throw new MatchlockMountPlanError(
       "dsh_profile_overlay_required",
-      `harness "dsh" requires the host-attested dshProfileOverlay option (runId + liveStateRoot) so install-derived profile module dirs are mounted from a private per-run overlay; refusing to mount the whole DSH_HOME (${policy.configurationRoot}) read-write.`,
+      `harness "dsh" requires the host-attested dshProfileOverlay option (runId + invocationId + liveStateRoot) so install-derived profile module dirs are mounted from a private per-invocation overlay; refusing to mount the whole DSH_HOME (${policy.configurationRoot}) read-write.`,
     );
   }
   let overlayRoot: string;
   let plan: DshProfileOverlayMountPlan;
   try {
-    overlayRoot = dshProfileOverlayRoot(overlay.runId, overlay.liveStateRoot);
+    overlayRoot = dshProfileOverlayRoot(overlay.runId, overlay.invocationId, overlay.liveStateRoot);
     plan = planDshHomeMounts(policy.configurationRoot, overlayRoot, policy.guestConfigurationRoot);
   } catch (err) {
     if (err instanceof DshProfileOverlayError) {

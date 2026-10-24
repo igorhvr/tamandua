@@ -8,6 +8,7 @@ import { MatchlockController } from "../../../dist/installer/matchlock/controlle
 import { writeFakeRpcDriver, tempTranscriptPath } from "../../../dist/installer/matchlock/fake-rpc-driver.js";
 import { dshProfileOverlayRoot } from "../../../dist/installer/matchlock/dsh-profile-overlay.js";
 import type { PinnedImageIdentity } from "../../../dist/installer/matchlock/image.js";
+import type { LaunchGateBinding } from "../../../dist/installer/matchlock/launch-gate-wiring.js";
 import type { ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
 import { MATCHLOCK_NETWORK_POLICY_VERSION } from "../../../dist/installer/matchlock/policy.js";
 import type { MatchlockStreamFrame } from "../../../dist/installer/matchlock/types.js";
@@ -169,7 +170,7 @@ describe("matchlock controller (fake rpc driver)", () => {
           .filter((l) => l.trim() !== "")
           .map((l) => JSON.parse(l) as Record<string, unknown>);
       },
-      makeController: (p: ExecutionIsolation = policy(), over: Record<string, number> = {}, rpcEnv?: Record<string, string>) => {
+      makeController: (p: ExecutionIsolation = policy(), over: Record<string, number> = {}, rpcEnv?: Record<string, string>, launchGate?: { invocationId: string; binding: LaunchGateBinding | null }) => {
         const c = new MatchlockController(p, {
           rpcBinaryPath: process.execPath,
           rpcArgs: [fakeDriver],
@@ -183,6 +184,7 @@ describe("matchlock controller (fake rpc driver)", () => {
           execCancelSettleTimeoutMs: 3_000,
           ...over,
           ...(rpcEnv ? { rpcEnv } : {}),
+          ...(launchGate ? { launchGate } : {}),
         });
         // Clean up the OWNED fake RPC child on success AND on assertion
         // failure: a leaked child keeps the test process alive forever.
@@ -1029,13 +1031,40 @@ describe("matchlock controller (fake rpc driver)", () => {
     return home;
   }
 
+  const DSH_TEST_RUN_ID = "11111111-2222-3333-4444-555555555555";
+
+  /**
+   * A dsh controller wired with a per-test live-state root. Returns the
+   * controller plus its live-state root so the caller can derive the
+   * invocation-bound overlay root from `controller.invocationId`.
+   */
+  function makeDshOverlayController(
+    t: { after: (fn: () => Promise<unknown> | void) => void },
+    home: string,
+  ): { controller: MatchlockController; liveState: string } {
+    const liveState = fs.mkdtempSync(path.join(tmp, "live-state-"));
+    const c = new MatchlockController(dshPolicy({ configurationRoot: home }), {
+      rpcBinaryPath: process.execPath,
+      rpcArgs: [fakeDriver],
+      helperPackHostPath: helperPack,
+      onLog: () => {},
+      requestTimeoutMs: 10_000,
+      readyTimeoutMs: 3_000,
+      stdinDrainTimeoutMs: 3_000,
+      execCancelSettleTimeoutMs: 3_000,
+      dshProfileOverlay: { runId: DSH_TEST_RUN_ID, liveStateRoot: liveState },
+      mountAdmission: { home: path.join(tmp, "operator-home"), liveStateRoot: liveState },
+    });
+    t.after(() => c.dispose());
+    return { controller: c, liveState };
+  }
+
   it("dsh create prepares the private overlay, mounts ONE real effective-home root from it, and removes the attested root after the confirmed close", async (t) => {
     const s = testScaffold(t);
     s.setFake(HAPPY_FAKE);
     const runId = "11111111-2222-3333-4444-555555555555";
     const dshHome = makeDshHomeFixture("dsh-home-");
     const liveState = fs.mkdtempSync(path.join(tmp, "live-state-"));
-    const overlayRoot = dshProfileOverlayRoot(runId, liveState);
     const p = dshPolicy({ configurationRoot: dshHome });
     const c = new MatchlockController(p, {
       rpcBinaryPath: process.execPath,
@@ -1049,6 +1078,10 @@ describe("matchlock controller (fake rpc driver)", () => {
       mountAdmission: { home: path.join(tmp, "operator-home"), liveStateRoot: liveState },
     });
     t.after(() => c.dispose());
+    // The overlay root is bound to the controller's OWN host-generated
+    // invocation identity (never caller-provided), so it can only be derived
+    // after construction.
+    const overlayRoot = dshProfileOverlayRoot(runId, c.invocationId, liveState);
 
     assert.equal(fs.existsSync(overlayRoot), false, "no overlay exists before the invocation");
 
@@ -1101,8 +1134,333 @@ describe("matchlock controller (fake rpc driver)", () => {
     assert.equal(
       fs.existsSync(overlayRoot),
       false,
-      "the attested per-run overlay root must be removed after the confirmed VM close",
+      "the attested per-invocation overlay root must be removed after the confirmed VM close",
     );
+  });
+
+  it("OVERLAY-INV-SCOPED: a confirmed close publishes the guest-written durable entries (never profiles/) and finalizes", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const home = makeDshHomeFixture("dsh-home-publish-");
+    const { controller: c, liveState } = makeDshOverlayController(t, home);
+    const overlayRoot = dshProfileOverlayRoot(DSH_TEST_RUN_ID, c.invocationId, liveState);
+    assert.deepEqual(c.dshProfileOverlayStatus, { status: "pending" }, "an attested dsh controller starts pending");
+
+    await c.prepareAndCreate(pin());
+    assert.deepEqual(c.dshProfileOverlayStatus, { status: "pending" });
+    // A guest-written durable entry: a NEW file under the staged (empty)
+    // sessions/ store, plus a guest-only file under the PRIVATE profiles/ copy.
+    fs.writeFileSync(path.join(overlayRoot, "sessions", "guest-session.jsonl"), "guest\n", "utf8");
+    fs.writeFileSync(path.join(overlayRoot, "profiles", "guest-profile.txt"), "private\n", "utf8");
+
+    await c.close(30);
+    assert.equal(c.isClosed, true);
+    // Publish happened BEFORE removal, and only this invocation's root is gone.
+    assert.equal(
+      fs.readFileSync(path.join(home, "sessions", "guest-session.jsonl"), "utf8"),
+      "guest\n",
+      "guest-written durable entries are merged back to the real host home",
+    );
+    assert.equal(
+      fs.existsSync(path.join(home, "profiles", "guest-profile.txt")),
+      false,
+      "the private per-invocation profiles/ copy is NEVER published to the host home",
+    );
+    assert.equal(fs.existsSync(overlayRoot), false, "the invocation root is removed after publishing");
+    assert.deepEqual(c.dshProfileOverlayStatus, { status: "finalized" });
+  });
+
+  it("OVERLAY-INV-SCOPED: dshProfileOverlayStatus is none without a dsh overlay", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    // pi harness: no overlay at all.
+    const plain = s.makeController(policy({ configurationRoot: configDir }));
+    assert.deepEqual(plain.dshProfileOverlayStatus, { status: "none" });
+    // dsh harness but NO host-attested overlay option: still no overlay owned.
+    const dshHome = makeDshHomeFixture("dsh-home-status-");
+    const unattested = s.makeController(dshPolicy({ configurationRoot: dshHome }));
+    assert.deepEqual(unattested.dshProfileOverlayStatus, { status: "none" });
+  });
+
+  it("OVERLAY-INV-SCOPED: dispose BEFORE a create is dispatched removes the provably-unused overlay (no-consumer) and never sends create", async (t) => {
+    const s = testScaffold(t);
+    s.setFake({ ...HAPPY_FAKE, FAKE_RESOLVE_DELAY_MS: "500" });
+    const home = makeDshHomeFixture("dsh-home-cancel-");
+    const { controller: c, liveState } = makeDshOverlayController(t, home);
+    const overlayRoot = dshProfileOverlayRoot(DSH_TEST_RUN_ID, c.invocationId, liveState);
+
+    const creating = settle(c.prepareAndCreate(pin()));
+    // The overlay is staged synchronously before the delayed resolve; the
+    // create has NOT been dispatched yet (the cancellation window the
+    // quiescence proof must exercise).
+    await pollUntil(() => fs.existsSync(overlayRoot));
+    assert.equal(transcriptMethodIndexes(s.readTranscript(), "create").length, 0);
+
+    await c.dispose();
+    const outcome = await creating;
+    assert.equal(outcome.ok, false, "the stale create continuation fails closed after revocation");
+    assert.equal(c.isClosed, false, "no wire close was ever confirmed");
+    assert.equal(
+      fs.existsSync(overlayRoot),
+      false,
+      "a provably-unused overlay is removed, never retained indefinitely",
+    );
+    assert.equal(c.dshProfileOverlayStatus.status, "finalized");
+    assert.equal(
+      transcriptMethodIndexes(s.readTranscript(), "create").length,
+      0,
+      "no create may be dispatched after the overlay was removed",
+    );
+  });
+
+  it("OVERLAY-INV-SCOPED: dispose while a create request is IN FLIGHT RETAINS the overlay (transport death never proves VM death)", async (t) => {
+    const s = testScaffold(t);
+    s.setFake({ ...HAPPY_FAKE, FAKE_CREATE_DELAY_MS: "800" });
+    const home = makeDshHomeFixture("dsh-home-live-");
+    const { controller: c, liveState } = makeDshOverlayController(t, home);
+    const overlayRoot = dshProfileOverlayRoot(DSH_TEST_RUN_ID, c.invocationId, liveState);
+
+    const creating = settle(c.prepareAndCreate(pin()));
+    await pollUntil(() => transcriptMethodIndexes(s.readTranscript(), "create").length > 0);
+
+    await c.dispose();
+    await creating;
+    assert.equal(
+      fs.existsSync(overlayRoot),
+      true,
+      "a possibly-live mount source must be RETAINED on the hard-dispose path",
+    );
+    const d = c.dshProfileOverlayStatus;
+    assert.equal(d.status, "retained");
+    if (d.status === "retained") {
+      assert.equal(d.code, "dsh_profile_overlay_retained");
+      assert.match(d.quiescence, /create-dispatched-without-wire-close/);
+      assert.ok(d.reason.length > 0, "a retained disposition names its reason");
+    }
+    // Retention is a filesystem decision only: dispose still killed the transport.
+    await pollUntil(() => !c.rpcRunning);
+    assert.equal(c.rpcRunning, false);
+  });
+
+  it("OVERLAY-INV-SCOPED: an UNCONFIRMED close retains the root; only a later CONFIRMED close finalizes it", async (t) => {
+    // The FIRST close fails with a real wire error (not an already-stopped
+    // body), the second succeeds: quiescence is unproven on the first attempt.
+    const s = testScaffold(t);
+    s.setFake({ ...HAPPY_FAKE, FAKE_CLOSE_FAIL: "1" });
+    const home = makeDshHomeFixture("dsh-home-unconfirmed-");
+    const { controller: c, liveState } = makeDshOverlayController(t, home);
+    const overlayRoot = dshProfileOverlayRoot(DSH_TEST_RUN_ID, c.invocationId, liveState);
+    await c.prepareAndCreate(pin());
+
+    await assert.rejects(
+      () => c.close(30),
+      (e: unknown) => rpcCodeOf(e) === -32000 && /close failed \(fixture\)/.test(String((e as { message?: string }).message)),
+    );
+    assert.equal(c.isClosed, false, "an unconfirmed close never fabricates a closed VM");
+    const d = c.dshProfileOverlayStatus;
+    assert.equal(d.status, "retained");
+    if (d.status === "retained") {
+      assert.equal(d.code, "dsh_profile_overlay_retained");
+      assert.equal(d.quiescence, "unconfirmed-close");
+    }
+    assert.equal(fs.existsSync(overlayRoot), true, "the root is RETAINED while quiescence is unproven");
+
+    // A later CONFIRMED close re-attempts finalization and succeeds.
+    await c.close(30);
+    assert.equal(c.isClosed, true);
+    assert.deepEqual(c.dshProfileOverlayStatus, { status: "finalized" });
+    assert.equal(fs.existsSync(overlayRoot), false);
+  });
+
+  it("OVERLAY-INV-SCOPED: a close that NEVER confirms (every attempt fails) never reports finalized — dispose keeps it retained", async (t) => {
+    const s = testScaffold(t);
+    s.setFake({ ...HAPPY_FAKE, FAKE_CLOSE_ERROR_MESSAGE: "close: internal runtime error (fixture)" });
+    const home = makeDshHomeFixture("dsh-home-never-closed-");
+    const { controller: c, liveState } = makeDshOverlayController(t, home);
+    const overlayRoot = dshProfileOverlayRoot(DSH_TEST_RUN_ID, c.invocationId, liveState);
+    await c.prepareAndCreate(pin());
+
+    for (const attempt of [1, 2]) {
+      await assert.rejects(
+        () => c.close(30),
+        (e: unknown) => rpcCodeOf(e) === -32000 && /internal runtime error/.test(String((e as { message?: string }).message)),
+        `close attempt ${attempt} must reject`,
+      );
+      assert.equal(c.isClosed, false);
+      assert.equal(c.dshProfileOverlayStatus.status, "retained");
+      assert.equal(fs.existsSync(overlayRoot), true);
+    }
+
+    await c.dispose();
+    assert.equal(
+      c.dshProfileOverlayStatus.status,
+      "retained",
+      "dispose after an unconfirmed close must NEVER report finalized",
+    );
+    assert.equal(fs.existsSync(overlayRoot), true, "the possibly-live mount source stays retained");
+  });
+
+  it("OVERLAY-INV-SCOPED: a publish refusal after a confirmed close is RETAINED (not masked) and a later confirmed close finalizes", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const home = makeDshHomeFixture("dsh-home-publish-fail-");
+    const { controller: c, liveState } = makeDshOverlayController(t, home);
+    const overlayRoot = dshProfileOverlayRoot(DSH_TEST_RUN_ID, c.invocationId, liveState);
+    await c.prepareAndCreate(pin());
+    fs.writeFileSync(path.join(overlayRoot, "sessions", "guest-session.jsonl"), "guest\n", "utf8");
+
+    // Make publication REFUSE: the host home is (temporarily) not a real
+    // directory. It is MOVED ASIDE rather than deleted: under the R3 publish
+    // policy every durable host file recorded at prepare is a destination, so a
+    // delete-and-recreate would (correctly) become a retained
+    // `dsh_profile_overlay_publish_conflict` instead of a transient
+    // `dsh_profile_overlay_source_missing`.
+    const homeAway = `${home}.away`;
+    fs.renameSync(home, homeAway);
+    await assert.rejects(
+      () => c.close(30),
+      (e: unknown) => codeOf(e) === "dsh_profile_overlay_source_missing",
+      "a publish refusal after the confirmed close must surface as a typed error, never a silent success",
+    );
+    assert.equal(c.isClosed, true, "the VM close WAS confirmed on the wire");
+    const d = c.dshProfileOverlayStatus;
+    assert.equal(d.status, "retained");
+    if (d.status === "retained") {
+      assert.equal(d.code, "dsh_profile_overlay_source_missing");
+      assert.ok(d.reason.length > 0);
+      assert.equal(d.quiescence, "wire-confirmed-close");
+    }
+    assert.equal(fs.existsSync(overlayRoot), true, "the root is still present after the refused publish");
+
+    // A subsequent confirmed close re-attempts and finalizes.
+    fs.renameSync(homeAway, home);
+    await c.close(30);
+    assert.deepEqual(c.dshProfileOverlayStatus, { status: "finalized" });
+    assert.equal(fs.existsSync(overlayRoot), false);
+    assert.equal(
+      fs.readFileSync(path.join(home, "sessions", "guest-session.jsonl"), "utf8"),
+      "guest\n",
+      "the retry published the retained guest-written durable entry",
+    );
+  });
+
+  it("OVERLAY-INV-SCOPED: a cleanup refusal (foreign root) is RETAINED, re-reported by repeated close(), and never touches the foreign target", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const home = makeDshHomeFixture("dsh-home-retain-");
+    const { controller: c, liveState } = makeDshOverlayController(t, home);
+    const overlayRoot = dshProfileOverlayRoot(DSH_TEST_RUN_ID, c.invocationId, liveState);
+    await c.prepareAndCreate(pin());
+
+    // Plant a foreign symlink at the invocation root: finalization can never
+    // complete, and the symlink target must never be touched.
+    const escape = fs.mkdtempSync(path.join(tmp, "finalize-escape-"));
+    fs.writeFileSync(path.join(escape, "sentinel"), "keep\n", "utf8");
+    fs.rmSync(overlayRoot, { recursive: true, force: true });
+    fs.symlinkSync(escape, overlayRoot);
+
+    await assert.rejects(
+      () => c.close(30),
+      (e: unknown) => codeOf(e) === "dsh_profile_overlay_foreign_root",
+    );
+    assert.equal(c.isClosed, true, "the VM close was confirmed on the wire");
+    assert.equal(c.dshProfileOverlayStatus.status, "retained");
+    // A repeated close re-attempts and re-reports the SAME failure (never a
+    // hidden success), even though `closed` is already true.
+    await assert.rejects(
+      () => c.close(30),
+      (e: unknown) => codeOf(e) === "dsh_profile_overlay_foreign_root",
+    );
+    await c.dispose();
+    assert.equal(fs.readFileSync(path.join(escape, "sentinel"), "utf8"), "keep\n");
+  });
+
+  it("OVERLAY-INV-SCOPED: finalized is TERMINAL — later close()/dispose() neither re-publish nor remove anything", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const home = makeDshHomeFixture("dsh-home-terminal-");
+    const { controller: c, liveState } = makeDshOverlayController(t, home);
+    const overlayRoot = dshProfileOverlayRoot(DSH_TEST_RUN_ID, c.invocationId, liveState);
+    await c.prepareAndCreate(pin());
+    await c.close(30);
+    assert.deepEqual(c.dshProfileOverlayStatus, { status: "finalized" });
+    assert.equal(fs.existsSync(overlayRoot), false);
+
+    // Re-create the root with a POISON entry: a re-finalization would publish
+    // and remove it, so any post-finalized work is observable.
+    fs.mkdirSync(overlayRoot, { recursive: true });
+    fs.writeFileSync(path.join(overlayRoot, ".credentials.yaml"), "POISON: re-published\n", "utf8");
+    const hostCredentials = fs.readFileSync(path.join(home, ".credentials.yaml"), "utf8");
+
+    await c.close(30);
+    await c.dispose();
+    assert.deepEqual(c.dshProfileOverlayStatus, { status: "finalized" });
+    assert.equal(
+      fs.readFileSync(path.join(home, ".credentials.yaml"), "utf8"),
+      hostCredentials,
+      "a finalized overlay is NEVER re-published by later close()/dispose()",
+    );
+    assert.equal(
+      fs.existsSync(path.join(overlayRoot, ".credentials.yaml")),
+      true,
+      "a finalized overlay is NEVER removed again by later close()/dispose()",
+    );
+  });
+
+  it("OVERLAY-INV-SCOPED: two invocations of one run get disjoint roots; a predecessor's confirmed close never touches a successor's live root", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const home = makeDshHomeFixture("dsh-home-two-inv-");
+    const liveState = fs.mkdtempSync(path.join(tmp, "live-state-two-inv-"));
+    const make = (): MatchlockController => {
+      const c = new MatchlockController(dshPolicy({ configurationRoot: home }), {
+        rpcBinaryPath: process.execPath,
+        rpcArgs: [fakeDriver],
+        helperPackHostPath: helperPack,
+        requestTimeoutMs: 10_000,
+        readyTimeoutMs: 3_000,
+        stdinDrainTimeoutMs: 3_000,
+        execCancelSettleTimeoutMs: 3_000,
+        dshProfileOverlay: { runId: "11111111-2222-3333-4444-555555555555", liveStateRoot: liveState },
+        mountAdmission: { home: path.join(tmp, "operator-home"), liveStateRoot: liveState },
+      });
+      t.after(() => c.dispose());
+      return c;
+    };
+    const predecessor = make();
+    const successor = make();
+    assert.notEqual(predecessor.invocationId, successor.invocationId);
+
+    await predecessor.prepareAndCreate(pin());
+    const predRoot = dshProfileOverlayRoot(
+      "11111111-2222-3333-4444-555555555555",
+      predecessor.invocationId,
+      liveState,
+    );
+    await successor.prepareAndCreate(pin());
+    const succRoot = dshProfileOverlayRoot(
+      "11111111-2222-3333-4444-555555555555",
+      successor.invocationId,
+      liveState,
+    );
+    assert.notEqual(predRoot, succRoot, "two invocations of one run must never share a root");
+
+    // The predecessor's confirmed close publishes+removes ONLY its own root.
+    await predecessor.close(30);
+    assert.equal(fs.existsSync(predRoot), false, "the predecessor root is removed");
+    assert.equal(
+      fs.existsSync(succRoot),
+      true,
+      "the successor's live root must survive the predecessor teardown",
+    );
+
+    // The successor can still perform a genuinely NEW filesystem operation
+    // under the root its guest has mounted.
+    const target = path.join(succRoot, "new-guest-op.txt");
+    fs.writeFileSync(target, "successor\n", "utf8");
+    assert.equal(fs.readFileSync(target, "utf8"), "successor\n");
+    await successor.close(30);
+    assert.equal(fs.existsSync(succRoot), false);
   });
 
   it("dsh create with NO host-attested overlay option is refused by the mount plan and never reaches create", async (t) => {
@@ -1572,5 +1930,84 @@ describe("matchlock controller (fake rpc driver)", () => {
     const identity = await c.resolveAndAdmitIdentity();
     assert.deepEqual(identity, pin(), "a short alias HOME must not be refused");
     assert.deepEqual(transcriptMethods(s.readTranscript()), ["resolve_image"]);
+  });
+
+  // ── G8 US-004 launch-gate backstop ────────────────────────────────────
+
+  function gateBinding(invocationId: string, over: Record<string, unknown> = {}): LaunchGateBinding {
+    return {
+      invocationId,
+      kind: "scheduled-attempt",
+      storeSetKey: `sha256:${"c".repeat(64)}`,
+      receiptPath: `/state/matchlock/gate/${invocationId}.json`,
+      decidedAt: "2026-10-23T00:00:00.000Z",
+      stores: [],
+      configJournalMode: "delete",
+      configSource: `${configDir}/config.yaml`,
+      ...over,
+    } as LaunchGateBinding;
+  }
+
+  it("refuses a create whose launchGate binding belongs to a DIFFERENT invocation, before any RPC", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const c = s.makeController(policy({ configurationRoot: configDir }), {}, undefined, {
+      invocationId: "run:r7:round:j2:attempt:1",
+      binding: gateBinding("run:r7:round:j2:attempt:0"),
+    });
+    const created = await settle(c.prepareAndCreate(pin()));
+    assert.equal(created.ok, false);
+    if (!created.ok) {
+      assert.equal(codeOf(created.error), "matchlock_gate_verdict_missing");
+      const message = created.error instanceof Error ? created.error.message : String(created.error);
+      assert.match(message, /run:r7:round:j2:attempt:1/);
+      assert.match(message, /attempt:0\.json/);
+    }
+    assert.deepEqual(s.readTranscript(), [], "no RPC request may reach the wire without a bound verdict");
+    assert.equal(c.rpcRunning, false, "no owned transport was spawned");
+    assert.equal(c.identity.vmId, null);
+  });
+
+  it("refuses a create with a NULL launchGate binding and a create with an empty store-set key", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const nullBound = s.makeController(policy({ configurationRoot: configDir }), {}, undefined, {
+      invocationId: "inv-null",
+      binding: null,
+    });
+    const nullResult = await settle(nullBound.prepareAndCreate(pin()));
+    assert.equal(nullResult.ok, false);
+    if (!nullResult.ok) assert.equal(codeOf(nullResult.error), "matchlock_gate_verdict_missing");
+
+    const emptyKey = s.makeController(policy({ configurationRoot: configDir }), {}, undefined, {
+      invocationId: "inv-empty",
+      binding: gateBinding("inv-empty", { storeSetKey: "" }),
+    });
+    const emptyResult = await settle(emptyKey.prepareAndCreate(pin()));
+    assert.equal(emptyResult.ok, false);
+    if (!emptyResult.ok) assert.equal(codeOf(emptyResult.error), "matchlock_gate_verdict_missing");
+    assert.deepEqual(s.readTranscript(), []);
+  });
+
+  it("creates exactly once when the launchGate binding matches THIS invocation", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const c = s.makeController(policy({ configurationRoot: configDir }), {}, undefined, {
+      invocationId: "inv-bound",
+      binding: gateBinding("inv-bound"),
+    });
+    const { vmId } = await c.prepareAndCreate(pin());
+    assert.match(vmId, /^vm-/);
+    assert.deepEqual(transcriptMethods(s.readTranscript()), ["resolve_image", "create"]);
+    assert.equal(transcriptMethodIndexes(s.readTranscript(), "create").length, 1);
+  });
+
+  it("leaves an ungated controller byte-identical (no launchGate option ⇒ no verdict required)", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const c = s.makeController(policy({ configurationRoot: configDir }));
+    const { vmId } = await c.prepareAndCreate(pin());
+    assert.match(vmId, /^vm-/);
+    assert.equal(transcriptMethodIndexes(s.readTranscript(), "create").length, 1);
   });
 });

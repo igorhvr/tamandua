@@ -31,6 +31,7 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
@@ -59,6 +60,7 @@ import {
   MATCHLOCK_GUEST_SKILL_FILE,
   setMatchlockSchedulerRoundRunnerForTest,
   setMatchlockHomeAliasResolverForTest,
+  setMatchlockScheduledLaunchGateForTest,
   buildMatchlockProbeCommand,
   buildMatchlockProbePrompt,
   buildMatchlockMergeContext,
@@ -72,6 +74,8 @@ import {
 import { setMatchlockExecutionBoundarySeamsForTest } from "../../dist/installer/matchlock/execution-boundary.js";
 import { classifyInvocationError } from "../../dist/installer/matchlock/pi-invocation-runner.js";
 import { MatchlockControllerError } from "../../dist/installer/matchlock/controller.js";
+import { parseReceipt } from "../../dist/installer/matchlock/gate-receipt.js";
+import { LAUNCH_GATE_REFUSAL_EXIT_CODE } from "../../dist/installer/matchlock/gate-exit-code.js";
 import { MATCHLOCK_SOCKET_PATH_TOO_LONG_CODE, MatchlockHomeAliasError } from "../../dist/installer/matchlock/home-alias.js";
 import {
   setDshSchedulerRoundRunnerForTest,
@@ -196,6 +200,15 @@ function policyJson(imageTag = "vic/ml:latest", imagePath?: string): string {
  * (canonical host root / profile id / guest HERMES_HOME).
  */
 function hermesPolicyJson(imageTag = "vic/hermes:latest"): string {
+  return hermesPolicyJsonForHome("/home/operator", imageTag);
+}
+
+/**
+ * A persisted hermes opt-in whose FROZEN submission inputs point at a REAL
+ * disposable operator home, so the G8 launch gate can observe a genuine
+ * profile store set at dispatch time.
+ */
+function hermesPolicyJsonForHome(operatorHome: string, imageTag = "vic/hermes:latest"): string {
   return serializeMatchlockPolicy(
     buildMatchlockPolicy({
       requestedImage: imageTag,
@@ -211,10 +224,10 @@ function hermesPolicyJson(imageTag = "vic/hermes:latest"): string {
         { hostPath: "/srv/project", hostRealPath: "/srv/project", guestPath: "/srv/project" },
       ],
       gitMetadataRoots: [],
-      configurationRoot: "/home/operator/.hermes",
+      configurationRoot: path.join(operatorHome, ".hermes"),
       configurationProfile: "default",
       guestConfigurationRoot: "/workspace/config/hermes",
-      hermes: { homeDir: "/home/operator", cwd: "/srv/project", hermesHomeEnv: null },
+      hermes: { homeDir: operatorHome, cwd: "/srv/project", hermesHomeEnv: null },
     }),
   );
 }
@@ -400,6 +413,13 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     seamJournal = [];
     seamJournalDsh = [];
     installSeamFake({ journal: seamJournal });
+    // G8 US-005: the launch gate observes the REAL Hermes profile stores of
+    // the round's FROZEN submission. These dispatch tests use synthetic
+    // `/home/operator` profiles that could never pass a real gate, and they are
+    // not about the gate, so it is SKIPPED by default here
+    // (`evaluate: () => null`). The dedicated US-005 cases below install the
+    // PRODUCTION seams (`{}`) and build a real disposable profile.
+    setMatchlockScheduledLaunchGateForTest({ evaluate: () => null, evaluateAttempt: () => null });
     // US-004: these dispatch tests are not about the daemon execution
     // boundary; install a supporting swap probe so the gate passes without a
     // real matchlock binary. The uid default (the real non-root test uid)
@@ -413,6 +433,7 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     setMatchlockSchedulerRoundRunnerForTest(null);
     setDshSchedulerRoundRunnerForTest(null);
     setMatchlockHomeAliasResolverForTest(null);
+    setMatchlockScheduledLaunchGateForTest(null);
     setMatchlockExecutionBoundarySeamsForTest(null);
     if (savedPiBinary === undefined) delete process.env.TAMANDUA_PI_BINARY;
     else process.env.TAMANDUA_PI_BINARY = savedPiBinary;
@@ -1319,6 +1340,193 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     const tokens = getDb().prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(runId) as { tokens_spent: number } | undefined;
     assert.ok(tokens, "run row must exist");
     assert.equal(tokens.tokens_spent, 155, "the runner's in-VM usage projection is attributed exactly once");
+  });
+
+  // ── G8 ADMISSION-INTEGRATION US-005: the scheduled launch gate ────────
+  //
+  // A hermes scheduled round is a launch: it mounts the operator's effective
+  // profile RW into a fresh VM. These cases drive the REAL dispatch motor with
+  // the REAL gate (only the clock-free managed scope is pinned) over a REAL
+  // disposable profile, so the gate's refusal / allow is measured end to end:
+  // zero runner-seam invocations (i.e. zero VM creates), zero host spawns.
+
+  /** A disposable operator home with a profile store + config journal mode. */
+  function makeOperatorProfile(
+    name: string,
+    journalMode: "delete" | "wal",
+    store: "rollback" | "wal",
+  ): string {
+    const operatorHome = path.join(tempHome, name);
+    const hermes = path.join(operatorHome, ".hermes");
+    fs.mkdirSync(hermes, { recursive: true });
+    fs.writeFileSync(
+      path.join(hermes, "config.yaml"),
+      `database:\n  journal_mode: ${journalMode}\n`,
+    );
+    const storePath = path.join(hermes, "state.db");
+    if (store === "rollback") {
+      const database = new DatabaseSync(storePath);
+      database.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)");
+      database.exec("INSERT INTO t (value) VALUES ('row')");
+      database.close();
+    } else {
+      const header = Buffer.alloc(4096);
+      Buffer.from("SQLite format 3\u0000", "latin1").copy(header, 0);
+      header[18] = 2;
+      header[19] = 2;
+      fs.writeFileSync(storePath, header);
+    }
+    return operatorHome;
+  }
+
+  /** Install the PRODUCTION gate (only the managed config scope is pinned). */
+  function installProductionGate(): void {
+    setMatchlockScheduledLaunchGateForTest({ gateDeps: { configOptions: { managedDir: null } } });
+  }
+
+  /**
+   * Create the run's dispatch job and run TWO dispatch ticks against it before
+   * tearing the job down, so "no further round on a later tick" is measured.
+   */
+  async function dispatchTwice(
+    runId: string,
+    workdir: string,
+    opts: { workflowId?: string; harnessType?: string } = {},
+  ): Promise<string> {
+    const workflowId = opts.workflowId ?? "test-wf";
+    const workflow = makeWorkflow(workflowId);
+    const created = await createAgentCronJob({
+      workflowId,
+      runId,
+      agent: makeAgent(),
+      workflow,
+      workingDirectoryForHarness: workdir,
+    });
+    assert.ok(created.ok, "agent cron job must be created");
+    const job: CronJobInfo = {
+      id: created.id!,
+      workflowId,
+      runId,
+      agentId: `${workflowId}_test-agent`,
+      harnessType: (opts.harnessType ?? "hermes") as CronJobInfo["harnessType"],
+      workingDirectoryForHarness: workdir,
+      createdAt: "",
+    };
+    try {
+      await executeDispatchRound(job, makeAgent(), workflow);
+      await executeDispatchRound(job, makeAgent(), workflow);
+    } finally {
+      await removeRunCrons(runId);
+    }
+    return created.id!;
+  }
+
+  it("US-005: a dispatch-time gate REFUSAL records one event + receipt, force-fails the run (scheduling_status NULL) and spawns NOTHING", async () => {
+    installProductionGate();
+    const operatorHome = makeOperatorProfile("operator-wal", "wal", "wal");
+    const runId = "4d4d4d4d-4d4d-4d4d-8d4d-4d4d4d4d4d4d";
+    const workdir = path.join(tempHome, "work-gate-refused");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, hermesPolicyJsonForHome(operatorHome), { workflowId: "do-now" });
+    // Probe enabled: the gate must refuse BEFORE the once-per-run probe VM too.
+    process.env.TAMANDUA_HARNESS_PROBE = "1";
+
+    const jobId = await dispatchTwice(runId, workdir, { workflowId: "do-now", harnessType: "hermes" });
+
+    const row = runRow(runId);
+    assert.ok(row);
+    assert.equal(row.status, "failed", "a refused dispatch is terminal for the run");
+    assert.equal(
+      row.scheduling_status,
+      null,
+      "scheduling_status NULL — 'error' is re-admitted by reconcileOnce() and is NOT a blocked-equivalent",
+    );
+    assert.ok(!fs.existsSync(piLog), "no host harness spawn on a refused dispatch");
+    assert.equal(
+      seamJournal.length,
+      0,
+      "ZERO runner-seam invocations: no probe VM, no work VM, no step claim",
+    );
+    assert.equal(
+      stepRows(runId).every((step) => step.status === "canceled" || step.status === "pending"),
+      true,
+      "no step was claimed or started",
+    );
+
+    const events = eventsFor(runId);
+    const refused = events.filter((e) => e.event === "run.matchlock_gate_refused");
+    assert.equal(refused.length, 1, "exactly ONE gate-refusal event across TWO dispatch ticks");
+    assert.equal(
+      refused[0].invocationId,
+      `run:${runId}:round:${jobId}:dispatch`,
+      "the event is bound to THIS dispatch invocation",
+    );
+    assert.equal(refused[0].harness, "hermes");
+    assert.equal(refused[0].exitCode, LAUNCH_GATE_REFUSAL_EXIT_CODE);
+    assert.deepEqual(
+      [...(refused[0].findingCodes as string[])].sort(),
+      ["not-delete-config", "wal-header"],
+      "the event carries the refused reason codes",
+    );
+    assert.match(String(refused[0].storeSetKey), /^sha256:[0-9a-f]{64}$/);
+    assert.equal(events.filter((e) => e.event === "run.force_failed").length, 1, "exactly one terminal transition");
+    assert.equal(
+      events.filter((e) => e.event === "run.harness_probe_ok" || e.event === "run.harness_probe_failed").length,
+      0,
+      "the probe never ran (and is never recorded as passed or failed)",
+    );
+
+    // The refusal receipt is on disk and is the same evidence the event cites.
+    const receiptPath = String(refused[0].receiptPath);
+    assert.ok(fs.existsSync(receiptPath), "the refusal receipt exists");
+    const receipt = parseReceipt(fs.readFileSync(receiptPath, "utf8").trimEnd());
+    assert.equal(receipt.action, "refused");
+    assert.equal(receipt.invocation.kind, "scheduled-dispatch");
+    assert.equal(receipt.invocation.runId, runId);
+    assert.equal(receipt.storeSetKey, refused[0].storeSetKey, "the event's key is the receipt's own key");
+  });
+
+  it("US-005: a COMPLIANT profile passes the gate and dispatches exactly one work round (no refusal)", async () => {
+    installProductionGate();
+    const operatorHome = makeOperatorProfile("operator-delete", "delete", "rollback");
+    const runId = "4e4e4e4e-4e4e-4e4e-8e4e-4e4e4e4e4e4e";
+    const workdir = path.join(tempHome, "work-gate-allowed");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, hermesPolicyJsonForHome(operatorHome), { workflowId: "do-now" });
+
+    await dispatchJob(runId, workdir, { workflowId: "do-now", harnessType: "hermes" });
+
+    const row = runRow(runId);
+    assert.ok(row);
+    assert.equal(row.status, "completed", "an allowed dispatch runs the work round normally");
+    assert.equal(seamJournal.length, 1, "exactly one work round through the runner seam");
+    assert.equal(seamJournal[0].kind, "work");
+    const events = eventsFor(runId);
+    assert.equal(events.filter((e) => e.event === "run.matchlock_gate_refused").length, 0);
+    assert.equal(events.filter((e) => e.event === "run.force_failed").length, 0);
+    assert.ok(!fs.existsSync(piLog), "no host harness spawn for an allowed hermes round");
+  });
+
+  it("US-005: a pi policy round makes no gate call and dispatches exactly as before", async () => {
+    installProductionGate();
+    const runId = "4f4f4f4f-4f4f-4f4f-8f4f-4f4f4f4f4f4f";
+    const workdir = path.join(tempHome, "work-gate-pi");
+    fs.mkdirSync(workdir, { recursive: true });
+    seedRun(runId, workdir, policyJson(), { workflowId: "do-now" });
+    const gateDir = path.join(process.env.TAMANDUA_STATE_DIR!, "matchlock", "gate");
+
+    await dispatchJob(runId, workdir, { workflowId: "do-now", harnessType: "pi" });
+
+    const row = runRow(runId);
+    assert.ok(row);
+    assert.equal(row.status, "completed", "the pi route is untouched by the hermes launch gate");
+    assert.equal(seamJournal.length, 1, "exactly one pi work round through the runner seam");
+    assert.equal(
+      fs.existsSync(gateDir),
+      false,
+      "no gate receipt directory is created for a pi round: the gate never evaluated anything",
+    );
+    assert.equal(eventsFor(runId).filter((e) => e.event === "run.matchlock_gate_refused").length, 0);
   });
 
   // ── US-006 (H1/D1): a completed guest round is never empty_output ─────

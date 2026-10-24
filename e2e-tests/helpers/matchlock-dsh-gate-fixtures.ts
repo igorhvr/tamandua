@@ -318,6 +318,13 @@ export interface DshOverlayObservation {
    * in `withFileLock`'s finally) is still retained once a sample saw it.
    */
   readonly files: string[];
+  /**
+   * OVERLAY-INV-SCOPED — every immediate invocation dir name observed under a
+   * per-run grouping dir (sorted). Empty in the default single-root mode.
+   * Diagnostic only: the controller's invocation id is host-generated, so a
+   * gate records WHICH invocation roots it actually sampled.
+   */
+  readonly invocationDirs: string[];
   /** Number of samples taken (diagnostic only). */
   readonly ticks: number;
 }
@@ -386,6 +393,39 @@ export function snapshotDshTreeFiles(root: string, maxDepth = 8): string[] {
 }
 
 /**
+ * The live per-invocation overlay roots currently present under ONE run's
+ * grouping dir (`dshProfileInvocationGroupRoot(runId, liveStateRoot)`).
+ *
+ * OVERLAY-INV-SCOPED: the grouping dir also holds the R3 host-side publish
+ * provenance manifest `<invocationId>.prepare.json` and may hold symlink
+ * debris left by an interrupted gate, so only REAL immediate subdirectories
+ * count as invocation roots: a `*.prepare.json` sibling, a regular file and a
+ * symlink entry are all excluded (the `lstat` check, not the `Dirent`, is
+ * authoritative so a dangling symlink cannot throw). Returns ABSOLUTE paths,
+ * sorted; a missing grouping dir yields `[]` (never a throw).
+ *
+ * Pure fs, no VM, no child process: the fast gate-helper tests exercise it
+ * directly, and the real-VM gates use it to reason about teardown orders.
+ */
+export function invocationRoots(groupRoot: string): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(groupRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const roots: string[] = [];
+  for (const entry of entries) {
+    if (entry.name.endsWith(".prepare.json")) continue;
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    const full = path.join(groupRoot, entry.name);
+    if (!isRealDir(full)) continue;
+    roots.push(full);
+  }
+  return roots.sort((a, b) => a.localeCompare(b));
+}
+
+/**
  * Polls a host-attested per-run overlay root while a round is live and merges
  * every symlink AND regular file it observes. The controller removes the
  * overlay after the confirmed VM close, so this is the only way to capture the
@@ -393,10 +433,27 @@ export function snapshotDshTreeFiles(root: string, maxDepth = 8): string[] {
  * (the `withFileLock` sibling `profiles/node_modules.lock`): it proves the
  * guest wrote guest-install links and its boot writer lock into the private
  * overlay (and thus never into the host farm).
+ *
+ * OVERLAY-INV-SCOPED: the overlay root is now bound to the controller's own
+ * host-generated invocation id, which a live gate cannot predict. Opt into
+ * `invocationGroupDir: true` and pass the per-run grouping dir
+ * (`dshProfileInvocationGroupRoot(runId, tamanduaDir)`); every immediate real
+ * invocation subdirectory is then sampled, with merged paths RELATIVE to that
+ * invocation root, so `.prepare.json` siblings and symlinks are never mistaken
+ * for an invocation root. The default (single fixed root) mode is unchanged.
  */
 export class DshOverlayObserver {
   private readonly root: string;
   private readonly intervalMs: number;
+  /**
+   * OVERLAY-INV-SCOPED: when true, `root` is the per-run grouping dir
+   * (`<...>/dsh-profile-invocations/<runId>`) and every immediate invocation
+   * subdirectory is sampled with paths RELATIVE to that invocation root. The
+   * controller's invocation id is host-generated, so the exact root is unknown
+   * while the round is live; this observes whichever invocation is active.
+   */
+  private readonly invocationGroupDir: boolean;
+  private readonly observedInvocationDirs = new Set<string>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
   private rootSeen = false;
@@ -406,9 +463,13 @@ export class DshOverlayObserver {
   private readonly dirs = new Set<string>();
   private readonly files = new Set<string>();
 
-  constructor(root: string, opts: { intervalMs?: number } = {}) {
+  constructor(
+    root: string,
+    opts: { intervalMs?: number; invocationGroupDir?: boolean } = {},
+  ) {
     this.root = root;
     this.intervalMs = opts.intervalMs ?? 50;
+    this.invocationGroupDir = opts.invocationGroupDir === true;
   }
 
   start(): this {
@@ -424,12 +485,39 @@ export class DshOverlayObserver {
   private sample(): void {
     if (this.stopped) return;
     this.ticks += 1;
+    if (this.invocationGroupDir) {
+      this.sampleInvocationGroup();
+      return;
+    }
     const st = lstatOrUndefined(this.root);
     if (st === undefined || !st.isDirectory() || st.isSymbolicLink()) return;
     this.rootSeen = true;
-    for (const rel of snapshotDshTreeDirs(this.root)) this.dirs.add(rel);
-    for (const rel of snapshotDshTreeFiles(this.root)) this.files.add(rel);
-    for (const [rel, target] of Object.entries(snapshotDshTreeLinks(this.root))) {
+    this.sampleRoot(this.root);
+  }
+
+  /**
+   * Sample every immediate INVOCATION root under the per-run grouping dir.
+   * Only real immediate subdirectories count (a `.prepare.json` publish
+   * manifest sibling and any symlink entry are never invocation roots), and
+   * only those set `rootSeen`.
+   */
+  private sampleInvocationGroup(): void {
+    // `invocationRoots` applies the exact same filter the observer documents:
+    // real immediate subdirectories only (no `*.prepare.json` manifest, no
+    // symlink, no regular file), so the observer and the live gates can never
+    // disagree about what an invocation root is.
+    for (const invocationRoot of invocationRoots(this.root)) {
+      this.rootSeen = true;
+      this.observedInvocationDirs.add(path.basename(invocationRoot));
+      this.sampleRoot(invocationRoot);
+    }
+  }
+
+  /** Merge one overlay root's dirs/files/links (paths relative to that root). */
+  private sampleRoot(root: string): void {
+    for (const rel of snapshotDshTreeDirs(root)) this.dirs.add(rel);
+    for (const rel of snapshotDshTreeFiles(root)) this.files.add(rel);
+    for (const [rel, target] of Object.entries(snapshotDshTreeLinks(root))) {
       this.links.set(rel, target);
       let seen = this.allTargets.get(rel);
       if (seen === undefined) {
@@ -459,6 +547,7 @@ export class DshOverlayObserver {
       ),
       dirs: [...this.dirs].sort((a, b) => a.localeCompare(b)),
       files: [...this.files].sort((a, b) => a.localeCompare(b)),
+      invocationDirs: [...this.observedInvocationDirs].sort((a, b) => a.localeCompare(b)),
       ticks: this.ticks,
     };
   }

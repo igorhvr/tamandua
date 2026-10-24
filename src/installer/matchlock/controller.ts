@@ -74,9 +74,25 @@
  *
  * It never falls back to a native host harness and never accepts a guest
  * command for host execution.
+ *
+ * LAUNCH-GATE BACKSTOP (G8 US-004). When the caller supplies a
+ * `launchGate` context, `prepareAndCreate` refuses — synchronously, BEFORE any
+ * state mutation, overlay preparation or RPC child spawn — unless a gate
+ * verdict exists for THE CURRENT RESOLVED INVOCATION: same invocation id and a
+ * non-empty store-set key (the receipt path is reported, never required). A
+ * verdict that belongs to a DIFFERENT invocation never authorises this create.
+ * The check is a pure binding read: the controller NEVER re-evaluates the gate
+ * and NEVER falls back to an earlier verdict. When `launchGate` is absent
+ * (native pi/dsh runs, and hermes call paths that are not gate-wired yet) the
+ * behaviour is byte-identical to the pre-G8 controller. This module
+ * deliberately imports only the gate TYPES (`import type`), never an
+ * observation/evaluation module, so it cannot accidentally become a second
+ * evaluator.
  */
 
 import { MatchlockRpcClient, isAlreadyStoppedCloseError, type MatchlockRpcClientOptions, type StreamNotify, type MatchlockPipeHandle, type MatchlockTtyHandle } from "./rpc-client.js";
+import type { LaunchGateBinding } from "./launch-gate-wiring.js";
+import { boundMatchlockErrorText } from "./runner-error.js";
 import { MATCHLOCK_SOCKET_PATH_TOO_LONG_CODE, matchlockSocketPathRefusal } from "./home-alias.js";
 import {
   buildMatchlockCreateConfig,
@@ -86,6 +102,7 @@ import {
 import { resolveImageIdentity, validatePinnedIdentity, verifyImageIdentity, type PinnedImageIdentity } from "./image.js";
 import {
   cleanupDshProfileOverlay,
+  DshProfileOverlayError,
   prepareDshProfileOverlay,
   publishDshHomeOverlayToHost,
 } from "./dsh-profile-overlay.js";
@@ -98,7 +115,34 @@ import type {
   MatchlockTtyExecOptions,
 } from "./types.js";
 
+export interface MatchlockControllerLaunchGate {
+  /**
+   * The invocation id the caller RESOLVED and evaluated (interactive plan
+   * invocation id / scheduled attempt invocation id). The binding must match
+   * THIS id — a verdict from another invocation never authorises a create.
+   */
+  invocationId: string;
+  /**
+   * The gate verdict bound to {@link invocationId}, or `null` when no verdict
+   * exists. A `null` binding is an explicit refusal, never a bypass: the
+   * controller refuses to create a VM for it.
+   */
+  binding: LaunchGateBinding | null;
+}
+
 export interface MatchlockControllerOptions {
+  /**
+   * G8 ADMISSION-INTEGRATION US-004: the launch-gate BACKSTOP context for THIS
+   * invocation. When present, `prepareAndCreate` refuses with
+   * `matchlock_gate_verdict_missing` — BEFORE any state mutation or RPC child
+   * spawn — unless `binding` exists, belongs to `invocationId`, and carries a
+   * non-empty store-set key. The controller never re-evaluates the gate and
+   * never falls back to a verdict belonging to another invocation. Absent ⇒
+   * byte-identical prior behaviour (native pi/dsh runs are untouched). The
+   * value is supplied by the gate callers (`interactive-session.ts` from the
+   * admitted plan, `hermes-invocation-runner.ts` from the attempt binding).
+   */
+  launchGate?: MatchlockControllerLaunchGate;
   /** Absolute path/matchlock binary for the control RPC (tests inject a fake). */
   rpcBinaryPath?: string;
   /** Extra args for `matchlock rpc` (default ["rpc"]). */
@@ -136,11 +180,14 @@ export interface MatchlockControllerOptions {
    *
    * When set (and the policy harness is "dsh") the controller owns the
    * per-invocation private overlay lifecycle: `prepareDshProfileOverlay`
-   * creates the run's private install-derived directories BEFORE `create`, the
-   * option is forwarded into the create-config builder so the composed dsh
-   * home plan sources them from the overlay (never the host farm), and
-   * `cleanupDshProfileOverlay` removes the attested run root after the VM close
-   * is confirmed (and on hard dispose). Absent ⇒ the builder refuses a dsh
+   * creates THIS invocation's private overlay root (bound to the controller's
+   * own host-generated `invocationId`) BEFORE `create`, the option is forwarded
+   * into the create-config builder (with the invocation identity) so the
+   * composed dsh home plan sources the effective home from it (never the host
+   * farm), and finalization publishes/removes exactly that attested invocation
+   * root ONLY under proven consumer quiescence (a wire-confirmed close, or a
+   * provably-unused overlay) — a hard dispose or an unconfirmed close RETAINS
+   * it (see `dshProfileOverlayStatus`). Absent ⇒ the builder refuses a dsh
    * policy with `dsh_profile_overlay_required`.
    */
   dshProfileOverlay?: { runId: string; liveStateRoot: string };
@@ -235,6 +282,30 @@ export class MatchlockControllerError extends Error {
   }
 }
 
+/**
+ * OVERLAY-INV-SCOPED: explicit disposition of the per-invocation dsh
+ * profile-overlay finalization, tracked INDEPENDENTLY of the VM `closed` flag.
+ *
+ * - `none`: this controller owns no dsh overlay.
+ * - `pending`: the overlay (if any) has been prepared but not yet finalized.
+ * - `finalized`: TERMINAL — exactly this invocation's root was published
+ *   (normal path) and/or removed, and no consumer could still exist.
+ * - `retained`: consumer quiescence was UNPROVEN (hard dispose / transport
+ *   death without a wire close) or publish/remove failed. The root is left in
+ *   place (never removed) with typed evidence; a later `close()`/`dispose()`
+ *   re-attempts when quiescence is now proven or re-reports the disposition.
+ */
+export type DshProfileOverlayDisposition =
+  | { readonly status: "none" }
+  | { readonly status: "pending" }
+  | { readonly status: "finalized" }
+  | {
+      readonly status: "retained";
+      readonly code: string;
+      readonly reason: string;
+      readonly quiescence: string;
+    };
+
 export class MatchlockController {
   private client: MatchlockRpcClient | null = null;
   private readonly clientOpts: MatchlockRpcClientOptions;
@@ -249,6 +320,7 @@ export class MatchlockController {
     | ((policy: ExecutionIsolation, identity: PinnedImageIdentity) => MatchlockCreateParams)
     | undefined;
   private readonly rpcEnv: Record<string, string> | undefined;
+  private readonly launchGate: MatchlockControllerLaunchGate | undefined;
   private pinnedIdentity: PinnedImageIdentity | null = null;
   private invoked = false;
   private vmId: string | null = null;
@@ -261,6 +333,13 @@ export class MatchlockController {
   private lateVmRecord: MatchlockLateVmSettlement | null = null;
   /** True once a `create` request has actually been dispatched on the wire. */
   private createRequestSent = false;
+  /**
+   * OVERLAY-INV-SCOPED: overlay finalization disposition, tracked
+   * INDEPENDENTLY of `closed`. `finalized` is terminal; a `retained` result is
+   * re-attempted (when quiescence is now proven) or re-reported by later
+   * close()/dispose() calls.
+   */
+  private overlayDisposition: DshProfileOverlayDisposition;
 
   readonly invocationId: string;
 
@@ -274,6 +353,7 @@ export class MatchlockController {
     this.createEnv = opts.createEnv;
     this.buildCreateConfig = opts.buildCreateConfig;
     this.rpcEnv = opts.rpcEnv;
+    this.launchGate = opts.launchGate;
     if (opts.requireHelperPack !== false && !this.helperPackHostPath) {
       // The guest pack is the only scoped bridge + helper source. Refuse to
       // run without it rather than fall back to the host harness.
@@ -283,6 +363,7 @@ export class MatchlockController {
       );
     }
     this.invocationId = `inv-${Math.random().toString(16).slice(2, 10)}-${Date.now().toString(16)}`;
+    this.overlayDisposition = this.hasDshProfileOverlay() ? { status: "pending" } : { status: "none" };
     // The controller builds transports lazily and per phase: admission
     // resolves over one owned child (then disposes it) and the create
     // invocation starts a FRESH owned child, so a disposed transport is never
@@ -359,38 +440,160 @@ export class MatchlockController {
     return process.env.HOME ?? "";
   }
 
-  /**
-   * DSH-PROFILE-OVERLAY US-002: stage this invocation's private dsh
-   * profile-overlay root (a private copy of the host effective DSH_HOME
-   * `profiles/` tree, with install-derived dirs empty) before `create`. No-op
-   * for non-dsh policies or when the host attestation is absent (the
-   * mount-plan builder refuses a dsh policy without it).
-   */
-  private prepareDshProfileOverlayForInvocation(): void {
-    const overlay = this.dshProfileOverlay;
-    if (!overlay || this.policy.harness !== "dsh") return;
-    prepareDshProfileOverlay(overlay.runId, overlay.liveStateRoot, this.policy.configurationRoot);
+  /** True when this controller owns a dsh per-invocation profile overlay. */
+  private hasDshProfileOverlay(): boolean {
+    return this.dshProfileOverlay !== undefined && this.policy.harness === "dsh";
   }
 
   /**
-   * DSH-PROFILE-OVERLAY US-003: merge the guest-written durable entries of the
-   * per-run effective home back to the real host home (never `profiles/`), then
-   * remove ONLY the attested per-run overlay root. Idempotent. `swallow` is used
-   * on the hard-dispose path so a cleanup/publish refusal can never mask the
-   * abort.
+   * OVERLAY-INV-SCOPED: observable overlay finalization disposition. Tests and
+   * controller recovery read this to distinguish a terminal published+removed
+   * result from an explicitly RETAINED (quiescence-unproven / failed) one.
    */
-  private cleanupDshProfileOverlayForInvocation(swallow: boolean): void {
+  get dshProfileOverlayStatus(): DshProfileOverlayDisposition {
+    return this.overlayDisposition;
+  }
+
+  /**
+   * DSH-PROFILE-OVERLAY US-002 / OVERLAY-INV-SCOPED: stage THIS invocation's
+   * private dsh profile-overlay root (a private copy of the host effective
+   * DSH_HOME `profiles/` tree, with install-derived dirs empty) before
+   * `create`. The root is bound to the controller's own host-generated
+   * `invocationId` and allocated EXCLUSIVELY, so two overlapping invocations of
+   * one run can never share (and therefore destroy) one mounted overlay root.
+   * No-op for non-dsh policies or when the host attestation is absent (the
+   * mount-plan builder refuses a dsh policy without it).
+   */
+  private prepareDshProfileOverlayForInvocation(): void {
+    if (!this.hasDshProfileOverlay()) return;
     const overlay = this.dshProfileOverlay;
-    if (!overlay || this.policy.harness !== "dsh") return;
+    if (!overlay) return;
+    prepareDshProfileOverlay(
+      overlay.runId,
+      this.invocationId,
+      overlay.liveStateRoot,
+      this.policy.configurationRoot,
+    );
+    this.overlayDisposition = { status: "pending" };
+  }
+
+  /**
+   * Evidence that NO consumer of the overlay can exist. Quiescence is PROVEN
+   * only when either:
+   *
+   *   - the VM close was CONFIRMED on the wire (`closed`) — the single-shot
+   *     invocation can never create again; or
+   *   - the create was NEVER dispatched (`!createRequestSent`) AND work
+   *     revocation is already irrevocable (`closing`/`disposed`), so the
+   *     post-resolve lifecycle recheck in `doPrepareAndCreate` can never
+   *     dispatch a create and no other continuation allocates an overlay
+   *     (allocation is synchronous and precedes any await).
+   *
+   * Every other state — a dispatched create with no wire close response,
+   * transport death, a late/unknown VM — leaves quiescence UNPROVEN. A single
+   * false `createRequestSent` read alone is never treated as proof: the
+   * revocation must be simultaneously irrevocable.
+   */
+  private overlayQuiescenceProof(context: string): { proven: boolean; how: string } {
+    if (this.closed) return { proven: true, how: "wire-confirmed-close" };
+    const revoked = this.lifecycleState === "closing" || this.lifecycleState === "disposed";
+    if (!this.createRequestSent && revoked) return { proven: true, how: "no-consumer" };
+    return {
+      proven: false,
+      how: this.createRequestSent
+        ? `create-dispatched-without-wire-close (${context})`
+        : `revocation-not-irrevocable (${context})`,
+    };
+  }
+
+  /** Structured, non-fatal log of an overlay disposition change. */
+  private logOverlayDisposition(): void {
+    const d = this.overlayDisposition;
+    const level = d.status === "retained" ? "warn" : "info";
+    this.clientOpts.onLog?.(level, `dsh profile overlay ${d.status}`, {
+      runId: this.dshProfileOverlay?.runId,
+      invocationId: this.invocationId,
+      vmId: this.vmId,
+      createRequestSent: this.createRequestSent,
+      closed: this.closed,
+      lifecycle: this.lifecycleState,
+      ...(d.status === "retained" ? { code: d.code, reason: d.reason, quiescence: d.quiescence } : {}),
+    });
+  }
+
+  /**
+   * OVERLAY-INV-SCOPED single finalization operation. A terminal
+   * `published+removed` result is shared by every later close()/dispose() call;
+   * a `retained` result is re-attempted when quiescence is now proven or
+   * re-reported otherwise. Returns `true` when the overlay is terminal
+   * (`finalized`/`none`), `false` when it is retained.
+   *
+   * Quiescence gate: publish ONLY on a wire-confirmed close (normal path:
+   * publish THEN remove own root); on a proven no-consumer invocation remove
+   * own UNUSED root without publishing; on any unproven path RETAIN the root
+   * (no removal, no premature publish) with a typed disposition. Never equate
+   * RPC transport exit with VM termination.
+   */
+  private tryFinalizeDshProfileOverlay(proof: { proven: boolean; how: string }): boolean {
+    if (!this.hasDshProfileOverlay()) return true;
+    if (this.overlayDisposition.status === "finalized") return true;
+    const overlay = this.dshProfileOverlay;
+    if (!overlay) return true;
+    if (!proof.proven) {
+      this.overlayDisposition = {
+        status: "retained",
+        code: "dsh_profile_overlay_retained",
+        reason: `consumer quiescence unproven; overlay retained (${proof.how})`,
+        quiescence: proof.how,
+      };
+      this.logOverlayDisposition();
+      return false;
+    }
     try {
-      publishDshHomeOverlayToHost(
-        overlay.runId,
-        overlay.liveStateRoot,
-        this.policy.configurationRoot,
-      );
-      cleanupDshProfileOverlay(overlay.runId, overlay.liveStateRoot);
+      if (proof.how === "wire-confirmed-close") {
+        // Normal path: the VM close is CONFIRMED on the wire, so merge the
+        // guest-written durable entries back (never profiles/) BEFORE removing
+        // exactly this invocation's root.
+        publishDshHomeOverlayToHost(
+          overlay.runId,
+          this.invocationId,
+          overlay.liveStateRoot,
+          this.policy.configurationRoot,
+        );
+      }
+      // `no-consumer`: the overlay is unused, so remove own root without
+      // publishing (nothing was ever written into it by a consumer).
+      cleanupDshProfileOverlay(overlay.runId, this.invocationId, overlay.liveStateRoot);
+      this.overlayDisposition = { status: "finalized" };
+      this.logOverlayDisposition();
+      return true;
     } catch (err) {
-      if (!swallow) throw err;
+      const code = err instanceof DshProfileOverlayError ? err.code : "dsh_profile_overlay_finalize_failed";
+      this.overlayDisposition = {
+        status: "retained",
+        code,
+        reason: (err as Error).message,
+        quiescence: proof.how,
+      };
+      this.logOverlayDisposition();
+      return false;
+    }
+  }
+
+  /**
+   * Re-attempt or re-report finalization after a wire-confirmed VM close. This
+   * is the ONLY path that publishes. Throws a typed error when the overlay
+   * remains retained after the attempt so a failed publish/remove is never
+   * masked as a successful close.
+   */
+  private finalizeConfirmedCloseOrThrow(): void {
+    if (!this.hasDshProfileOverlay()) return;
+    if (!this.tryFinalizeDshProfileOverlay({ proven: true, how: "wire-confirmed-close" })) {
+      const d = this.overlayDisposition as Extract<DshProfileOverlayDisposition, { status: "retained" }>;
+      throw new MatchlockControllerError(
+        d.code,
+        `dsh profile overlay finalization failed after the wire-confirmed VM close; overlay RETAINED (${d.reason}); retry close()/dispose()`,
+      );
     }
   }
 
@@ -443,6 +646,58 @@ export class MatchlockController {
           `cannot ${operation}: controller is disposed and never reopens work; use a fresh controller for a new invocation`,
         );
     }
+  }
+
+  /**
+   * G8 US-004 — the controller's launch-gate BACKSTOP.
+   *
+   * A preflight verdict is evidence about a RESOLVED INVOCATION, so it is only
+   * usable by the invocation it was decided for. This check is a pure binding
+   * read (no re-evaluation, no fallback to any earlier verdict) executed
+   * synchronously BEFORE any state mutation, overlay preparation or RPC child
+   * spawn:
+   *
+   *   - no `launchGate` context  ⇒ native / not-gate-wired caller, no check;
+   *   - `binding === null`       ⇒ refuse (no verdict exists);
+   *   - binding.invocationId ≠ this invocation id ⇒ refuse (a foreign verdict
+   *     never authorises THIS create);
+   *   - empty/missing storeSetKey ⇒ refuse (a verdict that binds no store set
+   *     proves nothing).
+   *
+   * The refusal is `matchlock_gate_verdict_missing` and names the invocation id
+   * and — when a (foreign) receipt exists — its path, so an operator can see
+   * exactly which verdict was present and which one was required.
+   */
+  private requireLaunchGateVerdict(): void {
+    const gate = this.launchGate;
+    if (gate === undefined) return;
+    const invocationId = typeof gate.invocationId === "string" ? gate.invocationId : "";
+    const binding = gate.binding ?? null;
+    const storeSetKey = binding !== null && typeof binding.storeSetKey === "string" ? binding.storeSetKey.trim() : "";
+    if (binding !== null && invocationId !== "" && binding.invocationId === invocationId && storeSetKey !== "") {
+      return;
+    }
+    const receiptPath =
+      binding !== null && typeof binding.receiptPath === "string" && binding.receiptPath.trim() !== ""
+        ? binding.receiptPath.trim()
+        : null;
+    const reason =
+      binding === null
+        ? "no launch-gate verdict exists for this invocation"
+        : invocationId === ""
+          ? "the resolved invocation id is missing, so no verdict can be bound to it"
+          : binding.invocationId !== invocationId
+            ? `the only available verdict belongs to a DIFFERENT invocation (${binding.invocationId})`
+            : "the available verdict carries no store-set key";
+    const message =
+      `refusing to create a VM: ${reason}; required invocation ${invocationId !== "" ? invocationId : "<missing>"}, ` +
+      `receipt ${receiptPath !== null ? receiptPath : "<none recorded>"} ` +
+      "(the launch gate must evaluate and record a verdict for THIS invocation before the controller may create; " +
+      "the controller never re-evaluates)";
+    throw new MatchlockControllerError(
+      "matchlock_gate_verdict_missing",
+      boundMatchlockErrorText(message, 1024),
+    );
   }
 
   /**
@@ -530,6 +785,11 @@ export class MatchlockController {
     // closing/closed/disposed controller can NEVER create, even when the
     // close that revoked it failed because no transport ever existed.
     this.requireLifecycleOpen("create a VM");
+    // G8 US-004 launch-gate backstop: also synchronous, also before any state
+    // mutation or child spawn. A gate-wired caller must present a verdict that
+    // belongs to THIS invocation; the controller never re-evaluates and never
+    // accepts a verdict recorded for a different invocation.
+    this.requireLaunchGateVerdict();
     // Pre-flight SUN_LEN guard at the create entry too, so `create` can never
     // spawn an RPC child for a HOME whose socket path would not fit (this
     // mirrors resolveAndAdmitIdentity's admission entry).
@@ -640,7 +900,9 @@ export class MatchlockController {
       : buildMatchlockCreateConfig(this.policy, identity, {
           helperPackHostPath: helperPackHostPath ?? undefined,
           ...(this.progressResource ? { progressResource: this.progressResource } : {}),
-          ...(this.dshProfileOverlay ? { dshProfileOverlay: this.dshProfileOverlay } : {}),
+          ...(this.dshProfileOverlay && this.policy.harness === "dsh"
+            ? { dshProfileOverlay: { ...this.dshProfileOverlay, invocationId: this.invocationId } }
+            : {}),
           ...(this.mountAdmission ? { admission: this.mountAdmission } : {}),
         });
     // Invocation-bound guest env (helper-pack PATH prepend, TAMANDUA_* identity
@@ -707,11 +969,20 @@ export class MatchlockController {
    * confirmation (the VM is gone) and marks the controller closed exactly like
    * a successful close; it never becomes a `matchlock_cleanup_failed`. A dead
    * transport with NO wire response still throws (isClosed is never fabricated
-   * from transport death), and close on an already-`closed` controller is a
-   * no-op.
+   * from transport death). On an already-`closed` controller close re-attempts
+   * (or re-reports) the dsh overlay finalization instead of hiding it: the VM
+   * close is confirmed, so quiescence is proven and a retained overlay is
+   * published+removed — or the refusal is thrown again.
    */
   async close(timeoutSeconds: number): Promise<void> {
-    if (this.closed) return;
+    if (this.closed) {
+      // VM close already CONFIRMED on the wire. Overlay finalization is
+      // tracked INDEPENDENTLY of `closed`: re-attempt it (quiescence is now
+      // proven) or re-report a retained result — a failed publish/cleanup is
+      // never masked by this no-op-shaped call.
+      this.finalizeConfirmedCloseOrThrow();
+      return;
+    }
     if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
       throw new MatchlockControllerError(
         "invalid_close_timeout",
@@ -763,7 +1034,10 @@ export class MatchlockController {
       // owning phase disposed it, or the owned RPC child already exited).
       // VM-close confirmation is DISTINCT from transport termination: isClosed
       // must never be set merely because the RPC child exited, so a confirmed
-      // close cannot be fabricated here.
+      // close cannot be fabricated here. The overlay is removed ONLY when the
+      // no-consumer proof holds (create never dispatched + revocation
+      // irrevocable); otherwise it is RETAINED with a typed disposition.
+      this.tryFinalizeDshProfileOverlay(this.overlayQuiescenceProof("close-no-live-transport"));
       throw new MatchlockControllerError(
         "matchlock_cleanup_failed",
         "no live matchlock rpc transport to confirm close; use dispose() for hard teardown",
@@ -782,11 +1056,16 @@ export class MatchlockController {
     // failure. The try/catch is defense-in-depth for a transport that surfaces
     // the recognized body as a rejection: it is swallowed as confirmed. Any
     // other failure — including a dead transport with NO wire response, which
-    // `isAlreadyStoppedCloseError` refuses — propagates (matchlock_cleanup_failed).
+    // `isAlreadyStoppedCloseError` refuses — leaves quiescence UNPROVEN: the
+    // overlay is RETAINED with a typed disposition and the error propagates
+    // (matchlock_cleanup_failed).
     try {
       await client.close(timeoutSeconds);
     } catch (err) {
-      if (!isAlreadyStoppedCloseError(err)) throw err;
+      if (!isAlreadyStoppedCloseError(err)) {
+        this.tryFinalizeDshProfileOverlay({ proven: false, how: "unconfirmed-close" });
+        throw err;
+      }
     }
     this.closed = true;
     // A terminal `disposed` state is never overwritten by a late successful
@@ -797,21 +1076,28 @@ export class MatchlockController {
       // cleanup is confirmed (still distinct from transport death).
       this.lateVmRecord = { ...this.lateVmRecord, cleanupConfirmed: true };
     }
-    // DSH-PROFILE-OVERLAY US-002: the VM close is CONFIRMED on the wire, so the
-    // private per-run dsh profile overlay is no longer in use — remove exactly
-    // its attested root. Never runs for an unconfirmed close.
-    this.cleanupDshProfileOverlayForInvocation(false);
+    // DSH-PROFILE-OVERLAY US-002 / OVERLAY-INV-SCOPED: the VM close is
+    // CONFIRMED on the wire, so this invocation's private overlay is no longer
+    // in use — finalization (publish THEN remove own root) runs under the same
+    // quiescence gate. Finalization is tracked independently of `closed`; a
+    // failure here stays visible on subsequent close()/dispose() calls instead
+    // of becoming a hidden success. Never runs for an unconfirmed close.
+    this.finalizeConfirmedCloseOrThrow();
   }
 
   /** Tear down without graceful close (cancel/abort path). Revokes guest work
    *  IMMEDIATELY (before the kill is observed), kills the EXACT owned RPC
-   *  child and resolves once the child close is observed. Idempotent. */
+   *  child and resolves once the child close is observed. Idempotent.
+   *
+   *  OVERLAY-INV-SCOPED: killing the RPC transport does NOT prove the VM is
+   *  gone, so the overlay is RETAINED (never published, never removed) unless
+   *  quiescence is positively proven — a confirmed wire close already observed
+   *  (`closed`) or a provably unused overlay (create never dispatched and
+   *  revocation irrevocable). Retention is a filesystem decision only: the
+   *  owned transport is still killed. */
   dispose(): Promise<{ code: number | null; signal: string | null }> {
     this.lifecycleState = "disposed";
-    // Hard abort: the VM may still be live, so the overlay removal here is
-    // best-effort (never masks the abort) — the normal path removes it only
-    // after a confirmed close.
-    this.cleanupDshProfileOverlayForInvocation(true);
+    this.tryFinalizeDshProfileOverlay(this.overlayQuiescenceProof("dispose"));
     return this.client ? this.client.dispose() : Promise.resolve({ code: null, signal: null });
   }
 

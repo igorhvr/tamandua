@@ -374,18 +374,42 @@ async function loadAdmission(): Promise<{
 }
 
 async function loadOverlayHelpers(): Promise<{
-  prepare: (runId: string, liveStateRoot: string, hostHome: string) => { overlayRoot: string };
-  root: (runId: string, liveStateRoot: string) => string;
-  cleanup: (runId: string, liveStateRoot: string) => void;
+  prepare: (
+    runId: string,
+    invocationId: string,
+    liveStateRoot: string,
+    hostHome: string,
+  ) => { overlayRoot: string };
+  root: (runId: string, invocationId: string, liveStateRoot: string) => string;
+  cleanup: (runId: string, invocationId: string, liveStateRoot: string) => void;
+  groupRoot: (runId: string, liveStateRoot: string) => string;
 }> {
   const mod = await import(`${repoRoot}/dist/installer/matchlock/dsh-profile-overlay.js`);
   return {
-    prepare: (runId, liveStateRoot, hostHome) =>
-      mod.prepareDshProfileOverlay(runId, liveStateRoot, hostHome) as { overlayRoot: string },
-    root: (runId, liveStateRoot) => mod.dshProfileOverlayRoot(runId, liveStateRoot) as string,
-    cleanup: (runId, liveStateRoot) =>
-      mod.cleanupDshProfileOverlay(runId, liveStateRoot) as void,
+    prepare: (runId, invocationId, liveStateRoot, hostHome) =>
+      mod.prepareDshProfileOverlay(
+        runId,
+        invocationId,
+        liveStateRoot,
+        hostHome,
+      ) as { overlayRoot: string },
+    root: (runId, invocationId, liveStateRoot) =>
+      mod.dshProfileOverlayRoot(runId, invocationId, liveStateRoot) as string,
+    cleanup: (runId, invocationId, liveStateRoot) =>
+      mod.cleanupDshProfileOverlay(runId, invocationId, liveStateRoot) as void,
+    groupRoot: (runId, liveStateRoot) =>
+      mod.dshProfileInvocationGroupRoot(runId, liveStateRoot) as string,
   };
+}
+
+/**
+ * OVERLAY-INV-SCOPED: an explicit invocation identity for a host pre-seed /
+ * sanity probe. The live runner's controller generates its own host-random
+ * invocation id, so real-runner observation uses the per-run grouping dir.
+ */
+function deterministicInvocationId(runId: string): string {
+  const hex = runId.replace(/[^0-9a-f]/gi, "").slice(0, 12).padEnd(12, "0");
+  return `inv-${hex}-00000000`;
 }
 
 async function resolveControlHomeAlias(realHome: string): Promise<string> {
@@ -659,10 +683,11 @@ describe(
       // its own overlay lifecycle.
       const overlayHelpers = await loadOverlayHelpers();
       const sanityRunId = randomUUID();
-      overlayHelpers.prepare(sanityRunId, tamanduaDir, dshHome);
-      overlayHelpers.cleanup(sanityRunId, tamanduaDir);
+      const sanityInvocationId = deterministicInvocationId(sanityRunId);
+      overlayHelpers.prepare(sanityRunId, sanityInvocationId, tamanduaDir, dshHome);
+      overlayHelpers.cleanup(sanityRunId, sanityInvocationId, tamanduaDir);
       assert.equal(
-        fs.existsSync(overlayHelpers.root(sanityRunId, tamanduaDir)),
+        fs.existsSync(overlayHelpers.root(sanityRunId, sanityInvocationId, tamanduaDir)),
         false,
         "the staging sanity overlay must be removed before the rounds",
       );
@@ -883,20 +908,17 @@ describe(
 
         for (let round = 1; round <= 2; round += 1) {
           const runId = randomUUID();
-          // Pre-prepare the production private overlay so the observer/watcher
-          // can watch `profiles/` from before the VM even boots (the runner's
-          // controller re-prepares the same root idempotently).
-          const overlayRoot = overlayHelpers.prepare(runId, tamanduaDir, dshHome).overlayRoot;
-          assert.equal(
-            overlayRoot,
-            overlayHelpers.root(runId, tamanduaDir),
-            `round ${round}: the pre-prepared overlay root must be the production run's attested root`,
-          );
+          // OVERLAY-INV-SCOPED: the invocation leaf is host-generated and is
+          // allocated EXCLUSIVELY, so the gate must NOT pre-prepare a predicted
+          // root (the runner's controller would refuse to adopt it). Observe
+          // the per-run grouping dir instead.
+          const overlayRoot = overlayHelpers.groupRoot(runId, tamanduaDir);
           const lockWatch = watchDshProfilesBootLock(path.join(overlayRoot, "profiles"), {
             pollMs: 2,
           });
           const observer = new DshOverlayObserver(overlayRoot, {
             intervalMs: DSH_OVERLAY_OBSERVER_INTERVAL_MS,
+            invocationGroupDir: true,
           }).start();
 
           const storeBefore = snapshotDshHostStore(dshHome);

@@ -190,12 +190,39 @@ describe("docs/matchlock-dsh-qualification.md composed dsh home mapping (DSH-PRO
     assert.match(recipe, /the single mount source is a real host directory/);
   });
 
-  it("documents the private per-run effective home root", () => {
-    assert.match(recipe, /private per-run copy/);
-    assert.match(recipe, /dsh-profile-overlays\/<bareRunId>/);
+  it("documents the private per-invocation effective home root and lifetime contract", () => {
+    assert.match(recipe, /private per-invocation copy/);
+    assert.match(recipe, /dsh-profile-invocations\/<bareRunId>\/<invocationId>/);
+    assert.match(recipe, /LEGACY\s+run-scoped shape/);
+    assert.match(recipe, /never touched \(no reclaim, no deletion, no\s+migration\)/);
     assert.match(recipe, /prepareDshProfileOverlay/);
     assert.match(recipe, /cleanupDshProfileOverlay/);
     assert.match(recipe, /publishDshHomeOverlayToHost/);
+  });
+
+  it("no longer presents the LEGACY run-scoped namespace as the effective home layout", () => {
+    assert.doesNotMatch(recipe, /^<liveStateRoot>\/matchlock\/dsh-profile-overlays\/<bareRunId>\/$/m);
+    assert.doesNotMatch(recipe, /private effective home is deterministic and host-attested/);
+  });
+
+  it("documents the OVERLAY-INV-SCOPED lifecycle fix (§5.1) and its publish policy", () => {
+    assert.match(
+      recipe,
+      /### 5\.1 Per-run dsh profile-overlay lifecycle race — FIXED \(OVERLAY-INV-SCOPED\)/,
+    );
+    assert.match(recipe, /EXCLUSIVELY \(a preexisting directory under that identity is refused, never\s+adopted\)/);
+    assert.match(recipe, /RETAINED with an explicit typed\s+incomplete-cleanup disposition/);
+    assert.match(recipe, /finalization is tracked INDEPENDENTLY of the VM `closed` flag/);
+    assert.match(recipe, /dsh_profile_overlay_publish_conflict/);
+    assert.match(recipe, /<groupingDir>\/<invocationId>\.prepare\.json/);
+    assert.match(recipe, /`dev`\/`ino`\/`size`\/`mtimeMs`/);
+    assert.match(recipe, /\.dsh-profile-publish-locks\/<sha256\(hostHome\)>/);
+    assert.match(recipe, /MONOTONIC clock/);
+    assert.match(recipe, /positively dead \(`ESRCH`\)/);
+    assert.match(recipe, /LEGACY `<...>\/dsh-profile-overlays` namespace is never touched: no\s+reclaim, no deletion, no migration/);
+    assert.match(recipe, /written \(not run in this delivering run\)/);
+    assert.match(recipe, /NOT run in this\s+delivering run/);
+    assert.match(recipe, /cannot boot nested VMs in-guest/);
   });
 
   it("documents that DSH_HOME is unchanged", () => {

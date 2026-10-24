@@ -58,6 +58,10 @@ import {
   type HermesInvocationResult,
 } from "../../../dist/installer/matchlock/hermes-invocation-runner.js";
 import { resolveHermesAdapterPlan, buildHermesGuestLaunch } from "../../../dist/installer/matchlock/hermes-adapter.js";
+import { DatabaseSync } from "node:sqlite";
+import { parseReceipt } from "../../../dist/installer/matchlock/gate-receipt.js";
+import { interactiveStoreMountPlan } from "../../../dist/installer/matchlock/doctor-gate.js";
+import { evaluateAndRecordLaunchGate } from "../../../dist/installer/matchlock/launch-gate-wiring.js";
 import { MatchlockRunnerError } from "../../../dist/installer/matchlock/pi-invocation-runner.js";
 import {
   MATCHLOCK_SOCKET_PATH_ADDED_BYTES,
@@ -794,6 +798,12 @@ interface InvokeOptions {
   signal?: AbortSignal;
   guestEnvOverrides?: Record<string, string>;
   mountAdmission?: { home?: string; liveStateRoot?: string };
+  /** G8 US-012: the attempt gate's allow binding/decision (launch evidence). */
+  launchGate?: import("../../../dist/installer/matchlock/launch-gate-wiring.js").LaunchGateBinding;
+  launchGateDecision?: Extract<
+    import("../../../dist/installer/matchlock/launch-gate-wiring.js").LaunchGateDecision,
+    { action: "allow" }
+  >;
   label: string;
   createTimeoutMs?: number;
   requestTimeoutMs?: number;
@@ -829,6 +839,8 @@ function invoke(opts: InvokeOptions): Promise<HermesInvocationResult> {
     rpcEnv: opts.rpcEnv ?? opts.driver.env,
     guestEnvOverrides: opts.guestEnvOverrides,
     mountAdmission: opts.mountAdmission ?? { home: process.env.HOME, liveStateRoot: path.join(opts.rig.root, "state") },
+    ...(opts.launchGate !== undefined ? { launchGate: opts.launchGate } : {}),
+    ...(opts.launchGateDecision !== undefined ? { launchGateDecision: opts.launchGateDecision } : {}),
     closeTimeoutSeconds: 25,
     createTimeoutMs: opts.createTimeoutMs ?? 15000,
     requestTimeoutMs: opts.requestTimeoutMs ?? 15000,
@@ -1274,6 +1286,102 @@ describe("hermes invocation runner (mock local-VM driver; real broker/services/p
     );
     assert.ok(String(harness.command).includes("'Implement the fixture '\\''quoted'\\'' prompt.'"), "prompt shell-quoted exactly");
     assert.equal(String(harness.cwd), rig.repoDir, "host-identical guest cwd");
+  });
+
+  // ── G8 US-012: the launch receipt is written AFTER the VM exists ────────
+  it("G8 US-012: writes the action:launched receipt only once the VM exists (the allow decision is the evidence input)", async () => {
+    const rig = makeRig("hermes-launch-receipt");
+    const registry = new HostInvocationRegistry();
+    const saveClaimTo = path.join(rig.root, "hermes-claim-launch.json");
+    const stepRow = randomUUID();
+    rig.st.insertStep({
+      id: stepRow,
+      runId: RUN,
+      stepId: "implement",
+      agentId: AGENT,
+      stepIndex: 0,
+      inputTemplate: "launch receipt fixture task",
+      status: "pending",
+      type: "single",
+      expects: "STATUS: done\nCHANGES:",
+      maxRetries: 2,
+    });
+
+    // A REAL allow decision from the production wiring over a disposable
+    // rollback-format profile home. The receipt is the gate's own evidence slot.
+    const gateHome = path.join(rig.root, "gate-profile");
+    fs.mkdirSync(gateHome, { recursive: true });
+    fs.writeFileSync(path.join(gateHome, "config.yaml"), "database:\n  journal_mode: delete\n");
+    const gateStore = new DatabaseSync(path.join(gateHome, "state.db"));
+    gateStore.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)");
+    gateStore.close();
+    const decision = evaluateAndRecordLaunchGate(
+      {
+        kind: "scheduled-attempt",
+        invocationId: INV_A,
+        runId: `run-${RUN}`,
+        roundId: "job-g8-us012",
+        profileHome: gateHome,
+        mountPlan: interactiveStoreMountPlan(gateHome),
+        configOptions: { managedDir: null },
+      },
+      {
+        now: () => "2026-10-24T00:00:00.000Z",
+        stateDir: path.join(rig.root, "gate-state"),
+        configOptions: { managedDir: null },
+      } as never,
+    );
+    assert.equal(decision.action, "allow", "the disposable profile must be admitted by the real gate");
+    if (decision.action !== "allow") return;
+    const receiptPath = decision.binding.receiptPath;
+    assert.equal(
+      fs.existsSync(receiptPath),
+      false,
+      "the gate writes NO receipt on the allow path (a launch receipt requires vmCreated)",
+    );
+
+    const driver = makeDriver({ transcriptPath: freshTranscript(), configGuest: GUEST_HERMES_HOME, configHost: rig.hermesDir });
+    const fakeHermes = writeFakeHermes("work", {
+      runId: RUN,
+      sessionId: SESSION_ID,
+      saveClaimTo,
+      outputText: "launch receipt round\nSTATUS: done\nCHANGES: runner\nTESTS: runner\n",
+    });
+    const result = await withTimeout(
+      invoke({
+        rig,
+        driver,
+        fakeHermes,
+        invocationId: INV_A,
+        kind: "work",
+        promptText: "Launch receipt fixture task.",
+        registry,
+        timeoutMs: 120000,
+        launchGate: decision.binding,
+        launchGateDecision: decision,
+        label: "launch receipt round",
+      }),
+      240000,
+      "launch receipt round",
+    );
+    assert.equal(result.exitCode, 0, `exit; stderr: ${result.stderrTail}`);
+    assert.match(result.vmId ?? "", /^vm-[0-9a-f]{8}-1$/);
+
+    // The receipt exists only because a VM did: action launched, verdict allow,
+    // vmCreated true, and the invocation kind is THIS attempt's.
+    assert.ok(fs.existsSync(receiptPath), `launch receipt missing at ${receiptPath}`);
+    const receipt = parseReceipt(fs.readFileSync(receiptPath, "utf8").trimEnd());
+    assert.equal(receipt.action, "launched");
+    assert.equal(receipt.verdict, "allow");
+    // The G9 receipt schema is CLOSED: `vmCreated` is the writer's precondition,
+    // not a receipt field — `action: "launched"` is the recorded fact.
+    assert.equal(receipt.invocation.kind, "scheduled-attempt");
+    assert.deepEqual(receipt.findings, []);
+
+    const lines = readTranscript(driver.env.FAKE_TRANSCRIPT_FILE!);
+    assert.equal(lines.filter((l) => l.method === "create").length, 1, "exactly one create");
+    assert.ok(lines.some((l) => l.event === "vm_created"));
+    assert.ok(lines.some((l) => l.event === "vm_closed"), "owned VM positively closed");
   });
 
   // ── US-006 (H1/D1): a rejected harness exec is surfaced, never swallowed ─

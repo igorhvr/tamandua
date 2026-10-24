@@ -14,8 +14,9 @@
  * (run #10, reproduced by #26 — see the mtlk-probe-transient investigation).
  *
  * This module is the pure, host-attested planner for the fix:
- * `prepareDshProfileOverlay` stages a PRIVATE per-run EFFECTIVE HOME at
- * `<liveState>/matchlock/dsh-profile-overlays/<runId>`:
+ * `prepareDshProfileOverlay` stages a PRIVATE per-INVOCATION EFFECTIVE HOME at
+ * `<liveState>/matchlock/dsh-profile-invocations/<runId>/<invocationId>`
+ * (OVERLAY-INV-SCOPED):
  *
  *   - `profiles/` is the private copy (durable config files copied, install-
  *     derived dirs empty) that the guest populates from its own dsh install, so
@@ -35,12 +36,35 @@
  * with no provider to fsync: the run-#35 `dsh: ENOENT: no such file or
  * directory, fsync` failure on the home root.
  *
+ * PUBLISH POLICY (OVERLAY-INV-SCOPED R3). Prepare records a HOST-side
+ * provenance manifest (one `lstat` fingerprint per durable host file, written
+ * under the run's host-only grouping dir — never inside the guest-writable
+ * overlay) so publish can distinguish a legitimate update from an independently
+ * changed host destination:
+ *
+ *   - same inode as the staged hard link: write-through, nothing to do;
+ *   - byte-identical destination: retry-safe no-op;
+ *   - host destination unchanged since prepare (fingerprint match): a
+ *     LEGITIMATE UPDATE flows (the guest's newer bytes are published);
+ *   - otherwise an INDEPENDENTLY CHANGED destination is a TRUE CONFLICT: it is
+ *     RETAINED (never silently overwritten) with a typed
+ *     `dsh_profile_overlay_publish_conflict` disposition, and the caller keeps
+ *     the invocation root that holds the losing copy.
+ *
+ * Publication is serialized at the shared host-home boundary with a bounded
+ * cross-process lock (`mkdir`-atomic, keyed by the host home) so a run's two
+ * invocations finishing simultaneously cannot lose an artifact through a
+ * read-modify-write race. `profiles/` is never published.
+ *
  * The module is deliberately Node-core ONLY (no `node:child_process`, no host
  * administrative imports) so it stays safe for the portable RO guest helper
  * pack closure. It performs presence/metadata inspection only (`lstat` /
- * `readdir` / `readlink`) and NEVER reads file contents.
+ * `readdir` / `readlink`) plus reading its OWN host-side provenance manifest
+ * and the publish-time byte comparison of a destination; it NEVER reads
+ * durable host file contents during prepare.
  */
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -50,13 +74,46 @@ export const DSH_PROFILES_DIR_NAME = "profiles";
 export const DSH_NODE_MODULES_DIR_NAME = "node_modules";
 /** Per-profile install-derived module-fallback marker directory. */
 export const DSH_MODULE_FALLBACK_DIR_NAME = ".dsh-module-fallback";
-/** Live-state parent directory holding the per-run private overlay roots. */
+/** Live-state parent directory holding the LEGACY per-run private overlay roots. */
 export const MATCHLOCK_DSH_OVERLAY_PARENT_DIR_NAME = "dsh-profile-overlays";
+/**
+ * OVERLAY-INV-SCOPED: live-state parent directory holding the NEW
+ * per-invocation private overlay roots. This is a DISJOINT, versioned sibling
+ * namespace of {@link MATCHLOCK_DSH_OVERLAY_PARENT_DIR_NAME}: it is never
+ * nested inside the legacy parent, so an old-runtime
+ * `cleanupDshProfileOverlay` (which recursively removes
+ * `<...>/dsh-profile-overlays/<runId>`) can never delete a live invocation
+ * root. The legacy namespace is NEVER touched by the new lifecycle — no
+ * reclaim, no deletion, no migration.
+ */
+export const MATCHLOCK_DSH_INVOCATION_PARENT_DIR_NAME = "dsh-profile-invocations";
 /** Live-state `matchlock` segment. */
 export const MATCHLOCK_DIR_NAME = "matchlock";
 
+/**
+ * Bounded host-home publication lock. `mkdir` is atomic on every POSIX
+ * filesystem, so an exclusive `mkdir` of the lock directory serializes
+ * concurrent finalizers of a run (in-process or cross-process). The wait is
+ * bounded on the MONOTONIC clock (`process.hrtime.bigint`, never wall-clock
+ * arithmetic), and a lock whose owner pid is no longer alive is broken so a
+ * crashed holder cannot deadlock a later invocation.
+ */
+const PUBLISH_LOCK_DIR_NAME = ".dsh-profile-publish-locks";
+const PUBLISH_LOCK_OWNER_FILE_NAME = "owner";
+/** Default bound for the shared host-home publication lock (milliseconds). */
+export const PUBLISH_LOCK_TIMEOUT_MS = 30_000;
+const PUBLISH_LOCK_POLL_MS = 20;
+/** Version of the host-side prepare-time provenance manifest. */
+const PROVENANCE_MANIFEST_VERSION = 1;
+
 const RUN_ID_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * Host-generated per-invocation identity shape emitted by the controller
+ * (`inv-<random hex>-<timestamp hex>`). Validated before it is ever joined into
+ * an overlay path so a malformed id can never escape the invocation parent.
+ */
+const INVOCATION_ID_RE = /^inv-[0-9a-f]+-[0-9a-f]+$/i;
 
 export class DshProfileOverlayError extends Error {
   readonly code: string;
@@ -118,45 +175,144 @@ export function assertDshOverlayRunId(runId: string): string {
 }
 
 /**
- * Deterministic host overlay root for a run:
- * `<liveStateRoot>/matchlock/dsh-profile-overlays/<bareRunId>`.
+ * Validate and normalize a host-generated invocation id for a dsh
+ * profile-overlay root. The id is transient/derived (never stored policy) and
+ * only ever produced by the controller. Refusing anything that is not
+ * `inv-<hex>-<hex>` guarantees the joined path can never escape the
+ * per-invocation parent below `<runId>`.
  */
-export function dshProfileOverlayRoot(runId: string, liveStateRoot: string): string {
+export function assertDshOverlayInvocationId(invocationId: string): string {
+  if (
+    typeof invocationId !== "string" ||
+    invocationId.length === 0 ||
+    invocationId.length > 64
+  ) {
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_invocation_id",
+      `Refusing malformed dsh overlay invocation id: ${JSON.stringify(invocationId)}`,
+    );
+  }
+  if (
+    !INVOCATION_ID_RE.test(invocationId) ||
+    invocationId.includes("/") ||
+    invocationId.includes("\\")
+  ) {
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_invocation_id",
+      `Refusing dsh profile overlay for non-invocation id: ${JSON.stringify(invocationId)}`,
+    );
+  }
+  return invocationId;
+}
+
+/**
+ * Deterministic host overlay root for ONE invocation:
+ * `<liveStateRoot>/matchlock/dsh-profile-invocations/<bareRunId>/<invocationId>`.
+ *
+ * The namespace is DISJOINT from the legacy run-scoped
+ * `<liveStateRoot>/matchlock/dsh-profile-overlays/<bareRunId>` and is never
+ * nested inside it, so a legacy cleanup can never recursively delete a live
+ * invocation root. Every invocation gets its OWN root; no two invocations
+ * share one and a successor never reuses a predecessor's root.
+ */
+export function dshProfileOverlayRoot(
+  runId: string,
+  invocationId: string,
+  liveStateRoot: string,
+): string {
+  const bare = assertDshOverlayRunId(runId);
+  const inv = assertDshOverlayInvocationId(invocationId);
+  return path.join(
+    normalize(liveStateRoot),
+    MATCHLOCK_DIR_NAME,
+    MATCHLOCK_DSH_INVOCATION_PARENT_DIR_NAME,
+    bare,
+    inv,
+  );
+}
+
+/**
+ * The `<liveStateRoot>/matchlock/dsh-profile-invocations/<bareRunId>` grouping
+ * directory that holds the invocation roots of one run. It may be pruned
+ * best-effort ONLY when it is empty; it is never removed recursively while
+ * another invocation could still own a root inside it.
+ */
+export function dshProfileInvocationGroupRoot(runId: string, liveStateRoot: string): string {
   const bare = assertDshOverlayRunId(runId);
   return path.join(
     normalize(liveStateRoot),
     MATCHLOCK_DIR_NAME,
-    MATCHLOCK_DSH_OVERLAY_PARENT_DIR_NAME,
+    MATCHLOCK_DSH_INVOCATION_PARENT_DIR_NAME,
     bare,
   );
 }
 
 /**
- * Structural shape of an overlay root: the leaf is a uuid and its parents are
- * `dsh-profile-overlays/matchlock`. This is the only shape
- * `planDshHomeMounts` will accept as an overlay source root.
+ * Host-side prepare-time provenance manifest for ONE invocation. It lives as a
+ * SIBLING of the invocation root under the host-only grouping directory (the
+ * grouping dir is never mounted, so the guest can never read or tamper with
+ * it), and is derived only from the host-attested run id + invocation id +
+ * live-state root. Removed with the overlay on a successful finalization.
+ */
+export function dshProfileOverlayProvenancePath(
+  runId: string,
+  invocationId: string,
+  liveStateRoot: string,
+): string {
+  const bare = assertDshOverlayRunId(runId);
+  const inv = assertDshOverlayInvocationId(invocationId);
+  return path.join(dshProfileInvocationGroupRoot(bare, liveStateRoot), `${inv}.prepare.json`);
+}
+
+/**
+ * Lock directory keyed by the HOST HOME (the shared publication boundary) and
+ * stored under the host-only live state, so two invocations of one run (same
+ * live state + same host home) serialize even across processes. The guest can
+ * never reach it: only the invocation ROOT is mounted.
+ */
+export function dshProfilePublishLockPath(liveStateRoot: string, hostHome: string): string {
+  const digest = createHash("sha256").update(normalize(hostHome)).digest("hex").slice(0, 24);
+  return path.join(normalize(liveStateRoot), MATCHLOCK_DIR_NAME, PUBLISH_LOCK_DIR_NAME, digest);
+}
+
+/**
+ * Structural shape of a per-invocation overlay root: the leaf is an invocation
+ * id, its parent is a bare run uuid, and its grandparents are
+ * `dsh-profile-invocations/matchlock`. This is the only shape
+ * `planDshHomeMounts` will accept as an overlay source root; the legacy
+ * `<...>/dsh-profile-overlays/<uuid>` shape is explicitly REJECTED.
  */
 export function isDshProfileOverlayRootShape(hostPath: string): boolean {
   const parts = normalize(hostPath)
     .split(path.sep)
     .filter((s) => s !== "");
-  if (parts.length < 3) return false;
-  const bare = parts[parts.length - 1];
+  if (parts.length < 4) return false;
+  const invocationId = parts[parts.length - 1];
+  const bare = parts[parts.length - 2];
   return (
+    INVOCATION_ID_RE.test(invocationId) &&
     RUN_ID_UUID_RE.test(bare) &&
-    parts[parts.length - 2] === MATCHLOCK_DSH_OVERLAY_PARENT_DIR_NAME &&
-    parts[parts.length - 3] === MATCHLOCK_DIR_NAME
+    parts[parts.length - 3] === MATCHLOCK_DSH_INVOCATION_PARENT_DIR_NAME &&
+    parts[parts.length - 4] === MATCHLOCK_DIR_NAME
   );
 }
 
-/** True ONLY for the exact deterministic per-run overlay root of a bound run. */
+/**
+ * True ONLY for the exact deterministic per-invocation overlay root of a bound
+ * run + invocation. Any other path (another invocation's root, a legacy
+ * run-scoped root, an arbitrary directory) fails closed.
+ */
 export function isHostAttestedDshProfileOverlay(
   hostPath: string,
   runId: string,
+  invocationId: string,
   liveStateRoot: string,
 ): boolean {
   try {
-    return normalize(hostPath) === normalize(dshProfileOverlayRoot(runId, liveStateRoot));
+    return (
+      normalize(hostPath) ===
+      normalize(dshProfileOverlayRoot(runId, invocationId, liveStateRoot))
+    );
   } catch {
     return false;
   }
@@ -216,7 +372,9 @@ export function discoverDshInstallDerivedDirs(hostHome: string): string[] {
 export interface DshProfileOverlayLayout {
   /** The bare (unprefixed) run id the overlay is bound to. */
   readonly runId: string;
-  /** Host-attested private overlay root for the run. */
+  /** The host-generated invocation id this overlay root is exclusively bound to. */
+  readonly invocationId: string;
+  /** Host-attested private overlay root for the invocation. */
   readonly overlayRoot: string;
   /** Host-home-relative install-derived paths with a private dir created. */
   readonly relPaths: string[];
@@ -266,6 +424,52 @@ function ensureRealDirNoFollowOrCreate(dir: string, code: string): void {
       code,
       `Dsh profile overlay path ${dir} is not a real directory; refusing a symlinked or foreign overlay root.`,
     );
+  }
+}
+
+/**
+ * OVERLAY-INV-SCOPED exclusive allocation: create the invocation root with a
+ * non-recursive `mkdir` and REFUSE to adopt a preexisting directory under this
+ * invocation's own identity. A successor/retry therefore never reuses a
+ * predecessor's (or a crash-leftover) root, and a symlinked/non-directory
+ * component can never be followed.
+ */
+function allocateExclusiveDirNoFollow(dir: string, code: string): void {
+  try {
+    fs.mkdirSync(dir);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "EEXIST") {
+      throw new DshProfileOverlayError(
+        code,
+        `Refusing to adopt preexisting dsh profile overlay root ${dir}; every invocation allocates its own exclusive root (never a successor reuse).`,
+      );
+    }
+    throw new DshProfileOverlayError(
+      code,
+      `Could not create dsh profile overlay root ${dir}: ${e.message}`,
+    );
+  }
+  const st = lstatOrUndefined(dir);
+  if (!st || st.isSymbolicLink() || !st.isDirectory()) {
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_foreign_root",
+      `Dsh profile overlay root ${dir} is not a real directory; refusing a symlinked or foreign overlay root.`,
+    );
+  }
+}
+
+/**
+ * Best-effort removal of an EMPTY grouping directory (never recursive, never
+ * following a symlink). A non-empty directory (another invocation still owns a
+ * root inside), a missing directory, a symlink and any permission error are
+ * all ignored: the grouping dir is only collapsed when it is genuinely empty.
+ */
+function pruneEmptyDirIfEmpty(dir: string): void {
+  try {
+    fs.rmdirSync(dir);
+  } catch {
+    /* not empty, absent, a symlink, or not removable: leave it untouched */
   }
 }
 
@@ -516,31 +720,43 @@ function stageDurableTopLevelEntry(hostHome: string, overlayRoot: string, name: 
 }
 
 /**
- * Create the per-run private overlay root, stage a private copy of the whole
- * host `profiles/` tree under it, one real directory per install-derived host
- * path, and an EFFECTIVE HOME for every durable top-level host entry. The
+ * Create THIS invocation's private overlay root, stage a private copy of the
+ * whole host `profiles/` tree under it, one real directory per install-derived
+ * host path, and an EFFECTIVE HOME for every durable top-level host entry. The
  * effective home is mounted as ONE real host-backed directory at the guest
  * `$DSH_HOME`, which is what makes the home root itself a real, writable,
  * fsync-able directory (a synthesized router root has no host provider and
- * fails `fsync`). Idempotent. Refuses a symlinked/foreign overlay root, or a
- * non-directory component, with a typed error. Never touches the host home.
+ * fails `fsync`).
+ *
+ * OVERLAY-INV-SCOPED: the root is
+ * `<liveStateRoot>/matchlock/dsh-profile-invocations/<bareRunId>/<invocationId>`
+ * and is allocated EXCLUSIVELY (a preexisting directory under this identity is
+ * refused, never adopted), so two invocations of one run can never share a
+ * root and a successor never reuses a predecessor's. Refuses a
+ * symlinked/foreign overlay root or a non-directory component with a typed
+ * error. `profiles/` is staged fresh; this call is NOT idempotent on a
+ * preexisting root by design. Never touches the host home.
  */
 export function prepareDshProfileOverlay(
   runId: string,
+  invocationId: string,
   liveStateRoot: string,
   hostHome: string,
 ): DshProfileOverlayLayout {
   const bare = assertDshOverlayRunId(runId);
+  const inv = assertDshOverlayInvocationId(invocationId);
   const live = normalize(liveStateRoot);
   fs.mkdirSync(live, { recursive: true });
 
   const host = normalize(hostHome);
   const matchlockDir = path.join(live, MATCHLOCK_DIR_NAME);
-  const overlaysDir = path.join(matchlockDir, MATCHLOCK_DSH_OVERLAY_PARENT_DIR_NAME);
-  const root = dshProfileOverlayRoot(bare, live);
+  const invocationsDir = path.join(matchlockDir, MATCHLOCK_DSH_INVOCATION_PARENT_DIR_NAME);
+  const groupDir = path.join(invocationsDir, bare);
+  const root = dshProfileOverlayRoot(bare, inv, live);
   ensureRealDirNoFollowOrCreate(matchlockDir, "dsh_profile_overlay_foreign_root");
-  ensureRealDirNoFollowOrCreate(overlaysDir, "dsh_profile_overlay_foreign_root");
-  ensureRealDirNoFollowOrCreate(root, "dsh_profile_overlay_foreign_root");
+  ensureRealDirNoFollowOrCreate(invocationsDir, "dsh_profile_overlay_foreign_root");
+  ensureRealDirNoFollowOrCreate(groupDir, "dsh_profile_overlay_foreign_root");
+  allocateExclusiveDirNoFollow(root, "dsh_profile_overlay_root_exists");
 
   const relPaths = discoverDshInstallDerivedDirs(host);
   const { profilesStaged, stagedProfilePaths } = stageDshProfilesTree(host, root, relPaths);
@@ -569,8 +785,16 @@ export function prepareDshProfileOverlay(
     stagedHomeEntries.push(dirent.name);
   }
 
+  // R3: record the HOST-side prepare-time provenance of every durable host file
+  // (never `profiles/`) BEFORE any consumer can run, so publish can later
+  // distinguish a legitimate update from an independently changed destination.
+  // The manifest is host-only (a sibling of the mounted root); a failure to
+  // write it fails closed before `create`.
+  writeProvenanceManifest(bare, inv, live, host);
+
   return {
     runId: bare,
+    invocationId: inv,
     overlayRoot: root,
     relPaths,
     profilesStaged,
@@ -580,27 +804,56 @@ export function prepareDshProfileOverlay(
 }
 
 /**
- * Remove ONLY the attested per-run overlay root. Idempotent (absent root is a
- * no-op). A symlinked or non-directory path at the attested location is
- * refused (never followed, never removed) — no other path is ever touched.
+ * Remove ONLY the attested PER-INVOCATION overlay root. Idempotent (absent root
+ * is a no-op). A symlinked or non-directory path at the attested location is
+ * refused (never followed, never removed). After a successful removal the
+ * run's empty grouping directory and the `dsh-profile-invocations` parent are
+ * pruned best-effort ONLY when empty (never recursively): another invocation's
+ * root is never touched. The LEGACY `<...>/dsh-profile-overlays` namespace is
+ * NEVER touched by this lifecycle — no reclaim, no deletion, no migration.
  */
-export function cleanupDshProfileOverlay(runId: string, liveStateRoot: string): void {
-  const root = dshProfileOverlayRoot(runId, liveStateRoot);
-  if (!isHostAttestedDshProfileOverlay(root, runId, liveStateRoot)) {
+export function cleanupDshProfileOverlay(
+  runId: string,
+  invocationId: string,
+  liveStateRoot: string,
+): void {
+  const bare = assertDshOverlayRunId(runId);
+  const inv = assertDshOverlayInvocationId(invocationId);
+  const live = normalize(liveStateRoot);
+  const invocationGroup = path.join(
+    live,
+    MATCHLOCK_DIR_NAME,
+    MATCHLOCK_DSH_INVOCATION_PARENT_DIR_NAME,
+    bare,
+  );
+  const invocationsDir = path.join(live, MATCHLOCK_DIR_NAME, MATCHLOCK_DSH_INVOCATION_PARENT_DIR_NAME);
+  const root = dshProfileOverlayRoot(bare, inv, live);
+  if (!isHostAttestedDshProfileOverlay(root, bare, inv, live)) {
     throw new DshProfileOverlayError(
       "dsh_profile_overlay_foreign_root",
       `Refusing to clean up non-attested dsh profile overlay root: ${root}`,
     );
   }
   const st = lstatOrUndefined(root);
-  if (!st) return;
-  if (st.isSymbolicLink() || !st.isDirectory()) {
-    throw new DshProfileOverlayError(
-      "dsh_profile_overlay_foreign_root",
-      `Refusing to remove symlinked/non-directory dsh profile overlay root: ${root}`,
-    );
+  if (st) {
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new DshProfileOverlayError(
+        "dsh_profile_overlay_foreign_root",
+        `Refusing to remove symlinked/non-directory dsh profile overlay root: ${root}`,
+      );
+    }
+    fs.rmSync(root, { recursive: true, force: false });
   }
-  fs.rmSync(root, { recursive: true, force: false });
+  // Remove THIS invocation's host-side provenance manifest (a symlink is
+  // unlinked, never followed) so the empty grouping dirs can collapse. A
+  // retained overlay keeps its manifest (it is still needed for a later
+  // ownership-verified re-attempt); only a completed cleanup removes it.
+  fs.rmSync(dshProfileOverlayProvenancePath(bare, inv, live), { force: true });
+  // Best-effort collapse of OUR empty grouping dirs only. Never recursive, so
+  // a sibling invocation root inside the group dir is never touched, and the
+  // LEGACY `dsh-profile-overlays` namespace is never referenced at all.
+  pruneEmptyDirIfEmpty(invocationGroup);
+  pruneEmptyDirIfEmpty(invocationsDir);
 }
 
 // ── Composed dsh home mount plan ────────────────────────────────────
@@ -796,7 +1049,7 @@ export function planDshHomeMounts(
   if (!isDshProfileOverlayRootShape(overlay)) {
     throw new DshProfileOverlayError(
       "dsh_profile_overlay_foreign_root",
-      `Dsh profile overlay root ${overlay} is not an attested <liveState>/matchlock/dsh-profile-overlays/<uuid> path.`,
+      `Dsh profile overlay root ${overlay} is not an attested <liveState>/matchlock/dsh-profile-invocations/<runId>/<invocationId> path.`,
     );
   }
   if (isBroadDshMountSource(host)) {
@@ -868,13 +1121,313 @@ function sameInode(a: fs.Stats, b: fs.Stats): boolean {
 }
 
 /**
- * Publish one entry of the effective home back to the host home. A directory is
- * created (when missing) and recursed; a regular file whose host path is a
- * DIFFERENT inode (new or atomically replaced in the guest) is copied with its
- * permission bits; an unchanged hard-linked file is skipped. A symlink or
- * special entry is refused. `profiles/` is never published by the caller.
+ * Prepare-time fingerprint of one HOST destination file. Recorded on the host
+ * (never inside the guest-writable overlay) at prepare time so publish can tell
+ * "unchanged since prepare" (a legitimate update) from an independently changed
+ * destination (a true conflict). `mtimeMs` catches in-place writes, `ino`
+ * catches atomic replacement, `size` catches truncation/growth and `dev` pins
+ * the filesystem. `ctime` is deliberately NOT included: unlinking our own
+ * staged hard link between prepare and publish bumps the host inode's ctime
+ * while leaving its identity and content untouched, which must remain a
+ * legitimate update rather than a spurious conflict.
  */
-function publishEffectiveHomeEntry(overlayPath: string, hostPath: string): void {
+interface HostFileFingerprint {
+  readonly dev: number;
+  readonly ino: number;
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
+interface DshProfileOverlayProvenance {
+  readonly version: number;
+  readonly runId: string;
+  readonly invocationId: string;
+  readonly hostHome: string;
+  readonly files: Record<string, HostFileFingerprint>;
+}
+
+function fingerprintOf(st: fs.Stats): HostFileFingerprint {
+  return { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs };
+}
+
+function isHostFileFingerprint(value: unknown): value is HostFileFingerprint {
+  if (!value || typeof value !== "object") return false;
+  const fp = value as Record<string, unknown>;
+  return (
+    typeof fp.dev === "number" &&
+    typeof fp.ino === "number" &&
+    typeof fp.size === "number" &&
+    typeof fp.mtimeMs === "number" &&
+    Number.isFinite(fp.dev) &&
+    Number.isFinite(fp.ino) &&
+    Number.isFinite(fp.size) &&
+    Number.isFinite(fp.mtimeMs)
+  );
+}
+
+/**
+ * Walk every durable host entry (never `profiles/`) and record a fingerprint
+ * for each regular file. Presence/metadata only — no file contents are read.
+ * Symlinked entries are skipped here (staging refuses them anyway, and a
+ * symlinked destination must never be a publish target).
+ */
+function recordHostFileFingerprints(
+  hostHome: string,
+  relPath: string,
+  files: Record<string, HostFileFingerprint>,
+): void {
+  const full = path.join(hostHome, relPath);
+  const st = lstatOrUndefined(full);
+  if (!st || st.isSymbolicLink()) return;
+  if (st.isFile()) {
+    files[relPath] = fingerprintOf(st);
+    return;
+  }
+  if (st.isDirectory()) {
+    for (const dirent of readdirDirents(full)) {
+      recordHostFileFingerprints(hostHome, path.join(relPath, dirent.name), files);
+    }
+  }
+}
+
+/**
+ * Write THIS invocation's prepare-time provenance manifest to its host-only
+ * location. Atomic (`tmp` + `rename`) so a concurrent reader never sees a torn
+ * manifest. The parent grouping dir is host-derived and never mounted.
+ */
+function writeProvenanceManifest(
+  bare: string,
+  inv: string,
+  live: string,
+  hostHome: string,
+): void {
+  const files: Record<string, HostFileFingerprint> = {};
+  for (const dirent of readdirDirents(hostHome)) {
+    if (dirent.name === DSH_PROFILES_DIR_NAME) continue;
+    recordHostFileFingerprints(hostHome, dirent.name, files);
+  }
+  const manifest: DshProfileOverlayProvenance = {
+    version: PROVENANCE_MANIFEST_VERSION,
+    runId: bare,
+    invocationId: inv,
+    hostHome: normalize(hostHome),
+    files,
+  };
+  const manifestPath = dshProfileOverlayProvenancePath(bare, inv, live);
+  try {
+    fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+    const tmp = `${manifestPath}.tmp-${process.pid}-${process.hrtime.bigint().toString(16)}`;
+    fs.writeFileSync(tmp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    try {
+      fs.renameSync(tmp, manifestPath);
+    } catch (err) {
+      fs.rmSync(tmp, { force: true });
+      throw err;
+    }
+  } catch (err) {
+    // Fail closed: without provenance a publish could not distinguish a
+    // legitimate update from an independent change, so never start `create`.
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_publish_failed",
+      `Could not record dsh overlay provenance manifest ${manifestPath}: ${(err as Error).message}`,
+    );
+  }
+}
+
+/**
+ * Read and identity-validate THIS invocation's provenance manifest. Returns an
+ * empty map when the manifest is absent (a pre-fix/crash leftover, or a caller
+ * that never prepared): publish then treats a differently-shaped existing
+ * destination conservatively as an independent change. A malformed or
+ * identity-mismatched manifest is REFUSED, never trusted.
+ */
+function readProvenanceManifest(
+  bare: string,
+  inv: string,
+  live: string,
+  hostHome: string,
+): Map<string, HostFileFingerprint> {
+  const manifestPath = dshProfileOverlayProvenancePath(bare, inv, live);
+  const st = lstatOrUndefined(manifestPath);
+  if (!st) return new Map();
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_provenance_mismatch",
+      `Refusing non-regular dsh overlay provenance manifest ${manifestPath}.`,
+    );
+  }
+  let parsed: DshProfileOverlayProvenance;
+  try {
+    parsed = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as DshProfileOverlayProvenance;
+  } catch (err) {
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_provenance_mismatch",
+      `Refusing unparseable dsh overlay provenance manifest ${manifestPath}: ${(err as Error).message}`,
+    );
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    parsed.version !== PROVENANCE_MANIFEST_VERSION ||
+    parsed.runId !== bare ||
+    parsed.invocationId !== inv ||
+    normalize(String(parsed.hostHome)) !== normalize(hostHome) ||
+    typeof parsed.files !== "object" ||
+    parsed.files === null ||
+    Array.isArray(parsed.files) ||
+    Object.values(parsed.files).some((fp) => !isHostFileFingerprint(fp))
+  ) {
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_provenance_mismatch",
+      `Refusing dsh overlay provenance manifest whose identity or shape does not match (run=${bare}, invocation=${inv}, host=${normalize(hostHome)}): ${manifestPath}`,
+    );
+  }
+  return new Map(Object.entries(parsed.files));
+}
+
+/** True when a host file is byte-identical to its overlay counterpart. */
+function filesEqual(a: string, b: string): boolean {
+  const sa = lstatOrUndefined(a);
+  const sb = lstatOrUndefined(b);
+  if (!sa || !sb || !sa.isFile() || !sb.isFile() || sa.size !== sb.size) return false;
+  const fa = fs.openSync(a, "r");
+  const fb = fs.openSync(b, "r");
+  try {
+    const bufA = Buffer.allocUnsafe(64 * 1024);
+    const bufB = Buffer.allocUnsafe(64 * 1024);
+    let pos = 0;
+    while (pos < sa.size) {
+      const n = Math.min(bufA.length, sa.size - pos);
+      const ra = fs.readSync(fa, bufA, 0, n, pos);
+      const rb = fs.readSync(fb, bufB, 0, n, pos);
+      if (ra !== rb) return false;
+      if (!bufA.subarray(0, ra).equals(bufB.subarray(0, rb))) return false;
+      pos += ra;
+    }
+    return true;
+  } finally {
+    fs.closeSync(fa);
+    fs.closeSync(fb);
+  }
+}
+
+function fingerprintsMatch(st: fs.Stats, fp: HostFileFingerprint): boolean {
+  return (
+    st.dev === fp.dev &&
+    st.ino === fp.ino &&
+    st.size === fp.size &&
+    st.mtimeMs === fp.mtimeMs
+  );
+}
+
+// ── Bounded shared host-home publication lock ───────────────────────
+
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function publishLockOwnerPath(lockPath: string): string {
+  return path.join(lockPath, PUBLISH_LOCK_OWNER_FILE_NAME);
+}
+
+/** True when the lock's recorded owner pid is positively dead on this host. */
+function publishLockOwnerIsDead(lockPath: string): boolean {
+  const raw = (() => {
+    try {
+      return fs.readFileSync(publishLockOwnerPath(lockPath), "utf8").trim();
+    } catch {
+      return "";
+    }
+  })();
+  const pid = Number.parseInt(raw, 10);
+  if (!Number.isInteger(pid) || pid <= 0) return false; // unreadable/unowned: never break
+  try {
+    process.kill(pid, 0);
+    return false; // still alive (or EPERM: alive for another user)
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+function acquirePublishLock(lockPath: string, timeoutMs = PUBLISH_LOCK_TIMEOUT_MS): void {
+  try {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  } catch (err) {
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_publish_lock_failed",
+      `Could not create the dsh overlay publication lock parent for ${lockPath}: ${(err as Error).message}`,
+    );
+  }
+  // MONOTONIC bound (never wall-clock arithmetic): an NTP step or
+  // suspend/resume can never inflate or shrink the wait.
+  const timeoutNs = BigInt(timeoutMs) * 1_000_000n;
+  const startedNs = process.hrtime.bigint();
+  for (;;) {
+    try {
+      fs.mkdirSync(lockPath);
+      // Record ownership so a crashed holder's pid can be probed next time.
+      fs.writeFileSync(publishLockOwnerPath(lockPath), `${process.pid}\n`, "utf8");
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        throw new DshProfileOverlayError(
+          "dsh_profile_overlay_publish_lock_failed",
+          `Could not acquire dsh overlay publication lock ${lockPath}: ${(err as Error).message}`,
+        );
+      }
+    }
+    if (publishLockOwnerIsDead(lockPath)) {
+      // A crashed holder must not deadlock a later invocation. Breaking the
+      // lock directory is not an overlay deletion and carries no consumer
+      // authority. A live/unknown owner is NEVER broken; the wait is bounded.
+      try {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+      } catch {
+        /* another waiter may have broken it first */
+      }
+      continue;
+    }
+    if (process.hrtime.bigint() - startedNs > timeoutNs) {
+      throw new DshProfileOverlayError(
+        "dsh_profile_overlay_publish_lock_timeout",
+        `Timed out after ${timeoutMs}ms waiting for the dsh overlay publication lock ${lockPath}.`,
+      );
+    }
+    sleepSyncMs(PUBLISH_LOCK_POLL_MS);
+  }
+}
+
+function releasePublishLock(lockPath: string): void {
+  try {
+    fs.rmSync(lockPath, { recursive: true, force: true });
+  } catch {
+    /* best effort — a dead-owner probe recovers a leaked lock */
+  }
+}
+
+// ── Publish policy ─────────────────────────────────────────────────
+
+/**
+ * Publish one entry of the effective home back to the host home under the
+ * documented collision policy. Directories are created/merged; files are
+ * classified against their prepare-time host provenance:
+ *
+ *   - same inode as the staged hard link => write-through, nothing to do;
+ *   - byte-identical destination => retry-safe no-op;
+ *   - fingerprint unchanged since prepare => LEGITIMATE UPDATE (copy);
+ *   - otherwise => TRUE CONFLICT: retain (never overwrite) by throwing a typed
+ *     `dsh_profile_overlay_publish_conflict`.
+ *
+ * A symlink or special overlay/host entry is refused. `profiles/` is never
+ * passed here by the caller.
+ */
+function publishEffectiveHomeEntry(
+  overlayPath: string,
+  hostPath: string,
+  relPath: string,
+  provenance: ReadonlyMap<string, HostFileFingerprint>,
+): void {
   const st = lstatOrUndefined(overlayPath);
   if (!st) return;
   if (st.isSymbolicLink()) {
@@ -904,7 +1457,12 @@ function publishEffectiveHomeEntry(overlayPath: string, hostPath: string): void 
       );
     }
     for (const dirent of readdirDirents(overlayPath)) {
-      publishEffectiveHomeEntry(path.join(overlayPath, dirent.name), path.join(hostPath, dirent.name));
+      publishEffectiveHomeEntry(
+        path.join(overlayPath, dirent.name),
+        path.join(hostPath, dirent.name),
+        path.join(relPath, dirent.name),
+        provenance,
+      );
     }
     return;
   }
@@ -922,27 +1480,60 @@ function publishEffectiveHomeEntry(overlayPath: string, hostPath: string): void 
       `Host path ${hostPath} is not a regular file; refusing to overwrite it.`,
     );
   }
+  const prep = provenance.get(relPath);
+  if (hostSt) {
+    if (filesEqual(overlayPath, hostPath)) return; // identical content: retry-safe
+    if (prep && fingerprintsMatch(hostSt, prep)) {
+      // The destination is untouched since prepare: this is the guest's own
+      // newer version, so the legitimate update flows.
+      const mode = st.mode & 0o777;
+      fs.copyFileSync(overlayPath, hostPath);
+      fs.chmodSync(hostPath, mode);
+      return;
+    }
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_publish_conflict",
+      `Host destination ${hostPath} (${relPath}) changed independently since prepare; refusing to overwrite it with the invocation's copy. The invocation root is RETAINED so the artifact is not lost.`,
+    );
+  }
+  if (prep) {
+    // The destination existed at prepare and has since been removed by an
+    // independent actor: writing our copy would resurrect/overwrite that
+    // decision, so treat it as a true conflict and retain.
+    throw new DshProfileOverlayError(
+      "dsh_profile_overlay_publish_conflict",
+      `Host destination ${hostPath} (${relPath}) was removed independently since prepare; refusing to re-create it from the invocation's copy. The invocation root is RETAINED so the artifact is not lost.`,
+    );
+  }
+  // Destination absent at prepare and still absent: a legitimate new artifact.
   const mode = st.mode & 0o777;
   fs.copyFileSync(overlayPath, hostPath);
   fs.chmodSync(hostPath, mode);
 }
 
 /**
- * Merge every guest-written durable entry of the per-run effective home back to
- * the real host home, EXCEPT the private `profiles/` tree (which must never be
- * published). Idempotent. This keeps the existing host-side pre/post session
- * inventory (which reads the real host home) correct: a session the guest wrote
- * into the effective home is present on the host after teardown and before the
- * post-round snapshot. Refuses a non-attested overlay root and a missing host
- * home; never touches `profiles/`.
+ * Merge every guest-written durable entry of the per-invocation effective home
+ * back to the real host home, EXCEPT the private `profiles/` tree (which must
+ * never be published). Idempotent/retry-safe. Under the shared host-home
+ * publication lock so a run's two invocations finishing simultaneously cannot
+ * lose an artifact through a read-modify-write race. This keeps the existing
+ * host-side pre/post session inventory (which reads the real host home)
+ * correct: a session the guest wrote into the effective home is present on the
+ * host after teardown and before the post-round snapshot. Refuses a
+ * non-attested overlay root and a missing host home; a true conflict is
+ * RETAINED by throwing `dsh_profile_overlay_publish_conflict`.
  */
 export function publishDshHomeOverlayToHost(
   runId: string,
+  invocationId: string,
   liveStateRoot: string,
   hostHome: string,
 ): void {
-  const root = dshProfileOverlayRoot(runId, liveStateRoot);
-  if (!isHostAttestedDshProfileOverlay(root, runId, liveStateRoot)) {
+  const bare = assertDshOverlayRunId(runId);
+  const inv = assertDshOverlayInvocationId(invocationId);
+  const live = normalize(liveStateRoot);
+  const root = dshProfileOverlayRoot(bare, inv, live);
+  if (!isHostAttestedDshProfileOverlay(root, bare, inv, live)) {
     throw new DshProfileOverlayError(
       "dsh_profile_overlay_foreign_root",
       `Refusing to publish from non-attested dsh overlay root: ${root}`,
@@ -963,8 +1554,23 @@ export function publishDshHomeOverlayToHost(
       `Dsh home ${host} is not an existing real directory; refusing to publish into it.`,
     );
   }
-  for (const dirent of readdirDirents(root)) {
-    if (dirent.name === DSH_PROFILES_DIR_NAME) continue; // private: never published
-    publishEffectiveHomeEntry(path.join(root, dirent.name), path.join(host, dirent.name));
+  const lockPath = dshProfilePublishLockPath(live, host);
+  acquirePublishLock(lockPath);
+  try {
+    // Acquire BEFORE reading the manifest: the manifest is the read half of the
+    // check-and-replace, so it must be observed under the same lock that guards
+    // the replace.
+    const provenance = readProvenanceManifest(bare, inv, live, host);
+    for (const dirent of readdirDirents(root)) {
+      if (dirent.name === DSH_PROFILES_DIR_NAME) continue; // private: never published
+      publishEffectiveHomeEntry(
+        path.join(root, dirent.name),
+        path.join(host, dirent.name),
+        dirent.name,
+        provenance,
+      );
+    }
+  } finally {
+    releasePublishLock(lockPath);
   }
 }

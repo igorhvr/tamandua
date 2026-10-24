@@ -87,7 +87,22 @@ const ENTRY_REL = {
  */
 const SHARED_CORE_REL = ["installer/matchlock/merge-core.js"];
 
-const WALK_ROOTS = [ENTRY_REL.cli, ENTRY_REL.service, ENTRY_REL.test, ...SHARED_CORE_REL];
+/**
+ * G8 ADMISSION-INTEGRATION US-010: the guest-visible effective-config probe.
+ * It is not imported by any other pack entry — the host runner executes it
+ * directly through the controller's exec seam after boot, before the harness
+ * starts — so it ships as an explicit closure root. Node-core only (fs/path/
+ * url), which is exactly the guarantee the walker enforces.
+ */
+const GUEST_PROBE_REL = ["installer/matchlock/gate-config-probe.js"];
+
+const WALK_ROOTS = [
+  ENTRY_REL.cli,
+  ENTRY_REL.service,
+  ENTRY_REL.test,
+  ...SHARED_CORE_REL,
+  ...GUEST_PROBE_REL,
+];
 
 const ALLOWED_DIR_REL = "installer/matchlock";
 

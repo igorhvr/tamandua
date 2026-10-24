@@ -717,9 +717,15 @@ describe("matchlock mount plan", () => {
     home: string,
     liveStateRoot: string,
     runId = DSH_RUN_ID,
-  ): { runId: string; liveStateRoot: string; overlayRoot: string } {
-    prepareDshProfileOverlay(runId, liveStateRoot, home);
-    return { runId, liveStateRoot, overlayRoot: dshProfileOverlayRoot(runId, liveStateRoot) };
+    invocationId = "inv-aaaaaaaa-11111111",
+  ): { runId: string; liveStateRoot: string; invocationId: string; overlayRoot: string } {
+    prepareDshProfileOverlay(runId, invocationId, liveStateRoot, home);
+    return {
+      runId,
+      liveStateRoot,
+      invocationId,
+      overlayRoot: dshProfileOverlayRoot(runId, invocationId, liveStateRoot),
+    };
   }
 
   it("dsh mode: mounts ONE real effective-home root from the private overlay (never the host profiles farm) and sets DSH_HOME (no PI_CODING_AGENT_DIR)", () => {
@@ -830,7 +836,11 @@ describe("matchlock mount plan", () => {
     assert.throws(
       () => buildMatchlockCreateConfig(p, IDENTITY, {
         helperPackHostPath: helperPack,
-        dshProfileOverlay: { runId: DSH_RUN_ID, liveStateRoot: liveState },
+        dshProfileOverlay: {
+          runId: DSH_RUN_ID,
+          liveStateRoot: liveState,
+          invocationId: "inv-aaaaaaaa-11111111",
+        },
       }),
       (e: unknown) => e instanceof MatchlockMountPlanError && e.code === "dsh_profile_overlay_source_missing",
     );

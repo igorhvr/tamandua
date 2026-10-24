@@ -965,6 +965,41 @@ the store image digest `sha256:cd83b838…` / config `sha256:cca820df…` and th
 probe/work v3 session totals reconciled exactly (probe 6769 + work 5308 =
 12077 == `runs.tokens_spent`).
 
+### G8 launch-gate admission (G8-ADMISSION-INTEGRATION)
+
+The Matchlock launch gate (bead `tamandua-7p5.1.8`) refuses a hermes launch
+BEFORE any VM create when a store cannot be launched against the
+delete-journal contract. ONE evaluator
+(`src/installer/matchlock/launch-gate-wiring.ts` `evaluateAndRecordLaunchGate`)
+runs the mandated order — profile+selection, final caller-supplied mount plan,
+store set, observe EVERY store, aggregate all findings, `(dev, ino)`+config
+revalidation, then create — and there are exactly four gated invocation kinds
+plus one backstop:
+
+- `interactive-hermes` / `interactive-hermes-shell` —
+  `planInteractiveSession` (`launch-gate-interactive.ts`), after admission and
+  before the plan is handed to the controller;
+- `scheduled-dispatch` / `scheduled-attempt` — `scheduler-matchlock.ts`
+  (`evaluateScheduledDispatchGate` / `evaluateScheduledAttemptGate`); a queued
+  round can wait hours, so the ATTEMPT re-evaluates instead of trusting the
+  dispatch verdict, and a refused round force-fails the run
+  (`status='failed'`, `scheduling_status=NULL`, one
+  `run.matchlock_gate_refused`) rather than re-dispatching;
+- the controller backstop (`controller.ts` `requireLaunchGateVerdict`) refuses
+  `matchlock_gate_verdict_missing` unless the binding belongs to THIS
+  invocation id and carries a non-empty store-set key; it never re-evaluates.
+
+Refusal is receipt-first (zero create calls, no partial mount) and exits
+`LAUNCH_GATE_REFUSAL_EXIT_CODE` (78) imported from
+`src/installer/matchlock/gate-exit-code.ts` — never a numeric status literal.
+Receipts, qualification records and interactive admission anchors all live in
+`<stateDir>/matchlock/gate/` (`<id>.json`, `<id>.qualification.json`,
+`<id>.admission.json`); the reason vocabulary is closed at ten codes and
+operational failures (receipt write, revalidation) are a separate class. There
+is NO lease: concurrent admissions may both pass (`NO_LEASE_LIMITATION`). Raw
+`matchlock run` with a hermes payload is explicitly OUT OF SCOPE. Full record:
+`docs/gate/G8-ADMISSION-INTEGRATION.md`.
+
 ## Real-VM gates cannot run in the developer agent sandbox
 
 The developer agent's command sandbox runs with `NoNewPrivs: 1` and
@@ -1336,6 +1371,11 @@ npm run build && npm test
 ```
 
 Tests use Node's built-in `node:test` and `node:assert`.
+
+Documentation regressions read committed files directly: for example,
+`tests/g8-admission-docs.test.ts` pins the G8 launch-gate section, including the
+canonical no-lease limitation `no-lease: concurrent admissions may both pass`
+(`NO_LEASE_LIMITATION`).
 
 ### Sandbox-safe process metadata (MPSX)
 

@@ -1,0 +1,185 @@
+{
+  "schema": "overlay-inv-scoped-contract/1",
+  "task": "OVERLAY-CONTINUATION",
+  "bead": "tamandua-7j6",
+  "brief": "/home/kaladin/task-overlay-reconcile.md",
+  "briefSection": "TESTING — BE HONEST ABOUT WHAT A GUEST CAN PROVE (items 1-7)",
+  "run": "d52e7205-ce68-4139-82f2-879bf1e5a702",
+  "branch": "fix/overlay-inv-scoped-continuation",
+  "pinnedBy": "tests/matchlock-overlay-inv-scoped-contract.test.ts",
+  "statusVocabulary": ["executed", "written-not-run"],
+  "environment": {
+    "where": "developer agent sandbox inside a Tamandua worker round (Matchlock guest)",
+    "nestedVmsBootable": false,
+    "reason": "a nested VM cannot boot in-guest; the sandbox runs NoNewPrivs=1 / CapEff=0, so matchlock's file capabilities are suppressed and the first VM create fails TUNSETIFF: operation not permitted",
+    "consequence": "no test recorded as 'executed' below is a real-VM test; simulated arms are labelled simulated"
+  },
+  "executions": [
+    {
+      "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+      "command": "npx tsx --test src/installer/matchlock/dsh-profile-overlay.test.ts",
+      "lane": "parallel",
+      "exitCode": 0,
+      "tests": 52,
+      "pass": 52,
+      "fail": 0,
+      "skipped": 0,
+      "note": "counts are for the whole containing file; the file is host-side fs / worker-thread execution only, no VM and no guest"
+    },
+    {
+      "file": "src/installer/matchlock/dsh-profile-overlay.regression.test.ts",
+      "command": "npx tsx --test src/installer/matchlock/dsh-profile-overlay.regression.test.ts",
+      "lane": "parallel",
+      "exitCode": 0,
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "skipped": 0,
+      "note": "two-implementation invariant control (PRE_FIX model vs SHIPPED exports); its red evidence comes from a mutation probe that delegates SHIPPED to PRE_FIX, see items[5].redEvidence"
+    }
+  ],
+  "items": [
+    {
+      "item": 1,
+      "requirement": "Overlay roots for two concurrent invocations of the SAME run are DISTINCT and under the new parent.",
+      "status": "executed",
+      "provingTest": {
+        "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+        "title": "gives two invocations of one run DISTINCT roots"
+      },
+      "additionalProvingTests": [
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "derives <liveState>/matchlock/dsh-profile-invocations/<bareRunId>/<invocationId> (run- prefix stripped)"
+        }
+      ],
+      "note": "the derive test pins the disjoint versioned parent dsh-profile-invocations/<bareRunId>; the distinctness test pins that two invocation ids of one bare run never share a root"
+    },
+    {
+      "item": 2,
+      "requirement": "Cleanup of invocation A cannot remove or invalidate invocation B's live root, in BOTH teardown orders (A-then-B and B-then-A).",
+      "status": "executed",
+      "provingTest": {
+        "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+        "title": "merges two overlapping invocations' unique artifacts without loss in EITHER teardown order"
+      },
+      "additionalProvingTests": [
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "removes exactly the attested invocation root and is idempotent (empty group pruned, sibling invocations kept)"
+        },
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.regression.test.ts",
+          "title": "shipped lifetime arm: two distinct invocation roots survive the peer's cleanup and still accept new writes"
+        }
+      ],
+      "note": "the shipped lifetime arm also proves the surviving peer root still accepts NEW writes after the cleanup, i.e. it is not merely left on disk but still usable"
+    },
+    {
+      "item": 3,
+      "requirement": "A legacy per-run path is never used to delete a live invocation root (compatibility/migration behaviour, if the reference has any — read it, don't invent it).",
+      "status": "executed",
+      "provingTest": {
+        "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+        "title": "never touches a PRE-PLANTED legacy run-scoped root, through prepare AND cleanup"
+      },
+      "additionalProvingTests": [
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "attests exactly one invocation root and fails closed for any other path (including legacy)"
+        },
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "refuses the LEGACY run-scoped shape as a mount source"
+        }
+      ],
+      "note": "the reference has NO migration/reclaim path: the legacy shape is never adopted, deleted or migrated. The pins cover prepare, cleanup, attestation and mount planning"
+    },
+    {
+      "item": 4,
+      "requirement": "Publication serializes, and a genuine conflict is retained and reported rather than lost.",
+      "status": "executed",
+      "provingTest": {
+        "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+        "title": "retains a TRUE conflict instead of silently overwriting an independently changed host destination"
+      },
+      "additionalProvingTests": [
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "serializes two genuinely concurrent finalizers: ONE winner + one retained conflict on a shared destination"
+        },
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "keys the publication lock by the host home under the host-only live state"
+        }
+      ],
+      "note": "the conflict is reported as the typed dsh_profile_overlay_publish_conflict and the losing copy is retained on disk, never discarded"
+    },
+    {
+      "item": 5,
+      "requirement": "Contradictory teardown orders leave no artifact loss and no deadlock, including when a holder crashed.",
+      "status": "executed",
+      "provingTest": {
+        "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+        "title": "loses no artifact under EITHER teardown order (A-then-B and B-then-A; SIMULATED: no VM)"
+      },
+      "additionalProvingTests": [
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "loses no artifact when a CRASHED holder's lock is left behind under the reverse teardown order (SIMULATED: no VM)"
+        },
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "breaks a CRASHED holder's lock and still publishes (SIMULATED crash: dead pid, no VM)"
+        }
+      ],
+      "simulated": true,
+      "simulationNote": "SIMULATED: the crash is a planted lock directory whose owner file names a positively-dead pid (proven ESRCH, above any platform pid_max); no process is killed, no VM and no guest is involved",
+      "note": "no-deadlock is asserted both ways: a crashed (dead-owner) lock is broken rather than waited out, and an indeterminate owner is never broken"
+    },
+    {
+      "item": 6,
+      "requirement": "A REGRESSION CONTROL: demonstrate that the key test actually FAILS against the pre-fix behaviour.",
+      "status": "executed",
+      "provingTest": {
+        "file": "src/installer/matchlock/dsh-profile-overlay.regression.test.ts",
+        "title": "pre-fix lifetime arm: the shared run-scoped root teardown destroys the peer invocation's staged artifact"
+      },
+      "additionalProvingTests": [
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.regression.test.ts",
+          "title": "pre-fix publication arm: the unconditional copy publishes the invocation's losing copy over the independently changed host destination"
+        },
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.regression.test.ts",
+          "title": "shipped publication arm: the typed dsh_profile_overlay_publish_conflict retains the independently changed host bytes and the losing copy"
+        }
+      ],
+      "preFixState": "The pre-fix implementation in the same file (PRE_FIX) models baseline f2f34c91: ONE shared run-scoped overlay root <liveState>/matchlock/dsh-profile-overlays/<bareRunId> adopted by every invocation, with an unconditional recursive teardown, and an unconditional fs.copyFileSync publish with no manifest/lock. Against it the pre-fix lifetime arm reproduces peer_artifact_destroyed (cleanup of invocation inv-aaaaaaaa-11111111 destroys invocation inv-bbbbbbbb-22222222's staged artifact .../dsh-profile-overlays/1111/sessions/regression/b/*.jsonl) and the pre-fix publication arm reproduces independent_host_destination_overwritten (expected \"from-host\\n\", observed \"from-invocation\\n\"). Red evidence for the SHIPPED implementation itself comes from a mutation probe that rewires the SHIPPED delegates to PRE_FIX: tests 5 / pass 2 / fail 3 with the messages above, after which the file was restored byte-identically (sha256 fface69f8da660ee1243c20e471e12ca3fb7159be41929700f901d61668c7efb).",
+      "note": "non-vacuity is structural: expectViolation() calls assert.fail when a pre-fix arm unexpectedly satisfies the invariant, so the control cannot pass silently"
+    },
+    {
+      "item": 7,
+      "requirement": "The pre-existing overlay unit tests still pass.",
+      "status": "executed",
+      "provingTest": {
+        "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+        "title": "stages a private byte-identical copy of the host profiles tree"
+      },
+      "additionalProvingTests": [
+        {
+          "file": "src/installer/matchlock/dsh-profile-overlay.test.ts",
+          "title": "exports the planner surface and imports only node: builtins"
+        }
+      ],
+      "note": "the PRE-EXISTING assertions were never weakened; the file reports 52 tests / 52 pass / 0 fail / 0 skipped, which is the pre-existing suite plus the additive arms added by this port"
+    }
+  ],
+  "realMatchlockOverlapGate": {
+    "file": "e2e-tests/matchlock-dsh-profile-overlay-gate.test.ts",
+    "title": "keeps a live invocation across the peer's cleanup and publishes BOTH invocations' REAL new artifacts (both teardown orders)",
+    "status": "written-not-run",
+    "reason": "cannot boot nested VMs in-guest; coordinator/host-owned",
+    "note": "the gate body, its two teardown orders and its event-loop-safe host waits are pinned structurally by tests/matchlock-dsh-overlay-gate-wiring.test.ts and its fixture controls by tests/matchlock-dsh-profile-overlay-gate-helpers.test.ts; neither pin is real VM execution. A green real run needs ./run-matchlock-dsh-profile-overlay-e2e-test (or the gate file under the shared gate lock) on the host outside the agent sandbox, and its artifact truth is profile-overlay-overlap.json in the gate evidence dir"
+  }
+}

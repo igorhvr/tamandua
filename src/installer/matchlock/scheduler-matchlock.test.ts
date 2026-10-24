@@ -24,6 +24,7 @@ import {
   runMatchlockSchedulerRound,
   setMatchlockProductionRouteRunnerForTest,
   setMatchlockHomeAliasResolverForTest,
+  setMatchlockScheduledLaunchGateForTest,
   MatchlockRunnerError,
   buildMatchlockMergeContext,
   type MatchlockSchedulerRound,
@@ -164,6 +165,13 @@ describe("scheduler-matchlock production suite wiring", () => {
     setMatchlockExecutionBoundarySeamsForTest({
       swapSupportProbe: (binaryPath) => ({ supported: true, binaryPath }),
     });
+    // G8 US-005: the launch gate observes REAL Hermes profile stores. These
+    // routing/suite tests use synthetic `/home/operator` profiles that could
+    // never pass a real gate, and they are not about the gate, so the gate is
+    // SKIPPED here (`evaluate: () => null`). The gate's own behaviour is
+    // covered by launch-gate-scheduled-dispatch.test.ts and the scheduler-level
+    // cases in agent-scheduler-matchlock.test.ts.
+    setMatchlockScheduledLaunchGateForTest({ evaluate: () => null, evaluateAttempt: () => null });
     tmp = tamanduaTempDir("tamandua-mtlk-sched-");
     packRoot = path.join(tmp, "pack");
     // Build a REAL versioned RO guest pack from the compiled checkout so the
@@ -181,6 +189,7 @@ describe("scheduler-matchlock production suite wiring", () => {
   after(() => {
     setMatchlockHomeAliasResolverForTest(null);
     setMatchlockExecutionBoundarySeamsForTest(null);
+    setMatchlockScheduledLaunchGateForTest(null);
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
@@ -319,6 +328,52 @@ describe("scheduler-matchlock production suite wiring", () => {
       setMatchlockProductionRouteRunnerForTest("hermes", null);
       setMatchlockProductionRouteRunnerForTest("dsh", null);
     }
+  });
+
+  // ── G8 US-005: the scheduled launch gate ────────────────────────────────
+  it("G8 US-005: a THROWING gate evaluator surfaces as a typed MatchlockRunnerError (never an instant-fail round)", async () => {
+    setMatchlockScheduledLaunchGateForTest({
+      evaluate: () => {
+        throw new Error("synthetic evaluator failure");
+      },
+    });
+    try {
+      const err = await runMatchlockSchedulerRound(round(hermesPolicy())).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(err instanceof MatchlockRunnerError, "a gate machinery failure is a typed infra error");
+      assert.equal((err as MatchlockRunnerError).code, "matchlock_gate_evaluation_failed");
+      assert.match((err as Error).message, /refusing before any VM create/);
+      assert.match((err as Error).message, /synthetic evaluator failure/);
+    } finally {
+      setMatchlockScheduledLaunchGateForTest({ evaluate: () => null, evaluateAttempt: () => null });
+    }
+  });
+
+  it("G8 US-005: a pi policy never consults the gate seam's evaluation at all", async () => {
+    const seen: string[] = [];
+    setMatchlockScheduledLaunchGateForTest({
+      evaluate: (r) => {
+        seen.push(r.policy.harness ?? "pi");
+        return null;
+      },
+    });
+    setMatchlockProductionRouteRunnerForTest("pi", async () => ({
+      output: "",
+      exitCode: 0,
+      signal: null,
+      stderrTail: "",
+      timedOut: false,
+      durationMs: 1,
+    }));
+    try {
+      await runMatchlockSchedulerRound(round(policy()));
+    } finally {
+      setMatchlockProductionRouteRunnerForTest("pi", null);
+      setMatchlockScheduledLaunchGateForTest({ evaluate: () => null, evaluateAttempt: () => null });
+    }
+    assert.deepEqual(seen, ["pi"], "the seam is consulted, and the production gate returns null for pi");
   });
 
   it("MTLK-ALL-WORKFLOWS US-002: toDshSchedulerRound forwards the host merge context to the dsh route", async () => {

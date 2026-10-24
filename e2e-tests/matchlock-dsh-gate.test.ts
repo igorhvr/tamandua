@@ -1107,11 +1107,15 @@ describe(
           `persist-vm: the host headless profile must keep its pre-created config files (${profileFilesBefore.join(", ")})`,
         );
 
-        // VM A: the runner derives the private overlay root from the controlled
-        // run id, so the gate observes exactly the guest's private farm source.
+        // VM A: OVERLAY-INV-SCOPED — the controller binds the overlay root to
+        // its own host-random invocation id, so the gate observes the per-run
+        // grouping dir and samples whichever invocation root is active.
         const runIdA = randomUUID();
-        const overlayA = await overlayRootForRun(runIdA);
-        const observerA = new DshOverlayObserver(overlayA, { intervalMs: 50 }).start();
+        const overlayA = await overlayGroupRootForRun(runIdA);
+        const observerA = new DshOverlayObserver(overlayA, {
+          intervalMs: 50,
+          invocationGroupDir: true,
+        }).start();
         const a = await directChatInvocation({
           label: "persist-vm-A",
           policy: basePolicy,
@@ -1161,12 +1165,15 @@ describe(
           "after VM A: the host profile file set must be unchanged (per-entry profile mounts never persist arbitrary new files)",
         );
 
-        // VM B: a DISTINCT fresh VM and a DISTINCT private overlay root (fresh
+        // VM B: a DISTINCT fresh VM and a DISTINCT private overlay group (fresh
         // private farm per VM).
         const runIdB = randomUUID();
-        const overlayB = await overlayRootForRun(runIdB);
-        assert.notEqual(overlayB, overlayA, "each fresh VM must get its own private per-run overlay root");
-        const observerB = new DshOverlayObserver(overlayB, { intervalMs: 50 }).start();
+        const overlayB = await overlayGroupRootForRun(runIdB);
+        assert.notEqual(overlayB, overlayA, "each fresh VM must get its own private per-run overlay group");
+        const observerB = new DshOverlayObserver(overlayB, {
+          intervalMs: 50,
+          invocationGroupDir: true,
+        }).start();
         const b = await directChatInvocation({
           label: "persist-vm-B",
           policy: basePolicy,
@@ -1555,13 +1562,23 @@ describe(
         // populated with guest-install links even when the host's real dsh
         // install is transiently incomplete; the HOST farm is never touched.
         const runId1 = randomUUID();
-        const overlayRoot1 = await seedPrivateFarmWithGuestLink(
+        // OVERLAY-INV-SCOPED: the invocation leaf is host-generated, so the
+        // gate observes the per-run grouping dir. The hermetic seed uses an
+        // explicit stand-in identity; the REAL guest heal populates the actual
+        // invocation root, which the group-dir observer captures.
+        const invocation1 = deterministicInvocationId(runId1);
+        const seeded1 = await seedPrivateFarmWithGuestLink(
           runId1,
+          invocation1,
           synthHome,
           "commander",
           "/opt/dsh/apps/cli/node_modules/commander",
         );
-        const observer1 = new DshOverlayObserver(overlayRoot1, { intervalMs: 50 }).start();
+        const overlayRoot1 = await overlayGroupRootForRun(runId1);
+        const observer1 = new DshOverlayObserver(overlayRoot1, {
+          intervalMs: 50,
+          invocationGroupDir: true,
+        }).start();
         const rec1 = await directRealBootInvocation({
           label: "real-dsh-boot-vm-1",
           policy: realPolicy as Record<string, unknown>,
@@ -1590,23 +1607,40 @@ describe(
             `real-dsh VM 1: guest private farm link ${rel} -> ${target} must be a guest-install link (never a host path)`,
           );
         }
+        // The gate-owned hermetic seed was never adopted by the production
+        // controller (exclusive allocation), so it is this gate's debris to
+        // remove; only after that can the grouping dir collapse. The REAL
+        // invocation root must already be gone (removed under proven
+        // quiescence on the confirmed close).
+        await cleanupSeededFarm(runId1, invocation1);
+        assert.equal(
+          seeded1,
+          path.join(overlayRoot1, invocation1),
+          "real-dsh VM 1: the seeded stand-in farm must live under the observed group root",
+        );
         assert.equal(
           fs.existsSync(overlayRoot1),
           false,
-          "real-dsh VM 1: the private overlay root must be removed after the confirmed close",
+          "real-dsh VM 1: the private overlay group must be empty+pruned after the confirmed close",
         );
 
-        // VM 2: a DISTINCT fresh VM and a DISTINCT private overlay root.
+        // VM 2: a DISTINCT fresh VM and a DISTINCT private overlay group.
         const runId2 = randomUUID();
-        const overlayRoot2 = await seedPrivateFarmWithGuestLink(
+        const invocation2 = deterministicInvocationId(runId2);
+        const seeded2 = await seedPrivateFarmWithGuestLink(
           runId2,
+          invocation2,
           synthHome,
           "commander",
           "/opt/dsh/apps/cli/node_modules/commander",
         );
-        assert.notEqual(overlayRoot2, overlayRoot1, "each fresh VM must get its own private per-run overlay root");
+        const overlayRoot2 = await overlayGroupRootForRun(runId2);
+        assert.notEqual(overlayRoot2, overlayRoot1, "each fresh VM must get its own private per-run overlay group");
         const hostBefore2 = hostFarmSnapshot();
-        const observer2 = new DshOverlayObserver(overlayRoot2, { intervalMs: 50 }).start();
+        const observer2 = new DshOverlayObserver(overlayRoot2, {
+          intervalMs: 50,
+          invocationGroupDir: true,
+        }).start();
         const rec2 = await directRealBootInvocation({
           label: "real-dsh-boot-vm-2",
           policy: realPolicy as Record<string, unknown>,
@@ -1626,10 +1660,16 @@ describe(
             `real-dsh VM 2: guest private farm link ${rel} -> ${target} must be a guest-install link (never a host path)`,
           );
         }
+        await cleanupSeededFarm(runId2, invocation2);
+        assert.equal(
+          seeded2,
+          path.join(overlayRoot2, invocation2),
+          "real-dsh VM 2: the seeded stand-in farm must live under the observed group root",
+        );
         assert.equal(
           fs.existsSync(overlayRoot2),
           false,
-          "real-dsh VM 2: the private overlay root must be removed after the confirmed close",
+          "real-dsh VM 2: the private overlay group must be empty+pruned after the confirmed close",
         );
 
         // The boot attempted (a fresh VM was owned and positively closed) and
@@ -2102,14 +2142,21 @@ async function loadStoreHelpers(): Promise<StoreHelpers> {
 }
 
 /**
- * DSH-PROFILE-OVERLAY US-004: production private-overlay geometry. The gate
- * uses the SAME derivation the runner does (`dshProfileOverlayRoot`) so the
- * overlay root it observes while a round is live is exactly the host-attested
- * per-run private root the guest's install-derived farm resolves to.
+ * OVERLAY-INV-SCOPED: production private-overlay geometry. The overlay root is
+ * bound to the controller's own host-generated invocation id, so a gate can
+ * only predict a leaf for a hermetic pre-seed; live observation uses the
+ * per-run grouping dir (`dshProfileInvocationGroupRoot`).
  */
 interface OverlayHelpers {
-  prepare: (runId: string, liveStateRoot: string, hostHome: string) => { overlayRoot: string };
-  root: (runId: string, liveStateRoot: string) => string;
+  prepare: (
+    runId: string,
+    invocationId: string,
+    liveStateRoot: string,
+    hostHome: string,
+  ) => { overlayRoot: string };
+  root: (runId: string, invocationId: string, liveStateRoot: string) => string;
+  cleanup: (runId: string, invocationId: string, liveStateRoot: string) => void;
+  groupRoot: (runId: string, liveStateRoot: string) => string;
 }
 
 let overlayHelpersMemo: OverlayHelpers | undefined;
@@ -2118,22 +2165,50 @@ async function loadOverlayHelpers(): Promise<OverlayHelpers> {
   if (overlayHelpersMemo) return overlayHelpersMemo;
   const mod = await import(`${repoRoot}/dist/installer/matchlock/dsh-profile-overlay.js`);
   overlayHelpersMemo = {
-    prepare: (runId, liveStateRoot, hostHome) =>
-      mod.prepareDshProfileOverlay(runId, liveStateRoot, hostHome) as { overlayRoot: string },
-    root: (runId, liveStateRoot) => mod.dshProfileOverlayRoot(runId, liveStateRoot) as string,
+    prepare: (runId, invocationId, liveStateRoot, hostHome) =>
+      mod.prepareDshProfileOverlay(
+        runId,
+        invocationId,
+        liveStateRoot,
+        hostHome,
+      ) as { overlayRoot: string },
+    root: (runId, invocationId, liveStateRoot) =>
+      mod.dshProfileOverlayRoot(runId, invocationId, liveStateRoot) as string,
+    cleanup: (runId, invocationId, liveStateRoot) =>
+      mod.cleanupDshProfileOverlay(runId, invocationId, liveStateRoot) as void,
+    groupRoot: (runId, liveStateRoot) =>
+      mod.dshProfileInvocationGroupRoot(runId, liveStateRoot) as string,
   };
   return overlayHelpersMemo;
 }
 
 /**
- * The host-attested private overlay root the direct runner will use for a
- * controlled run id. Direct invocations pass no `progressResource.runRoot`, so
- * the runner falls back to `resolveLiveStateRoot()` — the process
- * `TAMANDUA_STATE_DIR` pinned in `before()`.
+ * OVERLAY-INV-SCOPED: an explicit stand-in invocation identity for a host
+ * pre-seed. The LIVE controller generates its own host-random invocation id
+ * (and allocation is EXCLUSIVE, so a pre-seed is never adopted), which is why
+ * real-runner observation watches the per-run grouping dir.
  */
-async function overlayRootForRun(runId: string): Promise<string> {
+function deterministicInvocationId(runId: string): string {
+  const hex = runId.replace(/[^0-9a-f]/gi, "").slice(0, 12).padEnd(12, "0");
+  return `inv-${hex}-00000000`;
+}
+
+/**
+ * The per-run grouping dir the direct runner will allocate under for a
+ * controlled run id: `<liveState>/matchlock/dsh-profile-invocations/<runId>`.
+ * Direct invocations pass no `progressResource.runRoot`, so the runner falls
+ * back to `resolveLiveStateRoot()` — the process `TAMANDUA_STATE_DIR` pinned in
+ * `before()`.
+ */
+async function overlayGroupRootForRun(runId: string): Promise<string> {
   const helpers = await loadOverlayHelpers();
-  return helpers.root(runId, tamanduaDir);
+  return helpers.groupRoot(runId, tamanduaDir);
+}
+
+/** Remove the gate-owned hermetic seed (never adopted by the controller). */
+async function cleanupSeededFarm(runId: string, invocationId: string): Promise<void> {
+  const helpers = await loadOverlayHelpers();
+  helpers.cleanup(runId, invocationId, tamanduaDir);
 }
 
 /**
@@ -2144,15 +2219,20 @@ async function overlayRootForRun(runId: string): Promise<string> {
  * observer it lets the gate assert the private farm carries GUEST-install links
  * deterministically even when the real dsh install on the host is transiently
  * incomplete.
+ *
+ * The seed names an EXPLICIT stand-in invocation identity (the live controller
+ * id is host-random), so this root is gate-owned debris and is cleaned up by
+ * the gate itself.
  */
 async function seedPrivateFarmWithGuestLink(
   runId: string,
+  invocationId: string,
   hostHome: string,
   linkName: string,
   guestTarget: string,
 ): Promise<string> {
   const helpers = await loadOverlayHelpers();
-  const layout = helpers.prepare(runId, tamanduaDir, hostHome);
+  const layout = helpers.prepare(runId, invocationId, tamanduaDir, hostHome);
   const farmDir = path.join(layout.overlayRoot, "profiles", "node_modules");
   fs.mkdirSync(farmDir, { recursive: true });
   const link = path.join(farmDir, linkName);
