@@ -48,6 +48,7 @@ import { cleanChildEnv, createTempHome, reservePortHandles } from "../../tests/h
 import { terminateOwnedProcessGroup, reapStaleOrphans } from "../../tests/helpers/dead-owner-teardown.ts";
 import { getProcessStartIdentity } from "../lib/process-start-identity.ts";
 import { getPgid } from "../../dist/lib/proc-info.js";
+import { Deadline } from "../../dist/lib/instant.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SHIM_PATH = path.resolve(__dirname, "..", "..", "dist", "suite", "shim.js");
@@ -61,10 +62,25 @@ interface ShimResult {
   durationMs: number;
 }
 
+/**
+ * Live view of a spawned shim's output and exit state.
+ *
+ * `ShimResult` only exists once the child exits, but an ordering barrier
+ * (see `waitForSuiteClaimWaitEvents`) may need to render the shim's stderr
+ * while it is still running — or when it died before reaching the expected
+ * state. The live record is mutated as output arrives.
+ */
+interface ShimLiveOutput {
+  stdout: string;
+  stderr: string;
+  exited: boolean;
+}
+
 /** Spawn the shim and capture stdout, stderr, exit code, and duration. */
 async function runShim(
   args: string[],
   env: NodeJS.ProcessEnv,
+  live?: ShimLiveOutput,
 ): Promise<ShimResult> {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -78,12 +94,15 @@ async function runShim(
 
     child.stdout!.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
+      if (live) live.stdout = stdout;
     });
     child.stderr!.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
+      if (live) live.stderr = stderr;
     });
 
     child.on("close", (code: number | null) => {
+      if (live) live.exited = true;
       resolve({
         exitCode: code ?? 1,
         stdout,
@@ -93,6 +112,7 @@ async function runShim(
     });
 
     child.on("error", (err: Error) => {
+      if (live) live.exited = true;
       resolve({
         exitCode: 1,
         stdout,
@@ -112,6 +132,7 @@ async function runShimWithPreload(
   preloadPath: string,
   args: string[],
   env: NodeJS.ProcessEnv,
+  live?: ShimLiveOutput,
 ): Promise<ShimResult> {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -126,16 +147,20 @@ async function runShimWithPreload(
 
     child.stdout!.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
+      if (live) live.stdout = stdout;
     });
     child.stderr!.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
+      if (live) live.stderr = stderr;
     });
 
     child.on("close", (code: number | null) => {
+      if (live) live.exited = true;
       resolve({ exitCode: code ?? 1, stdout, stderr, durationMs: Date.now() - start });
     });
 
     child.on("error", (err: Error) => {
+      if (live) live.exited = true;
       resolve({
         exitCode: 1,
         stdout,
@@ -212,6 +237,135 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   }
 }
 
+// ── FLAKE-ROOTCAUSE (US-002): bounded claim-collision barrier ─────────
+//
+// The two single-flight tests used to force the waiter state with a fixed
+// pre-record sleep (500 ms / 2500 ms) and then POST /suite/record. That guess
+// is not a guarantee. The shim's `main()` runs `lookupSuiteRecord` and then
+// `claimSuiteKey` back to back (`pollForResult` repeats the same pair on every
+// poll iteration), and `handleSuiteRecord` releases the claim immediately
+// after it stores the row (`suiteClaims.delete`). A record landing inside that
+// lookup -> claim gap therefore makes the shim's own claim a legitimate owner
+// ("action": "run") and it correctly EXECUTES instead of replaying — the
+// false red. Under host load the fixed sleep lands exactly there.
+//
+// The barrier removes the guess: it waits until the control server has
+// actually answered `minCount` /suite/claim requests from `runId` with "wait",
+// observed in the run's own event timeline `<stateDir>/events/<runId>.jsonl`
+// (the default `emitSuiteClaimEvent` of `createControlServer` is `emitEvent`,
+// so this is the server's own claim handling — never a wall-clock guess). Once
+// a `suite.claim_wait` is observed the shim is provably inside its
+// `SINGLEFLIGHT_POLL_INTERVAL_MS` (1000 ms) sleep, so the record lands inside
+// that sleep and the next /suite/lookup must see the green row and replay.
+//
+// Bounded by a MONOTONIC deadline (never a `Date.now()` difference), with a
+// tight poll interval, and it throws a diagnostic naming the run id, the
+// observed timeline and the live shim stderr instead of hanging.
+interface SuiteClaimTimelineEvent {
+  event: string;
+  runId: string;
+  stepId?: string;
+}
+
+interface SuiteClaimBarrierOptions {
+  /** The shim's own `--run` value; the control server stamps it on the timeline. */
+  runId: string;
+  /** How many `suite.claim_wait` answers to wait for. */
+  minCount: number;
+  /** The state dir the in-process control server writes events to. */
+  stateDir: string;
+  /** Live stdout/stderr/exit state of the spawned shim, for diagnostics. */
+  live: ShimLiveOutput;
+}
+
+const SUITE_CLAIM_BARRIER_POLL_MS = 25;
+const SUITE_CLAIM_BARRIER_DEADLINE_MS = 30_000;
+
+/**
+ * Parse the run's event timeline, ignoring anything that is not a complete
+ * JSON object event: the shim child appends to the same file, so a read can
+ * catch a line mid-append. A skipped partial line is re-read on the next poll.
+ */
+function readSuiteClaimTimeline(eventsPath: string): SuiteClaimTimelineEvent[] {
+  if (!existsSync(eventsPath)) return [];
+  const raw = readFileSync(eventsPath, "utf8");
+  const events: SuiteClaimTimelineEvent[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || typeof parsed.event !== "string") continue;
+      events.push({
+        event: parsed.event,
+        runId: typeof parsed.runId === "string" ? parsed.runId : "",
+        stepId: typeof parsed.stepId === "string" ? parsed.stepId : undefined,
+      });
+    } catch {
+      // Torn/partial append from a concurrent writer — ignore.
+    }
+  }
+  return events;
+}
+
+async function waitForSuiteClaimWaitEvents(
+  options: SuiteClaimBarrierOptions,
+): Promise<{ claimWaitCount: number; observedEvents: string[] }> {
+  const { runId, minCount, stateDir, live } = options;
+  const eventsPath = join(stateDir, "events", `${runId}.jsonl`);
+  const deadline = new Deadline(SUITE_CLAIM_BARRIER_DEADLINE_MS);
+
+  const observedForRun = (): SuiteClaimTimelineEvent[] =>
+    readSuiteClaimTimeline(eventsPath).filter((event) => event.runId === runId);
+  const countClaimWaits = (events: SuiteClaimTimelineEvent[]): number =>
+    events.filter((event) => event.event === "suite.claim_wait").length;
+  const describeObserved = (events: SuiteClaimTimelineEvent[]): string[] =>
+    events.map((event) =>
+      event.stepId ? `${event.event}(step ${event.stepId})` : event.event,
+    );
+  // Count only claim_wait answers observed from now on, so an earlier claim
+  // (or a repeated run id) can never satisfy the barrier.
+  const baseline = countClaimWaits(observedForRun());
+  const renderDiagnostic = (why: string, observed: SuiteClaimTimelineEvent[]): string => {
+    const timeline = describeObserved(observed);
+    const stderrTail = live.stderr.slice(-4_000).trim();
+    return [
+      `claim-collision barrier: ${why}`,
+      `run id: ${runId}`,
+      `expected: >= ${minCount} "suite.claim_wait" answer(s) from the control server for that run`,
+      `observed: ${countClaimWaits(observed) - baseline} claim_wait answer(s) since the barrier started (${baseline} before it)`,
+      `timeline for this run: ${timeline.length > 0 ? timeline.join(", ") : "<none>"}`,
+      `events file: ${eventsPath}${existsSync(eventsPath) ? "" : " (absent)"}`,
+      `budget: ${SUITE_CLAIM_BARRIER_DEADLINE_MS} ms (poll interval ${SUITE_CLAIM_BARRIER_POLL_MS} ms)`,
+      `shim exited: ${live.exited}`,
+      `--- shim stderr (live tail) ---`,
+      stderrTail.length > 0 ? stderrTail : "<empty>",
+    ].join("\n");
+  };
+
+  while (!deadline.expired()) {
+    const observed = observedForRun();
+    const claimWaitCount = countClaimWaits(observed) - baseline;
+    if (claimWaitCount >= minCount) {
+      return { claimWaitCount, observedEvents: describeObserved(observed) };
+    }
+    if (live.exited) {
+      throw new Error(
+        renderDiagnostic("the shim exited before the claim collision was observed", observed),
+      );
+    }
+    await new Promise((resolve) =>
+      setTimeout(
+        resolve,
+        Math.min(SUITE_CLAIM_BARRIER_POLL_MS, Math.max(1, deadline.remainingMs())),
+      ),
+    );
+  }
+  throw new Error(
+    renderDiagnostic("the bounded deadline expired", observedForRun()),
+  );
+}
+
 /** Create a fixture git repo with a test script and return its path. */
 function createFixtureRepo(
   baseDir: string,
@@ -283,6 +437,8 @@ async function setupControlEnv(th: { homeDir: string; tamanduaDir: string }): Pr
   const { createControlServer } = await import(
     "../../dist/server/control-server.js"
   );
+  // Default emitSuiteClaimEvent is emitEvent, which appends the claim timeline
+  // to <stateDir>/events/<runId>.jsonl — the file the US-002 barrier reads.
   const server = createControlServer({ port: controlPort, secret });
   await new Promise<void>((resolve) => {
     server.once("listening", resolve);
@@ -1943,13 +2099,24 @@ exit 0
     assert.equal(claimBody.action, "run", "first claim should say run");
 
     // Spawn the shim — it should get "wait" on claim, start polling.
+    const live: ShimLiveOutput = { stdout: "", stderr: "", exited: false };
     const shimPromise = runShim(
       ["--repo", repoDir, "--run", "r-sf-ac2", "--step", "s1", "--", counterScript],
       env,
+      live,
     );
 
-    // Give the shim time to start polling, then record a green result.
-    await new Promise((r) => setTimeout(r, 500));
+    // FLAKE-ROOTCAUSE (US-002): no fixed pre-record sleep. Wait until the
+    // control server has answered this shim's own claim with "wait", which
+    // proves it is inside the single-flight poll, then record immediately: the
+    // record lands inside the shim's 1000 ms poll sleep, so the next lookup
+    // must see the green row and replay it.
+    await waitForSuiteClaimWaitEvents({
+      runId: "r-sf-ac2",
+      minCount: 1,
+      stateDir: controlEnv.stateDir,
+      live,
+    });
 
     await controlPlanePost("/suite/record", {
       origin_repo: originRepo,
@@ -2216,16 +2383,32 @@ exit 0
     const preload = join(tempBase, "us005-poll-preload.cjs");
     writeFileSync(preload, MONOTONIC_FORWARD_JUMP_PRELOAD);
 
+    const live: ShimLiveOutput = { stdout: "", stderr: "", exited: false };
     const shimPromise = runShimWithPreload(
       preload,
       ["--repo", repoDir, "--run", "r-us005-monotonic-poll", "--step", "s1", "--", counterScript],
       env,
+      live,
     );
 
-    // Let the waiter poll well past the point where an epoch-based
+    // FLAKE-ROOTCAUSE (US-002): no fixed pre-record sleep. Wait for THREE
+    // `suite.claim_wait` answers for this shim: the initial claim plus two full
+    // poll iterations (sleep -> lookup -> claim each). That is >=2 s of real
+    // polling — well past the point where an epoch-based
     // `Date.now() - start < CLAIM_TIMEOUT_MS` loop would have declared the
-    // 30-minute budget exhausted after the +1h jump.
-    await new Promise((r) => setTimeout(r, 2500));
+    // 30-minute budget exhausted after the +1h-per-read jump — and the third
+    // "wait" means the shim is inside its 1000 ms poll sleep, so recording now
+    // lands in that sleep and the next lookup must replay the green row.
+    const barrier = await waitForSuiteClaimWaitEvents({
+      runId: "r-us005-monotonic-poll",
+      minCount: 3,
+      stateDir: controlEnv.stateDir,
+      live,
+    });
+    assert.ok(
+      barrier.claimWaitCount >= 3,
+      `the green result must be recorded only after >=3 claim_wait events, got ${barrier.claimWaitCount}`,
+    );
 
     // Release the claim by recording a green result; a monotonic waiter is
     // still polling and must replay it.
