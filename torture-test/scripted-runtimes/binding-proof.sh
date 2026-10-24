@@ -336,10 +336,16 @@ run_workflow() {
   run_stdout="$(mktemp "$TMP_DIR/run-stdout.XXXXXX")"
   run_stderr="$(mktemp "$TMP_DIR/run-stderr.XXXXXX")"
 
-  env -i $(echo "$scripted_env") PATH="${PATH}" \
+  # Capture the run command's REAL exit status. The command is the condition
+  # of an `if`, so `set -e` does not abort here and `$?` in the `else` branch
+  # is the command's status. Never append `|| true` — that erases the status.
+  if env -i $(echo "$scripted_env") PATH="${PATH}" \
     "$TAMANDUA_CLI" workflow run do-now-proof --task-file "$TASK_FILE" --wait --timeout 5m --json \
-    >"$run_stdout" 2>"$run_stderr" || true
-  run_rc=$?
+    >"$run_stdout" 2>"$run_stderr"; then
+    run_rc=0
+  else
+    run_rc=$?
+  fi
 
   info "Workflow run stderr (heartbeats):"
   cat "$run_stderr" | while IFS= read -r line; do info "  [wait] $line"; done
@@ -348,7 +354,37 @@ run_workflow() {
   cat "$run_stdout" | while IFS= read -r line; do info "  $line"; done
   info ""
 
-  # Extract run ID from stdout (printed as "Run: run-<uuid>")
+  # Fail closed on a nonzero run exit status: a failed run must never be
+  # reported as PASS.
+  if [ "$run_rc" -ne 0 ]; then
+    fail "Workflow run command failed (rc=$run_rc)"
+    info "stdout contents:"
+    cat "$run_stdout" >&2
+    info "stderr contents:"
+    cat "$run_stderr" >&2
+    print_diagnostics
+    exit 1
+  fi
+
+  # Fail closed on a timeout signature even when the command exited 0.
+  local timeout_signature=""
+  if grep -Eq '"timedOut"[[:space:]]*:[[:space:]]*true' "$run_stdout" "$run_stderr"; then
+    timeout_signature='"timedOut": true'
+  elif grep -Eqi 'timed[ -]out|wait loop timed out' "$run_stdout" "$run_stderr"; then
+    timeout_signature="wait-loop timed out"
+  fi
+  if [ -n "$timeout_signature" ]; then
+    fail "Workflow run timed out (signature: $timeout_signature)"
+    info "stdout contents:"
+    cat "$run_stdout" >&2
+    info "stderr contents:"
+    cat "$run_stderr" >&2
+    print_diagnostics
+    exit 1
+  fi
+
+  # Extract run ID from stdout. The merged --wait --json document begins with
+  # `{"runId":"run-<uuid>"...`; text mode prints "Run: run-<uuid>".
   RUN_ID="$(grep -oE 'run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$run_stdout" | head -1 || true)"
   if [ -z "$RUN_ID" ]; then
     fail "Could not extract run ID from stdout"
@@ -357,24 +393,97 @@ run_workflow() {
   fi
   info "Run ID: $RUN_ID"
 
-  # Parse the JSON result from the wait command (last JSON line on stdout)
-  local json_line
-  json_line="$(grep -E '^\{"runs":' "$run_stdout" | tail -1 || true)"
+  # Parse the wait JSON robustly (no jq dependency). Select the LAST stdout
+  # line that is a complete JSON object (trimmed line starts '{' and ends
+  # '}') and JSON-parses, then REQUIRE a non-empty runs array, a completed
+  # status, and numeric tokensSpent. A line is never accepted merely because
+  # it contains the substring `runs`.
+  local parsed parse_err parse_rc=0
+  parse_err="$(mktemp "$TMP_DIR/parse-err.XXXXXX")"
+  parsed="$("$NODE_BIN" --input-type=module - "$run_stdout" 2>"$parse_err" <<'NODE_PARSE'
+import fs from "node:fs";
 
-  if [ -z "$json_line" ]; then
-    fail "Could not extract JSON result from workflow run --wait --json output"
+const file = process.argv[2];
+let text;
+try {
+  text = fs.readFileSync(file, "utf8");
+} catch {
+  process.stderr.write(
+    "Could not read workflow run --wait --json output\n",
+  );
+  process.exit(2);
+}
+
+let parsedObject = null;
+for (const raw of text.split(/\r?\n/)) {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+  try {
+    const candidate = JSON.parse(trimmed);
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+      parsedObject = candidate;
+    }
+  } catch {
+    // Not a complete JSON object; keep looking for the last one.
+  }
+}
+
+if (!parsedObject) {
+  process.stderr.write(
+    "Could not extract JSON result from workflow run --wait --json output (no complete JSON object line)\n",
+  );
+  process.exit(2);
+}
+
+const runs = parsedObject.runs;
+if (!Array.isArray(runs) || runs.length === 0) {
+  process.stderr.write(
+    "Run output missing expected runs data (runs array absent or empty)\n",
+  );
+  process.exit(3);
+}
+
+const run = runs[0];
+const status = run && typeof run.status === "string" ? run.status : "";
+if (status !== "completed" && status !== "done") {
+  process.stderr.write(
+    `Run did not complete successfully (status: ${status || "missing"})\n`,
+  );
+  process.exit(4);
+}
+
+const tokens = run.tokensSpent;
+if (typeof tokens !== "number" || !Number.isInteger(tokens) || tokens < 0) {
+  process.stderr.write(
+    `Tokens spent is ${JSON.stringify(tokens)} — expected a non-negative integer\n`,
+  );
+  process.exit(5);
+}
+
+process.stdout.write(`RUN_STATUS=${status}\n`);
+process.stdout.write(`TOKENS_SPENT=${tokens}\n`);
+process.stdout.write(`RUN_COUNT=${runs.length}\n`);
+NODE_PARSE
+)" || parse_rc=$?
+
+  if [ "$parse_rc" -ne 0 ]; then
+    local parse_msg
+    parse_msg="$(cat "$parse_err" 2>/dev/null || true)"
+    fail "${parse_msg:-Could not parse workflow run --wait --json output (parser rc=$parse_rc)}"
     info "stdout contents:"
     cat "$run_stdout" >&2
     print_diagnostics
     exit 1
   fi
 
-  # Parse fields from JSON using grep + sed (no jq dependency)
-  local run_status; run_status="$(echo "$json_line" | grep -oE '"status":"[^"]*"' | head -1 | sed 's/"status":"//;s/"//' || true)"
-  local tokens_spent; tokens_spent="$(echo "$json_line" | grep -oE '"tokensSpent":[0-9]+' | head -1 | sed 's/"tokensSpent"://' || echo "unknown")"
+  local run_status tokens_spent run_count
+  run_status="$(printf '%s\n' "$parsed" | grep '^RUN_STATUS=' | cut -d= -f2-)"
+  tokens_spent="$(printf '%s\n' "$parsed" | grep '^TOKENS_SPENT=' | cut -d= -f2-)"
+  run_count="$(printf '%s\n' "$parsed" | grep '^RUN_COUNT=' | cut -d= -f2-)"
 
   info "Run status: $run_status"
   info "Tokens spent: $tokens_spent"
+  info "Run count: $run_count"
 
   # ── Assertions ──────────────────────────────────────────────────
 
@@ -397,11 +506,11 @@ run_workflow() {
   fi
 
   # Assert: output matches behaviors file expectations
-  # The wait JSON should show step completion matching our behavior
-  if echo "$json_line" | grep -q '"runs"'; then
-    pass "Run output contains expected runs array"
+  # The validated parse must contain at least one run.
+  if [ "${run_count:-0}" -ge 1 ]; then
+    pass "Run output contains expected runs array (run count: $run_count)"
   else
-    fail "Run output missing expected runs data"
+    fail "Run output missing expected runs data (run count: ${run_count:-0})"
     print_diagnostics
     exit 1
   fi
