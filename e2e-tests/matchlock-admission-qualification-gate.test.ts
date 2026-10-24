@@ -3681,8 +3681,25 @@ realVmDescribe("G8 admission qualification — REAL-VM TIER", () => {
     // Exact-owned disposal ONLY: recorded vm-<8hex> ids, never a pattern. A
     // failed/unknown `matchlock rm` throws and RETAINS the state dir and DB
     // rows for diagnostics (no erase-to-look-clean).
-    cleanupOwnedVms(privateHome, ledgerPath, observedVmIds, { rpcBin: MATCHLOCK_RPC_BIN });
-    assertNoOwnedVms(privateHome, GATE_LABEL, { ledgerPath, rpcBin: MATCHLOCK_RPC_BIN });
+    // Each scenario runs under its OWN private HOME
+    // (scenario-a/A2-allow/home, scenario-c/C1-mixed-overlap/home), so the
+    // disposal and the inventory assertion must run per scenario home; the
+    // evidence-root private home never holds a store. A home that exists but
+    // holds no store is skipped by the dbPresent rule in cleanupOwnedVms.
+    const scenarioHomes: string[] = [];
+    for (const group of ["scenario-a", "scenario-c"]) {
+      const groupDir = path.join(evidenceDir, group);
+      if (!fs.existsSync(groupDir)) continue;
+      for (const scenario of fs.readdirSync(groupDir).sort()) {
+        const home = path.join(groupDir, scenario, "home");
+        if (fs.existsSync(home)) scenarioHomes.push(home);
+      }
+    }
+    const cleanupHomes = scenarioHomes.length > 0 ? scenarioHomes : [privateHome];
+    for (const home of cleanupHomes) {
+      cleanupOwnedVms(home, ledgerPath, observedVmIds, { rpcBin: MATCHLOCK_RPC_BIN });
+      assertNoOwnedVms(home, GATE_LABEL, { ledgerPath, rpcBin: MATCHLOCK_RPC_BIN });
+    }
   });
 
   it("runs under the shared gate lock with a private HOME/TMPDIR/state and a seeded image store", () => {

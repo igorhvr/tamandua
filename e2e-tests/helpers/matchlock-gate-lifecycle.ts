@@ -347,7 +347,11 @@ export function cleanupOwnedVms(
         `leftover owned VM rows/dirs after cleanup: rows=${finalInventory.rows.map((r) => r.id).join(",")}, dirs=${finalInventory.dirIds.join(",")}`,
       );
     }
-    if (!finalInventory.dbPresent && observedIds.length > 0) {
+    // A home with no .matchlock store at all was never in play for this
+    // cleanup call (a composed gate may own several scenario homes), so the
+    // absent-store rule applies only where a store was actually used.
+    const storeInPlay = fs.existsSync(path.join(homeDir, ".matchlock"));
+    if (!finalInventory.dbPresent && storeInPlay && observedIds.length > 0) {
       ledger.push(
         `${new Date().toISOString()} matchlock state DB is MISSING after a gate that created VMs — failing (absent ≠ clean)`,
       );
