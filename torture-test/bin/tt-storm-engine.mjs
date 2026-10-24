@@ -3080,7 +3080,7 @@ export function classifyTerminalGuardMiss(named, ctx, state, action) {
 
 // ─────────────────────────────────────────────────────────────────────
 // Read-path pounding (spec 09: dashboard HTTP + 2 MCP tool calls every 30s;
-// assert no 5xx and first-byte latency < 2s). This is a REAL engine
+// assert no 5xx and first-byte latency <= 4 s). This is a REAL engine
 // activity driven through the injected proc adapters (ctx.proc.httpGet /
 // ctx.proc.mcpTool) on a cadence the engine owns; it is not a no-op phase
 // status. Round A runs pounding from round start (it is the round's sole

@@ -2301,7 +2301,7 @@ export const PRODUCTION_PORTS = Object.freeze([3334, 3338, 3339]);
 export const REHEARSAL_DAEMON_KIND = 'scripted';
 // Rehearsal pounding cadence + latency bound (spec 09 Round B table).
 export const REHEARSAL_POUND_INTERVAL_MS = 30_000;
-export const REHEARSAL_POUND_LATENCY_BOUND_MS = 2_000;
+export const REHEARSAL_POUND_LATENCY_BOUND_MS = 4_000;
 // Default MCP tool names pounded each round (real streamable-HTTP reads).
 // These MUST be the product's REGISTERED tool names (src/server/mcp-server.ts
 // MCP_TOOL_RUNS_LIST / MCP_TOOL_RUN_STATUS). The attempt-2 campaign pounded

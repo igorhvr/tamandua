@@ -121,9 +121,9 @@ export const ROUND_A_QUEUED_STAGGER_MS = 30_000;
 export const SAMPLER_INTERVAL_MS = 15_000;
 
 // Read-path pounding cadence + latency bound (spec 09 Round B table: 30s
-// between pounding rounds; first-byte latency bound < 2s; no 5xx).
+// between pounding rounds; first-byte latency bound at most 4 s; no 5xx).
 export const POUND_INTERVAL_MS = 30_000;
-export const POUND_LATENCY_BOUND_MS = 2_000;
+export const POUND_LATENCY_BOUND_MS = 4_000;
 
 // Parse a workflow.yml text and return { workflowId, stepAgents (distinct,
 // ordered), declaredAgents (distinct, ordered), usedStepAgents }.

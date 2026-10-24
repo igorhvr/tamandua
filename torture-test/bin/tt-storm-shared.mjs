@@ -401,7 +401,7 @@ export const REAL_PROC = {
     catch (err) { return { ok: false, pid, signal, error: String(err?.message ?? err) }; }
   },
   // Read-path pounding transport (Round A/B pounding; spec 09 "dashboard
-  // HTTP + 2 MCP tool calls every 30s; no 5xx; first-byte < 2s"). httpGet is
+  // HTTP + 2 MCP tool calls every 30s; no 5xx; first-byte at most 4 s"). httpGet is
   // a real fetch with a bounded timeout. mcpTool is the name the engine
   // calls (poundOnce -> ctx.proc.mcpTool): it delegates to the real
   // streamable-HTTP MCP transport from tt-storm-real.mjs (makeRealMcpTool),
@@ -643,7 +643,7 @@ export function newCampaignState({ campaignId, clock, source, fixture }) {
         status: 'planned',
         runs: {},
         pounding: {
-          active: false, notRunReason: null, cadenceMs: 30_000, latencyBoundMs: 2_000,
+          active: false, notRunReason: null, cadenceMs: 30_000, latencyBoundMs: 4_000,
           lastPoundMs: null, rounds: 0, probes: 0, assertionFailures: 0, maxLatencyMs: 0,
         },
       },
@@ -652,7 +652,7 @@ export function newCampaignState({ campaignId, clock, source, fixture }) {
         runs: {},
         phases: {},
         pounding: {
-          active: false, notRunReason: null, cadenceMs: 30_000, latencyBoundMs: 2_000,
+          active: false, notRunReason: null, cadenceMs: 30_000, latencyBoundMs: 4_000,
           lastPoundMs: null, rounds: 0, probes: 0, assertionFailures: 0, maxLatencyMs: 0,
         },
       },

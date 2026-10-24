@@ -407,7 +407,8 @@ export function makeCtx({ fs, clock, proc, db, varRoot = "/var", campaignDir = n
 }
 
 // Standard pounding config + healthy adapters: enables the engine's REAL
-// read-path pounding loop (30s cadence, latency bound 2s). Tests override
+// read-path pounding loop (30s cadence; the explicit 2s bound below is a
+// deliberate fixture pin, not the engine default). Tests override
 // `http`/`mcp` adapter results to inject 5xx / slow-latency probes.
 export function poundingOpts() {
   return {
