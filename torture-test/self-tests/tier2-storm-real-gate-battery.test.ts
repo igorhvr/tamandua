@@ -34,6 +34,7 @@ import {
   DOCUMENTED_CHAIN_ENVIRONMENT_DEVIATION_FILES,
   GATE_BATTERY_KIND,
   GATE_BATTERY_PATH,
+  SCRIPTED_PREPARE_REGRESSION_COMMAND,
   buildStormRealGateBattery,
   classifyChainRedFiles,
   gateResultsForContract,
@@ -263,6 +264,40 @@ describe("STORM-REAL-PROFILE US-017 REAL-profile gate battery", () => {
         "the contract points at a content-addressed battery artifact",
       );
     }
+  });
+
+  it("B9: the SCRIPTED_REHEARSAL regression command uses a TT_VAR daemon-control accepts (under torture-test/var)", () => {
+    // STORM-TTVAR-GUARD: daemon-control resolves TT_ROOT from TT_VAR and
+    // refuses (exit 2) any TT_VAR outside torture-test/var. The printed
+    // regression command must therefore emit an ACCEPTED root, not a scratch
+    // path outside the repo var.
+    assert.doesNotMatch(
+      SCRIPTED_PREPARE_REGRESSION_COMMAND,
+      /<scratch outside/,
+      "the old scratch-placeholder TT_VAR is gone",
+    );
+    const m = SCRIPTED_PREPARE_REGRESSION_COMMAND.match(/^TT_VAR=(\S+) (.*)$/);
+    assert.ok(m, `the command starts with a TT_VAR assignment: ${SCRIPTED_PREPARE_REGRESSION_COMMAND}`);
+    const ttVar = m[1];
+    assert.match(ttVar, /^torture-test\/var\/[A-Za-z0-9._-]+$/, "TT_VAR is a named directory under torture-test/var");
+    assert.equal(
+      m[2],
+      "node torture-test/bin/tt-storm prepare --profile SCRIPTED_REHEARSAL --fixture tt-poly",
+      "the rest of the printed command is unchanged",
+    );
+    // The recorded battery gate carries the exact same command (no silent
+    // fallback to the old placeholder through a missing gate command).
+    const battery: any = buildStormRealGateBattery({
+      source: syntheticSource(),
+      recordedAtUtc: "2026-09-23T00:00:00.000Z",
+      evidenceDir: "/tmp/storm-chain-us017",
+      chainSummary: chainSummary(DOCUMENTED_CHAIN_ENVIRONMENT_DEVIATION_FILES),
+      focusedSelfTests: greenFocused(),
+      build: { verdict: "PASS" },
+      typecheck: { verdict: "PASS" },
+      scriptedPrepareRegression: { verdict: "PASS", campaign_id: "storm-...", profile: "SCRIPTED_REHEARSAL" },
+    });
+    assert.equal(battery.gates.scripted_prepare_regression.command, SCRIPTED_PREPARE_REGRESSION_COMMAND);
   });
 
   it("B8: a SCRIPTED_REHEARSAL prepare still succeeds (launch-free regression)", () => {

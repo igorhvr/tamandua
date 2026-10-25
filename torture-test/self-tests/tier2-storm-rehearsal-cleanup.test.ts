@@ -26,11 +26,24 @@
 //       evidenced:true;
 //   C7  a missing private state dir / daemon_ports makes the port check
 //       impossible -> evidenced:false (never a silent PASS);
-//   C8  a production port (3334/3338/3339) is refused before any signal.
+//   C8  a production port (3334/3338/3339) is refused before any signal;
+//   C9  three recorded listener identities (daemon pid via control.provenance,
+//       dashboard.pid, mcp.pid) with state.daemon already stopped are all
+//       stopped by exact recorded pid, all appear in stoppedListenerPids, and
+//       evidenced:true with the three campaign ports free;
+//   C10 a recorded pid that is already gone is silently absent from
+//       stoppedListenerPids (no survivor, no error) while the two live
+//       recorded listeners are stopped and cleanup still yields evidenced:true;
+//   C11 a daemon stop that REMOVES dashboard.pid/mcp.pid still reaps those
+//       recorded listeners (captured before dispatch), proving the ordering
+//       fix rather than a post-stop re-read.
 //
-// Only pids THIS test spawned are ever signalled; the state dir and every
-// child are test-owned scratch removed in finally. Ports are OS-allocated on
-// 127.0.0.1 (never 3334/3338/3339). No daemon/harness/workflow is spawned.
+// The recorded pid files are captured BEFORE the daemon stop in the handler:
+// a daemon that removes them while its orphaned children keep listening must
+// not be able to hide the live listeners. Only pids THIS test spawned are
+// ever signalled; the state dir and every child are test-owned scratch removed
+// in finally. Ports are OS-allocated on 127.0.0.1 (never 3334/3338/3339). No
+// daemon/harness/workflow is spawned.
 
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -296,5 +309,151 @@ describe("US-004 rehearsal cleanup: provenance-only standalone listener reap + c
     const res = await makeRehearsalDaemonCleanupHandler({ control, record, fsx: fs, privateStateDir: stateDir, daemonPorts: { dashboard: 3334, mcp: 3338, control: 3339 } })({ resources: {} });
     assert.equal(res.evidenced, false);
     assert.match(String(res.error), /production/);
+  });
+
+  it("C9: daemon + dashboard.pid + mcp.pid recorded listeners are all stopped by exact pid and named positively", async () => {
+    const home = ownedTmpDir("recorded-three-home");
+    const stateDir = path.join(home, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dashboardPort = await allocFreePort();
+    const mcpPort = await allocFreePort();
+    const controlPort = await allocFreePort();
+    const ports = { dashboard: dashboardPort, mcp: mcpPort, control: controlPort };
+    const daemon = spawnListener({ port: controlPort, cwd: stateDir, stateDirEnv: stateDir, home });
+    const dashboard = spawnListener({ port: dashboardPort, cwd: stateDir, stateDirEnv: stateDir, home });
+    const mcp = spawnListener({ port: mcpPort, cwd: stateDir, stateDirEnv: stateDir, home });
+    const daemonPid = daemon.pid!;
+    const dashboardPid = dashboard.pid!;
+    const mcpPid = mcp.pid!;
+    fs.writeFileSync(path.join(stateDir, "dashboard.pid"), String(dashboardPid));
+    fs.writeFileSync(path.join(stateDir, "mcp.pid"), String(mcpPid));
+    try {
+      const listening = await Promise.all([controlPort, dashboardPort, mcpPort].map((p) => waitPortListening(p)));
+      assert.ok(listening.every(Boolean), "all three recorded listeners bound");
+      // state.daemon is ALREADY recorded stopped: the daemon pid is only known
+      // from control.provenance, exactly the S6 split (daemon gone, listeners
+      // alive). No daemon dispatch must be needed to stop the recorded pids.
+      const record: any = { kind: REHEARSAL_DAEMON_KIND, status: "stopped", evidence: { pid: daemonPid } };
+      const control = fakeControl({ daemonPid, ports });
+      const handler = makeRehearsalDaemonCleanupHandler({ control, record, fsx: fs, privateStateDir: stateDir, daemonPorts: ports });
+      const res: any = await handler({ resources: {} });
+      assert.equal(res.evidenced, true, `all recorded listeners reaped and ports free: ${res.error ?? ""}`);
+      const stoppedPids = (res.stoppedListenerPids ?? []).map((s: any) => s.pid).sort((a: number, b: number) => a - b);
+      assert.deepEqual(stoppedPids, [daemonPid, dashboardPid, mcpPid].sort((a, b) => a - b), "all three recorded pids appear in stoppedListenerPids");
+      assert.ok((res.stoppedListenerPids ?? []).every((s: any) => s.signal === "SIGTERM" || s.signal === "SIGKILL"), "each stop records the signal used");
+      assert.equal(alive(daemonPid), false, "recorded daemon pid is gone");
+      assert.equal(alive(dashboardPid), false, "recorded dashboard pid is gone");
+      assert.equal(alive(mcpPid), false, "recorded mcp pid is gone");
+      for (const [label, port] of Object.entries(ports)) {
+        assert.equal(await probeTcpPortFree(port), true, `campaign ${label} port ${port} is free`);
+      }
+      assert.deepEqual(control.calls, [], "an already-stopped daemon needs no dispatch; the recorded pids are stopped directly");
+    } finally {
+      killOwned(daemonPid);
+      killOwned(dashboardPid);
+      killOwned(mcpPid);
+    }
+  });
+
+  it("C10: an already-gone recorded pid is silently absent while two live recorded listeners still pass", async () => {
+    const home = ownedTmpDir("recorded-dead-home");
+    const stateDir = path.join(home, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    // A deterministically dead pid: a child this test spawned that already exited.
+    const deadChild = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+    const deadPid = deadChild.pid!;
+    await new Promise<void>((resolve) => deadChild.once("exit", () => resolve()));
+    assert.equal(alive(deadPid), false, "the recorded dashboard pid is already gone");
+    const dashboardPort = await allocFreePort();
+    const mcpPort = await allocFreePort();
+    const controlPort = await allocFreePort();
+    const ports = { dashboard: dashboardPort, mcp: mcpPort, control: controlPort };
+    const daemon = spawnListener({ port: controlPort, cwd: stateDir, stateDirEnv: stateDir, home });
+    const mcp = spawnListener({ port: mcpPort, cwd: stateDir, stateDirEnv: stateDir, home });
+    const daemonPid = daemon.pid!;
+    const mcpPid = mcp.pid!;
+    fs.writeFileSync(path.join(stateDir, "dashboard.pid"), String(deadPid));
+    fs.writeFileSync(path.join(stateDir, "mcp.pid"), String(mcpPid));
+    try {
+      const listening = await Promise.all([controlPort, mcpPort].map((p) => waitPortListening(p)));
+      assert.ok(listening.every(Boolean), "the two live recorded listeners bound");
+      const record: any = { kind: REHEARSAL_DAEMON_KIND, status: "stopped", evidence: { pid: daemonPid } };
+      const control = fakeControl({ daemonPid, ports });
+      const handler = makeRehearsalDaemonCleanupHandler({ control, record, fsx: fs, privateStateDir: stateDir, daemonPorts: ports });
+      const res: any = await handler({ resources: {} });
+      assert.equal(res.evidenced, true, `a gone recorded pid is not a failure: ${res.error ?? ""}`);
+      const stoppedPids = (res.stoppedListenerPids ?? []).map((s: any) => s.pid);
+      assert.ok(!stoppedPids.includes(deadPid), "an already-gone pid is absent from stoppedListenerPids");
+      assert.ok(!(res.survivors ?? []).some((s: any) => s.pid === deadPid), "an already-gone pid is not a survivor");
+      assert.ok(stoppedPids.includes(daemonPid), "the live daemon pid is stopped and named");
+      assert.ok(stoppedPids.includes(mcpPid), "the live mcp pid is stopped and named");
+      assert.equal(alive(daemonPid), false, "live daemon pid is gone");
+      assert.equal(alive(mcpPid), false, "live mcp pid is gone");
+      for (const [label, port] of Object.entries(ports)) {
+        assert.equal(await probeTcpPortFree(port), true, `campaign ${label} port ${port} is free`);
+      }
+      assert.deepEqual(control.calls, [], "no dispatch was needed for this recorded-pid cleanup");
+    } finally {
+      killOwned(daemonPid);
+      killOwned(mcpPid);
+    }
+  });
+
+  it("C11: pid files removed by the daemon stop are still reaped because they are captured before dispatch", async () => {
+    const home = ownedTmpDir("prestop-home");
+    const stateDir = path.join(home, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dashboardPort = await allocFreePort();
+    const mcpPort = await allocFreePort();
+    const controlPort = await allocFreePort();
+    const ports = { dashboard: dashboardPort, mcp: mcpPort, control: controlPort };
+    const daemon = spawnListener({ port: controlPort, cwd: stateDir, stateDirEnv: stateDir, home });
+    const dashboard = spawnListener({ port: dashboardPort, cwd: stateDir, stateDirEnv: stateDir, home });
+    const mcp = spawnListener({ port: mcpPort, cwd: stateDir, stateDirEnv: stateDir, home });
+    const daemonPid = daemon.pid!;
+    const dashboardPid = dashboard.pid!;
+    const mcpPid = mcp.pid!;
+    fs.writeFileSync(path.join(stateDir, "dashboard.pid"), String(dashboardPid));
+    fs.writeFileSync(path.join(stateDir, "mcp.pid"), String(mcpPid));
+    const calls: string[] = [];
+    const control: any = {
+      kind: REHEARSAL_DAEMON_KIND,
+      dispatch: async (op: string) => {
+        calls.push(op);
+        if (op === "stop") {
+          // The defect: daemon-control removes the pid files as it stops the
+          // daemon, while the orphaned standalone children keep listening. A
+          // post-stop read would lose dashboard/mcp entirely.
+          fs.rmSync(path.join(stateDir, "dashboard.pid"), { force: true });
+          fs.rmSync(path.join(stateDir, "mcp.pid"), { force: true });
+          return { exitCode: 0, stdout: "stopped", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "daemon-control: scripted daemon not running", stderr: "" };
+      },
+      provenance: () => ({ found: true, file: "/tmp/tt-fake-scripted.json", record: { pid: daemonPid } }),
+    };
+    try {
+      const listening = await Promise.all([controlPort, dashboardPort, mcpPort].map((p) => waitPortListening(p)));
+      assert.ok(listening.every(Boolean), "all three recorded listeners bound before the stop");
+      const record: any = { kind: REHEARSAL_DAEMON_KIND, status: "running", evidence: { pid: daemonPid } };
+      const handler = makeRehearsalDaemonCleanupHandler({ control, record, fsx: fs, privateStateDir: stateDir, daemonPorts: ports });
+      const res: any = await handler({ resources: {} });
+      assert.ok(!fs.existsSync(path.join(stateDir, "dashboard.pid")), "the fake stop removed dashboard.pid");
+      assert.ok(!fs.existsSync(path.join(stateDir, "mcp.pid")), "the fake stop removed mcp.pid");
+      assert.equal(res.evidenced, true, `pre-stop capture kept the removed pidfiles reaped: ${res.error ?? ""}`);
+      const stoppedPids = (res.stoppedListenerPids ?? []).map((s: any) => s.pid);
+      for (const pid of [daemonPid, dashboardPid, mcpPid]) {
+        assert.ok(stoppedPids.includes(pid), `recorded pid ${pid} appears in stoppedListenerPids`);
+        assert.equal(alive(pid), false, `recorded pid ${pid} is gone`);
+      }
+      for (const [label, port] of Object.entries(ports)) {
+        assert.equal(await probeTcpPortFree(port), true, `campaign ${label} port ${port} is free`);
+      }
+      assert.deepEqual(calls, ["stop", "status"], "the daemon stop ran and was verified");
+    } finally {
+      killOwned(daemonPid);
+      killOwned(dashboardPid);
+      killOwned(mcpPid);
+    }
   });
 });

@@ -3542,7 +3542,19 @@ export function makeRehearsalDaemonCleanupHandler({
 
     const recordedPid = Number.isInteger(activeRecord.evidence?.pid) ? activeRecord.evidence.pid : null;
     const alreadyStopped = activeRecord.status === 'stopped';
-    let prov = { found: false, file: null, record: null };
+
+    // Capture every recorded listener identity BEFORE dispatching the daemon
+    // stop. daemon-control removes dashboard.pid/mcp.pid (and rewrites the
+    // provenance record) as it stops the daemon while its orphaned standalone
+    // children keep listening, so reading them after the stop is precisely the
+    // split that left live listeners un-reaped.
+    const recordedListenerPids = [];
+    for (const name of ['dashboard.pid', 'mcp.pid']) {
+      const pid = readRehearsalStatePidFile({ fsx: activeFsx, privateStateDir: activeStateDir, name });
+      if (pid) recordedListenerPids.push(pid);
+    }
+    let prov = activeControl.provenance ? (activeControl.provenance() ?? { found: false, file: null, record: null }) : { found: false, file: null, record: null };
+    const provenancePid = Number.isInteger(prov?.record?.pid) && prov.record.pid > 0 ? Number(prov.record.pid) : null;
 
     // Capture the descendant chain BEFORE the stop: once the daemon dies its
     // standalone children are reparented to PID 1 and the link is gone.
@@ -3550,25 +3562,28 @@ export function makeRehearsalDaemonCleanupHandler({
 
     if (!alreadyStopped) {
       const stopResult = await activeControl.dispatch('stop', {});
-      prov = activeControl.provenance ? activeControl.provenance() : { found: false, file: null, record: null };
+      // Refresh provenance for post-stop evidence only; the candidate pids and
+      // the pre-stop provenance pid were already captured above.
+      if (activeControl.provenance) {
+        const refreshed = activeControl.provenance();
+        if (refreshed) prov = refreshed;
+      }
       const statusResult = typeof activeControl.dispatch === 'function' ? await activeControl.dispatch('status', {}) : null;
       const status = classifyDaemonStatus({ result: statusResult, provenance: prov, kind: activeRecord.kind ?? REHEARSAL_DAEMON_KIND });
       const closed = stopResult?.exitCode === 0 && status.ok === true && status.running === false;
       if (!closed) {
         return { evidenced: false, error: `rehearsal-daemon stop produced no positive closed evidence (stop exit ${stopResult?.exitCode}, status running=${status.running}, reason=${status.reason ?? 'n/a'})` };
       }
-    } else if (activeControl.provenance) {
-      prov = activeControl.provenance() ?? prov;
     }
 
-    // Enumerate campaign-owned standalone listeners from PROVENANCE ONLY.
+    // Enumerate campaign-owned standalone listeners from the identities
+    // captured BEFORE the stop: recorded pid files, the provenance record pid,
+    // and the pre-stop descendant chain. Never re-read pid files here — the
+    // daemon may already have removed them.
     const candidates = new Set();
     for (const pid of descendantChain) candidates.add(pid);
-    for (const name of ['dashboard.pid', 'mcp.pid']) {
-      const pid = readRehearsalStatePidFile({ fsx: activeFsx, privateStateDir: activeStateDir, name });
-      if (pid) candidates.add(pid);
-    }
-    if (Number.isInteger(prov?.record?.pid) && prov.record.pid > 0) candidates.add(Number(prov.record.pid));
+    for (const pid of recordedListenerPids) candidates.add(pid);
+    if (provenancePid !== null) candidates.add(provenancePid);
 
     const survivors = [];
     const stoppedListenerPids = [];

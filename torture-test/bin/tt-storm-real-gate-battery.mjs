@@ -52,9 +52,11 @@ const FALSE_HARNESS = '/usr/bin/false';
 
 // The SCRIPTED_REHEARSAL prepare regression the story requires: prove the
 // zero-token path still prepares exactly as before with a REAL-profile module
-// set present.
+// set present. STORM-TTVAR-GUARD: the TT_VAR must be a path daemon-control
+// ACCEPTS (under torture-test/var), not a scratch path outside it — an
+// out-of-var TT_VAR is refused at daemon-control by the production guard.
 export const SCRIPTED_PREPARE_REGRESSION_COMMAND =
-  'TT_VAR=<scratch outside ~/.tamandua> node torture-test/bin/tt-storm prepare --profile SCRIPTED_REHEARSAL --fixture tt-poly';
+  'TT_VAR=torture-test/var/scripted-prepare-regression node torture-test/bin/tt-storm prepare --profile SCRIPTED_REHEARSAL --fixture tt-poly';
 export const SCRIPTED_PREPARE_REGRESSION_PROFILE = 'SCRIPTED_REHEARSAL';
 
 // The DOCUMENTED, pre-existing host-environment red set. Every one of these is
