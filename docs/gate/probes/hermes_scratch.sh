@@ -36,6 +36,16 @@ case "$HERMES_HOME" in
   *) refuse "HERMES_HOME must be an absolute path (got: $HERMES_HOME)" ;;
 esac
 
+# Refuse a spelling that IS the operator home before resolving it. On a host
+# where that path does not exist (a build or CI box), readlink -f fails first,
+# and the refusal would then name a resolution error instead of the rule it is
+# actually enforcing. Checking the literal spelling keeps the guard portable and
+# keeps its message truthful; the resolved check below still catches symlinked
+# and '..' spellings that reach the same place.
+case "$HERMES_HOME" in
+  "$REAL_HOME"|"$REAL_HOME"/*) refuse "HERMES_HOME is the real operator home: $HERMES_HOME" ;;
+esac
+
 # Resolve symlinks and '..' before comparing: validation must inspect the real
 # location the process would use, not the caller's spelling of it.
 resolved_home="$(readlink -f -- "$HERMES_HOME" 2>/dev/null)" || refuse "cannot resolve HERMES_HOME=$HERMES_HOME"
