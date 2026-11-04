@@ -11,24 +11,24 @@ MAINTAINER Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>
 #
 # Frozen source SHAs for r4 (also recorded in /etc/tamandua-image-manifest.json
 # and the OCI labels below; users can `git pull` ahead of them at will):
-#   hermes-agent: 4d04303818b61bf3aa09278af48356315515965b
+#   hermes-agent: b200f5bc60e31588ba2cb60e288029c4a54ba5fa
 #   pi:           bd3c9b823762b7383954aa49e13ee350471015fe
 #   dsh:          5badb15009ae1756c3afe0ae0cef1faafc290ccc
 #   tamandua:     3f5d008c8d2263017bf13059625606539a625f06
-# Python runtime pin: 3.14.7 -- the NEWEST Python hermes main supports
+# Python runtime pin: 3.14.9 -- the NEWEST Python hermes main supports
 # (`requires-python >=3.11,<3.15`; upstream's own pm/lock.json names the exact
-# 3.14.7+20260901 artifact). Newest-supported is deliberate: older Pythons
+# 3.14.9 build artifact). Newest-supported is deliberate: older Pythons
 # previously caused sqlite corruption for the maintainer.
 # ============================================================================
 
 LABEL org.opencontainers.image.title="tamandua standard image (r4)" \
       org.opencontainers.image.source="https://github.com/igorhvr/tamandua" \
       org.opencontainers.image.description="Matchlock standard image: tamandua, dsh, pi and hermes (pi/hermes built from in-image source with build-and-install scripts)" \
-      com.tamandua.hermes.commit="4d04303818b61bf3aa09278af48356315515965b" \
+      com.tamandua.hermes.commit="b200f5bc60e31588ba2cb60e288029c4a54ba5fa" \
       com.tamandua.pi.commit="bd3c9b823762b7383954aa49e13ee350471015fe" \
       com.tamandua.dsh.commit="5badb15009ae1756c3afe0ae0cef1faafc290ccc" \
       com.tamandua.tamandua.commit="3f5d008c8d2263017bf13059625606539a625f06" \
-      com.tamandua.python.pin="3.14.7"
+      com.tamandua.python.pin="3.14.9"
 
 # User-agnostic PATH: everything the image runs for any caller uid lives under
 # /usr/local (never behind /root) or /nix (a world-readable store). The nix
@@ -79,13 +79,13 @@ RUN set -eu; \
       sleep 10; \
     done; \
     [ -n "$ok" ]; \
-    git -C /opt/src/hermes-agent checkout -B main 4d04303818b61bf3aa09278af48356315515965b; \
+    git -C /opt/src/hermes-agent checkout -B main b200f5bc60e31588ba2cb60e288029c4a54ba5fa; \
     git -C /opt/src/hermes-agent branch --set-upstream-to=origin/main main
 
 COPY build-and-install-hermes.sh /opt/src/hermes-agent/build-and-install
 RUN printf 'build-and-install\n' >> /opt/src/hermes-agent/.git/info/exclude \
  && chmod 755 /opt/src/hermes-agent/build-and-install \
- && EXPECT_HEAD=4d04303818b61bf3aa09278af48356315515965b \
+ && EXPECT_HEAD=b200f5bc60e31588ba2cb60e288029c4a54ba5fa \
     HERMES_SYSTEM_HOME=/opt/src/hermes-root \
     TAMANDUA_IMAGE_BUILD=1 \
     /opt/src/hermes-agent/build-and-install
@@ -176,3 +176,33 @@ RUN rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub \
              /root/.ssh/authorized_keys; do \
       test ! -e "$f" || { echo "image hygiene: $f still present" >&2; exit 1; }; \
     done
+
+# --- stock-Hermes payload accommodation (two filesystem facts) ----------------
+# Proven necessary by disposable-guest trials against the previous image; both
+# facts are required for stock Hermes to run as a NON-ROOT user with NO chown,
+# no USER change and no patch to Hermes itself:
+#
+#  1. Sealed-payload marker beside the store. Hermes' PM decides it is running
+#     from a sealed payload by looking for manifest.json in the PARENT of the
+#     store root. Our store is /opt/src/hermes-root/tools while the build puts
+#     the manifest at /opt/src/manifest.json, so the check misses and PM tries
+#     to write into the read-only payload. Copying the manifest beside the store
+#     makes PM route its writes to the caller's HERMES_HOME.
+#  2. Lease directories must be creatable by any uid. Activation takes a lease
+#     inside <generation>/.leases; those ship root-owned 0755, so a non-root
+#     caller gets EACCES before doing any work. 1777 + sticky lets any uid mint
+#     its own lease without transferring ownership to a fixed uid.
+#
+# Placement matters: this runs AFTER the in-image hermes build, because the
+# build creates the store and its generation directories. The glob covers every
+# generation the build produced, so a bumped Hermes pin keeps working.
+RUN set -eu; \
+    test -f /opt/src/manifest.json; \
+    cp -f /opt/src/manifest.json /opt/src/hermes-root/manifest.json; \
+    n=0; \
+    for d in $(find /opt/src/hermes-root -type d -name .leases 2>/dev/null); do \
+      chmod 1777 "$d"; n=$((n+1)); \
+    done; \
+    echo "payload-accommodation: manifest=$(ls -l /opt/src/hermes-root/manifest.json | awk '{print $1, $5}') leases_dirs=$n"; \
+    test "$n" -ge 1; \
+    find /opt/src/hermes-root -type d -name .leases -exec ls -ld {} \;

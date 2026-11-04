@@ -19,8 +19,8 @@ TS=$(git -C /opt/tamandua rev-parse HEAD)
 # --- pin guards (fail closed; a bump is a deliberate operator change) -------
 grep -q 'requires-python = ">=3.11,<3.15"' "$INSTALL_DIR/pyproject.toml" \
   || { echo "FATAL: hermes requires-python no longer declares >=3.11,<3.15" >&2; exit 1; }
-grep -q '3\.14\.7' "$INSTALL_DIR/pm/lock.json" \
-  || { echo "FATAL: hermes pm/lock.json no longer pins python 3.14.7" >&2; exit 1; }
+grep -q '3\.14\.9' "$INSTALL_DIR/pm/lock.json" \
+  || { echo "FATAL: hermes pm/lock.json no longer pins python 3.14.9" >&2; exit 1; }
 
 # --- interpreter + application environment via the upstream resolvers ------
 resolved="$(HERMES_HOME="$HERMES_HOME" python3 - "$INSTALL_DIR" <<'PY'
@@ -43,7 +43,7 @@ VENVPY="$(printf '%s\n' "$resolved" | sed -n 2p)"
 [ -x "$PYEXE" ] || { echo "FATAL: store interpreter missing: $PYEXE" >&2; exit 1; }
 [ -x "$VENVPY" ] || { echo "FATAL: application interpreter missing: $VENVPY" >&2; exit 1; }
 PYVER="$("$PYEXE" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
-[ "$PYVER" = "3.14.7" ] || { echo "FATAL: store python is $PYVER, expected 3.14.7" >&2; exit 1; }
+[ "$PYVER" = "3.14.9" ] || { echo "FATAL: store python is $PYVER, expected 3.14.9" >&2; exit 1; }
 "$VENVPY" -c 'import ruamel.yaml' || { echo "FATAL: app environment incomplete (ruamel)" >&2; exit 1; }
 SQLITE="$("$PYEXE" -c 'import sqlite3;print(sqlite3.sqlite_version)')"
 NODE="$(node -v)"
@@ -116,7 +116,7 @@ manifest = {
     "piCommit": env["PS"],
     "dshCommit": env["DS"],
     "tamanduaCommit": env["TS"],
-    "pythonPin": "3.14.7",
+    "pythonPin": "3.14.9",
     "pythonVersion": env["PYVER"],
     "pythonPath": env["PYEXE"],
     "sqliteVersion": env["SQLITE"],
