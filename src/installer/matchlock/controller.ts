@@ -283,6 +283,24 @@ export class MatchlockControllerError extends Error {
 }
 
 /**
+ * Hermes re-points TMPDIR at `<HERMES_HOME>/cache/scratch` at startup whenever
+ * the caller has not set it (hermes_cli/main.py, `_export_scratch_tmp_env`).
+ * Under Matchlock the Hermes home is a FUSE mount, and a Unix socket cannot be
+ * bound on it. The gateway's control-socket path therefore falls back — and the
+ * fallback resolves through `tempfile.gettempdir()`, i.e. that same TMPDIR — so
+ * it lands on the very filesystem that just refused the bind and fails with
+ * EOPNOTSUPP (errno 95), aborting bootstrap with "gateway session bootstrap
+ * control listener unavailable".
+ *
+ * The guest's temp space must be guest-local. Pin `/tmp` whenever a Hermes home
+ * is mapped, and only when the caller has not chosen a TMPDIR itself.
+ */
+export function applyGuestTempPolicy(env: Record<string, string> | undefined): void {
+  if (env === undefined) return;
+  if (env.HERMES_HOME && env.TMPDIR === undefined) env.TMPDIR = "/tmp";
+}
+
+/**
  * OVERLAY-INV-SCOPED: explicit disposition of the per-invocation dsh
  * profile-overlay finalization, tracked INDEPENDENTLY of the VM `closed` flag.
  *
@@ -912,6 +930,7 @@ export class MatchlockController {
     if (this.createEnv && Object.keys(this.createEnv).length > 0) {
       cfg.env = { ...(cfg.env ?? {}), ...this.createEnv };
     }
+    applyGuestTempPolicy(cfg.env);
     return cfg;
   }
 
