@@ -920,11 +920,11 @@ describe("binding-proof.sh W0.3b fail-closed run_workflow", () => {
     let baseSource: string;
     try {
       baseSource = execSync(
-        "git show bb330709:torture-test/scripted-runtimes/binding-proof.sh",
+        "git show backup/gate/base-binding-proof:torture-test/scripted-runtimes/binding-proof.sh",
         { cwd: repoRoot, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
       );
     } catch {
-      t.skip("base revision bb330709 is not available in this checkout");
+      t.skip("base revision backup/gate/base-binding-proof is not available in this checkout");
       return;
     }
     const baseDir = makeTempDir();

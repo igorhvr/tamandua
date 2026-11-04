@@ -59,7 +59,7 @@ const CANDIDATE_MODULE = path.join(
   "matchlock",
   "store-header.js",
 );
-const BASELINE_COMMIT = "d6c0383d";
+const BASELINE_COMMIT = "backup/gate/base-store-header";
 const BASELINE_TREE = "a7090b54";
 const BASELINE_SOURCE_PATH = "src/installer/matchlock/store-header.ts";
 const DEADLINE_MS = 3_000;
