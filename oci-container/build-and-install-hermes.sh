@@ -6,7 +6,7 @@
 #
 # System mode (uid 0 -- the image build, or a root shell in the guest):
 #   builds the checkout the script lives in; the managed data root (uv,
-#   Python 3.14.7, Node, the application venv generations) lives under
+#   Python 3.14.9, Node, the application venv generations) lives under
 #   HERMES_SYSTEM_HOME (default: <checkout parent>/hermes-root). Publishes
 #   /usr/local/bin/{hermes,hermes-acp} plus the hermes-agent convenience
 #   (`hermes --run-module run_agent`), the same shape upstream publishes.
@@ -42,11 +42,11 @@
 # under the explicit TAMANDUA_IMAGE_BUILD=1 flag: a guest rebuild keeps its
 # configuration, edits and locks.
 #
-# Python pin: 3.14.7 -- the newest Python hermes main supports
+# Python pin: 3.14.9 -- the newest Python hermes main supports
 # (requires-python >=3.11,<3.15; upstream pm/lock.json names the exact
-# 3.14.7+20260901 artifacts). Newest-supported is deliberate: older Pythons
+# 3.14.9 build artifacts). Newest-supported is deliberate: older Pythons
 # previously caused sqlite corruption for the maintainer. The script
-# fail-closes if the managed interpreter is not exactly 3.14.7.
+# fail-closes if the managed interpreter is not exactly 3.14.9.
 set -euo pipefail
 umask 022
 
@@ -417,7 +417,7 @@ VENV_PY="$(printf '%s\n' "$RESOLVED" | sed -n 2p)"
 [ -x "$VENV_PY" ] || { echo "FATAL: application interpreter missing: $VENV_PY" >&2; exit 1; }
 
 PYVER="$("$STORE_PY" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')"
-[ "$PYVER" = "3.14.7" ] || { echo "FATAL: managed python is $PYVER, expected 3.14.7" >&2; exit 1; }
+[ "$PYVER" = "3.14.9" ] || { echo "FATAL: managed python is $PYVER, expected 3.14.9" >&2; exit 1; }
 SQLITE="$("$STORE_PY" -c 'import sqlite3;print(sqlite3.sqlite_version)')"
 echo "-- store interpreter: $STORE_PY (python $PYVER, sqlite $SQLITE)"
 echo "-- application env:   $VENV_PY"
