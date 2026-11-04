@@ -17,7 +17,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { applyGuestTempPolicy } from "../src/installer/matchlock/controller.ts";
+import { applyGuestTempPolicy } from "../dist/installer/matchlock/controller.js";
 
 describe("applyGuestTempPolicy", () => {
   it("pins guest-local /tmp when a Hermes home is mapped", () => {
