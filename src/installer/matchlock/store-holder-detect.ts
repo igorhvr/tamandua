@@ -225,7 +225,12 @@ const SECRET_FLAG_NAMES = new Set<string>([
 /** Pattern-kill vocabulary that must never survive into a description. */
 const PATTERN_KILL_WORDS = ["pkill", "killall"] as const;
 
-const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
+/**
+ * SQLite sidecar suffixes a store may carry. Exported so the darwin probe
+ * runner can tell an OPTIONAL sidecar spelling (whose absence is normal) from a
+ * REQUIRED store path (whose absence is evidence of a gap).
+ */
+export const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
 
 interface Identity {
   dev: string;

@@ -59,21 +59,29 @@
  * it; GATE-IMPLEMENTATION-SPEC.md sections 3 and 5).
  *
  * DARWIN uses the bounded lsof primitive (`runLsof` in
- * `src/lib/lsof-probe.ts`, which ALWAYS prepends `-b -w` and enforces a hard
- * SIGKILL timeout) exactly once per probe:
+ * `src/lib/lsof-probe.ts`, which prepends `-w`, omits `-b` for this
+ * pathname-selecting probe and enforces a hard SIGKILL timeout) exactly once
+ * per probe:
  *
  *   runLsof(["-F", "pcn", "--", ...paths])
  *
  * and parses the `p<pid>` / `c<command>` / `n<path>` field records into
- * candidates. lsof only reports descriptors it could match to the requested
- * paths, so no identity prefilter runs there; the raw `n` spellings are
- * returned and the pure module still re-derives the `(dev, ino)` match. lsof
+ * candidates. `-b` is omitted because on macOS lsof 4.91 it stubs out stat(2)
+ * and pathname selection is stat(2)-based, so a `-b` pathname probe never sees
+ * a single open file; the SIGKILL timeout — not `-b` — is what bounds a blocked
+ * filesystem, and a blocked probe lands in the `timeout` result. lsof only
+ * reports descriptors it could match to the requested paths, so no identity
+ * prefilter runs there; the raw `n` spellings are returned and the pure module
+ * still re-derives the `(dev, ino)` match. lsof
  * has no argv, so a candidate's `argv` is `[command]` (the `c` record) and a
  * process whose command lsof could not report has no argv at all, which the
  * pure module renders as "(command unavailable)". lsof's own exit convention
  * is honoured: status 1 with EMPTY stderr means "no open file matched a
- * requested path" (zero candidates, NOT a failure), while a timeout, an
- * unavailable binary or any other non-zero exit is UNKNOWN — it throws a
+ * requested path" (zero candidates, NOT a failure), and status 1 whose stderr
+ * is NOTHING BUT `No such file or directory` for the caller's own OPTIONAL
+ * sidecar spellings is likewise an observation (see
+ * {@link toleratedMissingSidecars}). A timeout, an unavailable binary, any
+ * other non-zero exit, or a missing REQUIRED path is UNKNOWN — it throws a
  * {@link HolderProbeError} (`lsof:timeout` / `lsof:probe`) rather than reading
  * as "no holder". Every other platform throws `platform:<platform>` /
  * "unsupported platform"; it never returns `[]`.
@@ -83,7 +91,7 @@
  * a real descriptor or a real lsof binary. The defaults are the production
  * helpers: `src/lib/proc-info.ts` (`hasProcfs`, `listPids`, `procfsPidPath`),
  * `node:fs`, `src/lib/process-start-identity.ts` (`getProcessStartIdentity`)
- * and `src/lib/lsof-probe.ts` (`runLsof`, already `-b -w` with a SIGKILL
+ * and `src/lib/lsof-probe.ts` (`runLsof`, already `-w` with a SIGKILL
  * timeout — never call `lsof` any other way).
  */
 
@@ -97,7 +105,7 @@ import {
 import { runLsof as boundedLsof } from "../../lib/lsof-probe.js";
 import type { LsofProbeResult } from "../../lib/lsof-probe.js";
 import { getProcessStartIdentity } from "../../lib/process-start-identity.js";
-import { HolderProbeError } from "./store-holder-detect.js";
+import { HolderProbeError, SIDECAR_SUFFIXES } from "./store-holder-detect.js";
 import type { HolderCandidate, HolderProbeDeps } from "./store-holder-detect.js";
 
 /** Filesystem identity of a path, as DECIMAL strings (never JS doubles). */
@@ -505,15 +513,89 @@ function collectDarwinCandidates(
   return { candidates, failure };
 }
 
+/** One `No such file or directory` stderr line for one path, as lsof writes it. */
+const LSOF_MISSING_PATH_LINE = /^lsof: status error on (.+): No such file or directory$/;
+
+/**
+ * Parent-directory-resolved spelling of a path; the input path itself when the
+ * parent cannot be resolved.
+ *
+ * lsof prints the REALPATH spelling of a missing path (so `/tmp/x-wal` comes
+ * back as `/private/tmp/x-wal` on macOS) while it echoes the given spelling for
+ * other status errors. Comparing raw spellings alone would therefore miss the
+ * caller's own path, so both spellings are normalized before the comparison.
+ */
+function parentResolvedSpelling(candidatePath: string): string {
+  try {
+    return path.join(fs.realpathSync(path.dirname(candidatePath)), path.basename(candidatePath));
+  } catch {
+    return candidatePath;
+  }
+}
+
+/**
+ * Whether a failed probe is nevertheless a COMPLETED observation.
+ *
+ * True only when ALL of the following hold:
+ *
+ *   - the exit status is 1 and stdout is non-empty (lsof really listed
+ *     something),
+ *   - stderr is non-empty and EVERY non-empty stderr line is exactly
+ *     `lsof: status error on <path>: No such file or directory`,
+ *   - each `<path>` is one of the caller's OWN scoped paths (raw or
+ *     parent-resolved spelling), and is an OPTIONAL sidecar spelling.
+ *
+ * The sidecar restriction is what keeps uncertainty honest: the pure module
+ * always appends `-wal`/`-shm`/`-journal`, which normally do not exist, so
+ * tolerating only those means an absent sidecar is fine while a missing
+ * REQUIRED store path still surfaces as a probe failure (`observationComplete:
+ * false`). Any other stderr content — EAGAIN, permission denied, a mixed or
+ * unknown-path message — and any other status stay failures.
+ */
+function toleratedMissingSidecars(
+  result: { status: number | null; stdout: string; stderr: string },
+  scopedPaths: readonly string[],
+): boolean {
+  if (result.status !== 1) return false;
+  if (result.stdout.length === 0) return false;
+
+  const lines = result.stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return false;
+
+  const scopedBySpelling = new Map<string, string>();
+  for (const scoped of scopedPaths) {
+    scopedBySpelling.set(scoped, scoped);
+    scopedBySpelling.set(parentResolvedSpelling(scoped), scoped);
+  }
+
+  for (const line of lines) {
+    const match = LSOF_MISSING_PATH_LINE.exec(line);
+    if (match === null) return false;
+    const reported = match[1].trim();
+    const scoped =
+      scopedBySpelling.get(reported) ??
+      scopedBySpelling.get(parentResolvedSpelling(reported));
+    if (scoped === undefined) return false;
+    if (!SIDECAR_SUFFIXES.some((suffix) => path.basename(scoped).endsWith(suffix))) return false;
+  }
+
+  return true;
+}
+
 /**
  * Enumerate darwin holder candidates with ONE bounded lsof probe.
  *
- * Only `runLsof` from `src/lib/lsof-probe.ts` is used: it owns `-b -w` and the
+ * Only `runLsof` from `src/lib/lsof-probe.ts` is used: it owns the flag set
+ * (`-w`, plus `-b` only for probes that do not select by pathname) and the
  * SIGKILL timeout, so this module must never spawn lsof itself and never adds
  * those flags. A probe that could not answer throws a typed
  * {@link HolderProbeError} (`lsof:timeout` / `lsof:probe`) instead of reading
- * as "no holder"; lsof's status-1-with-empty-stderr convention is the one
- * case that legitimately means "nothing matched".
+ * as "no holder"; the two status-1 shapes described at
+ * {@link toleratedMissingSidecars} are the only cases that legitimately mean
+ * "nothing to report".
  */
 function listDarwinCandidates(
   requestedPaths: readonly string[],
@@ -528,8 +610,9 @@ function listDarwinCandidates(
 
   let result: LsofProbeResult;
   try {
-    // The ONE pinned lsof argv: bounded primitive owns -b -w and the timeout,
-    // and "pcn" requests pid, command and file name records only.
+    // The ONE pinned lsof argv: bounded primitive owns the flags and the
+    // timeout, and "pcn" requests pid, command and file name records only.
+    // `--` also marks this as a pathname probe, so the primitive omits `-b`.
     result = seams.runLsof(["-F", "pcn", "--", ...scopedPaths]);
   } catch (error) {
     throw new HolderProbeError(
@@ -559,6 +642,28 @@ function listDarwinCandidates(
     // and reports that with EMPTY stderr. That is zero candidates, not a
     // failure — the one error status that is an observation.
     if (result.status === 1 && stderr.length === 0) return [];
+    // A second status-1 shape is an observation too: an absent OPTIONAL sidecar
+    // is normal, and lsof still lists the real holders on stdout while it
+    // reports the missing spelling on stderr. Without this, a probe can never
+    // report a holder on macOS at all (the pure module always appends the
+    // three sidecar spellings). Parse that retained stdout exactly as a
+    // successful probe's — including the partial-candidate failure path, so
+    // tolerance never swallows a parse or identity failure.
+    if (toleratedMissingSidecars(result, scopedPaths)) {
+      const { candidates, failure } = collectDarwinCandidates(result.stdout, seams);
+      if (failure !== null) {
+        throw new HolderProbeError(failure.scope, failure.reason, candidates);
+      }
+      // Non-empty output that yielded nothing usable is malformed, not an empty
+      // observation: tolerating the ENOENT lines must not swallow a parse gap.
+      if (candidates.length === 0) {
+        throw new HolderProbeError(
+          "pid:0",
+          "lsof output could not be parsed into holder records",
+        );
+      }
+      return candidates;
+    }
     const detail =
       stderr.length > 0
         ? stderr

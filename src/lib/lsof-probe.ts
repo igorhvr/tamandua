@@ -5,7 +5,8 @@
  * network mount, can block forever inside the kernel. A blocking `lsof` is
  * unkillable with SIGTERM, so every probe here is:
  *
- *   1. marked `-b` (avoid kernel blocks) and `-w` (suppress warnings),
+ *   1. marked `-w` (suppress warnings) and, for fd-type/pid-scoped probes
+ *      only, `-b` (avoid kernel blocks),
  *   2. scoped to the pid(s) of interest by the caller,
  *   3. run under a hard timeout with `killSignal: "SIGKILL"` so a wedged
  *      child is killed and reaped when `spawnSync` returns.
@@ -14,7 +15,17 @@
  * `ok` result. Callers making destructive decisions must treat anything but
  * a real `ok` as unknown and fail closed.
  *
- * macOS (lsof 4.91) and Linux both accept `-b` and `-w`.
+ * WHY `-b` IS CONDITIONAL. `-b` makes lsof avoid the kernel calls that can
+ * block, and on macOS lsof 4.91 it substitutes an EAGAIN stub for lstat(2),
+ * stat(2) and readlink(2) (man lsof). PATHNAME selection (an argument list
+ * containing `--`) is stat(2)-based, so a `-b` pathname probe always fails with
+ * `status error on <path>: Resource temporarily unavailable` and never sees a
+ * single open file. The `-b` suppression is not needed for pathname probes in
+ * exchange: the SIGKILL timeout below is what actually bounds a blocked
+ * filesystem, and a blocked pathname probe lands in the existing `timeout`
+ * result. fd-type/pid-scoped probes (`-p`, `-d cwd`) keep `-b` unchanged.
+ *
+ * macOS (lsof 4.91) and Linux both accept `-w`.
  */
 import { spawnSync } from "node:child_process";
 import { logger } from "./logger.js";
@@ -37,12 +48,20 @@ export const LSOF_DEFAULT_BINARY = "lsof";
  */
 export const LSOF_DEFAULT_MAX_BUFFER = 64 * 1024 * 1024;
 
-/** How a bounded lsof probe ended. */
+/**
+ * How a bounded lsof probe ended.
+ *
+ * The `error` variant carries the REAL exit status (never rewritten to 0 for a
+ * non-zero exit) together with whatever lsof already wrote to stdout: a
+ * non-zero exit can still have produced usable output (pathname probes report
+ * a missing path on stderr while listing real holders on stdout), so the
+ * caller — not this primitive — decides whether that output is an answer.
+ */
 export type LsofProbeResult =
   | { kind: "ok"; stdout: string; stderr: string; status: 0 }
   | { kind: "timeout"; timeoutMs: number }
   | { kind: "unavailable"; error: string }
-  | { kind: "error"; status: number | null; stderr: string };
+  | { kind: "error"; status: number | null; stdout: string; stderr: string };
 
 export interface RunLsofOptions {
   /** Binary to execute; overrides `TAMANDUA_LSOF_BIN` and `PATH`. */
@@ -54,12 +73,22 @@ export interface RunLsofOptions {
 }
 
 /**
- * Build the argv for an lsof probe. `-b` and `-w` are ALWAYS prepended so no
- * call site can forget them.
+ * Build the argv for an lsof probe. `-w` is ALWAYS prepended so no call site
+ * can forget it; `-b` is prepended only when the probe does NOT select by
+ * pathname.
+ *
+ * `--` marks a pathname probe, and `-b` is incompatible with it: on macOS lsof
+ * 4.91 `-b` stubs lstat/stat/readlink with EAGAIN while pathname selection is
+ * stat(2)-based, so every `-b` pathname probe fails before it can match. The
+ * condition is on the argument list, never on the platform, because the
+ * incompatibility is a property of the flags, not of the host. Every
+ * fd-type/pid-scoped probe keeps `-b`.
  *
  * Pure and synchronous — the single place the flag contract is expressed.
  */
 export function lsofProbeArgv(args: readonly string[]): string[] {
+  // `--` marks a pathname probe; `-b` would stub out the stat(2) it needs.
+  if (args.includes("--")) return ["-w", ...args];
   return ["-b", "-w", ...args];
 }
 
@@ -98,9 +127,13 @@ export function resolveLsofBinary(override?: string): string {
 /**
  * Run a bounded, pid-scoped lsof probe.
  *
- * Always prepends `-b -w` (see {@link lsofProbeArgv}) and imposes a hard
- * SIGKILL timeout. On expiry the child is killed and reaped before this
- * returns, so callers can never leak a kernel-blocked lsof process.
+ * Prepends `-w` (and `-b` unless the probe selects by pathname — see
+ * {@link lsofProbeArgv}) and imposes a hard SIGKILL timeout. On expiry the
+ * child is killed and reaped before this returns, so callers can never leak a
+ * kernel-blocked lsof process.
+ *
+ * A non-zero exit is returned as `kind: "error"` with its real status and its
+ * stdout preserved; it is never flattened to an empty `ok`.
  */
 export function runLsof(
   args: readonly string[],
@@ -147,5 +180,7 @@ export function runLsof(
   if (result.status === 0) {
     return { kind: "ok", stdout, stderr, status: 0 };
   }
-  return { kind: "error", status: result.status, stderr };
+  // The real status is kept and stdout is preserved: a non-zero exit can still
+  // carry usable output, and only the caller knows whether it can.
+  return { kind: "error", status: result.status, stdout, stderr };
 }

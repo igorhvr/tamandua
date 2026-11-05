@@ -551,6 +551,25 @@ describe("store-holder-detect-runner: platforms it refuses to answer for", () =>
 // Darwin: one bounded lsof probe.
 // ---------------------------------------------------------------------------
 
+/**
+ * Parent-directory-resolved spelling of a path. lsof reports the REALPATH
+ * spelling of a missing path (`/tmp/...` comes back as `/private/tmp/...` on
+ * macOS), so the fixtures spell their expected stderr the same way.
+ */
+function parentResolved(filePath: string): string {
+  return path.join(fs.realpathSync(path.dirname(filePath)), path.basename(filePath));
+}
+
+/** One exact `No such file or directory` stderr line, as lsof writes it. */
+function missingLine(filePath: string): string {
+  return `lsof: status error on ${filePath}: No such file or directory`;
+}
+
+/** The three sidecar spellings the pure module appends for {@link store}. */
+function sidecarSpellings(): string[] {
+  return ["-wal", "-shm", "-journal"].map((suffix) => `${parentResolved(storePath)}${suffix}`);
+}
+
 describe("store-holder-detect-runner: darwin bounded lsof", () => {
   function darwinHost(stdout: string, processes?: FakeProcess[]): FakeHost {
     // The fake process table only has to know the pids lsof reported, so a
@@ -666,12 +685,135 @@ describe("store-holder-detect-runner: darwin bounded lsof", () => {
     const host = fakeHost([], {
       platform: "darwin",
       procfs: false,
-      lsofResult: () => ({ kind: "error", status: 1, stderr: "" }),
+      lsofResult: () => ({ kind: "error", status: 1, stdout: "", stderr: "" }),
     });
     const deps = createDefaultHolderProbeDeps(host.seams);
 
     assert.deepEqual(deps.listOpenFileHolders([storePath]), []);
     assert.equal(host.lsofCalls.length, 1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Tolerated absence of an OPTIONAL sidecar spelling.
+  //
+  // The pure module always probes `<store>-wal`/`-shm`/`-journal`, which
+  // normally do not exist. lsof therefore exits 1 and reports those paths on
+  // stderr while it lists the real holder on stdout. Tolerating exactly that
+  // shape is what makes the darwin holder listing work at all; everything else
+  // must stay a failure, because "could not determine" must never read as "no
+  // holders".
+  // -------------------------------------------------------------------------
+
+  it("keeps listing a holder when only absent optional sidecars were reported", () => {
+    const holderPid = 5600;
+    const host = fakeHost([{ pid: holderPid }], {
+      platform: "darwin",
+      procfs: false,
+      lsofResult: () => ({
+        kind: "error",
+        status: 1,
+        stdout: `p${holderPid}\ncsleep\nn${storePath}\n`,
+        // lsof prints the REALPATH spelling of a missing path.
+        stderr: sidecarSpellings().map(missingLine).join("\n"),
+      }),
+    });
+    const deps = createDefaultHolderProbeDeps(host.seams);
+
+    const detection = detectStoreHolders([store], deps);
+
+    assert.equal(detection.observationComplete, true);
+    assert.deepEqual(detection.probeFailures, []);
+    assert.deepEqual(
+      detection.holders.map((holder) => holder.pid),
+      [holderPid],
+      "the holder listed on stdout is still named",
+    );
+    assert.deepEqual(detection.holders[0].storePaths, [storePath]);
+  });
+
+  it("still fails when a REQUIRED store path is missing", () => {
+    const host = fakeHost([{ pid: 5610 }], {
+      platform: "darwin",
+      procfs: false,
+      lsofResult: () => ({
+        kind: "error",
+        status: 1,
+        stdout: "p5610\ncsleep\nn/tmp/elsewhere.db\n",
+        stderr: [missingLine(parentResolved(storePath)), ...sidecarSpellings().map(missingLine)].join(
+          "\n",
+        ),
+      }),
+    });
+    const deps = createDefaultHolderProbeDeps(host.seams);
+
+    const error = captureHolderProbeError(() => deps.listOpenFileHolders([storePath, ...sidecarSpellings()]));
+
+    assert.equal(error.scope, "lsof:probe");
+    assert.match(error.message, /No such file or directory/);
+  });
+
+  it("still fails when the reported problem is not an absence (permission denied)", () => {
+    const host = fakeHost([{ pid: 5620 }], {
+      platform: "darwin",
+      procfs: false,
+      lsofResult: () => ({
+        kind: "error",
+        status: 1,
+        stdout: `p5620\ncsleep\nn${storePath}\n`,
+        stderr: `lsof: status error on ${parentResolved(storePath)}-wal: Permission denied`,
+      }),
+    });
+    const deps = createDefaultHolderProbeDeps(host.seams);
+
+    const error = captureHolderProbeError(() =>
+      deps.listOpenFileHolders([storePath, ...sidecarSpellings()]),
+    );
+
+    assert.equal(error.scope, "lsof:probe");
+    assert.match(error.message, /Permission denied/);
+  });
+
+  it("still fails when the missing path is not one of the caller's own paths", () => {
+    const host = fakeHost([{ pid: 5630 }], {
+      platform: "darwin",
+      procfs: false,
+      lsofResult: () => ({
+        kind: "error",
+        status: 1,
+        stdout: `p5630\ncsleep\nn${storePath}\n`,
+        stderr: "lsof: status error on /somewhere/other.db-wal: No such file or directory",
+      }),
+    });
+    const deps = createDefaultHolderProbeDeps(host.seams);
+
+    const error = captureHolderProbeError(() => deps.listOpenFileHolders([storePath]));
+
+    assert.equal(error.scope, "lsof:probe");
+  });
+
+  it("still fails when the tolerated exit carries unparseable stdout", () => {
+    const host = fakeHost([], {
+      platform: "darwin",
+      procfs: false,
+      lsofResult: () => ({
+        kind: "error",
+        status: 1,
+        // A pid header record with no pid: the following n record belongs to
+        // no process, so nothing usable came out of the probe.
+        stdout: `p\nn${storePath}\n`,
+        stderr: missingLine(`${parentResolved(storePath)}-wal`),
+      }),
+    });
+    const deps = createDefaultHolderProbeDeps(host.seams);
+
+    const error = captureHolderProbeError(() =>
+      deps.listOpenFileHolders([storePath, ...sidecarSpellings()]),
+    );
+
+    // Discriminates against the pre-fix `lsof:probe` and pins that the
+    // tolerance never turns a parse failure into an empty holder list.
+    assert.equal(error.scope, "pid:0");
+    assert.match(error.message, /could not be parsed/);
   });
 
   it("throws lsof:timeout when the bounded probe times out (a timeout is UNKNOWN)", () => {
@@ -707,7 +849,7 @@ describe("store-holder-detect-runner: darwin bounded lsof", () => {
     const host = fakeHost([], {
       platform: "darwin",
       procfs: false,
-      lsofResult: () => ({ kind: "error", status: 2, stderr: noisy }),
+      lsofResult: () => ({ kind: "error", status: 2, stdout: "", stderr: noisy }),
     });
     const deps = createDefaultHolderProbeDeps(host.seams);
 
@@ -723,7 +865,7 @@ describe("store-holder-detect-runner: darwin bounded lsof", () => {
     const host = fakeHost([], {
       platform: "darwin",
       procfs: false,
-      lsofResult: () => ({ kind: "error", status: 2, stderr: "  \n" }),
+      lsofResult: () => ({ kind: "error", status: 2, stdout: "", stderr: "  \n" }),
     });
     const deps = createDefaultHolderProbeDeps(host.seams);
 

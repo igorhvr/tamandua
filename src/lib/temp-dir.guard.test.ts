@@ -138,6 +138,16 @@ const TMP_PATH_ALLOWLIST: Record<string, string> = {
     "test fixture — fake /tmp/tamandua-worktrees/*, /tmp/wt/* worktree paths",
   "src/server/control-client.test.ts":
     `test fixture — "/tmp/test-repo" origin repository for suite record tests`,
+
+  // Fixture data — the fake lsof shims print /tmp paths as their stdout/stderr,
+  // and the canned lsof stderr fixtures carry a fake missing /tmp path; no
+  // directory is created there.
+  "src/lib/lsof-probe.test.ts":
+    "test fixture — /tmp/state.db in fake lsof shim stdout/stderr",
+  "src/installer/matchlock/store-holder-detect-runner.test.ts":
+    "test fixture — /tmp/elsewhere.db in fake lsof stdout and the realpath note",
+  "src/installer/matchlock/store-holder-detect-runner.ts":
+    "doc comment — /tmp vs /private/tmp realpath spelling of a missing path",
   "src/server/mcp-server.test.ts":
     "test fixture — fake /tmp/remote-harness, /tmp/harness, /tmp/test-project",
   "tests/plmb-feature-merger-prompts.test.ts":

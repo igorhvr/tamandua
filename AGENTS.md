@@ -389,12 +389,19 @@ kernel on a host with a stale FUSE or network mount (a 2026 incident left 24
 bounded:
 
 - Product code goes through `src/lib/lsof-probe.ts` `runLsof(args)`: it always
-  prepends `-b` (no blocking kernel calls) and `-w` (suppress warnings) and
-  runs under a hard `spawnSync(..., { timeout, killSignal: "SIGKILL" })`
+  prepends `-w` (suppress warnings) and `-b` (no blocking kernel calls) for
+  **fd-type/pid-scoped** probes, and runs under a hard
+  `spawnSync(..., { timeout, killSignal: "SIGKILL" })`
   (default 5 s, `TAMANDUA_LSOF_TIMEOUT_MS`). A timed-out probe returns
   `kind: "timeout"` — never an empty `ok` — and callers must treat anything
   but `ok` as unknown and **fail closed** (e.g. `processHasOpenFileUnder`
-  returns `"unknown"`, `daemonctl` refuses to signal).
+  returns `"unknown"`, `daemonctl` refuses to signal). `-b` is OMITTED when the
+  argument list selects by pathname (`--`): on macOS lsof 4.91 `-b` stubs
+  lstat/stat/readlink with EAGAIN and pathname selection is stat(2)-based, so
+  every `-b` pathname probe fails outright (the SIGKILL timeout, not `-b`, is
+  what bounds a blocked filesystem). The condition is on the flags, never on
+  the platform. A non-zero exit is `kind: "error"` carrying the real status
+  and any stdout, so the caller decides whether that output is an answer.
 - Any remaining direct Node call site (test helpers, the torture-test Node
   tools) must pass `-b -w`, a finite `timeout` and `killSignal: "SIGKILL"`.
   `tests/lsof-bounded-lint.test.ts` scans `src/`, `tests/` and

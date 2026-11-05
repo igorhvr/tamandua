@@ -1,9 +1,14 @@
 /**
  * Tests for src/lib/lsof-probe.ts — the bounded lsof probe primitive.
  *
- * The story requires that no lsof invocation can block forever: probes carry
- * `-b -w`, a hard SIGKILL timeout, and a timed-out probe is reported as
- * `kind: "timeout"` rather than an empty `ok`.
+ * The story requires that no lsof invocation can block forever: probes carry a
+ * hard SIGKILL timeout and are marked `-w`, and a timed-out probe is reported
+ * as `kind: "timeout"` rather than an empty `ok`.
+ *
+ * `-b` (avoid blocking kernel calls) is only for fd-type/pid-scoped probes: it
+ * stubs out stat(2) on macOS, and pathname selection (`--`) needs stat(2), so a
+ * `-b` pathname probe can never see anything. That asymmetry and the preserved
+ * exit status/stdout for non-zero exits are pinned here.
  *
  * Classified as serial: the probe module imports node:child_process and the
  * tests spawn fake lsof shims (one deliberately hangs).
@@ -63,12 +68,27 @@ function restoreEnv(key: string, previous: string | undefined): void {
 }
 
 describe("lsofProbeArgv", () => {
-  it("always prepends -b and -w", () => {
+  it("prepends -b and -w for a pid-scoped probe", () => {
     assert.deepEqual(lsofProbeArgv(["-p", "1"]), ["-b", "-w", "-p", "1"]);
   });
 
-  it("prepends the flags even when the caller passes no args", () => {
+  it("prepends -b and -w even when the caller passes no args", () => {
     assert.deepEqual(lsofProbeArgv([]), ["-b", "-w"]);
+  });
+
+  it("omits -b for a pathname probe, which selects on stat(2)", () => {
+    assert.deepEqual(lsofProbeArgv(["-F", "pcn", "--", "/a", "/b"]), [
+      "-w",
+      "-F",
+      "pcn",
+      "--",
+      "/a",
+      "/b",
+    ]);
+  });
+
+  it("keeps -b for an fd-type probe (-d cwd) that has no --", () => {
+    assert.deepEqual(lsofProbeArgv(["-d", "cwd", "-Fn"]), ["-b", "-w", "-d", "cwd", "-Fn"]);
   });
 
   it("does not mutate the caller's argument array", () => {
@@ -215,5 +235,37 @@ describe("runLsof", () => {
     assert.ok(result.kind === "error", `expected error, got ${result.kind}`);
     assert.equal(result.status, 1);
     assert.match(result.stderr, /no match/);
+  });
+
+  it("keeps the real status and the stdout of a non-zero exit", () => {
+    // The shape a real pathname probe produces: a holder on stdout plus an
+    // absent sidecar on stderr, exit 1. Neither may be lost or rewritten.
+    const shim = writeShim(
+      "partial-lsof.sh",
+      "#!/bin/sh\nprintf 'p123\\ncsleep\\nn/tmp/state.db\\n'\n" +
+        "echo 'lsof: status error on /tmp/state.db-wal: No such file or directory' >&2\nexit 1\n",
+    );
+    const result = runLsof(["-F", "pcn", "--", "/tmp/state.db"], {
+      binary: shim,
+      timeoutMs: 3000,
+    });
+    assert.ok(result.kind === "error", `expected error, got ${result.kind}`);
+    assert.equal(result.status, 1, "the exit status is never rewritten to 0");
+    assert.equal(result.stdout, "p123\ncsleep\nn/tmp/state.db\n");
+    assert.match(result.stderr, /No such file or directory/);
+  });
+
+  it("omits -b from the real child argv for a pathname probe", () => {
+    const argvFile = path.join(tmpDir, "pathname-lsof.argv");
+    const shim = writeShim(
+      "pathname-lsof.sh",
+      `#!/bin/sh\nprintf '%s\\n' "$@" > ${shQuote(argvFile)}\nexit 1\n`,
+    );
+
+    const result = runLsof(["-F", "pcn", "--", "/a"], { binary: shim, timeoutMs: 3000 });
+    assert.ok(result.kind === "error", `expected error, got ${result.kind}`);
+
+    const argv = fs.readFileSync(argvFile, "utf-8").trim().split("\n");
+    assert.deepEqual(argv, ["-w", "-F", "pcn", "--", "/a"]);
   });
 });

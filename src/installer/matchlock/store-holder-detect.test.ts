@@ -1079,8 +1079,11 @@ describe("store-holder-detect: module purity and classification", () => {
   });
 
   it("exports detectStoreHolders and the typed HolderProbeError, nothing else executable", () => {
+    // SIDECAR_SUFFIXES is DATA (the optional sidecar spellings the runner
+    // distinguishes from required paths), not an executable surface.
     assert.deepEqual(Object.keys(holderModule).sort(), [
       "HolderProbeError",
+      "SIDECAR_SUFFIXES",
       "detectStoreHolders",
     ]);
   });
