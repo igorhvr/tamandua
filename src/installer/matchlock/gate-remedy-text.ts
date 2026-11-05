@@ -60,6 +60,14 @@
  * and it never widens the closed set of ten reason codes: operational failures
  * (a receipt that could not be written, a revalidation that could not run) are
  * a separate class that is never renumbered into them.
+ *
+ * DISPLAY TEXT VERSUS EXECUTABLE ADVICE. Prose stays sanitized so it reads well
+ * on one terminal line, but a `command:` line is meant to be pasted into a
+ * shell. The pathname in the command is therefore the UNMODIFIED canonical
+ * spelling, single-quote escaped, while the human-readable text around it
+ * (including the store header and evidence line) keeps the sanitized
+ * rendering. Quoting after sanitisation would collapse a tab or newline into a
+ * space and emit a safe-looking command aimed at the wrong file.
  */
 
 import type {
@@ -292,14 +300,30 @@ function commandPath(store: EvaluatedStore | null, requestedPath: string): strin
   return store.identity === null ? requestedPath : store.identity.canonicalPath;
 }
 
-/** The supported conversion to the delete journal mode, verbatim. */
-function convertCommand(path: string): string {
-  return `hermes sessions set-journal-mode delete --db ${path}`;
+/**
+ * Quote one pathname as a single shell word.
+ *
+ * The rendered command is pasted into a shell, so the shell — not this
+ * module — decides where the argument ends. Single-quote wrapping makes every
+ * byte literal; an embedded `'` is emitted as close-quote, escaped quote,
+ * reopen-quote (`'\''`) so the word survives. Double quotes would leave `$`, a
+ * backtick and `\\` live, and JSON escaping is not shell quoting. The whole
+ * pathname is quoted verbatim: it must NOT be sanitized first, because
+ * sanitizing collapses whitespace and would aim a safe-looking command at the
+ * wrong file.
+ */
+function shellQuoted(path: string): string {
+  return `'${path.replace(/'/g, `'\\''`)}'`;
 }
 
-/** The exact reverse conversion for a quiescent native store, verbatim. */
+/** The supported conversion to the delete journal mode, argument shell-quoted. */
+function convertCommand(path: string): string {
+  return `hermes sessions set-journal-mode delete --db ${shellQuoted(path)}`;
+}
+
+/** The exact reverse conversion for a quiescent native store, argument shell-quoted. */
 function reverseCommand(path: string): string {
-  return `hermes sessions set-journal-mode wal --db ${path}`;
+  return `hermes sessions set-journal-mode wal --db ${shellQuoted(path)}`;
 }
 
 /**

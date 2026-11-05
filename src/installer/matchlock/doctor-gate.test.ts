@@ -981,7 +981,7 @@ describe("runLaunchGateChecks", () => {
     assert.ok(deleteConfig.remedy, "a finding with commands carries a remedy");
     assert.ok(
       deleteConfig.remedy.includes(
-        `Run: hermes sessions set-journal-mode delete --db ${canonical}`,
+        `Run: hermes sessions set-journal-mode delete --db '${canonical}'`,
       ),
       `expected the convert command in ${deleteConfig.remedy}`,
     );

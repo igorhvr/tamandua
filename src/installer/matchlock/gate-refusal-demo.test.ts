@@ -219,11 +219,11 @@ describe("gate refusal demo: real store, real gate modules, real exit status", (
 
     // Both conversions are present, each naming the real store path.
     assert.ok(
-      stderr.includes(`hermes sessions set-journal-mode delete --db ${REFUSAL_STORE}`),
+      stderr.includes(`hermes sessions set-journal-mode delete --db '${REFUSAL_STORE}'`),
       stderr,
     );
     assert.ok(
-      stderr.includes(`hermes sessions set-journal-mode wal --db ${REFUSAL_STORE}`),
+      stderr.includes(`hermes sessions set-journal-mode wal --db '${REFUSAL_STORE}'`),
       stderr,
     );
 

@@ -17,9 +17,9 @@ STORE 1/1: /profile/stores/journal.db
     - The -journal sidecar is nonempty: this is a ROLLBACK journal, not a write-ahead-log, so a checkpoint is NOT a treatment for it.
     - The refusal may be TRANSIENT while a healthy delete-journal transaction is in flight: wait for quiescence (every writer stopped), then re-observe the store before relaunching.
     - If the -journal sidecar persists after quiescence, use the supported recovery/conversion path. The -journal file is never deleted.
-      command: hermes sessions set-journal-mode delete --db /profile/stores/journal.db
+      command: hermes sessions set-journal-mode delete --db '/profile/stores/journal.db'
     - For a quiescent NATIVE store, the exact reverse conversion restores the wal journal mode:
-      command: hermes sessions set-journal-mode wal --db /profile/stores/journal.db
+      command: hermes sessions set-journal-mode wal --db '/profile/stores/journal.db'
   holders: none observed
 
 HOLDER PROBE (informational)

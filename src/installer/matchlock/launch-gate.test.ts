@@ -1236,7 +1236,7 @@ describe("launch-gate — complete per-code remedies", () => {
     assert.match(text, /not in the host's configuration/);
     assert.ok(
       commandsFor(finding).includes(
-        `hermes sessions set-journal-mode delete --db ${CANONICAL_PATH}`,
+        `hermes sessions set-journal-mode delete --db '${CANONICAL_PATH}'`,
       ),
       "the delete command must name the canonical path",
     );
@@ -1262,13 +1262,13 @@ describe("launch-gate — complete per-code remedies", () => {
     const commands = commandsFor(finding);
     assert.ok(
       commands.includes(
-        `hermes sessions set-journal-mode delete --db ${CANONICAL_PATH}`,
+        `hermes sessions set-journal-mode delete --db '${CANONICAL_PATH}'`,
       ),
       "wal-header must name the delete conversion command",
     );
     assert.ok(
       commands.includes(
-        `hermes sessions set-journal-mode wal --db ${CANONICAL_PATH}`,
+        `hermes sessions set-journal-mode wal --db '${CANONICAL_PATH}'`,
       ),
       "wal-header must name the reverse wal command for a quiescent native store",
     );
@@ -1489,7 +1489,7 @@ describe("launch-gate — complete per-code remedies", () => {
     );
     assert.ok(
       commandsFor(finding).includes(
-        `hermes sessions set-journal-mode delete --db ${STORE_PATH}`,
+        `hermes sessions set-journal-mode delete --db '${STORE_PATH}'`,
       ),
       "without an identity the command must name the caller's spelling",
     );

@@ -200,6 +200,20 @@ function commandPath(store: EvaluatedStore): string {
   return store.identity === null ? store.requestedPath : store.identity.canonicalPath;
 }
 
+/**
+ * Quote one pathname as a single shell word.
+ *
+ * The remedy command is copy-paste advice, so it is the pasting shell that
+ * decides where the argument ends. Single-quote wrapping keeps every byte
+ * literal and an embedded `'` is emitted as `'\''` (close quote, escaped
+ * quote, reopen quote). Double quotes would leave `$`, a backtick and `\\`
+ * live. The pathname is quoted verbatim, never sanitized first: sanitizing
+ * collapses whitespace and would point the command at the wrong file.
+ */
+function shellQuoted(path: string): string {
+  return `'${path.replace(/'/g, `'\\''`)}'`;
+}
+
 /** Build a store-scoped finding. */
 function storeFinding(
   store: EvaluatedStore,
@@ -323,7 +337,7 @@ function remediesFor(store: EvaluatedStore, code: ReasonCode): RemedyStep[] {
       return [
         step(
           "Set `database.journal_mode: delete` where the guest reads it, not in the host's configuration, then relaunch.",
-          `hermes sessions set-journal-mode delete --db ${path}`,
+          `hermes sessions set-journal-mode delete --db ${shellQuoted(path)}`,
         ),
         step(
           "Relaunch the session after the guest-visible configuration requests the delete journal mode.",
@@ -336,14 +350,14 @@ function remediesFor(store: EvaluatedStore, code: ReasonCode): RemedyStep[] {
         ),
         step(
           "Convert the store to rollback-format with the delete journal mode.",
-          `hermes sessions set-journal-mode delete --db ${path}`,
+          `hermes sessions set-journal-mode delete --db ${shellQuoted(path)}`,
         ),
         step(
           "Relaunch the session after the store is rollback-format with the delete journal mode.",
         ),
         step(
           "For a quiescent native store, the reverse conversion restores the wal journal mode.",
-          `hermes sessions set-journal-mode wal --db ${path}`,
+          `hermes sessions set-journal-mode wal --db ${shellQuoted(path)}`,
         ),
       ];
     case "header-unreadable": {

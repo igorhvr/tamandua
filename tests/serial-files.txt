@@ -71,6 +71,8 @@ src/installer/matchlock/finalizer-ledger-seam.test.ts
 src/installer/matchlock/gate-config-probe-fixture.test.ts
 # Spawns `node tests/fixtures/gate-refusal-demo.mjs` and asserts its exit status.
 src/installer/matchlock/gate-refusal-demo.test.ts
+# Spawns `/bin/sh -c` over rendered remedy commands with a stub `hermes`.
+src/installer/matchlock/gate-remedy-shell-quoting.test.ts
 src/installer/matchlock/guest-bridge.test.ts
 src/installer/matchlock/guest-suite.test.ts
 src/installer/matchlock/harness-workflow-matrix.test.ts

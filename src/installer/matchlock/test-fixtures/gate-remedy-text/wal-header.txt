@@ -18,9 +18,9 @@ STORE 1/1: /profile/stores/main.db
     - Set `database.journal_mode: delete` in the configuration the GUEST reads (/guest/.hermes/config.yaml), not in the host's configuration. A missing, malformed or unrecognised value resolves fail-safe to wal, so the guest-visible value must be explicit.
     - Quiesce every writer before converting: a conversion under a live writer is not safe.
     - Convert the store to rollback-format with the delete journal mode:
-      command: hermes sessions set-journal-mode delete --db /profile/stores/main.db
+      command: hermes sessions set-journal-mode delete --db '/profile/stores/main.db'
     - For a quiescent NATIVE store, the exact reverse conversion restores the wal journal mode:
-      command: hermes sessions set-journal-mode wal --db /profile/stores/main.db
+      command: hermes sessions set-journal-mode wal --db '/profile/stores/main.db'
   holders (informational):
     - pid 4242, start v2:4242:1700000000000, command: node hermes serve --profile demo
 

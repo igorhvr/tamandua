@@ -365,12 +365,12 @@ function goldenScenario(name: string): {
 
 /** The convert command, verbatim, as it must appear under a store section. */
 function convertLine(storePath: string): string {
-  return `command: hermes sessions set-journal-mode delete --db ${storePath}`;
+  return `command: hermes sessions set-journal-mode delete --db '${storePath}'`;
 }
 
 /** The exact reverse command, verbatim, as it must appear. */
 function reverseLine(storePath: string): string {
-  return `command: hermes sessions set-journal-mode wal --db ${storePath}`;
+  return `command: hermes sessions set-journal-mode wal --db '${storePath}'`;
 }
 
 /** The guest-visible configuration instruction, verbatim. */
@@ -821,11 +821,11 @@ describe("gate-remedy-text: generated remedies", () => {
     const text = renderFindings([findingFor("wal-header", MAIN_STORE)], [presentStore()]);
 
     assert.ok(
-      text.includes(`command: hermes sessions set-journal-mode delete --db ${MAIN_STORE}`),
+      text.includes(`command: hermes sessions set-journal-mode delete --db '${MAIN_STORE}'`),
       text,
     );
     assert.ok(
-      text.includes(`command: hermes sessions set-journal-mode wal --db ${MAIN_STORE}`),
+      text.includes(`command: hermes sessions set-journal-mode wal --db '${MAIN_STORE}'`),
       text,
     );
     // Two conversion-bearing codes on one store still render each command once.
@@ -881,7 +881,7 @@ describe("gate-remedy-text: generated remedies", () => {
     assert.ok(secondSection.includes(convertLine("/real/journal.db")), secondSection);
     assert.ok(secondSection.includes(reverseLine("/real/journal.db")), secondSection);
     assert.ok(
-      !secondSection.includes(`--db /called/journal.db`),
+      !secondSection.includes(`--db '/called/journal.db'`),
       secondSection,
     );
   });

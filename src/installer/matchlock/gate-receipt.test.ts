@@ -205,7 +205,7 @@ function receiptFixture(withIds = true): GateReceipt {
           {
             description: "Convert the store to rollback-format.",
             command:
-              "hermes sessions set-journal-mode delete --db /srv/hermes/stores/hermes.db",
+              "hermes sessions set-journal-mode delete --db '/srv/hermes/stores/hermes.db'",
           },
         ],
       },
