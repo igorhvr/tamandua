@@ -33,6 +33,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const suiteDir = path.join(repoRoot, "scripts", "tests", "matchlock");
@@ -42,8 +43,12 @@ const lockPath = path.join(suiteDir, "lib", "lock.sh");
 // The hardlink contract only applies when the private store is on the same
 // DEVICE as the operator store. This host's default test temp root (/tmp) is a
 // tmpfs, a different device from $HOME, so the fixtures that must prove real
-// hardlinks use a scratch root next to the repo (same device as $HOME).
-const scratchParent = path.resolve(repoRoot, "..", "..");
+// hardlinks need a scratch root on the HOME device.
+//
+// Derive it from HOME rather than from the checkout's depth: a repository
+// installed at /opt/<name> makes "../.." resolve to "/", which is not writable
+// for a normal user and made every fixture here fail with EACCES at mkdtemp.
+const scratchParent = os.homedir();
 
 /** Create a private same-device scratch root (caller removes it). */
 function makeScratchRoot(tag: string): string {
