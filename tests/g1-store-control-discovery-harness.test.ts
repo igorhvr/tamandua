@@ -49,6 +49,29 @@ function scratchRoot(): string {
   return root;
 }
 
+/**
+ * Absolute path of a portable no-op executable that behaves like true(1).
+ *
+ * macOS has no `/bin/true` — the binary is `/usr/bin/true` — so a hardcoded
+ * `/bin/true` made the wrapper's final exec exit 126 there and the resolved
+ * command was never run. A one-line fixture script in a disposable `g1-*`
+ * scratch root is a no-op on every host, and it keeps `HERMES_BIN` a REAL
+ * executable, so "the wrapper execs the resolved command" is still exercised.
+ */
+let noOpHermesBinPath: string | null = null;
+
+function noOpHermesBin(): string {
+  if (noOpHermesBinPath !== null) return noOpHermesBinPath;
+  const binPath = path.join(scratchRoot(), "bin", "true");
+  fs.mkdirSync(path.dirname(binPath), { recursive: true });
+  fs.writeFileSync(binPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  // mkdir/writeFile honour the umask; the wrapper execs this path, so make the
+  // execute bit explicit rather than relying on the creation mode.
+  fs.chmodSync(binPath, 0o755);
+  noOpHermesBinPath = binPath;
+  return binPath;
+}
+
 describe("G1 US-001 artifact truth", () => {
   let doc: string;
 
@@ -143,12 +166,16 @@ describe("G1 US-001 disposable-probe wrapper", () => {
       env: {
         PATH: "/usr/local/bin:/usr/bin:/bin",
         HERMES_HOME: home,
-        HERMES_BIN: "/bin/true",
+        HERMES_BIN: noOpHermesBin(),
       },
     });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stderr, /hermes_scratch: HERMES_HOME=/);
-    assert.match(result.stderr, /hermes_scratch: exec \/bin\/true config path/);
+    const bin = noOpHermesBin();
+    assert.ok(
+      result.stderr.includes(`hermes_scratch: exec ${bin} config path`),
+      `the wrapper must exec the resolved command: ${result.stderr}`,
+    );
   });
 
   it("refuses the real operator home before exec", () => {
@@ -158,7 +185,7 @@ describe("G1 US-001 disposable-probe wrapper", () => {
       env: {
         PATH: "/usr/local/bin:/usr/bin:/bin",
         HERMES_HOME: "/home/kaladin/.hermes",
-        HERMES_BIN: "/bin/true",
+        HERMES_BIN: noOpHermesBin(),
       },
     });
     assert.equal(result.status, 64, "wrapper must exit 64 for the real operator home");
@@ -175,7 +202,7 @@ describe("G1 US-001 disposable-probe wrapper", () => {
       env: {
         PATH: "/usr/local/bin:/usr/bin:/bin",
         HERMES_HOME: nonScratch,
-        HERMES_BIN: "/bin/true",
+        HERMES_BIN: noOpHermesBin(),
       },
     });
     assert.equal(result.status, 64, "wrapper must reject homes outside the g1-* scratch root");
@@ -188,7 +215,7 @@ describe("G1 US-001 disposable-probe wrapper", () => {
       encoding: "utf-8",
       env: {
         PATH: "/usr/local/bin:/usr/bin:/bin",
-        HERMES_BIN: "/bin/true",
+        HERMES_BIN: noOpHermesBin(),
       },
     });
     assert.equal(result.status, 64, result.stderr);
