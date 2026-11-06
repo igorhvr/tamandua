@@ -33,6 +33,18 @@ function git(repo: string, args: string[]): string {
   return result.stdout;
 }
 
+function resolveRealGit(): string {
+  const result = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf-8" });
+  const resolved = (result.stdout ?? "").trim();
+  assert.equal(result.status, 0, result.stderr || "git not found on PATH");
+  assert.ok(path.isAbsolute(resolved), "git must resolve to an absolute path");
+  return resolved;
+}
+
+// Resolve before a test prepends its mock bin directory to PATH. Otherwise
+// delegation may re-enter the shim, including through /usr/bin on envfs.
+const REAL_GIT = resolveRealGit();
+
 function runCli(
   args: string[],
   envOverrides: Record<string, string> = {},
@@ -267,7 +279,7 @@ const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.MBLC_LEDGER_PATH, JSON.stringify(args) + "\\n");
-const result = spawnSync("/usr/bin/git", args, { encoding: "utf-8" });
+const result = spawnSync(${JSON.stringify(REAL_GIT)}, args, { encoding: "utf-8" });
 process.stdout.write(result.stdout || "");
 process.stderr.write(result.stderr || "");
 process.exit(result.status === null ? 1 : result.status);

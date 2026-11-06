@@ -61,6 +61,18 @@ function runGit(args: string[], cwd: string): string | null {
   return (result.stdout ?? "").trim();
 }
 
+function resolveRealGit(): string {
+  const result = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf-8" });
+  const resolved = (result.stdout ?? "").trim();
+  assert.equal(result.status, 0, result.stderr || "git not found on PATH");
+  assert.ok(path.isAbsolute(resolved), "git must resolve to an absolute path");
+  return resolved;
+}
+
+// Resolve before a test prepends its mock bin directory to PATH. Otherwise
+// delegation may re-enter the shim, including through /usr/bin on envfs.
+const REAL_GIT = resolveRealGit();
+
 function initGitRepo(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
   runGit(["init", "--initial-branch=main"], dir);
@@ -4395,7 +4407,7 @@ if [ "$1" = "rev-parse" ] && [ "$2" = "--abbrev-ref" ] && [ "$3" = "HEAD" ] && [
   echo "fatal: simulated original_branch capture failure" >&2
   exit 128
 fi
-/usr/bin/git "$@"
+"${REAL_GIT}" "$@"
 `;
         const fakeGitPath = path.join(mockBinDir, "git");
         fs.writeFileSync(fakeGitPath, fakeGitScript, { mode: 0o755 });
@@ -4467,7 +4479,7 @@ if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ] && [ "$#" = "2" ]; then
   echo "fatal: simulated base_branch_sha capture failure" >&2
   exit 128
 fi
-/usr/bin/git "$@"
+"${REAL_GIT}" "$@"
 `;
         const fakeGitPath = path.join(mockBinDir, "git");
         fs.writeFileSync(fakeGitPath, fakeGitScript, { mode: 0o755 });
