@@ -711,7 +711,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
       assert.ok(matchlockIdx < runIdx, "matchlock line must precede Run:");
       assert.equal(
         matchlockLines[0],
-        "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB swap=8192MB",
+        "matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB swap=8192MB network=intercepted(default)",
       );
     } finally {
       try { await fake.close(); } catch {}
@@ -779,6 +779,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
           swapMB: 8192,
           imageDigest: `sha256:${"a".repeat(64)}`,
           imageConfigDigest: `sha256:${"b".repeat(64)}`,
+          networkOutbound: { unrestricted: false, source: "default" },
         },
         `--json must carry the matchlock facts in resolution.matchlockResources:\n${stdout}`,
       );
@@ -795,6 +796,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
           swapMB: 8192,
           imageDigest: `sha256:${"a".repeat(64)}`,
           imageConfigDigest: `sha256:${"b".repeat(64)}`,
+          networkOutbound: { unrestricted: false, source: "default" },
         },
         `--json must mirror matchlockResources at the top level:\n${stdout}`,
       );
@@ -991,7 +993,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
       assert.deepEqual(
         matchlockLines,
         [
-          "matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB swap=8192MB allow-private=192.168.107.74:8888,box.internal",
+          "matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB swap=8192MB allow-private=192.168.107.74:8888,box.internal network=intercepted(default)",
         ],
         `launch line must carry the resolved allow-private entries:\n${text.stdout}`,
       );
@@ -1012,6 +1014,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
         imageDigest: `sha256:${"a".repeat(64)}`,
         imageConfigDigest: `sha256:${"b".repeat(64)}`,
         allowPrivate: ["192.168.107.74:8888", "box.internal"],
+        networkOutbound: { unrestricted: false, source: "default" },
       };
       assert.deepEqual(
         parsed.resolution.matchlockResources,
@@ -1230,7 +1233,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
       assert.deepEqual(
         stdoutLines(text.stdout).filter((l) => l.startsWith("matchlock:")),
         [
-          "matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB swap=32768MB",
+          "matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB swap=32768MB network=intercepted(default)",
         ],
         `the launch text must carry the resolved swap size:\n${text.stdout}`,
       );
@@ -1260,6 +1263,7 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
         swapMB: 32768,
         imageDigest: `sha256:${"a".repeat(64)}`,
         imageConfigDigest: `sha256:${"b".repeat(64)}`,
+        networkOutbound: { unrestricted: false, source: "default" },
       };
       assert.deepEqual(parsed.resolution.matchlockResources, expected);
       assert.deepEqual(parsed.matchlockResources, expected);
@@ -1267,6 +1271,122 @@ describe("CLI workflow run matchlock launch facts (MTLK-VM-SIZE US-005)", () => 
         !json.stdout.includes("matchlock pinned:"),
         `--json must stay a single document (no text pin line):\n${json.stdout}`,
       );
+    } finally {
+      try { await fake.close(); } catch {}
+      try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}
+      await stopPidfileServiceAndWait({
+        pidFile: path.join(env.tamanduaDir, "tamandua.pid"),
+        stop: stopDaemon,
+        label: "daemon",
+        homeDir: env.homeDir,
+      });
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  // NAT-EGRESS US-008: the resolved outbound mode and its selecting source
+  // reach the SAME resolved-launch block, so the single `matchlock:` line (and
+  // the --json document) state the mode BEFORE the run is created.
+  it("states the selected outbound mode + source on the launch line and in --json (US-008)", async () => {
+    const env = await createTempEnv();
+    const fake = await startFakeControlPlane();
+    const fixture = writeMatchlockFixture();
+
+    try {
+      const workflowId = "res-mtlk-netegress";
+      writeWorkflow(env.homeDir, workflowId, "direct");
+      fs.mkdirSync(path.join(env.homeDir, ".pi", "agent"), { recursive: true });
+      await Promise.all(env.portHandles.map((h) => h.close()));
+
+      const baseArgs = [
+        "workflow",
+        "run",
+        workflowId,
+        "Outbound mode",
+        "--matchlock-image",
+        "vic/matchlock-base:latest",
+        "--matchlock-cpus",
+        "2",
+        "--matchlock-memory",
+        "2048",
+        "--matchlock-disk",
+        "10240",
+      ];
+      const matchlockLine = (mode: string): string =>
+        `matchlock: vic/matchlock-base:latest cpus=2 memory=2048MB disk=10240MB swap=8192MB network=${mode}`;
+
+      // (1) no flag, no env -> default interception, stated with its source.
+      const byDefault = await runCliToExit(
+        [...baseArgs, "--working-directory-for-harness", fixture.workDir],
+        matchlockEnv(env, fixture, fake.port),
+      );
+      assert.equal(byDefault.code, 0, `expected exit 0, got ${byDefault.code}\nstdout:\n${byDefault.stdout}\nstderr:\n${byDefault.stderr}`);
+      assert.deepEqual(
+        stdoutLines(byDefault.stdout).filter((l) => l.startsWith("matchlock:")),
+        [matchlockLine("intercepted(default)")],
+      );
+
+      // (2) the FLAG -> unrestricted, source flag.
+      const byFlag = await runCliToExit(
+        [
+          ...baseArgs,
+          "--matchlock-unrestricted-outbound-networking",
+          "--working-directory-for-harness",
+          fixture.workDir,
+        ],
+        matchlockEnv(env, fixture, fake.port),
+      );
+      assert.equal(byFlag.code, 0, `expected exit 0, got ${byFlag.code}\nstdout:\n${byFlag.stdout}\nstderr:\n${byFlag.stderr}`);
+      assert.deepEqual(
+        stdoutLines(byFlag.stdout).filter((l) => l.startsWith("matchlock:")),
+        [matchlockLine("unrestricted-outbound(flag)")],
+      );
+      // The selection is exactly ONE line, part of the same resolved block and
+      // strictly before the synchronous run-created line.
+      const flagLines = stdoutLines(byFlag.stdout);
+      assert.ok(
+        flagLines.findIndex((l) => l.startsWith("matchlock:")) <
+          flagLines.findIndex((l) => l.startsWith("Run: run-")),
+        `matchlock line must precede Run:\n${byFlag.stdout}`,
+      );
+
+      // (3) the ENV form selects the same mode with a different source.
+      const byEnv = await runCliToExit(
+        [...baseArgs, "--working-directory-for-harness", fixture.workDir],
+        matchlockEnv(env, fixture, fake.port, {
+          TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING: "1",
+        }),
+      );
+      assert.equal(byEnv.code, 0, `expected exit 0, got ${byEnv.code}\nstdout:\n${byEnv.stdout}\nstderr:\n${byEnv.stderr}`);
+      assert.deepEqual(
+        stdoutLines(byEnv.stdout).filter((l) => l.startsWith("matchlock:")),
+        [matchlockLine("unrestricted-outbound(env)")],
+      );
+
+      // (4) --json carries the same mode+source object.
+      const jsonWorkDir = path.join(fixture.fixtureRoot, "work-netegress-json");
+      fs.mkdirSync(jsonWorkDir, { recursive: true });
+      const json = await runCliToExit(
+        [
+          ...baseArgs,
+          "--matchlock-unrestricted-outbound-networking",
+          "--working-directory-for-harness",
+          jsonWorkDir,
+          "--json",
+        ],
+        matchlockEnv(env, fixture, fake.port),
+      );
+      assert.equal(json.code, 0, `expected exit 0, got ${json.code}\nstdout:\n${json.stdout}\nstderr:\n${json.stderr}`);
+      const parsed = JSON.parse(json.stdout.trim());
+      assert.deepEqual(parsed.resolution.matchlockResources.networkOutbound, {
+        unrestricted: true,
+        source: "flag",
+      });
+      assert.deepEqual(parsed.matchlockResources.networkOutbound, {
+        unrestricted: true,
+        source: "flag",
+      });
     } finally {
       try { await fake.close(); } catch {}
       try { await Promise.all(env.portHandles.map((h) => h.close())); } catch {}

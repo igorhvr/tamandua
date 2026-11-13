@@ -19,8 +19,14 @@ import {
 } from "../../dist/installer/matchlock/resource-limits.js";
 import { MATCHLOCK_ALLOW_PRIVATE_ENV } from "../../dist/installer/matchlock/allow-private.js";
 import {
+  MATCHLOCK_DNS_PRIORITY_ENV,
   MatchlockIsolationSettingError,
 } from "../../dist/installer/matchlock/isolation-settings.js";
+import {
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV,
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG,
+  MatchlockNetworkOutboundError,
+} from "../../dist/installer/matchlock/network-outbound.js";
 
 // Deterministic host probe: 8 online CPUs, 32 GiB MemTotal so the built-in
 // defaults are stable (cpus 8, memory 16384 MB, disk 20480 MB, swap 8192 MB).
@@ -454,5 +460,247 @@ describe("ICEBOX isolation settings on the interactive parser", () => {
       () => parse(["--matchlock-prioritize-ipv6-dns-resolution", "something"]),
       /Unexpected argument/,
     );
+  });
+});
+
+describe("parseInteractiveSessionArgs — NAT-EGRESS unrestricted outbound networking", () => {
+  const NAT_FLAG = MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG;
+  const NAT_ENV = MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV;
+
+  it("resolves the default intercepted mode on all four subcommands", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      const result = parse([], subcommand, { env: {} });
+      assert.deepEqual(
+        result.networkOutbound,
+        { unrestricted: false, source: "default" },
+        `${subcommand} default`,
+      );
+    }
+  });
+
+  it("resolves unrestricted/flag from the flag on all four subcommands", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      const result = parse([NAT_FLAG], subcommand, { env: {} });
+      assert.deepEqual(
+        result.networkOutbound,
+        { unrestricted: true, source: "flag" },
+        `${subcommand} flag`,
+      );
+    }
+  });
+
+  it("resolves unrestricted/env from TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1 on all four subcommands", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      const trimmed = parse([], subcommand, { env: { [NAT_ENV]: " 1 " } });
+      assert.deepEqual(
+        trimmed.networkOutbound,
+        { unrestricted: true, source: "env" },
+        `${subcommand} env`,
+      );
+    }
+  });
+
+  it("a winning flag makes a malformed env value irrelevant (env only validated when consulted)", () => {
+    const result = parse([NAT_FLAG], "pi", { env: { [NAT_ENV]: "true" } });
+    assert.deepEqual(result.networkOutbound, { unrestricted: true, source: "flag" });
+  });
+
+  it("rejects a malformed network env value with the typed error naming the env and accepted value", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      for (const bad of ["true", "yes", "0", "TRUE"]) {
+        assert.throws(
+          () => parse([], subcommand, { env: { [NAT_ENV]: bad } }),
+          (err: unknown) => {
+            assert.ok(err instanceof MatchlockNetworkOutboundError, `${subcommand} ${bad} type`);
+            assert.equal(err.code, "matchlock_network_outbound_invalid");
+            assert.match(err.message, new RegExp(NAT_ENV));
+            assert.match(err.message, /"1"/);
+            assert.match(err.message, new RegExp(JSON.stringify(bad)));
+            return true;
+          },
+        );
+      }
+    }
+  });
+
+  it("rejects the value-bearing equals form on all four subcommands naming it as taking no value", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      for (const token of [`${NAT_FLAG}=1`, `${NAT_FLAG}=true`, `${NAT_FLAG}=`]) {
+        assert.throws(
+          () => parse([token], subcommand, { env: {} }),
+          (err: unknown) => {
+            assert.ok(err instanceof InteractiveSessionArgError);
+            assert.match(err.message, new RegExp(NAT_FLAG));
+            assert.match(err.message, /takes no value/);
+            return true;
+          },
+          `${subcommand} ${token}`,
+        );
+      }
+    }
+  });
+
+  it("never consumes a following token as a value for the outbound flag", () => {
+    // Known to the missing-value guard: `--matchlock-image <NAT_FLAG>` has no value.
+    assert.throws(
+      () => parse(["--matchlock-image", NAT_FLAG]),
+      /Missing value for --matchlock-image/,
+    );
+    assert.throws(() => parse([NAT_FLAG, "something"]), /Unexpected argument/);
+  });
+
+  it("refuses flag + --matchlock-allow-private (space and equals) naming both sides on all four subcommands", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      for (const args of [
+        [NAT_FLAG, "--matchlock-allow-private", "10.0.0.1"],
+        ["--matchlock-allow-private", "10.0.0.1", NAT_FLAG],
+        [NAT_FLAG, "--matchlock-allow-private=10.0.0.1"],
+      ]) {
+        assert.throws(
+          () => parse(args, subcommand, { env: {} }),
+          (err: unknown) => {
+            assert.ok(err instanceof MatchlockNetworkOutboundError);
+            assert.match(err.message, new RegExp(NAT_FLAG));
+            assert.match(err.message, /--matchlock-allow-private/);
+            return true;
+          },
+          `${subcommand} ${args.join(" ")}`,
+        );
+      }
+    }
+  });
+
+  it("refuses flag + non-empty TAMANDUA_MATCHLOCK_ALLOW_PRIVATE naming both sides", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      assert.throws(
+        () => parse([NAT_FLAG], subcommand, { env: { [MATCHLOCK_ALLOW_PRIVATE_ENV]: "10.0.0.1" } }),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.match(err.message, new RegExp(NAT_FLAG));
+          assert.match(err.message, new RegExp(MATCHLOCK_ALLOW_PRIVATE_ENV));
+          return true;
+        },
+        subcommand,
+      );
+    }
+  });
+
+  it("refuses flag + either DNS-priority flag naming both sides", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      for (const dnsFlag of [
+        "--matchlock-prioritize-ipv4-dns-resolution",
+        "--matchlock-prioritize-ipv6-dns-resolution",
+      ]) {
+        assert.throws(
+          () => parse([NAT_FLAG, dnsFlag], subcommand, { env: {} }),
+          (err: unknown) => {
+            assert.ok(err instanceof MatchlockNetworkOutboundError);
+            assert.match(err.message, new RegExp(NAT_FLAG));
+            assert.match(err.message, new RegExp(dnsFlag));
+            return true;
+          },
+          `${subcommand} ${dnsFlag}`,
+        );
+      }
+    }
+  });
+
+  it("refuses flag + non-empty TAMANDUA_MATCHLOCK_DNS_PRIORITY naming both sides", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      assert.throws(
+        () => parse([NAT_FLAG], subcommand, { env: { [MATCHLOCK_DNS_PRIORITY_ENV]: "ipv6" } }),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.match(err.message, new RegExp(NAT_FLAG));
+          assert.match(err.message, new RegExp(MATCHLOCK_DNS_PRIORITY_ENV));
+          return true;
+        },
+        subcommand,
+      );
+    }
+  });
+
+  it("does not treat blank allow-private or DNS env values as conflicts", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      const result = parse([NAT_FLAG], subcommand, {
+        env: {
+          [MATCHLOCK_ALLOW_PRIVATE_ENV]: "   ",
+          [MATCHLOCK_DNS_PRIORITY_ENV]: "\t ",
+        },
+      });
+      assert.deepEqual(result.networkOutbound, { unrestricted: true, source: "flag" });
+      assert.deepEqual(result.allowPrivate, []);
+    }
+  });
+
+  // R4/R6/R7: the matrix is keyed on the RESOLVED selection, so an
+  // env-selected unrestricted mode is refused exactly like the flag.
+  it("refuses an env-selected unrestricted mode + --matchlock-allow-private naming both sides on all four subcommands", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      assert.throws(
+        () => parse(["--matchlock-allow-private", "10.0.0.1"], subcommand, { env: { [NAT_ENV]: "1" } }),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.match(err.message, new RegExp(NAT_ENV));
+          assert.match(err.message, /--matchlock-allow-private/);
+          return true;
+        },
+        subcommand,
+      );
+    }
+  });
+
+  it("refuses an env-selected unrestricted mode + non-empty TAMANDUA_MATCHLOCK_ALLOW_PRIVATE naming both sides", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      assert.throws(
+        () => parse([], subcommand, { env: { [NAT_ENV]: "1", [MATCHLOCK_ALLOW_PRIVATE_ENV]: "10.0.0.1" } }),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.match(err.message, new RegExp(NAT_ENV));
+          assert.match(err.message, new RegExp(MATCHLOCK_ALLOW_PRIVATE_ENV));
+          return true;
+        },
+        subcommand,
+      );
+    }
+  });
+
+  it("refuses an env-selected unrestricted mode + either DNS-priority flag naming both sides", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      for (const dnsFlag of [
+        "--matchlock-prioritize-ipv4-dns-resolution",
+        "--matchlock-prioritize-ipv6-dns-resolution",
+      ]) {
+        assert.throws(
+          () => parse([dnsFlag], subcommand, { env: { [NAT_ENV]: "1" } }),
+          (err: unknown) => {
+            assert.ok(err instanceof MatchlockNetworkOutboundError);
+            assert.equal(err.code, "matchlock_network_outbound_conflict");
+            assert.match(err.message, new RegExp(NAT_ENV));
+            assert.match(err.message, new RegExp(dnsFlag));
+            return true;
+          },
+          `${subcommand} ${dnsFlag}`,
+        );
+      }
+    }
+  });
+
+  it("refuses an env-selected unrestricted mode + non-empty TAMANDUA_MATCHLOCK_DNS_PRIORITY naming both sides", () => {
+    for (const subcommand of INTERACTIVE_SESSION_SUBCOMMANDS) {
+      assert.throws(
+        () => parse([], subcommand, { env: { [NAT_ENV]: "1", [MATCHLOCK_DNS_PRIORITY_ENV]: "ipv6" } }),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.match(err.message, new RegExp(NAT_ENV));
+          assert.match(err.message, new RegExp(MATCHLOCK_DNS_PRIORITY_ENV));
+          return true;
+        },
+        subcommand,
+      );
+    }
   });
 });

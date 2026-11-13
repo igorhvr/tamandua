@@ -14,7 +14,18 @@ import {
   type MatchlockImageSource,
 } from "../installer/matchlock/standard-image.js";
 import { parseSwapMB } from "../installer/matchlock/resource-limits.js";
-import { MATCHLOCK_NO_PRIVILEGED_FLAG } from "../installer/matchlock/isolation-settings.js";
+import {
+  MATCHLOCK_DNS_PRIORITY_ENV,
+  MATCHLOCK_NO_PRIVILEGED_FLAG,
+} from "../installer/matchlock/isolation-settings.js";
+import {
+  MATCHLOCK_OUTBOUND_ALLOW_PRIVATE_ENV,
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG,
+  assertMatchlockNetworkOutboundCompatible,
+  formatMatchlockNetworkOutboundSelectionLabel,
+  resolveMatchlockNetworkOutbound,
+  type ResolvedMatchlockNetworkOutbound,
+} from "../installer/matchlock/network-outbound.js";
 
 export interface WorkflowRunArgs {
   taskTitle: string;
@@ -105,6 +116,18 @@ export interface WorkflowRunArgs {
    * default is ignored without an opt-in.
    */
   matchlockAllowPrivate?: string[];
+  /**
+   * NAT-EGRESS US-007: the outbound network mode for a Matchlock run,
+   * resolved ONCE at parse time through the shared resolver
+   * (`resolveMatchlockNetworkOutbound`: flag >
+   * `TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1` > default intercepted).
+   * Always present (the default selection is `{unrestricted:false,
+   * source:"default"}`) so the launch summary can state the mode
+   * unconditionally. The mode is fixed at run creation: it is persisted at
+   * admission and every later launch composes from the STORED policy, never
+   * from this field or the current environment.
+   */
+  networkOutbound: ResolvedMatchlockNetworkOutbound;
   /** Key-value pairs injected as run template context */
   context: Record<string, string>;
   /** Block until the run reaches a terminal status */
@@ -162,6 +185,7 @@ const KNOWN_FLAGS = new Set([
   "--matchlock-no-swap",
   "--matchlock-no-privileged",
   "--matchlock-allow-private",
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG,
   MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
 ]);
 
@@ -272,6 +296,10 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   // so a missing opt-in names the flag the operator wrote first.
   const matchlockAllowPrivateEntries: string[] = [];
   let matchlockAllowPrivateSupplied = false;
+  // NAT-EGRESS US-007: the pure-boolean outbound-network opt-in. It never
+  // consumes a following token and is a dependent flag (usage error without a
+  // Matchlock opt-in).
+  let unrestrictedOutboundSeen = false;
   let firstMatchlockDependentFlag: string | undefined;
   const context: Record<string, string> = {};
 
@@ -362,6 +390,28 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
       // MTLK-ISO-SLICE1 R13: the deliberate long root-execution override. A
       // pure boolean and a dependent flag (usage error without an opt-in).
       matchlockRootUsageOverrideSeen = true;
+      if (firstMatchlockDependentFlag === undefined) {
+        firstMatchlockDependentFlag = token;
+      }
+      continue;
+    }
+
+    // NAT-EGRESS US-007: the outbound flag takes NO value. A value-bearing
+    // token is a HARD ERROR naming the flag (never silently absorbed into the
+    // task text), mirroring the `--matchlock=` precedent.
+    if (token.startsWith(`${MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG}=`)) {
+      throw new Error(
+        `${MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG} takes no value. ` +
+          `Use exactly ${MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG} to disable egress interception.`,
+      );
+    }
+
+    if (token === MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG) {
+      // A PURE BOOLEAN: it never consumes a following token, so it can appear
+      // anywhere with zero ambiguity; a repeated occurrence is idempotent.
+      // Dependent flag: an opt-in is required, and the first dependent flag
+      // supplied is the one the missing-opt-in error names.
+      unrestrictedOutboundSeen = true;
       if (firstMatchlockDependentFlag === undefined) {
         firstMatchlockDependentFlag = token;
       }
@@ -823,6 +873,46 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     }
   }
 
+  // NAT-EGRESS US-007: ONE shared resolution for the outbound network mode
+  // (flag > env `TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1` > default
+  // intercepted). It runs at PARSE time so a malformed env value is a typed
+  // usage error and a conflict is refused before any run row or VM exists.
+  // The field is ALWAYS present so the launch summary can state the mode
+  // unconditionally (the default selection still renders the intercepted
+  // segment).
+  const networkOutbound = resolveMatchlockNetworkOutbound({
+    flag: unrestrictedOutboundSeen,
+    env: process.env,
+  });
+
+  // NAT-EGRESS: the ENVIRONMENT form of the opt-in selects a Matchlock-only
+  // mode, so it needs the SAME workflow opt-in as the flag. The flag gate above
+  // runs FIRST, so a flag-without-opt-in keeps its existing message; this is
+  // the env-without-opt-in half. Without it the env-selected mode would be
+  // parsed and then silently ignored (native run, no admission, no policy).
+  if (networkOutbound.unrestricted && !matchlockRequested) {
+    throw new Error(
+      `Cannot select unrestricted outbound networking via ` +
+        `${formatMatchlockNetworkOutboundSelectionLabel(networkOutbound)} ` +
+        `without a Matchlock opt-in: pass --matchlock or --matchlock-image <image>.`,
+    );
+  }
+
+  // NAT-EGRESS US-007 conflict matrix: keyed on the RESOLVED selection, so the
+  // flag and the env form obey the SAME rules (R4/R6/R7). The workflow surface
+  // exposes no per-run DNS-priority flag, so only the DNS-priority ENV can
+  // conflict. Pass the resolved allow-private list when the flag supplied it,
+  // else the raw env value — so a flag-vs-env conflict names the env var, and
+  // the flag-vs-flag conflict names `--matchlock-allow-private`.
+  // An empty/whitespace env value is not a conflict.
+  assertMatchlockNetworkOutboundCompatible({
+    resolved: networkOutbound,
+    allowPrivateEntries: matchlockAllowPrivateSupplied ? (matchlockAllowPrivate ?? []) : [],
+    allowPrivateEnvRaw: process.env[MATCHLOCK_OUTBOUND_ALLOW_PRIVATE_ENV],
+    dnsPriorityFlags: [],
+    dnsPriorityEnvRaw: process.env[MATCHLOCK_DNS_PRIORITY_ENV],
+  });
+
   return {
     taskTitle,
     workingDirectoryForHarness,
@@ -843,6 +933,7 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     matchlockNoSwap: matchlockNoSwapSeen || undefined,
     matchlockNoPrivileged: matchlockNoPrivilegedSeen || undefined,
     matchlockAllowPrivate,
+    networkOutbound,
     context,
     wait,
     timeout,

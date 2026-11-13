@@ -710,6 +710,46 @@ function composeCreateParams(
   mounts: Record<string, MatchlockMountConfig>,
   env: Record<string, string>,
 ): MatchlockCreateParams {
+  // Network boundary (NAT-EGRESS): ONE composer emits both modes.
+  //
+  // DEFAULT (no persisted/unrestricted mode, or a policy record that predates
+  // the field) keeps the d8047aa5 block byte-for-byte: public destinations are
+  // allowed; private, loopback, link-local, CGNAT and Yggdrasil destinations
+  // (including IPv6) stay blocked for everything not explicitly listed. The
+  // current matchlock fork intercepts IPv6 too, so the old IPv6 caveat is
+  // gone. The per-run allow-private exceptions (MTLK-ALLOW-PRIVATE) are
+  // emitted as `network.allow_private` ONLY when the admitted policy carries
+  // entries; with none admitted the key is omitted entirely and the block
+  // stays on.
+  //
+  // UNRESTRICTED OUTBOUND (opted in ONCE at run/session creation and persisted
+  // on the policy) disables the interception machinery itself: the request
+  // carries `intercept: false` + `block_private_ips: false` and NOTHING else.
+  // `dns_priority` and `allow_private` are interception-only — emitting them
+  // would advertise machinery that is not running — so both keys are ABSENT
+  // (never `false`/`[]`), even when the policy still carries a resolved DNS
+  // priority or allow-private entries from an earlier resolution.
+  const network: NonNullable<MatchlockCreateParams["network"]> =
+    policy.networkOutbound?.unrestricted === true
+      ? {
+          block_private_ips: false,
+          intercept: false,
+        }
+      : {
+          block_private_ips: true,
+          intercept: true,
+          // ICEBOX DNS (NIXV6-DNS-REWRITER): the resolved address-family
+          // preference ALWAYS travels explicitly — even when it equals the fork
+          // default — so every create request is self-describing and behavior
+          // is pinned to the tamandua version that composed it (no ambiguity if
+          // the fork default ever changes). A policy record that predates the
+          // field falls back to the fork default "ipv4".
+          dns_priority: policy.matchlockDnsPriority?.priority ?? "ipv4",
+          ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
+            ? { allow_private: [...policy.networkAllowPrivate] }
+            : {}),
+        };
+
   return {
     image: policy.requestedImage,
     image_identity: {
@@ -738,27 +778,10 @@ function composeCreateParams(
       // matchlock).
       ...(policy.resourceLimits.swapMB > 0 ? { swap_mb: policy.resourceLimits.swapMB } : {}),
     },
-    // Network boundary: public destinations are allowed; private, loopback,
-    // link-local, CGNAT and Yggdrasil destinations (including IPv6) stay
-    // blocked for everything not explicitly listed. The current matchlock
-    // fork intercepts IPv6 too, so the old IPv6 caveat is gone. The per-run
-    // allow-private exceptions (MTLK-ALLOW-PRIVATE) are emitted as
-    // `network.allow_private` ONLY when the admitted policy carries entries;
-    // with none admitted the key is omitted entirely and the block stays on.
-    network: {
-      block_private_ips: true,
-      intercept: true,
-      // ICEBOX DNS (NIXV6-DNS-REWRITER): the resolved address-family
-      // preference ALWAYS travels explicitly — even when it equals the fork
-      // default — so every create request is self-describing and behavior
-      // is pinned to the tamandua version that composed it (no ambiguity if
-      // the fork default ever changes). A policy record that predates the
-      // field falls back to the fork default "ipv4".
-      dns_priority: policy.matchlockDnsPriority?.priority ?? "ipv4",
-      ...(policy.networkAllowPrivate && policy.networkAllowPrivate.length > 0
-        ? { allow_private: [...policy.networkAllowPrivate] }
-        : {}),
-    },
+    // Network boundary (see the composer-local `network` const above): the
+    // persisted outbound mode selects the intercepted (default) or
+    // unrestricted wire block; the two builders share this one field.
+    network,
     env,
     vfs: {
       exact_destinations: true,

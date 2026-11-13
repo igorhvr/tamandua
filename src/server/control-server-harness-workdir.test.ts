@@ -23,6 +23,10 @@ import {
 } from "../../dist/installer/workdir-collision.js";
 import { shutdownAllCrons, removeRunCrons } from "../../dist/installer/agent-scheduler.js";
 import { getDb } from "../../dist/db.js";
+import {
+  buildMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../dist/installer/matchlock/policy.js";
 
 interface JsonResponse {
   status: number;
@@ -603,6 +607,37 @@ function setRunStatus(dbPath: string, runId: string, status: string): void {
   db.close();
 }
 
+/** The persisted Matchlock policy column (byte-for-byte). */
+function readRunPolicy(dbPath: string, runId: string): string | null {
+  const db = new DatabaseSync(dbPath);
+  const row = db.prepare("SELECT matchlock_policy FROM runs WHERE id = ?").get(runId) as
+    | { matchlock_policy: string | null }
+    | undefined;
+  db.close();
+  return row?.matchlock_policy ?? null;
+}
+
+/** A real v3 NAT policy record for the queued-admission retention case. */
+function natPolicyJson(): string {
+  return serializeMatchlockPolicy(
+    buildMatchlockPolicy({
+      requestedImage: "vic/ml:latest",
+      identity: {
+        digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+      harness: "pi",
+      workingDirectory: "/srv/project",
+      originalRepositoryRoot: "/srv/project",
+      workMounts: [
+        { hostPath: "/srv/project", hostRealPath: "/srv/project", guestPath: "/srv/project" },
+      ],
+      gitMetadataRoots: [],
+      networkOutbound: { unrestricted: true, source: "env" },
+    }),
+  );
+}
+
 function countLogLines(stateDir: string, level: string, marker: string): number {
   return readLog(stateDir)
     .split("\n")
@@ -659,6 +694,59 @@ describe("control-server reconcile admits waiting runs (US-002)", () => {
         .split("\n")
         .find((line) => line.includes(ADMIT_AFTER_WAIT_MARKER));
       assert.ok(infoLine && infoLine.includes(runB), "INFO line must name the admitted run");
+    } finally {
+      await close(server);
+    }
+  });
+
+  // NAT-EGRESS retention at the QUEUED-ADMISSION seam. This seam only
+  // registers and flips scheduling_status (control-server.ts
+  // _admitQueuedRunsOnce) — it composes NO create request — so this is a
+  // COLUMN-retention assertion, executed for real in-process. The composed
+  // wire block after a drain is covered by the real retried dispatch round in
+  // agent-scheduler-matchlock.test.ts; a daemon-driven launch is NOT claimed
+  // here, and daemon RESTART is uncovered by the suite (stated, not labelled).
+  it("NAT-EGRESS: a queued NAT run is admitted after the holder releases with its stored policy bytes untouched", async () => {
+    const { root, dbPath } = setupState();
+    const shared = path.join(root, "shared-nat-workdir");
+    fs.mkdirSync(shared, { recursive: true });
+
+    const natPolicy = natPolicyJson();
+    const runA = crypto.randomUUID();
+    const runB = crypto.randomUUID();
+    seedRun(dbPath, runA, "running", { working_directory_for_harness: shared });
+    seedRun(dbPath, runB, "running", {
+      working_directory_for_harness: shared,
+      workdir_collision_policy: "queue",
+    });
+    // Opted-in Matchlock run: the stored NAT mode + the host-owned intent.
+    const seedDb = new DatabaseSync(dbPath);
+    seedDb.prepare("UPDATE runs SET matchlock_policy = ?, isolation_intent = 'true' WHERE id = ?")
+      .run(natPolicy, runB);
+    seedDb.close();
+    _resetWorkdirWaitWarnState();
+
+    const server = createControlServer({ secret: SECRET, listen: false });
+    const port = await listen(server);
+    try {
+      const registerA = await jsonRequest(port, "POST", "/control/register-run", { runId: runA });
+      assert.equal(registerA.body.state, "active", JSON.stringify(registerA.body));
+      const registerB = await jsonRequest(port, "POST", "/control/register-run", { runId: runB });
+      assert.equal(registerB.body.state, "waiting", JSON.stringify(registerB.body));
+      assert.equal(readRunRow(dbPath, runB).scheduling_status, "waiting");
+      assert.equal(readRunPolicy(dbPath, runB), natPolicy, "queuing never rewrites the stored mode");
+
+      await removeRunCrons(runA);
+      setRunStatus(dbPath, runA, "completed");
+      await _reconcileOnce();
+
+      assert.equal(readRunRow(dbPath, runB).scheduling_status, "active");
+      assert.equal(readRunRow(dbPath, runB).status, "running");
+      assert.equal(
+        readRunPolicy(dbPath, runB),
+        natPolicy,
+        "admission after the wait preserves the stored NAT policy byte-for-byte",
+      );
     } finally {
       await close(server);
     }

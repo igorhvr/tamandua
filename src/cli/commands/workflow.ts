@@ -31,6 +31,12 @@ import {
   MATCHLOCK_IMAGE_ENV,
 } from "../../installer/matchlock/standard-image.js";
 import {
+  formatMatchlockNetworkOutboundResumeRefusal,
+  hasMatchlockUnrestrictedOutboundFlag,
+  MATCHLOCK_NETWORK_OUTBOUND_RESUME_REFUSED_CODE,
+  MatchlockNetworkOutboundError,
+} from "../../installer/matchlock/network-outbound.js";
+import {
   buildWorkflowWarnings,
   parseWorkflowWarnings,
   withWorkflowWarnings,
@@ -251,6 +257,10 @@ Options:
     --matchlock-image <image>       Run isolated with an explicit image
                                     (must already be in the local matchlock
                                     store; tamandua never fetches at launch)
+    --matchlock-unrestricted-outbound-networking
+                                    Disable egress interception for every VM
+                                    of this run (or set
+                                    TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1)
   --matchlock
       Opt in to Matchlock with the standard image ${STANDARD_MATCHLOCK_IMAGE}.
       A pure boolean: it never consumes a following token, so it can appear
@@ -438,6 +448,44 @@ Options:
       the env var is ignored without --matchlock. Private, loopback,
       link-local, CGNAT and Yggdrasil (including IPv6) destinations stay
       blocked for everything not explicitly listed.
+  --matchlock-unrestricted-outbound-networking
+      Create every VM of the opted-in run with unrestricted OUTBOUND
+      networking: the create request carries intercept=false and
+      block_private_ips=false, and the interception-only dns_priority /
+      allow_private settings are omitted entirely. A pure boolean: it never
+      consumes a following token, so it can appear anywhere with zero
+      ambiguity. A value-bearing (--matchlock-unrestricted-outbound-
+      networking=...) form is an error. Requires --matchlock or
+      --matchlock-image <image>; without an opt-in the flag is a usage error.
+      Env form: TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1 (the ONLY
+      enabling value; absent, empty or whitespace selects the default).
+      The env form requires the SAME workflow opt-in: without --matchlock or
+      --matchlock-image <image> it is refused naming the env var and the
+      opt-in (never silently ignored on a native run).
+      Precedence: --matchlock-unrestricted-outbound-networking >
+      TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1 > default intercepted.
+      Default (neither flag nor env): egress interception stays ON and private
+      destinations stay blocked — byte-identical to the pre-flag behaviour.
+      The mode is fixed when the run is CREATED: admission records it in the
+      run's Matchlock policy and every later launch (queued dispatch, retry,
+      resume, daemon restart and replacement/rugpull) composes from that
+      stored policy, never from current flags or environment. An inherited
+      policy without the field stays intercepted (it is never widened), and
+      the mode is never changed for an existing run — passing this flag to
+      "workflow resume" is refused (create a new run instead).
+      Conflicts, each refused before any run row or VM exists and naming BOTH
+      sides (unrestricted outbound disables interception, so the
+      interception-only settings have no meaning) — they apply identically to
+      the flag AND the environment form:
+        --matchlock-unrestricted-outbound-networking (or a non-empty
+        TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1) with
+        --matchlock-allow-private
+        --matchlock-unrestricted-outbound-networking (or the env form) with a
+        non-empty TAMANDUA_MATCHLOCK_ALLOW_PRIVATE
+        --matchlock-unrestricted-outbound-networking (or the env form) with a
+        non-empty TAMANDUA_MATCHLOCK_DNS_PRIORITY
+      (workflow run exposes no per-run DNS-priority flag.) An empty or
+      whitespace allow-private/DNS env value is not a conflict.
   --task-file <path>
       Read the task description from a file instead of passing it inline.
       The file path is dereferenced exactly once at CLI time — the path
@@ -463,6 +511,8 @@ Options:
 Examples:
   tamandua workflow run feature-dev-merge "Add dark mode toggle" --matchlock
   tamandua workflow run feature-dev-merge "Add dark mode toggle" --matchlock-image registry.acme/jail:2
+  tamandua workflow run feature-dev-merge "Install deps from the host LAN" \\
+      --matchlock --matchlock-unrestricted-outbound-networking
   tamandua workflow run feature-dev-merge "Add dark mode toggle"
   tamandua workflow run feature-dev-merge "Refactor DB layer" \\
       --no-hurry-please-save-tokens-mode
@@ -645,6 +695,10 @@ Options:
       to preparation recovery (never native), and a present-but-unusable
       policy refuses on the STATUS-UNUSABLE path before consent is
       consulted. A refused resume preserves the run's prior state.
+  --matchlock-unrestricted-outbound-networking
+      REFUSED on resume: the outbound network mode is fixed when the run is
+      created and stored on its Matchlock policy, so every later launch
+      composes from that stored value. Create a new run to change it.
 
 Examples:
   tamandua workflow resume run-abc12345   # Resume a paused run
@@ -1040,6 +1094,21 @@ export async function handleWorkflow(
   }
 
   if (action === "resume") {
+    // NAT-EGRESS (US-008): the outbound network mode is chosen when a run is
+    // CREATED and persisted on its Matchlock policy; every later launch
+    // composes from that stored value. An explicit flag here is therefore a
+    // usage refusal — never a silent no-op. Checked FIRST, before any run
+    // lookup or daemon call, so a refusal cannot touch state or the control
+    // plane. Both the plain and the (invalid) `=value` spelling are refused by
+    // name.
+    if (hasMatchlockUnrestrictedOutboundFlag(args)) {
+      const refusal = new MatchlockNetworkOutboundError(
+        formatMatchlockNetworkOutboundResumeRefusal(),
+        MATCHLOCK_NETWORK_OUTBOUND_RESUME_REFUSED_CODE,
+      );
+      process.stderr.write(`${refusal.message}\n`);
+      process.exit(1);
+    }
     if (!target) { process.stderr.write("Missing run-id.\n"); process.exit(1); }
     const wrongPrefix = detectWrongPrefix(target, "run");
     if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
@@ -1394,6 +1463,13 @@ export async function handleWorkflow(
         ...(runArgs.matchlockAllowPrivate && runArgs.matchlockAllowPrivate.length > 0
           ? { allowPrivate: [...runArgs.matchlockAllowPrivate] }
           : {}),
+        // NAT-EGRESS (US-008): the parser-resolved outbound mode + selecting
+        // source reach the SAME resolved-launch block, so the single
+        // `matchlock:` line states the mode before the synchronous
+        // `run #N ... created` line and `--json` carries it. `networkOutbound`
+        // is always present on the parsed args (default = intercepted), so the
+        // summary always states which networking mode this launch selected.
+        networkOutbound: { ...runArgs.networkOutbound },
       };
     }
     if (launchInfo && !runArgs.jsonFlag) {
@@ -1430,6 +1506,10 @@ export async function handleWorkflow(
       // MTLK-ALLOW-PRIVATE: the launch-resolved (flag > env) entry list reaches
       // run creation/admission, which persists it on the run's Matchlock policy.
       matchlockAllowPrivate: runArgs.matchlockAllowPrivate,
+      // NAT-EGRESS (US-008): the launch-resolved outbound mode reaches run
+      // creation, which forwards it to admission for a FRESH opt-in ONLY. A
+      // replacement (inherited policy) ignores it; the stored policy wins.
+      matchlockUnrestrictedOutbound: runArgs.networkOutbound,
       context: runArgs.context,
       parentRunId,
     });

@@ -14,6 +14,11 @@ import {
   MatchlockResourceLimitError,
   resolveMatchlockResourceLimits,
 } from "../../dist/installer/matchlock/resource-limits.js";
+import {
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV,
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG,
+  MatchlockNetworkOutboundError,
+} from "../../dist/installer/matchlock/network-outbound.js";
 import { writeFileSync, unlinkSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -1481,5 +1486,313 @@ describe("--matchlock-no-privileged (ICEBOX)", () => {
     const result = parseWorkflowRunArgs(["task", "--", "--matchlock-no-privileged"]);
     assert.equal(result.matchlockNoPrivileged, undefined);
     assert.equal(result.taskTitle, "task --matchlock-no-privileged");
+  });
+});
+
+// NAT-EGRESS US-007: the workflow-run surface of the shared unrestricted
+// outbound-network mode. The flag is a pure boolean dependent flag, the env
+// form is the same shared resolver, and the flag-vs-interception-settings
+// conflicts are refused at PARSE time (before any run row or VM exists).
+describe("--matchlock-unrestricted-outbound-networking (workflow run)", () => {
+  const FLAG = MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG;
+  const ENV_VAR = MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV;
+  const ALLOW_PRIVATE_ENV = "TAMANDUA_MATCHLOCK_ALLOW_PRIVATE";
+  const DNS_PRIORITY_ENV = "TAMANDUA_MATCHLOCK_DNS_PRIORITY";
+
+  const NO_ENV: Record<string, string | undefined> = {
+    [ENV_VAR]: undefined,
+    [ALLOW_PRIVATE_ENV]: undefined,
+    [DNS_PRIORITY_ENV]: undefined,
+  };
+
+  function withEnvs<T>(values: Record<string, string | undefined>, fn: () => T): T {
+    const previous = new Map<string, string | undefined>();
+    for (const [name, value] of Object.entries(values)) {
+      previous.set(name, process.env[name]);
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    try {
+      return fn();
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }
+
+  it("defaults to intercepted/default when neither flag nor env is set", () => {
+    withEnvs(NO_ENV, () => {
+      const result = parseWorkflowRunArgs(["do the thing"]);
+      assert.deepEqual(result.networkOutbound, {
+        unrestricted: false,
+        source: "default",
+      });
+      assert.equal(result.taskTitle, "do the thing");
+    });
+  });
+
+  it("resolves unrestricted/flag alongside --matchlock", () => {
+    withEnvs(NO_ENV, () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock", FLAG]);
+      assert.deepEqual(result.networkOutbound, {
+        unrestricted: true,
+        source: "flag",
+      });
+      assert.equal(result.matchlockRequested, true);
+    });
+  });
+
+  it("resolves unrestricted/flag alongside --matchlock-image <image>", () => {
+    withEnvs(NO_ENV, () => {
+      const result = parseWorkflowRunArgs([
+        "task",
+        "--matchlock-image",
+        "vic/ml",
+        FLAG,
+      ]);
+      assert.deepEqual(result.networkOutbound, {
+        unrestricted: true,
+        source: "flag",
+      });
+      assert.equal(result.matchlockImage, "vic/ml");
+    });
+  });
+
+  it("resolves unrestricted/env from TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1", () => {
+    withEnvs({ ...NO_ENV, [ENV_VAR]: "1" }, () => {
+      const result = parseWorkflowRunArgs(["task", "--matchlock"]);
+      assert.deepEqual(result.networkOutbound, {
+        unrestricted: true,
+        source: "env",
+      });
+    });
+  });
+
+  it("treats absent, empty and whitespace-only env values as the default", () => {
+    for (const value of [undefined, "", "   "]) {
+      withEnvs({ ...NO_ENV, [ENV_VAR]: value }, () => {
+        const result = parseWorkflowRunArgs(["task", "--matchlock"]);
+        assert.deepEqual(result.networkOutbound, {
+          unrestricted: false,
+          source: "default",
+        });
+      });
+    }
+  });
+
+  it("refuses a malformed env value as a typed usage error at parse time", () => {
+    withEnvs({ ...NO_ENV, [ENV_VAR]: "true" }, () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock"]),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_invalid");
+          assert.match(err.message, new RegExp(ENV_VAR));
+          assert.match(err.message, /"1"/);
+          return true;
+        },
+      );
+    });
+  });
+
+  it("refuses the flag without a Matchlock opt-in, naming both sides", () => {
+    withEnvs(NO_ENV, () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", FLAG]),
+        (err: Error) => {
+          assert.ok(err.message.includes(FLAG));
+          assert.ok(err.message.includes("--matchlock"));
+          assert.ok(err.message.includes("--matchlock-image"));
+          return true;
+        },
+      );
+    });
+  });
+
+  it("is a pure boolean: it never consumes the following token", () => {
+    withEnvs(NO_ENV, () => {
+      const result = parseWorkflowRunArgs([
+        "do",
+        "--matchlock",
+        FLAG,
+        "the",
+        "thing",
+      ]);
+      assert.equal(result.taskTitle, "do the thing");
+      assert.deepEqual(result.networkOutbound, {
+        unrestricted: true,
+        source: "flag",
+      });
+    });
+  });
+
+  it("rejects the value-bearing equals form instead of silently absorbing it", () => {
+    withEnvs(NO_ENV, () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock", `${FLAG}=1`]),
+        /--matchlock-unrestricted-outbound-networking takes no value/,
+      );
+    });
+  });
+
+  it("after the -- separator it is task text, not a flag", () => {
+    withEnvs(NO_ENV, () => {
+      const result = parseWorkflowRunArgs(["task", "--", FLAG]);
+      assert.equal(result.taskTitle, `task ${FLAG}`);
+      assert.deepEqual(result.networkOutbound, {
+        unrestricted: false,
+        source: "default",
+      });
+    });
+  });
+
+  it("refuses the flag with --matchlock-allow-private, naming both sides", () => {
+    withEnvs(NO_ENV, () => {
+      assert.throws(
+        () =>
+          parseWorkflowRunArgs([
+            "task",
+            "--matchlock",
+            "--matchlock-allow-private",
+            "10.0.0.0/8",
+            FLAG,
+          ]),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.ok(err.message.includes(FLAG));
+          assert.ok(err.message.includes("--matchlock-allow-private"));
+          return true;
+        },
+      );
+    });
+  });
+
+  it("refuses the flag with a non-empty allow-private env, naming both sides", () => {
+    withEnvs({ ...NO_ENV, [ALLOW_PRIVATE_ENV]: "10.0.0.0/8" }, () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock", FLAG]),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.ok(err.message.includes(FLAG));
+          assert.ok(err.message.includes(ALLOW_PRIVATE_ENV));
+          return true;
+        },
+      );
+    });
+  });
+
+  it("refuses the flag with a non-empty DNS-priority env, naming both sides", () => {
+    withEnvs({ ...NO_ENV, [DNS_PRIORITY_ENV]: "ipv6" }, () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock", FLAG]),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.ok(err.message.includes(FLAG));
+          assert.ok(err.message.includes(DNS_PRIORITY_ENV));
+          return true;
+        },
+      );
+    });
+  });
+
+  it("does not treat empty/whitespace allow-private or DNS env values as conflicts", () => {
+    withEnvs(
+      { ...NO_ENV, [ALLOW_PRIVATE_ENV]: "   ", [DNS_PRIORITY_ENV]: "" },
+      () => {
+        const result = parseWorkflowRunArgs(["task", "--matchlock", FLAG]);
+        assert.deepEqual(result.networkOutbound, {
+          unrestricted: true,
+          source: "flag",
+        });
+        assert.equal(result.matchlockAllowPrivate, undefined);
+      },
+    );
+  });
+
+  // R4/R6/R7: the conflict matrix is keyed on the RESOLVED selection, so the
+  // ENV form of the opt-in is refused exactly like the flag (it never silently
+  // wins and drops the interception-only settings).
+  it("refuses env-selected + --matchlock-allow-private, naming both sides", () => {
+    withEnvs({ ...NO_ENV, [ENV_VAR]: "1" }, () => {
+      assert.throws(
+        () =>
+          parseWorkflowRunArgs([
+            "task",
+            "--matchlock",
+            "--matchlock-allow-private",
+            "10.0.0.0/8",
+          ]),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.ok(err.message.includes(ENV_VAR), `must name ${ENV_VAR}: ${err.message}`);
+          assert.ok(err.message.includes("--matchlock-allow-private"));
+          return true;
+        },
+      );
+    });
+  });
+
+  it("refuses env-selected + non-empty allow-private env, naming both sides", () => {
+    withEnvs({ ...NO_ENV, [ENV_VAR]: "1", [ALLOW_PRIVATE_ENV]: "10.0.0.0/8" }, () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock"]),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.ok(err.message.includes(ENV_VAR));
+          assert.ok(err.message.includes(ALLOW_PRIVATE_ENV));
+          return true;
+        },
+      );
+    });
+  });
+
+  it("refuses env-selected + non-empty DNS-priority env, naming both sides", () => {
+    withEnvs({ ...NO_ENV, [ENV_VAR]: "1", [DNS_PRIORITY_ENV]: "ipv6" }, () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task", "--matchlock"]),
+        (err: unknown) => {
+          assert.ok(err instanceof MatchlockNetworkOutboundError);
+          assert.equal(err.code, "matchlock_network_outbound_conflict");
+          assert.ok(err.message.includes(ENV_VAR));
+          assert.ok(err.message.includes(DNS_PRIORITY_ENV));
+          return true;
+        },
+      );
+    });
+  });
+
+  it("refuses an env-selected mode without --matchlock/--matchlock-image, naming the env var and the opt-in", () => {
+    withEnvs({ ...NO_ENV, [ENV_VAR]: "1" }, () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["task"]),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.ok(err.message.includes(ENV_VAR), `must name ${ENV_VAR}: ${err.message}`);
+          assert.ok(
+            err.message.includes("--matchlock or --matchlock-image <image>"),
+            `must name the opt-in: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    });
+  });
+
+  it("does not treat empty/whitespace allow-private or DNS env values as env-selected conflicts", () => {
+    withEnvs(
+      { ...NO_ENV, [ENV_VAR]: "1", [ALLOW_PRIVATE_ENV]: "   ", [DNS_PRIORITY_ENV]: "" },
+      () => {
+        const result = parseWorkflowRunArgs(["task", "--matchlock"]);
+        assert.deepEqual(result.networkOutbound, { unrestricted: true, source: "env" });
+        assert.equal(result.matchlockAllowPrivate, undefined);
+      },
+    );
   });
 });

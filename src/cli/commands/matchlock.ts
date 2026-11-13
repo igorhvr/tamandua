@@ -30,6 +30,7 @@ import {
   type MatchlockResourceHostProbe,
 } from "../../installer/matchlock/resource-limits.js";
 import { MatchlockIsolationSettingError } from "../../installer/matchlock/isolation-settings.js";
+import { MatchlockNetworkOutboundError } from "../../installer/matchlock/network-outbound.js";
 import { LAUNCH_GATE_REFUSAL_EXIT_CODE } from "../../installer/matchlock/gate-exit-code.js";
 import { LaunchGateRefusalError } from "../../installer/matchlock/launch-gate-wiring.js";
 import { renderInteractiveLaunchGateRefusal } from "../../installer/matchlock/launch-gate-interactive.js";
@@ -90,6 +91,24 @@ const MATCHLOCK_OPTIONS_HELP = `Options:
                           both DNS-priority flags are supplied.
                           Env default (unless either flag is supplied):
                           TAMANDUA_MATCHLOCK_DNS_PRIORITY=ipv4|ipv6.
+  --matchlock-unrestricted-outbound-networking
+                          Create the VM with unrestricted outbound networking:
+                          egress interception is DISABLED and private
+                          destinations are reachable. Default: egress
+                          interception stays ON and private destinations stay
+                          blocked. Env form:
+                          TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1.
+                          This flag takes no value. Selecting unrestricted
+                          mode — by this flag OR by a non-empty
+                          TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1 —
+                          conflicts with
+                          --matchlock-allow-private, a non-empty
+                          TAMANDUA_MATCHLOCK_ALLOW_PRIVATE,
+                          --matchlock-prioritize-ipv4-dns-resolution,
+                          --matchlock-prioritize-ipv6-dns-resolution and a
+                          non-empty TAMANDUA_MATCHLOCK_DNS_PRIORITY (all
+                          refused before any VM is created), naming both
+                          sides.
   --force-matchlock-usage-as-root-not-recommended-per-matchlock-docs
                           Acknowledge and allow a root invocation for this
                           session only (session-scoped consent; never inferred
@@ -109,6 +128,8 @@ Environment precedence:
            --matchlock-prioritize-ipv4-dns-resolution >
            TAMANDUA_MATCHLOCK_DNS_PRIORITY (exactly "ipv4" or "ipv6") >
            default ipv4
+  network --matchlock-unrestricted-outbound-networking >
+          TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1 > default intercepted
 
 A missing standard image is refused with the remedy \`tamandua matchlock setup\`.
 A root invocation is refused before any Matchlock interaction unless the exact
@@ -447,7 +468,8 @@ export async function handleMatchlock(
     if (
       error instanceof InteractiveSessionArgError ||
       error instanceof MatchlockResourceLimitError ||
-      error instanceof MatchlockIsolationSettingError
+      error instanceof MatchlockIsolationSettingError ||
+      error instanceof MatchlockNetworkOutboundError
     ) {
       stderr(`Error: ${error.message}\nUsage: ${MATCHLOCK_USAGE}\n`);
       exit(1);

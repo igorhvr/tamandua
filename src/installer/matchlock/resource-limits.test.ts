@@ -443,4 +443,71 @@ describe("matchlock resource limits", () => {
       "empty list must append nothing",
     );
   });
+
+  // NAT-EGRESS (US-003): the single `matchlock:` line also states the resolved
+  // outbound network mode and how it was selected. The segment is composed by
+  // the shared formatter, appended LAST (after allow-private) and NEVER on a
+  // second line. A caller that omits the resolved mode keeps the previous
+  // byte-identical line (the not-yet-migrated status renderer / fixtures).
+  describe("NAT-EGRESS US-003: network mode segment on the shared summary", () => {
+    const limits = { cpus: 8, memoryMB: 16384, diskSizeMB: 20480, swapMB: 8192 };
+    const BASE = "matchlock: img cpus=8 memory=16384MB disk=20480MB swap=8192MB";
+
+    it("appends network=intercepted(default) for the resolved default mode", () => {
+      assert.equal(
+        formatMatchlockResourceSummary("img", limits, undefined, {
+          unrestricted: false,
+          source: "default",
+        }),
+        `${BASE} network=intercepted(default)`,
+      );
+    });
+
+    it("appends network=unrestricted-outbound(flag) and (env) for the two selections", () => {
+      assert.equal(
+        formatMatchlockResourceSummary("img", limits, undefined, {
+          unrestricted: true,
+          source: "flag",
+        }),
+        `${BASE} network=unrestricted-outbound(flag)`,
+      );
+      assert.equal(
+        formatMatchlockResourceSummary("img", limits, undefined, {
+          unrestricted: true,
+          source: "env",
+        }),
+        `${BASE} network=unrestricted-outbound(env)`,
+      );
+    });
+
+    it("keeps exactly one matchlock: line and prints the segment once, after allow-private", () => {
+      const summary = formatMatchlockResourceSummary(
+        "igorhvr/tamandua",
+        { ...limits, imageSource: "standard", swapMB: 0 },
+        ["box.internal", "10.0.0.0/8"],
+        { unrestricted: false, source: "default" },
+      );
+      assert.equal(
+        summary,
+        "matchlock: igorhvr/tamandua (standard image) cpus=8 memory=16384MB disk=20480MB swap=off allow-private=box.internal,10.0.0.0/8 network=intercepted(default)",
+      );
+      assert.equal(summary.split("matchlock:").length - 1, 1, "exactly one matchlock: line");
+      assert.equal(summary.match(/network=/g)?.length, 1, "the network segment prints exactly once");
+    });
+
+    it("omitting the resolved mode keeps the previous byte-identical line", () => {
+      assert.equal(formatMatchlockResourceSummary("img", limits), BASE);
+      assert.equal(formatMatchlockResourceSummary("img", limits, ["box.internal"]), `${BASE} allow-private=box.internal`);
+    });
+
+    it("a fixture summary without the segment is a strict prefix of the mode-bearing line", () => {
+      const without = formatMatchlockResourceSummary("img", limits);
+      const withDefault = formatMatchlockResourceSummary("img", limits, undefined, {
+        unrestricted: false,
+        source: "default",
+      });
+      assert.equal(withDefault.startsWith(without), true);
+      assert.equal(withDefault.slice(without.length), " network=intercepted(default)");
+    });
+  });
 });

@@ -27,6 +27,12 @@ import {
 } from "../../dist/installer/matchlock/admission.js";
 import { tempTranscriptPath, writeFakeRpcDriver } from "../../dist/installer/matchlock/fake-rpc-driver.js";
 import type { MatchlockSwapSupportProbe } from "../../dist/installer/matchlock/swap-support.js";
+import type { ResolvedMatchlockNetworkOutbound } from "../../dist/installer/matchlock/network-outbound.js";
+import {
+  MATCHLOCK_OUTBOUND_ALLOW_PRIVATE_ENV,
+  MATCHLOCK_OUTBOUND_DNS_PRIORITY_ENV,
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV,
+} from "../../dist/installer/matchlock/network-outbound.js";
 import { getPidFile, getPortFile, stopDaemon, stopDaemonFamily } from "../../dist/server/daemonctl.js";
 import {
   reservePortHandles,
@@ -146,6 +152,8 @@ async function runMatchlockRunAndReadPolicy(
     matchlockPolicy?: ReturnType<typeof parseMatchlockPolicy>;
     /** ICEBOX: the whole-VM privilege opt-out for THIS fresh launch. */
     matchlockNoPrivileged?: boolean;
+    /** NAT-EGRESS: the resolved outbound mode supplied to a FRESH launch. */
+    matchlockUnrestrictedOutbound?: ResolvedMatchlockNetworkOutbound;
     /**
      * ICEBOX: extra env values set for the runWorkflow call (restored after).
      * `undefined` DELETES the key for the duration of the call.
@@ -185,6 +193,9 @@ async function runMatchlockRunAndReadPolicy(
       ...(opts.matchlockRootUsageOverride ? { matchlockRootUsageOverride: true } : {}),
       ...(opts.matchlockPolicy ? { matchlockPolicy: opts.matchlockPolicy } : {}),
       ...(opts.matchlockNoPrivileged ? { matchlockNoPrivileged: true } : {}),
+      ...(opts.matchlockUnrestrictedOutbound
+        ? { matchlockUnrestrictedOutbound: opts.matchlockUnrestrictedOutbound }
+        : {}),
       matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
       matchlockResourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 },
     });
@@ -1467,6 +1478,184 @@ describe("runWorkflow", () => {
       }
     });
 
+    // NAT-EGRESS provenance: the REAL replacement admission must take the
+    // INHERITED record verbatim and never consult the ambient environment.
+    // DISCRIMINATION: the inherited record below is UNRESTRICTED, which ARMS
+    // admission's conflict matrix (`assertAdmissionNetworkOutboundConsistent`
+    // returns early for an intercepted run). So an ambient
+    // TAMANDUA_MATCHLOCK_ALLOW_PRIVATE / TAMANDUA_MATCHLOCK_DNS_PRIORITY leak
+    // either REFUSES the replacement (`matchlock_network_outbound_conflict`)
+    // or silently persists ambient values — both asserted absent here. This is
+    // why an intercepted-only negative case would NOT discriminate: with an
+    // intercepted record the matrix is inert and an ambient leak is invisible.
+    // It fails if the run-creation wiring or admission consults the ambient
+    // environment/supplied options for an inherited run.
+    it("NAT-EGRESS: a replacement inherits an unrestricted NAT policy verbatim while ambient ALLOW_PRIVATE/DNS/NAT env conflicts are set", async () => {
+      const workflowId = "test-ctx-mtlk-nat-provenance";
+      const replacementId = "test-ctx-mtlk-nat-provenance-replacement";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      writeMinimalWorkflow(tempHome, replacementId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const first = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "First unrestricted run",
+          image: "vic/ml:latest",
+          repoDir,
+          // Exactly what the CLI parser resolves from the NAT env selection.
+          matchlockUnrestrictedOutbound: { unrestricted: true, source: "env" },
+          extraEnv: [[MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV, "1"]],
+        });
+        assert.deepEqual(
+          first.policy.networkOutbound,
+          { unrestricted: true, source: "env" },
+          "the fresh admission persists the env-selected mode",
+        );
+
+        // Production replacement shape (rugpull.ts passes ONLY matchlockPolicy):
+        // no fresh outbound/allow-private/DNS option is threaded, while the
+        // ambient environment selects ALL THREE conflicting values.
+        const replacement = await runMatchlockRunAndReadPolicy(tempHome, replacementId, {
+          taskTitle: "Replacement inherits NAT",
+          image: "vic/ml:latest",
+          repoDir,
+          matchlockPolicy: first.policy,
+          extraEnv: [
+            [MATCHLOCK_OUTBOUND_ALLOW_PRIVATE_ENV, "10.0.0.0/8"],
+            [MATCHLOCK_OUTBOUND_DNS_PRIORITY_ENV, "ipv6"],
+            [MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV, "1"],
+          ],
+        });
+        assert.deepEqual(
+          replacement.policy.networkOutbound,
+          { unrestricted: true, source: "env" },
+          "mode AND source are inherited verbatim (no ambient value introduced)",
+        );
+
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const rawPolicy = (id: string): string => {
+          const row = db.prepare(
+            "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1",
+          ).get(id) as { matchlock_policy: string | null } | undefined;
+          assert.ok(row?.matchlock_policy, `${id}: matchlock_policy should be persisted`);
+          return row!.matchlock_policy!;
+        };
+        const firstRaw = rawPolicy(workflowId);
+        const replacementRaw = rawPolicy(replacementId);
+        assert.equal(
+          replacementRaw,
+          firstRaw,
+          "the replacement re-persists the inherited policy BYTE-IDENTICALLY (no ambient allow-private/DNS value introduced)",
+        );
+
+        const helperPack = path.join(tempHome, "mtlk-nat-provenance-guest-pack");
+        fs.mkdirSync(helperPack, { recursive: true });
+        const cfg = buildMatchlockCreateConfig(
+          parseMatchlockPolicy(replacementRaw),
+          {
+            digest: first.policy.resolvedImageDigest ?? "",
+            config_digest: first.policy.resolvedImageConfigDigest ?? "",
+          },
+          { helperPackHostPath: helperPack },
+        );
+        assert.deepEqual(
+          cfg.network,
+          { block_private_ips: false, intercept: false },
+          "the composed create request is exactly the unrestricted block",
+        );
+        assert.equal(
+          JSON.stringify(cfg.network),
+          '{"block_private_ips":false,"intercept":false}',
+          "key order is the wire shape (no dns_priority / allow_private fields)",
+        );
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    // NAT-EGRESS complementary direction: an INHERITED record with NO network
+    // field stays INTERCEPTED even while the ambient NAT + conflict env is
+    // set. The stored record's ABSENCE is authoritative. (Here the conflict
+    // matrix is inert — which is exactly why the NAT test above is the
+    // discriminating one — but this proves the ambient NAT selection cannot
+    // WIDEN an intercepted run.)
+    it("NAT-EGRESS: a replacement of an intercepted record stays intercepted with the ambient NAT + conflict env set", async () => {
+      const workflowId = "test-ctx-mtlk-intercepted-provenance";
+      const replacementId = "test-ctx-mtlk-intercepted-provenance-replacement";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      writeMinimalWorkflow(tempHome, replacementId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const first = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "First intercepted run",
+          image: "vic/ml:latest",
+          repoDir,
+        });
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(first.policy, "networkOutbound"),
+          false,
+          "the default admission persists NO network field",
+        );
+
+        const replacement = await runMatchlockRunAndReadPolicy(tempHome, replacementId, {
+          taskTitle: "Replacement stays intercepted",
+          image: "vic/ml:latest",
+          repoDir,
+          matchlockPolicy: first.policy,
+          extraEnv: [
+            [MATCHLOCK_OUTBOUND_ALLOW_PRIVATE_ENV, "10.0.0.0/8"],
+            [MATCHLOCK_OUTBOUND_DNS_PRIORITY_ENV, "ipv6"],
+            [MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV, "1"],
+          ],
+        });
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(replacement.policy, "networkOutbound"),
+          false,
+          "absence in the inherited record is authoritative (never widened by ambient NAT)",
+        );
+
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const rawPolicy = (id: string): string => {
+          const row = db.prepare(
+            "SELECT matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1",
+          ).get(id) as { matchlock_policy: string | null } | undefined;
+          assert.ok(row?.matchlock_policy, `${id}: matchlock_policy should be persisted`);
+          return row!.matchlock_policy!;
+        };
+        const firstRaw = rawPolicy(workflowId);
+        const replacementRaw = rawPolicy(replacementId);
+        assert.equal(
+          replacementRaw,
+          firstRaw,
+          "the replacement re-persists the inherited policy BYTE-IDENTICALLY (no network field, no ambient values)",
+        );
+        assert.equal(replacementRaw.includes("networkOutbound"), false);
+
+        const helperPack = path.join(tempHome, "mtlk-intercepted-provenance-guest-pack");
+        fs.mkdirSync(helperPack, { recursive: true });
+        const cfg = buildMatchlockCreateConfig(
+          parseMatchlockPolicy(replacementRaw),
+          {
+            digest: first.policy.resolvedImageDigest ?? "",
+            config_digest: first.policy.resolvedImageConfigDigest ?? "",
+          },
+          { helperPackHostPath: helperPack },
+        );
+        assert.deepEqual(
+          cfg.network,
+          { block_private_ips: true, intercept: true, dns_priority: "ipv4" },
+          "the baseline intercepted block is composed (no allow_private)",
+        );
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
     // MTLK-VM-SIZE US-003: CLI-resolved limits are persisted in the run's
     // policy (serialize/parse round-trip) and surfaced on the result so the
     // CLI can echo the admitted VM size. An injected host probe proves the
@@ -2440,6 +2629,317 @@ describe("runWorkflow", () => {
         if (transcript && fs.existsSync(transcript)) fs.rmSync(transcript, { force: true });
         if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true });
       }
+    });
+  });
+
+  // NAT-EGRESS US-008: run creation persists the fresh outbound mode on the
+  // run's Matchlock policy and forwards NOTHING for a replacement, so the
+  // stored policy is authoritative on every later launch.
+  describe("NAT-EGRESS US-008: run creation threads the fresh outbound mode", () => {
+    it("a fresh flag-selected unrestricted launch persists {unrestricted:true,source:'flag'}", async () => {
+      const workflowId = "test-ctx-netegress-fresh-flag";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const { policy } = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Fresh unrestricted (flag) run",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          matchlockUnrestrictedOutbound: { unrestricted: true, source: "flag" },
+        });
+        assert.deepEqual(
+          policy.networkOutbound,
+          { unrestricted: true, source: "flag" },
+          "the fresh flag-selected mode must be persisted on the run policy",
+        );
+        // Re-parse of the persisted string keeps the same mode+source.
+        const reparsed = parseMatchlockPolicy(serializeMatchlockPolicy(policy));
+        assert.deepEqual(reparsed.networkOutbound, { unrestricted: true, source: "flag" });
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("a fresh env-selected unrestricted launch persists source 'env' verbatim", async () => {
+      const workflowId = "test-ctx-netegress-fresh-env";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const { policy } = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Fresh unrestricted (env) run",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          matchlockUnrestrictedOutbound: { unrestricted: true, source: "env" },
+        });
+        assert.deepEqual(policy.networkOutbound, { unrestricted: true, source: "env" });
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("a fresh DEFAULT launch writes NO networkOutbound field (interception stays absent)", async () => {
+      const workflowId = "test-ctx-netegress-fresh-default";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const { policy } = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Fresh default (intercepted) run",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+        });
+        assert.equal(policy.networkOutbound, undefined, "default admission persists nothing");
+        assert.equal(
+          serializeMatchlockPolicy(policy).includes("networkOutbound"),
+          false,
+          "a default policy record must stay byte-identical (no field)",
+        );
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    // ANTI-WIDENING: a replacement run inherits an INTERCEPTED policy and is
+    // handed a newly selected unrestricted mode. It must stay intercepted —
+    // the stored policy is authoritative and the supplied value is ignored.
+    it("a replacement of an INTERCEPTED run IGNORES a supplied unrestricted mode", async () => {
+      const workflowId = "test-ctx-netegress-replacement-intercepted";
+      const replacementId = "test-ctx-netegress-replacement-intercepted-2";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      writeMinimalWorkflow(tempHome, replacementId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const first = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "Intercepted first run",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+        });
+        assert.equal(first.policy.networkOutbound, undefined);
+
+        const replacement = await runMatchlockRunAndReadPolicy(tempHome, replacementId, {
+          taskTitle: "Replacement that must not widen",
+          image: first.policy.requestedImage,
+          repoDir,
+          matchlockPolicy: first.policy,
+          matchlockUnrestrictedOutbound: { unrestricted: true, source: "flag" },
+        });
+        assert.equal(
+          replacement.policy.networkOutbound,
+          undefined,
+          "a replacement must never widen an intercepted inherited policy",
+        );
+        assert.equal(
+          serializeMatchlockPolicy(replacement.policy).includes("networkOutbound"),
+          false,
+        );
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("a replacement of a NAT run stays NAT when no mode is supplied", async () => {
+      const workflowId = "test-ctx-netegress-replacement-nat";
+      const replacementId = "test-ctx-netegress-replacement-nat-2";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      writeMinimalWorkflow(tempHome, replacementId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      try {
+        const first = await runMatchlockRunAndReadPolicy(tempHome, workflowId, {
+          taskTitle: "NAT first run",
+          image: "vic/matchlock-base:latest",
+          repoDir,
+          matchlockUnrestrictedOutbound: { unrestricted: true, source: "flag" },
+        });
+        assert.deepEqual(first.policy.networkOutbound, { unrestricted: true, source: "flag" });
+
+        const replacement = await runMatchlockRunAndReadPolicy(tempHome, replacementId, {
+          taskTitle: "Replacement of a NAT run",
+          image: first.policy.requestedImage,
+          repoDir,
+          matchlockPolicy: first.policy,
+        });
+        assert.deepEqual(
+          replacement.policy.networkOutbound,
+          { unrestricted: true, source: "flag" },
+          "an inherited NAT policy stays NAT verbatim",
+        );
+      } finally {
+        fs.rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // NAT-EGRESS R6/R7 at the COMPOSITION seam: a direct `runWorkflow` caller
+  // (no CLI parser) must be refused, never handed a silent narrowing where the
+  // composer drops dns_priority/allow_private under unrestricted mode.
+  describe("NAT-EGRESS R6/R7: run creation refuses contradictory network settings", () => {
+    const resourceLimits = { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 };
+
+    function envScope(over: Array<[string, string | undefined]>): {
+      restore: () => void;
+    } {
+      const saved = over.map(([key]) => [key, process.env[key]] as [string, string | undefined]);
+      for (const [key, value] of over) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      return {
+        restore: () => {
+          for (const [key, value] of saved) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+          }
+        },
+      };
+    }
+
+    it("a fresh opt-in + matchlockAllowPrivate + env-selected NAT is refused: run failed, no policy, no RPC", async () => {
+      const workflowId = "test-ctx-netegress-conflict-allow-private";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      fs.mkdirSync(path.join(tempHome, ".pi", "agent"), { recursive: true });
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const scope = envScope([
+        [MATCHLOCK_RPC_BIN_ENV, process.execPath],
+        [MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver])],
+        ["FAKE_TRANSCRIPT_FILE", transcript],
+        ["FAKE_IMAGE_TAG", "vic/matchlock-base:latest"],
+        ["FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["TAMANDUA_MATCHLOCK_DNS_PRIORITY", undefined],
+      ]);
+      try {
+        await assert.rejects(
+          () =>
+            runWorkflow({
+              workflowId,
+              taskTitle: "Contradictory allow-private + NAT",
+              workingDirectoryForHarness: repoDir,
+              matchlockImage: "vic/matchlock-base:latest",
+              matchlockAllowPrivate: ["10.0.0.0/8"],
+              matchlockUnrestrictedOutbound: { unrestricted: true, source: "env" },
+              matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
+              matchlockResourceLimits: resourceLimits,
+            }),
+          (err: unknown) => {
+            assert.ok(err instanceof MatchlockAdmissionError, `expected admission refusal, got ${String(err)}`);
+            assert.equal(err.code, "matchlock_network_outbound_conflict");
+            assert.match(err.message, /TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING/);
+            assert.match(err.message, /--matchlock-allow-private/);
+            return true;
+          },
+        );
+      } finally {
+        scope.restore();
+      }
+
+      assert.equal(
+        fs.existsSync(transcript),
+        false,
+        "the refusal precedes every matchlock RPC (no resolve, no create, no VM)",
+      );
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const run = db.prepare(
+        "SELECT id, status, scheduling_status, matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).get(workflowId) as
+        | { id: string; status: string; scheduling_status: string | null; matchlock_policy: string | null }
+        | undefined;
+      assert.ok(run, "the refused run row must exist (honest failure)");
+      assert.equal(run.status, "failed");
+      assert.equal(run.scheduling_status, null);
+      assert.equal(run.matchlock_policy, null, "no policy may be persisted for a refused admission");
+      const steps = db.prepare("SELECT COUNT(*) AS n FROM steps WHERE run_id = ?").get(run.id) as { n: number };
+      assert.equal(steps.n, 0, "no step/work may be runnable for a refused run");
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    });
+
+    it("a fresh opt-in + env-selected NAT + DNS-priority env is refused: run failed, no policy, no RPC", async () => {
+      const workflowId = "test-ctx-netegress-conflict-dns-env";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const fixtureRoot = path.join(MTLK_FIXTURE_BASE, `${workflowId}-${crypto.randomUUID().slice(0, 8)}`);
+      const repoDir = path.join(fixtureRoot, "repo");
+      initGitRepo(repoDir);
+      fs.mkdirSync(path.join(tempHome, ".pi", "agent"), { recursive: true });
+      const fakeDriver = writeFakeRpcDriver({ dir: path.join(fixtureRoot, "driver") });
+      const transcript = tempTranscriptPath();
+      const scope = envScope([
+        [MATCHLOCK_RPC_BIN_ENV, process.execPath],
+        [MATCHLOCK_RPC_ARGS_ENV, JSON.stringify([fakeDriver])],
+        ["FAKE_TRANSCRIPT_FILE", transcript],
+        ["FAKE_IMAGE_TAG", "vic/matchlock-base:latest"],
+        ["FAKE_IMAGE_DIGEST", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["FAKE_IMAGE_CONFIG_DIGEST", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["TAMANDUA_MATCHLOCK_DNS_PRIORITY", "ipv6"],
+      ]);
+      try {
+        await assert.rejects(
+          () =>
+            runWorkflow({
+              workflowId,
+              taskTitle: "Contradictory DNS env + NAT",
+              workingDirectoryForHarness: repoDir,
+              matchlockImage: "vic/matchlock-base:latest",
+              matchlockUnrestrictedOutbound: { unrestricted: true, source: "env" },
+              matchlockSwapSupportProbe: supportingMatchlockSwapProbe,
+              matchlockResourceLimits: resourceLimits,
+            }),
+          (err: unknown) => {
+            assert.ok(err instanceof MatchlockAdmissionError, `expected admission refusal, got ${String(err)}`);
+            assert.equal(err.code, "matchlock_network_outbound_conflict");
+            assert.match(err.message, /TAMANDUA_MATCHLOCK_DNS_PRIORITY/);
+            return true;
+          },
+        );
+      } finally {
+        scope.restore();
+      }
+
+      assert.equal(fs.existsSync(transcript), false, "the refusal precedes every matchlock RPC");
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const run = db.prepare(
+        "SELECT id, status, matchlock_policy FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).get(workflowId) as { id: string; status: string; matchlock_policy: string | null } | undefined;
+      assert.ok(run, "the refused run row must exist");
+      assert.equal(run.status, "failed");
+      assert.equal(run.matchlock_policy, null);
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    });
+
+    it("an env-selected NAT mode without --matchlock/--matchlock-image is refused with NO run row", async () => {
+      const workflowId = "test-ctx-netegress-conflict-no-optin";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      await assert.rejects(
+        () =>
+          runWorkflow({
+            workflowId,
+            taskTitle: "NAT without opt-in",
+            matchlockUnrestrictedOutbound: { unrestricted: true, source: "env" },
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.match(err.message, /TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING/);
+          assert.match(err.message, /--matchlock or --matchlock-image <image>/);
+          return true;
+        },
+      );
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare("SELECT id FROM runs WHERE workflow_id = ?").all(workflowId) as Array<{ id: string }>;
+      assert.equal(rows.length, 0, "the refusal precedes run creation: no native run row may exist");
     });
   });
 

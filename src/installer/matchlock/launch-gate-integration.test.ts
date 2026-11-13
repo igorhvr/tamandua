@@ -330,6 +330,9 @@ function interactiveArgs(overrides: Record<string, unknown> = {}): any {
     allowPrivate: [],
     matchlockPrivileged: { privileged: true, source: "default" },
     matchlockDnsPriority: { priority: "ipv4", source: "default" },
+    // NAT-EGRESS: the parser always resolves the outbound mode; default is
+    // interception.
+    networkOutbound: { unrestricted: false, source: "default" },
     ...overrides,
   };
 }

@@ -22,13 +22,16 @@ import {
   MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
   matchlockRootUsageRefusalText,
   pinFromPolicy,
+  resolveAdmissionNetworkOutbound,
   type MatchlockAllowPrivateSupportProbe,
 } from "../../../dist/installer/matchlock/admission.js";
 import {
   MATCHLOCK_POLICY_VERSION,
   serializeMatchlockPolicy,
   parseMatchlockPolicy,
+  withGrantedRootUsageConsent,
 } from "../../../dist/installer/matchlock/policy.js";
+import { MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV } from "../../../dist/installer/matchlock/network-outbound.js";
 import {
   MATCHLOCK_DEFAULT_SWAP_MB,
   MATCHLOCK_MAX_SWAP_MB,
@@ -123,7 +126,7 @@ describe("matchlock run-creation admission", () => {
     git(["add", "README.md"], sgdCheckout);
     git(["commit", "-m", "initial"], sgdCheckout);
 
-    for (const key of [MATCHLOCK_RPC_BIN_ENV, MATCHLOCK_RPC_ARGS_ENV, "FAKE_IMAGE_TAG", "FAKE_IMAGE_DIGEST", "FAKE_IMAGE_CONFIG_DIGEST", "FAKE_IMAGE_OCI_ENV_PATH", "FAKE_TRANSCRIPT_FILE", "PI_CODING_AGENT_DIR", "FAKE_RESOLVE_MISSING", "FAKE_CREATE_ACTUAL_DIGEST", "FAKE_CREATE_ACTUAL_CONFIG_DIGEST"]) {
+    for (const key of [MATCHLOCK_RPC_BIN_ENV, MATCHLOCK_RPC_ARGS_ENV, "FAKE_IMAGE_TAG", "FAKE_IMAGE_DIGEST", "FAKE_IMAGE_CONFIG_DIGEST", "FAKE_IMAGE_OCI_ENV_PATH", "FAKE_TRANSCRIPT_FILE", "PI_CODING_AGENT_DIR", "FAKE_RESOLVE_MISSING", "FAKE_CREATE_ACTUAL_DIGEST", "FAKE_CREATE_ACTUAL_CONFIG_DIGEST", MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV]) {
       savedEnv[key] = process.env[key];
     }
   });
@@ -352,6 +355,224 @@ describe("matchlock run-creation admission", () => {
     );
     assert.deepEqual(result.policy.matchlockDnsPriority, { priority: "ipv6", source: "env" });
     assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
+  // ── NAT-EGRESS US-004: fresh-mode persistence + authoritative inheritance ──
+
+  /** The standard fresh-admission fake environment (resolve_image only). */
+  function setFakeResolve(over: Record<string, string | undefined> = {}): void {
+    setFake({
+      [MATCHLOCK_RPC_BIN_ENV]: process.execPath,
+      [MATCHLOCK_RPC_ARGS_ENV]: JSON.stringify([fakeDriver]),
+      PI_CODING_AGENT_DIR: configRoot,
+      FAKE_IMAGE_TAG: "vic/ml:latest",
+      FAKE_IMAGE_DIGEST: "sha256:fakedigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:fakeconfigdigest",
+      FAKE_TRANSCRIPT_FILE: undefined,
+      FAKE_RESOLVE_MISSING: undefined,
+      ...over,
+    });
+  }
+
+  it("NAT-EGRESS US-004: a FRESH unrestricted admission persists the mode verbatim (flag + env sources, cloned)", async () => {
+    setFakeResolve();
+    const suppliedFlag = { unrestricted: true as const, source: "flag" as const };
+    const flagResult = await admitMatchlockRun(
+      admissionOpts({ networkOutbound: suppliedFlag }) as never,
+    );
+    assert.deepEqual(flagResult.policy.networkOutbound, { unrestricted: true, source: "flag" });
+    assert.notEqual(
+      flagResult.policy.networkOutbound,
+      suppliedFlag,
+      "the persisted record must not alias the caller-owned resolved object",
+    );
+
+    const envResult = await admitMatchlockRun(
+      admissionOpts({ networkOutbound: { unrestricted: true, source: "env" } }) as never,
+    );
+    assert.deepEqual(envResult.policy.networkOutbound, { unrestricted: true, source: "env" });
+  });
+
+  it("NAT-EGRESS US-004: a FRESH default admission persists NO field (absent and explicit-false supplied)", async () => {
+    setFakeResolve();
+    const absent = await admitMatchlockRun(admissionOpts({}) as never);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(absent.policy, "networkOutbound"),
+      false,
+      "absent option => no field (absence means interception)",
+    );
+    assert.equal(serializeMatchlockPolicy(absent.policy).includes("networkOutbound"), false);
+
+    const explicitDefault = await admitMatchlockRun(
+      admissionOpts({ networkOutbound: { unrestricted: false, source: "default" } }) as never,
+    );
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(explicitDefault.policy, "networkOutbound"),
+      false,
+      "a default selection must not be written (byte-identical pre-change record)",
+    );
+  });
+
+  it("NAT-EGRESS US-004: re-parsing the persisted string and re-composing yields the same mode", async () => {
+    transcript = tempTranscriptPath();
+    setFakeResolve({ FAKE_TRANSCRIPT_FILE: transcript });
+    const result = await admitMatchlockRun(
+      admissionOpts({ networkOutbound: { unrestricted: true, source: "flag" } }) as never,
+    );
+    const reparsed = parseMatchlockPolicy(serializeMatchlockPolicy(result.policy));
+    assert.deepEqual(reparsed.networkOutbound, { unrestricted: true, source: "flag" });
+
+    const helperPack = path.join(tmpRoot, "nat-us004-pack");
+    fs.mkdirSync(helperPack, { recursive: true });
+    const cfg = buildMatchlockCreateConfig(reparsed, result.identity, { helperPackHostPath: helperPack });
+    assert.deepEqual(cfg.network, { block_private_ips: false, intercept: false });
+    assert.deepEqual(Object.keys(cfg.network ?? {}).sort(), ["block_private_ips", "intercept"]);
+    assert.deepEqual(readTranscript(transcript).map((e) => e.method).filter(Boolean), ["resolve_image"]);
+  });
+
+  it("NAT-EGRESS US-004: a replacement of an INTERCEPTED run stays intercepted even when unrestricted is supplied AND ambient", async () => {
+    setFakeResolve();
+    const intercepted = await admitMatchlockRun(admissionOpts({}) as never);
+    assert.equal(intercepted.policy.networkOutbound, undefined);
+
+    // The ambient environment must be irrelevant: admission never reads it.
+    process.env[MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV] = "1";
+    try {
+      const replacement = await admitMatchlockRun(
+        admissionOpts({
+          inheritedPolicy: intercepted.policy,
+          // A newly supplied NAT value must NOT widen an intercepted run.
+          networkOutbound: { unrestricted: true, source: "flag" },
+        }) as never,
+      );
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(replacement.policy, "networkOutbound"),
+        false,
+        "anti-widening: an inherited record without the field is authoritative (intercepted)",
+      );
+      const helperPack = path.join(tmpRoot, "nat-us004-anti-widening-pack");
+      fs.mkdirSync(helperPack, { recursive: true });
+      const cfg = buildMatchlockCreateConfig(
+        parseMatchlockPolicy(serializeMatchlockPolicy(replacement.policy)),
+        replacement.identity,
+        { helperPackHostPath: helperPack },
+      );
+      assert.equal(cfg.network?.intercept, true);
+      assert.equal(cfg.network?.block_private_ips, true);
+    } finally {
+      delete process.env[MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV];
+    }
+  });
+
+  it("NAT-EGRESS US-004: a replacement of a NAT run stays NAT (inherited wins verbatim)", async () => {
+    setFakeResolve();
+    const nat = await admitMatchlockRun(
+      admissionOpts({ networkOutbound: { unrestricted: true, source: "env" } }) as never,
+    );
+    assert.deepEqual(nat.policy.networkOutbound, { unrestricted: true, source: "env" });
+
+    // No supplied value at all.
+    const replacement = await admitMatchlockRun(
+      admissionOpts({ inheritedPolicy: nat.policy }) as never,
+    );
+    assert.deepEqual(replacement.policy.networkOutbound, { unrestricted: true, source: "env" });
+
+    // A contradictory supplied default must not narrow the inherited NAT mode.
+    const contradictory = await admitMatchlockRun(
+      admissionOpts({
+        inheritedPolicy: nat.policy,
+        networkOutbound: { unrestricted: false, source: "default" },
+      }) as never,
+    );
+    assert.deepEqual(contradictory.policy.networkOutbound, { unrestricted: true, source: "env" });
+  });
+
+  it("NAT-EGRESS US-004: withGrantedRootUsageConsent preserves the field value/absence", async () => {
+    setFakeResolve();
+    const nat = await admitMatchlockRun(
+      admissionOpts({ networkOutbound: { unrestricted: true, source: "flag" } }) as never,
+    );
+    const consentedNat = withGrantedRootUsageConsent(serializeMatchlockPolicy(nat.policy));
+    const natAfter = parseMatchlockPolicy(consentedNat);
+    assert.equal(natAfter.rootUsageConsent, true);
+    assert.deepEqual(natAfter.networkOutbound, { unrestricted: true, source: "flag" });
+
+    const intercepted = await admitMatchlockRun(admissionOpts({}) as never);
+    const consentedIntercepted = withGrantedRootUsageConsent(serializeMatchlockPolicy(intercepted.policy));
+    const interceptedAfter = parseMatchlockPolicy(consentedIntercepted);
+    assert.equal(interceptedAfter.rootUsageConsent, true);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(interceptedAfter, "networkOutbound"),
+      false,
+      "the consent rewrite is field-preserving: a run without the mode keeps it absent",
+    );
+  });
+
+  it("NAT-EGRESS US-004: the hermes admission branch persists the supplied unrestricted mode", async () => {
+    const hermesRoot = path.join(tmpRoot, "nat-us004-hermes");
+    fs.mkdirSync(hermesRoot, { recursive: true });
+    transcript = tempTranscriptPath();
+    setFake({
+      PI_CODING_AGENT_DIR: undefined,
+      FAKE_TRANSCRIPT_FILE: transcript,
+      FAKE_IMAGE_TAG: "vic/hermes-nat:latest",
+      FAKE_IMAGE_DIGEST: "sha256:hermesnatdigest",
+      FAKE_IMAGE_CONFIG_DIGEST: "sha256:hermesnatconfigdigest",
+      FAKE_RESOLVE_MISSING: undefined,
+    });
+    const result = await admitMatchlockRun(
+      admissionOpts({
+        harness: "hermes",
+        submission: { homeDir: path.join(tmpRoot, "operator"), cwd: nonRepoDir, hermesHomeEnv: hermesRoot },
+        networkOutbound: { unrestricted: true, source: "flag" },
+      }) as never,
+    );
+    assert.equal(result.policy.harness, "hermes");
+    assert.deepEqual(result.policy.networkOutbound, { unrestricted: true, source: "flag" });
+    const reparsed = parseMatchlockPolicy(serializeMatchlockPolicy(result.policy));
+    const helperPack = path.join(tmpRoot, "nat-us004-hermes-pack");
+    fs.mkdirSync(helperPack, { recursive: true });
+    const cfg = buildMatchlockCreateConfig(reparsed, result.identity, { helperPackHostPath: helperPack });
+    assert.deepEqual(cfg.network, { block_private_ips: false, intercept: false });
+  });
+
+  it("NAT-EGRESS US-004: the dsh admission branch persists the supplied unrestricted mode (shared pi/dsh build)", async () => {
+    const homeDir = path.join(tmpRoot, "home");
+    fs.mkdirSync(path.join(homeDir, ".dsh"), { recursive: true });
+    setFakeResolve({ PI_CODING_AGENT_DIR: path.join(tmpRoot, "ignored-for-dsh-nat") });
+    const result = await admitMatchlockRun(
+      admissionOptsDsh({ networkOutbound: { unrestricted: true, source: "env" } }) as never,
+    );
+    assert.equal(result.policy.harness, "dsh");
+    assert.deepEqual(result.policy.networkOutbound, { unrestricted: true, source: "env" });
+    const reparsed = parseMatchlockPolicy(serializeMatchlockPolicy(result.policy));
+    assert.deepEqual(reparsed.networkOutbound, { unrestricted: true, source: "env" });
+  });
+
+  it("NAT-EGRESS US-004: resolveAdmissionNetworkOutbound follows the inherited-authoritative rule", () => {
+    // Fresh: only a genuinely unrestricted supplied value is persisted.
+    assert.equal(resolveAdmissionNetworkOutbound(undefined, undefined), undefined);
+    assert.equal(
+      resolveAdmissionNetworkOutbound(undefined, { unrestricted: false, source: "default" }),
+      undefined,
+    );
+    assert.deepEqual(
+      resolveAdmissionNetworkOutbound(undefined, { unrestricted: true, source: "flag" }),
+      { unrestricted: true, source: "flag" },
+    );
+    // Inherited: authoritative, cloned; an absent inherited field ignores the
+    // supplied/ambient value entirely.
+    const inheritedNat = { networkOutbound: { unrestricted: true, source: "env" } } as never;
+    const nat = resolveAdmissionNetworkOutbound(inheritedNat, {
+      unrestricted: false,
+      source: "default",
+    });
+    assert.deepEqual(nat, { unrestricted: true, source: "env" });
+    assert.notEqual(nat, (inheritedNat as { networkOutbound: unknown }).networkOutbound);
+    assert.equal(
+      resolveAdmissionNetworkOutbound({} as never, { unrestricted: true, source: "flag" }),
+      undefined,
+    );
   });
 
   it("an inherited policy's resourceLimits win over newly supplied limits (replacement, MTLK-VM-SIZE US-003)", async () => {

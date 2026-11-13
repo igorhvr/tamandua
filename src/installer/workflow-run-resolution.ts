@@ -20,6 +20,7 @@ import { resolveWorkflowDir } from "./paths.js";
 import { getControlPort } from "../server/control-server.js";
 import { isDaemonControlReachable } from "../server/control-client.js";
 import { formatMatchlockResourceSummary } from "./matchlock/resource-limits.js";
+import type { ResolvedMatchlockNetworkOutbound } from "./matchlock/network-outbound.js";
 import type { MatchlockImageSource } from "./matchlock/standard-image.js";
 import type { HarnessType } from "./types.js";
 
@@ -66,6 +67,19 @@ export interface WorkflowRunLaunchMatchlockResources {
    * byte-identical in that case.
    */
   allowPrivate?: string[];
+  /**
+   * NAT-EGRESS (US-008): the launch-resolved outbound network mode and the
+   * setting that selected it (flag > env > default interception). The shared
+   * summary formatter appends its `network=` segment to the SAME `matchlock:`
+   * line, so the operator sees the mode before the run is created. Omitted by
+   * a caller that predates the field (the line then stays byte-identical); the
+   * `workflow run` launch path always supplies it for an opted-in run.
+   *
+   * Note: `workflow status --json` reports the PERSISTED policy shape, which
+   * does not carry this launch-time selection; this field belongs to the
+   * launch facts only.
+   */
+  networkOutbound?: ResolvedMatchlockNetworkOutbound;
 }
 
 export interface WorkflowRunLaunchInfo {
@@ -270,6 +284,9 @@ export function formatWorkflowRunLaunchLines(
         info.matchlockResources.image,
         info.matchlockResources,
         info.matchlockResources.allowPrivate,
+        // NAT-EGRESS: the mode+source segment lands on the SAME single
+        // `matchlock:` line; `undefined` omits it (pre-change byte identity).
+        info.matchlockResources.networkOutbound,
       ),
     );
   }
@@ -283,7 +300,7 @@ export function formatWorkflowRunLaunchLines(
  *   working-directory / origin.path / origin.ref / origin.sha / clean /
  *   harness.type / harness.path / harness.version / daemon.endpoint /
  *   daemon.ok / matchlockResources.{image,imageSource,cpus,memoryMB,diskSizeMB,
- *   swapMB,imageDigest,imageConfigDigest,allowPrivate}.
+ *   swapMB,imageDigest,imageConfigDigest,allowPrivate,networkOutbound}.
  *
  * US-003: this is emitted whenever `workflow run --json` is requested, so the
  * resolved values are machine-consumable; optional facts (a missing harness

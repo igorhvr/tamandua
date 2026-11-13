@@ -88,6 +88,7 @@ import {
   type InteractiveHermesSelection,
 } from "./interactive-hermes-selection.js";
 import { nowIso } from "../../lib/instant.js";
+import type { ResolvedMatchlockNetworkOutbound } from "./network-outbound.js";
 import {
   evaluateInteractiveLaunchGate,
   interactiveLaunchGateInvocationId,
@@ -238,6 +239,16 @@ export interface InteractiveSessionPlan {
   hermesSelection?: InteractiveHermesSelection;
   /** Resolved allow-private list (empty when none). */
   allowPrivate: string[];
+  /**
+   * NAT-EGRESS: the parser-resolved unrestricted-outbound network mode plus
+   * the source that selected it (`flag` | `env` | `default`). The mode is
+   * chosen ONCE here, at session admission, and lives only in this plan —
+   * interactive sessions have no persisted record to inherit it from. It is
+   * forwarded to admission so the admitted policy carries the mode (the
+   * default selection persists nothing: absence means interception), and the
+   * pre-launch summary reports it.
+   */
+  networkOutbound: ResolvedMatchlockNetworkOutbound;
   /** Resolved VM resource limits (parser output). */
   resourceLimits: ExecutionIsolationResourceLimits;
   /** True when the exact root-usage override flag was supplied here. */
@@ -585,6 +596,14 @@ export async function planInteractiveSession(
     ...(args.matchlockDnsPriority !== undefined
       ? { matchlockDnsPriority: args.matchlockDnsPriority }
       : {}),
+    // NAT-EGRESS: the parser resolved the mode ONCE (`flag` > env=1 > default
+    // intercepted) and validated the conflict matrix before this seam. Forward
+    // it so admission persists the unrestricted selection on the session
+    // policy the shared create composer reads (a default selection writes
+    // nothing, keeping a pre-change record byte-identical).
+    ...(args.networkOutbound !== undefined
+      ? { networkOutbound: args.networkOutbound }
+      : {}),
     ...(options.allowPrivateSupportProbe
       ? { allowPrivateSupportProbe: options.allowPrivateSupportProbe }
       : {}),
@@ -662,6 +681,9 @@ export async function planInteractiveSession(
     configSelection,
     ...(hermesSelection !== undefined ? { hermesSelection } : {}),
     allowPrivate: [...args.allowPrivate],
+    // NAT-EGRESS: captured verbatim from the parser (no independent resolve, no
+    // environment read here).
+    networkOutbound: { ...args.networkOutbound },
     resourceLimits,
     rootUsageOverride: args.rootUsageOverride,
     ...(rootUsageWarning !== undefined ? { rootUsageWarning } : {}),

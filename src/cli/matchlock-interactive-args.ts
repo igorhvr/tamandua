@@ -44,6 +44,7 @@ import {
   type MatchlockImageSource,
 } from "../installer/matchlock/standard-image.js";
 import {
+  MATCHLOCK_DNS_PRIORITY_ENV,
   MATCHLOCK_NO_PRIVILEGED_FLAG,
   MATCHLOCK_PRIORITIZE_IPV4_FLAG,
   MATCHLOCK_PRIORITIZE_IPV6_FLAG,
@@ -52,6 +53,12 @@ import {
   type ResolvedMatchlockDnsPriority,
   type ResolvedMatchlockPrivileged,
 } from "../installer/matchlock/isolation-settings.js";
+import {
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG,
+  assertMatchlockNetworkOutboundCompatible,
+  resolveMatchlockNetworkOutbound,
+  type ResolvedMatchlockNetworkOutbound,
+} from "../installer/matchlock/network-outbound.js";
 import { MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG } from "../installer/matchlock/root-gate.js";
 
 // Re-export the canonical R13 flag from the gate that owns the refusal naming
@@ -110,6 +117,7 @@ const KNOWN_FLAGS = new Set<string>([
   MATCHLOCK_NO_PRIVILEGED_FLAG,
   MATCHLOCK_PRIORITIZE_IPV4_FLAG,
   MATCHLOCK_PRIORITIZE_IPV6_FLAG,
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG,
   MATCHLOCK_ROOT_USAGE_OVERRIDE_FLAG,
   WORKING_DIRECTORY_FLAG,
 ]);
@@ -159,6 +167,14 @@ export interface InteractiveSessionArgs {
    * ipv4; both flags => ipv6, never an error).
    */
   matchlockDnsPriority: ResolvedMatchlockDnsPriority;
+  /**
+   * NAT-EGRESS: the resolved outbound network mode + how it was selected
+   * (`flag` > env `TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1` > default
+   * intercepted). Always present, including the default-interception case: the
+   * session plan hands it to admission as a FRESH selection, and there is no
+   * persisted interactive-session record to inherit from.
+   */
+  networkOutbound: ResolvedMatchlockNetworkOutbound;
 }
 
 /** Injectable inputs for deterministic tests; production callers omit these. */
@@ -292,6 +308,9 @@ export function parseInteractiveSessionArgs(
   let noPrivilegedSeen = false;
   let ipv4PrioritySeen = false;
   let ipv6PrioritySeen = false;
+  // NAT-EGRESS: a pure boolean (never consumes a following token); resolved
+  // and conflict-checked AFTER the loop, before any admission/RPC.
+  let unrestrictedOutboundSeen = false;
 
   const assignValue = (field: InteractiveValueField, flag: string, rawValue: string): void => {
     if (rawValues[field] !== undefined) {
@@ -344,6 +363,19 @@ export function parseInteractiveSessionArgs(
       i++;
       continue;
     }
+    // NAT-EGRESS: the outbound flag takes NO value. A value-bearing token is a
+    // hard usage error naming the flag (never silently ignored).
+    if (token.startsWith(`${MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG}=`)) {
+      throw new InteractiveSessionArgError(
+        `${MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG} takes no value. ` +
+          `Use exactly ${MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG} to disable egress interception.`,
+      );
+    }
+    if (token === MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG) {
+      unrestrictedOutboundSeen = true;
+      continue;
+    }
+
     if (token.startsWith(`${MATCHLOCK_ALLOW_PRIVATE_FLAG}=`)) {
       const value = token.slice(MATCHLOCK_ALLOW_PRIVATE_FLAG.length + 1).trim();
       if (value === "" || nextTokenIsKnownFlag(value)) {
@@ -474,6 +506,29 @@ export function parseInteractiveSessionArgs(
     env,
   });
 
+  // NAT-EGRESS: ONE shared resolution (flag > env=1 > default intercepted). A
+  // malformed consulted env value is the typed MatchlockNetworkOutboundError
+  // and propagates as a usage exit. The conflict matrix is keyed on the RESOLVED
+  // selection (flag OR env — R4/R6/R7 apply identically), and both sides are
+  // named in every refusal. This runs BEFORE the plan/admission seam, so no
+  // admission or RPC can precede a refusal.
+  const networkOutbound = resolveMatchlockNetworkOutbound({
+    flag: unrestrictedOutboundSeen,
+    env,
+  });
+  assertMatchlockNetworkOutboundCompatible({
+    resolved: networkOutbound,
+    // The already-resolved list is the effective one; when it came from the
+    // flag, the flag refusal wins, otherwise the raw env value is named below.
+    allowPrivateEntries: allowPrivateSupplied ? allowPrivate : [],
+    allowPrivateEnvRaw: env[MATCHLOCK_ALLOW_PRIVATE_ENV],
+    dnsPriorityFlags: [
+      ...(ipv4PrioritySeen ? [MATCHLOCK_PRIORITIZE_IPV4_FLAG] : []),
+      ...(ipv6PrioritySeen ? [MATCHLOCK_PRIORITIZE_IPV6_FLAG] : []),
+    ],
+    dnsPriorityEnvRaw: env[MATCHLOCK_DNS_PRIORITY_ENV],
+  });
+
   return {
     subcommand,
     harness: selection.harness,
@@ -486,5 +541,6 @@ export function parseInteractiveSessionArgs(
     allowPrivate,
     matchlockPrivileged,
     matchlockDnsPriority,
+    networkOutbound,
   };
 }

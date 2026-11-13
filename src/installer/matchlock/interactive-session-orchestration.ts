@@ -370,11 +370,16 @@ export function formatInteractiveSessionPrelaunch(runtime: InteractiveSessionRun
   // ` (standard image)` provenance suffix the workflow path prints — driven
   // by the RECORDED provenance (plan.imageSource), never inferred from the
   // image name itself.
+  // NAT-EGRESS: the SAME shared `matchlock:` resource-summary line carries the
+  // resolved outbound network mode (and the source that selected it) as its
+  // LAST segment — never a second `matchlock:` line. The mode comes from the
+  // admitted plan, which received it from the parser's single resolution.
   lines.push(
     formatMatchlockResourceSummary(
       plan.image,
       { ...plan.resourceLimits, imageSource: plan.imageSource },
       plan.allowPrivate,
+      plan.networkOutbound,
     ),
   );
   lines.push(`image provenance: ${plan.imageSource}`);

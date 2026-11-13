@@ -25,6 +25,8 @@
  */
 
 import os from "node:os";
+import type { ResolvedMatchlockNetworkOutbound } from "./network-outbound.js";
+import { formatMatchlockNetworkOutboundSummary } from "./network-outbound.js";
 
 /** Standing project cap: never more than 16 vCPUs for a Matchlock VM. */
 export const MATCHLOCK_MAX_CPUS = 16;
@@ -356,11 +358,22 @@ export type MatchlockResourceSummaryLimits = Pick<
  * destination list, the resolved entries are appended as
  * ` allow-private=<comma-separated entries>`. An absent or empty list appends
  * nothing.
+ *
+ * NAT-EGRESS (US-003): when the caller supplies the resolved outbound network
+ * mode, its stable segment is appended LAST (after allow-private) as
+ * ` network=intercepted(default)` / ` network=unrestricted-outbound(flag|env)`.
+ * The segment is composed by {@link formatMatchlockNetworkOutboundSummary} so
+ * every surface spells it identically, and it stays on the SAME single
+ * `matchlock:` line (never a second line). A caller that omits the value (the
+ * not-yet-migrated status renderer, fixtures predating the field) keeps the
+ * previous byte-identical line; the launch paths always pass the resolved
+ * mode, including the default-interception case.
  */
 export function formatMatchlockResourceSummary(
   image: string,
   limits: MatchlockResourceSummaryLimits,
   allowPrivate?: readonly string[],
+  networkOutbound?: ResolvedMatchlockNetworkOutbound,
 ): string {
   const standardSuffix = limits.imageSource === "standard" ? " (standard image)" : "";
   const swapSegment =
@@ -370,6 +383,9 @@ export function formatMatchlockResourceSummary(
   let summary = `matchlock: ${image}${standardSuffix} cpus=${limits.cpus} memory=${limits.memoryMB}MB disk=${limits.diskSizeMB}MB${swapSegment}`;
   if (allowPrivate && allowPrivate.length > 0) {
     summary += ` allow-private=${allowPrivate.join(",")}`;
+  }
+  if (networkOutbound !== undefined) {
+    summary += formatMatchlockNetworkOutboundSummary(networkOutbound);
   }
   return summary;
 }

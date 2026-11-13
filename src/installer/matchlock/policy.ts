@@ -69,6 +69,7 @@ import {
   type ResolvedMatchlockDnsPriority,
   type ResolvedMatchlockPrivileged,
 } from "./isolation-settings.js";
+import type { ResolvedMatchlockNetworkOutbound } from "./network-outbound.js";
 
 /**
  * Current policy record version. Bump when the field set changes
@@ -344,6 +345,17 @@ export interface ExecutionIsolation {
    */
   matchlockDnsPriority?: ResolvedMatchlockDnsPriority;
   /**
+   * NAT-EGRESS: the outbound-network mode selected ONCE when the run was
+   * created (`unrestricted` + how it was selected). OPTIONAL — ABSENT means
+   * the default interception mode, which is what every pre-NAT-EGRESS record
+   * and every default admission carries (a default admission writes
+   * NOTHING). Persisted here so every later launch of the run (queued
+   * dispatch, retry, resume, daemon restart, replacement/rugpull) composes
+   * from the STORED mode and never re-resolves it from current flags or
+   * environment.
+   */
+  networkOutbound?: ResolvedMatchlockNetworkOutbound;
+  /**
    * Versioning note (ICEBOX): both settings are OPTIONAL additions to the
    * version-3 record — the same shape discipline as `networkAllowPrivate`
    * (no version bump). A pre-ICEBOX reader lists them as unknown fields and
@@ -449,6 +461,14 @@ export interface BuildMatchlockPolicyParams {
    * env > default ipv4). Same emission rule as {@link matchlockPrivileged}.
    */
   matchlockDnsPriority?: ResolvedMatchlockDnsPriority;
+  /**
+   * NAT-EGRESS: the submission-resolved outbound-network mode. EMISSION RULE
+   * — the field is written ONLY when the caller supplies it (cloned), so a
+   * default admission persists nothing and absence continues to mean
+   * interception. Fresh admission supplies the resolved value; inherited
+   * policies are spread verbatim by admission and never pass here.
+   */
+  networkOutbound?: ResolvedMatchlockNetworkOutbound;
   /**
    * Optional injected host probe used ONLY when `resourceLimits` is absent, so
    * the host-derived defaults are deterministic in tests. Production callers
@@ -756,6 +776,12 @@ export function buildMatchlockPolicy(params: BuildMatchlockPolicyParams): Execut
     ...(params.matchlockDnsPriority !== undefined
       ? { matchlockDnsPriority: { ...params.matchlockDnsPriority } }
       : {}),
+    // NAT-EGRESS outbound mode: same EMISSION RULE as the ICEBOX settings —
+    // only when the caller supplies it, cloned so the persisted record never
+    // aliases caller state. Absent means interception.
+    ...(params.networkOutbound !== undefined
+      ? { networkOutbound: { ...params.networkOutbound } }
+      : {}),
     resourceLimits: params.resourceLimits
       ? completeResourceLimits(params.resourceLimits)
       : resolveDefaultResourceLimits(params.resourceHostProbe),
@@ -916,6 +942,8 @@ const EXECUTION_ISOLATION_KEYS = new Set([
   // value is shape-validated).
   "matchlockPrivileged",
   "matchlockDnsPriority",
+  // NAT-EGRESS outbound-network mode (v3, OPTIONAL; absent = interception).
+  "networkOutbound",
   "resourceLimits",
 ]);
 
@@ -1115,6 +1143,9 @@ export function matchlockPolicyValidationErrors(
     if (v.matchlockDnsPriority !== undefined) {
       errors.push("matchlockDnsPriority is a version-3 field; a version-2 record must not carry it");
     }
+    if (v.networkOutbound !== undefined) {
+      errors.push("networkOutbound is a version-3 field; a version-2 record must not carry it");
+    }
   } else {
     // REQUIRED v3 image provenance.
     if (v.requestedImageSource !== "explicit" && v.requestedImageSource !== "standard") {
@@ -1270,6 +1301,32 @@ export function matchlockPolicyValidationErrors(
       }
       if (!isMatchlockIsolationSettingSource(s.source)) {
         errors.push('matchlockDnsPriority.source must be "flag", "env" or "default"');
+      }
+    }
+  }
+  // NAT-EGRESS outbound mode: OPTIONAL (absent = interception), but a PRESENT
+  // value is a strict `{ unrestricted, source }` pair with no unknown nested
+  // keys — a malformed or partial object must never survive a fail-closed
+  // read.
+  if (v.networkOutbound !== undefined) {
+    const s = v.networkOutbound;
+    if (!isRecord(s)) {
+      errors.push("networkOutbound must be an object with unrestricted + source when present");
+    } else {
+      for (const key of Object.keys(s)) {
+        if (key !== "unrestricted" && key !== "source") {
+          errors.push(
+            /^[A-Za-z0-9_]{1,64}$/.test(key)
+              ? `networkOutbound has unknown field "${key}"`
+              : "networkOutbound has an unknown field (unsafe name withheld)",
+          );
+        }
+      }
+      if (typeof s.unrestricted !== "boolean") {
+        errors.push("networkOutbound.unrestricted must be a boolean");
+      }
+      if (!isMatchlockIsolationSettingSource(s.source)) {
+        errors.push('networkOutbound.source must be "flag", "env" or "default"');
       }
     }
   }

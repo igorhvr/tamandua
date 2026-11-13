@@ -1001,6 +1001,45 @@ after admission succeeds, and the limits are
 recorded in the run's Matchlock policy; `tamandua workflow status <run>`
 shows them for a Matchlock run.
 
+###### Matchlock outbound networking (`--matchlock-unrestricted-outbound-networking`)
+
+A Matchlock VM runs with egress **interception ON by default**: private
+destinations are blocked and DNS is pinned through the guest resolver — the
+byte-identical pre-existing behaviour. An opted-in run or interactive session
+can instead be created with **unrestricted outbound networking**, which sends
+`intercept: false` and `block_private_ips: false` on the create request (the
+interception-only `dns_priority` / `allow_private` fields are omitted).
+
+- `--matchlock-unrestricted-outbound-networking` (a pure boolean) on
+  `tamandua workflow run`, `tamandua matchlock pi`, `tamandua matchlock
+  pi-shell`, `tamandua matchlock hermes` and `tamandua matchlock hermes-shell`.
+  For a workflow run it requires the existing Matchlock opt-in (`--matchlock`
+  or `--matchlock-image <image>`).
+- `TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1` is the environment form. The
+  ONLY enabling value is the literal `1`; any other non-empty value is a typed
+  usage error. Precedence: flag > env > default intercepted.
+- Selecting unrestricted mode — by the flag or by the environment form —
+  conflicts with `--matchlock-allow-private`, a non-empty
+  `TAMANDUA_MATCHLOCK_ALLOW_PRIVATE`, any DNS-priority flag and a non-empty
+  `TAMANDUA_MATCHLOCK_DNS_PRIORITY`; each is refused before any VM is created,
+  naming both sides. An empty/whitespace env value is not a conflict.
+- The environment form also requires the workflow opt-in: on `tamandua workflow
+  run`, `TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1` without `--matchlock` /
+  `--matchlock-image <image>` is refused, naming the env var and the opt-in
+  (it is never silently ignored on a native run).
+- The mode is chosen when the run/session is **created**. For a workflow run it
+  is persisted as an optional field inside the existing `runs.matchlock_policy`
+  JSON (absence means interception), and every later launch (queued dispatch,
+  retry, resume, daemon restart, replacement/rugpull) composes from that stored
+  policy. A replacement inherits the stored mode verbatim — an intercepted run
+  can never be widened by a newly supplied flag/env value. Passing the flag to
+  `tamandua workflow resume` is a usage refusal (create a new run instead).
+  Interactive sessions have no persisted record: the resolved mode lives in
+  that process's session plan.
+- The resolved launch summary states the mode and its source on the single
+  `matchlock:` line, e.g. `… swap=8192MB network=intercepted(default)`,
+  `network=unrestricted-outbound(flag)` or `network=unrestricted-outbound(env)`.
+
 ###### Pi under Matchlock
 
 `--pi-as-harness` (the default) runs the image's pi inside fresh VMs; the pi
@@ -1339,6 +1378,10 @@ unknown options are refused with a non-zero usage error:
   `--matchlock-swap`.
 - Repeatable `--matchlock-allow-private <entry>` — CLI entries replace
   `TAMANDUA_MATCHLOCK_ALLOW_PRIVATE`.
+- `--matchlock-unrestricted-outbound-networking` — create the VM with egress
+  interception OFF (unrestricted outbound). Conflicts with
+  `--matchlock-allow-private` and DNS priority; `TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1`
+  is the env form (see "Matchlock outbound networking" above).
 - `--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs` — the
   exact root-usage override.
 

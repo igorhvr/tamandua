@@ -117,6 +117,9 @@ function baseArgs(overrides: Partial<InteractiveSessionArgs> = {}): InteractiveS
     // source "default".
     matchlockPrivileged: { privileged: true, source: "default" },
     matchlockDnsPriority: { priority: "ipv4", source: "default" },
+    // NAT-EGRESS: the parser always resolves the outbound mode; default is
+    // interception.
+    networkOutbound: { unrestricted: false, source: "default" },
     ...overrides,
   };
 }
@@ -887,6 +890,100 @@ describe("US-004 real admission seam through the fake RPC driver", () => {
     assert.ok(methods.includes("resolve_image"));
     assert.ok(!methods.includes("create"));
   });
+
+  // ── NAT-EGRESS US-006: the plan carries the parser-resolved mode ─────
+
+  /** Set the standard fake-driver environment for one fresh admission. */
+  function setFakeAdmissionEnv(): void {
+    process.env.PI_CODING_AGENT_DIR = configRoot;
+    process.env.FAKE_IMAGE_TAG = "vic/ml:latest";
+    process.env.FAKE_IMAGE_DIGEST = "sha256:fakedigest";
+    process.env.FAKE_IMAGE_CONFIG_DIGEST = "sha256:fakeconfigdigest";
+    delete process.env.FAKE_RESOLVE_MISSING;
+  }
+
+  const INTERACTIVE_SUBCOMMANDS = [
+    { subcommand: "pi", harness: "pi", shell: false },
+    { subcommand: "pi-shell", harness: "pi", shell: true },
+    { subcommand: "hermes", harness: "hermes", shell: false },
+    { subcommand: "hermes-shell", harness: "hermes", shell: true },
+  ] as const;
+
+  const NETWORK_SELECTIONS = [
+    { name: "flag", resolved: { unrestricted: true, source: "flag" } },
+    { name: "env", resolved: { unrestricted: true, source: "env" } },
+    { name: "default", resolved: { unrestricted: false, source: "default" } },
+  ] as const;
+
+  for (const sc of INTERACTIVE_SUBCOMMANDS) {
+    for (const selection of NETWORK_SELECTIONS) {
+      it(`NAT-EGRESS US-006: ${sc.subcommand} admits with the ${selection.name}-selected mode and composes it`, async () => {
+        setFakeAdmissionEnv();
+        const hermesHome = path.join(tmpRoot, `hermes-${sc.subcommand}`);
+        fs.mkdirSync(hermesHome, { recursive: true });
+        const args = baseArgs({
+          subcommand: sc.subcommand,
+          harness: sc.harness,
+          shell: sc.shell,
+          image: "vic/ml:latest",
+          imageSource: "explicit",
+          workingDirectory: workDir,
+          networkOutbound: { ...selection.resolved },
+        });
+        const plan = await planInteractiveSession(
+          args,
+          baseOptions({
+            env: {},
+            ...(sc.harness === "hermes"
+              ? {
+                  homeDir: path.join(tmpRoot, "submitter-home"),
+                  hermesHomeEnv: hermesHome,
+                  hermesIsDirectory: (p: string) => p === hermesHome,
+                  launchGate: allowLaunchGate(),
+                }
+              : {}),
+            rpcBinaryPath: process.execPath,
+            rpcArgs: [fakeDriver],
+            admission: { home: os.homedir() },
+          }),
+        );
+
+        // 1. The plan carries the parser-resolved mode verbatim (no persisted
+        //    session record is invented and no environment read happens here).
+        assert.deepEqual(plan.networkOutbound, selection.resolved);
+
+        // 2. Admission received it: an unrestricted selection is persisted on
+        //    the admitted policy; the default persists NOTHING (absence means
+        //    interception, so a pre-change record stays byte-identical).
+        if (selection.resolved.unrestricted) {
+          assert.deepEqual(plan.policy.networkOutbound, selection.resolved);
+        } else {
+          assert.equal(plan.policy.networkOutbound, undefined);
+          assert.equal(
+            Object.prototype.hasOwnProperty.call(plan.policy, "networkOutbound"),
+            false,
+          );
+        }
+
+        // 3. The SAME shared create composer builds the interactive config from
+        //    the persisted policy: NAT emits ONLY the two off switches.
+        const createConfig = buildInteractiveSessionCreateConfig(
+          plan.policy,
+          plan.pinnedIdentity,
+          { ownerUid: 1000, ownerGid: 1000 },
+        );
+        const network = createConfig.network ?? {};
+        if (selection.resolved.unrestricted) {
+          assert.deepEqual(network, { block_private_ips: false, intercept: false });
+          assert.deepEqual(Object.keys(network).sort(), ["block_private_ips", "intercept"]);
+        } else {
+          assert.equal(network.intercept, true);
+          assert.equal(network.block_private_ips, true);
+          assert.equal(network.dns_priority, "ipv4");
+        }
+      });
+    }
+  }
 });
 
 // ── MTLK-RPC-BIN-SPLIT (tamandua-dwl): plan-time freeze ──────────────

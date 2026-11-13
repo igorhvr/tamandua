@@ -52,6 +52,8 @@ import {
 } from "./policy.js";
 import { MATCHLOCK_DEFAULT_SWAP_MB, resolveMatchlockResourceLimits } from "./resource-limits.js";
 import {
+  MATCHLOCK_PRIORITIZE_IPV4_FLAG,
+  MATCHLOCK_PRIORITIZE_IPV6_FLAG,
   resolveMatchlockDnsPriority,
   resolveMatchlockPrivileged,
   type ResolvedMatchlockDnsPriority,
@@ -77,6 +79,12 @@ import {
 } from "./swap-support.js";
 import type { DshSubmissionContext } from "./dsh-adapter-contract.js";
 import type { MatchlockImageSource } from "./standard-image.js";
+import {
+  MATCHLOCK_NETWORK_OUTBOUND_CONFLICT_CODE,
+  MatchlockNetworkOutboundError,
+  assertMatchlockNetworkOutboundCompatible,
+  type ResolvedMatchlockNetworkOutbound,
+} from "./network-outbound.js";
 import {
   canonicalRealPath,
   isWithinPath,
@@ -338,6 +346,22 @@ export interface MatchlockAdmissionOptions {
    * verbatim.
    */
   matchlockDnsPriority?: ResolvedMatchlockDnsPriority;
+  /**
+   * NAT-EGRESS: the SUBMISSION-resolved unrestricted-outbound network mode +
+   * source (flag > `TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1` > default
+   * intercepted), resolved by the composing surface (the CLI parser / run
+   * creation) and threaded here for a FRESH admission. Admission NEVER reads
+   * the ambient environment for this setting.
+   *
+   * INHERITANCE RULE: when `inheritedPolicy` is present its persisted
+   * `networkOutbound` is AUTHORITATIVE and copied verbatim (a replacement /
+   * rugpull can never widen or narrow the mode). A stored record WITHOUT the
+   * field means the run is INTERCEPTED — it must never fall through to a newly
+   * supplied NAT flag or environment value. A fresh admission persists the
+   * supplied value only when it selects unrestricted; the default writes
+   * nothing (absence = interception, byte-identical to a pre-change record).
+   */
+  networkOutbound?: ResolvedMatchlockNetworkOutbound;
   /**
    * MTLK-ALLOW-PRIVATE US-008: injectable allow-private support probe. When an
    * effective (inherited or supplied) allow-private list is non-empty, admission
@@ -710,6 +734,101 @@ function resolveAdmissionAllowPrivate(
     }
   }
   return normalized;
+}
+
+/**
+ * NAT-EGRESS: resolve the effective unrestricted-outbound network mode for one
+ * admission.
+ *
+ * INHERITANCE RULE (authoritative, and deliberately DIFFERENT from the
+ * "materialize the standing default" rule the ICEBOX settings use):
+ *
+ *  - An INHERITED policy is authoritative. When it carries `networkOutbound`
+ *    the value is copied VERBATIM (cloned so the new record never aliases the
+ *    inherited object); when it is ABSENT the result is `undefined` — the run
+ *    is intercepted. The supplied/ambient value is NEVER consulted in that
+ *    case, so a replacement of an intercepted run cannot widen its egress just
+ *    because the current environment/flag selects unrestricted.
+ *  - A FRESH admission (no inherited policy) persists the supplied resolved
+ *    value only when it selects `unrestricted`. The default selection writes
+ *    NOTHING so a pre-change record stays byte-identical (absence means
+ *    interception at compose time).
+ *
+ * Admission never reads `process.env`; the composing surface (CLI parser / run
+ * creation) owns resolution and threads the result here.
+ */
+export function resolveAdmissionNetworkOutbound(
+  inherited: ExecutionIsolation | undefined,
+  supplied: ResolvedMatchlockNetworkOutbound | undefined,
+): ResolvedMatchlockNetworkOutbound | undefined {
+  if (inherited) {
+    return inherited.networkOutbound !== undefined
+      ? { ...inherited.networkOutbound }
+      : undefined;
+  }
+  if (supplied?.unrestricted === true) {
+    return { ...supplied };
+  }
+  return undefined;
+}
+
+/**
+ * NAT-EGRESS R4/R6/R7 at the admission choke point: the conflict matrix is
+ * applied to the RESOLVED selection (flag or env alike) together with the
+ * EFFECTIVE allow-private list and DNS preference this admission would persist.
+ *
+ * This is defense-in-depth for a direct caller (no CLI parser):
+ * `buildMatchlockPolicy` would happily persist the contradictory triple and the
+ * create composer would then silently omit `dns_priority` / `allow_private`.
+ * Refusing here precedes every probe/RPC/VM and every policy write, and it
+ * covers pi, hermes and dsh with no second composition path.
+ *
+ * The DNS preference only conflicts when it was explicitly SELECTED (`source`
+ * `flag` or `env`); the built-in `default` ipv4 preference is not a conflict
+ * because it is not an operator spelling. An inherited (stored) contradictory
+ * record is refused too — with the refusal naming the STORED policy and the
+ * remedy — because the mode is fixed at admission and is never silently
+ * narrowed in place.
+ *
+ * Throws a typed {@link MatchlockAdmissionError} carrying
+ * `matchlock_network_outbound_conflict`.
+ */
+export function assertAdmissionNetworkOutboundConsistent(
+  inherited: ExecutionIsolation | undefined,
+  resolved: ResolvedMatchlockNetworkOutbound | undefined,
+  allowPrivate: readonly string[] | undefined,
+  dnsPriority: ResolvedMatchlockDnsPriority,
+): void {
+  if (resolved?.unrestricted !== true) return;
+  const dnsPriorityFlags =
+    dnsPriority.source === "flag"
+      ? [
+          dnsPriority.priority === "ipv6"
+            ? MATCHLOCK_PRIORITIZE_IPV6_FLAG
+            : MATCHLOCK_PRIORITIZE_IPV4_FLAG,
+        ]
+      : [];
+  const dnsPriorityEnvRaw = dnsPriority.source === "env" ? dnsPriority.priority : undefined;
+  try {
+    assertMatchlockNetworkOutboundCompatible({
+      resolved,
+      allowPrivateEntries: allowPrivate ?? [],
+      dnsPriorityFlags,
+      dnsPriorityEnvRaw,
+    });
+  } catch (err) {
+    if (err instanceof MatchlockNetworkOutboundError) {
+      const stored = inherited?.networkOutbound?.unrestricted === true;
+      throw new MatchlockAdmissionError(
+        MATCHLOCK_NETWORK_OUTBOUND_CONFLICT_CODE,
+        stored
+          ? `${err.message} The run's STORED Matchlock policy is contradictory; ` +
+              `the network mode is fixed at admission — create a new run to change it.`
+          : err.message,
+      );
+    }
+    throw err;
+  }
 }
 
 /**
@@ -1091,6 +1210,24 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
     privileged: opts.matchlockPrivileged,
     dnsPriority: opts.matchlockDnsPriority,
   });
+  // NAT-EGRESS outbound mode: resolved ONCE here under the INHERITANCE RULE
+  // (an inherited policy's persisted mode wins VERBATIM; a stored record
+  // without the field is INTERCEPTED and never falls through to the supplied
+  // value). Admission never reads the ambient environment for this.
+  const networkOutbound = resolveAdmissionNetworkOutbound(inherited, opts.networkOutbound);
+
+  // NAT-EGRESS R4/R6/R7: the conflict matrix applies to the RESOLVED selection
+  // (flag OR env) together with the effective allow-private list and DNS
+  // preference resolved above. Refusing HERE — before the resolve-once RPC
+  // binding, the swap/allow-private probes, the image resolve and every policy
+  // write — means a direct caller can never receive a silent narrowing, and the
+  // pi/hermes/dsh branches are all covered with no second composition path.
+  assertAdmissionNetworkOutboundConsistent(
+    inherited,
+    networkOutbound,
+    allowPrivate,
+    isolationSettings.matchlockDnsPriority,
+  );
 
   // MTLK-ISO2-MEND (admission resolve-once-and-bind): resolve the ONE rpc
   // invocation HERE, after every structural refusal and before the first
@@ -1104,7 +1241,7 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
   };
 
   if (harness === "hermes") {
-    return admitHermesMatchlockRun(boundOpts, inherited, ctx, allowPrivate, isolationSettings);
+    return admitHermesMatchlockRun(boundOpts, inherited, ctx, allowPrivate, isolationSettings, networkOutbound);
   }
 
   // MTLK-ISO-SLICE2 US-003: the pi/dsh path runs the swap-capability handshake
@@ -1242,6 +1379,10 @@ export async function admitMatchlockRun(opts: MatchlockAdmissionOptions): Promis
     // resolveAdmissionIsolationSettings for the INHERITANCE RULE).
     matchlockPrivileged: isolationSettings.matchlockPrivileged,
     matchlockDnsPriority: isolationSettings.matchlockDnsPriority,
+    // NAT-EGRESS: the resolved outbound mode reaches the persisted policy on
+    // every fresh unrestricted admission write; an intercepted run persists
+    // nothing, so the default record is byte-identical to before.
+    ...(networkOutbound !== undefined ? { networkOutbound } : {}),
   });
   return { policy, identity: admitted.pin };
 }
@@ -1270,6 +1411,7 @@ async function admitHermesMatchlockRun(
     matchlockPrivileged: ResolvedMatchlockPrivileged;
     matchlockDnsPriority: ResolvedMatchlockDnsPriority;
   },
+  networkOutbound: ResolvedMatchlockNetworkOutbound | undefined,
 ): Promise<MatchlockAdmissionResult> {
   // R13 parity: the hermes path runs the SAME root gate, with the same code
   // and ordering, before its selection checks, probes or image resolve. The
@@ -1387,6 +1529,10 @@ async function admitHermesMatchlockRun(
     // persisted policy.
     matchlockPrivileged: isolationSettings.matchlockPrivileged,
     matchlockDnsPriority: isolationSettings.matchlockDnsPriority,
+    // NAT-EGRESS: identical to the pi/dsh path — the resolved mode (inherited
+    // verbatim, or the fresh submission-resolved value, or absent) reaches the
+    // persisted policy so the hermes branch cannot drift from the shared rule.
+    ...(networkOutbound !== undefined ? { networkOutbound } : {}),
   });
   return { policy, identity };
 }

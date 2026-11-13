@@ -31,6 +31,10 @@ import {
   resolveMatchlockPrivileged,
 } from "./matchlock/isolation-settings.js";
 import {
+  formatMatchlockNetworkOutboundSelectionLabel,
+  type ResolvedMatchlockNetworkOutbound,
+} from "./matchlock/network-outbound.js";
+import {
   runMatchlockResumePreflight,
   type InheritedImageVerifier,
 } from "./matchlock/resume-preflight.js";
@@ -182,6 +186,20 @@ export interface RunWorkflowParams {
    * policy list always wins and is never re-derived from the environment.
    */
   matchlockAllowPrivate?: string[];
+  /**
+   * NAT-EGRESS: the CLI-resolved outbound network mode for a FRESH Matchlock
+   * opt-in (flag > TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1 > default
+   * interception, already resolved/validated by the composing surface).
+   * Admission persists it on the run's policy before the run is registrable, so
+   * every later launch (queued dispatch, retry, resume, daemon restart,
+   * replacement) composes from the STORED policy. Ignored when
+   * `matchlockPolicy` (an inherited replacement policy) is present — the
+   * persisted policy is authoritative and is never re-derived from this value
+   * or the environment (the anti-widening rule). The default
+   * `{unrestricted:false}` writes nothing, keeping a pre-change record
+   * byte-identical.
+   */
+  matchlockUnrestrictedOutbound?: ResolvedMatchlockNetworkOutbound;
   /**
    * MTLK-ALLOW-PRIVATE US-008: injectable allow-private support probe threaded
    * to admission so tests never need a real matchlock binary. Production omits
@@ -518,6 +536,7 @@ export async function runWorkflow(
     matchlockResourceLimits,
     matchlockResourceHostProbe,
     matchlockAllowPrivate,
+    matchlockUnrestrictedOutbound,
     matchlockAllowPrivateSupportProbe,
     matchlockSwapSupportProbe,
     matchlockNoPrivileged,
@@ -525,6 +544,26 @@ export async function runWorkflow(
     parentRunId,
     workdirCollisionPolicy,
   } = params;
+
+  // NAT-EGRESS: unrestricted outbound networking is a Matchlock-only mode, so
+  // selecting it (by flag OR by a non-empty env) without the workflow opt-in is
+  // a refusal — never a silently ignored value on a native run. This is the
+  // composition half of the parse-time gate (`workflow-run-args.ts`): a direct
+  // `runWorkflow` caller cannot bypass it. It runs BEFORE the workflow dir load,
+  // the DB open, or any worktree/control-plane effect, so no run row exists.
+  // An inherited `matchlockPolicy` IS an opt-in, and the inheritance rule
+  // ignores a supplied mode (anti-widening), so it is never refused here.
+  if (
+    matchlockUnrestrictedOutbound?.unrestricted === true &&
+    !matchlockImage &&
+    !matchlockPolicy
+  ) {
+    throw new Error(
+      `Cannot select unrestricted outbound networking via ` +
+        `${formatMatchlockNetworkOutboundSelectionLabel(matchlockUnrestrictedOutbound)} ` +
+        `without a Matchlock opt-in: pass --matchlock or --matchlock-image <image>.`,
+    );
+  }
 
   // ICEBOX (tamandua-5rr.3 E2): resolve the isolation settings (whole-VM
   // privilege + guest-resolver address-family preference) ONCE at submission,
@@ -1036,6 +1075,14 @@ export async function runWorkflow(
       !matchlockPolicy && matchlockAllowPrivate && matchlockAllowPrivate.length > 0
         ? [...matchlockAllowPrivate]
         : undefined;
+    // NAT-EGRESS: the resolved outbound mode is supplied for a FRESH opt-in
+    // ONLY, exactly like allow-private. A replacement (inherited
+    // `matchlockPolicy`) passes NOTHING so admission cannot be widened by a
+    // recently supplied flag/env value — the stored policy is authoritative.
+    const networkOutboundForAdmission: ResolvedMatchlockNetworkOutbound | undefined =
+      !matchlockPolicy && matchlockUnrestrictedOutbound !== undefined
+        ? { ...matchlockUnrestrictedOutbound }
+        : undefined;
     const admission = await admitMatchlockRun({
       requestedImage: image,
       // SHARED-V3 provenance + R13 consent for a FRESH opt-in. An inherited
@@ -1074,6 +1121,9 @@ export async function runWorkflow(
       inheritedPolicy: matchlockPolicy,
       resourceLimits: resourceLimitsForAdmission,
       ...(allowPrivateForAdmission ? { allowPrivate: allowPrivateForAdmission } : {}),
+      ...(networkOutboundForAdmission
+        ? { networkOutbound: networkOutboundForAdmission }
+        : {}),
       ...(matchlockAllowPrivateSupportProbe
         ? { allowPrivateSupportProbe: matchlockAllowPrivateSupportProbe }
         : {}),

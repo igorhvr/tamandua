@@ -9,6 +9,7 @@ import {
   describeUnusableMatchlockPolicy,
   sanitizeUnusableMatchlockPolicyReason,
   isExecutionIsolationPolicy,
+  matchlockPolicyValidationErrors,
   assertNoCredentialValues,
   resolvePiConfigRoot,
   resolveDshPolicyHome,
@@ -1279,5 +1280,235 @@ describe("ICEBOX isolation settings on the v3 policy record", () => {
     assert.equal(parsed.matchlockPrivileged, undefined);
     assert.equal(parsed.matchlockDnsPriority, undefined);
     assert.equal(parsed.version, MATCHLOCK_POLICY_VERSION);
+  });
+});
+
+// ── NAT-EGRESS (US-002): networkOutbound on the v3 policy record ────────────
+
+/**
+ * FROZEN copy of the `EXECUTION_ISOLATION_KEYS` key list as of the baseline
+ * commit d8047aa5 (the reference default behaviour for this feature). It MUST
+ * NOT contain the new optional `networkOutbound` field: an older daemon lists
+ * the field as unknown and therefore REFUSES a record carrying it instead of
+ * silently downgrading to interception.
+ */
+const BASELINE_D8047AA5_EXECUTION_ISOLATION_KEYS = [
+  "version",
+  "backend",
+  "requestedImage",
+  "requestedImageSource",
+  "rootUsageConsent",
+  "imagePath",
+  "resolvedImageDigest",
+  "resolvedImageConfigDigest",
+  "harness",
+  "hermes",
+  "configurationRoot",
+  "configurationProfile",
+  "guestConfigurationRoot",
+  "submissionHomeDir",
+  "submissionCwd",
+  "submissionDshHomeEnv",
+  "submissionDshHomeSource",
+  "workPathMode",
+  "workingDirectory",
+  "workMounts",
+  "originalRepositoryRoot",
+  "gitMetadataRoots",
+  "mountPolicyVersion",
+  "networkPolicyVersion",
+  "networkAllowPrivate",
+  "matchlockPrivileged",
+  "matchlockDnsPriority",
+  "resourceLimits",
+] as const;
+
+/**
+ * The BASELINE validator's unknown-field check, built from the frozen key list
+ * above. This stands in for "an older daemon reads the record": its schema
+ * does not know `networkOutbound`, so it must report the field as unknown
+ * (fail closed) rather than ignoring it.
+ */
+function baselineUnknownFieldErrors(record: Record<string, unknown>): string[] {
+  const known = new Set<string>(BASELINE_D8047AA5_EXECUTION_ISOLATION_KEYS);
+  const errors: string[] = [];
+  for (const key of Object.keys(record)) {
+    if (known.has(key)) continue;
+    errors.push(
+      /^[A-Za-z0-9_]{1,64}$/.test(key)
+        ? `unknown field "${key}"`
+        : "unknown field (unsafe name withheld)",
+    );
+  }
+  return errors;
+}
+
+describe("NAT-EGRESS networkOutbound on the v3 policy record", () => {
+  it("buildMatchlockPolicy omits networkOutbound when not supplied and emits it verbatim (cloned) when supplied", () => {
+    // Default admission: nothing is written; absence keeps meaning interception.
+    const bare = buildMatchlockPolicy(BASE);
+    assert.equal("networkOutbound" in bare, false);
+    const bareRaw = JSON.parse(serializeMatchlockPolicy(bare)) as Record<string, unknown>;
+    assert.equal("networkOutbound" in bareRaw, false);
+
+    const suppliedCases = [
+      { unrestricted: true, source: "flag" },
+      { unrestricted: true, source: "env" },
+      { unrestricted: false, source: "default" },
+    ] as const;
+    for (const supplied of suppliedCases) {
+      const built = buildMatchlockPolicy({ ...BASE, networkOutbound: supplied });
+      assert.deepEqual(built.networkOutbound, supplied);
+      // Round-trip preserves value + source.
+      const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(built));
+      assert.deepEqual(parsed.networkOutbound, supplied);
+      assert.deepEqual(parsed, built);
+      assert.ok(isExecutionIsolationPolicy(parsed));
+    }
+
+    // Cloned: later caller-side mutation of the supplied object cannot rewrite
+    // the persisted policy.
+    const mutable = { unrestricted: true, source: "flag" as const };
+    const cloned = buildMatchlockPolicy({ ...BASE, networkOutbound: mutable });
+    (mutable as { unrestricted: boolean }).unrestricted = false;
+    assert.deepEqual(cloned.networkOutbound, { unrestricted: true, source: "flag" });
+  });
+
+  it("parseMatchlockPolicy round-trips a record carrying networkOutbound and still parses a record without it", () => {
+    const withField = buildMatchlockPolicy({
+      ...BASE,
+      networkOutbound: { unrestricted: true, source: "env" },
+    });
+    const reparsed = parseMatchlockPolicy(serializeMatchlockPolicy(withField));
+    assert.deepEqual(reparsed.networkOutbound, { unrestricted: true, source: "env" });
+
+    // A legacy v3 record without the field parses exactly as before: the key
+    // stays absent (absence = interception), never defaulted to a value.
+    const withoutField = buildMatchlockPolicy(BASE);
+    const parsed = parseMatchlockPolicy(serializeMatchlockPolicy(withoutField));
+    assert.equal(parsed.networkOutbound, undefined);
+    assert.equal("networkOutbound" in parsed, false);
+    assert.deepEqual({ ...parsed }, { ...withoutField });
+
+    // A valid v2 record (which cannot carry the field) still normalizes cleanly.
+    const v2 = asV2Record(withoutField);
+    const normalized = parseMatchlockPolicy(JSON.stringify(v2));
+    assert.equal(normalized.version, MATCHLOCK_POLICY_VERSION);
+    assert.equal(normalized.networkOutbound, undefined);
+  });
+
+  it("matchlockPolicyValidationErrors rejects malformed PRESENT values fail-closed", () => {
+    const base = JSON.parse(
+      serializeMatchlockPolicy(buildMatchlockPolicy(BASE)),
+    ) as Record<string, unknown>;
+    const badValues: unknown[] = [
+      null,
+      [],
+      "unrestricted",
+      7,
+      true,
+      // Partial objects.
+      { unrestricted: true },
+      { source: "flag" },
+      {},
+      // Non-boolean `unrestricted` (strict boolean — no truthiness coercion).
+      { unrestricted: "true", source: "flag" },
+      { unrestricted: 1, source: "env" },
+      // Invalid source.
+      { unrestricted: true, source: "matchlock" },
+      { unrestricted: true, source: null },
+      // Unknown nested key.
+      { unrestricted: true, source: "flag", extra: true },
+      { unrestricted: true, source: "flag", dns_priority: "ipv4" },
+    ];
+    for (const bad of badValues) {
+      const errors = matchlockPolicyValidationErrors({ ...base, networkOutbound: bad });
+      assert.ok(
+        errors.some((e) => /networkOutbound/.test(e)),
+        `networkOutbound ${JSON.stringify(bad)} must be rejected: ${errors.join("; ")}`,
+      );
+      assert.throws(
+        () => parseMatchlockPolicy(JSON.stringify({ ...base, networkOutbound: bad })),
+        (err: unknown) =>
+          err instanceof MatchlockPolicyError &&
+          err.code === "policy_invalid_record" &&
+          /networkOutbound/.test(err.message),
+      );
+    }
+    // An unsafe nested key name is withheld (never echoed verbatim).
+    const unsafe = { unrestricted: true, source: "flag", "bad key\u0000": 1 };
+    const unsafeErrors = matchlockPolicyValidationErrors({ ...base, networkOutbound: unsafe });
+    assert.ok(unsafeErrors.some((e) => /unsafe name withheld/.test(e)));
+    assert.ok(!unsafeErrors.join("; ").includes("bad key"));
+  });
+
+  it("matchlockPolicyValidationErrors(record, 2) rejects a v2 record carrying networkOutbound", () => {
+    const v2 = asV2Record(buildMatchlockPolicy(BASE));
+    const v2WithField = { ...v2, networkOutbound: { unrestricted: true, source: "flag" } };
+    const errors = matchlockPolicyValidationErrors(v2WithField, 2);
+    assert.deepEqual(
+      errors.filter((e) => e.includes("networkOutbound")),
+      ["networkOutbound is a version-3 field; a version-2 record must not carry it"],
+    );
+    assert.throws(
+      () => parseMatchlockPolicy(JSON.stringify(v2WithField)),
+      (err: unknown) =>
+        err instanceof MatchlockPolicyError &&
+        err.code === "policy_invalid_record" &&
+        /networkOutbound is a version-3 field; a version-2 record must not carry it/.test(err.message),
+    );
+    // A v2 record WITHOUT the field stays valid.
+    assert.deepEqual(matchlockPolicyValidationErrors(v2, 2), []);
+  });
+
+  it("schema skew: the frozen d8047aa5 baseline validator refuses a record carrying networkOutbound", () => {
+    // The baseline key list genuinely predates the field...
+    assert.ok(
+      !(BASELINE_D8047AA5_EXECUTION_ISOLATION_KEYS as readonly string[]).includes("networkOutbound"),
+      "the frozen baseline key list must not contain networkOutbound",
+    );
+    // ...and it is otherwise faithful: a baseline record produces no unknown
+    // fields under it.
+    const baselineRecord = JSON.parse(
+      serializeMatchlockPolicy(buildMatchlockPolicy(BASE)),
+    ) as Record<string, unknown>;
+    assert.deepEqual(baselineUnknownFieldErrors(baselineRecord), []);
+
+    // An older daemon given a record carrying the new field FAILS CLOSED with
+    // an explicit unknown-field error instead of silently downgrading to
+    // interception.
+    const withField = JSON.parse(
+      serializeMatchlockPolicy(
+        buildMatchlockPolicy({ ...BASE, networkOutbound: { unrestricted: true, source: "flag" } }),
+      ),
+    ) as Record<string, unknown>;
+    assert.deepEqual(baselineUnknownFieldErrors(withField), ['unknown field "networkOutbound"']);
+
+    // The current validator accepts that same record (the skew is deliberate
+    // and one-directional: new reads old, old refuses new).
+    assert.deepEqual(matchlockPolicyValidationErrors(withField, 3), []);
+
+    // No policy-version bump accompanied the optional field.
+    assert.equal(MATCHLOCK_POLICY_VERSION, 3);
+    assert.equal(MATCHLOCK_NETWORK_POLICY_VERSION, 2);
+  });
+
+  it("withGrantedRootUsageConsent preserves networkOutbound verbatim (field-preserving consent rewrite)", () => {
+    const stored = serializeMatchlockPolicy(
+      buildMatchlockPolicy({
+        ...BASE,
+        rootUsageConsent: false,
+        networkOutbound: { unrestricted: true, source: "flag" },
+      }),
+    );
+    const granted = parseMatchlockPolicy(withGrantedRootUsageConsent(stored));
+    assert.equal(granted.rootUsageConsent, true);
+    assert.deepEqual(granted.networkOutbound, { unrestricted: true, source: "flag" });
+
+    // An intercepted policy stays without the field after the consent grant.
+    const interceptedStored = serializeMatchlockPolicy(buildMatchlockPolicy(BASE));
+    const interceptedGranted = parseMatchlockPolicy(withGrantedRootUsageConsent(interceptedStored));
+    assert.equal(interceptedGranted.networkOutbound, undefined);
+    assert.equal("networkOutbound" in interceptedGranted, false);
   });
 });

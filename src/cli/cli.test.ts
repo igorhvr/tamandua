@@ -52,6 +52,7 @@ describe("parseWorkflowRunArgs", () => {
       matchlockNoSwap: undefined,
       matchlockNoPrivileged: undefined,
       matchlockAllowPrivate: undefined,
+      networkOutbound: { unrestricted: false, source: "default" },
       context: {},
       wait: false,
       timeout: undefined,

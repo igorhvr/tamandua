@@ -49,12 +49,13 @@ import {
   classifyWorkRoundOutcome,
 } from "../../dist/installer/agent-scheduler.js";
 import { getDb } from "../../dist/db.js";
-import { completeStep } from "../../dist/installer/step-ops.js";
+import { completeStep, failStep } from "../../dist/installer/step-ops.js";
 import {
   buildMatchlockPolicy,
   parseMatchlockPolicy,
   serializeMatchlockPolicy,
 } from "../../dist/installer/matchlock/policy.js";
+import { buildMatchlockCreateConfig } from "../../dist/installer/matchlock/mount-plan.js";
 import {
   MATCHLOCK_GUEST_CLI,
   MATCHLOCK_GUEST_SKILL_FILE,
@@ -190,6 +191,32 @@ function policyJson(imageTag = "vic/ml:latest", imagePath?: string): string {
         { hostPath: "/srv/project", hostRealPath: "/srv/project", guestPath: "/srv/project" },
       ],
       gitMetadataRoots: [],
+    }),
+  );
+}
+
+/**
+ * NAT-EGRESS: the SAME persisted identity/scope shape as {@link policyJson},
+ * plus the stored UNRESTRICTED outbound mode. A later launch (retry, queued
+ * dispatch, resume) re-reads these exact bytes; nothing re-resolves the mode.
+ */
+function natPolicyJson(imageTag = "vic/ml:latest"): string {
+  return serializeMatchlockPolicy(
+    buildMatchlockPolicy({
+      requestedImage: imageTag,
+      identity: {
+        digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        tag: imageTag,
+      },
+      harness: "pi",
+      workingDirectory: "/srv/project",
+      originalRepositoryRoot: "/srv/project",
+      workMounts: [
+        { hostPath: "/srv/project", hostRealPath: "/srv/project", guestPath: "/srv/project" },
+      ],
+      gitMetadataRoots: [],
+      networkOutbound: { unrestricted: true, source: "env" },
     }),
   );
 }
@@ -1420,6 +1447,93 @@ describe("executeDispatchRound Matchlock admission + opted-in dispatch", () => {
     }
     return created.id!;
   }
+
+  it("NAT-EGRESS: a failed-step retry re-dispatches with the stored NAT policy (intercept:false) and never rewrites the column", async () => {
+    const runId = "3f3f3f3f-3f3f-4f3f-8f3f-3f3f3f3f3f3f";
+    const workflowId = "do-now";
+    const workdir = path.join(tempHome, "work-nat-retry");
+    fs.mkdirSync(workdir, { recursive: true });
+    const stored = natPolicyJson();
+    seedRun(runId, workdir, stored, { workflowId });
+
+    // Two GENUINELY driven rounds: the first claims the step and fails it
+    // through the REAL step-ops failStep (retry budget not exhausted, so the
+    // step is re-pended); the second claims it again and completes it. Both
+    // rounds must carry the SAME stored mode, proving retention across a real
+    // later launch rather than a repeated call to the pure composer.
+    const workPolicies: Array<ReturnType<typeof parseMatchlockPolicy>> = [];
+    let workRounds = 0;
+    setMatchlockSchedulerRoundRunnerForTest(async (round) => {
+      if (round.kind === "probe") {
+        return { output: MATCHLOCK_GUEST_SKILL_FILE, exitCode: 0, signal: null, timedOut: false, durationMs: 5 };
+      }
+      workPolicies.push(round.policy);
+      workRounds += 1;
+      const db = getDb();
+      const next = db.prepare(
+        "SELECT id FROM steps WHERE run_id = ? AND status = 'pending' ORDER BY step_index ASC LIMIT 1",
+      ).get(runId) as { id: string };
+      db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE id = ?").run(
+        round.identity.jobId,
+        next.id,
+      );
+      if (workRounds === 1) {
+        const failed = await failStep(next.id, "NAT retention: first attempt fails");
+        assert.equal(failed.status, "retrying", "the retry budget is not exhausted, so the step re-pends");
+        assert.equal(stepRows(runId)[0].status, "pending");
+        // A clean-but-empty round: the scheduler recovers nothing (the step is
+        // pending, not running), so the retry is driven by the NEXT dispatch.
+        return { output: "", exitCode: 1, signal: null, timedOut: false, durationMs: 10 };
+      }
+      return {
+        output: "STATUS: done\nCHANGES: retry recovered\nTESTS: seam",
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        durationMs: 10,
+      };
+    });
+    process.env.TAMANDUA_HARNESS_PROBE = "1";
+
+    await dispatchTwice(runId, workdir, { workflowId, harnessType: "pi" });
+
+    assert.equal(workRounds, 2, "the failed step must be retried on a second real dispatch round");
+    assert.equal(workPolicies.length, 2);
+    for (const [roundIndex, policy] of workPolicies.entries()) {
+      assert.deepEqual(
+        policy.networkOutbound,
+        { unrestricted: true, source: "env" },
+        `round ${roundIndex + 1}: the dispatch policy carries the stored mode`,
+      );
+    }
+    assert.equal(runRow(runId)!.status, "completed", "the retried step completes the run");
+    assert.equal(
+      runRow(runId)!.matchlock_policy,
+      stored,
+      "the stored policy column is byte-identical before and after the retry (a launch never rewrites it)",
+    );
+
+    // The RETRIED launch (not just the first) composes exactly the unrestricted
+    // block from the stored record.
+    const retried = workPolicies[1];
+    const helperPack = path.join(tempHome, "nat-retry-guest-pack");
+    fs.mkdirSync(helperPack, { recursive: true });
+    // The host pi configuration source must exist for the create composer.
+    assert.ok(retried.configurationRoot);
+    fs.mkdirSync(retried.configurationRoot, { recursive: true });
+    const cfg = buildMatchlockCreateConfig(
+      retried,
+      {
+        digest: retried.resolvedImageDigest ?? "",
+        config_digest: retried.resolvedImageConfigDigest ?? "",
+      },
+      { helperPackHostPath: helperPack },
+    );
+    assert.deepEqual(cfg.network, { block_private_ips: false, intercept: false });
+    assert.equal(JSON.stringify(cfg.network), '{"block_private_ips":false,"intercept":false}');
+    assert.equal("dns_priority" in (cfg.network ?? {}), false);
+    assert.equal("allow_private" in (cfg.network ?? {}), false);
+  });
 
   it("US-005: a dispatch-time gate REFUSAL records one event + receipt, force-fails the run (scheduling_status NULL) and spawns NOTHING", async () => {
     installProductionGate();

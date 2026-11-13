@@ -96,6 +96,8 @@ src/installer/matchlock/native-step-cli-differential.test.ts
 src/installer/matchlock/native-step-progress.test.ts
 src/installer/matchlock/native-step-seam.test.ts
 src/installer/matchlock/native-step-services.test.ts
+src/installer/matchlock/network-outbound-harness-matrix.test.ts
+src/installer/matchlock/network-outbound-retention.test.ts
 src/installer/matchlock/pi-invocation-runner.test.ts
 src/installer/matchlock/prep-state.test.ts
 src/installer/matchlock/progress-resource.test.ts

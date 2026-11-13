@@ -107,6 +107,9 @@ function makePlan(over: Record<string, unknown> = {}): Record<string, unknown> {
     identity: { uid: 4242, gid: 4343, homeDir: "/home/testuser", cwd: "/srv/interactive-work" },
     configSelection: { piConfigRoot: configRoot, piConfigProfile: "settings.json" },
     allowPrivate: [],
+    // NAT-EGRESS: the parser always resolves the outbound mode; default is
+    // interception with source `default`.
+    networkOutbound: { unrestricted: false, source: "default" },
     resourceLimits: { cpus: 2, memoryMB: 2048, diskSizeMB: 20480, swapMB: 8192 },
     rootUsageOverride: false,
     policy: makePolicy(),
@@ -218,6 +221,74 @@ describe("US-013: interactive pre-launch summary", () => {
     const plan = makePlan({ allowPrivate: ["10.0.0.1", "10.0.0.2"] });
     const text = formatInteractiveSessionPrelaunch(makeRuntime(plan));
     assert.match(text, /allow-private=10\.0\.0\.1,10\.0\.0\.2/);
+  });
+
+  // ── NAT-EGRESS US-006: mode + selecting source on the single line ────
+
+  const NETWORK_SUMMARY_CASES = [
+    {
+      name: "default",
+      resolved: { unrestricted: false, source: "default" },
+      segment: " network=intercepted(default)",
+    },
+    {
+      name: "flag",
+      resolved: { unrestricted: true, source: "flag" },
+      segment: " network=unrestricted-outbound(flag)",
+    },
+    {
+      name: "env",
+      resolved: { unrestricted: true, source: "env" },
+      segment: " network=unrestricted-outbound(env)",
+    },
+  ] as const;
+
+  const SUMMARY_SUBCOMMANDS = [
+    { subcommand: "pi", harness: "pi", shell: false },
+    { subcommand: "pi-shell", harness: "pi", shell: true },
+    { subcommand: "hermes", harness: "hermes", shell: false },
+    { subcommand: "hermes-shell", harness: "hermes", shell: true },
+  ] as const;
+
+  it("NAT-EGRESS US-006: states the selected outbound mode and its source on the single matchlock: line (all four subcommands)", () => {
+    for (const sc of SUMMARY_SUBCOMMANDS) {
+      for (const networkCase of NETWORK_SUMMARY_CASES) {
+        const plan = makePlan({
+          subcommand: sc.subcommand,
+          harness: sc.harness,
+          shell: sc.shell,
+          ...(sc.harness === "hermes"
+            ? {
+                policy: makePolicy({
+                  harness: "hermes",
+                  guestConfigurationRoot: "/workspace/config/hermes",
+                }),
+              }
+            : {}),
+          networkOutbound: { ...networkCase.resolved },
+        });
+        const text = formatInteractiveSessionPrelaunch(makeRuntime(plan));
+        // Exactly ONE `matchlock:` resource-summary line exists, and the
+        // network segment is its LAST part (never a second line).
+        const summaryLines = text
+          .split("\n")
+          .filter((line) => line.startsWith("matchlock: ") && !line.startsWith("matchlock: interactive "));
+        assert.equal(
+          summaryLines.length,
+          1,
+          `${sc.subcommand}/${networkCase.name}: expected exactly one resource-summary line`,
+        );
+        assert.ok(
+          summaryLines[0].endsWith(networkCase.segment),
+          `${sc.subcommand}/${networkCase.name}: ${JSON.stringify(summaryLines[0])} must end with ${JSON.stringify(networkCase.segment)}`,
+        );
+        assert.equal(
+          text.split("network=").length - 1,
+          1,
+          `${sc.subcommand}/${networkCase.name}: the mode must be stated exactly once`,
+        );
+      }
+    }
   });
 
   // ── ICEBOX: 5ui suffix + Pillar B guest-sudo banner ──────────────────

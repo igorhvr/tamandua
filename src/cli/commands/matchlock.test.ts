@@ -39,6 +39,10 @@ import {
   type InteractiveSessionArgs,
 } from "../../../dist/cli/matchlock-interactive-args.js";
 import { createDefaultMatchlockSetupDeps } from "../../../dist/installer/matchlock-setup-runner.js";
+import {
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV,
+  MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG,
+} from "../../../dist/installer/matchlock/network-outbound.js";
 import { KNOWN_TOP_LEVEL, isTopLevelGroup } from "../../../dist/cli/shared.js";
 import { cleanChildEnv, createTempHome } from "../../../tests/helpers/test-env.ts";
 
@@ -332,6 +336,63 @@ describe("matchlock CLI handler (in-process)", () => {
     assert.match(captured.stderr(), /Cannot specify both/);
   });
 
+  it("refuses the outbound flag with allow-private before launching, naming both sides", async () => {
+    let launched = false;
+    const captured = captureDeps({
+      runSession: async () => {
+        launched = true;
+        return 0;
+      },
+    });
+    await handleMatchlock(
+      "matchlock",
+      [
+        "matchlock",
+        "hermes",
+        MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG,
+        "--matchlock-allow-private",
+        "10.0.0.1",
+      ],
+      captured.deps,
+    );
+    assert.equal(launched, false, "a refused conflict must never reach the session seam");
+    assert.deepEqual(captured.exits, [1]);
+    assert.match(captured.stderr(), new RegExp(MATCHLOCK_UNRESTRICTED_OUTBOUND_FLAG));
+    assert.match(captured.stderr(), /--matchlock-allow-private/);
+  });
+
+  it("refuses a malformed outbound env value before launching", async () => {
+    let launched = false;
+    const captured = captureDeps({
+      env: { [MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV]: "yes" },
+      runSession: async () => {
+        launched = true;
+        return 0;
+      },
+    });
+    await handleMatchlock("matchlock", ["matchlock", "pi"], captured.deps);
+    assert.equal(launched, false);
+    assert.deepEqual(captured.exits, [1]);
+    assert.match(captured.stderr(), new RegExp(MATCHLOCK_UNRESTRICTED_OUTBOUND_ENV));
+  });
+
+  it("hands the resolved unrestricted mode to the session seam", async () => {
+    let seen: InteractiveSessionArgs | undefined;
+    const captured = captureDeps({
+      runSession: async (args) => {
+        seen = args;
+        return 0;
+      },
+    });
+    await handleMatchlock(
+      "matchlock",
+      ["matchlock", "pi-shell", `--matchlock-unrestricted-outbound-networking`],
+      captured.deps,
+    );
+    assert.deepEqual(captured.exits, []);
+    assert.deepEqual(seen?.networkOutbound, { unrestricted: true, source: "flag" });
+  });
+
   it("parses a valid pi invocation and hands the plan to the runSession seam", async () => {
     const cwd = makeTemp("mtlk-cli-cwd-");
     let seen: InteractiveSessionArgs | undefined;
@@ -448,6 +509,8 @@ describe("matchlock help renderers", () => {
     assert.match(help, /--matchlock-no-privileged/);
     assert.match(help, /--matchlock-prioritize-ipv4-dns-resolution/);
     assert.match(help, /--matchlock-prioritize-ipv6-dns-resolution/);
+    assert.match(help, /--matchlock-unrestricted-outbound-networking/);
+    assert.match(help, /TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1/);
     assert.match(help, /--force-matchlock-usage-as-root-not-recommended-per-matchlock-docs/);
     assert.match(help, /tamandua matchlock setup/);
     assert.match(help, /no workflow-round deadline/);
@@ -472,6 +535,19 @@ describe("matchlock help renderers", () => {
       assert.match(help, /--matchlock-no-privileged/);
       assert.match(help, /--matchlock-prioritize-ipv4-dns-resolution/);
       assert.match(help, /--matchlock-prioritize-ipv6-dns-resolution/);
+      // NAT-EGRESS: the outbound option, env form, default and every conflict
+      // are documented on every interactive command's help.
+      assert.match(help, /--matchlock-unrestricted-outbound-networking/);
+      assert.match(help, /TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1/);
+      assert.match(help, /Default: egress\s+interception stays ON/);
+      assert.match(help, /conflicts with\s+--matchlock-allow-private/);
+      assert.match(help, /--matchlock-allow-private, a non-empty\s+TAMANDUA_MATCHLOCK_ALLOW_PRIVATE/);
+      assert.match(help, /--matchlock-prioritize-ipv4-dns-resolution,\s+--matchlock-prioritize-ipv6-dns-resolution and a\s+non-empty\s+TAMANDUA_MATCHLOCK_DNS_PRIORITY/);
+      assert.match(help, /non-empty TAMANDUA_MATCHLOCK_DNS_PRIORITY \(all\s+refused before any VM is created\)/);
+      assert.match(
+        help,
+        /network --matchlock-unrestricted-outbound-networking >\s+TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1 > default intercepted/,
+      );
       assert.match(help, /privileged --matchlock-no-privileged > TAMANDUA_MATCHLOCK_NO_PRIVILEGED=1/);
       assert.match(
         help,

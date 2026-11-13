@@ -22,7 +22,10 @@ import {
   prepareDshProfileOverlay,
 } from "../../../dist/installer/matchlock/dsh-profile-overlay.js";
 import type { ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
-import { MATCHLOCK_NETWORK_POLICY_VERSION } from "../../../dist/installer/matchlock/policy.js";
+import {
+  MATCHLOCK_NETWORK_POLICY_VERSION,
+  parseMatchlockPolicy,
+} from "../../../dist/installer/matchlock/policy.js";
 
 const IDENTITY = { digest: "sha256:aaaa", config_digest: "sha256:bbbb", tag: "img:1" };
 
@@ -178,6 +181,132 @@ describe("matchlock mount plan", () => {
     assert.notEqual(cfg.network?.allow_private, entries, "create params must not alias the policy array");
     entries.push("evil.example");
     assert.deepEqual(cfg.network?.allow_private, ["192.168.107.74:8888"]);
+  });
+
+  // ── NAT-EGRESS US-003: the persisted outbound mode drives the wire block ──
+  //
+  // ONE shared composer (`composeCreateParams`) turns the stored mode into the
+  // `network` object for BOTH builders. The default wire shape must stay
+  // byte-identical to d8047aa5; the unrestricted shape carries ONLY
+  // `block_private_ips:false` + `intercept:false` (no dns_priority, no
+  // allow_private) because those two fields describe interception machinery
+  // that is not running.
+  describe("NAT-EGRESS US-003: composed network block follows the persisted mode", () => {
+    /** The exact d8047aa5 default block for a policy with no allow-private list. */
+    const GOLDEN_DEFAULT = { block_private_ips: true, intercept: true, dns_priority: "ipv4" };
+
+    function goldenFixture(): ExecutionIsolation {
+      return policy({ configurationRoot: tmp });
+    }
+
+    /**
+     * Project a built v3 record back to the ORIGINAL v2 stored shape (the
+     * SHARED-V3 additions stripped, version stamped 2) so the v2 READ path is
+     * exercised on a real record instead of a hand-rolled mutation.
+     */
+    function asV2Record(p: ExecutionIsolation): Record<string, unknown> {
+      const record = JSON.parse(JSON.stringify(p)) as Record<string, unknown>;
+      record.version = 2;
+      for (const key of ["requestedImageSource", "rootUsageConsent", "matchlockPrivileged", "matchlockDnsPriority", "networkOutbound"]) {
+        delete record[key];
+      }
+      delete (record.resourceLimits as Record<string, unknown>).swapMB;
+      // A real persisted record carries the immutable image pin; the mount-plan
+      // fixture is a hand-built policy and only the pin fields are added here.
+      record.resolvedImageDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+      record.resolvedImageConfigDigest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+      return record;
+    }
+
+    it("a v3 policy record WITHOUT the field composes the d8047aa5 wire shape", () => {
+      const cfg = buildMatchlockCreateConfig(goldenFixture(), IDENTITY, { helperPackHostPath: helperPack });
+      assert.deepEqual(cfg.network, GOLDEN_DEFAULT);
+      assert.deepEqual(Object.keys(cfg.network ?? {}), ["block_private_ips", "intercept", "dns_priority"]);
+      assert.equal("allow_private" in (cfg.network ?? {}), false);
+      // Absence of the field is the documented "interception" encoding.
+      assert.equal("networkOutbound" in goldenFixture(), false);
+    });
+
+    it("a v2 policy record normalized at read composes the same golden wire shape", () => {
+      const v2 = asV2Record(goldenFixture());
+      assert.equal(v2.version, 2);
+      assert.equal("networkOutbound" in v2, false);
+      const normalized = parseMatchlockPolicy(JSON.stringify(v2));
+      assert.equal(normalized.version, 3, "the read path projects a valid v2 record to v3");
+      assert.equal("networkOutbound" in normalized, false);
+      const cfg = buildMatchlockCreateConfig(normalized, IDENTITY, { helperPackHostPath: helperPack });
+      assert.deepEqual(cfg.network, GOLDEN_DEFAULT);
+      assert.equal(
+        JSON.stringify(cfg.network),
+        JSON.stringify(buildMatchlockCreateConfig(goldenFixture(), IDENTITY, { helperPackHostPath: helperPack }).network),
+        "the normalized record must compose byte-identically to the default fixture",
+      );
+    });
+
+    it("a hand-built policy without the field composes the same golden shape even when interception settings are present", () => {
+      const fixture = policy({
+        configurationRoot: tmp,
+        matchlockDnsPriority: { priority: "ipv6", source: "flag" },
+        networkAllowPrivate: ["192.168.107.74:8888"],
+      });
+      const cfg = buildMatchlockCreateConfig(fixture, IDENTITY, { helperPackHostPath: helperPack });
+      assert.deepEqual(cfg.network, {
+        block_private_ips: true,
+        intercept: true,
+        dns_priority: "ipv6",
+        allow_private: ["192.168.107.74:8888"],
+      });
+    });
+
+    it("an explicitly persisted false mode (default source) keeps the intercepted block", () => {
+      const cfg = buildMatchlockCreateConfig(
+        policy({ configurationRoot: tmp, networkOutbound: { unrestricted: false, source: "default" } }),
+        IDENTITY,
+        { helperPackHostPath: helperPack },
+      );
+      assert.deepEqual(cfg.network, GOLDEN_DEFAULT);
+    });
+
+    it("an unrestricted policy composes ONLY block_private_ips:false + intercept:false (dns_priority/allow_private absent)", () => {
+      for (const source of ["flag", "env"] as const) {
+        const cfg = buildMatchlockCreateConfig(
+          policy({
+            configurationRoot: tmp,
+            networkOutbound: { unrestricted: true, source },
+            // Both interception-only settings are STILL on the policy (a stale
+            // resolution, a resumed record): they must not reach the wire.
+            networkAllowPrivate: ["192.168.107.74:8888", "10.0.0.0/8"],
+            matchlockDnsPriority: { priority: "ipv6", source: "flag" },
+          }),
+          IDENTITY,
+          { helperPackHostPath: helperPack },
+        );
+        assert.deepEqual(cfg.network, { block_private_ips: false, intercept: false }, `source=${source}`);
+        assert.deepEqual(Object.keys(cfg.network ?? {}), ["block_private_ips", "intercept"]);
+        assert.equal("dns_priority" in (cfg.network ?? {}), false, "dns_priority is interception-only");
+        assert.equal("allow_private" in (cfg.network ?? {}), false, "allow_private is interception-only");
+        assert.equal(JSON.stringify(cfg.network), '{"block_private_ips":false,"intercept":false}');
+      }
+    });
+
+    it("an unrestricted policy composes identically whether or not the policy carries stale interception settings", () => {
+      const bare = buildMatchlockCreateConfig(
+        policy({ configurationRoot: tmp, networkOutbound: { unrestricted: true, source: "flag" } }),
+        IDENTITY,
+        { helperPackHostPath: helperPack },
+      );
+      const stale = buildMatchlockCreateConfig(
+        policy({
+          configurationRoot: tmp,
+          networkOutbound: { unrestricted: true, source: "flag" },
+          networkAllowPrivate: ["box.internal"],
+          matchlockDnsPriority: { priority: "ipv6", source: "env" },
+        }),
+        IDENTITY,
+        { helperPackHostPath: helperPack },
+      );
+      assert.deepEqual(stale.network, bare.network);
+    });
   });
 
   it("rejects a missing host configuration directory (fail closed, never image default)", () => {
@@ -911,6 +1040,63 @@ describe("matchlock mount plan", () => {
       const cfg = buildInteractiveSessionCreateConfig(interactivePolicy(), IDENTITY, OWNER);
       assert.equal(cfg.env?.PI_CODING_AGENT_DIR, interactiveConfig);
       assert.equal(cfg.env?.HERMES_HOME, undefined);
+    });
+
+    // NAT-EGRESS US-003: the interactive builder goes through the SAME shared
+    // composer, so the persisted session mode drives its wire block too.
+    it("NAT-EGRESS US-003: the interactive builder honors the default, unrestricted(flag/env) and explicit-false modes", () => {
+      for (const harness of ["pi", "hermes"] as const) {
+        // Default (field absent): the golden intercepted block, including the
+        // interception-only settings that ARE in effect here.
+        const dflt = buildInteractiveSessionCreateConfig(
+          interactivePolicy({
+            harness,
+            matchlockDnsPriority: { priority: "ipv6", source: "flag" },
+            networkAllowPrivate: ["box.internal"],
+          }),
+          IDENTITY,
+          OWNER,
+        );
+        assert.deepEqual(
+          dflt.network,
+          {
+            block_private_ips: true,
+            intercept: true,
+            dns_priority: "ipv6",
+            allow_private: ["box.internal"],
+          },
+          `${harness} default must keep the intercepted wire block`,
+        );
+
+        // Flag/env selected unrestricted outbound: ONLY the two off switches.
+        for (const source of ["flag", "env"] as const) {
+          const nat = buildInteractiveSessionCreateConfig(
+            interactivePolicy({
+              harness,
+              networkOutbound: { unrestricted: true, source },
+              matchlockDnsPriority: { priority: "ipv6", source: "flag" },
+              networkAllowPrivate: ["box.internal"],
+            }),
+            IDENTITY,
+            OWNER,
+          );
+          assert.deepEqual(
+            nat.network,
+            { block_private_ips: false, intercept: false },
+            `${harness} (${source}) must compose only the two off switches`,
+          );
+          assert.equal("dns_priority" in (nat.network ?? {}), false);
+          assert.equal("allow_private" in (nat.network ?? {}), false);
+        }
+
+        // An explicitly persisted false mode stays intercepted.
+        const off = buildInteractiveSessionCreateConfig(
+          interactivePolicy({ harness, networkOutbound: { unrestricted: false, source: "default" } }),
+          IDENTITY,
+          OWNER,
+        );
+        assert.deepEqual(off.network, { block_private_ips: true, intercept: true, dns_priority: "ipv4" });
+      }
     });
 
     it("hermes mounts the whole effective profile home at its identical host path and sets HERMES_HOME there (never PI_CODING_AGENT_DIR)", () => {

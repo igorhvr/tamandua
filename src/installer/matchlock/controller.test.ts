@@ -10,7 +10,12 @@ import { dshProfileOverlayRoot } from "../../../dist/installer/matchlock/dsh-pro
 import type { PinnedImageIdentity } from "../../../dist/installer/matchlock/image.js";
 import type { LaunchGateBinding } from "../../../dist/installer/matchlock/launch-gate-wiring.js";
 import type { ExecutionIsolation } from "../../../dist/installer/matchlock/policy.js";
-import { MATCHLOCK_NETWORK_POLICY_VERSION } from "../../../dist/installer/matchlock/policy.js";
+import {
+  MATCHLOCK_NETWORK_POLICY_VERSION,
+  buildMatchlockPolicy,
+  parseMatchlockPolicy,
+  serializeMatchlockPolicy,
+} from "../../../dist/installer/matchlock/policy.js";
 import type { MatchlockStreamFrame } from "../../../dist/installer/matchlock/types.js";
 import { decodeFramesText, MATCHLOCK_CLIENT_ERROR_CODES } from "../../../dist/installer/matchlock/rpc-client.js";
 
@@ -468,6 +473,45 @@ describe("matchlock controller (fake rpc driver)", () => {
       "ipv6",
       "the persisted ipv6 priority is preserved on the wire",
     );
+  });
+
+  // NAT-EGRESS retention at the REAL launch composer: a stored unrestricted
+  // record is parsed back from its persisted bytes and handed to the
+  // controller, so this asserts the create WIRE (controller.prepareAndCreate
+  // -> buildCreateParams), not the pure composer the retention file already
+  // covers. A scheduler-side re-resolution or a round->controller override of
+  // the network block would fail here.
+  it("NAT-EGRESS: a stored unrestricted policy round-trips and reaches the create WIRE as {intercept:false} with no interception-only fields", async (t) => {
+    const s = testScaffold(t);
+    s.setFake(HAPPY_FAKE);
+    const stored = serializeMatchlockPolicy(
+      buildMatchlockPolicy({
+        requestedImage: "img:1",
+        identity: { digest: "sha256:aaaa", config_digest: "sha256:bbbb" },
+        harness: "pi",
+        workingDirectory: "/opt/project",
+        originalRepositoryRoot: "/opt/project",
+        workMounts: [
+          { hostPath: "/opt/project", hostRealPath: "/opt/project", guestPath: "/opt/project" },
+        ],
+        gitMetadataRoots: ["/opt/project/.git"],
+        configurationRoot: configDir,
+        networkOutbound: { unrestricted: true, source: "env" },
+      }),
+    );
+    // The column READ a later launch performs (never a re-resolution).
+    const roundTripped = parseMatchlockPolicy(stored);
+    assert.deepEqual(roundTripped.networkOutbound, { unrestricted: true, source: "env" });
+
+    const c = s.makeController(roundTripped);
+    await c.prepareAndCreate(pin());
+    const txn = s.readTranscript();
+    const createParams = txn.find((frame) => frame.method === "create")!.params as Record<string, unknown>;
+    const network = createParams.network as Record<string, unknown>;
+    assert.deepEqual(network, { block_private_ips: false, intercept: false });
+    assert.equal(JSON.stringify(network), '{"block_private_ips":false,"intercept":false}');
+    assert.equal("dns_priority" in network, false, "dns_priority is interception-only");
+    assert.equal("allow_private" in network, false, "allow_private is interception-only");
   });
 
   it("exec_pipe: streams stdout and stderr separately, honors stdin + EOF, frames decode exactly once", async (t) => {

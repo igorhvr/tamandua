@@ -168,6 +168,23 @@ describe("SPL2 workflow command module", () => {
     assert.match(resumeHelp, /never collide/);
   });
 
+  // NAT-EGRESS US-007: the workflow-run help documents the outbound-mode
+  // flag, its env form, the default, the opt-in requirement and every
+  // conflict pair.
+  it("documents the unrestricted outbound networking flag in workflow run help", () => {
+    const runHelp = getWorkflowRunHelp();
+    assert.match(runHelp, /--matchlock-unrestricted-outbound-networking/);
+    assert.match(runHelp, /TAMANDUA_MATCHLOCK_UNRESTRICTED_NETWORKING=1/);
+    assert.match(runHelp, /default intercepted/i);
+    assert.match(runHelp, /intercept=false/);
+    assert.match(runHelp, /block_private_ips=false/);
+    assert.match(runHelp, /Requires --matchlock or\s+--matchlock-image/);
+    assert.match(runHelp, /--matchlock-allow-private/);
+    assert.match(runHelp, /TAMANDUA_MATCHLOCK_ALLOW_PRIVATE/);
+    assert.match(runHelp, /TAMANDUA_MATCHLOCK_DNS_PRIORITY/);
+    assert.match(runHelp, /takes no value|value-bearing/);
+  });
+
   // MTLK-ISO-SLICE2 US-009 (R13): the resume help documents the standalone
   // root-usage override, and the resume action threads it to the control
   // plane while treating a preparing-held response as a failure.
@@ -2120,8 +2137,60 @@ describe("MTLK-VM-SIZE US-005: matchlock launch facts in the resolved block", ()
       assert.deepEqual(json.matchlockResources, base);
     }
   });
-});
+  // NAT-EGRESS US-008: the mode+source segment is appended to the SAME single
+  // `matchlock:` line and carried in the launch JSON. Absent (a caller that
+  // predates the field) keeps the line/JSON byte-identical.
+  it("appends the selected outbound mode + source to the launch line (flag/env/default)", () => {
+    const cases: Array<[string, { unrestricted: boolean; source: string }]> = [
+      ["intercepted(default)", { unrestricted: false, source: "default" }],
+      ["unrestricted-outbound(flag)", { unrestricted: true, source: "flag" }],
+      ["unrestricted-outbound(env)", { unrestricted: true, source: "env" }],
+    ];
+    for (const [segment, networkOutbound] of cases) {
+      const lines = formatWorkflowRunLaunchLines(
+        baseLaunchInfo({
+          matchlockResources: {
+            image: "vic/matchlock-base:latest",
+            cpus: 4,
+            memoryMB: 4096,
+            diskSizeMB: 20480,
+            swapMB: 4096,
+            networkOutbound,
+          },
+        }),
+      );
+      assert.equal(
+        lines[3],
+        `matchlock: vic/matchlock-base:latest cpus=4 memory=4096MB disk=20480MB swap=4096MB network=${segment}`,
+      );
+      assert.equal(
+        lines.filter((l) => l.startsWith("matchlock:")).length,
+        1,
+        "the mode must not add a second matchlock line",
+      );
+    }
+  });
 
+  it("carries the selected outbound mode + source in the launch JSON", () => {
+    const json = workflowRunLaunchInfoToJson(
+      baseLaunchInfo({
+        matchlockResources: {
+          image: "vic/matchlock-base:latest",
+          imageSource: "explicit",
+          cpus: 4,
+          memoryMB: 4096,
+          diskSizeMB: 20480,
+          swapMB: 4096,
+          networkOutbound: { unrestricted: true, source: "env" },
+        },
+      }),
+    );
+    assert.deepEqual(json.matchlockResources?.networkOutbound, {
+      unrestricted: true,
+      source: "env",
+    });
+  });
+});
 // MTLK-ISO-SLICE1 US-008: the run action must resolve the swap size through
 // the shared resolver and hand the parser's real image provenance plus the
 // per-action root-usage consent to run creation. The fields are consumed by
@@ -2151,6 +2220,57 @@ describe("MTLK-ISO-SLICE1 US-008: CLI launch wiring", () => {
     assert.match(call, /matchlockImageSource:\s*runArgs\.matchlockImageSource,/);
     assert.match(call, /matchlockRootUsageOverride:\s*runArgs\.matchlockRootUsageOverride,/);
     assert.match(call, /matchlockResourceLimits,/);
+  });
+
+  it("passes matchlockUnrestrictedOutbound to runWorkflow and states it in the launch block", () => {
+    const start = builtWorkflowModule.indexOf("await runWorkflow({");
+    assert.ok(start >= 0, "the run action must call runWorkflow");
+    const end = builtWorkflowModule.indexOf("});", start);
+    const call = builtWorkflowModule.slice(start, end);
+    assert.match(call, /matchlockUnrestrictedOutbound:\s*runArgs\.networkOutbound,/);
+    const blockStart = builtWorkflowModule.indexOf("launchInfo.matchlockResources = {");
+    assert.ok(blockStart >= 0, "the launch block must exist");
+    assert.match(
+      builtWorkflowModule.slice(blockStart),
+      /networkOutbound:\s*\{\s*\.\.\.runArgs\.networkOutbound\s*\}/,
+    );
+  });
+
+  // NAT-EGRESS US-008: the network mode is fixed at admission, so a resume that
+  // passes the flag is a typed usage refusal BEFORE any run lookup/daemon call
+  // (the nonexistent run id here is never resolved: the refusal comes first).
+  it("workflow resume refuses --matchlock-unrestricted-outbound-networking before any state read", async () => {
+    const { getExitCode, restore } = mockProcessExit();
+    let stderrOutput = "";
+    const origStderr = process.stderr.write;
+    (process.stderr as { write: typeof process.stderr.write }).write = (chunk: any) => {
+      stderrOutput += String(chunk);
+      return true;
+    };
+    try {
+      await handleWorkflow(
+        "workflow",
+        [
+          "workflow",
+          "resume",
+          `run-${crypto.randomUUID()}`,
+          "--matchlock-unrestricted-outbound-networking",
+        ],
+        () => {},
+      );
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      restore();
+      (process.stderr as { write: typeof process.stderr.write }).write = origStderr;
+    }
+    assert.equal(getExitCode(), 1);
+    assert.match(stderrOutput, /--matchlock-unrestricted-outbound-networking/);
+    assert.match(stderrOutput, /network mode is fixed at admission/);
+    assert.match(stderrOutput, /Create a new run/);
+    // The refusal precedes the run lookup, so a nonexistent run id never
+    // produces a "not found"/status error.
+    assert.doesNotMatch(stderrOutput, /No .*run found|Cannot resume/i);
   });
 
   // MTLK-ISO-SLICE2 US-011: the shared output contract now DOES render the
