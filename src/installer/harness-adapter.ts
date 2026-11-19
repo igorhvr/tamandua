@@ -379,7 +379,7 @@ class PiHarnessAdapter implements HarnessAdapter {
     if (pi) return pi;
 
     throw new Error(
-      "pi binary not found in PATH. Install pi (https://github.com/anthropics/pi) or set TAMANDUA_PI_BINARY.",
+      "pi binary not found in PATH. Install pi (https://github.com/earendil-works/pi) or set TAMANDUA_PI_BINARY.",
     );
   }
 
